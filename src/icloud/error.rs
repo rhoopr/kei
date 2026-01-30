@@ -1,7 +1,7 @@
 use thiserror::Error;
 
-#[allow(dead_code)]
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum ICloudError {
     #[error("API response error: {reason} (code: {code})")]
     ApiResponse { reason: String, code: String },

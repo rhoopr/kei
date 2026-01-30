@@ -36,12 +36,12 @@ pub fn sanitize_username(username: &str) -> String {
 #[allow(dead_code)]
 pub struct Session {
     client: Client,
-    pub(crate) cookie_jar: Arc<reqwest::cookie::Jar>,
+    pub(crate) _cookie_jar: Arc<reqwest::cookie::Jar>,
     pub session_data: HashMap<String, String>,
     cookie_dir: PathBuf,
     sanitized_username: String,
     home_endpoint: String,
-    timeout: Duration,
+    _timeout: Duration,
 }
 
 impl Session {
@@ -144,12 +144,12 @@ impl Session {
 
         Ok(Self {
             client,
-            cookie_jar,
+            _cookie_jar: cookie_jar,
             session_data,
             cookie_dir,
             sanitized_username: sanitized,
             home_endpoint: home_endpoint.to_string(),
-            timeout,
+            _timeout: timeout,
         })
     }
 
@@ -287,12 +287,6 @@ impl Session {
     /// Get the home endpoint URL.
     pub fn home_endpoint(&self) -> &str {
         &self.home_endpoint
-    }
-
-    /// Get the HTTP timeout.
-    #[allow(dead_code)]
-    pub fn timeout(&self) -> Duration {
-        self.timeout
     }
 
     /// Return a clone of the underlying HTTP client (with cookie jar attached).

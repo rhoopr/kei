@@ -1,0 +1,161 @@
+mod album;
+mod asset;
+mod library;
+pub mod queries;
+pub mod session;
+mod smart_folders;
+pub mod types;
+
+pub use album::PhotoAlbum;
+#[allow(unused_imports)]
+pub use asset::PhotoAsset;
+pub use library::PhotoLibrary;
+pub use session::PhotosSession;
+pub use types::{AssetItemType, AssetVersionSize};
+
+use std::collections::HashMap;
+
+use serde_json::{json, Value};
+use tracing::{debug, error};
+
+use crate::icloud::error::ICloudError;
+
+pub struct PhotosService {
+    service_root: String,
+    session: Box<dyn PhotosSession>,
+    params: HashMap<String, Value>,
+    primary_library: PhotoLibrary,
+    private_libraries: Option<HashMap<String, PhotoLibrary>>,
+    shared_libraries: Option<HashMap<String, PhotoLibrary>>,
+}
+
+impl PhotosService {
+    /// Create a new `PhotosService`.
+    ///
+    /// This checks that the primary library has finished indexing.
+    pub async fn new(
+        service_root: String,
+        session: Box<dyn PhotosSession>,
+        mut params: HashMap<String, Value>,
+    ) -> Result<Self, ICloudError> {
+        params.insert("remapEnums".to_string(), Value::Bool(true));
+        params.insert("getCurrentSyncToken".to_string(), Value::Bool(true));
+
+        let service_endpoint = Self::build_service_endpoint(&service_root, "private");
+        let zone_id = json!({"zoneName": "PrimarySync"});
+
+        // Clone the session for the primary library.
+        let lib_session = session.clone_box();
+
+        let primary_library = PhotoLibrary::new(
+            service_endpoint,
+            params.clone(),
+            lib_session,
+            zone_id,
+            "private".to_string(),
+        )
+        .await?;
+
+        Ok(Self {
+            service_root,
+            session,
+            params,
+            primary_library,
+            private_libraries: None,
+            shared_libraries: None,
+        })
+    }
+
+    /// Compute the service endpoint URL for a given library type.
+    pub fn get_service_endpoint(&self, library_type: &str) -> String {
+        Self::build_service_endpoint(&self.service_root, library_type)
+    }
+
+    fn build_service_endpoint(service_root: &str, library_type: &str) -> String {
+        format!("{service_root}/database/1/com.apple.photos.cloud/production/{library_type}")
+    }
+
+    /// Return albums from the primary library.
+    pub async fn albums(&self) -> anyhow::Result<HashMap<String, PhotoAlbum>> {
+        self.primary_library.albums().await
+    }
+
+    /// Return a `PhotoAlbum` for the entire primary collection.
+    pub fn all(&self) -> PhotoAlbum {
+        self.primary_library.all()
+    }
+
+    /// Fetch private libraries (lazily, first call triggers the HTTP request).
+    pub async fn fetch_private_libraries(
+        &mut self,
+    ) -> anyhow::Result<&HashMap<String, PhotoLibrary>> {
+        if self.private_libraries.is_none() {
+            let libs = self.fetch_libraries("private").await?;
+            self.private_libraries = Some(libs);
+        }
+        Ok(self.private_libraries.as_ref().unwrap())
+    }
+
+    /// Fetch shared libraries (lazily, first call triggers the HTTP request).
+    pub async fn fetch_shared_libraries(
+        &mut self,
+    ) -> anyhow::Result<&HashMap<String, PhotoLibrary>> {
+        if self.shared_libraries.is_none() {
+            let libs = self.fetch_libraries("shared").await?;
+            self.shared_libraries = Some(libs);
+        }
+        Ok(self.shared_libraries.as_ref().unwrap())
+    }
+
+    async fn fetch_libraries(&self, library_type: &str) -> anyhow::Result<HashMap<String, PhotoLibrary>> {
+        let mut libraries = HashMap::new();
+        let service_endpoint = self.get_service_endpoint(library_type);
+        let url = format!("{service_endpoint}/zones/list");
+
+        let response = self
+            .session
+            .post(&url, "{}", &[("Content-type", "text/plain")])
+            .await?;
+
+        let zones = match response["zones"].as_array() {
+            Some(z) => z,
+            None => return Ok(libraries),
+        };
+
+        for zone in zones {
+            if zone.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            let zone_name = zone["zoneID"]["zoneName"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    tracing::warn!("Missing expected field: zoneID.zoneName");
+                    ""
+                })
+                .to_string();
+            let zone_id = zone["zoneID"].clone();
+            let ep = self.get_service_endpoint(library_type);
+            let lib_session = self.session.clone_box();
+
+            match PhotoLibrary::new(
+                ep,
+                self.params.clone(),
+                lib_session,
+                zone_id,
+                library_type.to_string(),
+            )
+            .await
+            {
+                Ok(lib) => {
+                    debug!("Loaded library zone: {}", zone_name);
+                    libraries.insert(zone_name, lib);
+                }
+                Err(e) => {
+                    error!("Failed to load library zone {}: {}", zone_name, e);
+                }
+            }
+        }
+
+        Ok(libraries)
+    }
+}

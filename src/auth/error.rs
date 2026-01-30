@@ -1,8 +1,8 @@
 use thiserror::Error;
 
 /// Custom error types for iCloud authentication.
-#[allow(dead_code)]
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum AuthError {
     #[error("Failed login: {0}")]
     FailedLogin(String),

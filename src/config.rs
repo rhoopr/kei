@@ -55,9 +55,9 @@ impl std::fmt::Debug for Config {
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
+    if let Some(stripped) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]);
+            return home.join(stripped);
         }
     }
     PathBuf::from(path)
@@ -122,7 +122,7 @@ impl Config {
 /// Parse ISO date (2025-01-02) or interval (20d) to DateTime<Local>.
 ///
 /// Returns an error if the input cannot be parsed as any supported format.
-fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
+pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
     // Try interval first (e.g., "20d")
     if let Some(days_str) = s.strip_suffix('d') {
         if let Ok(days) = days_str.parse::<i64>() {
@@ -148,4 +148,54 @@ fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
          datetime (2025-01-02T14:30:00), or interval (20d)",
         s
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_tilde_with_home() {
+        let result = expand_tilde("~/Documents");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(result, home.join("Documents"));
+        }
+    }
+
+    #[test]
+    fn test_expand_tilde_no_prefix() {
+        assert_eq!(expand_tilde("/absolute/path"), PathBuf::from("/absolute/path"));
+        assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_parse_date_iso() {
+        let dt = parse_date_or_interval("2025-01-15").unwrap();
+        assert_eq!(dt.date_naive(), NaiveDate::from_ymd_opt(2025, 1, 15).unwrap());
+    }
+
+    #[test]
+    fn test_parse_datetime_iso() {
+        let dt = parse_date_or_interval("2025-06-15T14:30:00").unwrap();
+        let naive = dt.naive_local();
+        assert_eq!(naive.date(), NaiveDate::from_ymd_opt(2025, 6, 15).unwrap());
+        assert_eq!(naive.time(), chrono::NaiveTime::from_hms_opt(14, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn test_parse_interval_days() {
+        let before = chrono::Local::now();
+        let dt = parse_date_or_interval("10d").unwrap();
+        let after = chrono::Local::now();
+        let expected = before - chrono::Duration::days(10);
+        // Allow 1 second tolerance
+        assert!(dt >= expected - chrono::Duration::seconds(1));
+        assert!(dt <= after - chrono::Duration::days(10) + chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn test_parse_invalid_date() {
+        assert!(parse_date_or_interval("not-a-date").is_err());
+        assert!(parse_date_or_interval("").is_err());
+    }
 }

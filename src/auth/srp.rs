@@ -308,7 +308,7 @@ pub async fn authenticate_srp(
     let m2 = compute_m2(&a_pub, &m1, &key);
 
     tracing::debug!("SRP S: {}", BASE64.encode(s.to_bytes_be()));
-    tracing::debug!("SRP K: {}", BASE64.encode(&key));
+    tracing::debug!("SRP K: {}", BASE64.encode(key));
 
     let m1_b64 = BASE64.encode(&m1);
     let m2_b64 = BASE64.encode(&m2);
@@ -362,4 +362,99 @@ pub async fn authenticate_srp(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_apple_password_s2k() {
+        let key = derive_apple_password("testpass", "s2k", b"salt1234", 1000);
+        assert_eq!(key.len(), 32);
+        // Deterministic: same inputs produce same output
+        let key2 = derive_apple_password("testpass", "s2k", b"salt1234", 1000);
+        assert_eq!(key, key2);
+    }
+
+    #[test]
+    fn test_derive_apple_password_s2k_fo() {
+        let key = derive_apple_password("testpass", "s2k_fo", b"salt1234", 1000);
+        assert_eq!(key.len(), 32);
+        // s2k_fo uses hex encoding of hash, so result differs from s2k
+        let key_s2k = derive_apple_password("testpass", "s2k", b"salt1234", 1000);
+        assert_ne!(key, key_s2k);
+    }
+
+    #[test]
+    fn test_compute_x_deterministic() {
+        let salt = b"test_salt";
+        let password_key = b"test_password_key";
+        let x1 = compute_x(salt, password_key);
+        let x2 = compute_x(salt, password_key);
+        assert_eq!(x1, x2);
+        assert!(x1 > BigUint::ZERO);
+    }
+
+    #[test]
+    fn test_compute_k_deterministic() {
+        let n = BigUint::parse_bytes(N_HEX.as_bytes(), 16).unwrap();
+        let g = BigUint::from(G_VAL);
+        let k = compute_k(&n, &g);
+        assert!(k > BigUint::ZERO);
+        assert!(k < n);
+    }
+
+    #[test]
+    fn test_compute_u_deterministic() {
+        let n = BigUint::parse_bytes(N_HEX.as_bytes(), 16).unwrap();
+        let a = BigUint::from(12345u64);
+        let b = BigUint::from(67890u64);
+        let u1 = compute_u(&a, &b, &n);
+        let u2 = compute_u(&a, &b, &n);
+        assert_eq!(u1, u2);
+    }
+
+    #[test]
+    fn test_compute_m1_and_m2_deterministic() {
+        let n = BigUint::parse_bytes(N_HEX.as_bytes(), 16).unwrap();
+        let g = BigUint::from(G_VAL);
+        let a_pub = BigUint::from(100u64);
+        let b_pub = BigUint::from(200u64);
+        let key = vec![0u8; 32];
+        let m1 = compute_m1(&n, &g, b"user@test.com", b"salt", &a_pub, &b_pub, &key);
+        assert_eq!(m1.len(), 32); // SHA-256 output
+        let m2 = compute_m2(&a_pub, &m1, &key);
+        assert_eq!(m2.len(), 32);
+    }
+
+    #[test]
+    fn test_get_auth_headers_com_domain() {
+        let session_data = HashMap::new();
+        let headers = get_auth_headers("com", "client123", &session_data, None).unwrap();
+        assert_eq!(
+            headers.get("X-Apple-OAuth-Redirect-URI").unwrap(),
+            "https://www.icloud.com"
+        );
+    }
+
+    #[test]
+    fn test_get_auth_headers_cn_domain() {
+        let session_data = HashMap::new();
+        let headers = get_auth_headers("cn", "client123", &session_data, None).unwrap();
+        assert_eq!(
+            headers.get("X-Apple-OAuth-Redirect-URI").unwrap(),
+            "https://www.icloud.com.cn"
+        );
+    }
+
+    #[test]
+    fn test_get_auth_headers_with_session_data() {
+        let mut session_data = HashMap::new();
+        session_data.insert("scnt".to_string(), "test_scnt".to_string());
+        session_data.insert("session_id".to_string(), "test_session".to_string());
+        let headers = get_auth_headers("com", "client123", &session_data, None).unwrap();
+        assert_eq!(headers.get("scnt").unwrap(), "test_scnt");
+        assert_eq!(headers.get("X-Apple-ID-Session-Id").unwrap(), "test_session");
+    }
 }

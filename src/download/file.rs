@@ -14,7 +14,7 @@ const WAIT_SECONDS: u64 = 5;
 /// Base32 encode bytes using RFC 4648 alphabet (A-Z, 2-7), no padding.
 fn base32_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let mut result = String::with_capacity((data.len() * 8 + 4) / 5);
+    let mut result = String::with_capacity((data.len() * 8).div_ceil(5));
     let mut buffer: u64 = 0;
     let mut bits_left: u32 = 0;
 
