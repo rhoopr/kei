@@ -1,5 +1,6 @@
 .claude/
 CLAUDE.md
+.DS_Store
 
 # Rust
 /target
