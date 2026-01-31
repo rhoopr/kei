@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use base64::Engine;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
-const MAX_RETRIES: u32 = 5;
-const WAIT_SECONDS: u64 = 5;
+use super::error::DownloadError;
+use crate::retry::{self, RetryAction, RetryConfig};
 
 /// Base32 encode bytes using RFC 4648 alphabet (A-Z, 2-7), no padding.
 fn base32_encode(data: &[u8]) -> String {
@@ -34,11 +34,10 @@ fn base32_encode(data: &[u8]) -> String {
     result
 }
 
-/// Compute the temporary .part file path from the checksum.
-///
-/// The checksum is base64-encoded; we decode it then base32-encode for
-/// a filesystem-safe temp filename.
-fn temp_download_path(download_path: &Path, checksum: &str) -> Result<PathBuf> {
+/// Derive a deterministic .part filename from the checksum so that
+/// concurrent downloads of different files don't collide. Base32-encoded
+/// because base64 contains `/` which is invalid in filenames.
+fn temp_download_path(download_path: &Path, checksum: &str) -> anyhow::Result<PathBuf> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(checksum)
         .context("Failed to decode base64 checksum")?;
@@ -49,146 +48,128 @@ fn temp_download_path(download_path: &Path, checksum: &str) -> Result<PathBuf> {
     Ok(download_dir.join(format!("{}.part", encoded)))
 }
 
-/// Download a file from URL with resume support using .part temp files.
+/// Download a file from URL using .part temp files.
 ///
-/// Uses HTTP Range header to resume partial downloads. On completion the
-/// .part file is renamed to the final destination path. Retries with
-/// exponential backoff on failure.
-///
-/// Returns `Ok(true)` on success, `Ok(false)` after exhausting retries.
+/// Each attempt deletes any existing .part file and downloads from scratch
+/// to ensure reliable checksum verification. On completion the .part file
+/// is renamed to the final destination path. Retries with exponential
+/// backoff on transient failures.
 pub async fn download_file(
     client: &Client,
     url: &str,
     download_path: &Path,
     checksum: &str,
     dry_run: bool,
-) -> Result<bool> {
+    retry_config: &RetryConfig,
+) -> Result<(), DownloadError> {
     if dry_run {
         tracing::info!("[DRY RUN] Would download {}", download_path.display());
-        return Ok(true);
+        return Ok(());
     }
 
-    let part_path = temp_download_path(download_path, checksum)?;
+    let part_path = temp_download_path(download_path, checksum)
+        .map_err(DownloadError::Other)?;
 
-    for retry in 0..MAX_RETRIES {
-        match attempt_download(client, url, download_path, &part_path, checksum).await {
-            Ok(()) => return Ok(true),
-            Err(e) => {
-                if retry + 1 >= MAX_RETRIES {
-                    tracing::error!(
-                        "Could not download {} after {} retries: {}",
-                        download_path.display(),
-                        MAX_RETRIES,
-                        e
-                    );
-                    return Ok(false);
-                }
-                let wait_time = (retry as u64 + 1) * WAIT_SECONDS;
-                tracing::warn!(
-                    "Error downloading {}, retrying after {} seconds: {}",
-                    download_path.display(),
-                    wait_time,
-                    e
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(wait_time)).await;
+    let result = retry::retry_with_backoff(
+        retry_config,
+        |e: &DownloadError| {
+            if e.is_retryable() {
+                RetryAction::Retry
+            } else {
+                RetryAction::Abort
             }
-        }
-    }
+        },
+        || async {
+            // Delete any partial file so we always start fresh with checksum verification.
+            let _ = fs::remove_file(&part_path).await;
+            attempt_download(client, url, download_path, &part_path, checksum).await
+        },
+    )
+    .await;
 
-    Ok(false)
+    result.map_err(|e| DownloadError::RetriesExhausted {
+        retries: retry_config.max_retries,
+        path: download_path.display().to_string(),
+        last_error: e.to_string(),
+    })
 }
 
-/// Single download attempt with resume support and checksum verification.
+/// Single download attempt with checksum verification.
 async fn attempt_download(
     client: &Client,
     url: &str,
     download_path: &Path,
     part_path: &Path,
     checksum: &str,
-) -> Result<()> {
-    let current_size = if part_path.exists() {
-        let meta = fs::metadata(&part_path).await?;
-        let size = meta.len();
-        tracing::debug!(
-            "Resuming download of {} from byte {}",
-            download_path.display(),
-            size
-        );
-        size
-    } else {
-        0
-    };
+) -> Result<(), DownloadError> {
+    let path_str = download_path.display().to_string();
+    let response = client.get(url).send().await.map_err(|e| DownloadError::Http {
+        source: e,
+        path: path_str.clone(),
+    })?;
 
-    let mut request = client.get(url);
-    if current_size > 0 {
-        request = request.header("Range", format!("bytes={}-", current_size));
+    if !response.status().is_success() {
+        return Err(DownloadError::HttpStatus {
+            status: response.status().as_u16(),
+            path: path_str,
+        });
     }
 
-    let response = request.send().await.context("HTTP request failed")?;
-
-    if !response.status().is_success() && response.status().as_u16() != 206 {
-        anyhow::bail!(
-            "HTTP {} for {}",
-            response.status(),
-            download_path.display()
-        );
-    }
+    let status = response.status().as_u16();
+    let content_length = response.content_length();
 
     let mut file = OpenOptions::new()
         .create(true)
-        .append(current_size > 0)
         .write(true)
-        .truncate(current_size == 0)
+        .truncate(true)
         .open(&part_path)
         .await
-        .context("Failed to open .part file")?;
+        .map_err(|e| DownloadError::Other(anyhow::anyhow!("Failed to open .part file: {}", e)))?;
 
-    // Stream the response body in chunks, computing SHA256 incrementally
-    let mut hasher = if current_size == 0 {
-        Some(Sha256::new())
-    } else {
-        None
-    };
-
+    // Incremental SHA256 — avoids buffering entire files in memory for large MOVs.
+    let mut hasher = Sha256::new();
+    let mut bytes_written: u64 = 0;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Failed to read response chunk")?;
-        if let Some(ref mut h) = hasher {
-            h.update(&chunk);
-        }
-        file.write_all(&chunk).await.context("Failed to write to .part file")?;
+        let chunk = chunk.map_err(|e| {
+            tracing::warn!(
+                "Body decode error for {} (status={}, content_length={:?}, bytes_so_far={}): {}",
+                path_str, status, content_length, bytes_written, e
+            );
+            DownloadError::Http {
+                source: e,
+                path: path_str.clone(),
+            }
+        })?;
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
+        bytes_written += chunk.len() as u64;
     }
     file.flush().await?;
     drop(file);
 
-    // Verify checksum if this was a fresh (non-resumed) download.
-    if let Some(hasher) = hasher {
-        if let Ok(expected_hash) = base64::engine::general_purpose::STANDARD.decode(checksum) {
-            let actual_hash = hasher.finalize();
+    if let Ok(expected_hash) = base64::engine::general_purpose::STANDARD.decode(checksum) {
+        let actual_hash = hasher.finalize();
 
-            let matches = if expected_hash.len() == 32 {
-                actual_hash.as_slice() == expected_hash.as_slice()
-            } else if expected_hash.len() == 33 {
-                // Skip 1-byte prefix
-                actual_hash.as_slice() == &expected_hash[1..]
-            } else {
-                // Unknown hash format, skip verification
-                true
-            };
+        // Apple uses two checksum formats: raw 32-byte SHA-256, or 33-byte
+        // with a 1-byte type prefix (0x01 = SHA-256). Handle both.
+        let matches = if expected_hash.len() == 32 {
+            actual_hash.as_slice() == expected_hash.as_slice()
+        } else if expected_hash.len() == 33 {
+            actual_hash.as_slice() == &expected_hash[1..]
+        } else {
+            true
+        };
 
-            if !matches {
-                let _ = fs::remove_file(&part_path).await;
-                anyhow::bail!(
-                    "Checksum mismatch for {}",
-                    download_path.display()
-                );
-            }
+        if !matches {
+            let _ = fs::remove_file(&part_path).await;
+            return Err(DownloadError::ChecksumMismatch(
+                download_path.display().to_string(),
+            ));
         }
     }
 
-    fs::rename(&part_path, download_path)
-        .await
-        .context("Failed to rename .part file to final path")?;
+    fs::rename(&part_path, download_path).await?;
 
     Ok(())
 }

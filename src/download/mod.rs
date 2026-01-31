@@ -1,3 +1,8 @@
+//! Download engine: filters iCloud photos, downloads with retry, and stamps
+//! EXIF metadata. Uses a three-phase approach (filter → download → cleanup)
+//! to handle expired CDN URLs gracefully on large libraries.
+
+pub mod error;
 pub mod exif;
 pub mod file;
 pub mod paths;
@@ -15,12 +20,10 @@ use std::path::PathBuf;
 use futures_util::stream::{self, StreamExt};
 
 use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum};
+use crate::retry::RetryConfig;
 
-/// Application configuration for the download engine.
-///
-/// This is a standalone subset of fields consumed by the download loop.
-/// The canonical `Config` struct may live elsewhere; this serves as the
-/// interface contract for the download engine.
+/// Subset of application config consumed by the download engine.
+/// Decoupled from CLI parsing so the engine can be tested independently.
 #[derive(Debug)]
 pub struct DownloadConfig {
     pub(crate) directory: std::path::PathBuf,
@@ -34,6 +37,7 @@ pub struct DownloadConfig {
     pub(crate) dry_run: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
+    pub(crate) retry: RetryConfig,
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
@@ -44,23 +48,16 @@ struct DownloadTask {
     created_local: DateTime<Local>,
 }
 
-/// Main download loop: fetch all photos from each album, apply filters,
-/// check local existence, download missing files, and optionally stamp
-/// EXIF datetime.
+/// Fetch photos from all albums and build filtered download tasks.
 ///
-/// Uses a two-phase approach:
-/// 1. Sequential filter pass — builds a list of download tasks
-/// 2. Parallel download — consumes tasks with bounded concurrency
-pub async fn download_photos(
-    client: &Client,
+/// This re-contacts the iCloud API, so each call yields fresh download URLs.
+/// Files that already exist on disk are skipped automatically.
+async fn build_download_tasks(
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
-) -> Result<()> {
-    // ── Phase 1: Concurrent album fetch + sequential filter ─────────
+) -> Result<Vec<DownloadTask>> {
     let album_results: Vec<Result<Vec<_>>> = stream::iter(albums)
-        .map(|album| async move {
-            album.photos(config.recent).await
-        })
+        .map(|album| async move { album.photos(config.recent).await })
         .buffer_unordered(config.concurrent_downloads)
         .collect()
         .await;
@@ -70,7 +67,6 @@ pub async fn download_photos(
         let assets = album_result?;
 
         for asset in &assets {
-            // --- type filter ---
             if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
                 continue;
             }
@@ -78,7 +74,6 @@ pub async fn download_photos(
                 continue;
             }
 
-            // --- date filters (UTC comparison) ---
             let created_utc = asset.created();
             if let Some(before) = &config.skip_created_before {
                 if created_utc < *before {
@@ -91,7 +86,6 @@ pub async fn download_photos(
                 }
             }
 
-            // --- build local path ---
             let filename = match asset.filename() {
                 Some(f) => f,
                 None => {
@@ -113,8 +107,13 @@ pub async fn download_photos(
                 continue;
             }
 
-            // --- collect task ---
-            let versions = asset.versions();
+            let versions = match asset.versions() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("Skipping asset {}: {}", asset.id(), e);
+                    continue;
+                }
+            };
             if let Some(version) = versions.get(&config.size) {
                 tasks.push(DownloadTask {
                     url: version.url.clone(),
@@ -125,6 +124,25 @@ pub async fn download_photos(
             }
         }
     }
+
+    Ok(tasks)
+}
+
+/// Main download loop: fetch all photos from each album, apply filters,
+/// check local existence, download missing files, and optionally stamp
+/// EXIF datetime.
+///
+/// Uses a three-phase approach:
+/// 1. Filter pass — builds a list of download tasks with fresh URLs
+/// 2. Parallel download — consumes tasks with bounded concurrency
+/// 3. Cleanup pass — re-fetches URLs from API and retries failures
+pub async fn download_photos(
+    client: &Client,
+    albums: &[PhotoAlbum],
+    config: &DownloadConfig,
+) -> Result<()> {
+    // ── Phase 1: Build download tasks ────────────────────────────────
+    let tasks = build_download_tasks(albums, config).await?;
 
     if tasks.is_empty() {
         tracing::info!("No new photos to download");
@@ -146,108 +164,177 @@ pub async fn download_photos(
     }
 
     // ── Phase 2: Parallel download ───────────────────────────────────
-    let client = client.clone();
-    let set_exif = config.set_exif_datetime;
+    let total = tasks.len();
+    let failed_tasks = run_download_pass(
+        client,
+        tasks,
+        &config.retry,
+        config.set_exif_datetime,
+        config.concurrent_downloads,
+    )
+    .await;
 
-    let results: Vec<Result<()>> = stream::iter(tasks)
+    if failed_tasks.is_empty() {
+        tracing::info!("── Summary ──");
+        tracing::info!("  {} downloaded, 0 failed, {} total", total, total);
+        return Ok(());
+    }
+
+    // Phase 3: Re-fetch from API to get fresh CDN URLs (old ones may have
+    // expired during a long Phase 2), then retry at concurrency 1 to give
+    // large files full bandwidth.
+    let cleanup_concurrency = 1;
+    let failure_count = failed_tasks.len();
+    tracing::info!(
+        "── Cleanup pass: re-fetching URLs and retrying {} failed downloads (concurrency: {}) ──",
+        failure_count,
+        cleanup_concurrency,
+    );
+
+    let fresh_tasks = build_download_tasks(albums, config).await?;
+    tracing::info!(
+        "  Re-fetched {} tasks with fresh URLs",
+        fresh_tasks.len()
+    );
+
+    let remaining_failed = run_download_pass(
+        client,
+        fresh_tasks,
+        &config.retry,
+        config.set_exif_datetime,
+        cleanup_concurrency,
+    )
+    .await;
+
+    let failed = remaining_failed.len();
+    let succeeded = total - failed;
+    tracing::info!("── Summary ──");
+    tracing::info!("  {} downloaded, {} failed, {} total", succeeded, failed, total);
+
+    if failed > 0 {
+        for task in &remaining_failed {
+            tracing::error!("Download failed: {}", task.download_path.display());
+        }
+        anyhow::bail!("{} of {} downloads failed", failed, total);
+    }
+
+    Ok(())
+}
+
+/// Execute a download pass over the given tasks, returning any that failed.
+async fn run_download_pass(
+    client: &Client,
+    tasks: Vec<DownloadTask>,
+    retry_config: &RetryConfig,
+    set_exif: bool,
+    concurrency: usize,
+) -> Vec<DownloadTask> {
+    let client = client.clone();
+    let retry_config = retry_config.clone();
+
+    let results: Vec<(DownloadTask, Result<()>)> = stream::iter(tasks)
         .map(|task| {
             let client = client.clone();
+            let retry_config = retry_config.clone();
             async move {
-                if let Some(parent) = task.download_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-
-                let success = file::download_file(
-                    &client,
-                    &task.url,
-                    &task.download_path,
-                    &task.checksum,
-                    false,
-                )
-                .await?;
-
-                if success {
-                    // Set file modification time to photo creation date.
-                    let mtime_path = task.download_path.clone();
-                    let ts = task.created_local.timestamp();
-                    if let Err(e) = tokio::task::spawn_blocking(move || {
-                        set_file_mtime(&mtime_path, ts)
-                    })
-                    .await?
-                    {
-                        tracing::warn!(
-                            "Could not set mtime on {}: {}",
-                            task.download_path.display(),
-                            e
-                        );
-                    }
-
-                    tracing::info!("Downloaded {}", task.download_path.display());
-
-                    // Stamp EXIF DateTimeOriginal on JPEGs if missing.
-                    if set_exif {
-                        let ext = task
-                            .download_path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
-                        if matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg") {
-                            let exif_path = task.download_path.clone();
-                            let date_str = task
-                                .created_local
-                                .format("%Y:%m:%d %H:%M:%S")
-                                .to_string();
-                            let exif_result = tokio::task::spawn_blocking(move || {
-                                match exif::get_photo_exif(&exif_path) {
-                                    Ok(None) => {
-                                        if let Err(e) =
-                                            exif::set_photo_exif(&exif_path, &date_str)
-                                        {
-                                            tracing::warn!(
-                                                "Failed to set EXIF on {}: {}",
-                                                exif_path.display(),
-                                                e
-                                            );
-                                        }
-                                    }
-                                    Ok(Some(_)) => {}
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to read EXIF from {}: {}",
-                                            exif_path.display(),
-                                            e
-                                        );
-                                    }
-                                }
-                            })
-                            .await;
-                            if let Err(e) = exif_result {
-                                tracing::warn!("EXIF task panicked: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                Ok(())
+                let result = download_single_task(&client, &task, &retry_config, set_exif).await;
+                (task, result)
             }
         })
-        .buffer_unordered(config.concurrent_downloads)
+        .buffer_unordered(concurrency)
         .collect()
         .await;
 
-    let failed = results.iter().filter(|r| r.is_err()).count();
-    for result in &results {
-        if let Err(e) = result {
-            tracing::error!("Download failed: {}", e);
-        }
+    results
+        .into_iter()
+        .filter_map(|(task, result)| {
+            if let Err(e) = &result {
+                tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
+                Some(task)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Download a single task, handling mtime and EXIF stamping on success.
+async fn download_single_task(
+    client: &Client,
+    task: &DownloadTask,
+    retry_config: &RetryConfig,
+    set_exif: bool,
+) -> Result<()> {
+    if let Some(parent) = task.download_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
     }
 
-    let succeeded = results.len() - failed;
-    tracing::info!("── Summary ──");
-    tracing::info!("  {} downloaded, {} failed, {} total", succeeded, failed, results.len());
+    file::download_file(
+        client,
+        &task.url,
+        &task.download_path,
+        &task.checksum,
+        false,
+        retry_config,
+    )
+    .await?;
 
-    if failed > 0 {
-        anyhow::bail!("{} of {} downloads failed", failed, results.len());
+    let mtime_path = task.download_path.clone();
+    let ts = task.created_local.timestamp();
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        set_file_mtime(&mtime_path, ts)
+    })
+    .await?
+    {
+        tracing::warn!(
+            "Could not set mtime on {}: {}",
+            task.download_path.display(),
+            e
+        );
+    }
+
+    tracing::info!("Downloaded {}", task.download_path.display());
+
+    if set_exif {
+        let ext = task
+            .download_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg") {
+            let exif_path = task.download_path.clone();
+            let date_str = task
+                .created_local
+                .format("%Y:%m:%d %H:%M:%S")
+                .to_string();
+            let exif_result = tokio::task::spawn_blocking(move || {
+                match exif::get_photo_exif(&exif_path) {
+                    Ok(None) => {
+                        if let Err(e) =
+                            exif::set_photo_exif(&exif_path, &date_str)
+                        {
+                            tracing::warn!(
+                                "Failed to set EXIF on {}: {}",
+                                exif_path.display(),
+                                e
+                            );
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read EXIF from {}: {}",
+                            exif_path.display(),
+                            e
+                        );
+                    }
+                }
+            })
+            .await;
+            if let Err(e) = exif_result {
+                tracing::warn!("EXIF task panicked: {}", e);
+            }
+        }
     }
 
     Ok(())

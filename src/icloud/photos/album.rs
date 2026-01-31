@@ -78,10 +78,13 @@ impl PhotoAlbum {
             }]
         });
 
-        let response = self
-            .session
-            .post(&url, &body.to_string(), &[("Content-type", "text/plain")])
-            .await?;
+        let response = super::session::retry_post(
+            self.session.as_ref(),
+            &url,
+            &body.to_string(),
+            &[("Content-type", "text/plain")],
+        )
+        .await?;
 
         let batch: super::cloudkit::BatchQueryResponse = serde_json::from_value(response)?;
         let count = batch
@@ -112,10 +115,13 @@ impl PhotoAlbum {
             );
             let body = self.list_query(offset, direction);
             debug!("Album '{}' POST URL: {}", self.name, url);
-            let response = self
-                .session
-                .post(&url, &body.to_string(), &[("Content-type", "text/plain")])
-                .await?;
+            let response = super::session::retry_post(
+                self.session.as_ref(),
+                &url,
+                &body.to_string(),
+                &[("Content-type", "text/plain")],
+            )
+            .await?;
             debug!("Album '{}' response: {}", self.name, serde_json::to_string_pretty(&response).unwrap_or_default());
 
             let query: super::cloudkit::QueryResponse = serde_json::from_value(response)?;
@@ -198,6 +204,8 @@ impl PhotoAlbum {
         debug!("list_query filterBy ({} items): {}", filter_by.len(), serde_json::to_string(&query_part).unwrap_or_default());
         debug!("list_query zoneID: {}", serde_json::to_string(&self.zone_id).unwrap_or_default());
 
+        // resultsLimit is 2x page_size because each photo returns both a
+        // CPLMaster and CPLAsset record — we need both to build a PhotoAsset.
         json!({
             "query": {
                 "filterBy": filter_by,

@@ -1,3 +1,10 @@
+//! icloudpd-rs — Rust rewrite of icloud-photos-downloader.
+//!
+//! Downloads photos and videos from iCloud via Apple's private CloudKit APIs.
+//! Authentication uses SRP-6a with Apple's custom variant, followed by optional
+//! 2FA. Photos are streamed with checksum verification and exponential-backoff
+//! retries on transient failures.
+
 #![warn(clippy::all)]
 
 mod auth;
@@ -5,6 +12,7 @@ mod cli;
 mod config;
 mod download;
 mod icloud;
+pub mod retry;
 mod types;
 
 use clap::Parser;
@@ -14,7 +22,6 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
-    // Set up logging
     let filter = match cli.log_level {
         types::LogLevel::Debug => "debug",
         types::LogLevel::Info => "info",
@@ -30,7 +37,6 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::from_cli(cli)?;
     tracing::info!(concurrency = config.threads_num, "Starting icloudpd-rs");
 
-    // Authenticate
     let password_provider = {
         let pw = config.password.clone();
         move || -> Option<String> {
@@ -58,7 +64,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Initialize photos service
     let ckdatabasews_url = auth_result
         .data
         .webservices
@@ -67,14 +72,14 @@ async fn main() -> anyhow::Result<()> {
         .map(|ep| ep.url.as_str())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
 
-    // Build params from service data (must match Python's PyiCloudService.params)
+    // Must match Python's PyiCloudService.params for API compatibility
     let mut params = std::collections::HashMap::new();
     params.insert("clientBuildNumber".to_string(), serde_json::Value::String("2522Project44".to_string()));
     params.insert("clientMasteringNumber".to_string(), serde_json::Value::String("2522B2".to_string()));
     params.insert("clientId".to_string(), serde_json::Value::String(
         auth_result.session.client_id().cloned().unwrap_or_default()
     ));
-    if let Some(ref dsid) = auth_result.data.ds_info.as_ref().and_then(|ds| ds.dsid.as_ref()) {
+    if let Some(dsid) = &auth_result.data.ds_info.as_ref().and_then(|ds| ds.dsid.as_ref()) {
         params.insert("dsid".to_string(), serde_json::Value::String(dsid.to_string()));
     }
 
@@ -113,12 +118,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Require directory for download
     if config.directory.as_os_str().is_empty() {
         anyhow::bail!("--directory is required for downloading");
     }
 
-    // Get albums to download
     let albums = if config.albums.is_empty() {
         vec![photos_service.all()]
     } else {
@@ -140,7 +143,6 @@ async fn main() -> anyhow::Result<()> {
         matched
     };
 
-    // Build download config
     let download_config = download::DownloadConfig {
         directory: config.directory.clone(),
         folder_structure: config.folder_structure.clone(),
@@ -153,9 +155,13 @@ async fn main() -> anyhow::Result<()> {
         dry_run: config.dry_run,
         concurrent_downloads: config.threads_num as usize,
         recent: config.recent,
+        retry: retry::RetryConfig {
+            max_retries: config.max_retries,
+            base_delay_secs: config.retry_delay_secs,
+            max_delay_secs: 60,
+        },
     };
 
-    // Main download loop (with optional watch mode)
     loop {
         download::download_photos(&http_client, &albums, &download_config).await?;
 

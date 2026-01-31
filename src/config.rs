@@ -35,6 +35,8 @@ pub struct Config {
     pub skip_created_before: Option<DateTime<Local>>,
     pub skip_created_after: Option<DateTime<Local>>,
     pub only_print_filenames: bool,
+    pub max_retries: u32,
+    pub retry_delay_secs: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -109,21 +111,24 @@ impl Config {
             skip_created_before,
             skip_created_after,
             only_print_filenames: cli.only_print_filenames,
+            max_retries: cli.max_retries,
+            retry_delay_secs: cli.retry_delay,
         })
     }
 }
 
-/// Parse ISO date (2025-01-02) or interval (20d) to DateTime<Local>.
+/// Parse a human-friendly date spec into a concrete timestamp.
 ///
-/// Returns an error if the input cannot be parsed as any supported format.
+/// Supports three formats to match the Python CLI's behavior:
+/// - Relative interval: `"20d"` (20 days ago from now)
+/// - ISO date: `"2025-01-02"` (midnight local time)
+/// - ISO datetime: `"2025-01-02T14:30:00"` (local time)
 pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
-    // Try interval first (e.g., "20d")
     if let Some(days_str) = s.strip_suffix('d') {
         if let Ok(days) = days_str.parse::<i64>() {
             return Ok(Local::now() - chrono::Duration::days(days));
         }
     }
-    // Try ISO date
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         if let Some(naive_dt) = date.and_hms_opt(0, 0, 0) {
             if let Some(dt) = naive_dt.and_local_timezone(Local).single() {
@@ -131,7 +136,6 @@ pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>>
             }
         }
     }
-    // Try full ISO datetime
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         if let Some(local) = dt.and_local_timezone(Local).single() {
             return Ok(local);

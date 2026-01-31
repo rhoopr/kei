@@ -54,7 +54,7 @@ pub async fn request_2fa_code(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        // Check for wrong code error (-21669)
+            // Apple error code -21669 = incorrect verification code
         if text.contains("-21669") {
             tracing::error!("Code verification failed: wrong code");
             return Ok(false);
@@ -157,7 +157,8 @@ pub async fn authenticate_with_token(
     let body: AccountLoginResponse = response.json().await
         .context("Failed to parse accountLogin response as JSON")?;
 
-    // Check if Apple insists on a different domain
+    // Apple redirects China mainland accounts to .com.cn — users must
+    // re-run with --domain cn to use the correct regional endpoint.
     if let Some(ref domain_to_use) = body.domain_to_use {
         return Err(anyhow::anyhow!(
             "Apple insists on using {} for your request. Please use --domain parameter",

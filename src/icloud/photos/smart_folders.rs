@@ -1,3 +1,7 @@
+//! Apple's built-in smart albums (Favorites, Videos, etc.) — these exist
+//! for every iCloud account and use server-side query filters rather than
+//! explicit membership lists.
+
 use serde_json::{json, Value};
 
 pub struct FolderDef {

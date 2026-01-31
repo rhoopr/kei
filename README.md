@@ -73,6 +73,8 @@ icloudpd-rs --username my@email.address --directory /photos
 | `--list-libraries` | List available libraries |
 | `--recent N` | Download only the N most recent photos |
 | `--threads-num N` | Number of concurrent downloads (default: 1) |
+| `--max-retries N` | Max retries per download (default: 2, 0 = no retries) |
+| `--retry-delay N` | Initial retry delay in seconds (default: 5) |
 | `--dry-run` | Preview without modifying files or iCloud |
 
 ## License

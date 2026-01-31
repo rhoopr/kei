@@ -129,6 +129,14 @@ pub struct Cli {
     /// Only print filenames without downloading
     #[arg(long)]
     pub only_print_filenames: bool,
+
+    /// Max retries per download (default: 2, 0 = no retries)
+    #[arg(long, default_value_t = 2)]
+    pub max_retries: u32,
+
+    /// Initial retry delay in seconds (default: 5)
+    #[arg(long, default_value_t = 5)]
+    pub retry_delay: u64,
 }
 
 #[cfg(test)]
@@ -189,5 +197,41 @@ mod tests {
         args.extend(["--recent", "50"]);
         let cli = parse(&args);
         assert_eq!(cli.recent, Some(50));
+    }
+
+    #[test]
+    fn test_max_retries_default() {
+        let cli = parse(&base_args());
+        assert_eq!(cli.max_retries, 2);
+    }
+
+    #[test]
+    fn test_max_retries_custom() {
+        let mut args = base_args();
+        args.extend(["--max-retries", "10"]);
+        let cli = parse(&args);
+        assert_eq!(cli.max_retries, 10);
+    }
+
+    #[test]
+    fn test_max_retries_zero_disables() {
+        let mut args = base_args();
+        args.extend(["--max-retries", "0"]);
+        let cli = parse(&args);
+        assert_eq!(cli.max_retries, 0);
+    }
+
+    #[test]
+    fn test_retry_delay_default() {
+        let cli = parse(&base_args());
+        assert_eq!(cli.retry_delay, 5);
+    }
+
+    #[test]
+    fn test_retry_delay_custom() {
+        let mut args = base_args();
+        args.extend(["--retry-delay", "15"]);
+        let cli = parse(&args);
+        assert_eq!(cli.retry_delay, 15);
     }
 }

@@ -1,7 +1,11 @@
 use serde_json::Value;
 
-/// Minimal async session used by the photos service.
-/// The concrete implementation lives in `crate::auth::session`.
+use crate::retry::{self, RetryAction, RetryConfig};
+
+/// Async HTTP session trait for the photos service.
+///
+/// Abstracted as a trait so album/library code can be tested with stubs
+/// without hitting the real iCloud API.
 #[async_trait::async_trait]
 #[allow(dead_code)]
 pub trait PhotosSession: Send + Sync {
@@ -22,8 +26,8 @@ pub trait PhotosSession: Send + Sync {
     fn clone_box(&self) -> Box<dyn PhotosSession>;
 }
 
-// A convenience blanket implementation for `reqwest::Client` so that
-// callers can use it directly without a full auth session.
+// Blanket impl lets `reqwest::Client` (from auth) be used directly as a
+// `PhotosSession` without an adapter, since Client is Arc-backed and cheap to clone.
 #[async_trait::async_trait]
 impl PhotosSession for reqwest::Client {
     async fn post(
@@ -56,5 +60,60 @@ impl PhotosSession for reqwest::Client {
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
+    }
+}
+
+/// Classify API errors for retry: network failures and server-side errors
+/// (5xx, 429) are transient; client errors (4xx) indicate a real problem.
+fn classify_api_error(e: &anyhow::Error) -> RetryAction {
+    if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = reqwest_err.status() {
+            if status.as_u16() == 429 || status.as_u16() >= 500 {
+                return RetryAction::Retry;
+            }
+            return RetryAction::Abort;
+        }
+        return RetryAction::Retry;
+    }
+    RetryAction::Abort
+}
+
+/// Retry a `session.post()` call with default exponential backoff.
+pub async fn retry_post(
+    session: &dyn PhotosSession,
+    url: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> anyhow::Result<Value> {
+    let config = RetryConfig::default();
+    retry::retry_with_backoff(
+        &config,
+        classify_api_error,
+        || session.post(url, body, headers),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_non_reqwest_error_aborts() {
+        let e: anyhow::Error = anyhow::anyhow!("some other error");
+        assert_eq!(classify_api_error(&e), RetryAction::Abort);
+    }
+
+    #[test]
+    fn test_classify_network_error_retries() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(reqwest::Client::new().get("http://127.0.0.1:1").send())
+            .unwrap_err();
+        let e: anyhow::Error = err.into();
+        assert_eq!(classify_api_error(&e), RetryAction::Retry);
     }
 }

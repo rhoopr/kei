@@ -5,6 +5,9 @@ use serde_json::Value;
 
 use super::types::{AssetItemType, AssetVersionSize};
 
+/// CloudKit field names requested in every query — must include all fields
+/// needed for filename resolution, version URLs, checksums, and metadata.
+/// Matches the Python `DESIRED_KEYS` list for API compatibility.
 pub const DESIRED_KEYS: &[&str] = &[
     "resJPEGFullWidth",
     "resJPEGFullHeight",
@@ -136,6 +139,8 @@ pub fn item_type_from_str(s: &str) -> Option<AssetItemType> {
     }
 }
 
+/// Maps logical version sizes to CloudKit field prefixes.
+/// The field prefix + "Res" gives the resource field (e.g., "resOriginalRes").
 pub const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str)] = &[
     (AssetVersionSize::Original, "resOriginal"),
     (AssetVersionSize::Alternative, "resOriginalAlt"),

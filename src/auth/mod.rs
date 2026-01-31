@@ -1,3 +1,8 @@
+//! iCloud authentication via Apple's SRP-6a variant with optional 2FA.
+//!
+//! The flow mirrors Python icloudpd's `PyiCloudService` authentication:
+//! session token validation → SRP login → 2FA challenge → session trust.
+
 pub mod endpoints;
 pub mod error;
 pub mod responses;
@@ -49,7 +54,7 @@ pub async fn authenticate(
 
     let mut session = Session::new(cookie_dir, apple_id, endpoints.home, timeout_secs).await?;
 
-    // Resolve client_id: prefer session data, then provided, then generate new
+    // Prefer persisted client_id to maintain session continuity across runs
     let client_id = session
         .client_id()
         .cloned()
@@ -57,7 +62,6 @@ pub async fn authenticate(
         .unwrap_or_else(|| format!("auth-{}", Uuid::new_v4()));
     session.set_client_id(&client_id);
 
-    // Step 1: Try to validate existing token
     let mut data: Option<AccountLoginResponse> = None;
     if session.session_data.contains_key("session_token") {
         tracing::debug!("Checking session token validity");
@@ -72,7 +76,6 @@ pub async fn authenticate(
         }
     }
 
-    // Step 2: If no valid token, do SRP auth
     if data.is_none() {
         let password = password_provider()
             .ok_or_else(|| AuthError::FailedLogin("Password provider returned no data".into()))?;
@@ -89,14 +92,12 @@ pub async fn authenticate(
         )
         .await?;
 
-        // Step 3: Authenticate with the session token obtained from SRP
         let account_data = twofa::authenticate_with_token(&mut session, &endpoints).await?;
         data = Some(account_data);
     }
 
     let data = data.ok_or_else(|| anyhow::anyhow!("Authentication produced no account data"))?;
 
-    // Step 4: Check if 2FA is required
     let requires_2fa = check_requires_2fa(&data);
     if requires_2fa {
         tracing::info!("Two-factor authentication is required");
@@ -106,10 +107,8 @@ pub async fn authenticate(
             return Err(AuthError::TwoFactorFailed("2FA verification failed".into()).into());
         }
 
-        // Trust the session
         twofa::trust_session(&mut session, &endpoints, &client_id, domain).await?;
-
-        // Re-authenticate with token after 2FA
+        // Re-authenticate to get fresh account data with 2FA-elevated privileges
         let account_data = twofa::authenticate_with_token(&mut session, &endpoints).await?;
 
         tracing::info!("Authentication completed successfully");
@@ -123,14 +122,15 @@ pub async fn authenticate(
     Ok(AuthResult { session, data })
 }
 
-/// Check if 2FA is required based on the account data response.
+/// Apple's HSA2 (two-step verification v2) requires all three conditions:
+/// the account uses HSAv2, the browser isn't trusted yet, and the account
+/// has a device capable of receiving verification codes.
 fn check_requires_2fa(data: &AccountLoginResponse) -> bool {
     let (hsa_version, has_qualifying_device) = match &data.ds_info {
         Some(ds) => (ds.hsa_version, ds.has_i_cloud_qualifying_device),
         None => (0, false),
     };
 
-    // requires_2fa: hsaVersion == 2, challenge required or not trusted, and has qualifying device
     hsa_version == 2
         && (data.hsa_challenge_required || !data.hsa_trusted_browser)
         && has_qualifying_device

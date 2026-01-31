@@ -9,7 +9,8 @@ use reqwest::{Client, Response};
 use serde_json::Value;
 use tokio::fs;
 
-/// Maps HTTP response headers to session data keys.
+/// Apple's auth APIs return session state in custom HTTP headers.
+/// We capture these after every request to maintain session continuity.
 const HEADER_DATA: &[(&str, &str)] = &[
     ("X-Apple-ID-Account-Country", "account_country"),
     ("X-Apple-ID-Session-Id", "session_id"),
@@ -32,7 +33,8 @@ pub fn sanitize_username(username: &str) -> String {
         .collect()
 }
 
-/// HTTP session wrapper that persists cookies and session data to disk.
+/// HTTP session wrapper that persists cookies and session data to disk,
+/// allowing authentication to survive across process restarts.
 #[allow(dead_code)]
 pub struct Session {
     client: Client,
@@ -56,22 +58,18 @@ impl Session {
         let cookie_dir = cookie_dir.to_path_buf();
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
 
-        // Ensure cookie directory exists
         fs::create_dir_all(&cookie_dir).await
             .with_context(|| format!("Failed to create cookie directory: {}", cookie_dir.display()))?;
 
-        // Load cookie jar from file
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
 
         let cookiejar_path = cookie_dir.join(&sanitized);
         if cookiejar_path.exists() {
             match fs::read_to_string(&cookiejar_path).await {
                 Ok(contents) => {
-                    // Parse LWP cookie jar format or simple cookie lines
                     for line in contents.lines() {
                         let trimmed = line.trim();
                         if trimmed.starts_with('#') || trimmed.is_empty() || trimmed.starts_with("Set-Cookie3:") {
-                            // Skip comments, empty lines, LWP header
                             continue;
                         }
                         // Try to parse as "url\tcookie_header" pairs we save
@@ -89,7 +87,7 @@ impl Session {
             }
         }
 
-        // Build default headers
+        // Origin/Referer headers are required by Apple's CORS checks
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
             ORIGIN,
@@ -107,7 +105,6 @@ impl Session {
             .timeout(timeout)
             .build()?;
 
-        // Load session data from file
         let session_path = cookie_dir.join(format!("{}.session", sanitized));
         let session_data = if session_path.exists() {
             match fs::read_to_string(&session_path).await {
@@ -214,7 +211,8 @@ impl Session {
         Ok(response)
     }
 
-    /// Extract tracked headers from the response into session_data, then persist.
+    /// Extract Apple session headers from every response and persist to disk.
+    /// This must run after every request because Apple may rotate tokens at any time.
     async fn extract_and_save(&mut self, response: &Response) -> Result<()> {
         let headers = response.headers();
         for &(header_name, session_key) in HEADER_DATA {
@@ -226,22 +224,21 @@ impl Session {
             }
         }
 
-        // Save session data to JSON file
         let session_path = self.session_path();
         let json = serde_json::to_string_pretty(&self.session_data)?;
         fs::write(&session_path, json).await
             .with_context(|| format!("Failed to write session data to {}", session_path.display()))?;
         #[cfg(unix)]
         {
+            // Session files contain auth tokens — restrict to owner-only
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
             std::fs::set_permissions(&session_path, perms)?;
         }
         tracing::debug!("Saved session data to file");
 
-        // Save cookies — we store them as url\tcookie lines for simplicity
-        // Note: reqwest::cookie::Jar doesn't expose iteration, so we capture
-        // Set-Cookie headers from the response and append them to our file.
+        // reqwest::cookie::Jar doesn't expose iteration, so we persist
+        // Set-Cookie headers ourselves in a simple "url\tcookie" format.
         let cookiejar_path = self.cookiejar_path();
         let url_str = response.url().to_string();
         let mut cookie_lines: Vec<String> = if cookiejar_path.exists() {
@@ -256,9 +253,8 @@ impl Session {
 
         for cookie_header in headers.get_all("set-cookie") {
             if let Ok(val) = cookie_header.to_str() {
-                // Extract cookie name for deduplication
                 let new_name = val.split('=').next().unwrap_or("");
-                // Remove old entries with same cookie name from same URL
+                // Deduplicate: remove stale entries for the same cookie name + URL
                 cookie_lines.retain(|line| {
                     if let Some((line_url, line_cookie)) = line.split_once('\t') {
                         if line_url == url_str {
@@ -279,7 +275,6 @@ impl Session {
             let perms = std::fs::Permissions::from_mode(0o600);
             std::fs::set_permissions(&cookiejar_path, perms)?;
         }
-        tracing::debug!("Cookies saved to {}", cookiejar_path.display());
 
         Ok(())
     }

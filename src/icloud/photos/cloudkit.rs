@@ -38,7 +38,8 @@ pub struct BatchQueryResponse {
     pub batch: Vec<QueryResponse>,
 }
 
-/// A CloudKit record with typed metadata and dynamic fields.
+/// A CloudKit record. Fields are kept as dynamic JSON because Apple's schema
+/// varies by record type and changes without notice.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {

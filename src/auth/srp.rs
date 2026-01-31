@@ -12,7 +12,7 @@ use super::endpoints::Endpoints;
 use super::session::Session;
 use crate::auth::error::AuthError;
 
-/// Apple's widget key used for OAuth headers.
+/// Apple's public OAuth widget key — embedded in icloud.com's JavaScript.
 const APPLE_WIDGET_KEY: &str =
     "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
 
@@ -31,7 +31,9 @@ const N_HEX: &str = concat!(
 );
 const G_VAL: u32 = 2;
 
-/// Derive the password bytes using Apple's custom SRP password derivation.
+/// Apple's SRP uses PBKDF2 over a SHA-256 hash of the password, not the
+/// raw password. The `s2k_fo` protocol variant hex-encodes the hash first,
+/// while `s2k` uses raw bytes — both are PBKDF2'd with the server-provided salt.
 fn derive_apple_password(
     password: &str,
     protocol: &str,
@@ -52,8 +54,8 @@ fn derive_apple_password(
     key
 }
 
-/// Compute x = H(salt | H(":" | password_key)) — Apple's no-username-in-x variant.
-/// The colon separator is retained even though the username is empty.
+/// Apple's SRP omits the username from the x computation (unlike standard SRP),
+/// but retains the colon separator. See Python's `no_username_in_x()` flag.
 fn compute_x(salt: &[u8], password_key: &[u8]) -> BigUint {
     let mut inner_hasher = Sha256::new();
     inner_hasher.update(b":");
@@ -204,7 +206,6 @@ pub async fn authenticate_srp(
         .ok_or_else(|| anyhow::anyhow!("Failed to parse SRP prime"))?;
     let g = BigUint::from(G_VAL);
 
-    // Step 1: Generate random private key and public ephemeral A
     let mut a_bytes = vec![0u8; 32];
     rand::thread_rng().fill(&mut a_bytes[..]);
     let a_private = BigUint::from_bytes_be(&a_bytes);
@@ -230,7 +231,6 @@ pub async fn authenticate_srp(
 
     tracing::debug!("Initiating SRP authentication for {}", apple_id);
 
-    // POST /signin/init
     let init_url = format!("{}/signin/init", endpoints.auth);
     let response = session
         .post(&init_url, Some(init_body.to_string()), Some(init_headers))
@@ -248,7 +248,6 @@ pub async fn authenticate_srp(
     let body: super::responses::SrpInitResponse = response.json().await
         .context("Failed to parse SRP init response as JSON")?;
 
-    // Step 2: Parse server response
     let iterations = u32::try_from(body.iteration)
         .context("SRP iteration count exceeds u32")?;
 
@@ -256,10 +255,8 @@ pub async fn authenticate_srp(
     let b_pub_bytes = BASE64.decode(&body.b).context("Failed to decode SRP public key")?;
     let b_pub = BigUint::from_bytes_be(&b_pub_bytes);
 
-    // Step 3: Derive password key using Apple's method
     let password_key = derive_apple_password(password, &body.protocol, &salt, iterations);
 
-    // Step 4: Compute SRP values using Apple's no-username-in-x variant
     tracing::debug!("SRP protocol: {}, iterations: {}", body.protocol, iterations);
     tracing::debug!("SRP salt ({} bytes): {}", salt.len(), BASE64.encode(&salt));
     tracing::debug!("SRP password_key: {}", BASE64.encode(&password_key));
@@ -279,10 +276,9 @@ pub async fn authenticate_srp(
         return Err(AuthError::FailedLogin("SRP: B mod N is zero, aborting".into()).into());
     }
 
-    // S = (B - k * g^x) ^ (a + u * x) mod N
     let v = g.modpow(&x, &n);
     let kv = (&k * &v) % &n;
-    // Handle potential underflow: if B < kv, add N
+    // BigUint can't go negative, so add N to prevent underflow when B < kv
     let base = if b_pub >= kv {
         &b_pub - &kv
     } else {
@@ -291,10 +287,7 @@ pub async fn authenticate_srp(
     let exp = &a_private + &u * &x;
     let s = base.modpow(&exp, &n);
 
-    // K = H(S)
     let key = Sha256::digest(s.to_bytes_be());
-
-    // M1 = H(H(N) XOR H(g) | H(I) | salt | A | B | K)
     let m1 = compute_m1(&n, &g, apple_id.as_bytes(), &salt, &a_pub, &b_pub, &key);
     let m2 = compute_m2(&a_pub, &m1, &key);
 
@@ -306,7 +299,6 @@ pub async fn authenticate_srp(
     tracing::debug!("SRP M1: {}", m1_b64);
     tracing::debug!("SRP M2: {}", m2_b64);
 
-    // Build trust tokens
     let trust_tokens: Vec<String> = session
         .session_data
         .get("trust_token")
@@ -323,10 +315,8 @@ pub async fn authenticate_srp(
         "trustTokens": trust_tokens,
     });
 
-    // Rebuild headers with updated scnt/session_id from init response
+    // Rebuild headers — init response may have rotated scnt/session_id
     let complete_headers = get_auth_headers(domain, client_id, &session.session_data, Some(build_overrides()))?;
-
-    // POST /signin/complete
     let complete_url = format!("{}/signin/complete?isRememberMeEnabled=true", endpoints.auth);
     let response = session
         .post(&complete_url, Some(complete_body.to_string()), Some(complete_headers))
@@ -334,6 +324,7 @@ pub async fn authenticate_srp(
 
     let status = response.status();
     if status.as_u16() == 409 {
+        // 409 is Apple's signal that credentials are valid but 2FA is needed
         tracing::debug!("SRP complete returned 409: two-factor authentication required");
         return Ok(());
     } else if status.as_u16() == 412 {

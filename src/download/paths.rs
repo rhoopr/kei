@@ -18,9 +18,8 @@ pub fn local_download_path(
         return directory.join(&clean);
     }
 
-    // Expand strftime-like placeholders. Supports both the Python-style
-    // `{:%Y}` syntax (from the original icloudpd) and the plain `%Y` syntax
-    // (more intuitive for CLI users).
+    // Support both Python icloudpd's `{:%Y}` syntax and plain `%Y` for
+    // backwards compatibility with existing user configurations.
     let year = format!("{:04}", created_date.year());
     let month = format!("{:02}", created_date.month());
     let day = format!("{:02}", created_date.day());

@@ -1,6 +1,10 @@
+//! Photos service — fetches albums, assets, and download URLs from iCloud's
+//! CloudKit-based photos backend. Mirrors the Python `PhotosService` class.
+
 mod album;
 mod asset;
 pub mod cloudkit;
+pub mod error;
 mod library;
 pub mod queries;
 pub mod session;
@@ -94,7 +98,7 @@ impl PhotosService {
             let libs = self.fetch_libraries("private").await?;
             self.private_libraries = Some(libs);
         }
-        Ok(self.private_libraries.as_ref().unwrap())
+        Ok(self.private_libraries.as_ref().expect("just initialized above"))
     }
 
     /// Fetch shared libraries (lazily, first call triggers the HTTP request).
@@ -105,7 +109,7 @@ impl PhotosService {
             let libs = self.fetch_libraries("shared").await?;
             self.shared_libraries = Some(libs);
         }
-        Ok(self.shared_libraries.as_ref().unwrap())
+        Ok(self.shared_libraries.as_ref().expect("just initialized above"))
     }
 
     async fn fetch_libraries(&self, library_type: &str) -> anyhow::Result<HashMap<String, PhotoLibrary>> {
@@ -113,10 +117,13 @@ impl PhotosService {
         let service_endpoint = self.get_service_endpoint(library_type);
         let url = format!("{service_endpoint}/zones/list");
 
-        let response = self
-            .session
-            .post(&url, "{}", &[("Content-type", "text/plain")])
-            .await?;
+        let response = session::retry_post(
+            self.session.as_ref(),
+            &url,
+            "{}",
+            &[("Content-type", "text/plain")],
+        )
+        .await?;
 
         let zone_list: cloudkit::ZoneListResponse = serde_json::from_value(response)?;
 

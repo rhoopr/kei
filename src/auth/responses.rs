@@ -1,18 +1,20 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Response from `/signin/init` (SRP handshake).
+/// Server's half of the SRP handshake — contains the salt, public ephemeral B,
+/// iteration count, and protocol variant needed to compute the shared secret.
 #[derive(Debug, Deserialize)]
 pub struct SrpInitResponse {
     pub salt: String,
     pub b: String,
-    /// The `c` field has variable structure — kept as opaque JSON.
+    /// Opaque challenge token echoed back in `/signin/complete`.
     pub c: Value,
     pub iteration: u64,
     pub protocol: String,
 }
 
-/// Response from `/accountLogin` and `/validate`.
+/// Response from `/accountLogin` and `/validate` — carries the account's
+/// service URLs, 2FA state, and directory service info.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLoginResponse {

@@ -10,6 +10,7 @@ use super::session::PhotosSession;
 use super::smart_folders::smart_folders;
 use crate::icloud::error::ICloudError;
 
+// Apple's sentinel folder IDs — these are containers, not real albums.
 const ROOT_FOLDER: &str = "----Root-Folder----";
 const PROJECT_ROOT_FOLDER: &str = "----Project-Root-Folder----";
 
@@ -40,10 +41,14 @@ impl PhotoLibrary {
             "zoneID": &zone_id,
         });
 
-        let response = session
-            .post(&url, &body.to_string(), &[("Content-type", "text/plain")])
-            .await
-            .map_err(|e| ICloudError::Connection(e.to_string()))?;
+        let response = super::session::retry_post(
+            session.as_ref(),
+            &url,
+            &body.to_string(),
+            &[("Content-type", "text/plain")],
+        )
+        .await
+        .map_err(|e| ICloudError::Connection(e.to_string()))?;
 
         let query: super::cloudkit::QueryResponse = serde_json::from_value(response)
             .map_err(|e| ICloudError::Connection(e.to_string()))?;
@@ -69,7 +74,6 @@ impl PhotoLibrary {
     pub async fn albums(&self) -> anyhow::Result<HashMap<String, PhotoAlbum>> {
         let mut albums = HashMap::new();
 
-        // Smart folders
         for (name, def) in smart_folders() {
             albums.insert(
                 name.to_string(),
@@ -87,7 +91,7 @@ impl PhotoLibrary {
             );
         }
 
-        // User albums (skip for shared libraries)
+        // Shared libraries use a different album structure — skip user albums
         if self.library_type != "shared" {
             let folders = self.fetch_folders().await?;
             for folder in &folders {
@@ -97,7 +101,6 @@ impl PhotoLibrary {
                 {
                     continue;
                 }
-                // Skip deleted folders
                 if folder.fields["isDeleted"]["value"]
                     .as_bool()
                     .unwrap_or(false)
@@ -188,17 +191,20 @@ impl PhotoLibrary {
             "query": {"recordType": "CPLAlbumByPositionLive"},
             "zoneID": &self.zone_id,
         });
-        let response = self
-            .session
-            .post(&url, &body.to_string(), &[("Content-type", "text/plain")])
-            .await?;
+        let response = super::session::retry_post(
+            self.session.as_ref(),
+            &url,
+            &body.to_string(),
+            &[("Content-type", "text/plain")],
+        )
+        .await?;
 
         let query: super::cloudkit::QueryResponse = serde_json::from_value(response)?;
         Ok(query.records)
     }
 
-    /// Clone the session as a boxed trait object, preserving the original
-    /// client's cookies and configuration.
+    /// Clone the session for a new album/library — preserves the shared
+    /// cookie jar via the Arc inside reqwest::Client.
     fn clone_session(&self) -> Box<dyn PhotosSession> {
         self.session.clone_box()
     }

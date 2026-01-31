@@ -5,6 +5,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use tracing::warn;
 
+use super::error::PhotosError;
 use super::queries::{item_type_from_str, PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
 use super::types::{AssetItemType, AssetVersion, AssetVersionSize};
 
@@ -20,7 +21,9 @@ pub struct PhotoAsset {
     original_size: u64,
 }
 
-/// Decode filename from a `filenameEnc` field value.
+/// Decode filename from CloudKit's `filenameEnc` field.
+/// Apple uses either plain STRING or base64-encoded ENCRYPTED_BYTES depending
+/// on the user's iCloud configuration.
 fn decode_filename(fields: &Value) -> Option<String> {
     let enc = &fields["filenameEnc"];
     if enc.is_null() {
@@ -43,14 +46,16 @@ fn decode_filename(fields: &Value) -> Option<String> {
     }
 }
 
-/// Determine item type from fields, with filename fallback.
+/// Determine asset type from the `itemType` CloudKit field, falling back to
+/// file extension heuristics. Defaults to Movie for unknown types because
+/// videos are more likely to have non-standard UTI strings.
 fn resolve_item_type(fields: &Value, filename: &Option<String>) -> Option<AssetItemType> {
     if let Some(s) = fields["itemType"]["value"].as_str() {
         if let Some(t) = item_type_from_str(s) {
             return Some(t);
         }
     }
-    if let Some(ref name) = filename {
+    if let Some(name) = &filename {
         let lower = name.to_lowercase();
         if lower.ends_with(".heic")
             || lower.ends_with(".png")
@@ -132,7 +137,7 @@ impl PhotoAsset {
     pub fn asset_date(&self) -> DateTime<Utc> {
         self.asset_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
-            .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+            .unwrap_or(DateTime::UNIX_EPOCH)
     }
 
     pub fn created(&self) -> DateTime<Utc> {
@@ -143,7 +148,7 @@ impl PhotoAsset {
     pub fn added_date(&self) -> DateTime<Utc> {
         self.added_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
-            .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+            .unwrap_or(DateTime::UNIX_EPOCH)
     }
 
     pub fn item_type(&self) -> Option<AssetItemType> {
@@ -151,7 +156,10 @@ impl PhotoAsset {
     }
 
     /// Build the map of available versions for this asset.
-    pub fn versions(&self) -> HashMap<AssetVersionSize, AssetVersion> {
+    ///
+    /// Returns an error if a version entry is missing required `downloadURL`
+    /// or `fileChecksum` fields.
+    pub fn versions(&self) -> Result<HashMap<AssetVersionSize, AssetVersion>, PhotosError> {
         let lookup = if self.item_type() == Some(AssetItemType::Movie) {
             VIDEO_VERSION_LOOKUP
         } else {
@@ -163,7 +171,8 @@ impl PhotoAsset {
             let res_field = format!("{prefix}Res");
             let type_field = format!("{prefix}FileType");
 
-            // Try asset record first, then master record.
+            // Asset record has adjusted versions; master has originals.
+            // Prefer asset record so adjusted/edited versions take priority.
             let fields = if !self.asset_fields[&res_field].is_null() {
                 &self.asset_fields
             } else if !self.master_fields[&res_field].is_null() {
@@ -180,17 +189,17 @@ impl PhotoAsset {
             let size = res_entry["size"].as_u64().unwrap_or(0);
             let url = res_entry["downloadURL"]
                 .as_str()
-                .unwrap_or_else(|| {
-                    tracing::warn!("Missing expected field: {prefix}Res.downloadURL");
-                    ""
-                })
+                .ok_or_else(|| PhotosError::MissingField {
+                    asset_id: self.record_name.clone(),
+                    field: format!("{prefix}Res.downloadURL"),
+                })?
                 .to_string();
             let checksum = res_entry["fileChecksum"]
                 .as_str()
-                .unwrap_or_else(|| {
-                    tracing::warn!("Missing expected field: {prefix}Res.fileChecksum");
-                    ""
-                })
+                .ok_or_else(|| PhotosError::MissingField {
+                    asset_id: self.record_name.clone(),
+                    field: format!("{prefix}Res.fileChecksum"),
+                })?
                 .to_string();
 
             let asset_type = fields[&type_field]["value"]
@@ -211,7 +220,7 @@ impl PhotoAsset {
                 },
             );
         }
-        versions
+        Ok(versions)
     }
 }
 
@@ -320,7 +329,7 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        let versions = asset.versions();
+        let versions = asset.versions().unwrap();
         assert!(versions.contains_key(&AssetVersionSize::Original));
         let orig = &versions[&AssetVersionSize::Original];
         assert_eq!(orig.url, "https://example.com/orig");
@@ -331,6 +340,40 @@ mod tests {
     fn test_display() {
         let asset = make_asset(json!({"recordName": "XYZ"}), json!({}));
         assert_eq!(format!("{}", asset), "<PhotoAsset: id=XYZ>");
+    }
+
+    #[test]
+    fn test_versions_missing_download_url() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        let err = asset.versions().unwrap_err();
+        assert!(err.to_string().contains("downloadURL"));
+    }
+
+    #[test]
+    fn test_versions_missing_checksum() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        let err = asset.versions().unwrap_err();
+        assert!(err.to_string().contains("fileChecksum"));
     }
 
     #[test]
@@ -362,7 +405,7 @@ mod tests {
         assert_eq!(asset.item_type(), Some(AssetItemType::Image));
         assert_eq!(asset.size(), 5000);
         assert_eq!(asset.asset_date().format("%Y-%m-%d").to_string(), "2025-01-15");
-        let versions = asset.versions();
+        let versions = asset.versions().unwrap();
         assert!(versions.contains_key(&AssetVersionSize::Original));
     }
 
