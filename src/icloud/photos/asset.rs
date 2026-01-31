@@ -241,6 +241,12 @@ impl PhotoAsset {
     }
 }
 
+impl std::fmt::Display for PhotoAsset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<PhotoAsset: id={}>", self.id())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,11 +531,5 @@ mod tests {
         assert_eq!(asset.id(), "M2");
         assert_eq!(asset.filename(), None);
         assert_eq!(asset.size(), 0);
-    }
-}
-
-impl std::fmt::Display for PhotoAsset {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<PhotoAsset: id={}>", self.id())
     }
 }

@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn test_disk_not_retryable() {
-        let e = DownloadError::Disk(std::io::Error::new(std::io::ErrorKind::Other, "disk full"));
+        let e = DownloadError::Disk(std::io::Error::other("disk full"));
         assert!(!e.is_retryable());
     }
 

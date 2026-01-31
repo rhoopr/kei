@@ -297,6 +297,18 @@ impl PhotoAlbum {
     }
 }
 
+impl std::fmt::Display for PhotoAlbum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
+impl std::fmt::Debug for PhotoAlbum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<PhotoAlbum: '{}'>", self.name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,17 +396,5 @@ mod tests {
         let album = make_album(200, None, zone.clone());
         let q = album.list_query(0, "ASCENDING");
         assert_eq!(q["zoneID"], zone);
-    }
-}
-
-impl std::fmt::Display for PhotoAlbum {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.name)
-    }
-}
-
-impl std::fmt::Debug for PhotoAlbum {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<PhotoAlbum: '{}'>", self.name)
     }
 }
