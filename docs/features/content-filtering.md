@@ -37,6 +37,18 @@ Use [`--album`](../cli/album.md) to download from specific albums instead of the
 
 Use [`--recent N`](../cli/recent.md) to download only the N most recently added photos. This limits API pagination — enumeration stops after N assets are found.
 
+## RAW Alignment
+
+Use [`--align-raw`](../cli/align-raw.md) to control how RAW+JPEG pairs are handled. When a photo has both an Original and Alternative version, this policy can swap them so the RAW file becomes the primary download (or vice versa).
+
+| Policy | Effect |
+|--------|--------|
+| `as-is` | No change (default) |
+| `original` | RAW Alternative becomes the Original |
+| `alternative` | RAW Original becomes the Alternative |
+
+The swap is applied before the size lookup, so `--size original` combined with `--align-raw original` downloads the RAW file.
+
 ## Filter Ordering
 
 Filters are applied in the download pipeline after assets are enumerated from the API:

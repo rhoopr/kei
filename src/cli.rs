@@ -234,4 +234,33 @@ mod tests {
         let cli = parse(&args);
         assert_eq!(cli.retry_delay, 15);
     }
+
+    #[test]
+    fn test_align_raw_default_as_is() {
+        let cli = parse(&base_args());
+        assert!(matches!(cli.align_raw, RawTreatmentPolicy::AsIs));
+    }
+
+    #[test]
+    fn test_align_raw_accepts_original() {
+        let mut args = base_args();
+        args.extend(["--align-raw", "original"]);
+        let cli = parse(&args);
+        assert!(matches!(cli.align_raw, RawTreatmentPolicy::AsOriginal));
+    }
+
+    #[test]
+    fn test_align_raw_accepts_alternative() {
+        let mut args = base_args();
+        args.extend(["--align-raw", "alternative"]);
+        let cli = parse(&args);
+        assert!(matches!(cli.align_raw, RawTreatmentPolicy::AsAlternative));
+    }
+
+    #[test]
+    fn test_align_raw_rejects_invalid() {
+        let mut args = base_args();
+        args.extend(["--align-raw", "bogus"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
 }

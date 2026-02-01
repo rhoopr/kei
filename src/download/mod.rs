@@ -8,6 +8,7 @@ pub mod exif;
 pub mod file;
 pub mod paths;
 
+use std::collections::HashMap;
 use std::fs::FileTimes;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,9 +21,10 @@ use std::path::PathBuf;
 
 use futures_util::stream::{self, StreamExt};
 
+use crate::icloud::photos::types::AssetVersion;
 use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum};
 use crate::retry::RetryConfig;
-use crate::types::LivePhotoMovFilenamePolicy;
+use crate::types::{LivePhotoMovFilenamePolicy, RawTreatmentPolicy};
 
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
@@ -43,6 +45,7 @@ pub struct DownloadConfig {
     pub(crate) skip_live_photos: bool,
     pub(crate) live_photo_size: AssetVersionSize,
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
+    pub(crate) align_raw: RawTreatmentPolicy,
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
@@ -77,6 +80,45 @@ async fn build_download_tasks(
     }
 
     Ok(tasks)
+}
+
+/// Apply the RAW alignment policy by swapping Original and Alternative versions
+/// when appropriate, matching Python's `apply_raw_policy()`.
+fn apply_raw_policy(
+    versions: &HashMap<AssetVersionSize, AssetVersion>,
+    policy: RawTreatmentPolicy,
+) -> HashMap<AssetVersionSize, AssetVersion> {
+    if policy == RawTreatmentPolicy::AsIs {
+        return versions.clone();
+    }
+
+    let alt = match versions.get(&AssetVersionSize::Alternative) {
+        Some(v) => v,
+        None => return versions.clone(),
+    };
+
+    let should_swap = match policy {
+        RawTreatmentPolicy::AsOriginal => alt.asset_type.contains("raw"),
+        RawTreatmentPolicy::AsAlternative => versions
+            .get(&AssetVersionSize::Original)
+            .is_some_and(|v| v.asset_type.contains("raw")),
+        RawTreatmentPolicy::AsIs => false,
+    };
+
+    if !should_swap {
+        return versions.clone();
+    }
+
+    let mut result = versions.clone();
+    let orig = result.remove(&AssetVersionSize::Original);
+    let alt = result.remove(&AssetVersionSize::Alternative);
+    if let Some(o) = orig {
+        result.insert(AssetVersionSize::Alternative, o);
+    }
+    if let Some(a) = alt {
+        result.insert(AssetVersionSize::Original, a);
+    }
+    result
 }
 
 /// Apply content filters (type, date range) and local existence check,
@@ -121,10 +163,11 @@ fn filter_asset_to_tasks(
         filename,
     );
 
+    let versions = apply_raw_policy(asset.versions(), config.align_raw);
     let mut tasks = Vec::new();
 
     if !download_path.exists() {
-        if let Some(version) = asset.versions().get(&config.size) {
+        if let Some(version) = versions.get(&config.size) {
             tasks.push(DownloadTask {
                 url: version.url.clone(),
                 download_path: download_path.clone(),
@@ -136,7 +179,7 @@ fn filter_asset_to_tasks(
 
     // Live photo MOV companion — only for images
     if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
-        if let Some(live_version) = asset.versions().get(&config.live_photo_size) {
+        if let Some(live_version) = versions.get(&config.live_photo_size) {
             let mov_filename = match config.live_photo_mov_filename_policy {
                 LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(filename),
                 LivePhotoMovFilenamePolicy::Original => {
@@ -503,6 +546,7 @@ mod tests {
             skip_live_photos: false,
             live_photo_size: AssetVersionSize::LiveOriginal,
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
+            align_raw: RawTreatmentPolicy::AsIs,
         }
     }
 
@@ -790,5 +834,124 @@ mod tests {
         let p = PathBuf::from("/tmp/claude/download_tests/nonexistent_file.txt");
         let _ = fs::remove_file(&p); // ensure absent
         assert!(set_file_mtime(&p, 0).is_err());
+    }
+
+    fn photo_asset_with_original_and_alternative(orig_type: &str, alt_type: &str) -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "RAW_TEST", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "orig_ck"
+                }},
+                "resOriginalFileType": {"value": orig_type},
+                "resOriginalAltRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/alt",
+                    "fileChecksum": "alt_ck"
+                }},
+                "resOriginalAltFileType": {"value": alt_type}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_raw_policy_as_is_no_swap() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsIs);
+        assert_eq!(
+            versions[&AssetVersionSize::Original].url,
+            "https://example.com/orig"
+        );
+        assert_eq!(
+            versions[&AssetVersionSize::Alternative].url,
+            "https://example.com/alt"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_as_original_swaps_when_alt_is_raw() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsOriginal);
+        // Alternative was RAW → swap: Original now has alt URL
+        assert_eq!(
+            versions[&AssetVersionSize::Original].url,
+            "https://example.com/alt"
+        );
+        assert_eq!(
+            versions[&AssetVersionSize::Alternative].url,
+            "https://example.com/orig"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_as_alternative_swaps_when_orig_is_raw() {
+        let asset = photo_asset_with_original_and_alternative("com.adobe.raw-image", "public.jpeg");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsAlternative);
+        // Original was RAW → swap: Alternative now has orig URL
+        assert_eq!(
+            versions[&AssetVersionSize::Original].url,
+            "https://example.com/alt"
+        );
+        assert_eq!(
+            versions[&AssetVersionSize::Alternative].url,
+            "https://example.com/orig"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_as_original_no_swap_when_alt_not_raw() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsOriginal);
+        assert_eq!(
+            versions[&AssetVersionSize::Original].url,
+            "https://example.com/orig"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_as_alternative_no_swap_when_orig_not_raw() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsAlternative);
+        assert_eq!(
+            versions[&AssetVersionSize::Original].url,
+            "https://example.com/orig"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_no_alternative_no_swap() {
+        let asset = photo_asset_with_version(); // only has Original
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsOriginal);
+        assert_eq!(
+            versions[&AssetVersionSize::Original].url,
+            "https://example.com/orig"
+        );
+        assert!(!versions.contains_key(&AssetVersionSize::Alternative));
+    }
+
+    #[test]
+    fn test_filter_asset_uses_raw_policy_swap() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let mut config = test_config();
+        config.align_raw = RawTreatmentPolicy::AsOriginal;
+        // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].url, "https://example.com/alt");
+        assert_eq!(tasks[0].checksum, "alt_ck");
+    }
+
+    #[test]
+    fn test_filter_asset_as_is_downloads_original() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let config = test_config(); // align_raw defaults to AsIs
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].url, "https://example.com/orig");
+        assert_eq!(tasks[0].checksum, "orig_ck");
     }
 }

@@ -41,6 +41,7 @@ Use `--dry-run` to preview what would be downloaded. Use `--auth-only` to verify
 |------|-------------|
 | [`-d, --directory`](cli/directory.md) | Local download directory |
 | [`--size`](cli/size.md) | Image size variant |
+| [`--align-raw`](cli/align-raw.md) | RAW/JPEG alignment policy |
 | [`--live-photo-size`](cli/live-photo-size.md) | Live photo MOV size variant |
 | [`--live-photo-mov-filename-policy`](cli/live-photo-mov-filename-policy.md) | MOV filename style |
 | [`--folder-structure`](cli/folder-structure.md) | Date-based folder template |

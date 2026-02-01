@@ -32,13 +32,13 @@ A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud
 - Log level control (`--log-level`), `--skip-photos`, `--domain cn`, `--cookie-directory`
 - Live photo size and MOV filename policy selection
 - EXIF DateTimeOriginal write (`--set-exif-datetime`)
+- RAW file alignment (`--align-raw` with `as-is`, `original`, `alternative` modes)
 
 </details>
 
 <details open>
 <summary><strong>Now</strong></summary>
 
-- RAW file alignment (`--align-raw` with `as-is`, `as-original`, `as-alternative` modes)
 - Robust session persistence (mid-sync re-auth, token expiry tracking, lock files)
 - Progress bar integration (`--no-progress-bar` to disable)
 - Incremental sync with SQLite state tracking and CloudKit sync tokens
@@ -112,6 +112,7 @@ icloudpd-rs --username my@email.address --directory /photos
 | `--list-libraries` | List available libraries | |
 | `-a, --album` | Album(s) to download (repeatable) | all |
 | `--size` | Image size: original, medium, thumb, adjusted, alternative | `original` |
+| `--align-raw` | RAW alignment: as-is, original, alternative | `as-is` |
 | `--live-photo-size` | Live photo MOV size: original, medium, thumb | `original` |
 | `--live-photo-mov-filename-policy` | MOV naming: suffix, original | `suffix` |
 | `--recent N` | Download only the N most recent photos | |
