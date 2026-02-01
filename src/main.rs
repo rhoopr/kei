@@ -40,10 +40,7 @@ async fn main() -> anyhow::Result<()> {
         let pw = config.password;
         move || -> Option<String> {
             pw.clone().or_else(|| {
-                // Note: This closure is called from an async context but
-                // rpassword blocks. The caller should wrap in spawn_blocking
-                // if needed. For CLI startup this is acceptable.
-                rpassword::prompt_password("iCloud Password: ").ok()
+                tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
             })
         }
     };
