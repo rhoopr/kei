@@ -245,11 +245,9 @@ async fn stream_and_download(
     let set_exif = config.set_exif_datetime;
     let concurrency = config.concurrent_downloads;
 
-    // Stream assets → filter → download with bounded concurrency.
     let mut downloaded = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
 
-    // Use buffer_unordered on a stream of download futures.
     let task_stream = combined
         .filter_map(|result| async {
             match result {
@@ -302,7 +300,6 @@ pub async fn download_photos(
 ) -> Result<()> {
     let started = Instant::now();
 
-    // ── Phase 1: Stream and download ───────────────────────────────
     let (downloaded, failed_tasks) = stream_and_download(client, albums, config).await?;
 
     if downloaded == 0 && failed_tasks.is_empty() {
@@ -479,7 +476,6 @@ async fn download_single_task(
     Ok(())
 }
 
-/// Format a Duration as a human-readable string like "1h 23m 45s" or "42s".
 fn format_duration(d: Duration) -> String {
     let total_secs = d.as_secs();
     let hours = total_secs / 3600;
@@ -943,6 +939,29 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].url, "https://example.com/alt");
         assert_eq!(tasks[0].checksum, "alt_ck");
+    }
+
+    #[test]
+    fn test_format_duration_seconds_only() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(1)), "1s");
+        assert_eq!(format_duration(Duration::from_secs(42)), "42s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn test_format_duration_minutes_and_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(format_duration(Duration::from_secs(61)), "1m 01s");
+        assert_eq!(format_duration(Duration::from_secs(754)), "12m 34s");
+        assert_eq!(format_duration(Duration::from_secs(3599)), "59m 59s");
+    }
+
+    #[test]
+    fn test_format_duration_hours() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 00m 00s");
+        assert_eq!(format_duration(Duration::from_secs(5025)), "1h 23m 45s");
+        assert_eq!(format_duration(Duration::from_secs(86399)), "23h 59m 59s");
     }
 
     #[test]

@@ -209,8 +209,8 @@ async fn main() -> anyhow::Result<()> {
                 let mut session = shared_session.write().await;
                 if !auth::validate_session(&mut session, config.domain.as_str()).await? {
                     tracing::warn!("Session expired, re-authenticating...");
-                    session.release_lock()?; // release file lock before re-auth
-                    drop(session); // release write lock before re-auth
+                    session.release_lock()?;
+                    drop(session);
                     let new_auth = auth::authenticate(
                         &config.cookie_directory,
                         &config.username,

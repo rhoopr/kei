@@ -65,7 +65,7 @@ where
     C: Fn(&E) -> RetryAction,
     E: std::fmt::Display,
 {
-    let total_attempts = config.max_retries + 1; // 1 initial + max_retries retries
+    let total_attempts = config.max_retries + 1;
     let mut last_err: Option<E> = None;
 
     for attempt in 0..total_attempts {

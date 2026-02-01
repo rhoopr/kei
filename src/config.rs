@@ -1,8 +1,10 @@
-use crate::types::*;
+use crate::types::{
+    Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
+    RawTreatmentPolicy, VersionSize,
+};
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 use std::path::PathBuf;
 
-#[allow(dead_code)] // fields used by main.rs; some CLI flags not yet wired
 pub struct Config {
     pub username: String,
     pub password: Option<String>,
@@ -11,6 +13,7 @@ pub struct Config {
     pub list_albums: bool,
     pub list_libraries: bool,
     pub albums: Vec<String>,
+    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub library: String,
     pub size: VersionSize,
     pub live_photo_size: LivePhotoSize,
@@ -19,21 +22,27 @@ pub struct Config {
     pub skip_videos: bool,
     pub skip_photos: bool,
     pub skip_live_photos: bool,
+    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub force_size: bool,
     pub folder_structure: String,
     pub set_exif_datetime: bool,
     pub dry_run: bool,
     pub domain: Domain,
     pub watch_with_interval: Option<u64>,
+    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub log_level: LogLevel,
+    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub no_progress_bar: bool,
     pub cookie_directory: PathBuf,
+    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub keep_unicode_in_filenames: bool,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub align_raw: RawTreatmentPolicy,
+    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub file_match_policy: FileMatchPolicy,
     pub skip_created_before: Option<DateTime<Local>>,
     pub skip_created_after: Option<DateTime<Local>>,
+    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub only_print_filenames: bool,
     pub max_retries: u32,
     pub retry_delay_secs: u64,

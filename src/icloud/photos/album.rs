@@ -10,6 +10,7 @@ use super::queries::{encode_params, DESIRED_KEYS_VALUES};
 use super::session::PhotosSession;
 
 /// Configuration for creating a `PhotoAlbum`, bundling all non-session fields.
+#[derive(Debug)]
 pub struct PhotoAlbumConfig {
     pub params: HashMap<String, Value>,
     pub service_endpoint: String,
@@ -21,7 +22,6 @@ pub struct PhotoAlbumConfig {
     pub zone_id: Value,
 }
 
-#[allow(dead_code)] // fields accessed via pub(crate) by sibling modules
 pub struct PhotoAlbum {
     pub(crate) name: String,
     params: HashMap<String, Value>,
@@ -47,11 +47,6 @@ impl PhotoAlbum {
             page_size: config.page_size,
             zone_id: config.zone_id,
         }
-    }
-
-    #[allow(dead_code)] // public API for album display and future features
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     /// Return total item count for this album via `HyperionIndexCountLookup`.

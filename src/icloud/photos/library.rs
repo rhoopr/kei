@@ -156,7 +156,6 @@ impl PhotoLibrary {
         Ok(albums)
     }
 
-    /// Convenience: return a `PhotoAlbum` representing the whole collection.
     pub fn all(&self) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
@@ -173,7 +172,6 @@ impl PhotoLibrary {
         )
     }
 
-    /// Convenience: return a `PhotoAlbum` for recently deleted items.
     #[allow(dead_code)] // for --auto-delete feature
     pub fn recently_deleted(&self) -> PhotoAlbum {
         PhotoAlbum::new(
@@ -190,8 +188,6 @@ impl PhotoLibrary {
             self.clone_session(),
         )
     }
-
-    // -- internal helpers --
 
     async fn fetch_folders(&self) -> anyhow::Result<Vec<super::cloudkit::Record>> {
         let url = format!(

@@ -124,7 +124,6 @@ async fn attempt_download(
 ) -> Result<(), DownloadError> {
     let path_str = download_path.display().to_string();
 
-    // Check for existing .part file we can resume from.
     let resume_state = resume_hash_state(part_path).await;
     let resume_offset = resume_state.as_ref().map(|(_, len)| *len).unwrap_or(0);
 
@@ -151,7 +150,6 @@ async fn attempt_download(
             resume_state.expect("resume_state must be Some when status=206 and resume_offset>0");
         (hasher, len, false)
     } else if response.status().is_success() {
-        // Server sent full content — start fresh.
         (Sha256::new(), 0u64, true)
     } else {
         return Err(DownloadError::HttpStatus {

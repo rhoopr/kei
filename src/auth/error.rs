@@ -2,7 +2,6 @@ use thiserror::Error;
 
 /// Custom error types for iCloud authentication.
 #[derive(Debug, Error)]
-#[allow(dead_code)] // not all variants constructed yet; part of public error API
 pub enum AuthError {
     #[error("Failed login: {0}")]
     FailedLogin(String),
@@ -16,9 +15,11 @@ pub enum AuthError {
     #[error("Two-factor authentication failed: {0}")]
     TwoFactorFailed(String),
 
+    #[allow(dead_code)] // for future iCloud service-not-activated error handling
     #[error("Service not activated: {0}")]
     ServiceNotActivated(String),
 
+    #[allow(dead_code)] // for future connection error classification
     #[error("Connection error: {0}")]
     ConnectionError(String),
 

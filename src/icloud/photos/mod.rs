@@ -48,7 +48,6 @@ impl PhotosService {
         let service_endpoint = Self::build_service_endpoint(&service_root, "private");
         let zone_id = json!({"zoneName": "PrimarySync"});
 
-        // Clone the session for the primary library.
         let lib_session = session.clone_box();
 
         let primary_library = PhotoLibrary::new(
@@ -79,12 +78,10 @@ impl PhotosService {
         format!("{service_root}/database/1/com.apple.photos.cloud/production/{library_type}")
     }
 
-    /// Return albums from the primary library.
     pub async fn albums(&self) -> anyhow::Result<HashMap<String, PhotoAlbum>> {
         self.primary_library.albums().await
     }
 
-    /// Return a `PhotoAlbum` for the entire primary collection.
     pub fn all(&self) -> PhotoAlbum {
         self.primary_library.all()
     }

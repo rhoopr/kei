@@ -4,6 +4,7 @@
 
 use serde_json::{json, Value};
 
+#[derive(Debug)]
 pub struct FolderDef {
     pub obj_type: &'static str,
     pub list_type: &'static str,

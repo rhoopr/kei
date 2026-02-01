@@ -71,10 +71,6 @@ pub struct Session {
     cookie_dir: PathBuf,
     sanitized_username: String,
     home_endpoint: String,
-    /// Stored so the configured timeout survives with the session, even though
-    /// it is baked into the `Client` at construction and not read again.
-    #[allow(dead_code)]
-    timeout: Duration,
     /// Exclusive file lock preventing concurrent instances for the same account.
     /// The advisory lock is held for the lifetime of the Session via the open
     /// file descriptor; released automatically when the File is dropped.
@@ -139,7 +135,6 @@ impl Session {
                             }
                         }
                     } else {
-                        // Legacy tab-separated format
                         for line in contents.lines() {
                             let trimmed = line.trim();
                             if trimmed.starts_with('#')
@@ -233,17 +228,14 @@ impl Session {
             cookie_dir,
             sanitized_username: sanitized,
             home_endpoint: home_endpoint.to_string(),
-            timeout,
             lock_file,
         })
     }
 
-    /// Path for cookie jar persistence.
     pub fn cookiejar_path(&self) -> PathBuf {
         self.cookie_dir.join(&self.sanitized_username)
     }
 
-    /// Path for session data JSON file.
     pub fn session_path(&self) -> PathBuf {
         self.cookie_dir
             .join(format!("{}.session", self.sanitized_username))
@@ -257,18 +249,15 @@ impl Session {
             .context("Failed to release session lock file")
     }
 
-    /// Get the client_id from session data, or None.
     pub fn client_id(&self) -> Option<&String> {
         self.session_data.get("client_id")
     }
 
-    /// Set client_id in session data.
     pub fn set_client_id(&mut self, client_id: &str) {
         self.session_data
             .insert("client_id".to_string(), client_id.to_string());
     }
 
-    /// Send a POST request, extract headers, save session data and cookies.
     pub async fn post(
         &mut self,
         url: &str,
@@ -289,7 +278,6 @@ impl Session {
         Ok(response)
     }
 
-    /// Send a GET request, extract headers, save session data and cookies.
     pub async fn get(&mut self, url: &str, extra_headers: Option<HeaderMap>) -> Result<Response> {
         let mut builder = self.client.get(url);
         if let Some(h) = extra_headers {
@@ -393,7 +381,6 @@ impl Session {
         Ok(())
     }
 
-    /// Get the home endpoint URL.
     pub fn home_endpoint(&self) -> &str {
         &self.home_endpoint
     }

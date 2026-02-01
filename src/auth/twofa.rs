@@ -166,7 +166,7 @@ pub async fn authenticate_with_token(
 
     // Apple redirects China mainland accounts to .com.cn — users must
     // re-run with --domain cn to use the correct regional endpoint.
-    if let Some(ref domain_to_use) = body.domain_to_use {
+    if let Some(domain_to_use) = &body.domain_to_use {
         return Err(anyhow::anyhow!(
             "Apple insists on using {} for your request. Please use --domain parameter",
             domain_to_use
