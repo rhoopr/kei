@@ -210,7 +210,7 @@ impl PhotoAsset {
         self.filename.as_deref()
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // public API for size-based dedup
     pub fn size(&self) -> u64 {
         self.original_size
     }
@@ -225,7 +225,7 @@ impl PhotoAsset {
         self.asset_date()
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // public API for incremental sync
     pub fn added_date(&self) -> DateTime<Utc> {
         self.added_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())

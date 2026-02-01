@@ -1,5 +1,7 @@
 # Behavioral Changes from Python icloud-photos-downloader
 
+- **Robust session persistence** — lock files prevent concurrent instances from corrupting session state; trust token age is tracked with warnings before expiry; expired cookies are pruned on load; session is validated and refreshed in watch mode between cycles; `SharedSession` (Arc+RwLock) threads through the download layer for future mid-sync re-auth
+
 - **Streaming download pipeline** — downloads begin as soon as the first API page returns, rather than enumerating the entire library before starting. For large libraries (100k+ photos) this eliminates multi-minute startup delays
 - **Compact asset representation** — `PhotoAsset` no longer retains raw JSON blobs; version URLs are pre-parsed at construction, reducing per-asset memory
 - `--recent N` stops fetching from the API after N photos instead of enumerating the entire library first

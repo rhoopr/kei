@@ -97,8 +97,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let http_client = auth_result.session.http_client();
-    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(http_client.clone());
+    let shared_session: auth::SharedSession =
+        std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
+    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
 
     tracing::info!("Initializing photos service...");
     let photos_service =
@@ -182,11 +183,48 @@ async fn main() -> anyhow::Result<()> {
     };
 
     loop {
-        download::download_photos(&http_client, &albums, &download_config).await?;
+        // Check trust token expiry before each download cycle
+        {
+            let session = shared_session.read().await;
+            if session.trust_token_expires_soon(7) {
+                if let Some(age) = session.trust_token_age() {
+                    tracing::warn!(
+                        "Trust token is {} days old and may expire soon — \
+                         consider re-authenticating with --auth-only",
+                        age.as_secs() / 86400
+                    );
+                }
+            }
+        }
+
+        let client = shared_session.read().await.http_client();
+        download::download_photos(&client, &albums, &download_config).await?;
 
         if let Some(interval) = config.watch_with_interval {
             tracing::info!("Waiting {} seconds...", interval);
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+
+            // Validate session before next cycle; re-authenticate if expired
+            {
+                let mut session = shared_session.write().await;
+                if !auth::validate_session(&mut session, config.domain.as_str()).await? {
+                    tracing::warn!("Session expired, re-authenticating...");
+                    session.release_lock()?; // release file lock before re-auth
+                    drop(session); // release write lock before re-auth
+                    let new_auth = auth::authenticate(
+                        &config.cookie_directory,
+                        &config.username,
+                        &password_provider,
+                        config.domain.as_str(),
+                        None,
+                        None,
+                    )
+                    .await?;
+                    let mut session = shared_session.write().await;
+                    *session = new_auth.session;
+                    tracing::info!("Re-authentication successful");
+                }
+            }
         } else {
             break;
         }

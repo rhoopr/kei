@@ -1,7 +1,7 @@
 use crate::types::VersionSize;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // fields accessed via pub by download engine
 pub struct AssetVersion {
     pub size: u64,
     pub url: String,

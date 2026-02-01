@@ -161,7 +161,7 @@ impl PhotoLibrary {
     }
 
     /// Convenience: return a `PhotoAlbum` for recently deleted items.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // for --auto-delete feature
     pub fn recently_deleted(&self) -> PhotoAlbum {
         PhotoAlbum::new(
             self.params.clone(),

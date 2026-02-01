@@ -19,6 +19,7 @@ use self::endpoints::Endpoints;
 use self::error::AuthError;
 pub use self::responses::AccountLoginResponse;
 use self::session::Session;
+pub use self::session::SharedSession;
 
 /// Result of a successful authentication, including the account data payload.
 pub struct AuthResult {
@@ -124,6 +125,16 @@ pub async fn authenticate(
 
     tracing::info!("Authentication completed successfully");
     Ok(AuthResult { session, data })
+}
+
+/// Check if the current session token is still valid by calling Apple's
+/// validate endpoint. Returns `true` if valid, `false` if expired.
+pub async fn validate_session(session: &mut Session, domain: &str) -> Result<bool> {
+    let endpoints = Endpoints::for_domain(domain)?;
+    match twofa::validate_token(session, &endpoints).await {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Apple's HSA2 (two-step verification v2) requires all three conditions:

@@ -29,12 +29,21 @@ After successful authentication, session cookies and trust tokens are saved to t
 
 Files are written with `0o600` permissions. Corrupt files are detected and recovered automatically.
 
-### Current Limitations
+### Lock Files
 
-- Trust token expiry is not tracked — sessions may fail silently after expiry
-- No proactive session refresh during long syncs
-- No lock file to prevent concurrent instances from corrupting state
-- Session is not accessible from the download layer, so mid-sync re-auth is not possible
+A per-account lock file (`{cookie_dir}/{username}.lock`) prevents multiple icloudpd-rs instances from running against the same account simultaneously. The lock is advisory and held for the lifetime of the process. If a second instance is started for the same account, it fails immediately with an error message.
+
+### Trust Token Expiry Warnings
+
+Apple trust tokens last approximately 30 days. icloudpd-rs tracks when the trust token was last updated and logs a warning when it's within 7 days of expected expiry. This gives you time to re-authenticate (`--auth-only`) before the token lapses.
+
+### Proactive Session Refresh
+
+In watch mode (`--watch-with-interval`), the session is validated before each download cycle. If the session has expired, icloudpd-rs automatically re-authenticates using the stored password or prompts for credentials. This prevents long-running syncs from failing silently due to expired sessions.
+
+### Cookie Expiry
+
+Cookies with past expiry dates are pruned on load and skipped when persisting new Set-Cookie headers. This prevents stale cookies from accumulating in the cookie jar.
 
 ## Related Flags
 

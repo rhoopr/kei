@@ -7,7 +7,7 @@ use crate::retry::{self, RetryAction, RetryConfig};
 /// Abstracted as a trait so album/library code can be tested with stubs
 /// without hitting the real iCloud API.
 #[async_trait::async_trait]
-#[allow(dead_code)]
+#[allow(dead_code)] // get() not called yet; part of public session API for future use
 pub trait PhotosSession: Send + Sync {
     async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value>;
 
@@ -38,6 +38,26 @@ impl PhotosSession for reqwest::Client {
         }
         let resp = builder.send().await?;
         Ok(resp)
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+// SharedSession delegates to the inner Session's http_client(). The read lock
+// is held only long enough to clone the Arc-backed Client, then released before
+// the actual HTTP call so other tasks can read concurrently.
+#[async_trait::async_trait]
+impl PhotosSession for crate::auth::SharedSession {
+    async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value> {
+        let client = self.read().await.http_client();
+        PhotosSession::post(&client, url, body, headers).await
+    }
+
+    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response> {
+        let client = self.read().await.http_client();
+        PhotosSession::get(&client, url, headers).await
     }
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -82,6 +102,31 @@ mod tests {
     fn test_classify_non_reqwest_error_aborts() {
         let e: anyhow::Error = anyhow::anyhow!("some other error");
         assert_eq!(classify_api_error(&e), RetryAction::Abort);
+    }
+
+    #[tokio::test]
+    async fn test_shared_session_implements_photos_session() {
+        // Verify that SharedSession can be used as a PhotosSession trait object
+        let dir = std::path::PathBuf::from("/tmp/claude/shared_session_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = crate::auth::session::Session::new(
+            &dir,
+            "test@shared.com",
+            "https://example.com",
+            None,
+        )
+        .await
+        .unwrap();
+        let shared: crate::auth::SharedSession =
+            std::sync::Arc::new(tokio::sync::RwLock::new(session));
+
+        // Verify it can be boxed as a PhotosSession
+        let boxed: Box<dyn PhotosSession> = Box::new(shared.clone());
+        let _cloned = boxed.clone_box();
+
+        // Verify clone_box produces a valid trait object
+        let _cloned2 = _cloned.clone_box();
     }
 
     #[test]

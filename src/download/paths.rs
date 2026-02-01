@@ -57,7 +57,7 @@ pub fn clean_filename(filename: &str) -> String {
 
 /// Remove non-ASCII (unicode) characters from a filename, keeping only
 /// ASCII characters.
-#[allow(dead_code)]
+#[allow(dead_code)] // for --keep-unicode-in-filenames (parsed but not yet wired)
 pub fn remove_unicode_chars(filename: &str) -> String {
     filename.chars().filter(|c| c.is_ascii()).collect()
 }
@@ -66,7 +66,7 @@ pub fn remove_unicode_chars(filename: &str) -> String {
 ///
 /// For example, `"photo.jpg"` with size `12345` becomes `"photo-12345.jpg"`.
 /// If the filename has no extension, the suffix is simply appended.
-#[allow(dead_code)]
+#[allow(dead_code)] // for --file-match-policy (parsed but not yet wired)
 pub fn add_dedup_suffix(path: &str, size: u64) -> String {
     match path.rfind('.') {
         Some(dot_pos) => {

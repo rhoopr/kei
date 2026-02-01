@@ -2,7 +2,7 @@ use crate::types::*;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 use std::path::PathBuf;
 
-#[allow(dead_code)]
+#[allow(dead_code)] // fields used by main.rs; some CLI flags not yet wired
 pub struct Config {
     pub username: String,
     pub password: Option<String>,

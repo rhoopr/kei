@@ -9,7 +9,7 @@ use super::asset::PhotoAsset;
 use super::queries::{encode_params, DESIRED_KEYS_VALUES};
 use super::session::PhotosSession;
 
-#[allow(dead_code)]
+#[allow(dead_code)] // fields accessed via pub(crate) by sibling modules
 pub struct PhotoAlbum {
     pub(crate) name: String,
     params: HashMap<String, Value>,
@@ -48,13 +48,13 @@ impl PhotoAlbum {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // public API for album display and future features
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Return total item count for this album via `HyperionIndexCountLookup`.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // public API for progress bar integration
     pub async fn len(&self) -> anyhow::Result<u64> {
         let url = format!(
             "{}/internal/records/query/batch?{}",
