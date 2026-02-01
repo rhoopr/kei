@@ -45,7 +45,7 @@ rpassword = "7"
 
 # EXIF
 kamadak-exif = "0.5"
-little_exif = "0.4"
+little_exif = "0.6"
 
 # Error handling
 anyhow = "1"

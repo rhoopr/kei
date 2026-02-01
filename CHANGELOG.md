@@ -48,7 +48,7 @@
 ### Organization
 - Date-based folder structures (`--folder-structure`)
 - Filename sanitization and deduplication policies
-- EXIF DateTimeOriginal read/write and file modification time sync
+- EXIF date tag read/write (`DateTime`, `DateTimeOriginal`, `DateTimeDigitized`) and file modification time sync
 
 ### Operational
 - Dry-run, auth-only, list albums/libraries modes

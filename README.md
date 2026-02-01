@@ -65,7 +65,7 @@ icloudpd-rs --username my@email.address --directory /photos
 | `--skip-created-before` | Skip assets before ISO date or interval (e.g., `2025-01-02` or `20d`) | |
 | `--skip-created-after` | Skip assets after ISO date or interval | |
 | `--folder-structure` | Folder template for organizing downloads | `%Y/%m/%d` |
-| `--set-exif-datetime` | Write DateTimeOriginal EXIF tag if missing | |
+| `--set-exif-datetime` | Write EXIF date tags if missing (DateTime, DateTimeOriginal, DateTimeDigitized) | |
 | `--domain` | iCloud domain: com, cn | `com` |
 | `--cookie-directory` | Session/cookie storage path | `~/.icloudpd-rs` |
 | `--no-progress-bar` | Disable the progress bar | |
