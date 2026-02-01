@@ -15,8 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use futures_util::stream::{self, StreamExt};
@@ -46,6 +48,7 @@ pub struct DownloadConfig {
     pub(crate) live_photo_size: AssetVersionSize,
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub(crate) align_raw: RawTreatmentPolicy,
+    pub(crate) no_progress_bar: bool,
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
@@ -206,6 +209,26 @@ fn filter_asset_to_tasks(
     tasks
 }
 
+/// Create a progress bar with a consistent template.
+///
+/// Returns `ProgressBar::hidden()` when the user passed `--no-progress-bar` or
+/// stdout is not a TTY (e.g. piped output, cron jobs) — this prevents output
+/// corruption and honours the user's preference.
+fn create_progress_bar(no_progress_bar: bool, total: u64) -> ProgressBar {
+    if no_progress_bar || !std::io::stdout().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+        )
+        .expect("valid template")
+        .progress_chars("=> "),
+    );
+    pb
+}
+
 /// Streaming download pipeline — merges per-album streams and pipes assets
 /// directly into the download loop as they arrive from the API.
 ///
@@ -218,6 +241,23 @@ async fn stream_and_download(
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
 ) -> Result<(usize, Vec<DownloadTask>)> {
+    // Lightweight count-only API query (HyperionIndexCountLookup) — separate
+    // from the page-by-page photo fetch, used to size the progress bar.
+    // When --recent is set, cap to that limit since the stream will stop early.
+    //
+    // Note: the total reflects *photo count*, but each photo may produce
+    // multiple download tasks (e.g. live photo MOV companions, RAW
+    // alternates). The bar may therefore overshoot pos > len slightly.
+    // This matches Python icloudpd's tqdm behavior and keeps the ETA useful.
+    let mut total: u64 = 0;
+    for album in albums {
+        total += album.len().await.unwrap_or(0);
+    }
+    if let Some(recent) = config.recent {
+        total = total.min(recent as u64);
+    }
+    let pb = create_progress_bar(config.no_progress_bar, total);
+
     // select_all interleaves across albums so no single large album
     // starves others; each stream's background task provides prefetch.
     let album_streams: Vec<_> = albums
@@ -248,12 +288,15 @@ async fn stream_and_download(
     let mut downloaded = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
 
+    let pb_ref = &pb;
     let task_stream = combined
-        .filter_map(|result| async {
+        .filter_map(|result| async move {
             match result {
                 Ok(asset) => Some(filter_asset_to_tasks(&asset, config)),
                 Err(e) => {
-                    tracing::error!("Error fetching asset: {}", e);
+                    // indicatif needs `suspend` to coordinate stderr/stdout writes
+                    // with the progress bar redraw, preventing garbled output.
+                    pb_ref.suspend(|| tracing::error!("Error fetching asset: {}", e));
                     None
                 }
             }
@@ -273,15 +316,26 @@ async fn stream_and_download(
     tokio::pin!(download_stream);
 
     while let Some((task, result)) = download_stream.next().await {
+        let filename = task
+            .download_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("")
+            .to_string();
+        pb.set_message(filename);
         match result {
             Ok(()) => downloaded += 1,
             Err(e) => {
-                tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
+                pb.suspend(|| {
+                    tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
+                });
                 failed.push(task);
             }
         }
+        pb.inc(1);
     }
 
+    pb.finish_and_clear();
     Ok((downloaded, failed))
 }
 
@@ -351,6 +405,7 @@ pub async fn download_photos(
         &config.retry,
         config.set_exif_datetime,
         cleanup_concurrency,
+        config.no_progress_bar,
     )
     .await;
 
@@ -384,7 +439,9 @@ async fn run_download_pass(
     retry_config: &RetryConfig,
     set_exif: bool,
     concurrency: usize,
+    no_progress_bar: bool,
 ) -> Vec<DownloadTask> {
+    let pb = create_progress_bar(no_progress_bar, tasks.len() as u64);
     let client = client.clone();
 
     let results: Vec<(DownloadTask, Result<()>)> = stream::iter(tasks)
@@ -399,17 +456,24 @@ async fn run_download_pass(
         .collect()
         .await;
 
-    results
+    let failed: Vec<DownloadTask> = results
         .into_iter()
         .filter_map(|(task, result)| {
             if let Err(e) = &result {
-                tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
+                pb.suspend(|| {
+                    tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
+                });
+                pb.inc(1);
                 Some(task)
             } else {
+                pb.inc(1);
                 None
             }
         })
-        .collect()
+        .collect();
+
+    pb.finish_and_clear();
+    failed
 }
 
 /// Download a single task, handling mtime and EXIF stamping on success.
@@ -443,7 +507,7 @@ async fn download_single_task(
         );
     }
 
-    tracing::info!("Downloaded {}", task.download_path.display());
+    tracing::debug!("Downloaded {}", task.download_path.display());
 
     if set_exif {
         let ext = task
@@ -543,6 +607,7 @@ mod tests {
             live_photo_size: AssetVersionSize::LiveOriginal,
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             align_raw: RawTreatmentPolicy::AsIs,
+            no_progress_bar: true,
         }
     }
 
@@ -962,6 +1027,27 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(3600)), "1h 00m 00s");
         assert_eq!(format_duration(Duration::from_secs(5025)), "1h 23m 45s");
         assert_eq!(format_duration(Duration::from_secs(86399)), "23h 59m 59s");
+    }
+
+    #[test]
+    fn test_create_progress_bar_hidden_when_disabled() {
+        let pb = create_progress_bar(true, 100);
+        assert!(pb.is_hidden());
+    }
+
+    #[test]
+    fn test_create_progress_bar_with_total() {
+        // When not disabled, the bar should have the correct length.
+        // In CI/test environments stdout may not be a TTY, so the bar
+        // may be hidden — we test both branches.
+        let pb = create_progress_bar(false, 42);
+        if std::io::stdout().is_terminal() {
+            assert!(!pb.is_hidden());
+            assert_eq!(pb.length(), Some(42));
+        } else {
+            // Non-TTY: bar is hidden regardless of the flag
+            assert!(pb.is_hidden());
+        }
     }
 
     #[test]

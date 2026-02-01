@@ -31,7 +31,6 @@ pub struct Config {
     pub watch_with_interval: Option<u64>,
     #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub log_level: LogLevel,
-    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub no_progress_bar: bool,
     pub cookie_directory: PathBuf,
     #[allow(dead_code)] // CLI flag parsed but not yet wired

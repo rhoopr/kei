@@ -50,7 +50,6 @@ impl PhotoAlbum {
     }
 
     /// Return total item count for this album via `HyperionIndexCountLookup`.
-    #[allow(dead_code)] // public API for progress bar integration
     pub async fn len(&self) -> anyhow::Result<u64> {
         let url = format!(
             "{}/internal/records/query/batch?{}",
@@ -202,6 +201,7 @@ impl PhotoAlbum {
                     break;
                 }
 
+                let mut limit_reached = false;
                 for master in master_records {
                     if let Some(asset_rec) = asset_records.remove(&master.record_name) {
                         let asset = PhotoAsset::from_records(master, asset_rec);
@@ -210,16 +210,20 @@ impl PhotoAlbum {
                             return;
                         }
                         total_sent += 1;
+                        if let Some(n) = limit {
+                            if total_sent >= n as u64 {
+                                limit_reached = true;
+                                break;
+                            }
+                        }
                     }
                     offset += 1;
                 }
 
                 tracing::info!("  fetched {} photos so far...", total_sent);
 
-                if let Some(n) = limit {
-                    if total_sent >= n as u64 {
-                        break;
-                    }
+                if limit_reached {
+                    break;
                 }
             }
         });

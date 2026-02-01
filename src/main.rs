@@ -180,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         live_photo_size: config.live_photo_size.to_asset_version_size(),
         live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
         align_raw: config.align_raw,
+        no_progress_bar: config.no_progress_bar,
     };
 
     loop {

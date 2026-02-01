@@ -140,6 +140,9 @@ async fn attempt_download(
     let response = request.send().await.map_err(|e| DownloadError::Http {
         source: e,
         path: path_str.clone(),
+        status: 0,
+        content_length: None,
+        bytes_written: 0,
     })?;
 
     let status = response.status().as_u16();
@@ -171,17 +174,13 @@ async fn attempt_download(
 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| {
-                tracing::warn!(
-                "Body decode error for {} (status={}, content_length={:?}, bytes_so_far={}): {}",
-                path_str, status, content_length, bytes_written, e
-            );
-                DownloadError::Http {
-                    source: e,
-                    path: path_str.clone(),
-                }
-            })?;
+        let chunk = chunk.map_err(|e| DownloadError::Http {
+            source: e,
+            path: path_str.clone(),
+            status,
+            content_length,
+            bytes_written,
+        })?;
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
         bytes_written += chunk.len() as u64;

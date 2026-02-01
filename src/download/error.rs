@@ -16,10 +16,13 @@ pub enum DownloadError {
     #[error("Disk error: {0}")]
     Disk(#[from] std::io::Error),
 
-    #[error("HTTP error downloading {path}: {source}")]
+    #[error("HTTP error downloading {path} (status={status}, content_length={content_length:?}, bytes_so_far={bytes_written}): {source}")]
     Http {
         source: reqwest::Error,
         path: String,
+        status: u16,
+        content_length: Option<u64>,
+        bytes_written: u64,
     },
 
     #[error(transparent)]
@@ -131,6 +134,9 @@ mod tests {
         let e = DownloadError::Http {
             source: err,
             path: "x".into(),
+            status: 0,
+            content_length: None,
+            bytes_written: 0,
         };
         assert!(e.is_retryable());
     }
