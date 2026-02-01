@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use rand::Rng as _;
+use rand::Rng;
 
 /// Retry decision returned by the error classifier callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +38,7 @@ impl RetryConfig {
             .saturating_mul(1u64.checked_shl(retry).unwrap_or(u64::MAX));
         let capped = exp_delay.min(self.max_delay_secs);
         let jitter = if self.base_delay_secs > 0 {
-            rand::thread_rng().gen_range(0..self.base_delay_secs)
+            rand::rng().random_range(0..self.base_delay_secs)
         } else {
             0
         };

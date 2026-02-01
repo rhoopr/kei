@@ -82,11 +82,7 @@ pub async fn download_file(
     )
     .await;
 
-    result.map_err(|e| DownloadError::RetriesExhausted {
-        retries: retry_config.max_retries,
-        path: download_path.display().to_string(),
-        last_error: e.to_string(),
-    })
+    result
 }
 
 /// Rebuild SHA256 hash state by re-reading an existing .part file.
@@ -98,9 +94,19 @@ async fn resume_hash_state(part_path: &Path) -> Option<(Sha256, u64)> {
         return None;
     }
 
-    let data = fs::read(part_path).await.ok()?;
+    let file = fs::File::open(part_path).await.ok()?;
+    let mut reader = tokio::io::BufReader::new(file);
     let mut hasher = Sha256::new();
-    hasher.update(&data);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+            .await
+            .ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     Some((hasher, existing_len))
 }
 

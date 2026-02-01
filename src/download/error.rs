@@ -13,13 +13,6 @@ pub enum DownloadError {
     #[error("Checksum mismatch for {0}")]
     ChecksumMismatch(String),
 
-    #[error("Download failed after {retries} retries: {path} (last error: {last_error})")]
-    RetriesExhausted {
-        retries: u32,
-        path: String,
-        last_error: String,
-    },
-
     #[error("Disk error: {0}")]
     Disk(#[from] std::io::Error),
 
@@ -43,7 +36,6 @@ impl DownloadError {
             DownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
             DownloadError::ChecksumMismatch(_) => true,
             DownloadError::Http { .. } => true,
-            DownloadError::RetriesExhausted { .. } => false,
             DownloadError::Disk(_) => false,
             DownloadError::Other(_) => false,
         }
@@ -141,15 +133,5 @@ mod tests {
             path: "x".into(),
         };
         assert!(e.is_retryable());
-    }
-
-    #[test]
-    fn test_retries_exhausted_not_retryable() {
-        let e = DownloadError::RetriesExhausted {
-            retries: 5,
-            path: "x".into(),
-            last_error: "err".into(),
-        };
-        assert!(!e.is_retryable());
     }
 }

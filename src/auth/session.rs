@@ -159,6 +159,16 @@ impl Session {
                             }
                         }
                     }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Err(e) = std::fs::set_permissions(
+                            &cookiejar_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        ) {
+                            tracing::warn!("Could not set cookie file permissions: {}", e);
+                        }
+                    }
                     tracing::debug!("Read cookies from {}", cookiejar_path.display());
                 }
                 Err(e) => {

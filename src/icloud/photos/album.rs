@@ -292,6 +292,8 @@ impl PhotoAlbum {
                 "filterBy": filter_by,
                 "recordType": list_type,
             },
+            // CloudKit returns interleaved CPLMaster + CPLAsset records,
+            // so 2 * page_size fetches page_size paired records.
             "resultsLimit": page_size * 2,
             "desiredKeys": desired_keys,
             "zoneID": zone_id,

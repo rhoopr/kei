@@ -225,7 +225,7 @@ pub async fn authenticate_srp(
     let g = BigUint::from(G_VAL);
 
     let mut a_bytes = vec![0u8; 32];
-    rand::thread_rng().fill(&mut a_bytes[..]);
+    rand::rng().fill(&mut a_bytes[..]);
     let a_private = BigUint::from_bytes_be(&a_bytes);
 
     // A = g^a mod N
@@ -294,16 +294,9 @@ pub async fn authenticate_srp(
         body.protocol,
         iterations
     );
-    tracing::debug!("SRP salt ({} bytes): {}", salt.len(), BASE64.encode(&salt));
-    tracing::debug!("SRP password_key: {}", BASE64.encode(&password_key));
-
     let x = compute_x(&salt, &password_key);
     let k = compute_k(&n, &g);
     let u = compute_u(&a_pub, &b_pub, &n);
-
-    tracing::debug!("SRP x: {}", BASE64.encode(x.to_bytes_be()));
-    tracing::debug!("SRP k: {}", BASE64.encode(k.to_bytes_be()));
-    tracing::debug!("SRP u: {}", BASE64.encode(u.to_bytes_be()));
 
     if u == BigUint::ZERO {
         return Err(AuthError::FailedLogin("SRP: u is zero, aborting".into()).into());
@@ -327,13 +320,8 @@ pub async fn authenticate_srp(
     let m1 = compute_m1(&n, &g, apple_id.as_bytes(), &salt, &a_pub, &b_pub, &key);
     let m2 = compute_m2(&a_pub, &m1, &key);
 
-    tracing::debug!("SRP S: {}", BASE64.encode(s.to_bytes_be()));
-    tracing::debug!("SRP K: {}", BASE64.encode(key));
-
     let m1_b64 = BASE64.encode(&m1);
     let m2_b64 = BASE64.encode(&m2);
-    tracing::debug!("SRP M1: {}", m1_b64);
-    tracing::debug!("SRP M2: {}", m2_b64);
 
     let trust_tokens: Vec<String> = session
         .session_data

@@ -85,16 +85,16 @@ async fn build_download_tasks(
 /// Apply the RAW alignment policy by swapping Original and Alternative versions
 /// when appropriate, matching Python's `apply_raw_policy()`.
 fn apply_raw_policy(
-    mut versions: HashMap<AssetVersionSize, AssetVersion>,
+    versions: &HashMap<AssetVersionSize, AssetVersion>,
     policy: RawTreatmentPolicy,
-) -> HashMap<AssetVersionSize, AssetVersion> {
+) -> std::borrow::Cow<'_, HashMap<AssetVersionSize, AssetVersion>> {
     if policy == RawTreatmentPolicy::AsIs {
-        return versions;
+        return std::borrow::Cow::Borrowed(versions);
     }
 
     let alt = match versions.get(&AssetVersionSize::Alternative) {
         Some(v) => v,
-        None => return versions,
+        None => return std::borrow::Cow::Borrowed(versions),
     };
 
     let should_swap = match policy {
@@ -106,18 +106,19 @@ fn apply_raw_policy(
     };
 
     if !should_swap {
-        return versions;
+        return std::borrow::Cow::Borrowed(versions);
     }
 
-    let orig = versions.remove(&AssetVersionSize::Original);
-    let alt = versions.remove(&AssetVersionSize::Alternative);
+    let mut swapped = versions.clone();
+    let orig = swapped.remove(&AssetVersionSize::Original);
+    let alt = swapped.remove(&AssetVersionSize::Alternative);
     if let Some(o) = orig {
-        versions.insert(AssetVersionSize::Alternative, o);
+        swapped.insert(AssetVersionSize::Alternative, o);
     }
     if let Some(a) = alt {
-        versions.insert(AssetVersionSize::Original, a);
+        swapped.insert(AssetVersionSize::Original, a);
     }
-    versions
+    std::borrow::Cow::Owned(swapped)
 }
 
 /// Apply content filters (type, date range) and local existence check,
@@ -162,7 +163,7 @@ fn filter_asset_to_tasks(
         filename,
     );
 
-    let versions = apply_raw_policy(asset.versions().clone(), config.align_raw);
+    let versions = apply_raw_policy(asset.versions(), config.align_raw);
     let mut tasks = Vec::new();
 
     if !download_path.exists() {
@@ -346,6 +347,7 @@ pub async fn download_photos(
     let fresh_tasks = build_download_tasks(albums, config).await?;
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
+    let phase2_task_count = fresh_tasks.len();
     let remaining_failed = run_download_pass(
         client,
         fresh_tasks,
@@ -356,13 +358,15 @@ pub async fn download_photos(
     .await;
 
     let failed = remaining_failed.len();
-    let succeeded = total - failed;
+    let phase2_succeeded = phase2_task_count - failed;
+    let succeeded = downloaded + phase2_succeeded;
+    let final_total = succeeded + failed;
     tracing::info!("── Summary ──");
     tracing::info!(
         "  {} downloaded, {} failed, {} total",
         succeeded,
         failed,
-        total
+        final_total
     );
     tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
 
@@ -370,7 +374,7 @@ pub async fn download_photos(
         for task in &remaining_failed {
             tracing::error!("Download failed: {}", task.download_path.display());
         }
-        anyhow::bail!("{} of {} downloads failed", failed, total);
+        anyhow::bail!("{} of {} downloads failed", failed, final_total);
     }
 
     Ok(())
@@ -857,7 +861,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_is_no_swap() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
-        let versions = apply_raw_policy(asset.versions().clone(), RawTreatmentPolicy::AsIs);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsIs);
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
             "https://example.com/orig"
@@ -871,7 +875,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_original_swaps_when_alt_is_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
-        let versions = apply_raw_policy(asset.versions().clone(), RawTreatmentPolicy::AsOriginal);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsOriginal);
         // Alternative was RAW → swap: Original now has alt URL
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
@@ -886,8 +890,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_alternative_swaps_when_orig_is_raw() {
         let asset = photo_asset_with_original_and_alternative("com.adobe.raw-image", "public.jpeg");
-        let versions =
-            apply_raw_policy(asset.versions().clone(), RawTreatmentPolicy::AsAlternative);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsAlternative);
         // Original was RAW → swap: Alternative now has orig URL
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
@@ -902,7 +905,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_original_no_swap_when_alt_not_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
-        let versions = apply_raw_policy(asset.versions().clone(), RawTreatmentPolicy::AsOriginal);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsOriginal);
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
             "https://example.com/orig"
@@ -912,8 +915,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_alternative_no_swap_when_orig_not_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
-        let versions =
-            apply_raw_policy(asset.versions().clone(), RawTreatmentPolicy::AsAlternative);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsAlternative);
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
             "https://example.com/orig"
@@ -923,7 +925,7 @@ mod tests {
     #[test]
     fn test_raw_policy_no_alternative_no_swap() {
         let asset = photo_asset_with_version(); // only has Original
-        let versions = apply_raw_policy(asset.versions().clone(), RawTreatmentPolicy::AsOriginal);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsOriginal);
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
             "https://example.com/orig"
