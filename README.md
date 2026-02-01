@@ -15,7 +15,7 @@ A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud
 
 See [CHANGELOG.md](CHANGELOG.md) for what's already implemented.
 
-**Now** — Progress bars, incremental sync (skip already-downloaded assets across runs), graceful shutdown, and mid-sync session recovery.
+**Now** — Incremental sync (skip already-downloaded assets across runs), graceful shutdown, and mid-sync session recovery.
 
 **Next** — XMP sidecar export, shared library downloads, OS keyring integration, robust daemon mode with systemd/launchd support, and additional download controls.
 
@@ -68,6 +68,7 @@ icloudpd-rs --username my@email.address --directory /photos
 | `--set-exif-datetime` | Write DateTimeOriginal EXIF tag if missing | |
 | `--domain` | iCloud domain: com, cn | `com` |
 | `--cookie-directory` | Session/cookie storage path | `~/.icloudpd-rs` |
+| `--no-progress-bar` | Disable the progress bar | |
 | `--log-level` | Log verbosity: debug, info, error | `error` |
 | `--max-retries N` | Max retries per download (0 = no retries) | `2` |
 | `--retry-delay N` | Initial retry delay in seconds | `5` |

@@ -14,6 +14,7 @@
 - Streaming download pipeline with configurable concurrent downloads (`--threads-num`)
 - Resumable partial downloads via HTTP Range requests with SHA256 verification
 - Retry with exponential backoff and transient/permanent error classification (`--max-retries`, `--retry-delay`)
+- Progress bar tracking download progress, auto-hidden in non-TTY environments (`--no-progress-bar`)
 - Two-phase cleanup pass — retries failures with fresh CDN URLs
 - Low memory streaming for large libraries (100k+ photos)
 
