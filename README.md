@@ -17,21 +17,15 @@ A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud
 > [!IMPORTANT]
 > Early development. Core authentication (SRP, 2FA) and photo download are functional, but several features are still in progress. Expect breaking changes.
 
-## Project Roadmap
+See [CHANGELOG.md](CHANGELOG.md) for what's already implemented and how it differs from the Python version.
 
-See [CHANGELOG.md](CHANGELOG.md) for what's already implemented.
+## Roadmap
 
 **Now** — Incremental sync (skip already-downloaded assets across runs) and mid-sync session recovery.
 
 **Next** — XMP sidecar export, shared library downloads, OS keyring integration, robust daemon mode with systemd/launchd support, and additional download controls.
 
 **Later** — iCloud lifecycle management (auto-delete, delete-after-download), notifications, headless MFA for Docker, and multi-account support.
-
-
-
-# Documentation
-
-See the [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) for detailed CLI flag reference and feature guides.
 
 ## Build
 
@@ -46,6 +40,8 @@ Binary: `target/release/icloudpd-rs`
 ```sh
 icloudpd-rs --username my@email.address --directory /photos
 ```
+
+If `--password` is not provided, you will be prompted securely at the terminal. You can also set the `ICLOUD_PASSWORD` environment variable.
 
 > [!TIP]
 > Use `--dry-run` to preview what would be downloaded without writing any files. Use `--auth-only` to verify your credentials without starting a download.
@@ -64,10 +60,8 @@ icloudpd-rs --username my@email.address --directory /photos
 | `--watch-with-interval N` | Run continuously, waiting N seconds between runs | |
 | `--dry-run` | Preview without modifying files or iCloud | |
 
-See the [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) for the full flag reference.
+See the [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) for the full flag reference and feature guides.
 
+## License
 
-
-# License
-
-MIT - see [LICENSE.md](LICENSE.md)
+MIT — see [LICENSE.md](LICENSE.md)

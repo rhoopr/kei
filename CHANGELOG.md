@@ -3,27 +3,40 @@
 ## Current (unreleased)
 
 ### Authentication
-- SRP-6a authentication with Apple's custom protocol variants
-- Two-factor authentication (trusted device code) with trust persistence
+- SRP-6a authentication with Apple's custom protocol variants (including automatic `s2k`/`s2k_fo` negotiation)
+- Two-factor authentication (trusted device code) with trust token persistence
 - Session persistence with cookie management and lock files
+- Interactive secure password prompt when `--password` is not provided
+- Automatic SRP repair flow on HTTP 412 responses
+- Domain redirect detection — if Apple indicates a region-specific domain (e.g. `.cn`), the user is prompted to re-run with `--domain`
 
 > [!IMPORTANT]
 > **Change from Python:** Lock files prevent concurrent instances from corrupting session state; expired cookies are pruned on load
 
+> [!NOTE]
+> **Change from Python:** Cookie files support both the new JSON format and the legacy Python icloudpd tab-separated format for migration
+
+> [!TIP]
+> **Change from Python:** Session and cookie files are restricted to owner-only permissions (`0600`) on Unix
+
 ### Downloads
 - Streaming download pipeline with configurable concurrent downloads (`--threads-num`)
+
+> [!IMPORTANT]
+> **Change from Python:** `--threads-num` controls actual concurrent downloads — Python deprecated this flag and always downloads sequentially
 - Resumable partial downloads via HTTP Range requests with SHA256 verification
-- Retry with exponential backoff and transient/permanent error classification (`--max-retries`, `--retry-delay`)
+- Retry with exponential backoff, jitter, and transient/permanent error classification (`--max-retries`, `--retry-delay`)
+
+> [!TIP]
+> **Change from Python:** `--max-retries` and `--retry-delay` are new flags — Python hardcodes `MAX_RETRIES = 0` with no user control
 - Progress bar tracking download progress, auto-hidden in non-TTY environments (`--no-progress-bar`)
 - Live photo MOV collision detection — when a regular video occupies the same filename, the companion MOV is saved with an asset ID suffix (e.g. `IMG_0001-ASSET_ID.MOV`)
 - Two-phase cleanup pass — retries failures with fresh CDN URLs
 - Low memory streaming for large libraries (100k+ photos)
+- Deterministic `.part` filenames derived from checksum (base32-encoded, filesystem-safe)
 
 > [!IMPORTANT]
 > **Change from Python:** Downloads begin as soon as the first API page returns, rather than enumerating the entire library before starting — eliminates multi-minute startup delays on large libraries
-
-> [!TIP]
-> **Change from Python:** `PhotoAsset` no longer retains raw JSON blobs; version URLs are pre-parsed at construction, reducing per-asset memory
 
 > [!IMPORTANT]
 > **Change from Python:** Partial `.part` files are resumed via HTTP Range; existing bytes are hashed on resume so the final SHA256 checksum covers the entire file
@@ -31,30 +44,43 @@
 > [!TIP]
 > **Change from Python:** Failed downloads get a cleanup pass that re-fetches URLs from iCloud before retrying, fixing expired CDN URL failures on large syncs
 
+> [!TIP]
+> **Change from Python:** `PhotoAsset` no longer retains raw JSON blobs; version URLs are pre-parsed at construction, reducing per-asset memory and making `versions()` infallible
+
 > [!NOTE]
-> **Change from Python:** API calls (album fetch, zone list) retry automatically on 5xx/429 errors
+> **Change from Python:** API calls (album fetch, zone list) retry automatically on 5xx/429 errors with jitter to prevent thundering herd
 
 > [!NOTE]
 > **Change from Python:** Album photo fetching runs concurrently (bounded by `--threads-num`) instead of sequentially
+
+> [!NOTE]
+> **Change from Python:** Error classification distinguishes retryable errors (5xx, 429 rate limit, checksum mismatch from truncated transfer) from permanent errors (4xx, disk errors), avoiding wasted retries
 
 ### Photos & Media
 - Photo, video, and live photo MOV downloads with size variants
 - RAW file alignment (`--align-raw`: as-is, original, alternative)
 - Live photo MOV filename policies (suffix, original)
 - Content filtering by media type, date range, album, and recency
+- Smart album support (time-lapse, videos, slo-mo, bursts, favorites)
+- Handles both plain-text and base64-encoded (`ENCRYPTED_BYTES`) filenames from CloudKit
+- Asset type detection via CloudKit `itemType` with filename extension fallback
 
 > [!TIP]
 > **Change from Python:** Live photo MOV size is independently configurable (`--live-photo-size`)
 
 ### Organization
 - Date-based folder structures (`--folder-structure`)
-- Filename sanitization and deduplication policies
+- Filename sanitization (strips `/\:*?"<>|`) and deduplication policies
 - EXIF date tag read/write (`DateTime`, `DateTimeOriginal`, `DateTimeDigitized`) and file modification time sync
+
+> [!NOTE]
+> **Change from Python:** Folder structure format accepts both Python-style `{:%Y}` and plain `%Y` strftime syntax for backwards compatibility
 
 ### Operational
 - Dry-run, auth-only, list albums/libraries modes
-- Watch mode with session validation between cycles
+- Watch mode with automatic session validation and re-authentication between cycles
 - Graceful shutdown — first Ctrl+C / SIGTERM / SIGHUP finishes in-flight downloads then exits; second signal force-exits immediately. Partial `.part` files are kept for smart resume on next run. Watch mode sleep is interruptible.
+- Library indexing readiness check before querying (waits for CloudKit indexing to finish)
 - Album and shared library enumeration
 - Log level control, domain selection (com/cn), custom cookie directory
 
@@ -63,3 +89,10 @@
 
 > [!CAUTION]
 > **Change from Python:** `--until-found` removed — will be replaced by stateful incremental sync with local database
+
+### Not Yet Wired (parsed but inactive)
+- `--force-size` — download only the requested size without fallback to original
+- `--keep-unicode-in-filenames` — preserve Unicode characters in filenames
+- `--file-match-policy` — alternative deduplication strategies (`name-size-dedup-with-suffix`, `name-id7`)
+- `--only-print-filenames` — print download paths without downloading
+- `--library` — select which library to download from (default: PrimarySync)
