@@ -189,20 +189,6 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // Check trust token expiry before each download cycle
-        {
-            let session = shared_session.read().await;
-            if session.trust_token_expires_soon(7) {
-                if let Some(age) = session.trust_token_age() {
-                    tracing::warn!(
-                        "Trust token is {} days old and may expire soon — \
-                         consider re-authenticating with --auth-only",
-                        age.as_secs() / 86400
-                    );
-                }
-            }
-        }
-
         let client = shared_session.read().await.http_client();
         download::download_photos(&client, &albums, &download_config, shutdown_token.clone())
             .await?;

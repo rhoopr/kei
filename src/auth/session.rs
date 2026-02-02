@@ -299,13 +299,6 @@ impl Session {
                 if let Ok(val_str) = val.to_str() {
                     self.session_data
                         .insert(session_key.to_string(), val_str.to_string());
-                    // Track when the trust token was last updated
-                    if session_key == "trust_token" {
-                        self.session_data.insert(
-                            "trust_token_timestamp".to_string(),
-                            chrono::Utc::now().timestamp().to_string(),
-                        );
-                    }
                 }
             }
         }
@@ -392,34 +385,6 @@ impl Session {
     pub fn http_client(&self) -> Client {
         self.client.clone()
     }
-
-    /// How long ago the trust token was last updated, if tracked.
-    pub fn trust_token_age(&self) -> Option<std::time::Duration> {
-        let ts_str = self.session_data.get("trust_token_timestamp")?;
-        let ts: i64 = ts_str.parse().ok()?;
-        let now = chrono::Utc::now().timestamp();
-        now.checked_sub(ts)
-            .and_then(|d| u64::try_from(d).ok())
-            .map(std::time::Duration::from_secs)
-    }
-
-    /// Returns true if the trust token is older than (30 - warn_days) days.
-    /// Apple trust tokens last ~30 days empirically.
-    pub fn trust_token_expires_soon(&self, warn_days: u64) -> bool {
-        const TRUST_TOKEN_LIFETIME_DAYS: u64 = 30;
-        match self.trust_token_age() {
-            Some(age) => {
-                let threshold = std::time::Duration::from_secs(
-                    (TRUST_TOKEN_LIFETIME_DAYS - warn_days.min(TRUST_TOKEN_LIFETIME_DAYS))
-                        * 24
-                        * 60
-                        * 60,
-                );
-                age > threshold
-            }
-            None => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -473,61 +438,6 @@ mod tests {
         let _s2 = Session::new(&dir, "user@test.com", "https://example.com", None)
             .await
             .expect("Lock should be released after drop");
-    }
-
-    #[test]
-    fn test_trust_token_age_none_when_no_timestamp() {
-        let session_data: HashMap<String, String> = HashMap::new();
-        let ts: Option<&String> = session_data.get("trust_token_timestamp");
-        assert!(ts.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_trust_token_age_computes_correctly() {
-        let dir = test_dir("trust_age");
-        let mut session = Session::new(&dir, "user@test.com", "https://example.com", None)
-            .await
-            .unwrap();
-
-        // No timestamp yet
-        assert!(session.trust_token_age().is_none());
-
-        // Set timestamp to 2 hours ago
-        let two_hours_ago = chrono::Utc::now().timestamp() - 7200;
-        session.session_data.insert(
-            "trust_token_timestamp".to_string(),
-            two_hours_ago.to_string(),
-        );
-        let age = session.trust_token_age().unwrap();
-        // Should be approximately 7200 seconds (allow 5s tolerance)
-        assert!(age.as_secs() >= 7195 && age.as_secs() <= 7210);
-    }
-
-    #[tokio::test]
-    async fn test_trust_token_expires_soon() {
-        let dir = test_dir("trust_expires");
-        let mut session = Session::new(&dir, "user@test.com", "https://example.com", None)
-            .await
-            .unwrap();
-
-        // No timestamp — should not warn
-        assert!(!session.trust_token_expires_soon(7));
-
-        // Set timestamp to 25 days ago — should warn with 7-day window
-        let twenty_five_days_ago = chrono::Utc::now().timestamp() - (25 * 86400);
-        session.session_data.insert(
-            "trust_token_timestamp".to_string(),
-            twenty_five_days_ago.to_string(),
-        );
-        assert!(session.trust_token_expires_soon(7));
-
-        // Set timestamp to 10 days ago — should not warn
-        let ten_days_ago = chrono::Utc::now().timestamp() - (10 * 86400);
-        session.session_data.insert(
-            "trust_token_timestamp".to_string(),
-            ten_days_ago.to_string(),
-        );
-        assert!(!session.trust_token_expires_soon(7));
     }
 
     #[tokio::test]

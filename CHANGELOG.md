@@ -5,10 +5,10 @@
 ### Authentication
 - SRP-6a authentication with Apple's custom protocol variants
 - Two-factor authentication (trusted device code) with trust persistence
-- Session persistence with cookie management, lock files, and proactive token refresh
+- Session persistence with cookie management and lock files
 
 > [!IMPORTANT]
-> **Change from Python:** Lock files prevent concurrent instances from corrupting session state; trust token age is tracked with warnings before expiry; expired cookies are pruned on load
+> **Change from Python:** Lock files prevent concurrent instances from corrupting session state; expired cookies are pruned on load
 
 ### Downloads
 - Streaming download pipeline with configurable concurrent downloads (`--threads-num`)
