@@ -51,8 +51,9 @@ Benchmarked against Python icloudpd 1.32.2 on macOS with WiFi (84 runs, ~500GB t
 > **Change from Python:** `--max-retries` and `--retry-delay` are new flags — Python hardcodes `MAX_RETRIES = 0` with no user control
 - Progress bar tracking download progress, auto-hidden in non-TTY environments (`--no-progress-bar`). Skipped files (already downloaded) advance the counter on resume.
 - Live photo MOV collision detection — when a regular video occupies the same filename, the companion MOV is saved with an asset ID suffix (e.g. `IMG_0001-ASSET_ID.MOV`)
+- File collision deduplication (`--file-match-policy`) — when multiple iCloud assets share the same filename but have different content, the default `name-size-dedup-with-suffix` policy saves both files by appending the file size (e.g. `photo.jpg` and `photo-12345.jpg`)
 - Two-phase cleanup pass — retries failures with fresh CDN URLs
-- Low memory streaming for large libraries (100k+ photos)
+- Concurrent downloads with collision detection (tasks are buffered in memory for deduplication)
 - Deterministic `.part` filenames derived from checksum (base32-encoded, filesystem-safe)
 
 > [!IMPORTANT]
@@ -99,6 +100,11 @@ Benchmarked against Python icloudpd 1.32.2 on macOS with WiFi (84 runs, ~500GB t
 ### Operational
 - Dry-run, auth-only, list albums/libraries modes
 - Watch mode with automatic session validation and re-authentication between cycles
+- **Mid-sync session recovery** — if Apple invalidates the session during a large download, automatically re-authenticates and resumes (up to 3 attempts). In headless mode, provides actionable guidance to run `--auth-only` interactively for 2FA.
+
+> [!TIP]
+> **Change from Python:** Python icloudpd exits with auth errors if the session expires mid-sync; icloudpd-rs detects 401/403 responses and triggers re-authentication automatically
+
 - Graceful shutdown — first Ctrl+C / SIGTERM / SIGHUP finishes in-flight downloads then exits; second signal force-exits immediately. Partial `.part` files are kept for smart resume on next run. Watch mode sleep is interruptible.
 - Library indexing readiness check before querying (waits for CloudKit indexing to finish)
 - Album and shared library enumeration
@@ -113,6 +119,5 @@ Benchmarked against Python icloudpd 1.32.2 on macOS with WiFi (84 runs, ~500GB t
 ### Not Yet Wired (parsed but inactive)
 - `--force-size` — download only the requested size without fallback to original
 - `--keep-unicode-in-filenames` — preserve Unicode characters in filenames
-- `--file-match-policy` — alternative deduplication strategies (`name-size-dedup-with-suffix`, `name-id7`)
 - `--only-print-filenames` — print download paths without downloading
 - `--library` — select which library to download from (default: PrimarySync)

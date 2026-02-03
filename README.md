@@ -21,7 +21,7 @@ See [CHANGELOG.md](CHANGELOG.md) for what's already implemented and how it diffe
 
 ## Roadmap
 
-**Now** — Incremental sync (skip already-downloaded assets across runs) and mid-sync session recovery.
+**Now** — Incremental sync (skip already-downloaded assets across runs) via SQLite state tracking.
 
 **Next** — XMP sidecar export, shared library downloads, OS keyring integration, robust daemon mode with systemd/launchd support, and additional download controls.
 
@@ -58,6 +58,7 @@ If `--password` is not provided, you will be prompted securely at the terminal. 
 | `--threads-num N` | Number of concurrent downloads | `10` |
 | `--max-retries N` | Retry attempts per failed download | `3` |
 | `--folder-structure` | Folder template for organizing downloads | `%Y/%m/%d` |
+| `--file-match-policy` | File deduplication strategy | `name-size-dedup-with-suffix` |
 | `--log-level` | Log verbosity (`error`, `warn`, `info`, `debug`) | `info` |
 | `--watch-with-interval N` | Run continuously, waiting N seconds between runs | |
 | `--dry-run` | Preview without modifying files or iCloud | |

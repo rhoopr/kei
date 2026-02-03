@@ -16,8 +16,66 @@ pub mod retry;
 mod shutdown;
 mod types;
 
+use std::io::IsTerminal;
+use std::path::Path;
+
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+/// Maximum number of re-authentication attempts before giving up.
+const MAX_REAUTH_ATTEMPTS: u32 = 3;
+
+/// Attempt to re-authenticate the session.
+///
+/// First validates the existing session; if invalid, performs full re-authentication.
+/// In headless mode (non-interactive stdin), returns an error suggesting the user
+/// run `--auth-only` interactively since 2FA prompts won't work.
+async fn attempt_reauth<F>(
+    shared_session: &auth::SharedSession,
+    cookie_directory: &Path,
+    username: &str,
+    domain: &str,
+    password_provider: &F,
+) -> anyhow::Result<()>
+where
+    F: Fn() -> Option<String>,
+{
+    // Check if headless — 2FA won't work without a TTY
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "Session expired and re-authentication may require 2FA.\n\
+             Run `icloudpd-rs --auth-only` interactively to re-authenticate,\n\
+             then restart your sync."
+        );
+    }
+
+    let mut session = shared_session.write().await;
+
+    // Try validation first
+    if auth::validate_session(&mut session, domain).await? {
+        tracing::debug!("Session still valid after re-validation");
+        return Ok(());
+    }
+
+    tracing::info!("Session invalid, performing full re-authentication...");
+    session.release_lock()?;
+    drop(session);
+
+    let new_auth = auth::authenticate(
+        cookie_directory,
+        username,
+        password_provider,
+        domain,
+        None,
+        None,
+    )
+    .await?;
+
+    let mut session = shared_session.write().await;
+    *session = new_auth.session;
+    tracing::info!("Re-authentication successful");
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -180,9 +238,12 @@ async fn main() -> anyhow::Result<()> {
         live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
         align_raw: config.align_raw,
         no_progress_bar: config.no_progress_bar,
+        file_match_policy: config.file_match_policy,
     };
 
     let shutdown_token = shutdown::install_signal_handler()?;
+
+    let mut reauth_attempts = 0u32;
 
     loop {
         if shutdown_token.is_cancelled() {
@@ -191,13 +252,48 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let download_client = shared_session.read().await.download_client();
-        download::download_photos(
+        let outcome = download::download_photos(
             &download_client,
             &albums,
             &download_config,
             shutdown_token.clone(),
         )
         .await?;
+
+        match outcome {
+            download::DownloadOutcome::Success => {
+                reauth_attempts = 0;
+            }
+            download::DownloadOutcome::SessionExpired { auth_error_count } => {
+                reauth_attempts += 1;
+                if reauth_attempts >= MAX_REAUTH_ATTEMPTS {
+                    anyhow::bail!(
+                        "Session expired {} times, giving up after {} re-auth attempts",
+                        auth_error_count,
+                        MAX_REAUTH_ATTEMPTS
+                    );
+                }
+                tracing::warn!(
+                    "Session expired ({} auth errors), attempting re-auth ({}/{})",
+                    auth_error_count,
+                    reauth_attempts,
+                    MAX_REAUTH_ATTEMPTS
+                );
+                attempt_reauth(
+                    &shared_session,
+                    &config.cookie_directory,
+                    &config.username,
+                    config.domain.as_str(),
+                    &password_provider,
+                )
+                .await?;
+                tracing::info!("Re-auth successful, resuming download...");
+                continue; // Restart download pass
+            }
+            download::DownloadOutcome::PartialFailure { failed_count } => {
+                anyhow::bail!("{} downloads failed", failed_count);
+            }
+        }
 
         if let Some(interval) = config.watch_with_interval {
             if shutdown_token.is_cancelled() {
@@ -214,26 +310,15 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Validate session before next cycle; re-authenticate if expired
-            {
-                let mut session = shared_session.write().await;
-                if !auth::validate_session(&mut session, config.domain.as_str()).await? {
-                    tracing::warn!("Session expired, re-authenticating...");
-                    session.release_lock()?;
-                    drop(session);
-                    let new_auth = auth::authenticate(
-                        &config.cookie_directory,
-                        &config.username,
-                        &password_provider,
-                        config.domain.as_str(),
-                        None,
-                        None,
-                    )
-                    .await?;
-                    let mut session = shared_session.write().await;
-                    *session = new_auth.session;
-                    tracing::info!("Re-authentication successful");
-                }
-            }
+            attempt_reauth(
+                &shared_session,
+                &config.cookie_directory,
+                &config.username,
+                config.domain.as_str(),
+                &password_provider,
+            )
+            .await
+            .ok(); // Best-effort pre-check; mid-sync re-auth handles failures
         } else {
             break;
         }

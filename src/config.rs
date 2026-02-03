@@ -37,7 +37,6 @@ pub struct Config {
     pub keep_unicode_in_filenames: bool,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub align_raw: RawTreatmentPolicy,
-    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub file_match_policy: FileMatchPolicy,
     pub skip_created_before: Option<DateTime<Local>>,
     pub skip_created_after: Option<DateTime<Local>>,

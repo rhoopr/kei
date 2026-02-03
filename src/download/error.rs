@@ -43,6 +43,21 @@ impl DownloadError {
             DownloadError::Other(_) => false,
         }
     }
+
+    /// Whether this error indicates the session has expired.
+    ///
+    /// HTTP 401 (Unauthorized) and 403 (Forbidden) typically indicate that
+    /// the iCloud session token has been invalidated server-side. The caller
+    /// should re-authenticate and retry.
+    pub fn is_session_expired(&self) -> bool {
+        matches!(
+            self,
+            DownloadError::HttpStatus {
+                status: 401 | 403,
+                ..
+            }
+        )
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +154,53 @@ mod tests {
             bytes_written: 0,
         };
         assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn test_http_401_is_session_expired() {
+        let e = DownloadError::HttpStatus {
+            status: 401,
+            path: "x".into(),
+        };
+        assert!(e.is_session_expired());
+    }
+
+    #[test]
+    fn test_http_403_is_session_expired() {
+        let e = DownloadError::HttpStatus {
+            status: 403,
+            path: "x".into(),
+        };
+        assert!(e.is_session_expired());
+    }
+
+    #[test]
+    fn test_http_500_not_session_expired() {
+        let e = DownloadError::HttpStatus {
+            status: 500,
+            path: "x".into(),
+        };
+        assert!(!e.is_session_expired());
+    }
+
+    #[test]
+    fn test_http_404_not_session_expired() {
+        let e = DownloadError::HttpStatus {
+            status: 404,
+            path: "x".into(),
+        };
+        assert!(!e.is_session_expired());
+    }
+
+    #[test]
+    fn test_checksum_mismatch_not_session_expired() {
+        let e = DownloadError::ChecksumMismatch("x".into());
+        assert!(!e.is_session_expired());
+    }
+
+    #[test]
+    fn test_disk_not_session_expired() {
+        let e = DownloadError::Disk(std::io::Error::other("disk full"));
+        assert!(!e.is_session_expired());
     }
 }

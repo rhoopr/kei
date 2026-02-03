@@ -73,7 +73,6 @@ pub fn remove_unicode_chars(filename: &str) -> String {
 ///
 /// For example, `"photo.jpg"` with size `12345` becomes `"photo-12345.jpg"`.
 /// If the filename has no extension, the suffix is simply appended.
-#[allow(dead_code)] // for --file-match-policy (parsed but not yet wired)
 pub fn add_dedup_suffix(path: &str, size: u64) -> String {
     insert_suffix(path, &size.to_string())
 }
