@@ -1,0 +1,157 @@
+name: Rust CI
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Treat any compiler warning as an error to keep the codebase warning-free
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  # Enforces consistent code style across the project
+  # Fails if any code isn't formatted with rustfmt
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # Catches common mistakes, unidiomatic code, and potential bugs
+  # Acts as an additional layer of static analysis beyond the compiler
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Caches compiled dependencies to speed up subsequent runs
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features
+
+  # Runs the test suite on all major platforms to catch platform-specific bugs
+  # fail-fast: false ensures all platforms run even if one fails
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  # Ensures documentation builds without warnings
+  # Important for maintaining quality docs, especially for published crates
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-Dwarnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features
+
+  # Detects dependencies declared in Cargo.toml but not actually used
+  # Keeps the dependency tree lean and reduces compile times
+  # Requires nightly because cargo-udeps uses unstable features
+  unused-deps:
+    name: Unused Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-udeps
+      - run: cargo +nightly udeps --all-targets
+
+  # Verifies Cargo.lock is committed and in sync with Cargo.toml
+  # Ensures reproducible builds and prevents "works on my machine" issues
+  lockfile:
+    name: Lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fetch --locked
+
+  # Measures what percentage of code is exercised by tests
+  # Helps identify untested code paths and track coverage over time
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Required by cargo-llvm-cov for instrumentation
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+      # Uploads to Codecov for tracking and PR comments showing coverage changes
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # Compiles release builds on all platforms to catch platform-specific compile errors
+  # Release mode can surface different issues than debug mode (e.g., optimization bugs)
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+  # Verifies the project compiles on the minimum supported Rust version
+  # Prevents accidentally using features from newer Rust versions
+  # Update the toolchain version to match rust-version in your Cargo.toml
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.75"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-features
+
+  # Checks dependencies against the RustSec Advisory Database
+  # Catches known security vulnerabilities in your dependency tree
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+
+  # Catches spelling mistakes in code, comments, and documentation
+  # Small thing but helps maintain a professional codebase
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@master
