@@ -59,6 +59,12 @@ pub fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
+
+    /// Cross-platform temp directory for tests
+    fn test_tmp_dir(subdir: &str) -> PathBuf {
+        std::env::temp_dir().join("claude").join(subdir)
+    }
 
     /// Minimal valid JPEG with no EXIF data (SOI + APP0 JFIF + EOI).
     fn minimal_jpeg() -> Vec<u8> {
@@ -78,7 +84,7 @@ mod tests {
 
     #[test]
     fn test_set_and_get_exif_roundtrip() {
-        let dir = Path::new("/tmp/claude/exif_tests");
+        let dir = &test_tmp_dir("exif_tests");
         fs::create_dir_all(dir).unwrap();
         let path = dir.join("test_roundtrip.jpg");
         fs::write(&path, minimal_jpeg()).unwrap();
@@ -95,7 +101,7 @@ mod tests {
 
     #[test]
     fn test_get_exif_no_exif_data() {
-        let dir = Path::new("/tmp/claude/exif_tests");
+        let dir = &test_tmp_dir("exif_tests");
         fs::create_dir_all(dir).unwrap();
         let path = dir.join("test_no_exif.jpg");
         fs::write(&path, minimal_jpeg()).unwrap();
@@ -108,7 +114,7 @@ mod tests {
 
     #[test]
     fn test_set_exif_preserves_existing() {
-        let dir = Path::new("/tmp/claude/exif_tests");
+        let dir = &test_tmp_dir("exif_tests");
         fs::create_dir_all(dir).unwrap();
         let path = dir.join("test_preserve.jpg");
         fs::write(&path, minimal_jpeg()).unwrap();

@@ -107,7 +107,9 @@ mod tests {
     #[tokio::test]
     async fn test_shared_session_implements_photos_session() {
         // Verify that SharedSession can be used as a PhotosSession trait object
-        let dir = std::path::PathBuf::from("/tmp/claude/shared_session_test");
+        let dir = std::env::temp_dir()
+            .join("claude")
+            .join("shared_session_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let session = crate::auth::session::Session::new(

@@ -18,8 +18,8 @@ pub fn local_download_path(
         return directory.join(&clean);
     }
 
-    // Support both Python icloudpd's `{:%Y}` syntax and plain `%Y` for
-    // backwards compatibility with existing user configurations.
+    // Support both Python icloudpd's `{:%Y/%m/%d}` syntax and plain `%Y/%m/%d`
+    // for backwards compatibility with existing user configurations.
     let year = format!("{:04}", created_date.year());
     let month = format!("{:02}", created_date.month());
     let day = format!("{:02}", created_date.day());
@@ -27,15 +27,14 @@ pub fn local_download_path(
     let minute = format!("{:02}", created_date.minute());
     let second = format!("{:02}", created_date.second());
 
-    let date_path = folder_structure
-        // Python-style {:%Y} format
-        .replace("{:%Y}", &year)
-        .replace("{:%m}", &month)
-        .replace("{:%d}", &day)
-        .replace("{:%H}", &hour)
-        .replace("{:%M}", &minute)
-        .replace("{:%S}", &second)
-        // Plain strftime %Y format
+    // Extract format from Python-style {:%Y/%m/%d} wrapper if present
+    let format_str = if folder_structure.starts_with("{:") && folder_structure.ends_with('}') {
+        &folder_structure[2..folder_structure.len() - 1]
+    } else {
+        folder_structure
+    };
+
+    let date_path = format_str
         .replace("%Y", &year)
         .replace("%m", &month)
         .replace("%d", &day)
@@ -43,7 +42,15 @@ pub fn local_download_path(
         .replace("%M", &minute)
         .replace("%S", &second);
 
-    directory.join(&date_path).join(&clean)
+    // Split on "/" and join as path components to handle cross-platform paths.
+    // This converts "{:%Y/%m/%d}" format like "2025/01/15" into proper PathBuf.
+    let mut path = directory.to_path_buf();
+    for component in date_path.split('/') {
+        if !component.is_empty() {
+            path = path.join(component);
+        }
+    }
+    path.join(&clean)
 }
 
 /// Clean a filename by removing characters that are invalid on common

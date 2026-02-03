@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+#[cfg(unix)]
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 

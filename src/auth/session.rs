@@ -256,9 +256,7 @@ impl Session {
     /// Release the exclusive file lock without dropping the Session.
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
     pub fn release_lock(&self) -> Result<()> {
-        self.lock_file
-            .unlock()
-            .context("Failed to release session lock file")
+        FileExt::unlock(&self.lock_file).context("Failed to release session lock file")
     }
 
     pub fn client_id(&self) -> Option<&String> {
@@ -413,7 +411,10 @@ mod tests {
     use super::*;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = PathBuf::from("/tmp/claude/session_tests").join(name);
+        let dir = std::env::temp_dir()
+            .join("claude")
+            .join("session_tests")
+            .join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -58,9 +58,11 @@ rand = "0.9"
 # File locking
 fs4 = "0.12"
 
+# Pin time for MSRV 1.85 (0.3.46+ requires rustc 1.88)
+time = ">=0.3.37, <0.3.46"
+
 # Misc
 url = "2"
-regex = "1"
 dirs = "6"
 async-trait = "0.1"
 urlencoding = "2"
