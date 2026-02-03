@@ -33,6 +33,15 @@ pub struct PhotosService {
     shared_libraries: Option<HashMap<String, PhotoLibrary>>,
 }
 
+impl std::fmt::Debug for PhotosService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhotosService")
+            .field("service_root", &self.service_root)
+            .field("primary_library", &self.primary_library)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PhotosService {
     /// Create a new `PhotosService`.
     ///
@@ -94,10 +103,11 @@ impl PhotosService {
             let libs = self.fetch_libraries("private").await?;
             self.private_libraries = Some(libs);
         }
+        // Safe: we just ensured private_libraries is Some above
         Ok(self
             .private_libraries
             .as_ref()
-            .expect("just initialized above"))
+            .unwrap_or_else(|| unreachable!("private_libraries was just set to Some")))
     }
 
     /// Fetch shared libraries (lazily, first call triggers the HTTP request).
@@ -108,10 +118,11 @@ impl PhotosService {
             let libs = self.fetch_libraries("shared").await?;
             self.shared_libraries = Some(libs);
         }
+        // Safe: we just ensured shared_libraries is Some above
         Ok(self
             .shared_libraries
             .as_ref()
-            .expect("just initialized above"))
+            .unwrap_or_else(|| unreachable!("shared_libraries was just set to Some")))
     }
 
     async fn fetch_libraries(

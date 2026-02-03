@@ -70,7 +70,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 impl Config {
-    pub fn from_cli(cli: crate::cli::Cli) -> anyhow::Result<Self> {
+    pub fn from_cli(cli: crate::cli::LegacyCli) -> anyhow::Result<Self> {
         let directory = cli.directory.map(|d| expand_tilde(&d)).unwrap_or_default();
 
         let cookie_directory = expand_tilde(&cli.cookie_directory);
@@ -216,13 +216,13 @@ mod tests {
         assert!(parse_date_or_interval("").is_err());
     }
 
-    fn make_cli(overrides: impl FnOnce(&mut crate::cli::Cli)) -> crate::cli::Cli {
+    fn make_cli(overrides: impl FnOnce(&mut crate::cli::LegacyCli)) -> crate::cli::LegacyCli {
         use clap::Parser;
-        let mut cli =
-            crate::cli::Cli::try_parse_from(["icloudpd-rs", "--username", "u@example.com"])
-                .unwrap();
-        overrides(&mut cli);
-        cli
+        let cli = crate::cli::Cli::try_parse_from(["icloudpd-rs", "--username", "u@example.com"])
+            .unwrap();
+        let mut legacy: crate::cli::LegacyCli = cli.into();
+        overrides(&mut legacy);
+        legacy
     }
 
     #[test]

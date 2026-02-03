@@ -66,7 +66,6 @@ where
     E: std::fmt::Display,
 {
     let total_attempts = config.max_retries + 1;
-    let mut last_err: Option<E> = None;
 
     for attempt in 0..total_attempts {
         match operation().await {
@@ -77,8 +76,7 @@ where
                 }
                 let is_last = attempt + 1 >= total_attempts;
                 if is_last {
-                    last_err = Some(e);
-                    break;
+                    return Err(e);
                 }
                 let delay = config.delay_for_retry(attempt);
                 tracing::warn!(
@@ -93,7 +91,9 @@ where
         }
     }
 
-    Err(last_err.expect("loop must have run at least once"))
+    // This is unreachable: the loop always runs at least once (total_attempts >= 1)
+    // and either returns Ok, returns Err on abort, or returns Err on last attempt.
+    unreachable!("retry loop must return before exhausting iterations")
 }
 
 #[cfg(test)]

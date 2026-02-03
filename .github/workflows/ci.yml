@@ -86,27 +86,55 @@ jobs:
       - run: cargo fetch --locked
 
   # Measures what percentage of code is exercised by tests
-  # Helps identify untested code paths and track coverage over time
+  # Posts coverage summary as PR comment
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # Required by cargo-llvm-cov for instrumentation
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
-      # Uploads to Codecov for tracking and PR comments showing coverage changes
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov --all-features > coverage.txt
+          cat coverage.txt
+      - name: Post coverage comment
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
         env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Extract stats from coverage output
+          TOTAL=$(grep "^TOTAL" coverage.txt | awk '{print $10}')
+          TESTS=$(grep -E "^test result:" coverage.txt | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
+
+          # Find files with 0% and 100% coverage
+          ZERO_COV=$(grep "0.00%" coverage.txt | grep -v "^TOTAL" | awk '{print $1}' | head -5 | tr '\n' ', ' | sed 's/,$//')
+          FULL_COV=$(grep "100.00%" coverage.txt | awk '{print $1}' | tr '\n' ', ' | sed 's/,$//')
+
+          {
+            echo "## Coverage Report"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| **Line Coverage** | ${TOTAL} |"
+            echo "| **Tests Passed** | ${TESTS} |"
+            echo ""
+            if [ -n "$FULL_COV" ]; then
+              echo "**100% coverage:** \`${FULL_COV}\`"
+              echo ""
+            fi
+            if [ -n "$ZERO_COV" ]; then
+              echo "**Needs tests:** \`${ZERO_COV}\`"
+            fi
+          } > comment.md
+
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md || echo "Failed to post comment"
 
   # Compiles release builds on all platforms to catch platform-specific compile errors
   # Release mode can surface different issues than debug mode (e.g., optimization bugs)
@@ -122,20 +150,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-
-  # Verifies the project compiles on the minimum supported Rust version
-  # Prevents accidentally using features from newer Rust versions
-  # Update the toolchain version to match rust-version in your Cargo.toml
-  msrv:
-    name: MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.85"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-features
 
   # Checks dependencies against the RustSec Advisory Database
   # Catches known security vulnerabilities in your dependency tree

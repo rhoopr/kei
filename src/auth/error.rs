@@ -15,14 +15,6 @@ pub enum AuthError {
     #[error("Two-factor authentication failed: {0}")]
     TwoFactorFailed(String),
 
-    #[allow(dead_code)] // for future iCloud service-not-activated error handling
-    #[error("Service not activated: {0}")]
-    ServiceNotActivated(String),
-
-    #[allow(dead_code)] // for future connection error classification
-    #[error("Connection error: {0}")]
-    ConnectionError(String),
-
     #[error(transparent)]
     Http(#[from] reqwest::Error),
 

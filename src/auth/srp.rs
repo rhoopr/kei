@@ -135,7 +135,7 @@ fn compute_m2(a_pub: &BigUint, m1: &[u8], key: &[u8]) -> Vec<u8> {
 }
 
 /// Build the Apple OAuth/auth headers required for SRP authentication requests.
-pub fn get_auth_headers(
+pub(crate) fn get_auth_headers(
     domain: &str,
     client_id: &str,
     session_data: &HashMap<String, String>,

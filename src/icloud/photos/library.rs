@@ -28,6 +28,15 @@ pub struct PhotoLibrary {
     library_type: String,
 }
 
+impl std::fmt::Debug for PhotoLibrary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhotoLibrary")
+            .field("service_endpoint", &self.service_endpoint)
+            .field("library_type", &self.library_type)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PhotoLibrary {
     /// Create a new `PhotoLibrary`, verifying that indexing has finished.
     pub async fn new(

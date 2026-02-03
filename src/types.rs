@@ -47,15 +47,14 @@ pub enum FileMatchPolicy {
     NameId7,
 }
 
-#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum RawTreatmentPolicy {
     #[value(name = "as-is")]
-    AsIs,
+    Unchanged,
     #[value(name = "original")]
-    AsOriginal,
+    PreferOriginal,
     #[value(name = "alternative")]
-    AsAlternative,
+    PreferAlternative,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -94,5 +93,11 @@ mod tests {
             LivePhotoSize::Thumb.to_asset_version_size(),
             AssetVersionSize::LiveThumb
         );
+    }
+
+    #[test]
+    fn test_domain_as_str() {
+        assert_eq!(Domain::Com.as_str(), "com");
+        assert_eq!(Domain::Cn.as_str(), "cn");
     }
 }

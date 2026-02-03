@@ -64,9 +64,11 @@ struct CookieEntry {
 pub struct Session {
     client: Client,
     download_client: Client,
-    /// Held for the lifetime of the Session so the `Arc` reference kept by
-    /// `reqwest::Client` stays alive. Not accessed directly after construction.
-    #[allow(dead_code)]
+    /// Cookie jar shared with `reqwest::Client`. This field is intentionally
+    /// never read — it exists solely to prevent the `Arc<Jar>` from being
+    /// dropped while the client is in use. The client holds a weak reference
+    /// internally, so we must keep the Arc alive here.
+    #[allow(dead_code)] // Intentional: prevents Arc from dropping
     cookie_jar: Arc<reqwest::cookie::Jar>,
     pub session_data: HashMap<String, String>,
     cookie_dir: PathBuf,
@@ -76,6 +78,17 @@ pub struct Session {
     /// The advisory lock is held for the lifetime of the Session via the open
     /// file descriptor; released automatically when the File is dropped.
     lock_file: std::fs::File,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("cookie_dir", &self.cookie_dir)
+            .field("sanitized_username", &self.sanitized_username)
+            .field("home_endpoint", &self.home_endpoint)
+            .field("session_data", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Session {
@@ -106,12 +119,15 @@ impl Session {
                 let file = std::fs::File::create(&lock_path).with_context(|| {
                     format!("Failed to create lock file: {}", lock_path.display())
                 })?;
-                file.try_lock_exclusive().map_err(|_| {
-                    anyhow::anyhow!(
+                let acquired = file
+                    .try_lock_exclusive()
+                    .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))?;
+                if !acquired {
+                    anyhow::bail!(
                         "Another icloudpd-rs instance is running for this account (lock: {})",
                         lock_path.display()
-                    )
-                })?;
+                    );
+                }
                 Ok::<std::fs::File, anyhow::Error>(file)
             }
         })

@@ -11,6 +11,7 @@ pub mod paths;
 use std::collections::HashMap;
 use std::fs::FileTimes;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -27,9 +28,40 @@ use tokio_util::sync::CancellationToken;
 use crate::icloud::photos::types::AssetVersion;
 use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum};
 use crate::retry::RetryConfig;
+use crate::state::{AssetRecord, MediaType, StateDb, SyncRunStats};
 use crate::types::{FileMatchPolicy, LivePhotoMovFilenamePolicy, RawTreatmentPolicy};
 
 use error::DownloadError;
+
+/// Determine the media type for an asset based on version size and item type.
+pub fn determine_media_type(
+    version_size: &str,
+    asset: &crate::icloud::photos::PhotoAsset,
+) -> MediaType {
+    if version_size.contains("live") {
+        if asset.item_type() == Some(AssetItemType::Image) {
+            MediaType::LivePhotoVideo
+        } else {
+            MediaType::Video
+        }
+    } else if asset.item_type() == Some(AssetItemType::Movie) {
+        MediaType::Video
+    } else if asset.item_type() == Some(AssetItemType::Image) {
+        // Could be live photo image or regular photo
+        // Check if asset has live photo versions
+        let versions = asset.versions();
+        if versions.contains_key(&AssetVersionSize::LiveOriginal)
+            || versions.contains_key(&AssetVersionSize::LiveMedium)
+            || versions.contains_key(&AssetVersionSize::LiveThumb)
+        {
+            MediaType::LivePhotoImage
+        } else {
+            MediaType::Photo
+        }
+    } else {
+        MediaType::Photo
+    }
+}
 
 /// Normalize a path for collision detection on case-insensitive filesystems.
 ///
@@ -61,7 +93,6 @@ pub enum DownloadOutcome {
 
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
-#[derive(Debug)]
 pub struct DownloadConfig {
     pub(crate) directory: std::path::PathBuf,
     pub(crate) folder_structure: String,
@@ -81,16 +112,51 @@ pub struct DownloadConfig {
     pub(crate) align_raw: RawTreatmentPolicy,
     pub(crate) no_progress_bar: bool,
     pub(crate) file_match_policy: FileMatchPolicy,
+    /// State database for tracking download progress.
+    pub(crate) state_db: Option<Arc<dyn StateDb>>,
+}
+
+impl std::fmt::Debug for DownloadConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadConfig")
+            .field("directory", &self.directory)
+            .field("folder_structure", &self.folder_structure)
+            .field("size", &self.size)
+            .field("skip_videos", &self.skip_videos)
+            .field("skip_photos", &self.skip_photos)
+            .field("skip_created_before", &self.skip_created_before)
+            .field("skip_created_after", &self.skip_created_after)
+            .field("set_exif_datetime", &self.set_exif_datetime)
+            .field("dry_run", &self.dry_run)
+            .field("concurrent_downloads", &self.concurrent_downloads)
+            .field("recent", &self.recent)
+            .field("retry", &self.retry)
+            .field("skip_live_photos", &self.skip_live_photos)
+            .field("live_photo_size", &self.live_photo_size)
+            .field(
+                "live_photo_mov_filename_policy",
+                &self.live_photo_mov_filename_policy,
+            )
+            .field("align_raw", &self.align_raw)
+            .field("no_progress_bar", &self.no_progress_bar)
+            .field("file_match_policy", &self.file_match_policy)
+            .field("state_db", &self.state_db.is_some())
+            .finish()
+    }
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DownloadTask {
     url: String,
     download_path: PathBuf,
     checksum: String,
     created_local: DateTime<Local>,
     size: u64,
+    /// iCloud asset ID for state tracking.
+    asset_id: String,
+    /// Version size key (e.g., "original", "live_original") for state tracking.
+    version_size: String,
 }
 
 /// Eagerly enumerate all albums and build a complete task list.
@@ -128,7 +194,7 @@ fn apply_raw_policy(
     versions: &HashMap<AssetVersionSize, AssetVersion>,
     policy: RawTreatmentPolicy,
 ) -> std::borrow::Cow<'_, HashMap<AssetVersionSize, AssetVersion>> {
-    if policy == RawTreatmentPolicy::AsIs {
+    if policy == RawTreatmentPolicy::Unchanged {
         return std::borrow::Cow::Borrowed(versions);
     }
 
@@ -138,11 +204,11 @@ fn apply_raw_policy(
     };
 
     let should_swap = match policy {
-        RawTreatmentPolicy::AsOriginal => alt.asset_type.contains("raw"),
-        RawTreatmentPolicy::AsAlternative => versions
+        RawTreatmentPolicy::PreferOriginal => alt.asset_type.contains("raw"),
+        RawTreatmentPolicy::PreferAlternative => versions
             .get(&AssetVersionSize::Original)
             .is_some_and(|v| v.asset_type.contains("raw")),
-        RawTreatmentPolicy::AsIs => false,
+        RawTreatmentPolicy::Unchanged => false,
     };
 
     if !should_swap {
@@ -304,6 +370,8 @@ fn filter_asset_to_tasks(
                 checksum: version.checksum.clone(),
                 created_local,
                 size: version.size,
+                asset_id: asset.id().to_string(),
+                version_size: format!("{:?}", config.size).to_lowercase(),
             });
         }
     }
@@ -393,6 +461,8 @@ fn filter_asset_to_tasks(
                     checksum: live_version.checksum.clone(),
                     created_local,
                     size: live_version.size,
+                    asset_id: asset.id().to_string(),
+                    version_size: format!("{:?}", config.live_photo_size).to_lowercase(),
                 });
             }
         }
@@ -411,13 +481,12 @@ fn create_progress_bar(no_progress_bar: bool, total: u64) -> ProgressBar {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
-        )
-        .expect("valid template")
-        .progress_chars("=> "),
-    );
+    // Template is a compile-time constant; unwrap_or_else handles the impossible case
+    if let Ok(style) = ProgressStyle::with_template(
+        "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+    ) {
+        pb.set_style(style.progress_chars("=> "));
+    }
     pb
 }
 
@@ -505,10 +574,28 @@ async fn stream_and_download(
     let retry_config = config.retry;
     let set_exif = config.set_exif_datetime;
     let concurrency = config.concurrent_downloads;
+    let state_db = config.state_db.clone();
+
+    // Start sync run tracking
+    let sync_run_id = if let Some(db) = &state_db {
+        match db.start_sync_run().await {
+            Ok(id) => {
+                tracing::debug!(run_id = id, "Started sync run");
+                Some(id)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start sync run tracking: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut downloaded = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
+    let mut assets_seen = 0u64;
 
     // Collect all download tasks first, processing assets sequentially to ensure
     // proper collision detection via claimed_paths. This trades some streaming
@@ -520,11 +607,67 @@ async fn stream_and_download(
         }
         match result {
             Ok(asset) => {
+                assets_seen += 1;
                 let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths);
                 if tasks.is_empty() {
                     pb.inc(1);
                 } else {
-                    all_tasks.extend(tasks);
+                    // Record assets in state DB and filter by should_download
+                    let mut filtered_tasks = Vec::new();
+                    for task in tasks {
+                        if let Some(db) = &state_db {
+                            // Create asset record for state tracking
+                            let media_type = determine_media_type(&task.version_size, &asset);
+                            let record = AssetRecord::new_pending(
+                                task.asset_id.clone(),
+                                task.version_size.clone(),
+                                task.checksum.clone(),
+                                task.download_path
+                                    .file_name()
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                asset.created(),
+                                Some(asset.added_date()),
+                                task.size,
+                                media_type,
+                            );
+                            if let Err(e) = db.upsert_seen(&record).await {
+                                tracing::warn!("Failed to record asset in state DB: {}", e);
+                            }
+
+                            // Check if we should download (DB-based skip)
+                            match db
+                                .should_download(
+                                    &task.asset_id,
+                                    &task.version_size,
+                                    &task.checksum,
+                                    &task.download_path,
+                                )
+                                .await
+                            {
+                                Ok(true) => filtered_tasks.push(task),
+                                Ok(false) => {
+                                    tracing::debug!(
+                                        asset_id = %task.asset_id,
+                                        path = %task.download_path.display(),
+                                        "Skipping (already downloaded per state DB)"
+                                    );
+                                    pb.inc(1);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "State DB check failed, downloading anyway: {}",
+                                        e
+                                    );
+                                    filtered_tasks.push(task);
+                                }
+                            }
+                        } else {
+                            filtered_tasks.push(task);
+                        }
+                    }
+                    all_tasks.extend(filtered_tasks);
                 }
             }
             Err(e) => {
@@ -539,8 +682,44 @@ async fn stream_and_download(
     let download_stream = task_stream
         .map(|task| {
             let client = download_client.clone();
+            let db = state_db.clone();
             async move {
                 let result = download_single_task(&client, &task, &retry_config, set_exif).await;
+
+                // Record outcome in state DB
+                if let Some(db) = &db {
+                    match &result {
+                        Ok(()) => {
+                            if let Err(e) = db
+                                .mark_downloaded(
+                                    &task.asset_id,
+                                    &task.version_size,
+                                    &task.download_path,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark {} as downloaded in state DB: {}",
+                                    task.asset_id,
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if let Err(db_err) = db
+                                .mark_failed(&task.asset_id, &task.version_size, &e.to_string())
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark {} as failed in state DB: {}",
+                                    task.asset_id,
+                                    db_err
+                                );
+                            }
+                        }
+                    }
+                }
+
                 (task, result)
             }
         })
@@ -601,6 +780,27 @@ async fn stream_and_download(
     }
 
     pb.finish_and_clear();
+
+    // Complete sync run tracking
+    if let (Some(db), Some(run_id)) = (&state_db, sync_run_id) {
+        let stats = SyncRunStats {
+            assets_seen,
+            assets_downloaded: downloaded as u64,
+            assets_failed: failed.len() as u64,
+            interrupted: shutdown_token.is_cancelled() || auth_errors >= AUTH_ERROR_THRESHOLD,
+        };
+        if let Err(e) = db.complete_sync_run(run_id, &stats).await {
+            tracing::warn!("Failed to complete sync run tracking: {}", e);
+        } else {
+            tracing::debug!(
+                run_id,
+                assets_seen,
+                downloaded,
+                failed = failed.len(),
+                "Completed sync run"
+            );
+        }
+    }
 
     Ok(StreamingResult {
         downloaded,
@@ -692,16 +892,16 @@ pub async fn download_photos(
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let phase2_task_count = fresh_tasks.len();
-    let pass_result = run_download_pass(
-        download_client,
-        fresh_tasks,
-        &config.retry,
-        config.set_exif_datetime,
-        cleanup_concurrency,
-        config.no_progress_bar,
+    let pass_config = PassConfig {
+        client: download_client,
+        retry_config: &config.retry,
+        set_exif: config.set_exif_datetime,
+        concurrency: cleanup_concurrency,
+        no_progress_bar: config.no_progress_bar,
         shutdown_token,
-    )
-    .await;
+        state_db: config.state_db.clone(),
+    };
+    let pass_result = run_download_pass(pass_config, fresh_tasks).await;
 
     let remaining_failed = pass_result.failed;
     let phase2_auth_errors = pass_result.auth_errors;
@@ -746,25 +946,69 @@ struct PassResult {
     auth_errors: usize,
 }
 
-/// Execute a download pass over the given tasks, returning any that failed.
-async fn run_download_pass(
-    client: &Client,
-    tasks: Vec<DownloadTask>,
-    retry_config: &RetryConfig,
+/// Configuration for a download pass.
+struct PassConfig<'a> {
+    client: &'a Client,
+    retry_config: &'a RetryConfig,
     set_exif: bool,
     concurrency: usize,
     no_progress_bar: bool,
     shutdown_token: CancellationToken,
-) -> PassResult {
-    let pb = create_progress_bar(no_progress_bar, tasks.len() as u64);
-    let client = client.clone();
+    state_db: Option<Arc<dyn StateDb>>,
+}
+
+/// Execute a download pass over the given tasks, returning any that failed.
+async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> PassResult {
+    let pb = create_progress_bar(config.no_progress_bar, tasks.len() as u64);
+    let client = config.client.clone();
+    let retry_config = config.retry_config;
+    let set_exif = config.set_exif;
+    let state_db = config.state_db.clone();
+    let shutdown_token = config.shutdown_token.clone();
+    let concurrency = config.concurrency;
 
     let results: Vec<(DownloadTask, Result<()>)> = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
+            let db = state_db.clone();
             async move {
                 let result = download_single_task(&client, &task, retry_config, set_exif).await;
+
+                // Record outcome in state DB
+                if let Some(db) = &db {
+                    match &result {
+                        Ok(()) => {
+                            if let Err(e) = db
+                                .mark_downloaded(
+                                    &task.asset_id,
+                                    &task.version_size,
+                                    &task.download_path,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark {} as downloaded in state DB: {}",
+                                    task.asset_id,
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if let Err(db_err) = db
+                                .mark_failed(&task.asset_id, &task.version_size, &e.to_string())
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark {} as failed in state DB: {}",
+                                    task.asset_id,
+                                    db_err
+                                );
+                            }
+                        }
+                    }
+                }
+
                 (task, result)
             }
         })
@@ -943,9 +1187,10 @@ mod tests {
             skip_live_photos: false,
             live_photo_size: AssetVersionSize::LiveOriginal,
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
-            align_raw: RawTreatmentPolicy::AsIs,
+            align_raw: RawTreatmentPolicy::Unchanged,
             no_progress_bar: true,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
+            state_db: None,
         }
     }
 
@@ -1358,7 +1603,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_is_no_swap() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsIs);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::Unchanged);
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
             "https://example.com/orig"
@@ -1372,7 +1617,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_original_swaps_when_alt_is_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsOriginal);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         // Alternative was RAW → swap: Original now has alt URL
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
@@ -1387,7 +1632,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_alternative_swaps_when_orig_is_raw() {
         let asset = photo_asset_with_original_and_alternative("com.adobe.raw-image", "public.jpeg");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsAlternative);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
         // Original was RAW → swap: Alternative now has orig URL
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
@@ -1402,7 +1647,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_original_no_swap_when_alt_not_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsOriginal);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
             "https://example.com/orig"
@@ -1412,7 +1657,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_alternative_no_swap_when_orig_not_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsAlternative);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
             "https://example.com/orig"
@@ -1422,7 +1667,7 @@ mod tests {
     #[test]
     fn test_raw_policy_no_alternative_no_swap() {
         let asset = photo_asset_with_version(); // only has Original
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::AsOriginal);
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         assert_eq!(
             versions[&AssetVersionSize::Original].url,
             "https://example.com/orig"
@@ -1434,7 +1679,7 @@ mod tests {
     fn test_filter_asset_uses_raw_policy_swap() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let mut config = test_config();
-        config.align_raw = RawTreatmentPolicy::AsOriginal;
+        config.align_raw = RawTreatmentPolicy::PreferOriginal;
         // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
@@ -1604,6 +1849,8 @@ mod tests {
                 checksum: "aaa".into(),
                 created_local: chrono::Local::now(),
                 size: 1000,
+                asset_id: "ASSET_A".into(),
+                version_size: "original".into(),
             },
             DownloadTask {
                 url: "https://example.com/b".into(),
@@ -1611,6 +1858,8 @@ mod tests {
                 checksum: "bbb".into(),
                 created_local: chrono::Local::now(),
                 size: 2000,
+                asset_id: "ASSET_B".into(),
+                version_size: "original".into(),
             },
         ];
 
@@ -1618,7 +1867,16 @@ mod tests {
         let retry = RetryConfig::default();
 
         // Pre-cancelled token: take_while stops immediately, no downloads attempted.
-        let result = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
+        let pass_config = PassConfig {
+            client: &client,
+            retry_config: &retry,
+            set_exif: false,
+            concurrency: 1,
+            no_progress_bar: true,
+            shutdown_token: token,
+            state_db: None,
+        };
+        let result = run_download_pass(pass_config, tasks).await;
         assert!(result.failed.is_empty());
     }
 
@@ -1633,6 +1891,8 @@ mod tests {
             checksum: "ccc".into(),
             created_local: chrono::Local::now(),
             size: 500,
+            asset_id: "ASSET_C".into(),
+            version_size: "original".into(),
         }];
 
         let client = Client::new();
@@ -1643,7 +1903,16 @@ mod tests {
         };
 
         // Non-cancelled token: task is attempted (and fails since URL is bogus).
-        let result = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
+        let pass_config = PassConfig {
+            client: &client,
+            retry_config: &retry,
+            set_exif: false,
+            concurrency: 1,
+            no_progress_bar: true,
+            shutdown_token: token,
+            state_db: None,
+        };
+        let result = run_download_pass(pass_config, tasks).await;
         assert_eq!(result.failed.len(), 1);
     }
 }

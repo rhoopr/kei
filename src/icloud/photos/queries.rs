@@ -8,7 +8,7 @@ use super::types::{AssetItemType, AssetVersionSize};
 /// CloudKit field names requested in every query — must include all fields
 /// needed for filename resolution, version URLs, checksums, and metadata.
 /// Matches the Python `DESIRED_KEYS` list for API compatibility.
-pub const DESIRED_KEYS: &[&str] = &[
+pub(crate) const DESIRED_KEYS: &[&str] = &[
     "resJPEGFullWidth",
     "resJPEGFullHeight",
     "resJPEGFullFileType",
@@ -112,14 +112,14 @@ pub const DESIRED_KEYS: &[&str] = &[
     "isKeyAsset",
 ];
 
-pub static DESIRED_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::new(|| {
+pub(crate) static DESIRED_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::new(|| {
     DESIRED_KEYS
         .iter()
         .map(|k| Value::String((*k).to_string()))
         .collect()
 });
 
-pub fn item_type_from_str(s: &str) -> Option<AssetItemType> {
+pub(crate) fn item_type_from_str(s: &str) -> Option<AssetItemType> {
     match s {
         "public.heic"
         | "public.heif"
@@ -144,7 +144,7 @@ pub fn item_type_from_str(s: &str) -> Option<AssetItemType> {
 
 /// Maps logical version sizes to CloudKit field prefixes.
 /// The field prefix + "Res" gives the resource field (e.g., "resOriginalRes").
-pub const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str)] = &[
+pub(crate) const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str)] = &[
     (AssetVersionSize::Original, "resOriginal"),
     (AssetVersionSize::Alternative, "resOriginalAlt"),
     (AssetVersionSize::Medium, "resJPEGMed"),
@@ -155,13 +155,13 @@ pub const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str)] = &[
     (AssetVersionSize::LiveThumb, "resVidSmall"),
 ];
 
-pub const VIDEO_VERSION_LOOKUP: &[(AssetVersionSize, &str)] = &[
+pub(crate) const VIDEO_VERSION_LOOKUP: &[(AssetVersionSize, &str)] = &[
     (AssetVersionSize::Original, "resOriginal"),
     (AssetVersionSize::Medium, "resVidMed"),
     (AssetVersionSize::Thumb, "resVidSmall"),
 ];
 
-pub fn encode_params(params: &HashMap<String, Value>) -> String {
+pub(crate) fn encode_params(params: &HashMap<String, Value>) -> String {
     use std::borrow::Cow;
     let pairs: Vec<String> = params
         .iter()

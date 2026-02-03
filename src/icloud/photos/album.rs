@@ -34,6 +34,18 @@ pub struct PhotoAlbum {
     zone_id: Value,
 }
 
+impl std::fmt::Debug for PhotoAlbum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhotoAlbum")
+            .field("name", &self.name)
+            .field("service_endpoint", &self.service_endpoint)
+            .field("list_type", &self.list_type)
+            .field("obj_type", &self.obj_type)
+            .field("page_size", &self.page_size)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PhotoAlbum {
     pub fn new(config: PhotoAlbumConfig, session: Box<dyn PhotosSession>) -> Self {
         Self {
@@ -303,12 +315,6 @@ impl PhotoAlbum {
 impl std::fmt::Display for PhotoAlbum {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name)
-    }
-}
-
-impl std::fmt::Debug for PhotoAlbum {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<PhotoAlbum: '{}'>", self.name)
     }
 }
 

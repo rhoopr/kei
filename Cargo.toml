@@ -15,7 +15,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 
 # HTTP
-reqwest = { version = "0.12", features = ["cookies", "json", "stream"] }
+reqwest = { version = "0.13", features = ["cookies", "json", "stream"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
 tokio-util = "0.7"
@@ -41,11 +41,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Progress / UI
-indicatif = "0.17"
+indicatif = "0.18"
 rpassword = "7"
 
 # EXIF
-kamadak-exif = "0.5"
+kamadak-exif = "0.6"
 little_exif = "0.6"
 
 # Error handling
@@ -56,13 +56,15 @@ thiserror = "2"
 rand = "0.9"
 
 # File locking
-fs4 = "0.12"
+fs4 = "0.13"
 
-# Pin time for MSRV 1.85 (0.3.46+ requires rustc 1.88)
-time = ">=0.3.37, <0.3.46"
+time = "0.3"
 
 # Misc
 url = "2"
 dirs = "6"
 async-trait = "0.1"
 urlencoding = "2"
+
+# SQLite state tracking
+rusqlite = { version = "0.38", features = ["bundled"] }

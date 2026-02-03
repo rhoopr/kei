@@ -5,13 +5,13 @@
 use serde_json::{json, Value};
 
 #[derive(Debug)]
-pub struct FolderDef {
-    pub obj_type: &'static str,
-    pub list_type: &'static str,
-    pub query_filter: Option<Value>,
+pub(crate) struct FolderDef {
+    pub(crate) obj_type: &'static str,
+    pub(crate) list_type: &'static str,
+    pub(crate) query_filter: Option<Value>,
 }
 
-pub fn smart_folder_filter(field: &str, value: &str) -> Value {
+pub(crate) fn smart_folder_filter(field: &str, value: &str) -> Value {
     json!([{
         "fieldName": field,
         "comparator": "EQUALS",
@@ -19,7 +19,7 @@ pub fn smart_folder_filter(field: &str, value: &str) -> Value {
     }])
 }
 
-pub fn smart_folders() -> Vec<(&'static str, FolderDef)> {
+pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
     vec![
         (
             "Time-lapse",
@@ -102,4 +102,53 @@ pub fn smart_folders() -> Vec<(&'static str, FolderDef)> {
             },
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_smart_folders_count() {
+        let folders = smart_folders();
+        assert_eq!(folders.len(), 10);
+    }
+
+    #[test]
+    fn test_smart_folders_names() {
+        let folders = smart_folders();
+        let names: Vec<&str> = folders.iter().map(|(name, _)| *name).collect();
+        assert!(names.contains(&"Favorites"));
+        assert!(names.contains(&"Videos"));
+        assert!(names.contains(&"Screenshots"));
+        assert!(names.contains(&"Live"));
+        assert!(names.contains(&"Recently Deleted"));
+    }
+
+    #[test]
+    fn test_smart_folder_filter_produces_valid_json() {
+        let filter = smart_folder_filter("smartAlbum", "FAVORITE");
+        let arr = filter.as_array().expect("filter should be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["fieldName"], "smartAlbum");
+        assert_eq!(arr[0]["comparator"], "EQUALS");
+        assert_eq!(arr[0]["fieldValue"]["value"], "FAVORITE");
+    }
+
+    #[test]
+    fn test_bursts_has_no_filter() {
+        let folders = smart_folders();
+        let bursts = folders.iter().find(|(name, _)| *name == "Bursts").unwrap();
+        assert!(bursts.1.query_filter.is_none());
+    }
+
+    #[test]
+    fn test_favorites_has_filter() {
+        let folders = smart_folders();
+        let favorites = folders
+            .iter()
+            .find(|(name, _)| *name == "Favorites")
+            .unwrap();
+        assert!(favorites.1.query_filter.is_some());
+    }
 }

@@ -15,15 +15,15 @@ A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud
 ## Status
 
 > [!IMPORTANT]
-> Early development. Core authentication (SRP, 2FA) and photo download are functional, but several features are still in progress. Expect breaking changes.
+> Early development. Core authentication (SRP, 2FA), photo download, and SQLite state tracking are functional, but several features are still in progress. Expect breaking changes.
 
 See [CHANGELOG.md](CHANGELOG.md) for what's already implemented and how it differs from the Python version.
 
 ## Roadmap
 
-**Now** — Incremental sync (skip already-downloaded assets across runs) via SQLite state tracking.
+**Now** — XMP sidecar export and shared library downloads.
 
-**Next** — XMP sidecar export, shared library downloads, OS keyring integration, robust daemon mode with systemd/launchd support, and additional download controls.
+**Next** — OS keyring integration, robust daemon mode with systemd/launchd support, and additional download controls.
 
 **Later** — iCloud lifecycle management (auto-delete, delete-after-download), notifications, headless MFA for Docker, and multi-account support.
 
@@ -38,7 +38,26 @@ Binary: `target/release/icloudpd-rs`
 ## Usage
 
 ```sh
+# Download photos (default command)
 icloudpd-rs --username my@email.address --directory /photos
+
+# Or explicitly use the sync subcommand
+icloudpd-rs sync --username my@email.address --directory /photos
+
+# Check sync status and database summary
+icloudpd-rs status --username my@email.address
+
+# Retry failed downloads
+icloudpd-rs retry-failed --username my@email.address --directory /photos
+
+# Import existing local files into state database
+icloudpd-rs import-existing --username my@email.address --directory /photos
+
+# Verify downloaded files exist and check checksums
+icloudpd-rs verify --username my@email.address --checksums
+
+# Reset state database and start fresh
+icloudpd-rs reset-state --username my@email.address --yes
 ```
 
 If `--password` is not provided, you will be prompted securely at the terminal. You can also set the `ICLOUD_PASSWORD` environment variable.

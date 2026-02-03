@@ -148,17 +148,15 @@ async fn attempt_download(
     let status = response.status().as_u16();
 
     // 206 = resumed successfully, 200 = server ignored Range (start over)
-    let (mut hasher, mut bytes_written, truncate) = if status == 206 && resume_offset > 0 {
-        let (hasher, len) =
-            resume_state.expect("resume_state must be Some when status=206 and resume_offset>0");
-        (hasher, len, false)
-    } else if response.status().is_success() {
-        (Sha256::new(), 0u64, true)
-    } else {
-        return Err(DownloadError::HttpStatus {
-            status,
-            path: path_str,
-        });
+    let (mut hasher, mut bytes_written, truncate) = match (status, resume_offset, resume_state) {
+        (206, offset, Some((h, len))) if offset > 0 => (h, len, false),
+        (_, _, _) if response.status().is_success() => (Sha256::new(), 0u64, true),
+        _ => {
+            return Err(DownloadError::HttpStatus {
+                status,
+                path: path_str,
+            });
+        }
     };
 
     let content_length = response.content_length();
@@ -228,5 +226,40 @@ mod tests {
         assert_eq!(base32_encode(b"f"), "MY");
         assert_eq!(base32_encode(b"fo"), "MZXQ");
         assert_eq!(base32_encode(b"foo"), "MZXW6");
+    }
+
+    #[test]
+    fn test_temp_download_path_valid_checksum() {
+        // Base64 "AAAA" decodes to [0, 0, 0], base32 encodes to "AAAAA"
+        let path = PathBuf::from("/photos/test.jpg");
+        let result = temp_download_path(&path, "AAAA").unwrap();
+        assert_eq!(result.parent().unwrap(), Path::new("/photos"));
+        assert!(result.to_string_lossy().ends_with(".part"));
+    }
+
+    #[test]
+    fn test_temp_download_path_derives_from_checksum() {
+        let path = PathBuf::from("/photos/test.jpg");
+        let result1 = temp_download_path(&path, "AAAA").unwrap();
+        let result2 = temp_download_path(&path, "AAAB").unwrap();
+        // Different checksums should produce different .part filenames
+        assert_ne!(result1, result2);
+    }
+
+    #[test]
+    fn test_temp_download_path_same_checksum_same_result() {
+        let path1 = PathBuf::from("/photos/a.jpg");
+        let path2 = PathBuf::from("/photos/b.jpg");
+        let result1 = temp_download_path(&path1, "AAAA").unwrap();
+        let result2 = temp_download_path(&path2, "AAAA").unwrap();
+        // Same checksum, same directory -> same .part file (for resume)
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn test_temp_download_path_invalid_base64() {
+        let path = PathBuf::from("/photos/test.jpg");
+        let result = temp_download_path(&path, "not-valid-base64!!!");
+        assert!(result.is_err());
     }
 }

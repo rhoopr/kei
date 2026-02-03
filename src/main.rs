@@ -14,13 +14,18 @@ mod download;
 mod icloud;
 pub mod retry;
 mod shutdown;
+mod state;
 mod types;
 
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+use cli::{AuthArgs, Command};
+use state::StateDb;
 
 /// Maximum number of re-authentication attempts before giving up.
 const MAX_REAUTH_ATTEMPTS: u32 = 3;
@@ -77,6 +82,411 @@ where
     Ok(())
 }
 
+/// Expand ~ to the user's home directory.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Get the database path for a given auth config.
+fn get_db_path(auth: &AuthArgs) -> PathBuf {
+    let cookie_dir = expand_tilde(&auth.cookie_directory);
+    cookie_dir.join(format!(
+        "{}.db",
+        auth::session::sanitize_username(&auth.username)
+    ))
+}
+
+/// Run the status command.
+async fn run_status(args: cli::StatusArgs) -> anyhow::Result<()> {
+    let db_path = get_db_path(&args.auth);
+
+    if !db_path.exists() {
+        println!("No state database found at {}", db_path.display());
+        println!("Run a sync first to create the database.");
+        return Ok(());
+    }
+
+    let db = state::SqliteStateDb::open(&db_path).await?;
+    let summary = db.get_summary().await?;
+
+    println!("State Database: {}", db_path.display());
+    println!();
+    println!("Assets:");
+    println!("  Total:      {}", summary.total_assets);
+    println!("  Downloaded: {}", summary.downloaded);
+    println!("  Pending:    {}", summary.pending);
+    println!("  Failed:     {}", summary.failed);
+    println!();
+
+    if let Some(started) = &summary.last_sync_started {
+        println!(
+            "Last sync started:   {}",
+            started.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+    }
+    if let Some(completed) = &summary.last_sync_completed {
+        println!(
+            "Last sync completed: {}",
+            completed.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+    }
+
+    if args.failed && summary.failed > 0 {
+        println!();
+        println!("Failed assets:");
+        let failed = db.get_failed().await?;
+        for asset in failed {
+            let last_seen = asset.last_seen_at.format("%Y-%m-%d %H:%M:%S");
+            println!(
+                "  {} ({}) - {} (attempts: {}, last seen: {})",
+                asset.filename,
+                asset.id,
+                asset.last_error.as_deref().unwrap_or("unknown error"),
+                asset.download_attempts,
+                last_seen
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the reset-state command.
+async fn run_reset_state(args: cli::ResetStateArgs) -> anyhow::Result<()> {
+    let db_path = get_db_path(&args.auth);
+
+    if !db_path.exists() {
+        println!("No state database found at {}", db_path.display());
+        return Ok(());
+    }
+
+    if !args.yes {
+        println!("This will delete the state database at:");
+        println!("  {}", db_path.display());
+        println!();
+        print!("Are you sure? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    std::fs::remove_file(&db_path)?;
+    println!("State database deleted.");
+
+    // Also remove WAL and SHM files if they exist
+    let wal_path = db_path.with_extension("db-wal");
+    let shm_path = db_path.with_extension("db-shm");
+    let _ = std::fs::remove_file(&wal_path);
+    let _ = std::fs::remove_file(&shm_path);
+
+    Ok(())
+}
+
+/// Run the verify command.
+async fn run_verify(args: cli::VerifyArgs) -> anyhow::Result<()> {
+    let db_path = get_db_path(&args.auth);
+
+    if !db_path.exists() {
+        println!("No state database found at {}", db_path.display());
+        println!("Run a sync first to create the database.");
+        return Ok(());
+    }
+
+    let db = state::SqliteStateDb::open(&db_path).await?;
+    let downloaded = db.get_all_downloaded().await?;
+
+    println!("Verifying {} downloaded assets...", downloaded.len());
+    println!();
+
+    let mut missing = 0;
+    let mut corrupted = 0;
+    let mut verified = 0;
+
+    for asset in &downloaded {
+        // Sanity check: all assets from get_all_downloaded should have Downloaded status
+        debug_assert_eq!(asset.status, state::AssetStatus::Downloaded);
+
+        if let Some(local_path) = &asset.local_path {
+            if !local_path.exists() {
+                let downloaded_at = asset
+                    .downloaded_at
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!(
+                    "MISSING: {} ({}) - downloaded {}",
+                    local_path.display(),
+                    asset.id,
+                    downloaded_at
+                );
+                missing += 1;
+                continue;
+            }
+
+            if args.checksums {
+                // Verify checksum
+                match verify_checksum(local_path, &asset.checksum).await {
+                    Ok(true) => verified += 1,
+                    Ok(false) => {
+                        println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
+                        corrupted += 1;
+                    }
+                    Err(e) => {
+                        println!("ERROR: {} - {}", local_path.display(), e);
+                        corrupted += 1;
+                    }
+                }
+            } else {
+                verified += 1;
+            }
+        } else {
+            println!("NO PATH: {} - no local path recorded", asset.id);
+            missing += 1;
+        }
+    }
+
+    println!();
+    println!("Results:");
+    println!("  Verified:  {}", verified);
+    println!("  Missing:   {}", missing);
+    if args.checksums {
+        println!("  Corrupted: {}", corrupted);
+    }
+
+    if missing > 0 || corrupted > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Verify a file's SHA256 checksum.
+async fn verify_checksum(path: &Path, expected: &str) -> anyhow::Result<bool> {
+    use sha2::{Digest, Sha256};
+
+    let path = path.to_path_buf();
+    let expected = expected.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        let hash = hasher.finalize();
+        let computed: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+
+        // Apple sometimes uses a 33-byte format with a leading byte
+        let expected_normalized = if expected.len() == 66 && expected.starts_with("01") {
+            &expected[2..]
+        } else {
+            &expected
+        };
+
+        Ok(computed.eq_ignore_ascii_case(expected_normalized))
+    })
+    .await?
+}
+
+/// Run the import-existing command.
+///
+/// This imports existing local files into the state database by:
+/// 1. Enumerating all iCloud assets via the photos API
+/// 2. Computing the expected local path for each asset
+/// 3. If the file exists and size matches, marking it as downloaded in the DB
+async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
+    use chrono::Local;
+    use futures_util::StreamExt;
+    use icloud::photos::AssetVersionSize;
+
+    let db_path = get_db_path(&args.auth);
+    let directory = expand_tilde(&args.directory);
+
+    if !directory.exists() {
+        anyhow::bail!("Directory does not exist: {}", directory.display());
+    }
+
+    // Create or open the state database
+    let db = Arc::new(state::SqliteStateDb::open(&db_path).await?);
+    tracing::info!("State database at {}", db_path.display());
+
+    // Authenticate
+    let password_provider = {
+        let pw = args.auth.password.clone();
+        move || -> Option<String> {
+            pw.clone().or_else(|| {
+                tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
+            })
+        }
+    };
+
+    let cookie_directory = expand_tilde(&args.auth.cookie_directory);
+    let auth_result = auth::authenticate(
+        &cookie_directory,
+        &args.auth.username,
+        &password_provider,
+        args.auth.domain.as_str(),
+        None,
+        None,
+    )
+    .await?;
+
+    let ckdatabasews_url = auth_result
+        .data
+        .webservices
+        .as_ref()
+        .and_then(|ws| ws.ckdatabasews.as_ref())
+        .map(|ep| ep.url.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
+
+    let mut params = std::collections::HashMap::new();
+    params.insert(
+        "clientBuildNumber".to_string(),
+        serde_json::Value::String("2522Project44".to_string()),
+    );
+    params.insert(
+        "clientMasteringNumber".to_string(),
+        serde_json::Value::String("2522B2".to_string()),
+    );
+    params.insert(
+        "clientId".to_string(),
+        serde_json::Value::String(auth_result.session.client_id().cloned().unwrap_or_default()),
+    );
+    if let Some(dsid) = &auth_result
+        .data
+        .ds_info
+        .as_ref()
+        .and_then(|ds| ds.dsid.as_ref())
+    {
+        params.insert(
+            "dsid".to_string(),
+            serde_json::Value::String(dsid.to_string()),
+        );
+    }
+
+    let shared_session: auth::SharedSession =
+        Arc::new(tokio::sync::RwLock::new(auth_result.session));
+    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
+
+    tracing::info!("Initializing photos service...");
+    let photos_service =
+        icloud::photos::PhotosService::new(ckdatabasews_url.to_string(), session_box, params)
+            .await?;
+
+    let all_album = photos_service.all();
+    let stream = all_album.photo_stream(args.recent);
+    tokio::pin!(stream);
+
+    println!("Scanning iCloud assets and matching with local files...");
+
+    let mut matched = 0u64;
+    let mut unmatched = 0u64;
+    let mut total = 0u64;
+
+    while let Some(result) = stream.next().await {
+        let asset: icloud::photos::PhotoAsset = match result {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("Error fetching asset: {}", e);
+                continue;
+            }
+        };
+
+        total += 1;
+
+        // Get filename from the asset
+        let filename = match asset.filename() {
+            Some(f) => f.to_string(),
+            None => {
+                tracing::debug!(id = %asset.id(), "Skipping asset with no filename");
+                continue;
+            }
+        };
+
+        // Get versions
+        let versions = asset.versions();
+        if versions.is_empty() {
+            tracing::debug!(id = %asset.id(), "Skipping asset with no versions");
+            continue;
+        }
+
+        // Get the created date in local time for path computation
+        let created_local = asset.created().with_timezone(&Local);
+
+        // Check each version (we only check "original" for import since that's
+        // what the normal sync would download)
+        if let Some(version) = versions.get(&AssetVersionSize::Original) {
+            let expected_path = download::paths::local_download_path(
+                &directory,
+                &args.folder_structure,
+                &created_local,
+                &filename,
+            );
+
+            if expected_path.exists() {
+                // Check size matches
+                if let Ok(metadata) = std::fs::metadata(&expected_path) {
+                    if metadata.len() == version.size {
+                        // File exists with matching size - mark as downloaded
+                        let version_size_str = "original".to_string();
+                        let media_type = download::determine_media_type(&version_size_str, &asset);
+                        let record = state::AssetRecord::new_pending(
+                            asset.id().to_string(),
+                            version_size_str.clone(),
+                            version.checksum.clone(),
+                            filename.clone(),
+                            asset.created(),
+                            Some(asset.added_date()),
+                            version.size,
+                            media_type,
+                        );
+
+                        if let Err(e) = db.upsert_seen(&record).await {
+                            tracing::warn!("Failed to record asset {}: {}", asset.id(), e);
+                            continue;
+                        }
+
+                        if let Err(e) = db
+                            .mark_downloaded(asset.id(), &version_size_str, &expected_path)
+                            .await
+                        {
+                            tracing::warn!("Failed to mark {} as downloaded: {}", asset.id(), e);
+                            continue;
+                        }
+
+                        matched += 1;
+                        if matched.is_multiple_of(100) {
+                            println!("  Matched {} files so far...", matched);
+                        }
+                    } else {
+                        unmatched += 1;
+                    }
+                } else {
+                    unmatched += 1;
+                }
+            } else {
+                unmatched += 1;
+            }
+        }
+    }
+
+    println!();
+    println!("Import complete:");
+    println!("  Total assets scanned: {}", total);
+    println!("  Files matched:        {}", matched);
+    println!("  Unmatched versions:   {}", unmatched);
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
@@ -93,7 +503,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = config::Config::from_cli(cli)?;
+    // Dispatch based on command
+    let is_retry_failed = matches!(cli.effective_command(), Command::RetryFailed(_));
+    match cli.effective_command() {
+        Command::Status(args) => return run_status(args).await,
+        Command::ResetState(args) => return run_reset_state(args).await,
+        Command::Verify(args) => return run_verify(args).await,
+        Command::ImportExisting(args) => return run_import_existing(args).await,
+        Command::Sync { .. } | Command::RetryFailed(_) => {
+            // Continue with sync logic below
+        }
+    }
+
+    // For Sync and RetryFailed, use legacy config path
+    let legacy_cli: cli::LegacyCli = cli.into();
+    let config = config::Config::from_cli(legacy_cli)?;
     tracing::info!(concurrency = config.threads_num, "Starting icloudpd-rs");
 
     let password_provider = {
@@ -212,6 +636,45 @@ async fn main() -> anyhow::Result<()> {
         matched
     };
 
+    // Initialize state database
+    let state_db: Option<Arc<dyn state::StateDb>> = {
+        let db_path = config.cookie_directory.join(format!(
+            "{}.db",
+            auth::session::sanitize_username(&config.username)
+        ));
+        match state::SqliteStateDb::open(&db_path).await {
+            Ok(db) => {
+                tracing::debug!("State database opened at {}", db_path.display());
+                let db = Arc::new(db);
+
+                // For retry-failed, reset failed assets to pending
+                if is_retry_failed {
+                    match db.reset_failed().await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(count, "Reset failed assets to pending");
+                        }
+                        Ok(_) => {
+                            tracing::info!("No failed assets to retry");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to reset failed assets: {}", e);
+                        }
+                    }
+                }
+
+                Some(db as Arc<dyn state::StateDb>)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to open state database at {}: {}. Continuing without state tracking.",
+                    db_path.display(),
+                    e
+                );
+                None
+            }
+        }
+    };
+
     let download_config = download::DownloadConfig {
         directory: config.directory.clone(),
         folder_structure: config.folder_structure.clone(),
@@ -239,6 +702,7 @@ async fn main() -> anyhow::Result<()> {
         align_raw: config.align_raw,
         no_progress_bar: config.no_progress_bar,
         file_match_policy: config.file_match_policy,
+        state_db,
     };
 
     let shutdown_token = shutdown::install_signal_handler()?;

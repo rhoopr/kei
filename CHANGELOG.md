@@ -21,6 +21,32 @@ Benchmarked against Python icloudpd 1.32.2 on macOS with WiFi (84 runs, ~500GB t
 
 ## Current (unreleased)
 
+### SQLite State Tracking
+- **Always-on state database** — every sync run records asset state per-file in a SQLite database (`<cookie_directory>/<username>.db`)
+- Tracks asset status: `pending`, `downloaded`, `failed`
+- Tracks download metadata: checksum, filename, local path, download attempts, last error
+- **Skip-by-DB downloads** — assets already marked as downloaded are skipped without filesystem checks (faster second runs)
+- **File existence verification** — if DB says downloaded but file is missing, re-downloads automatically
+- **Sync run tracking** — records start time, completion time, and statistics (assets seen, downloaded, failed, interrupted) for each sync run
+
+> [!IMPORTANT]
+> **Change from Python:** Python icloudpd has no persistent state — every run re-scans the entire library and filesystem. icloudpd-rs tracks state in SQLite, making subsequent syncs near-instant for unchanged libraries.
+
+### CLI Subcommands
+New subcommand structure (backwards compatible — bare `icloudpd-rs --username ...` still works as `sync`):
+
+| Command | Purpose |
+|---------|---------|
+| `sync` | Download photos from iCloud (default) |
+| `status` | Show sync status and database summary |
+| `retry-failed` | Reset failed downloads to pending and re-sync |
+| `reset-state` | Delete the state database and start fresh |
+| `import-existing` | Import existing local files into the state database |
+| `verify` | Verify downloaded files exist and optionally check checksums |
+
+> [!TIP]
+> Use `status --failed` to list failed assets with error messages
+
 ### Authentication
 - SRP-6a authentication with Apple's custom protocol variants (including automatic `s2k`/`s2k_fo` negotiation)
 - Two-factor authentication (trusted device code) with trust token persistence
@@ -115,6 +141,14 @@ Benchmarked against Python icloudpd 1.32.2 on macOS with WiFi (84 runs, ~500GB t
 
 > [!CAUTION]
 > **Change from Python:** `--until-found` removed — will be replaced by stateful incremental sync with local database
+
+### Code Quality
+- Removed all `#[allow(dead_code)]` on error enum variants by removing unused variants
+- Removed `#[allow(clippy::enum_variant_names)]` by renaming `RawTreatmentPolicy` variants (`AsIs` → `Unchanged`, `AsOriginal` → `PreferOriginal`, `AsAlternative` → `PreferAlternative`) — CLI flag values unchanged
+- Added custom `Debug` implementations for structs containing non-Debug types (e.g., `reqwest::Client`, `Box<dyn Trait>`)
+- Changed internal APIs from `pub` to `pub(crate)` for proper encapsulation
+- Replaced `.expect()` calls with proper error handling patterns
+- Fixed `if let Some(ref x) = foo` to idiomatic `if let Some(x) = &foo`
 
 ### Not Yet Wired (parsed but inactive)
 - `--force-size` — download only the requested size without fallback to original
