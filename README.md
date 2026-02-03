@@ -55,8 +55,10 @@ If `--password` is not provided, you will be prompted securely at the terminal. 
 | `-d, --directory` | Local download directory | |
 | `-a, --album` | Album(s) to download (repeatable) | all |
 | `--recent N` | Download only the N most recent photos | |
-| `--threads-num N` | Number of concurrent downloads | `1` |
+| `--threads-num N` | Number of concurrent downloads | `10` |
+| `--max-retries N` | Retry attempts per failed download | `3` |
 | `--folder-structure` | Folder template for organizing downloads | `%Y/%m/%d` |
+| `--log-level` | Log verbosity (`error`, `warn`, `info`, `debug`) | `info` |
 | `--watch-with-interval N` | Run continuously, waiting N seconds between runs | |
 | `--dry-run` | Preview without modifying files or iCloud | |
 

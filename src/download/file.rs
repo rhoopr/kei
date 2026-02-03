@@ -97,7 +97,7 @@ async fn resume_hash_state(part_path: &Path) -> Option<(Sha256, u64)> {
     let file = fs::File::open(part_path).await.ok()?;
     let mut reader = tokio::io::BufReader::new(file);
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; 262_144]; // 256 KiB for faster resume hashing
     loop {
         let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
             .await

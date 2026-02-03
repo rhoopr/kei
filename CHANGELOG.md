@@ -20,16 +20,17 @@
 > **Change from Python:** Session and cookie files are restricted to owner-only permissions (`0600`) on Unix
 
 ### Downloads
-- Streaming download pipeline with configurable concurrent downloads (`--threads-num`)
+- Streaming download pipeline with configurable concurrent downloads (`--threads-num`, default: 10)
+- Separate HTTP client for downloads — no total request timeout, so large files aren't killed mid-transfer. Uses 30s connect timeout and 120s read timeout for stall detection.
 
 > [!IMPORTANT]
-> **Change from Python:** `--threads-num` controls actual concurrent downloads — Python deprecated this flag and always downloads sequentially
-- Resumable partial downloads via HTTP Range requests with SHA256 verification
-- Retry with exponential backoff, jitter, and transient/permanent error classification (`--max-retries`, `--retry-delay`)
+> **Change from Python:** `--threads-num` controls actual concurrent downloads (default: 10) — Python deprecated this flag and always downloads sequentially
+- Resumable partial downloads via HTTP Range requests with SHA256 verification (256KB hash buffer for fast resume)
+- Retry with exponential backoff, jitter, and transient/permanent error classification (`--max-retries` default: 3, `--retry-delay`)
 
 > [!TIP]
 > **Change from Python:** `--max-retries` and `--retry-delay` are new flags — Python hardcodes `MAX_RETRIES = 0` with no user control
-- Progress bar tracking download progress, auto-hidden in non-TTY environments (`--no-progress-bar`)
+- Progress bar tracking download progress, auto-hidden in non-TTY environments (`--no-progress-bar`). Skipped files (already downloaded) advance the counter on resume.
 - Live photo MOV collision detection — when a regular video occupies the same filename, the companion MOV is saved with an asset ID suffix (e.g. `IMG_0001-ASSET_ID.MOV`)
 - Two-phase cleanup pass — retries failures with fresh CDN URLs
 - Low memory streaming for large libraries (100k+ photos)
@@ -82,7 +83,7 @@
 - Graceful shutdown — first Ctrl+C / SIGTERM / SIGHUP finishes in-flight downloads then exits; second signal force-exits immediately. Partial `.part` files are kept for smart resume on next run. Watch mode sleep is interruptible.
 - Library indexing readiness check before querying (waits for CloudKit indexing to finish)
 - Album and shared library enumeration
-- Log level control, domain selection (com/cn), custom cookie directory
+- Log level control (`--log-level`: `debug`, `info`, `warn`, `error`; default: `info`), domain selection (com/cn), custom cookie directory
 
 > [!TIP]
 > **Change from Python:** `--recent N` stops fetching from the API after N photos instead of enumerating the entire library first

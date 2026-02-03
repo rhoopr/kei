@@ -63,6 +63,7 @@ struct CookieEntry {
 /// allowing authentication to survive across process restarts.
 pub struct Session {
     client: Client,
+    download_client: Client,
     /// Held for the lifetime of the Session so the `Arc` reference kept by
     /// `reqwest::Client` stays alive. Not accessed directly after construction.
     #[allow(dead_code)]
@@ -187,8 +188,18 @@ impl Session {
 
         let client = Client::builder()
             .cookie_provider(cookie_jar.clone())
-            .default_headers(default_headers)
+            .default_headers(default_headers.clone())
             .timeout(timeout)
+            .build()?;
+
+        // Separate client for file downloads: no total timeout so large files
+        // aren't killed mid-transfer. connect_timeout catches unreachable hosts;
+        // read_timeout detects stalled connections (no bytes for 120s).
+        let download_client = Client::builder()
+            .cookie_provider(cookie_jar.clone())
+            .default_headers(default_headers)
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(120))
             .build()?;
 
         let session_path = cookie_dir.join(format!("{}.session", sanitized));
@@ -223,6 +234,7 @@ impl Session {
 
         Ok(Self {
             client,
+            download_client,
             cookie_jar,
             session_data,
             cookie_dir,
@@ -384,6 +396,15 @@ impl Session {
     /// not duplicate connections or state.
     pub fn http_client(&self) -> Client {
         self.client.clone()
+    }
+
+    /// Return a clone of the download-specific HTTP client.
+    ///
+    /// Unlike `http_client()`, this client has no total request timeout so
+    /// large file transfers aren't killed mid-stream. It uses a 30s connect
+    /// timeout and 120s read timeout for stall detection.
+    pub fn download_client(&self) -> Client {
+        self.download_client.clone()
     }
 }
 

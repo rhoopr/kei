@@ -53,8 +53,8 @@ pub struct Cli {
     #[arg(long)]
     pub recent: Option<u32>,
 
-    /// Number of concurrent download threads (default: 1)
-    #[arg(long = "threads-num", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    /// Number of concurrent download threads (default: 10)
+    #[arg(long = "threads-num", default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..))]
     pub threads_num: u16,
 
     /// Don't download videos
@@ -94,7 +94,7 @@ pub struct Cli {
     pub watch_with_interval: Option<u64>,
 
     /// Log level
-    #[arg(long, value_enum, default_value = "error")]
+    #[arg(long, value_enum, default_value = "info")]
     pub log_level: LogLevel,
 
     /// Disable progress bar
@@ -133,8 +133,8 @@ pub struct Cli {
     #[arg(long)]
     pub only_print_filenames: bool,
 
-    /// Max retries per download (default: 2, 0 = no retries)
-    #[arg(long, default_value_t = 2)]
+    /// Max retries per download (default: 3, 0 = no retries)
+    #[arg(long, default_value_t = 3)]
     pub max_retries: u32,
 
     /// Initial retry delay in seconds (default: 5)
@@ -156,9 +156,9 @@ mod tests {
     }
 
     #[test]
-    fn test_threads_num_defaults_to_1() {
+    fn test_threads_num_defaults_to_10() {
         let cli = parse(&base_args());
-        assert_eq!(cli.threads_num, 1);
+        assert_eq!(cli.threads_num, 10);
     }
 
     #[test]
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn test_max_retries_default() {
         let cli = parse(&base_args());
-        assert_eq!(cli.max_retries, 2);
+        assert_eq!(cli.max_retries, 3);
     }
 
     #[test]

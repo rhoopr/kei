@@ -21,7 +21,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 2,
+            max_retries: 3,
             base_delay_secs: 5,
             max_delay_secs: 60,
         }
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = RetryConfig::default();
-        assert_eq!(config.max_retries, 2);
+        assert_eq!(config.max_retries, 3);
         assert_eq!(config.base_delay_secs, 5);
         assert_eq!(config.max_delay_secs, 60);
     }

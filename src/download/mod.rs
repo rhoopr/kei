@@ -58,6 +58,7 @@ struct DownloadTask {
     download_path: PathBuf,
     checksum: String,
     created_local: DateTime<Local>,
+    size: u64,
 }
 
 /// Eagerly enumerate all albums and build a complete task list.
@@ -179,6 +180,7 @@ fn filter_asset_to_tasks(
                 download_path: download_path.clone(),
                 checksum: version.checksum.clone(),
                 created_local,
+                size: version.size,
             });
         }
     }
@@ -236,6 +238,7 @@ fn filter_asset_to_tasks(
                     download_path: path,
                     checksum: live_version.checksum.clone(),
                     created_local,
+                    size: live_version.size,
                 });
             }
         }
@@ -272,7 +275,7 @@ fn create_progress_bar(no_progress_bar: bool, total: u64) -> ProgressBar {
 /// background task prefetches the next page via a channel buffer, so API
 /// latency overlaps with download I/O.
 async fn stream_and_download(
-    client: &Client,
+    download_client: &Client,
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
     shutdown_token: CancellationToken,
@@ -320,7 +323,7 @@ async fn stream_and_download(
         return Ok((count, Vec::new()));
     }
 
-    let client = client.clone();
+    let download_client = download_client.clone();
     let retry_config = config.retry;
     let set_exif = config.set_exif_datetime;
     let concurrency = config.concurrent_downloads;
@@ -332,7 +335,17 @@ async fn stream_and_download(
     let task_stream = combined
         .filter_map(|result| async move {
             match result {
-                Ok(asset) => Some(filter_asset_to_tasks(&asset, config)),
+                Ok(asset) => {
+                    let tasks = filter_asset_to_tasks(&asset, config);
+                    if tasks.is_empty() {
+                        // Asset already downloaded or filtered out — advance
+                        // the progress bar so the position reflects skipped items.
+                        pb_ref.inc(1);
+                        None
+                    } else {
+                        Some(tasks)
+                    }
+                }
                 Err(e) => {
                     // indicatif needs `suspend` to coordinate stderr/stdout writes
                     // with the progress bar redraw, preventing garbled output.
@@ -345,7 +358,7 @@ async fn stream_and_download(
 
     let download_stream = task_stream
         .map(|task| {
-            let client = client.clone();
+            let client = download_client.clone();
             async move {
                 let result = download_single_task(&client, &task, &retry_config, set_exif).await;
                 (task, result)
@@ -392,7 +405,7 @@ async fn stream_and_download(
 /// originals may have expired during a long Phase 1) and retry failures at
 /// reduced concurrency to give large files full bandwidth.
 pub async fn download_photos(
-    client: &Client,
+    download_client: &Client,
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
     shutdown_token: CancellationToken,
@@ -400,7 +413,7 @@ pub async fn download_photos(
     let started = Instant::now();
 
     let (downloaded, failed_tasks) =
-        stream_and_download(client, albums, config, shutdown_token.clone()).await?;
+        stream_and_download(download_client, albums, config, shutdown_token.clone()).await?;
 
     if downloaded == 0 && failed_tasks.is_empty() {
         if config.dry_run {
@@ -453,7 +466,7 @@ pub async fn download_photos(
 
     let phase2_task_count = fresh_tasks.len();
     let remaining_failed = run_download_pass(
-        client,
+        download_client,
         fresh_tasks,
         &config.retry,
         config.set_exif_datetime,
@@ -542,6 +555,12 @@ async fn download_single_task(
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+
+    tracing::debug!(
+        size_bytes = task.size,
+        path = %task.download_path.display(),
+        "downloading",
+    );
 
     file::download_file(
         client,
@@ -691,6 +710,7 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].url, "https://example.com/orig");
         assert_eq!(tasks[0].checksum, "abc123");
+        assert_eq!(tasks[0].size, 1000);
     }
 
     #[test]
@@ -711,6 +731,27 @@ mod tests {
         let mut config = test_config();
         config.skip_videos = true;
         assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_filter_video_task_carries_size() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "VID_2", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 500_000_000,
+                    "downloadURL": "https://example.com/big_vid",
+                    "fileChecksum": "big_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].size, 500_000_000);
     }
 
     #[test]
@@ -808,7 +849,9 @@ mod tests {
         let tasks = filter_asset_to_tasks(&asset, &config);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(tasks[0].size, 2000);
         assert_eq!(tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(tasks[1].size, 3000);
         assert!(tasks[1]
             .download_path
             .to_str()
@@ -1161,12 +1204,14 @@ mod tests {
                 download_path: PathBuf::from("/tmp/claude/shutdown_test/a.jpg"),
                 checksum: "aaa".into(),
                 created_local: chrono::Local::now(),
+                size: 1000,
             },
             DownloadTask {
                 url: "https://example.com/b".into(),
                 download_path: PathBuf::from("/tmp/claude/shutdown_test/b.jpg"),
                 checksum: "bbb".into(),
                 created_local: chrono::Local::now(),
+                size: 2000,
             },
         ];
 
@@ -1187,6 +1232,7 @@ mod tests {
             download_path: PathBuf::from("/tmp/claude/shutdown_test/c.jpg"),
             checksum: "ccc".into(),
             created_local: chrono::Local::now(),
+            size: 500,
         }];
 
         let client = Client::new();

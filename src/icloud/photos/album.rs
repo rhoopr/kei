@@ -220,7 +220,7 @@ impl PhotoAlbum {
                     offset += 1;
                 }
 
-                tracing::info!("  fetched {} photos so far...", total_sent);
+                tracing::debug!(count = total_sent, "fetched photos so far");
 
                 if limit_reached {
                     break;
