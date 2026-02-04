@@ -55,21 +55,45 @@ See the [Changelog](CHANGELOG.md) for detailed feature notes and differences fro
 
 ## Installation
 
+### Homebrew (macOS & Linux)
+
+```sh
+brew tap rhoopr/icloudpd-rs
+brew install icloudpd-rs
+```
+
+### Pre-built Binaries
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/rhoopr/icloudpd-rs/releases):
+
+| Platform | Architecture | Download |
+|----------|--------------|----------|
+| macOS | Apple Silicon | `icloudpd-rs-macos-aarch64.tar.gz` |
+| macOS | Intel | `icloudpd-rs-macos-x86_64.tar.gz` |
+| Linux | ARM64 | `icloudpd-rs-linux-aarch64.tar.gz` |
+| Linux | x86_64 | `icloudpd-rs-linux-x86_64.tar.gz` |
+| Windows | x86_64 | `icloudpd-rs-windows-x86_64.zip` |
+
+```sh
+# Example: macOS Apple Silicon
+curl -LO https://github.com/rhoopr/icloudpd-rs/releases/latest/download/icloudpd-rs-macos-aarch64.tar.gz
+tar xzf icloudpd-rs-macos-aarch64.tar.gz
+./icloudpd-rs --help
+```
+
 ### From Source
 
 ```sh
-# Clone and build
 git clone https://github.com/rhoopr/icloudpd-rs.git
 cd icloudpd-rs
 cargo build --release
-
-# Binary location
-./target/release/icloudpd-rs --version
+./target/release/icloudpd-rs --help
 ```
+
+Requires Rust 1.85 or later.
 
 ### Requirements
 
-- Rust 1.85 or later
 - An iCloud account with two-factor authentication enabled
 
 ## Quick Start
