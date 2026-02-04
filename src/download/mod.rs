@@ -23,6 +23,8 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use futures_util::stream::{self, StreamExt};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::types::AssetVersion;
@@ -123,6 +125,7 @@ pub enum DownloadOutcome {
 
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
+#[derive(Clone)]
 pub struct DownloadConfig {
     pub(crate) directory: std::path::PathBuf,
     pub(crate) folder_structure: String,
@@ -754,124 +757,124 @@ async fn stream_and_download(
     let mut downloaded = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
-    let mut assets_seen = 0u64;
 
-    // Collect records for batch upsert
-    let mut pending_records: Vec<AssetRecord> = Vec::new();
+    // Use a bounded channel to stream tasks from the producer to the download loop.
+    // This allows downloads to start immediately as assets arrive from the API,
+    // rather than waiting for all assets to be enumerated first.
+    let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
 
-    // Collect all download tasks first, processing assets sequentially to ensure
-    // proper collision detection via claimed_paths. This trades some streaming
-    // benefit for correctness when multiple assets share the same filename.
-    let mut all_tasks: Vec<DownloadTask> = Vec::new();
-    while let Some(result) = combined.next().await {
-        if shutdown_token.is_cancelled() {
-            break;
-        }
-        match result {
-            Ok(asset) => {
-                assets_seen += 1;
-                let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths);
-                if tasks.is_empty() {
-                    pb.inc(1);
-                } else {
-                    // Record assets in state DB and filter by should_download
-                    let mut filtered_tasks = Vec::new();
-                    for task in tasks {
-                        if state_db.is_some() {
-                            // Create asset record for state tracking
-                            let media_type = determine_media_type(task.version_size, &asset);
-                            let record = AssetRecord::new_pending(
-                                task.asset_id.clone(),
-                                task.version_size,
-                                task.checksum.clone(),
-                                task.download_path
-                                    .file_name()
-                                    .and_then(|f| f.to_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                asset.created(),
-                                Some(asset.added_date()),
-                                task.size,
-                                media_type,
-                            );
-                            pending_records.push(record);
+    // Wrap counters in Arc for sharing with producer task
+    let assets_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let assets_seen_producer = Arc::clone(&assets_seen);
 
-                            // Fast path: check pre-loaded state first
-                            match download_ctx.should_download_fast(
-                                &task.asset_id,
-                                task.version_size,
-                                &task.checksum,
-                            ) {
-                                Some(true) => {
-                                    // Definitely needs download
-                                    filtered_tasks.push(task);
+    // Spawn producer task that processes assets and sends download tasks
+    let producer_config = config.clone();
+    let producer_state_db = state_db.clone();
+    let producer_shutdown = shutdown_token.clone();
+    let producer_pb = pb.clone();
+    let producer = tokio::spawn(async move {
+        let config = &producer_config;
+        let mut claimed_paths = claimed_paths;
+        while let Some(result) = combined.next().await {
+            if producer_shutdown.is_cancelled() {
+                break;
+            }
+            match result {
+                Ok(asset) => {
+                    assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths);
+                    if tasks.is_empty() {
+                        producer_pb.inc(1);
+                    } else {
+                        for task in tasks {
+                            // Record asset in state DB
+                            if let Some(db) = &producer_state_db {
+                                let media_type = determine_media_type(task.version_size, &asset);
+                                let record = AssetRecord::new_pending(
+                                    task.asset_id.clone(),
+                                    task.version_size,
+                                    task.checksum.clone(),
+                                    task.download_path
+                                        .file_name()
+                                        .and_then(|f| f.to_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    asset.created(),
+                                    Some(asset.added_date()),
+                                    task.size,
+                                    media_type,
+                                );
+                                if let Err(e) = db.upsert_seen(&record).await {
+                                    tracing::warn!(
+                                        "Failed to record asset {}: {}",
+                                        task.asset_id,
+                                        e
+                                    );
                                 }
-                                Some(false) => {
-                                    // Should not happen — fast check doesn't return false
-                                    filtered_tasks.push(task);
-                                }
-                                None => {
-                                    // Downloaded with matching checksum — check file exists
-                                    let path_exists =
-                                        tokio::fs::try_exists(&task.download_path).await;
-                                    match path_exists {
-                                        Ok(true) => {
-                                            tracing::debug!(
-                                                asset_id = %task.asset_id,
-                                                path = %task.download_path.display(),
-                                                "Skipping (already downloaded)"
-                                            );
-                                            pb.inc(1);
+
+                                // Fast path: check pre-loaded state first
+                                match download_ctx.should_download_fast(
+                                    &task.asset_id,
+                                    task.version_size,
+                                    &task.checksum,
+                                ) {
+                                    Some(true) | Some(false) => {
+                                        // Needs download (Some(false) shouldn't happen but download anyway)
+                                        if task_tx.send(task).await.is_err() {
+                                            return; // Receiver dropped
                                         }
-                                        Ok(false) => {
-                                            // File missing — re-download
-                                            tracing::debug!(
-                                                asset_id = %task.asset_id,
-                                                path = %task.download_path.display(),
-                                                "File missing, will re-download"
-                                            );
-                                            filtered_tasks.push(task);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "File existence check failed, downloading anyway: {}",
-                                                e
-                                            );
-                                            filtered_tasks.push(task);
+                                    }
+                                    None => {
+                                        // Downloaded with matching checksum — check file exists
+                                        match tokio::fs::try_exists(&task.download_path).await {
+                                            Ok(true) => {
+                                                tracing::debug!(
+                                                    asset_id = %task.asset_id,
+                                                    path = %task.download_path.display(),
+                                                    "Skipping (already downloaded)"
+                                                );
+                                                producer_pb.inc(1);
+                                            }
+                                            Ok(false) => {
+                                                tracing::debug!(
+                                                    asset_id = %task.asset_id,
+                                                    path = %task.download_path.display(),
+                                                    "File missing, will re-download"
+                                                );
+                                                if task_tx.send(task).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "File existence check failed, downloading anyway: {}",
+                                                    e
+                                                );
+                                                if task_tx.send(task).await.is_err() {
+                                                    return;
+                                                }
+                                            }
                                         }
                                     }
                                 }
+                            } else {
+                                // No state DB — just send for download
+                                if task_tx.send(task).await.is_err() {
+                                    return;
+                                }
                             }
-                        } else {
-                            filtered_tasks.push(task);
                         }
                     }
-                    all_tasks.extend(filtered_tasks);
+                }
+                Err(e) => {
+                    producer_pb.suspend(|| tracing::error!("Error fetching asset: {}", e));
                 }
             }
-            Err(e) => {
-                pb.suspend(|| tracing::error!("Error fetching asset: {}", e));
-            }
         }
-    }
+    });
 
-    // Batch upsert all pending records
-    if let Some(db) = &state_db {
-        if !pending_records.is_empty() {
-            if let Err(e) = db.upsert_seen_batch(&pending_records).await {
-                tracing::warn!(
-                    "Failed to batch upsert {} records: {}",
-                    pending_records.len(),
-                    e
-                );
-            }
-        }
-    }
-
-    // Now download all tasks concurrently
-    let task_stream = stream::iter(all_tasks);
-
-    let download_stream = task_stream
+    // Convert channel receiver to stream and feed into buffer_unordered
+    let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
             async move {
@@ -987,6 +990,16 @@ async fn stream_and_download(
         }
     }
 
+    // Wait for producer to finish (it may still be processing if we broke early)
+    if let Err(e) = producer.await {
+        if e.is_panic() {
+            tracing::error!("Asset producer task panicked: {:?}", e);
+        }
+    }
+
+    // Load the final count from the atomic counter
+    let assets_seen_count = assets_seen.load(std::sync::atomic::Ordering::Relaxed);
+
     // Flush remaining batches
     if let Some(db) = &state_db {
         if !downloaded_batch.is_empty() {
@@ -1014,7 +1027,7 @@ async fn stream_and_download(
     // Complete sync run tracking
     if let (Some(db), Some(run_id)) = (&state_db, sync_run_id) {
         let stats = SyncRunStats {
-            assets_seen,
+            assets_seen: assets_seen_count,
             assets_downloaded: downloaded as u64,
             assets_failed: failed.len() as u64,
             interrupted: shutdown_token.is_cancelled() || auth_errors >= AUTH_ERROR_THRESHOLD,
@@ -1024,7 +1037,7 @@ async fn stream_and_download(
         } else {
             tracing::debug!(
                 run_id,
-                assets_seen,
+                assets_seen = assets_seen_count,
                 downloaded,
                 failed = failed.len(),
                 "Completed sync run"

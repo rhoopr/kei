@@ -123,7 +123,7 @@ impl PhotoAlbum {
     pub fn photo_stream(
         &self,
         limit: Option<u32>,
-    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<PhotoAsset>>(self.page_size);
 
         // The spawned task must be 'static, so clone all needed state.
