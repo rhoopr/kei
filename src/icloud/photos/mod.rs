@@ -12,7 +12,7 @@ mod smart_folders;
 pub mod types;
 
 pub use album::PhotoAlbum;
-pub use asset::PhotoAsset;
+pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
 pub use session::PhotosSession;
 pub use types::{AssetItemType, AssetVersionSize};

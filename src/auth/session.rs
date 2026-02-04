@@ -211,11 +211,14 @@ impl Session {
         // Separate client for file downloads: no total timeout so large files
         // aren't killed mid-transfer. connect_timeout catches unreachable hosts;
         // read_timeout detects stalled connections (no bytes for 120s).
+        // Pool settings tuned for high-concurrency downloads to Apple's CDN.
         let download_client = Client::builder()
             .cookie_provider(cookie_jar.clone())
             .default_headers(default_headers)
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(120))
+            .pool_max_idle_per_host(20)
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()?;
 
         let session_path = cookie_dir.join(format!("{}.session", sanitized));

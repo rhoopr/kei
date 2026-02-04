@@ -1,12 +1,16 @@
 use crate::types::VersionSize;
 
+/// Information about a downloadable asset version.
+///
+/// Uses `Box<str>` instead of `String` for url, asset_type, and checksum
+/// to save 8 bytes per field (16 vs 24 bytes) since these strings are
+/// never mutated after construction.
 #[derive(Debug, Clone)]
 pub struct AssetVersion {
-    #[allow(dead_code)] // used by asset.size() for size-based dedup (not yet wired)
     pub size: u64,
-    pub url: String,
-    pub asset_type: String,
-    pub checksum: String,
+    pub url: Box<str>,
+    pub asset_type: Box<str>,
+    pub checksum: Box<str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -15,16 +19,20 @@ pub enum AssetItemType {
     Movie,
 }
 
+/// Version size key for asset versions.
+///
+/// Uses `#[repr(u8)]` to guarantee 1-byte size for better struct packing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum AssetVersionSize {
-    Original,
-    Alternative,
-    Medium,
-    Thumb,
-    Adjusted,
-    LiveOriginal,
-    LiveMedium,
-    LiveThumb,
+    Original = 0,
+    Alternative = 1,
+    Medium = 2,
+    Thumb = 3,
+    Adjusted = 4,
+    LiveOriginal = 5,
+    LiveMedium = 6,
+    LiveThumb = 7,
 }
 
 impl From<VersionSize> for AssetVersionSize {

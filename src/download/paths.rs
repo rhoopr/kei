@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, Local, Timelike};
@@ -18,15 +19,6 @@ pub fn local_download_path(
         return directory.join(&clean);
     }
 
-    // Support both Python icloudpd's `{:%Y/%m/%d}` syntax and plain `%Y/%m/%d`
-    // for backwards compatibility with existing user configurations.
-    let year = format!("{:04}", created_date.year());
-    let month = format!("{:02}", created_date.month());
-    let day = format!("{:02}", created_date.day());
-    let hour = format!("{:02}", created_date.hour());
-    let minute = format!("{:02}", created_date.minute());
-    let second = format!("{:02}", created_date.second());
-
     // Extract format from Python-style {:%Y/%m/%d} wrapper if present
     let format_str = if folder_structure.starts_with("{:") && folder_structure.ends_with('}') {
         &folder_structure[2..folder_structure.len() - 1]
@@ -34,13 +26,9 @@ pub fn local_download_path(
         folder_structure
     };
 
-    let date_path = format_str
-        .replace("%Y", &year)
-        .replace("%m", &month)
-        .replace("%d", &day)
-        .replace("%H", &hour)
-        .replace("%M", &minute)
-        .replace("%S", &second);
+    // Build date path in a single allocation by scanning for % tokens
+    // and replacing them inline, avoiding 6 intermediate String allocations.
+    let date_path = expand_date_format(format_str, created_date);
 
     // Split on "/" and join as path components to handle cross-platform paths.
     // This converts "{:%Y/%m/%d}" format like "2025/01/15" into proper PathBuf.
@@ -51,6 +39,50 @@ pub fn local_download_path(
         }
     }
     path.join(&clean)
+}
+
+/// Expand date format tokens (%Y, %m, %d, %H, %M, %S) in a single pass.
+///
+/// Avoids the 6 intermediate String allocations from chained `.replace()` calls.
+fn expand_date_format(format_str: &str, date: &DateTime<Local>) -> String {
+    let mut result = String::with_capacity(format_str.len() + 8);
+    let mut chars = format_str.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.peek() {
+                Some('Y') => {
+                    chars.next();
+                    let _ = write!(result, "{:04}", date.year());
+                }
+                Some('m') => {
+                    chars.next();
+                    let _ = write!(result, "{:02}", date.month());
+                }
+                Some('d') => {
+                    chars.next();
+                    let _ = write!(result, "{:02}", date.day());
+                }
+                Some('H') => {
+                    chars.next();
+                    let _ = write!(result, "{:02}", date.hour());
+                }
+                Some('M') => {
+                    chars.next();
+                    let _ = write!(result, "{:02}", date.minute());
+                }
+                Some('S') => {
+                    chars.next();
+                    let _ = write!(result, "{:02}", date.second());
+                }
+                _ => result.push(c), // Unknown token, keep the %
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 /// Clean a filename by removing characters that are invalid on common
@@ -73,8 +105,29 @@ pub fn remove_unicode_chars(filename: &str) -> String {
 ///
 /// For example, `"photo.jpg"` with size `12345` becomes `"photo-12345.jpg"`.
 /// If the filename has no extension, the suffix is simply appended.
+///
+/// Formats the size directly into the result string, avoiding an intermediate
+/// `size.to_string()` allocation.
 pub fn add_dedup_suffix(path: &str, size: u64) -> String {
-    insert_suffix(path, &size.to_string())
+    match path.rfind('.') {
+        Some(dot_pos) => {
+            let (stem, ext) = path.split_at(dot_pos);
+            // Pre-allocate: stem + "-" + max 20 digits for u64 + ext
+            let mut result = String::with_capacity(stem.len() + 1 + 20 + ext.len());
+            result.push_str(stem);
+            result.push('-');
+            let _ = write!(result, "{}", size);
+            result.push_str(ext);
+            result
+        }
+        None => {
+            let mut result = String::with_capacity(path.len() + 1 + 20);
+            result.push_str(path);
+            result.push('-');
+            let _ = write!(result, "{}", size);
+            result
+        }
+    }
 }
 
 /// Add a string suffix before the file extension.
@@ -84,9 +137,21 @@ pub fn insert_suffix(path: &str, suffix: &str) -> String {
     match path.rfind('.') {
         Some(dot_pos) => {
             let (stem, ext) = path.split_at(dot_pos);
-            format!("{}-{}{}", stem, suffix, ext)
+            // Pre-allocate exact size needed
+            let mut result = String::with_capacity(stem.len() + 1 + suffix.len() + ext.len());
+            result.push_str(stem);
+            result.push('-');
+            result.push_str(suffix);
+            result.push_str(ext);
+            result
         }
-        None => format!("{}-{}", path, suffix),
+        None => {
+            let mut result = String::with_capacity(path.len() + 1 + suffix.len());
+            result.push_str(path);
+            result.push('-');
+            result.push_str(suffix);
+            result
+        }
     }
 }
 

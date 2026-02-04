@@ -33,18 +33,25 @@ const G_VAL: u32 = 2;
 /// Apple's SRP uses PBKDF2 over a SHA-256 hash of the password, not the
 /// raw password. The `s2k_fo` protocol variant hex-encodes the hash first,
 /// while `s2k` uses raw bytes — both are PBKDF2'd with the server-provided salt.
-fn derive_apple_password(password: &str, protocol: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
+///
+/// Returns a fixed 32-byte array, avoiding heap allocation.
+fn derive_apple_password(password: &str, protocol: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
     let hash = Sha256::digest(password.as_bytes());
 
-    let password_digest: Vec<u8> = if protocol == "s2k_fo" {
-        let hex_str: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
-        hex_str.into_bytes()
+    // For s2k_fo, we need to hex-encode first (64 bytes), then PBKDF2.
+    // For s2k, use the raw 32-byte hash directly.
+    let mut key = [0u8; 32];
+    if protocol == "s2k_fo" {
+        use std::fmt::Write;
+        let hex_str = hash.iter().fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        pbkdf2::pbkdf2_hmac::<Sha256>(hex_str.as_bytes(), salt, iterations, &mut key);
     } else {
-        hash.to_vec()
+        pbkdf2::pbkdf2_hmac::<Sha256>(&hash, salt, iterations, &mut key);
     };
 
-    let mut key = vec![0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(&password_digest, salt, iterations, &mut key);
     key
 }
 
@@ -96,6 +103,8 @@ fn compute_u(a_pub: &BigUint, b_pub: &BigUint, n: &BigUint) -> BigUint {
 /// Compute M1 = H(H(N) XOR H(g) | H(username) | salt | A | B | K).
 /// Note: `no_username_in_x` only affects x computation, NOT M1.
 /// M1 always uses the real username (apple_id).
+///
+/// Returns a fixed 32-byte array, avoiding heap allocation.
 fn compute_m1(
     n: &BigUint,
     g: &BigUint,
@@ -104,7 +113,7 @@ fn compute_m1(
     a_pub: &BigUint,
     b_pub: &BigUint,
     key: &[u8],
-) -> Vec<u8> {
+) -> [u8; 32] {
     let n_bytes = n.to_bytes_be();
     let g_bytes = g.to_bytes_be();
     // RFC 5054: pad g to N's byte length before hashing in HNxorg
@@ -112,26 +121,32 @@ fn compute_m1(
     g_padded.extend_from_slice(&g_bytes);
     let h_n = Sha256::digest(&n_bytes);
     let h_g = Sha256::digest(&g_padded);
-    let h_xor: Vec<u8> = h_n.iter().zip(h_g.iter()).map(|(a, b)| a ^ b).collect();
+    // XOR the hashes into a fixed array instead of Vec
+    let mut h_xor = [0u8; 32];
+    for (i, (a, b)) in h_n.iter().zip(h_g.iter()).enumerate() {
+        h_xor[i] = a ^ b;
+    }
     let h_username = Sha256::digest(username);
 
     let mut hasher = Sha256::new();
-    hasher.update(&h_xor);
+    hasher.update(h_xor);
     hasher.update(h_username);
     hasher.update(salt);
     hasher.update(a_pub.to_bytes_be());
     hasher.update(b_pub.to_bytes_be());
     hasher.update(key);
-    hasher.finalize().to_vec()
+    hasher.finalize().into()
 }
 
 /// Compute M2 = H(A | M1 | K).
-fn compute_m2(a_pub: &BigUint, m1: &[u8], key: &[u8]) -> Vec<u8> {
+///
+/// Returns a fixed 32-byte array, avoiding heap allocation.
+fn compute_m2(a_pub: &BigUint, m1: &[u8], key: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(a_pub.to_bytes_be());
     hasher.update(m1);
     hasher.update(key);
-    hasher.finalize().to_vec()
+    hasher.finalize().into()
 }
 
 /// Build the Apple OAuth/auth headers required for SRP authentication requests.
@@ -320,8 +335,8 @@ pub async fn authenticate_srp(
     let m1 = compute_m1(&n, &g, apple_id.as_bytes(), &salt, &a_pub, &b_pub, &key);
     let m2 = compute_m2(&a_pub, &m1, &key);
 
-    let m1_b64 = BASE64.encode(&m1);
-    let m2_b64 = BASE64.encode(&m2);
+    let m1_b64 = BASE64.encode(m1);
+    let m2_b64 = BASE64.encode(m2);
 
     let trust_tokens: Vec<String> = session
         .session_data

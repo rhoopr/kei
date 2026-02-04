@@ -73,7 +73,8 @@ pub struct SyncArgs {
     pub albums: Vec<String>,
 
     /// Library to download (default: PrimarySync)
-    #[arg(long, default_value = "PrimarySync")]
+    /// NOTE: Parsed but not yet wired up - hidden until implemented
+    #[arg(long, default_value = "PrimarySync", hide = true)]
     pub library: String,
 
     /// Image size to download
@@ -105,7 +106,8 @@ pub struct SyncArgs {
     pub skip_live_photos: bool,
 
     /// Only download requested size (don't fall back to original)
-    #[arg(long)]
+    /// NOTE: Parsed but not yet wired up - hidden until implemented
+    #[arg(long, hide = true)]
     pub force_size: bool,
 
     /// Folder structure for organizing downloads
@@ -129,7 +131,8 @@ pub struct SyncArgs {
     pub no_progress_bar: bool,
 
     /// Keep Unicode in filenames
-    #[arg(long)]
+    /// NOTE: Parsed but not yet wired up - hidden until implemented
+    #[arg(long, hide = true)]
     pub keep_unicode_in_filenames: bool,
 
     /// Live photo MOV filename policy
@@ -153,7 +156,8 @@ pub struct SyncArgs {
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
-    #[arg(long)]
+    /// NOTE: Parsed but not yet wired up - hidden until implemented
+    #[arg(long, hide = true)]
     pub only_print_filenames: bool,
 
     /// Max retries per download (default: 3, 0 = no retries)

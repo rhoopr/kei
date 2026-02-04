@@ -150,7 +150,8 @@ New subcommand structure (backwards compatible — bare `icloudpd-rs --username 
 - Replaced `.expect()` calls with proper error handling patterns
 - Fixed `if let Some(ref x) = foo` to idiomatic `if let Some(x) = &foo`
 
-### Not Yet Wired (parsed but inactive)
+### Not Yet Implemented (hidden from CLI)
+The following flags are planned but not yet functional. They are hidden from `--help` and will be enabled in a future release:
 - `--force-size` — download only the requested size without fallback to original
 - `--keep-unicode-in-filenames` — preserve Unicode characters in filenames
 - `--only-print-filenames` — print download paths without downloading

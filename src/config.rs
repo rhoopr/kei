@@ -5,45 +5,68 @@ use crate::types::{
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 use std::path::PathBuf;
 
+/// Application configuration.
+///
+/// Fields are ordered for optimal memory layout:
+/// - Heap types first (String, PathBuf, Vec, `Option<String>`)
+/// - DateTime fields (12-16 bytes each)
+/// - 8-byte primitives (u64, `Option<u64>`)
+/// - 4-byte primitives (u32, `Option<u32>`)
+/// - 2-byte primitives (u16)
+/// - 1-byte enums
+/// - All booleans grouped at the end
 pub struct Config {
+    // Heap types first
     pub username: String,
     pub password: Option<String>,
     pub directory: PathBuf,
-    pub auth_only: bool,
-    pub list_albums: bool,
-    pub list_libraries: bool,
+    pub cookie_directory: PathBuf,
+    pub folder_structure: String,
     pub albums: Vec<String>,
     #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub library: String,
+
+    // DateTime fields
+    pub skip_created_before: Option<DateTime<Local>>,
+    pub skip_created_after: Option<DateTime<Local>>,
+
+    // 8-byte primitives
+    pub watch_with_interval: Option<u64>,
+    pub retry_delay_secs: u64,
+
+    // 4-byte primitives
+    pub recent: Option<u32>,
+    pub max_retries: u32,
+
+    // 2-byte primitives
+    pub threads_num: u16,
+
+    // 1-byte enums
     pub size: VersionSize,
     pub live_photo_size: LivePhotoSize,
-    pub recent: Option<u32>,
-    pub threads_num: u16,
+    pub domain: Domain,
+    #[allow(dead_code)] // Copied from CLI but read from cli.log_level directly in main.rs
+    pub log_level: LogLevel,
+    pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
+    pub align_raw: RawTreatmentPolicy,
+    pub file_match_policy: FileMatchPolicy,
+
+    // All booleans grouped together
+    pub auth_only: bool,
+    pub list_albums: bool,
+    pub list_libraries: bool,
     pub skip_videos: bool,
     pub skip_photos: bool,
     pub skip_live_photos: bool,
     #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub force_size: bool,
-    pub folder_structure: String,
     pub set_exif_datetime: bool,
     pub dry_run: bool,
-    pub domain: Domain,
-    pub watch_with_interval: Option<u64>,
-    #[allow(dead_code)] // CLI flag parsed but not yet wired
-    pub log_level: LogLevel,
     pub no_progress_bar: bool,
-    pub cookie_directory: PathBuf,
     #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub keep_unicode_in_filenames: bool,
-    pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
-    pub align_raw: RawTreatmentPolicy,
-    pub file_match_policy: FileMatchPolicy,
-    pub skip_created_before: Option<DateTime<Local>>,
-    pub skip_created_after: Option<DateTime<Local>>,
     #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub only_print_filenames: bool,
-    pub max_retries: u32,
-    pub retry_delay_secs: u64,
 }
 
 impl std::fmt::Debug for Config {

@@ -1,5 +1,6 @@
 //! State database trait and SQLite implementation.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -9,7 +10,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::error::StateError;
 use super::schema;
-use super::types::{AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary};
+use super::types::{
+    AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary, VersionSizeKey,
+};
 
 /// Trait for state database operations.
 ///
@@ -24,6 +27,11 @@ pub trait StateDb: Send + Sync {
     /// - The asset's checksum has changed
     /// - The asset was downloaded but the local file no longer exists
     /// - The asset is in pending or failed status
+    ///
+    /// Note: In the optimized flow, the caller pre-loads downloaded IDs and
+    /// checksums using `get_downloaded_ids()` and `get_downloaded_checksums()`
+    /// for O(1) skip decisions, falling back to filesystem checks for edge cases.
+    #[allow(dead_code)]
     async fn should_download(
         &self,
         id: &str,
@@ -46,6 +54,10 @@ pub trait StateDb: Send + Sync {
     ) -> Result<(), StateError>;
 
     /// Mark an asset as failed with an error message.
+    ///
+    /// Note: The download engine uses `mark_failed_batch` for efficiency.
+    /// This method is retained for API completeness with `mark_downloaded`.
+    #[allow(dead_code)]
     async fn mark_failed(
         &self,
         id: &str,
@@ -72,6 +84,38 @@ pub trait StateDb: Send + Sync {
     ///
     /// Returns the number of assets reset.
     async fn reset_failed(&self) -> Result<u64, StateError>;
+
+    // ── Batch operations for performance optimization ──
+
+    /// Get all downloaded asset IDs as (id, version_size) pairs.
+    ///
+    /// Used at sync start to pre-load downloaded state for O(1) skip decisions.
+    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError>;
+
+    /// Get downloaded asset IDs with their checksums.
+    ///
+    /// Returns a map of (id, version_size) -> checksum for downloaded assets.
+    /// Used to detect checksum changes without querying the DB per asset.
+    async fn get_downloaded_checksums(
+        &self,
+    ) -> Result<HashMap<(String, String), String>, StateError>;
+
+    /// Batch insert or update asset records after seeing them during sync.
+    async fn upsert_seen_batch(&self, records: &[AssetRecord]) -> Result<(), StateError>;
+
+    /// Batch mark assets as successfully downloaded.
+    ///
+    /// Used by the download engine to reduce per-download DB overhead.
+    async fn mark_downloaded_batch(
+        &self,
+        items: &[(String, String, PathBuf)],
+    ) -> Result<(), StateError>;
+
+    /// Batch mark assets as failed with error messages.
+    ///
+    /// Used by the download engine to reduce per-download DB overhead.
+    async fn mark_failed_batch(&self, items: &[(String, String, String)])
+        -> Result<(), StateError>;
 }
 
 /// SQLite implementation of the state database.
@@ -155,26 +199,21 @@ impl StateDb for SqliteStateDb {
         checksum: &str,
         local_path: &Path,
     ) -> Result<bool, StateError> {
-        let id = id.to_string();
-        let version_size = version_size.to_string();
-        let checksum = checksum.to_string();
-        let local_path = local_path.to_path_buf();
+        // Query DB in a separate scope to ensure MutexGuard is dropped before any await
+        let result: Option<(String, String, Option<String>)> = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| StateError::Query(e.to_string()))?;
 
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
-
-        let result: Option<(String, String, Option<String>)> = conn
-            .query_row(
+            conn.query_row(
                 "SELECT status, checksum, local_path FROM assets WHERE id = ?1 AND version_size = ?2",
-                [&id, &version_size],
+                [id, version_size],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(StateError::query)?;
-
-        drop(conn);
+            .map_err(StateError::query)?
+        };
 
         match result {
             None => {
@@ -195,19 +234,30 @@ impl StateDb for SqliteStateDb {
 
                 match status {
                     AssetStatus::Downloaded => {
-                        // Check if file still exists
+                        // Check if file still exists (async to avoid blocking)
                         let path_to_check: PathBuf = stored_path_opt
                             .map(PathBuf::from)
-                            .unwrap_or_else(|| local_path.clone());
-                        if !path_to_check.exists() {
-                            tracing::debug!(
-                                id = %id,
-                                path = %path_to_check.display(),
-                                "Downloaded file missing, will re-download"
-                            );
-                            return Ok(true);
+                            .unwrap_or_else(|| local_path.to_path_buf());
+                        match tokio::fs::try_exists(&path_to_check).await {
+                            Ok(true) => Ok(false),
+                            Ok(false) => {
+                                tracing::debug!(
+                                    id = %id,
+                                    path = %path_to_check.display(),
+                                    "Downloaded file missing, will re-download"
+                                );
+                                Ok(true)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    id = %id,
+                                    path = %path_to_check.display(),
+                                    error = %e,
+                                    "Failed to check file existence, assuming missing"
+                                );
+                                Ok(true)
+                            }
                         }
-                        Ok(false)
                     }
                     AssetStatus::Pending | AssetStatus::Failed => Ok(true),
                 }
@@ -216,14 +266,6 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
-        let id = record.id.clone();
-        let version_size = record.version_size.clone();
-        let checksum = record.checksum.clone();
-        let filename = record.filename.clone();
-        let created_at = record.created_at.timestamp();
-        let added_at = record.added_at.map(|dt| dt.timestamp());
-        let size_bytes = record.size_bytes as i64;
-        let media_type = record.media_type.as_str().to_string();
         let last_seen_at = Utc::now().timestamp();
 
         let conn = self
@@ -247,14 +289,14 @@ impl StateDb for SqliteStateDb {
                 last_seen_at = excluded.last_seen_at
             "#,
             rusqlite::params![
-                id,
-                version_size,
-                checksum,
-                filename,
-                created_at,
-                added_at,
-                size_bytes,
-                media_type,
+                &record.id,
+                record.version_size.as_str(),
+                &record.checksum,
+                &record.filename,
+                record.created_at.timestamp(),
+                record.added_at.map(|dt| dt.timestamp()),
+                record.size_bytes as i64,
+                record.media_type.as_str(),
                 last_seen_at,
             ],
         )
@@ -269,9 +311,6 @@ impl StateDb for SqliteStateDb {
         version_size: &str,
         local_path: &Path,
     ) -> Result<(), StateError> {
-        let id = id.to_string();
-        let version_size = version_size.to_string();
-        let local_path = local_path.to_string_lossy().to_string();
         let downloaded_at = Utc::now().timestamp();
 
         let conn = self
@@ -281,7 +320,7 @@ impl StateDb for SqliteStateDb {
 
         conn.execute(
             "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, last_error = NULL WHERE id = ?3 AND version_size = ?4",
-            rusqlite::params![downloaded_at, local_path, id, version_size],
+            rusqlite::params![downloaded_at, local_path.to_string_lossy(), id, version_size],
         )
         .map_err(StateError::query)?;
 
@@ -294,10 +333,6 @@ impl StateDb for SqliteStateDb {
         version_size: &str,
         error: &str,
     ) -> Result<(), StateError> {
-        let id = id.to_string();
-        let version_size = version_size.to_string();
-        let error = error.to_string();
-
         let conn = self
             .conn
             .lock()
@@ -471,12 +506,218 @@ impl StateDb for SqliteStateDb {
 
         Ok(rows as u64)
     }
+
+    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        let mut stmt = conn
+            .prepare_cached("SELECT id, version_size FROM assets WHERE status = 'downloaded'")
+            .map_err(StateError::query)?;
+
+        let ids = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(StateError::query)?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(StateError::query)?;
+
+        Ok(ids)
+    }
+
+    async fn get_downloaded_checksums(
+        &self,
+    ) -> Result<HashMap<(String, String), String>, StateError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, version_size, checksum FROM assets WHERE status = 'downloaded'",
+            )
+            .map_err(StateError::query)?;
+
+        let checksums = stmt
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(StateError::query)?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(StateError::query)?;
+
+        Ok(checksums)
+    }
+
+    async fn upsert_seen_batch(&self, records: &[AssetRecord]) -> Result<(), StateError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        let last_seen_at = Utc::now().timestamp();
+
+        // Use a transaction for atomicity and better performance
+        conn.execute("BEGIN TRANSACTION", [])
+            .map_err(StateError::query)?;
+
+        let result = (|| {
+            let mut stmt = conn
+                .prepare_cached(
+                    r#"
+                    INSERT INTO assets (id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, last_seen_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)
+                    ON CONFLICT(id, version_size) DO UPDATE SET
+                        checksum = excluded.checksum,
+                        filename = excluded.filename,
+                        created_at = excluded.created_at,
+                        added_at = excluded.added_at,
+                        size_bytes = excluded.size_bytes,
+                        media_type = excluded.media_type,
+                        last_seen_at = excluded.last_seen_at
+                    "#,
+                )
+                .map_err(StateError::query)?;
+
+            for record in records {
+                stmt.execute(rusqlite::params![
+                    record.id,
+                    record.version_size.as_str(),
+                    record.checksum,
+                    record.filename,
+                    record.created_at.timestamp(),
+                    record.added_at.map(|dt| dt.timestamp()),
+                    record.size_bytes as i64,
+                    record.media_type.as_str(),
+                    last_seen_at,
+                ])
+                .map_err(StateError::query)?;
+            }
+
+            Ok::<_, StateError>(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", []).map_err(StateError::query)?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    async fn mark_downloaded_batch(
+        &self,
+        items: &[(String, String, PathBuf)],
+    ) -> Result<(), StateError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        let downloaded_at = Utc::now().timestamp();
+
+        conn.execute("BEGIN TRANSACTION", [])
+            .map_err(StateError::query)?;
+
+        let result = (|| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, last_error = NULL WHERE id = ?3 AND version_size = ?4",
+                )
+                .map_err(StateError::query)?;
+
+            for (id, version_size, local_path) in items {
+                stmt.execute(rusqlite::params![
+                    downloaded_at,
+                    local_path.to_string_lossy(),
+                    id,
+                    version_size,
+                ])
+                .map_err(StateError::query)?;
+            }
+
+            Ok::<_, StateError>(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", []).map_err(StateError::query)?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    async fn mark_failed_batch(
+        &self,
+        items: &[(String, String, String)],
+    ) -> Result<(), StateError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        conn.execute("BEGIN TRANSACTION", [])
+            .map_err(StateError::query)?;
+
+        let result = (|| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, last_error = ?1 WHERE id = ?2 AND version_size = ?3",
+                )
+                .map_err(StateError::query)?;
+
+            for (id, version_size, error) in items {
+                stmt.execute(rusqlite::params![error, id, version_size])
+                    .map_err(StateError::query)?;
+            }
+
+            Ok::<_, StateError>(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", []).map_err(StateError::query)?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Convert a database row to an AssetRecord.
 fn row_to_asset_record(row: &rusqlite::Row<'_>) -> AssetRecord {
     let id: String = row.get(0).unwrap_or_default();
-    let version_size: String = row.get(1).unwrap_or_default();
+    let version_size_str: String = row.get(1).unwrap_or_default();
     let checksum: String = row.get(2).unwrap_or_default();
     let filename: String = row.get(3).unwrap_or_default();
     let created_at_ts: i64 = row.get(4).unwrap_or(0);
@@ -492,25 +733,26 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> AssetRecord {
 
     AssetRecord {
         id,
-        version_size,
         checksum,
         filename,
+        local_path: local_path_str.map(PathBuf::from),
+        last_error,
+        size_bytes: size_bytes as u64,
         created_at: Utc
             .timestamp_opt(created_at_ts, 0)
             .single()
             .unwrap_or(DateTime::UNIX_EPOCH),
         added_at: added_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
-        size_bytes: size_bytes as u64,
-        media_type: MediaType::from_str(&media_type_str).unwrap_or(MediaType::Photo),
-        status: AssetStatus::from_str(&status_str).unwrap_or(AssetStatus::Pending),
         downloaded_at: downloaded_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
-        local_path: local_path_str.map(PathBuf::from),
         last_seen_at: Utc
             .timestamp_opt(last_seen_at_ts, 0)
             .single()
             .unwrap_or(DateTime::UNIX_EPOCH),
         download_attempts: download_attempts as u32,
-        last_error,
+        version_size: VersionSizeKey::from_str(&version_size_str)
+            .unwrap_or(VersionSizeKey::Original),
+        media_type: MediaType::from_str(&media_type_str).unwrap_or(MediaType::Photo),
+        status: AssetStatus::from_str(&status_str).unwrap_or(AssetStatus::Pending),
     }
 }
 
@@ -554,7 +796,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -588,7 +830,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -616,7 +858,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -653,7 +895,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "old_checksum".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -681,7 +923,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -708,7 +950,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -735,7 +977,7 @@ mod tests {
         for i in 0..3 {
             let record = AssetRecord::new_pending(
                 format!("PENDING_{}", i),
-                "original".to_string(),
+                VersionSizeKey::Original,
                 format!("checksum_{}", i),
                 format!("photo_{}.jpg", i),
                 Utc::now(),
@@ -750,7 +992,7 @@ mod tests {
         for i in 0..2 {
             let record = AssetRecord::new_pending(
                 format!("DOWNLOADED_{}", i),
-                "original".to_string(),
+                VersionSizeKey::Original,
                 format!("dl_checksum_{}", i),
                 format!("dl_photo_{}.jpg", i),
                 Utc::now(),
@@ -768,7 +1010,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "FAILED_1".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "fail_checksum".to_string(),
             "fail_photo.jpg".to_string(),
             Utc::now(),
@@ -819,7 +1061,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -852,7 +1094,7 @@ mod tests {
         for i in 0..3 {
             let record = AssetRecord::new_pending(
                 format!("DL_{}", i),
-                "original".to_string(),
+                VersionSizeKey::Original,
                 format!("checksum_{}", i),
                 format!("photo_{}.jpg", i),
                 Utc::now(),
@@ -870,5 +1112,218 @@ mod tests {
 
         let downloaded = db.get_all_downloaded().await.unwrap();
         assert_eq!(downloaded.len(), 3);
+    }
+
+    // ── Batch operation tests ──
+
+    #[tokio::test]
+    async fn test_get_downloaded_ids() {
+        let dir = test_dir("get_downloaded_ids");
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Create some assets with different statuses
+        for i in 0..3 {
+            let record = AssetRecord::new_pending(
+                format!("DL_{}", i),
+                VersionSizeKey::Original,
+                format!("checksum_{}", i),
+                format!("photo_{}.jpg", i),
+                Utc::now(),
+                None,
+                1000,
+                MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+            let path = dir.join(format!("photo_{}.jpg", i));
+            fs::write(&path, b"content").unwrap();
+            db.mark_downloaded(&format!("DL_{}", i), "original", &path)
+                .await
+                .unwrap();
+        }
+
+        // Add a pending asset (should not be in downloaded IDs)
+        let pending = AssetRecord::new_pending(
+            "PENDING_1".to_string(),
+            VersionSizeKey::Original,
+            "pending_ck".to_string(),
+            "pending.jpg".to_string(),
+            Utc::now(),
+            None,
+            1000,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&pending).await.unwrap();
+
+        let ids = db.get_downloaded_ids().await.unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&("DL_0".to_string(), "original".to_string())));
+        assert!(ids.contains(&("DL_1".to_string(), "original".to_string())));
+        assert!(ids.contains(&("DL_2".to_string(), "original".to_string())));
+        assert!(!ids.contains(&("PENDING_1".to_string(), "original".to_string())));
+    }
+
+    #[tokio::test]
+    async fn test_get_downloaded_checksums() {
+        let dir = test_dir("get_downloaded_checksums");
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for i in 0..2 {
+            let record = AssetRecord::new_pending(
+                format!("DL_{}", i),
+                VersionSizeKey::Original,
+                format!("checksum_{}", i),
+                format!("photo_{}.jpg", i),
+                Utc::now(),
+                None,
+                1000,
+                MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+            let path = dir.join(format!("photo_{}.jpg", i));
+            fs::write(&path, b"content").unwrap();
+            db.mark_downloaded(&format!("DL_{}", i), "original", &path)
+                .await
+                .unwrap();
+        }
+
+        let checksums = db.get_downloaded_checksums().await.unwrap();
+        assert_eq!(checksums.len(), 2);
+        assert_eq!(
+            checksums.get(&("DL_0".to_string(), "original".to_string())),
+            Some(&"checksum_0".to_string())
+        );
+        assert_eq!(
+            checksums.get(&("DL_1".to_string(), "original".to_string())),
+            Some(&"checksum_1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upsert_seen_batch() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let records: Vec<AssetRecord> = (0..5)
+            .map(|i| {
+                AssetRecord::new_pending(
+                    format!("BATCH_{}", i),
+                    VersionSizeKey::Original,
+                    format!("checksum_{}", i),
+                    format!("photo_{}.jpg", i),
+                    Utc::now(),
+                    None,
+                    1000 + i as u64,
+                    MediaType::Photo,
+                )
+            })
+            .collect();
+
+        db.upsert_seen_batch(&records).await.unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 5);
+        assert_eq!(summary.pending, 5);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_seen_batch_empty() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_seen_batch(&[]).await.unwrap();
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mark_downloaded_batch() {
+        let dir = test_dir("mark_downloaded_batch");
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // First insert assets
+        let records: Vec<AssetRecord> = (0..3)
+            .map(|i| {
+                AssetRecord::new_pending(
+                    format!("BATCH_{}", i),
+                    VersionSizeKey::Original,
+                    format!("checksum_{}", i),
+                    format!("photo_{}.jpg", i),
+                    Utc::now(),
+                    None,
+                    1000,
+                    MediaType::Photo,
+                )
+            })
+            .collect();
+        db.upsert_seen_batch(&records).await.unwrap();
+
+        // Mark them as downloaded in batch
+        let items: Vec<(String, String, PathBuf)> = (0..3)
+            .map(|i| {
+                let path = dir.join(format!("photo_{}.jpg", i));
+                fs::write(&path, b"content").unwrap();
+                (format!("BATCH_{}", i), "original".to_string(), path)
+            })
+            .collect();
+
+        db.mark_downloaded_batch(&items).await.unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 3);
+        assert_eq!(summary.pending, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mark_downloaded_batch_empty() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.mark_downloaded_batch(&[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mark_failed_batch() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // First insert assets
+        let records: Vec<AssetRecord> = (0..3)
+            .map(|i| {
+                AssetRecord::new_pending(
+                    format!("FAIL_{}", i),
+                    VersionSizeKey::Original,
+                    format!("checksum_{}", i),
+                    format!("photo_{}.jpg", i),
+                    Utc::now(),
+                    None,
+                    1000,
+                    MediaType::Photo,
+                )
+            })
+            .collect();
+        db.upsert_seen_batch(&records).await.unwrap();
+
+        // Mark them as failed in batch
+        let items: Vec<(String, String, String)> = (0..3)
+            .map(|i| {
+                (
+                    format!("FAIL_{}", i),
+                    "original".to_string(),
+                    format!("Error {}", i),
+                )
+            })
+            .collect();
+
+        db.mark_failed_batch(&items).await.unwrap();
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 3);
+
+        // Check each has the correct error
+        for record in &failed {
+            let idx: usize = record.id.strip_prefix("FAIL_").unwrap().parse().unwrap();
+            assert_eq!(record.last_error, Some(format!("Error {}", idx)));
+            assert_eq!(record.download_attempts, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mark_failed_batch_empty() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.mark_failed_batch(&[]).await.unwrap();
     }
 }

@@ -1,22 +1,38 @@
-use std::collections::HashMap;
-
 use base64::Engine;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
+use smallvec::SmallVec;
 use tracing::warn;
 
 use super::queries::{item_type_from_str, PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
 use super::types::{AssetItemType, AssetVersion, AssetVersionSize};
 
+/// Type alias for the versions map.
+///
+/// Uses SmallVec with capacity 4 to store versions inline (no heap allocation)
+/// for the common case of <=4 versions per asset. Most assets have 1-3 versions
+/// (original + optional medium/thumb + optional live photo).
+pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
+
+/// A photo or video asset from iCloud.
+///
+/// Fields are ordered for optimal memory layout:
+/// - Heap types first (String, `Option<String>`)
+/// - VersionsMap (SmallVec inline storage)
+/// - f64 primitives
+/// - Small enums last
 #[derive(Debug, Clone)]
 pub struct PhotoAsset {
+    // Heap types first
     record_name: String,
     filename: Option<String>,
-    item_type_val: Option<AssetItemType>,
+    // SmallVec with inline storage
+    versions: VersionsMap,
+    // f64 primitives
     asset_date_ms: Option<f64>,
     added_date_ms: Option<f64>,
-    original_size: u64,
-    versions: HashMap<AssetVersionSize, AssetVersion>,
+    // Small enum (1 byte)
+    item_type_val: Option<AssetItemType>,
 }
 
 /// Decode filename from CloudKit's `filenameEnc` field.
@@ -75,14 +91,14 @@ fn extract_versions(
     master_fields: &Value,
     asset_fields: &Value,
     record_name: &str,
-) -> HashMap<AssetVersionSize, AssetVersion> {
+) -> VersionsMap {
     let lookup = if item_type == Some(AssetItemType::Movie) {
         VIDEO_VERSION_LOOKUP
     } else {
         PHOTO_VERSION_LOOKUP
     };
 
-    let mut versions = HashMap::new();
+    let mut versions = VersionsMap::new();
     for (key, prefix) in lookup {
         let res_field = format!("{prefix}Res");
         let type_field = format!("{prefix}FileType");
@@ -104,8 +120,8 @@ fn extract_versions(
 
         let size = res_entry["size"].as_u64().unwrap_or(0);
 
-        let url = match res_entry["downloadURL"].as_str() {
-            Some(u) => u.to_string(),
+        let url: Box<str> = match res_entry["downloadURL"].as_str() {
+            Some(u) => u.into(),
             None => {
                 warn!(
                     "Asset {}: missing {prefix}Res.downloadURL, skipping version",
@@ -115,8 +131,8 @@ fn extract_versions(
             }
         };
 
-        let checksum = match res_entry["fileChecksum"].as_str() {
-            Some(c) => c.to_string(),
+        let checksum: Box<str> = match res_entry["fileChecksum"].as_str() {
+            Some(c) => c.into(),
             None => {
                 warn!(
                     "Asset {}: missing {prefix}Res.fileChecksum, skipping version",
@@ -126,15 +142,15 @@ fn extract_versions(
             }
         };
 
-        let asset_type = fields[&type_field]["value"]
+        let asset_type: Box<str> = fields[&type_field]["value"]
             .as_str()
             .unwrap_or_else(|| {
                 tracing::warn!("Missing expected field: {type_field}");
                 ""
             })
-            .to_string();
+            .into();
 
-        versions.insert(
+        versions.push((
             *key,
             AssetVersion {
                 size,
@@ -142,7 +158,7 @@ fn extract_versions(
                 asset_type,
                 checksum,
             },
-        );
+        ));
     }
     versions
 }
@@ -161,9 +177,6 @@ impl PhotoAsset {
         let item_type_val = resolve_item_type(&master_fields, &filename);
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
-        let original_size = master_fields["resOriginalRes"]["value"]["size"]
-            .as_u64()
-            .unwrap_or(0);
         let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
         Self {
             record_name,
@@ -171,7 +184,6 @@ impl PhotoAsset {
             item_type_val,
             asset_date_ms,
             added_date_ms,
-            original_size,
             versions,
         }
     }
@@ -182,9 +194,6 @@ impl PhotoAsset {
         let item_type_val = resolve_item_type(&master.fields, &filename);
         let asset_date_ms = asset.fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset.fields["addedDate"]["value"].as_f64();
-        let original_size = master.fields["resOriginalRes"]["value"]["size"]
-            .as_u64()
-            .unwrap_or(0);
         let versions = extract_versions(
             item_type_val,
             &master.fields,
@@ -197,7 +206,6 @@ impl PhotoAsset {
             item_type_val,
             asset_date_ms,
             added_date_ms,
-            original_size,
             versions,
         }
     }
@@ -210,11 +218,6 @@ impl PhotoAsset {
         self.filename.as_deref()
     }
 
-    #[allow(dead_code)] // public API for size-based dedup
-    pub fn size(&self) -> u64 {
-        self.original_size
-    }
-
     pub fn asset_date(&self) -> DateTime<Utc> {
         self.asset_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
@@ -225,7 +228,6 @@ impl PhotoAsset {
         self.asset_date()
     }
 
-    #[allow(dead_code)] // public API for incremental sync
     pub fn added_date(&self) -> DateTime<Utc> {
         self.added_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
@@ -236,10 +238,20 @@ impl PhotoAsset {
         self.item_type_val
     }
 
-    /// Available download versions, keyed by size variant. Pre-parsed at
-    /// construction so no JSON traversal happens at download time.
-    pub fn versions(&self) -> &HashMap<AssetVersionSize, AssetVersion> {
+    /// Available download versions, as a list of (size, version) pairs.
+    /// Pre-parsed at construction so no JSON traversal happens at download time.
+    pub fn versions(&self) -> &VersionsMap {
         &self.versions
+    }
+
+    /// Get a specific version by size key.
+    pub fn get_version(&self, key: &AssetVersionSize) -> Option<&AssetVersion> {
+        self.versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// Check if a specific version exists.
+    pub fn contains_version(&self, key: &AssetVersionSize) -> bool {
+        self.versions.iter().any(|(k, _)| k == key)
     }
 }
 
@@ -351,11 +363,10 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        let versions = asset.versions();
-        assert!(versions.contains_key(&AssetVersionSize::Original));
-        let orig = &versions[&AssetVersionSize::Original];
-        assert_eq!(orig.url, "https://example.com/orig");
-        assert_eq!(orig.checksum, "abc123");
+        assert!(asset.contains_version(&AssetVersionSize::Original));
+        let orig = asset.get_version(&AssetVersionSize::Original).unwrap();
+        assert_eq!(&*orig.url, "https://example.com/orig");
+        assert_eq!(&*orig.checksum, "abc123");
     }
 
     #[test]
@@ -425,13 +436,11 @@ mod tests {
         assert_eq!(asset.id(), "MASTER_1");
         assert_eq!(asset.filename(), Some("vacation.jpg"));
         assert_eq!(asset.item_type(), Some(AssetItemType::Image));
-        assert_eq!(asset.size(), 5000);
         assert_eq!(
             asset.asset_date().format("%Y-%m-%d").to_string(),
             "2025-01-15"
         );
-        let versions = asset.versions();
-        assert!(versions.contains_key(&AssetVersionSize::Original));
+        assert!(asset.contains_version(&AssetVersionSize::Original));
     }
 
     #[test]
@@ -455,8 +464,8 @@ mod tests {
                 "resOriginalFileType": {"value": "public.jpeg"}
             }}),
         );
-        let orig = &asset.versions()[&AssetVersionSize::Original];
-        assert_eq!(orig.url, "https://asset.example.com/adjusted");
+        let orig = asset.get_version(&AssetVersionSize::Original).unwrap();
+        assert_eq!(&*orig.url, "https://asset.example.com/adjusted");
         assert_eq!(orig.size, 2000);
     }
 
@@ -480,15 +489,12 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        let versions = asset.versions();
-        assert!(versions.contains_key(&AssetVersionSize::Original));
-        assert!(versions.contains_key(&AssetVersionSize::Medium));
+        assert!(asset.contains_version(&AssetVersionSize::Original));
+        assert!(asset.contains_version(&AssetVersionSize::Medium));
         // PHOTO_VERSION_LOOKUP maps Medium to resJPEGMed, but for videos
         // VIDEO_VERSION_LOOKUP maps Medium to resVidMed — verify the right one was used
-        assert_eq!(
-            versions[&AssetVersionSize::Medium].url,
-            "https://example.com/vid_med"
-        );
+        let medium = asset.get_version(&AssetVersionSize::Medium).unwrap();
+        assert_eq!(&*medium.url, "https://example.com/vid_med");
     }
 
     #[test]
@@ -511,10 +517,15 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        let versions = asset.versions();
-        assert_eq!(versions.len(), 2);
-        assert_eq!(versions[&AssetVersionSize::Original].size, 5000);
-        assert_eq!(versions[&AssetVersionSize::Thumb].size, 100);
+        assert_eq!(asset.versions().len(), 2);
+        assert_eq!(
+            asset.get_version(&AssetVersionSize::Original).unwrap().size,
+            5000
+        );
+        assert_eq!(
+            asset.get_version(&AssetVersionSize::Thumb).unwrap().size,
+            100
+        );
     }
 
     #[test]
@@ -535,6 +546,47 @@ mod tests {
         let asset = PhotoAsset::from_records(master, asset_rec);
         assert_eq!(asset.id(), "M2");
         assert_eq!(asset.filename(), None);
-        assert_eq!(asset.size(), 0);
+    }
+
+    #[test]
+    fn test_get_version_and_contains_version() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(asset.contains_version(&AssetVersionSize::Original));
+        assert!(!asset.contains_version(&AssetVersionSize::Medium));
+        assert!(asset.get_version(&AssetVersionSize::Original).is_some());
+        assert!(asset.get_version(&AssetVersionSize::Medium).is_none());
+    }
+
+    #[test]
+    fn test_struct_sizes() {
+        use std::mem::size_of;
+        // AssetVersion should be <= 64 bytes
+        // With Box<str> fields: size(8) + url(16) + asset_type(16) + checksum(16) = 56 bytes
+        assert!(
+            size_of::<AssetVersion>() <= 64,
+            "AssetVersion size {} exceeds 64 bytes",
+            size_of::<AssetVersion>()
+        );
+        // PhotoAsset with SmallVec<[...; 4]> inline storage is ~360 bytes.
+        // This is larger than HashMap but avoids heap allocation for common case (<=4 versions).
+        // The trade-off is acceptable since we process assets in streams, not all at once.
+        assert!(
+            size_of::<PhotoAsset>() <= 400,
+            "PhotoAsset size {} exceeds 400 bytes",
+            size_of::<PhotoAsset>()
+        );
+        // AssetVersionSize should be 1 byte (repr(u8))
+        assert_eq!(size_of::<AssetVersionSize>(), 1);
     }
 }

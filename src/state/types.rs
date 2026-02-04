@@ -4,6 +4,71 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
+use crate::icloud::photos::AssetVersionSize;
+
+/// Version size key for state tracking.
+///
+/// This is a 1-byte enum representing the version size, saving ~23 bytes
+/// per AssetRecord compared to storing as a String.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum VersionSizeKey {
+    Original = 0,
+    Medium = 1,
+    Thumb = 2,
+    Adjusted = 3,
+    Alternative = 4,
+    LiveOriginal = 5,
+    LiveMedium = 6,
+    LiveThumb = 7,
+}
+
+impl VersionSizeKey {
+    /// Convert to the string stored in the database.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::Medium => "medium",
+            Self::Thumb => "thumb",
+            Self::Adjusted => "adjusted",
+            Self::Alternative => "alternative",
+            Self::LiveOriginal => "live_original",
+            Self::LiveMedium => "live_medium",
+            Self::LiveThumb => "live_thumb",
+        }
+    }
+
+    /// Parse from the string stored in the database.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "original" => Some(Self::Original),
+            "medium" => Some(Self::Medium),
+            "thumb" => Some(Self::Thumb),
+            "adjusted" => Some(Self::Adjusted),
+            "alternative" => Some(Self::Alternative),
+            "live_original" | "liveoriginal" => Some(Self::LiveOriginal),
+            "live_medium" | "livemedium" => Some(Self::LiveMedium),
+            "live_thumb" | "livethumb" => Some(Self::LiveThumb),
+            _ => None,
+        }
+    }
+}
+
+impl From<AssetVersionSize> for VersionSizeKey {
+    fn from(v: AssetVersionSize) -> Self {
+        match v {
+            AssetVersionSize::Original => Self::Original,
+            AssetVersionSize::Medium => Self::Medium,
+            AssetVersionSize::Thumb => Self::Thumb,
+            AssetVersionSize::Adjusted => Self::Adjusted,
+            AssetVersionSize::Alternative => Self::Alternative,
+            AssetVersionSize::LiveOriginal => Self::LiveOriginal,
+            AssetVersionSize::LiveMedium => Self::LiveMedium,
+            AssetVersionSize::LiveThumb => Self::LiveThumb,
+        }
+    }
+}
+
 /// Status of an asset in the state database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetStatus {
@@ -17,7 +82,7 @@ pub enum AssetStatus {
 
 impl AssetStatus {
     /// Convert to the string stored in the database.
-    #[allow(dead_code)] // Used internally by db.rs for SQL serialization
+    #[allow(dead_code)] // Symmetric with from_str; used in tests
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -70,36 +135,52 @@ impl MediaType {
 }
 
 /// A record of an asset's state in the database.
+///
+/// Fields are ordered for optimal memory layout:
+/// - 8-byte aligned heap types first (String, `Option<PathBuf>`, `Option<String>`)
+/// - 8-byte primitives (u64)
+/// - DateTime fields (12-16 bytes each)
+/// - 4-byte primitives (u32)
+/// - 1-byte enums grouped at the end
 #[derive(Debug, Clone)]
 pub struct AssetRecord {
+    // 8-byte aligned heap types
     /// iCloud asset ID (recordName).
     pub id: String,
-    /// Version size key (e.g., "original", "medium", "live_original").
-    pub version_size: String,
     /// SHA256 checksum of the file.
     pub checksum: String,
     /// Original filename from iCloud.
     pub filename: String,
+    /// Local file path (if downloaded).
+    pub local_path: Option<PathBuf>,
+    /// Last error message (if failed).
+    pub last_error: Option<String>,
+
+    // 8-byte primitives
+    /// File size in bytes.
+    pub size_bytes: u64,
+
+    // DateTime fields (12-16 bytes each)
     /// Asset creation date in iCloud.
     pub created_at: DateTime<Utc>,
     /// Date the asset was added to the iCloud library (optional).
     pub added_at: Option<DateTime<Utc>>,
-    /// File size in bytes.
-    pub size_bytes: u64,
+    /// When the asset was downloaded locally (if downloaded).
+    pub downloaded_at: Option<DateTime<Utc>>,
+    /// When we last saw this asset during a sync.
+    pub last_seen_at: DateTime<Utc>,
+
+    // 4-byte primitives
+    /// Number of download attempts made.
+    pub download_attempts: u32,
+
+    // 1-byte enums grouped together
+    /// Version size key (e.g., Original, Medium, LiveOriginal).
+    pub version_size: VersionSizeKey,
     /// Type of media (photo, video, live photo).
     pub media_type: MediaType,
     /// Current status of the asset.
     pub status: AssetStatus,
-    /// When the asset was downloaded locally (if downloaded).
-    pub downloaded_at: Option<DateTime<Utc>>,
-    /// Local file path (if downloaded).
-    pub local_path: Option<PathBuf>,
-    /// When we last saw this asset during a sync.
-    pub last_seen_at: DateTime<Utc>,
-    /// Number of download attempts made.
-    pub download_attempts: u32,
-    /// Last error message (if failed).
-    pub last_error: Option<String>,
 }
 
 impl AssetRecord {
@@ -107,7 +188,7 @@ impl AssetRecord {
     #[allow(clippy::too_many_arguments)] // Matches SQL table columns
     pub fn new_pending(
         id: String,
-        version_size: String,
+        version_size: VersionSizeKey,
         checksum: String,
         filename: String,
         created_at: DateTime<Utc>,
@@ -117,19 +198,19 @@ impl AssetRecord {
     ) -> Self {
         Self {
             id,
-            version_size,
             checksum,
             filename,
+            local_path: None,
+            last_error: None,
+            size_bytes,
             created_at,
             added_at,
-            size_bytes,
-            media_type,
-            status: AssetStatus::Pending,
             downloaded_at: None,
-            local_path: None,
             last_seen_at: Utc::now(),
             download_attempts: 0,
-            last_error: None,
+            version_size,
+            media_type,
+            status: AssetStatus::Pending,
         }
     }
 }
@@ -167,6 +248,62 @@ pub struct SyncSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn test_version_size_key_round_trip() {
+        for key in [
+            VersionSizeKey::Original,
+            VersionSizeKey::Medium,
+            VersionSizeKey::Thumb,
+            VersionSizeKey::Adjusted,
+            VersionSizeKey::Alternative,
+            VersionSizeKey::LiveOriginal,
+            VersionSizeKey::LiveMedium,
+            VersionSizeKey::LiveThumb,
+        ] {
+            assert_eq!(VersionSizeKey::from_str(key.as_str()), Some(key));
+        }
+    }
+
+    #[test]
+    fn test_version_size_key_from_str_aliases() {
+        // Test alternate spellings (without underscore)
+        assert_eq!(
+            VersionSizeKey::from_str("liveoriginal"),
+            Some(VersionSizeKey::LiveOriginal)
+        );
+        assert_eq!(
+            VersionSizeKey::from_str("livemedium"),
+            Some(VersionSizeKey::LiveMedium)
+        );
+        assert_eq!(
+            VersionSizeKey::from_str("livethumb"),
+            Some(VersionSizeKey::LiveThumb)
+        );
+    }
+
+    #[test]
+    fn test_version_size_key_from_invalid() {
+        assert_eq!(VersionSizeKey::from_str("invalid"), None);
+    }
+
+    #[test]
+    fn test_version_size_key_from_asset_version_size() {
+        assert_eq!(
+            VersionSizeKey::from(AssetVersionSize::Original),
+            VersionSizeKey::Original
+        );
+        assert_eq!(
+            VersionSizeKey::from(AssetVersionSize::LiveOriginal),
+            VersionSizeKey::LiveOriginal
+        );
+    }
+
+    #[test]
+    fn test_version_size_key_size() {
+        assert_eq!(size_of::<VersionSizeKey>(), 1);
+    }
 
     #[test]
     fn test_asset_status_round_trip() {
@@ -206,7 +343,7 @@ mod tests {
         let now = Utc::now();
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             now,
@@ -220,5 +357,15 @@ mod tests {
         assert!(record.local_path.is_none());
         // Verify last_seen_at is set to a recent time (within 1 second of now)
         assert!((record.last_seen_at - now).num_seconds().abs() <= 1);
+    }
+
+    #[test]
+    fn test_asset_record_size() {
+        // Verify struct size is reasonable (goal: <= 256 bytes)
+        assert!(
+            size_of::<AssetRecord>() <= 256,
+            "AssetRecord size {} exceeds 256 bytes",
+            size_of::<AssetRecord>()
+        );
     }
 }

@@ -282,7 +282,11 @@ async fn verify_checksum(path: &Path, expected: &str) -> anyhow::Result<bool> {
         let mut hasher = Sha256::new();
         std::io::copy(&mut file, &mut hasher)?;
         let hash = hasher.finalize();
-        let computed: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        use std::fmt::Write;
+        let computed = hash.iter().fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
 
         // Apple sometimes uses a 33-byte format with a leading byte
         let expected_normalized = if expected.len() == 66 && expected.starts_with("01") {
@@ -412,8 +416,7 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
         };
 
         // Get versions
-        let versions = asset.versions();
-        if versions.is_empty() {
+        if asset.versions().is_empty() {
             tracing::debug!(id = %asset.id(), "Skipping asset with no versions");
             continue;
         }
@@ -423,7 +426,7 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
 
         // Check each version (we only check "original" for import since that's
         // what the normal sync would download)
-        if let Some(version) = versions.get(&AssetVersionSize::Original) {
+        if let Some(version) = asset.get_version(&AssetVersionSize::Original) {
             let expected_path = download::paths::local_download_path(
                 &directory,
                 &args.folder_structure,
@@ -436,12 +439,12 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
                 if let Ok(metadata) = std::fs::metadata(&expected_path) {
                     if metadata.len() == version.size {
                         // File exists with matching size - mark as downloaded
-                        let version_size_str = "original".to_string();
-                        let media_type = download::determine_media_type(&version_size_str, &asset);
+                        let version_size = state::VersionSizeKey::Original;
+                        let media_type = download::determine_media_type(version_size, &asset);
                         let record = state::AssetRecord::new_pending(
                             asset.id().to_string(),
-                            version_size_str.clone(),
-                            version.checksum.clone(),
+                            version_size,
+                            version.checksum.to_string(),
                             filename.clone(),
                             asset.created(),
                             Some(asset.added_date()),
@@ -455,7 +458,7 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
                         }
 
                         if let Err(e) = db
-                            .mark_downloaded(asset.id(), &version_size_str, &expected_path)
+                            .mark_downloaded(asset.id(), version_size.as_str(), &expected_path)
                             .await
                         {
                             tracing::warn!("Failed to mark {} as downloaded: {}", asset.id(), e);
