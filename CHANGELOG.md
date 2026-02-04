@@ -1,39 +1,26 @@
 # Changelog
 
-## Performance vs Python icloudpd
+All notable changes to this project will be documented in this file.
 
-Benchmarked against Python icloudpd 1.32.2 on macOS with WiFi (84 runs, ~500GB total downloaded):
-
-| Photo Count | Python 1T | Rust 1T | Rust 5T | Rust 10T |
-|-------------|-----------|---------|---------|----------|
-| 50 photos | 54s | 46s (1.2x) | 27s (2.0x) | 25s (2.1x) |
-| 500 photos | 5m 8s | 4m 36s (1.1x) | 1m 43s (3.0x) | 1m 43s (3.0x) |
-| 5000 photos | 96 min | 79 min (1.2x) | 30 min (3.2x) | **25 min (3.8x)** |
-| Memory | 63-77 MB | 24-41 MB | 25-30 MB | 27-35 MB |
-
-**Key Takeaways:**
-- **60-65% less memory** than Python across all test sizes
-- **3-4x faster** with concurrent downloads (5-10 threads)
-- Single-threaded Rust is 10-20% faster due to lower runtime overhead
-- At 5000 photos (144GB): Python takes 96 min, Rust 10T takes 25 min
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## Current (unreleased)
+## [0.1.0] - 2025-02-03
 
-### SQLite State Tracking
-- **Always-on state database** — every sync run records asset state per-file in a SQLite database (`<cookie_directory>/<username>.db`)
-- Tracks asset status: `pending`, `downloaded`, `failed`
-- Tracks download metadata: checksum, filename, local path, download attempts, last error
-- **Skip-by-DB downloads** — assets already marked as downloaded are skipped without filesystem checks (faster second runs)
-- **File existence verification** — if DB says downloaded but file is missing, re-downloads automatically
-- **Sync run tracking** — records start time, completion time, and statistics (assets seen, downloaded, failed, interrupted) for each sync run
+Initial release. A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) with full photo/video download capabilities and SQLite state tracking.
 
-> [!IMPORTANT]
-> **Change from Python:** Python icloudpd has no persistent state — every run re-scans the entire library and filesystem. icloudpd-rs tracks state in SQLite, making subsequent syncs near-instant for unchanged libraries.
+### Added
 
-### CLI Subcommands
-New subcommand structure (backwards compatible — bare `icloudpd-rs --username ...` still works as `sync`):
+#### State Management (New in Rust)
+
+- **SQLite state database** tracks every asset's status (`pending`, `downloaded`, `failed`) with checksums, paths, and error messages
+- **Skip-by-database** — subsequent syncs skip already-downloaded assets without filesystem checks
+- **Automatic re-download** — if database says downloaded but file is missing, re-downloads automatically
+- **Sync run history** — records start time, completion, and statistics for each run
+
+#### CLI Subcommands (New in Rust)
 
 | Command | Purpose |
 |---------|---------|
@@ -44,115 +31,123 @@ New subcommand structure (backwards compatible — bare `icloudpd-rs --username 
 | `import-existing` | Import existing local files into the state database |
 | `verify` | Verify downloaded files exist and optionally check checksums |
 
-> [!TIP]
-> Use `status --failed` to list failed assets with error messages
+#### Authentication
 
-### Authentication
-- SRP-6a authentication with Apple's custom protocol variants (including automatic `s2k`/`s2k_fo` negotiation)
-- Two-factor authentication (trusted device code) with trust token persistence
-- Session persistence with cookie management and lock files
-- Interactive secure password prompt when `--password` is not provided
+- SRP-6a with Apple's custom protocol variants (automatic `s2k`/`s2k_fo` negotiation)
+- Two-factor authentication via trusted device codes
+- Session persistence with cookie management
+- Interactive secure password prompt (or `ICLOUD_PASSWORD` environment variable)
 - Automatic SRP repair flow on HTTP 412 responses
-- Domain redirect detection — if Apple indicates a region-specific domain (e.g. `.cn`), the user is prompted to re-run with `--domain`
+- Domain redirect detection for region-specific endpoints (`.cn`)
 
-> [!IMPORTANT]
-> **Change from Python:** Lock files prevent concurrent instances from corrupting session state; expired cookies are pruned on load
+#### Downloads
 
-> [!NOTE]
-> **Change from Python:** Cookie files support both the new JSON format and the legacy Python icloudpd tab-separated format for migration
+- Streaming pipeline with configurable concurrency (`--threads-num`, default: 10)
+- Resumable `.part` files via HTTP Range; existing bytes hashed on resume for full SHA256 verification
+- Exponential backoff with jitter and transient/permanent error classification
+- Progress bar with download tracking (auto-hidden in non-TTY)
+- Live photo MOV collision detection with asset ID suffix fallback
+- File collision deduplication via `--file-match-policy`
+- Two-phase cleanup pass re-fetches expired CDN URLs before final retry
+- Deterministic `.part` filenames derived from checksum (base32, filesystem-safe)
 
-> [!TIP]
-> **Change from Python:** Session and cookie files are restricted to owner-only permissions (`0600`) on Unix
+#### Content & Organization
 
-### Downloads
-- Streaming download pipeline with configurable concurrent downloads (`--threads-num`, default: 10)
-- Separate HTTP client for downloads — no total request timeout, so large files aren't killed mid-transfer. Uses 30s connect timeout and 120s read timeout for stall detection.
-
-> [!IMPORTANT]
-> **Change from Python:** `--threads-num` controls actual concurrent downloads (default: 10) — Python deprecated this flag and always downloads sequentially
-- Resumable partial downloads via HTTP Range requests with SHA256 verification (256KB hash buffer for fast resume)
-- Retry with exponential backoff, jitter, and transient/permanent error classification (`--max-retries` default: 3, `--retry-delay`)
-
-> [!TIP]
-> **Change from Python:** `--max-retries` and `--retry-delay` are new flags — Python hardcodes `MAX_RETRIES = 0` with no user control
-- Progress bar tracking download progress, auto-hidden in non-TTY environments (`--no-progress-bar`). Skipped files (already downloaded) advance the counter on resume.
-- Live photo MOV collision detection — when a regular video occupies the same filename, the companion MOV is saved with an asset ID suffix (e.g. `IMG_0001-ASSET_ID.MOV`)
-- File collision deduplication (`--file-match-policy`) — when multiple iCloud assets share the same filename but have different content, the default `name-size-dedup-with-suffix` policy saves both files by appending the file size (e.g. `photo.jpg` and `photo-12345.jpg`)
-- Two-phase cleanup pass — retries failures with fresh CDN URLs
-- Concurrent downloads with collision detection (tasks are buffered in memory for deduplication)
-- Deterministic `.part` filenames derived from checksum (base32-encoded, filesystem-safe)
-
-> [!IMPORTANT]
-> **Change from Python:** Downloads begin as soon as the first API page returns, rather than enumerating the entire library before starting — eliminates multi-minute startup delays on large libraries
-
-> [!IMPORTANT]
-> **Change from Python:** Partial `.part` files are resumed via HTTP Range; existing bytes are hashed on resume so the final SHA256 checksum covers the entire file
-
-> [!TIP]
-> **Change from Python:** Failed downloads get a cleanup pass that re-fetches URLs from iCloud before retrying, fixing expired CDN URL failures on large syncs
-
-> [!TIP]
-> **Change from Python:** `PhotoAsset` no longer retains raw JSON blobs; version URLs are pre-parsed at construction, reducing per-asset memory and making `versions()` infallible
-
-> [!NOTE]
-> **Change from Python:** API calls (album fetch, zone list) retry automatically on 5xx/429 errors with jitter to prevent thundering herd
-
-> [!NOTE]
-> **Change from Python:** Album photo fetching runs concurrently (bounded by `--threads-num`) instead of sequentially
-
-> [!NOTE]
-> **Change from Python:** Error classification distinguishes retryable errors (5xx, 429 rate limit, checksum mismatch from truncated transfer) from permanent errors (4xx, disk errors), avoiding wasted retries
-
-### Photos & Media
 - Photo, video, and live photo MOV downloads with size variants
 - RAW file alignment (`--align-raw`: as-is, original, alternative)
-- Live photo MOV filename policies (suffix, original)
+- Live photo MOV filename policies (`--live-photo-mov-filename-policy`: suffix, original)
+- Independent live photo video size (`--live-photo-size`)
 - Content filtering by media type, date range, album, and recency
-- Smart album support (time-lapse, videos, slo-mo, bursts, favorites)
-- Handles both plain-text and base64-encoded (`ENCRYPTED_BYTES`) filenames from CloudKit
-- Asset type detection via CloudKit `itemType` with filename extension fallback
+- Smart album support (favorites, bursts, time-lapse, slo-mo, videos)
+- Date-based folder structures (`--folder-structure %Y/%m/%d`)
+- EXIF date tag read/write (`--set-exif-datetime`)
+- Filename sanitization (strips invalid characters)
+- Both plain-text and base64-encoded CloudKit filenames supported
 
-> [!TIP]
-> **Change from Python:** Live photo MOV size is independently configurable (`--live-photo-size`)
+#### Operations
 
-### Organization
-- Date-based folder structures (`--folder-structure`)
-- Filename sanitization (strips `/\:*?"<>|`) and deduplication policies
-- EXIF date tag read/write (`DateTime`, `DateTimeOriginal`, `DateTimeDigitized`) and file modification time sync
+- Dry-run mode (`--dry-run`)
+- Auth-only mode (`--auth-only`)
+- List albums (`--list-albums`) and libraries (`--list-libraries`)
+- Watch mode with configurable intervals (`--watch-with-interval`)
+- Mid-sync session recovery (up to 3 re-auth attempts)
+- Graceful shutdown (first signal finishes in-flight, second force-exits)
+- Library indexing readiness check before querying
+- Log level control (`--log-level`: debug, info, warn, error)
+- Domain selection (`--domain`: com, cn)
+- Custom cookie/session directory (`--cookie-directory`)
 
-> [!NOTE]
-> **Change from Python:** Folder structure format accepts both Python-style `{:%Y}` and plain `%Y` strftime syntax for backwards compatibility
+### Changed (vs Python icloudpd)
 
-### Operational
-- Dry-run, auth-only, list albums/libraries modes
-- Watch mode with automatic session validation and re-authentication between cycles
-- **Mid-sync session recovery** — if Apple invalidates the session during a large download, automatically re-authenticates and resumes (up to 3 attempts). In headless mode, provides actionable guidance to run `--auth-only` interactively for 2FA.
+These are intentional improvements over the Python implementation:
 
-> [!TIP]
-> **Change from Python:** Python icloudpd exits with auth errors if the session expires mid-sync; icloudpd-rs detects 401/403 responses and triggers re-authentication automatically
+| Area | Python Behavior | Rust Behavior |
+|------|-----------------|---------------|
+| **Concurrency** | Sequential downloads (`--threads-num` deprecated) | True parallel downloads (default: 10) |
+| **State** | No persistence; re-scans filesystem every run | SQLite tracks state; near-instant subsequent syncs |
+| **Startup** | Queries album counts before downloading | Downloads begin as first API page returns |
+| **Resumable** | Resumes `.part` files but no checksum verification | Resumes `.part` files with SHA256 verification of full file |
+| **Retry control** | Hardcoded `MAX_RETRIES = 0` (no retries) | Configurable `--max-retries` and `--retry-delay` |
+| **Session safety** | No file locks; concurrent instances can corrupt | Lock files prevent concurrent corruption |
+| **Cookie security** | Default file permissions | Owner-only permissions (`0600`) on Unix |
+| **Expired cookies** | Loads with `ignore_expires=True` | Prunes expired cookies on load |
+| **CDN expiry** | Failed downloads stay failed | Cleanup pass re-fetches URLs before retry |
+| **Mid-sync auth** | Re-authenticates but doesn't retry download | Re-authenticates and retries (up to 3 times) |
+| **Recent filter** | Counts albums first, then `islice` to N | Stops fetching from API after N photos |
+| **API errors** | Retry loop exists but `MAX_RETRIES = 0` | Automatic retry with jitter on 5xx/429 |
+| **Album fetch** | Sequential (`for album in albums`) | Concurrent (bounded by `--threads-num`) |
+| **Error handling** | No error classification | Classifies transient vs permanent errors |
+| **Cookie format** | LWPCookieJar format | JSON format + legacy LWP import support |
+| **Folder syntax** | Python datetime format (`{:%Y/%m/%d}`) | Both `{:%Y}` and `%Y` strftime accepted |
 
-- Graceful shutdown — first Ctrl+C / SIGTERM / SIGHUP finishes in-flight downloads then exits; second signal force-exits immediately. Partial `.part` files are kept for smart resume on next run. Watch mode sleep is interruptible.
-- Library indexing readiness check before querying (waits for CloudKit indexing to finish)
-- Album and shared library enumeration
-- Log level control (`--log-level`: `debug`, `info`, `warn`, `error`; default: `info`), domain selection (com/cn), custom cookie directory
+### Not Implemented (Planned)
 
-> [!TIP]
-> **Change from Python:** `--recent N` stops fetching from the API after N photos instead of enumerating the entire library first
+The following Python icloudpd features are not yet available. Links go to tracking issues:
 
-> [!CAUTION]
-> **Change from Python:** `--until-found` removed — will be replaced by stateful incremental sync with local database
+#### Authentication & Security
+- [#21](https://github.com/rhoopr/icloudpd-rs/issues/21) — SMS-based 2FA (trusted device only currently)
+- [#38](https://github.com/rhoopr/icloudpd-rs/issues/38) — Legacy two-step authentication (2SA)
+- [#22](https://github.com/rhoopr/icloudpd-rs/issues/22) — OS keyring integration for password storage
+- [#36](https://github.com/rhoopr/icloudpd-rs/issues/36) — Headless MFA via `--submit-code` for Docker
+- [#37](https://github.com/rhoopr/icloudpd-rs/issues/37) — Python LWPCookieJar session import
 
-### Code Quality
-- Removed all `#[allow(dead_code)]` on error enum variants by removing unused variants
-- Removed `#[allow(clippy::enum_variant_names)]` by renaming `RawTreatmentPolicy` variants (`AsIs` → `Unchanged`, `AsOriginal` → `PreferOriginal`, `AsAlternative` → `PreferAlternative`) — CLI flag values unchanged
-- Added custom `Debug` implementations for structs containing non-Debug types (e.g., `reqwest::Client`, `Box<dyn Trait>`)
-- Changed internal APIs from `pub` to `pub(crate)` for proper encapsulation
-- Replaced `.expect()` calls with proper error handling patterns
-- Fixed `if let Some(ref x) = foo` to idiomatic `if let Some(x) = &foo`
+#### Content & Downloads
+- [#20](https://github.com/rhoopr/icloudpd-rs/issues/20) — Shared library downloads
+- [#19](https://github.com/rhoopr/icloudpd-rs/issues/19) — XMP sidecar export (`--xmp-sidecar`)
+- [#14](https://github.com/rhoopr/icloudpd-rs/issues/14) — Multiple size downloads (`--size` accepting multiple values)
+- [#15](https://github.com/rhoopr/icloudpd-rs/issues/15) — Force size without fallback (`--force-size`)
+- [#25](https://github.com/rhoopr/icloudpd-rs/issues/25) — Keep Unicode in filenames (`--keep-unicode-in-filenames`)
+- [#17](https://github.com/rhoopr/icloudpd-rs/issues/17) — Print filenames only (`--only-print-filenames`)
+- [#35](https://github.com/rhoopr/icloudpd-rs/issues/35) — Fingerprint fallback filenames
+- [#52](https://github.com/rhoopr/icloudpd-rs/issues/52) — HEIC to JPEG conversion (`--convert-heic`)
 
-### Not Yet Implemented (hidden from CLI)
-The following flags are planned but not yet functional. They are hidden from `--help` and will be enabled in a future release:
-- `--force-size` — download only the requested size without fallback to original
-- `--keep-unicode-in-filenames` — preserve Unicode characters in filenames
-- `--only-print-filenames` — print download paths without downloading
-- `--library` — select which library to download from (default: PrimarySync)
+#### iCloud Lifecycle
+- [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) — Auto-delete (Recently Deleted album scan)
+- [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) — Delete after download (`--delete-after-download`)
+- [#30](https://github.com/rhoopr/icloudpd-rs/issues/30) — Keep iCloud recent days (`--keep-icloud-recent-days`)
+
+#### Notifications & Monitoring
+- [#31](https://github.com/rhoopr/icloudpd-rs/issues/31) — Email/SMTP notifications on 2FA expiration
+- [#32](https://github.com/rhoopr/icloudpd-rs/issues/32) — Notification scripts (`--notification-script`)
+- [#55](https://github.com/rhoopr/icloudpd-rs/issues/55) — Prometheus metrics export
+
+#### Distribution & Configuration
+- [#40](https://github.com/rhoopr/icloudpd-rs/issues/40) — Docker images and AUR builds
+- [#51](https://github.com/rhoopr/icloudpd-rs/issues/51) — Config file support (TOML)
+- [#33](https://github.com/rhoopr/icloudpd-rs/issues/33) — Multi-account support
+- [#34](https://github.com/rhoopr/icloudpd-rs/issues/34) — OS locale date formatting (`--use-os-locale`)
+
+### Removed (vs Python icloudpd)
+
+- `--until-found` — Replaced by SQLite state tracking; the database knows what's already downloaded
+- `--smtp-*` flags — Email notifications not yet implemented ([#31](https://github.com/rhoopr/icloudpd-rs/issues/31))
+- `--notification-*` flags — Script notifications not yet implemented ([#32](https://github.com/rhoopr/icloudpd-rs/issues/32))
+
+### Known Issues
+
+- [#47](https://github.com/rhoopr/icloudpd-rs/issues/47) — Progress bar position can overshoot when photos have companion files
+- [#69](https://github.com/rhoopr/icloudpd-rs/issues/69) — Schema migration logic needs improvement before v2
+
+---
+
+[0.1.0]: https://github.com/rhoopr/icloudpd-rs/releases/tag/v0.1.0
