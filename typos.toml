@@ -10,3 +10,5 @@ extend-exclude = ["reference/"]
 hsa = "hsa"
 # Used in s2k_fo protocol (Apple SRP) and base32 test data
 fo = "fo"
+# Appears in base64-encoded test data (e.g. "QUJDMTIz")
+Iz = "Iz"

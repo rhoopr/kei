@@ -58,12 +58,10 @@ pub struct Config {
     pub skip_videos: bool,
     pub skip_photos: bool,
     pub skip_live_photos: bool,
-    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub force_size: bool,
     pub set_exif_datetime: bool,
     pub dry_run: bool,
     pub no_progress_bar: bool,
-    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub keep_unicode_in_filenames: bool,
     #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub only_print_filenames: bool,

@@ -145,6 +145,8 @@ pub struct DownloadConfig {
     pub(crate) align_raw: RawTreatmentPolicy,
     pub(crate) no_progress_bar: bool,
     pub(crate) file_match_policy: FileMatchPolicy,
+    pub(crate) force_size: bool,
+    pub(crate) keep_unicode_in_filenames: bool,
     /// State database for tracking download progress.
     pub(crate) state_db: Option<Arc<dyn StateDb>>,
 }
@@ -173,6 +175,8 @@ impl std::fmt::Debug for DownloadConfig {
             .field("align_raw", &self.align_raw)
             .field("no_progress_bar", &self.no_progress_bar)
             .field("file_match_policy", &self.file_match_policy)
+            .field("force_size", &self.force_size)
+            .field("keep_unicode_in_filenames", &self.keep_unicode_in_filenames)
             .field("state_db", &self.state_db.is_some())
             .finish()
     }
@@ -398,7 +402,7 @@ fn filter_asset_to_tasks(
         }
     }
 
-    let filename = match asset.filename() {
+    let raw_filename = match asset.filename() {
         Some(f) => f,
         None => {
             tracing::warn!("Asset {} has no filename, skipping", asset.id());
@@ -406,14 +410,15 @@ fn filter_asset_to_tasks(
         }
     };
 
-    let created_local: DateTime<Local> = created_utc.with_timezone(&Local);
-    let download_path = paths::local_download_path(
-        &config.directory,
-        &config.folder_structure,
-        &created_local,
-        filename,
-    );
+    // Strip non-ASCII characters unless --keep-unicode-in-filenames is set.
+    // Matches Python's default behavior of calling remove_unicode_chars() on filenames.
+    let base_filename = if config.keep_unicode_in_filenames {
+        raw_filename.to_string()
+    } else {
+        paths::remove_unicode_chars(raw_filename)
+    };
 
+    let created_local: DateTime<Local> = created_utc.with_timezone(&Local);
     let versions = apply_raw_policy(asset.versions(), config.align_raw);
     let mut tasks = Vec::new();
 
@@ -422,7 +427,45 @@ fn filter_asset_to_tasks(
         versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     };
 
-    if let Some(version) = get_version(&config.size) {
+    // Select requested version, falling back to Original when the requested size is
+    // unavailable (unless --force-size is set). Matches Python's behavior.
+    // Track the effective size so we only add "-medium"/"-thumb" suffix when
+    // the asset actually has that version (not on fallback to Original).
+    let (version, effective_size) = match get_version(&config.size) {
+        Some(v) => (Some(v), config.size),
+        None if config.size != AssetVersionSize::Original && !config.force_size => {
+            match get_version(&AssetVersionSize::Original) {
+                Some(v) => (Some(v), AssetVersionSize::Original),
+                None => (None, config.size),
+            }
+        }
+        _ => (None, config.size),
+    };
+    if let Some(version) = version {
+        // Map the file extension based on the version's UTI asset_type
+        let mapped_filename = paths::map_filename_extension(&base_filename, &version.asset_type);
+
+        // Add size suffix for non-Original sizes (e.g., "-medium", "-thumb").
+        // Only when actually using that size, not on fallback to Original.
+        // Matches Python's VERSION_FILENAME_SUFFIX_LOOKUP.
+        let sized_filename = match effective_size {
+            AssetVersionSize::Medium => paths::insert_suffix(&mapped_filename, "medium"),
+            AssetVersionSize::Thumb => paths::insert_suffix(&mapped_filename, "thumb"),
+            _ => mapped_filename,
+        };
+
+        // Apply name-id7 policy: bake asset ID suffix into ALL filenames upfront
+        let filename = match config.file_match_policy {
+            FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized_filename, asset.id()),
+            _ => sized_filename,
+        };
+
+        let download_path = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &created_local,
+            &filename,
+        );
         // Determine the final download path, applying size-based deduplication if needed.
         // Check both on-disk files AND in-flight downloads (claimed_paths) to handle
         // concurrent downloads of assets with the same filename.
@@ -438,7 +481,7 @@ fn filter_asset_to_tasks(
                         None
                     } else {
                         // Different size — deduplicate by appending file size to filename.
-                        let dedup_filename = paths::add_dedup_suffix(filename, version.size);
+                        let dedup_filename = paths::add_dedup_suffix(&filename, version.size);
                         let dedup_path = paths::local_download_path(
                             &config.directory,
                             &config.folder_structure,
@@ -481,7 +524,7 @@ fn filter_asset_to_tasks(
                         None
                     } else {
                         // Different size — deduplicate by appending file size to filename.
-                        let dedup_filename = paths::add_dedup_suffix(filename, version.size);
+                        let dedup_filename = paths::add_dedup_suffix(&filename, version.size);
                         let dedup_path = paths::local_download_path(
                             &config.directory,
                             &config.folder_structure,
@@ -528,10 +571,15 @@ fn filter_asset_to_tasks(
     // Live photo MOV companion — only for images
     if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
         if let Some(live_version) = get_version(&config.live_photo_size) {
+            // Apply name-id7 to the base filename before deriving MOV name
+            let live_base = match config.file_match_policy {
+                FileMatchPolicy::NameId7 => paths::apply_name_id7(&base_filename, asset.id()),
+                _ => base_filename.clone(),
+            };
             let mov_filename = match config.live_photo_mov_filename_policy {
-                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(filename),
+                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
                 LivePhotoMovFilenamePolicy::Original => {
-                    paths::live_photo_mov_path_original(filename)
+                    paths::live_photo_mov_path_original(&live_base)
                 }
             };
             let mov_path = paths::local_download_path(
@@ -1361,6 +1409,19 @@ async fn download_single_task(
             if let Err(e) = exif_result {
                 tracing::warn!("EXIF task panicked: {}", e);
             }
+
+            // Restore mtime after EXIF modification (EXIF write updates mtime to "now")
+            let mtime_path2 = task.download_path.clone();
+            let ts2 = task.created_local.timestamp();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || set_file_mtime(&mtime_path2, ts2)).await?
+            {
+                tracing::warn!(
+                    "Could not restore mtime on {}: {}",
+                    task.download_path.display(),
+                    e
+                );
+            }
         }
     }
 
@@ -1441,6 +1502,8 @@ mod tests {
             align_raw: RawTreatmentPolicy::Unchanged,
             no_progress_bar: true,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
+            force_size: false,
+            keep_unicode_in_filenames: false,
             state_db: None,
         }
     }
@@ -2048,30 +2111,15 @@ mod tests {
             claimed_paths.keys().collect::<Vec<_>>()
         );
 
-        // Check the MOV filename based on platform
+        // Both the video (.mov) and the live-photo MOV get their extension
+        // mapped to uppercase .MOV via ITEM_TYPE_EXTENSIONS, so they collide
+        // on ALL platforms (not just case-insensitive ones).
         let mov_filename = mov_path.file_name().unwrap().to_str().unwrap();
-
-        // On case-insensitive filesystems (macOS, Windows), IMG_0996.mov and IMG_0996.MOV
-        // collide, so the MOV should be deduped with asset ID suffix.
-        // On case-sensitive filesystems (Linux), they're different files, no dedup needed.
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            assert!(
-                mov_filename.contains("-IMG_0996"),
-                "Case-insensitive collision: MOV should be deduped with asset ID suffix. \
-                Got: {}",
-                mov_filename
-            );
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            // On Linux (case-sensitive), both files can coexist without dedup
-            assert_eq!(
-                mov_filename, "IMG_0996.MOV",
-                "On case-sensitive FS, MOV should keep original name"
-            );
-        }
+        assert!(
+            mov_filename.contains("-IMG_0996"),
+            "MOV should be deduped with asset ID suffix due to path collision. Got: {}",
+            mov_filename
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

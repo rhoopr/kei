@@ -1,6 +1,7 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use chrono::{DateTime, Datelike, Local, Timelike};
 
 /// Build the local download path for a photo asset.
@@ -96,7 +97,6 @@ pub fn clean_filename(filename: &str) -> String {
 
 /// Remove non-ASCII (unicode) characters from a filename, keeping only
 /// ASCII characters.
-#[allow(dead_code)] // for --keep-unicode-in-filenames (parsed but not yet wired)
 pub fn remove_unicode_chars(filename: &str) -> String {
     filename.chars().filter(|c| c.is_ascii()).collect()
 }
@@ -152,6 +152,75 @@ pub fn insert_suffix(path: &str, suffix: &str) -> String {
             result.push_str(suffix);
             result
         }
+    }
+}
+
+/// Map UTI asset_type strings to standardized uppercase file extensions.
+///
+/// Matches Python icloudpd's `ITEM_TYPE_EXTENSIONS` mapping.
+const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
+    ("public.heic", "HEIC"),
+    ("public.heif", "HEIF"),
+    ("public.jpeg", "JPG"),
+    ("public.png", "PNG"),
+    ("com.apple.quicktime-movie", "MOV"),
+    ("com.adobe.raw-image", "DNG"),
+    ("com.canon.cr2-raw-image", "CR2"),
+    ("com.canon.crw-raw-image", "CRW"),
+    ("com.sony.arw-raw-image", "ARW"),
+    ("com.fuji.raw-image", "RAF"),
+    ("com.panasonic.rw2-raw-image", "RW2"),
+    ("com.nikon.nrw-raw-image", "NRF"),
+    ("com.pentax.raw-image", "PEF"),
+    ("com.nikon.raw-image", "NEF"),
+    ("com.olympus.raw-image", "ORF"),
+    ("com.canon.cr3-raw-image", "CR3"),
+    ("com.olympus.or-raw-image", "ORF"),
+];
+
+/// Replace a filename's extension based on the UTI `asset_type` string.
+///
+/// If `asset_type` is found in `ITEM_TYPE_EXTENSIONS`, the filename's extension
+/// is replaced with the mapped uppercase extension. Otherwise the original
+/// filename is returned unchanged.
+pub fn map_filename_extension(filename: &str, asset_type: &str) -> String {
+    let mapped_ext = ITEM_TYPE_EXTENSIONS
+        .iter()
+        .find(|(key, _)| *key == asset_type)
+        .map(|(_, ext)| *ext);
+
+    match mapped_ext {
+        Some(ext) => match filename.rfind('.') {
+            Some(dot) => {
+                let stem = &filename[..dot];
+                format!("{}.{}", stem, ext)
+            }
+            None => format!("{}.{}", filename, ext),
+        },
+        None => filename.to_string(),
+    }
+}
+
+/// Compute the first 7 characters of the base64-encoded asset ID.
+///
+/// Used by the `name-id7` file match policy to create unique filenames.
+fn base64_id7(id: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(id.as_bytes());
+    encoded.chars().take(7).collect()
+}
+
+/// Apply the `name-id7` policy: insert the first 7 chars of the base64-encoded
+/// asset ID as a suffix before the file extension, using underscore separator.
+///
+/// Matches Python's `add_suffix_to_filename(f"_{id_suffix}", filename)`.
+pub fn apply_name_id7(filename: &str, id: &str) -> String {
+    let suffix = base64_id7(id);
+    match filename.rfind('.') {
+        Some(dot) => {
+            let (stem, ext) = filename.split_at(dot);
+            format!("{}_{}{}", stem, suffix, ext)
+        }
+        None => format!("{}_{}", filename, suffix),
     }
 }
 
@@ -251,5 +320,87 @@ mod tests {
         );
         assert_eq!(insert_suffix("photo", "123"), "photo-123");
         assert_eq!(insert_suffix("a.b.mov", "id"), "a.b-id.mov");
+    }
+
+    #[test]
+    fn test_map_filename_extension_known_types() {
+        assert_eq!(
+            map_filename_extension("IMG_0001.jpeg", "public.jpeg"),
+            "IMG_0001.JPG"
+        );
+        assert_eq!(
+            map_filename_extension("photo.heic", "public.heic"),
+            "photo.HEIC"
+        );
+        assert_eq!(
+            map_filename_extension("video.mov", "com.apple.quicktime-movie"),
+            "video.MOV"
+        );
+        assert_eq!(
+            map_filename_extension("raw.cr2", "com.canon.cr2-raw-image"),
+            "raw.CR2"
+        );
+        assert_eq!(
+            map_filename_extension("photo.png", "public.png"),
+            "photo.PNG"
+        );
+    }
+
+    #[test]
+    fn test_map_filename_extension_unknown_type() {
+        assert_eq!(
+            map_filename_extension("photo.xyz", "com.unknown.type"),
+            "photo.xyz"
+        );
+    }
+
+    #[test]
+    fn test_map_filename_extension_no_extension() {
+        assert_eq!(map_filename_extension("photo", "public.jpeg"), "photo.JPG");
+    }
+
+    #[test]
+    fn test_apply_name_id7() {
+        let result = apply_name_id7("IMG_0001.JPG", "ABC123");
+        // base64("ABC123") = "QUJDMTIz", first 7 = "QUJDMTI"
+        assert_eq!(result, "IMG_0001_QUJDMTI.JPG");
+    }
+
+    #[test]
+    fn test_apply_name_id7_no_extension() {
+        let result = apply_name_id7("photo", "XYZ");
+        // base64("XYZ") = "WFla", first 7 (only 4 available) = "WFla"
+        assert_eq!(result, "photo_WFla");
+    }
+
+    #[test]
+    fn test_base64_id7_length() {
+        // Longer IDs should produce exactly 7 chars
+        let result = base64_id7("AaBbCcDdEeFfGg/HhIiJj+KkLl");
+        assert_eq!(result.len(), 7);
+    }
+
+    #[test]
+    fn test_remove_unicode_strips_narrow_no_break_space() {
+        // U+202F (NARROW NO-BREAK SPACE) is used before AM/PM in macOS screenshots
+        let input = "Screenshot 2025-04-03 at 1.40.01\u{202F}PM.PNG";
+        assert_eq!(
+            remove_unicode_chars(input),
+            "Screenshot 2025-04-03 at 1.40.01PM.PNG"
+        );
+    }
+
+    #[test]
+    fn test_insert_suffix_medium_thumb() {
+        // Matches Python's VERSION_FILENAME_SUFFIX_LOOKUP behavior
+        assert_eq!(
+            insert_suffix("IMG_5526.JPG", "medium"),
+            "IMG_5526-medium.JPG"
+        );
+        assert_eq!(insert_suffix("IMG_5526.JPG", "thumb"), "IMG_5526-thumb.JPG");
+        assert_eq!(
+            insert_suffix("IMG_5526_QUJDMTI.JPG", "medium"),
+            "IMG_5526_QUJDMTI-medium.JPG"
+        );
     }
 }

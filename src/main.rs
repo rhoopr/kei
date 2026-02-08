@@ -705,6 +705,8 @@ async fn main() -> anyhow::Result<()> {
         align_raw: config.align_raw,
         no_progress_bar: config.no_progress_bar,
         file_match_policy: config.file_match_policy,
+        force_size: config.force_size,
+        keep_unicode_in_filenames: config.keep_unicode_in_filenames,
         state_db,
     };
 
