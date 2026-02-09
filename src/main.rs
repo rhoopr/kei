@@ -592,8 +592,9 @@ async fn main() -> anyhow::Result<()> {
         icloud::photos::PhotosService::new(ckdatabasews_url.to_string(), session_box, params)
             .await?;
 
+    let mut photos_service = photos_service;
+
     if config.list_libraries {
-        let mut photos_service = photos_service;
         println!("Private libraries:");
         let private = photos_service.fetch_private_libraries().await?;
         for name in private.keys() {
@@ -607,8 +608,14 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Resolve the selected library (defaults to PrimarySync)
+    if config.library != "PrimarySync" {
+        tracing::info!(library = %config.library, "Using non-default library");
+    }
+    let library = photos_service.get_library(&config.library).await?;
+
     if config.list_albums {
-        let albums = photos_service.albums().await?;
+        let albums = library.albums().await?;
         println!("Albums:");
         for name in albums.keys() {
             println!("  {}", name);
@@ -621,9 +628,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let albums = if config.albums.is_empty() {
-        vec![photos_service.all()]
+        vec![library.all()]
     } else {
-        let mut album_map = photos_service.albums().await?;
+        let mut album_map = library.albums().await?;
         let mut matched = Vec::new();
         for name in &config.albums {
             match album_map.remove(name.as_str()) {

@@ -73,8 +73,7 @@ pub struct SyncArgs {
     pub albums: Vec<String>,
 
     /// Library to download (default: PrimarySync)
-    /// NOTE: Parsed but not yet wired up - hidden until implemented
-    #[arg(long, default_value = "PrimarySync", hide = true)]
+    #[arg(long, default_value = "PrimarySync")]
     pub library: String,
 
     /// Image size to download
@@ -539,6 +538,22 @@ mod tests {
 
     fn base_args() -> Vec<&'static str> {
         vec!["icloudpd-rs", "--username", "test@example.com"]
+    }
+
+    #[test]
+    fn test_library_default_primary_sync() {
+        let cli = parse(&base_args());
+        let legacy: LegacyCli = cli.into();
+        assert_eq!(legacy.library, "PrimarySync");
+    }
+
+    #[test]
+    fn test_library_accepts_custom_value() {
+        let mut args = base_args();
+        args.extend(["--library", "SharedSync-ABCD1234"]);
+        let cli = parse(&args);
+        let legacy: LegacyCli = cli.into();
+        assert_eq!(legacy.library, "SharedSync-ABCD1234");
     }
 
     #[test]

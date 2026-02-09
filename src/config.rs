@@ -23,7 +23,6 @@ pub struct Config {
     pub cookie_directory: PathBuf,
     pub folder_structure: String,
     pub albums: Vec<String>,
-    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub library: String,
 
     // DateTime fields
