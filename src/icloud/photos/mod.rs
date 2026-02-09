@@ -18,6 +18,7 @@ pub use session::PhotosSession;
 pub use types::{AssetItemType, AssetVersionSize};
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tracing::{debug, error};
@@ -27,7 +28,7 @@ use crate::icloud::error::ICloudError;
 pub struct PhotosService {
     service_root: String,
     session: Box<dyn PhotosSession>,
-    params: HashMap<String, Value>,
+    params: Arc<HashMap<String, Value>>,
     primary_library: PhotoLibrary,
     private_libraries: Option<HashMap<String, PhotoLibrary>>,
     shared_libraries: Option<HashMap<String, PhotoLibrary>>,
@@ -54,6 +55,7 @@ impl PhotosService {
         params.insert("remapEnums".to_string(), Value::Bool(true));
         params.insert("getCurrentSyncToken".to_string(), Value::Bool(true));
 
+        let params = Arc::new(params);
         let service_endpoint = Self::build_service_endpoint(&service_root, "private");
         let zone_id = json!({"zoneName": "PrimarySync"});
 
@@ -61,7 +63,7 @@ impl PhotosService {
 
         let primary_library = PhotoLibrary::new(
             service_endpoint,
-            params.clone(),
+            Arc::clone(&params),
             lib_session,
             zone_id,
             "private".to_string(),
@@ -175,7 +177,7 @@ impl PhotosService {
 
             match PhotoLibrary::new(
                 ep,
-                self.params.clone(),
+                Arc::clone(&self.params),
                 lib_session,
                 zone_id,
                 library_type.to_string(),

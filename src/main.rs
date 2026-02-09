@@ -39,11 +39,15 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
         let password = self.password.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pw) = password.as_deref() {
             if !pw.is_empty() {
-                let s = String::from_utf8_lossy(buf);
-                if s.contains(pw) {
-                    let redacted = s.replace(pw, "********");
-                    self.inner.write_all(redacted.as_bytes())?;
-                    return Ok(buf.len());
+                // A buffer shorter than the password can't contain it,
+                // avoiding the lossy UTF-8 conversion for short log fragments.
+                if buf.len() >= pw.len() {
+                    let s = String::from_utf8_lossy(buf);
+                    if s.contains(pw) {
+                        let redacted = s.replace(pw, "********");
+                        self.inner.write_all(redacted.as_bytes())?;
+                        return Ok(buf.len());
+                    }
                 }
             }
         }
@@ -349,8 +353,39 @@ async fn verify_checksum(path: &Path, expected: &str) -> anyhow::Result<bool> {
     .await?
 }
 
-/// Run the import-existing command.
+/// Build the query parameters HashMap for the iCloud Photos CloudKit API.
 ///
+/// Must match Python's `PyiCloudService.params` for API compatibility.
+fn build_photos_params(
+    auth_result: &auth::AuthResult,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    let mut params = std::collections::HashMap::new();
+    params.insert(
+        "clientBuildNumber".to_string(),
+        serde_json::Value::String("2522Project44".to_string()),
+    );
+    params.insert(
+        "clientMasteringNumber".to_string(),
+        serde_json::Value::String("2522B2".to_string()),
+    );
+    params.insert(
+        "clientId".to_string(),
+        serde_json::Value::String(auth_result.session.client_id().cloned().unwrap_or_default()),
+    );
+    if let Some(dsid) = &auth_result
+        .data
+        .ds_info
+        .as_ref()
+        .and_then(|ds| ds.dsid.as_ref())
+    {
+        params.insert(
+            "dsid".to_string(),
+            serde_json::Value::String(dsid.to_string()),
+        );
+    }
+    params
+}
+
 /// This imports existing local files into the state database by:
 /// 1. Enumerating all iCloud assets via the photos API
 /// 2. Computing the expected local path for each asset
@@ -400,30 +435,7 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
         .map(|ep| ep.url.as_str())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
 
-    let mut params = std::collections::HashMap::new();
-    params.insert(
-        "clientBuildNumber".to_string(),
-        serde_json::Value::String("2522Project44".to_string()),
-    );
-    params.insert(
-        "clientMasteringNumber".to_string(),
-        serde_json::Value::String("2522B2".to_string()),
-    );
-    params.insert(
-        "clientId".to_string(),
-        serde_json::Value::String(auth_result.session.client_id().cloned().unwrap_or_default()),
-    );
-    if let Some(dsid) = &auth_result
-        .data
-        .ds_info
-        .as_ref()
-        .and_then(|ds| ds.dsid.as_ref())
-    {
-        params.insert(
-            "dsid".to_string(),
-            serde_json::Value::String(dsid.to_string()),
-        );
-    }
+    let params = build_photos_params(&auth_result);
 
     let shared_session: auth::SharedSession =
         Arc::new(tokio::sync::RwLock::new(auth_result.session));
@@ -684,31 +696,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|ep| ep.url.as_str())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
 
-    // Must match Python's PyiCloudService.params for API compatibility
-    let mut params = std::collections::HashMap::new();
-    params.insert(
-        "clientBuildNumber".to_string(),
-        serde_json::Value::String("2522Project44".to_string()),
-    );
-    params.insert(
-        "clientMasteringNumber".to_string(),
-        serde_json::Value::String("2522B2".to_string()),
-    );
-    params.insert(
-        "clientId".to_string(),
-        serde_json::Value::String(auth_result.session.client_id().cloned().unwrap_or_default()),
-    );
-    if let Some(dsid) = &auth_result
-        .data
-        .ds_info
-        .as_ref()
-        .and_then(|ds| ds.dsid.as_ref())
-    {
-        params.insert(
-            "dsid".to_string(),
-            serde_json::Value::String(dsid.to_string()),
-        );
-    }
+    let params = build_photos_params(&auth_result);
 
     let shared_session: auth::SharedSession =
         std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
@@ -793,7 +781,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let download_config = download::DownloadConfig {
+    let download_config = Arc::new(download::DownloadConfig {
         directory: config.directory.clone(),
         folder_structure: config.folder_structure.clone(),
         size: config.size.into(),
@@ -824,7 +812,7 @@ async fn main() -> anyhow::Result<()> {
         keep_unicode_in_filenames: config.keep_unicode_in_filenames,
         temp_suffix: config.temp_suffix.clone(),
         state_db,
-    };
+    });
 
     let shutdown_token = shutdown::install_signal_handler(&notifier)?;
 
@@ -850,7 +838,7 @@ async fn main() -> anyhow::Result<()> {
         let outcome = download::download_photos(
             &download_client,
             &albums,
-            &download_config,
+            Arc::clone(&download_config),
             shutdown_token.clone(),
         )
         .await?;

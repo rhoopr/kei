@@ -1,8 +1,10 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use base64::Engine;
 use chrono::{DateTime, Datelike, Local, Timelike};
+use rustc_hash::FxHashMap;
 
 /// Build the local download path for a photo asset.
 ///
@@ -116,34 +118,37 @@ pub fn sanitize_path_component(name: &str) -> String {
     }
 
     // Check for Windows reserved names (case-insensitive)
-    let upper = trimmed.to_ascii_uppercase();
-    let base = upper.split('.').next().unwrap_or("");
-    if matches!(
-        base,
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    ) {
-        return format!("_{}", trimmed);
+    #[cfg(target_os = "windows")]
+    {
+        let upper = trimmed.to_ascii_uppercase();
+        let base = upper.split('.').next().unwrap_or("");
+        if matches!(
+            base,
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        ) {
+            return format!("_{}", trimmed);
+        }
     }
 
     trimmed.to_string()
@@ -291,15 +296,15 @@ pub fn live_photo_mov_path_suffix(filename: &str) -> String {
     }
 }
 
+/// Pre-built HashMap for O(1) asset type lookups instead of linear scan.
+static ITEM_TYPE_MAP: LazyLock<FxHashMap<&'static str, &'static str>> =
+    LazyLock::new(|| ITEM_TYPE_EXTENSIONS.iter().copied().collect());
+
 /// Look up the file extension for a UTI asset type string.
 ///
 /// Returns the uppercase extension (e.g. `"JPG"`) or `"unknown"` if not mapped.
 pub fn item_type_extension(asset_type: &str) -> &'static str {
-    ITEM_TYPE_EXTENSIONS
-        .iter()
-        .find(|(key, _)| *key == asset_type)
-        .map(|(_, ext)| *ext)
-        .unwrap_or("unknown")
+    ITEM_TYPE_MAP.get(asset_type).copied().unwrap_or("unknown")
 }
 
 /// Generate a fallback filename from the asset ID when `filenameEnc` is absent.
@@ -328,26 +333,45 @@ pub fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String
 /// enabling matching between files created with different locale settings.
 pub fn normalize_ampm(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
     let mut i = 0;
+
     while i < len {
-        // Check if current char is whitespace before "AM" or "PM"
-        if i + 2 < len
-            && (chars[i] == ' ' || chars[i] == '\u{202F}' || chars[i] == '\u{00A0}')
-            && ((chars[i + 1] == 'A' || chars[i + 1] == 'a')
-                && (chars[i + 2] == 'M' || chars[i + 2] == 'm'))
-            || (i + 2 < len
-                && (chars[i] == ' ' || chars[i] == '\u{202F}' || chars[i] == '\u{00A0}')
-                && ((chars[i + 1] == 'P' || chars[i + 1] == 'p')
-                    && (chars[i + 2] == 'M' || chars[i + 2] == 'm')))
-        {
-            // Skip the whitespace, keep AM/PM
-            i += 1;
-            continue;
+        // Check for whitespace characters that may precede AM/PM:
+        // - Regular space (U+0020): 1 byte
+        // - No-break space (U+00A0): 2 bytes (0xC2, 0xA0)
+        // - Narrow no-break space (U+202F): 3 bytes (0xE2, 0x80, 0xAF)
+        let ws_len = if bytes[i] == b' ' {
+            1
+        } else if i + 1 < len && bytes[i] == 0xC2 && bytes[i + 1] == 0xA0 {
+            2 // U+00A0
+        } else if i + 2 < len && bytes[i] == 0xE2 && bytes[i + 1] == 0x80 && bytes[i + 2] == 0xAF {
+            3 // U+202F
+        } else {
+            0
+        };
+
+        if ws_len > 0 && i + ws_len + 1 < len {
+            let next = bytes[i + ws_len].to_ascii_uppercase();
+            let next2 = bytes[i + ws_len + 1].to_ascii_uppercase();
+            if (next == b'A' || next == b'P') && next2 == b'M' {
+                // Skip the whitespace, the AM/PM chars will be added on next iterations
+                i += ws_len;
+                continue;
+            }
         }
-        result.push(chars[i]);
-        i += 1;
+
+        // Safe: we only skip known valid UTF-8 boundaries above
+        if bytes[i] < 0x80 {
+            result.push(bytes[i] as char);
+            i += 1;
+        } else {
+            // Multi-byte UTF-8: decode the char and advance past it
+            let ch = s[i..].chars().next().unwrap();
+            result.push(ch);
+            i += ch.len_utf8();
+        }
     }
     result
 }
@@ -358,8 +382,15 @@ pub fn normalize_ampm(s: &str) -> String {
 /// directory for an AM/PM whitespace variant (e.g., `1.40.01 PM.PNG` vs
 /// `1.40.01\u{202F}PM.PNG` vs `1.40.01PM.PNG`).
 ///
+/// On first call for a given parent directory, reads and caches all filenames.
+/// Subsequent calls for files in the same directory reuse the cache, avoiding
+/// repeated `read_dir` syscalls in hot loops.
+///
 /// Returns the matching variant's full path, or `None` if no match is found.
-pub fn find_ampm_variant(path: &Path) -> Option<PathBuf> {
+pub fn find_ampm_variant_cached(
+    path: &Path,
+    dir_cache: &mut std::collections::HashMap<PathBuf, Vec<String>>,
+) -> Option<PathBuf> {
     let filename = path.file_name()?.to_str()?;
     let normalized = normalize_ampm(filename);
 
@@ -369,17 +400,24 @@ pub fn find_ampm_variant(path: &Path) -> Option<PathBuf> {
     }
 
     let parent = path.parent()?;
-    let entries = std::fs::read_dir(parent).ok()?;
+    let filenames = dir_cache.entry(parent.to_path_buf()).or_insert_with(|| {
+        std::fs::read_dir(parent)
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
 
-    for entry in entries.flatten() {
-        let entry_name = entry.file_name();
-        if let Some(sibling) = entry_name.to_str() {
-            if sibling == filename {
-                continue; // Skip exact match (shouldn't exist, but be safe)
-            }
-            if normalize_ampm(sibling) == normalized {
-                return Some(entry.path());
-            }
+    for sibling in filenames {
+        if sibling == filename {
+            continue;
+        }
+        if normalize_ampm(sibling) == normalized {
+            return Some(parent.join(sibling));
         }
     }
 
@@ -632,7 +670,8 @@ mod tests {
 
         // Look for the narrow-no-break-space variant
         let query = dir.join("Screenshot at 1.40.01\u{202F}PM.PNG");
-        let found = find_ampm_variant(&query);
+        let mut cache = std::collections::HashMap::new();
+        let found = find_ampm_variant_cached(&query, &mut cache);
         assert!(found.is_some());
         assert_eq!(found.unwrap(), existing);
 
@@ -642,7 +681,8 @@ mod tests {
     #[test]
     fn test_find_ampm_variant_returns_none_for_non_ampm() {
         let path = Path::new("/tmp/claude/nonexistent/photo.jpg");
-        assert!(find_ampm_variant(path).is_none());
+        let mut cache = std::collections::HashMap::new();
+        assert!(find_ampm_variant_cached(path, &mut cache).is_none());
     }
 
     #[test]
@@ -663,12 +703,22 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn test_sanitize_path_component_reserved_names() {
         assert_eq!(sanitize_path_component("CON"), "_CON");
         assert_eq!(sanitize_path_component("nul"), "_nul");
         assert_eq!(sanitize_path_component("PRN"), "_PRN");
         assert_eq!(sanitize_path_component("COM1"), "_COM1");
         assert_eq!(sanitize_path_component("LPT3"), "_LPT3");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_sanitize_path_component_reserved_names_non_windows() {
+        // On non-Windows, reserved names are not prefixed
+        assert_eq!(sanitize_path_component("CON"), "CON");
+        assert_eq!(sanitize_path_component("nul"), "nul");
+        assert_eq!(sanitize_path_component("PRN"), "PRN");
     }
 
     #[test]

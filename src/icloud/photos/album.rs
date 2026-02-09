@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tokio_stream::Stream;
@@ -12,7 +13,7 @@ use super::session::PhotosSession;
 /// Configuration for creating a `PhotoAlbum`, bundling all non-session fields.
 #[derive(Debug)]
 pub struct PhotoAlbumConfig {
-    pub params: HashMap<String, Value>,
+    pub params: Arc<HashMap<String, Value>>,
     pub service_endpoint: String,
     pub name: String,
     pub list_type: String,
@@ -24,7 +25,7 @@ pub struct PhotoAlbumConfig {
 
 pub struct PhotoAlbum {
     pub(crate) name: String,
-    params: HashMap<String, Value>,
+    params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
     service_endpoint: String,
     list_type: String,
@@ -129,7 +130,7 @@ impl PhotoAlbum {
         // The spawned task must be 'static, so clone all needed state.
         let session = self.session.clone_box();
         let service_endpoint = self.service_endpoint.clone();
-        let params = self.params.clone();
+        let params = Arc::clone(&self.params);
         let name = self.name.clone();
         let list_type = self.list_type.clone();
         let query_filter = self.query_filter.clone();
@@ -350,7 +351,7 @@ mod tests {
     fn make_album(page_size: usize, query_filter: Option<Value>, zone_id: Value) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
-                params: HashMap::new(),
+                params: Arc::new(HashMap::new()),
                 service_endpoint: "https://example.com".into(),
                 name: "TestAlbum".into(),
                 list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),

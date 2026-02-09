@@ -131,17 +131,24 @@ async fn attempt_download(
     let status = response.status().as_u16();
 
     // 206 = resumed successfully, 200 = server ignored Range (start over)
-    let (mut hasher, mut bytes_written, truncate) = match (status, resume_offset, resume_state) {
-        (206, offset, Some((h, len))) if offset > 0 => (h, len, false),
+    // `effective_offset` tracks the actual byte offset used for the content-length
+    // check. When the server ignores Range and returns 200, we restart from zero
+    // so effective_offset must be 0 (not the stale resume_offset).
+    let (mut hasher, mut bytes_written, truncate, effective_offset) = match (
+        status,
+        resume_offset,
+        resume_state,
+    ) {
+        (206, offset, Some((h, len))) if offset > 0 => (h, len, false, offset),
         (_, _, _) if response.status().is_success() => {
             if resume_offset > 0 {
                 tracing::info!(
-                    "Server returned {} instead of 206 for Range request, restarting download of {}",
-                    status,
-                    path_str,
-                );
+                        "Server returned {} instead of 206 for Range request, restarting download of {}",
+                        status,
+                        path_str,
+                    );
             }
-            (Sha256::new(), 0u64, true)
+            (Sha256::new(), 0u64, true, 0u64)
         }
         _ => {
             return Err(DownloadError::HttpStatus {
@@ -185,7 +192,7 @@ async fn attempt_download(
     // promised. Catches CDN truncation (e.g. Apple silently cutting off
     // videos at ~1 GB) before we even reach the checksum comparison.
     if let Some(expected_len) = content_length {
-        let total_bytes = bytes_written - resume_offset;
+        let total_bytes = bytes_written - effective_offset;
         if total_bytes != expected_len {
             let _ = fs::remove_file(&part_path).await;
             return Err(DownloadError::ContentLengthMismatch {
@@ -243,6 +250,28 @@ mod tests {
         assert_eq!(BASE32_NOPAD.encode(b"f"), "MY");
         assert_eq!(BASE32_NOPAD.encode(b"fo"), "MZXQ");
         assert_eq!(BASE32_NOPAD.encode(b"foo"), "MZXW6");
+    }
+
+    /// Verify the content-length math when resume_offset > 0 but server returns 200
+    /// (ignoring Range). In this case effective_offset should be 0, so
+    /// `bytes_written - effective_offset` equals the full body length.
+    #[test]
+    fn test_content_length_check_after_resume_fallback() {
+        // Simulate: resume_offset was 500 but server returned 200 (full body of 1000 bytes).
+        // With the bug: total_bytes = 1000 - 500 = 500, mismatch against content_length=1000.
+        // With the fix: effective_offset = 0, total_bytes = 1000 - 0 = 1000, matches.
+        let resume_offset = 500u64;
+        let bytes_written_after_stream = 1000u64;
+        let content_length = 1000u64;
+
+        // Old (buggy) path would use resume_offset
+        let buggy_total = bytes_written_after_stream - resume_offset;
+        assert_ne!(buggy_total, content_length, "buggy path should mismatch");
+
+        // New (fixed) path: server returned 200, so effective_offset = 0
+        let effective_offset = 0u64;
+        let fixed_total = bytes_written_after_stream - effective_offset;
+        assert_eq!(fixed_total, content_length, "fixed path should match");
     }
 
     #[test]

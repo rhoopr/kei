@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -22,7 +23,7 @@ const QUERY_FOLDER_LIST: &str = "CPLContainerRelationLiveByAssetDate";
 
 pub struct PhotoLibrary {
     service_endpoint: String,
-    params: HashMap<String, Value>,
+    params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
     zone_id: Value,
     library_type: String,
@@ -41,7 +42,7 @@ impl PhotoLibrary {
     /// Create a new `PhotoLibrary`, verifying that indexing has finished.
     pub async fn new(
         service_endpoint: String,
-        params: HashMap<String, Value>,
+        params: Arc<HashMap<String, Value>>,
         session: Box<dyn PhotosSession>,
         zone_id: Value,
         library_type: String,
@@ -104,7 +105,7 @@ impl PhotoLibrary {
                 name.to_string(),
                 PhotoAlbum::new(
                     PhotoAlbumConfig {
-                        params: self.params.clone(),
+                        params: Arc::clone(&self.params),
                         service_endpoint: self.service_endpoint.clone(),
                         name: name.to_string(),
                         list_type: def.list_type.to_string(),
@@ -159,7 +160,7 @@ impl PhotoLibrary {
                     folder_name.clone(),
                     PhotoAlbum::new(
                         PhotoAlbumConfig {
-                            params: self.params.clone(),
+                            params: Arc::clone(&self.params),
                             service_endpoint: self.service_endpoint.clone(),
                             name: folder_name,
                             list_type: QUERY_FOLDER_LIST.to_string(),
