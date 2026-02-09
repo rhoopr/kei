@@ -14,13 +14,17 @@ use crate::retry::{self, RetryAction, RetryConfig};
 /// Derive a deterministic .part filename from the checksum so that
 /// concurrent downloads of different files don't collide. Base32-encoded
 /// because base64 contains `/` which is invalid in filenames.
-fn temp_download_path(download_path: &Path, checksum: &str) -> anyhow::Result<PathBuf> {
+fn temp_download_path(
+    download_path: &Path,
+    checksum: &str,
+    temp_suffix: &str,
+) -> anyhow::Result<PathBuf> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(checksum)
         .context("Failed to decode base64 checksum")?;
     let encoded = data_encoding::BASE32_NOPAD.encode(&decoded);
     let download_dir = download_path.parent().unwrap_or_else(|| Path::new("."));
-    Ok(download_dir.join(format!("{}.part", encoded)))
+    Ok(download_dir.join(format!("{}{}", encoded, temp_suffix)))
 }
 
 /// Download a file from URL using .part temp files.
@@ -38,13 +42,15 @@ pub async fn download_file(
     checksum: &str,
     dry_run: bool,
     retry_config: &RetryConfig,
+    temp_suffix: &str,
 ) -> Result<(), DownloadError> {
     if dry_run {
         tracing::info!("[DRY RUN] Would download {}", download_path.display());
         return Ok(());
     }
 
-    let part_path = temp_download_path(download_path, checksum).map_err(DownloadError::Other)?;
+    let part_path =
+        temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
 
     let result = retry::retry_with_backoff(
         retry_config,
@@ -107,7 +113,7 @@ async fn attempt_download(
     let mut request = client.get(url);
     if resume_offset > 0 {
         tracing::info!(
-            "Resuming {} from byte {} (.part file exists)",
+            "Resuming {} from byte {} (partial file exists)",
             path_str,
             resume_offset
         );
@@ -154,7 +160,9 @@ async fn attempt_download(
         .append(!truncate)
         .open(&part_path)
         .await
-        .map_err(|e| DownloadError::Other(anyhow::anyhow!("Failed to open .part file: {}", e)))?;
+        .map_err(|e| {
+            DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {}", e))
+        })?;
 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -241,17 +249,17 @@ mod tests {
     fn test_temp_download_path_valid_checksum() {
         // Base64 "AAAA" decodes to [0, 0, 0], base32 encodes to "AAAAA"
         let path = PathBuf::from("/photos/test.jpg");
-        let result = temp_download_path(&path, "AAAA").unwrap();
+        let result = temp_download_path(&path, "AAAA", ".icloudpd-tmp").unwrap();
         assert_eq!(result.parent().unwrap(), Path::new("/photos"));
-        assert!(result.to_string_lossy().ends_with(".part"));
+        assert!(result.to_string_lossy().ends_with(".icloudpd-tmp"));
     }
 
     #[test]
     fn test_temp_download_path_derives_from_checksum() {
         let path = PathBuf::from("/photos/test.jpg");
-        let result1 = temp_download_path(&path, "AAAA").unwrap();
-        let result2 = temp_download_path(&path, "AAAB").unwrap();
-        // Different checksums should produce different .part filenames
+        let result1 = temp_download_path(&path, "AAAA", ".icloudpd-tmp").unwrap();
+        let result2 = temp_download_path(&path, "AAAB", ".icloudpd-tmp").unwrap();
+        // Different checksums should produce different temp filenames
         assert_ne!(result1, result2);
     }
 
@@ -259,16 +267,31 @@ mod tests {
     fn test_temp_download_path_same_checksum_same_result() {
         let path1 = PathBuf::from("/photos/a.jpg");
         let path2 = PathBuf::from("/photos/b.jpg");
-        let result1 = temp_download_path(&path1, "AAAA").unwrap();
-        let result2 = temp_download_path(&path2, "AAAA").unwrap();
-        // Same checksum, same directory -> same .part file (for resume)
+        let result1 = temp_download_path(&path1, "AAAA", ".icloudpd-tmp").unwrap();
+        let result2 = temp_download_path(&path2, "AAAA", ".icloudpd-tmp").unwrap();
+        // Same checksum, same directory -> same temp file (for resume)
         assert_eq!(result1, result2);
     }
 
     #[test]
     fn test_temp_download_path_invalid_base64() {
         let path = PathBuf::from("/photos/test.jpg");
-        let result = temp_download_path(&path, "not-valid-base64!!!");
+        let result = temp_download_path(&path, "not-valid-base64!!!", ".icloudpd-tmp");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_temp_download_path_custom_suffix() {
+        let path = PathBuf::from("/photos/test.jpg");
+        let result = temp_download_path(&path, "AAAA", ".downloading").unwrap();
+        assert!(result.to_string_lossy().ends_with(".downloading"));
+    }
+
+    #[test]
+    fn test_temp_download_path_part_suffix() {
+        // Verify .part still works when explicitly configured
+        let path = PathBuf::from("/photos/test.jpg");
+        let result = temp_download_path(&path, "AAAA", ".part").unwrap();
+        assert!(result.to_string_lossy().ends_with(".part"));
     }
 }

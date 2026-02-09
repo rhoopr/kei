@@ -164,6 +164,11 @@ pub struct SyncArgs {
     /// Initial retry delay in seconds (default: 5)
     #[arg(long, default_value_t = 5)]
     pub retry_delay: u64,
+
+    /// Temp file suffix for partial downloads (default: .icloudpd-tmp).
+    /// Change if the default conflicts with your filesystem (e.g. Nextcloud rejects .part).
+    #[arg(long, default_value = ".icloudpd-tmp")]
+    pub temp_suffix: String,
 }
 
 /// Arguments for the status command.
@@ -334,6 +339,7 @@ pub struct LegacyCli {
     pub only_print_filenames: bool,
     pub max_retries: u32,
     pub retry_delay: u64,
+    pub temp_suffix: String,
 }
 
 impl From<Cli> for LegacyCli {
@@ -374,6 +380,7 @@ impl From<Cli> for LegacyCli {
                     only_print_filenames: sync.only_print_filenames,
                     max_retries: sync.max_retries,
                     retry_delay: sync.retry_delay,
+                    temp_suffix: sync.temp_suffix,
                 }
             }
             // For other commands, provide defaults (they won't use these fields)
@@ -412,6 +419,7 @@ impl From<Cli> for LegacyCli {
                 only_print_filenames: false,
                 max_retries: 3,
                 retry_delay: 5,
+                temp_suffix: ".icloudpd-tmp".to_string(),
             },
             Command::ResetState(args) => Self {
                 username: args.auth.username,
@@ -448,6 +456,7 @@ impl From<Cli> for LegacyCli {
                 only_print_filenames: false,
                 max_retries: 3,
                 retry_delay: 5,
+                temp_suffix: ".icloudpd-tmp".to_string(),
             },
             Command::ImportExisting(args) => Self {
                 username: args.auth.username,
@@ -484,6 +493,7 @@ impl From<Cli> for LegacyCli {
                 only_print_filenames: false,
                 max_retries: 3,
                 retry_delay: 5,
+                temp_suffix: ".icloudpd-tmp".to_string(),
             },
             Command::Verify(args) => Self {
                 username: args.auth.username,
@@ -520,6 +530,7 @@ impl From<Cli> for LegacyCli {
                 only_print_filenames: false,
                 max_retries: 3,
                 retry_delay: 5,
+                temp_suffix: ".icloudpd-tmp".to_string(),
             },
         }
     }
@@ -646,6 +657,22 @@ mod tests {
         let cli = parse(&args);
         let legacy: LegacyCli = cli.into();
         assert_eq!(legacy.retry_delay, 15);
+    }
+
+    #[test]
+    fn test_temp_suffix_default() {
+        let cli = parse(&base_args());
+        let legacy: LegacyCli = cli.into();
+        assert_eq!(legacy.temp_suffix, ".icloudpd-tmp");
+    }
+
+    #[test]
+    fn test_temp_suffix_custom() {
+        let mut args = base_args();
+        args.extend(["--temp-suffix", ".downloading"]);
+        let cli = parse(&args);
+        let legacy: LegacyCli = cli.into();
+        assert_eq!(legacy.temp_suffix, ".downloading");
     }
 
     #[test]

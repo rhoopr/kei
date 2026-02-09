@@ -147,6 +147,8 @@ pub struct DownloadConfig {
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_size: bool,
     pub(crate) keep_unicode_in_filenames: bool,
+    /// Temp file suffix for partial downloads (e.g. `.icloudpd-tmp`).
+    pub(crate) temp_suffix: String,
     /// State database for tracking download progress.
     pub(crate) state_db: Option<Arc<dyn StateDb>>,
 }
@@ -433,6 +435,9 @@ fn filter_asset_to_tasks(
     let created_local: DateTime<Local> = created_utc.with_timezone(&Local);
     let versions = apply_raw_policy(asset.versions(), config.align_raw);
     let mut tasks = Vec::new();
+    // Track the effective primary filename (including any dedup suffix) so the
+    // live photo MOV companion is derived from the same name, keeping them paired.
+    let mut effective_primary_filename: Option<String> = None;
 
     // Helper closure to find a version by key in the SmallVec
     let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
@@ -570,6 +575,13 @@ fn filter_asset_to_tasks(
             Some(download_path.clone())
         };
 
+        if let Some(ref path) = final_path {
+            // Record the effective filename used for the primary download so the
+            // MOV companion is derived from it, keeping HEIC/MOV paired after dedup.
+            if let Some(stem) = path.file_name().and_then(|f| f.to_str()) {
+                effective_primary_filename = Some(stem.to_string());
+            }
+        }
         if let Some(path) = final_path {
             // Clone for the normalized key, move original into DownloadTask
             claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
@@ -588,10 +600,15 @@ fn filter_asset_to_tasks(
     // Live photo MOV companion — only for images
     if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
         if let Some(live_version) = get_version(&config.live_photo_size) {
-            // Apply name-id7 to the base filename before deriving MOV name
+            // Derive the MOV filename from the effective primary filename (which
+            // includes any dedup suffix) so the HEIC and MOV remain visually paired.
+            // Fall back to the base filename when no primary was produced (e.g. skipped).
             let live_base = match config.file_match_policy {
                 FileMatchPolicy::NameId7 => paths::apply_name_id7(&base_filename, asset.id()),
-                _ => base_filename.clone(),
+                _ => effective_primary_filename
+                    .as_deref()
+                    .unwrap_or(&base_filename)
+                    .to_string(),
             };
             let mov_filename = match config.live_photo_mov_filename_policy {
                 LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
@@ -962,11 +979,15 @@ async fn stream_and_download(
     });
 
     // Convert channel receiver to stream and feed into buffer_unordered
+    let temp_suffix: Arc<str> = config.temp_suffix.clone().into();
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
+            let temp_suffix = Arc::clone(&temp_suffix);
             async move {
-                let result = download_single_task(&client, &task, &retry_config, set_exif).await;
+                let result =
+                    download_single_task(&client, &task, &retry_config, set_exif, &temp_suffix)
+                        .await;
                 (task, result)
             }
         })
@@ -1243,6 +1264,7 @@ pub async fn download_photos(
         set_exif: config.set_exif_datetime,
         concurrency: cleanup_concurrency,
         no_progress_bar: config.no_progress_bar,
+        temp_suffix: config.temp_suffix.clone(),
         shutdown_token,
         state_db: config.state_db.clone(),
     };
@@ -1310,6 +1332,7 @@ struct PassConfig<'a> {
     set_exif: bool,
     concurrency: usize,
     no_progress_bar: bool,
+    temp_suffix: String,
     shutdown_token: CancellationToken,
     state_db: Option<Arc<dyn StateDb>>,
 }
@@ -1323,13 +1346,17 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let state_db = config.state_db.clone();
     let shutdown_token = config.shutdown_token.clone();
     let concurrency = config.concurrency;
+    let temp_suffix: Arc<str> = config.temp_suffix.into();
 
     let results: Vec<(DownloadTask, Result<bool>)> = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
+            let temp_suffix = Arc::clone(&temp_suffix);
             async move {
-                let result = download_single_task(&client, &task, retry_config, set_exif).await;
+                let result =
+                    download_single_task(&client, &task, retry_config, set_exif, &temp_suffix)
+                        .await;
                 (task, result)
             }
         })
@@ -1425,6 +1452,7 @@ async fn download_single_task(
     task: &DownloadTask,
     retry_config: &RetryConfig,
     set_exif: bool,
+    temp_suffix: &str,
 ) -> Result<bool> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -1443,6 +1471,7 @@ async fn download_single_task(
         &task.checksum,
         false,
         retry_config,
+        temp_suffix,
     )
     .await?;
 
@@ -1592,6 +1621,7 @@ mod tests {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
+            temp_suffix: ".icloudpd-tmp".to_string(),
             state_db: None,
         }
     }
@@ -1899,6 +1929,93 @@ mod tests {
             dedup_path.contains("LIVE_1"),
             "Expected asset ID 'LIVE_1' in deduped path, got: {}",
             dedup_path,
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_filter_live_photo_dedup_suffix_consistent_with_mov() {
+        // Regression test for #102: when two live photos share the same base
+        // filename but have different sizes (triggering dedup), the MOV companion
+        // must derive from the deduped HEIC name so they remain visually paired.
+        let dir = test_tmp_dir("download_filter_tests_live_dedup_consistency");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let asset1 = PhotoAsset::new(
+            json!({"recordName": "LIVE_A", "fields": {
+                "filenameEnc": {"value": "IMG_0001.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/heic_a",
+                    "fileChecksum": "ck_a"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000,
+                    "downloadURL": "https://example.com/mov_a",
+                    "fileChecksum": "mov_ck_a"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+
+        let asset2 = PhotoAsset::new(
+            json!({"recordName": "LIVE_B", "fields": {
+                "filenameEnc": {"value": "IMG_0001.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 4000,
+                    "downloadURL": "https://example.com/heic_b",
+                    "fileChecksum": "ck_b"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/mov_b",
+                    "fileChecksum": "mov_ck_b"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+
+        let mut config = test_config();
+        config.directory = dir.clone();
+
+        // Process asset1: creates IMG_0001.HEIC (2000 bytes) and its MOV
+        let mut claimed_paths = FxHashMap::default();
+        let tasks1 = filter_asset_to_tasks(&asset1, &config, &mut claimed_paths);
+        assert_eq!(tasks1.len(), 2);
+        let heic1_path = &tasks1[0].download_path;
+
+        // Write asset1's HEIC to disk so asset2 sees a collision
+        fs::create_dir_all(heic1_path.parent().unwrap()).unwrap();
+        fs::write(heic1_path, vec![0u8; 2000]).unwrap();
+
+        // Process asset2: same filename, different size → should dedup HEIC
+        let tasks2 = filter_asset_to_tasks(&asset2, &config, &mut claimed_paths);
+        assert_eq!(tasks2.len(), 2, "Expected HEIC + MOV tasks for asset2");
+
+        let heic2_path = tasks2[0].download_path.to_str().unwrap();
+        let mov2_path = tasks2[1].download_path.to_str().unwrap();
+
+        // The deduped HEIC should have a size suffix
+        assert!(
+            heic2_path.contains("-4000."),
+            "Expected size suffix '-4000.' in deduped HEIC path, got: {}",
+            heic2_path,
+        );
+
+        // The MOV companion must also contain the size suffix from the HEIC,
+        // keeping them visually paired (this is the #102 fix).
+        assert!(
+            mov2_path.contains("-4000"),
+            "MOV companion should derive from deduped HEIC name (contain '-4000'), got: {}",
+            mov2_path,
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -2287,6 +2404,7 @@ mod tests {
             set_exif: false,
             concurrency: 1,
             no_progress_bar: true,
+            temp_suffix: ".icloudpd-tmp".to_string(),
             shutdown_token: token,
             state_db: None,
         };
@@ -2323,6 +2441,7 @@ mod tests {
             set_exif: false,
             concurrency: 1,
             no_progress_bar: true,
+            temp_suffix: ".icloudpd-tmp".to_string(),
             shutdown_token: token,
             state_db: None,
         };

@@ -21,10 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WEBP file type recognition** — WEBP images (`org.webmproject.webp`) are now correctly classified as images instead of defaulting to movie, preventing `--skip-videos` from incorrectly excluding WEBP photos ([#90])
 - **Large video download integrity** — Downloads now verify content-length against bytes received before checksum comparison, catching CDN truncation (e.g. Apple silently cutting off videos at ~1 GB) earlier and triggering automatic retry ([#91])
 - **CAS Op-Lock / TRY_AGAIN_LATER retry** — CloudKit server errors (`TRY_AGAIN_LATER`, `CAS_OP_LOCK`, `RETRY_LATER`, `THROTTLED`) embedded in JSON responses are now detected and automatically retried with exponential backoff, preventing silent page loss during photo enumeration ([#94])
+- **Configurable temp file suffix** — Partial downloads now use `.icloudpd-tmp` by default instead of `.part`, avoiding conflicts with Nextcloud/WebDAV sync clients that reject `.part` files. Configurable via `--temp-suffix` ([#92])
+- **Live photo dedup suffix consistency** — When two live photos share the same base filename and size-based deduplication adds a suffix to the HEIC, the MOV companion now derives from the deduped HEIC name, keeping the pair visually matched on disk ([#102])
 
 [#90]: https://github.com/rhoopr/icloudpd-rs/issues/90
 [#91]: https://github.com/rhoopr/icloudpd-rs/issues/91
+[#92]: https://github.com/rhoopr/icloudpd-rs/issues/92
 [#94]: https://github.com/rhoopr/icloudpd-rs/issues/94
+[#102]: https://github.com/rhoopr/icloudpd-rs/issues/102
 
 ---
 

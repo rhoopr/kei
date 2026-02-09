@@ -779,6 +779,7 @@ async fn main() -> anyhow::Result<()> {
         file_match_policy: config.file_match_policy,
         force_size: config.force_size,
         keep_unicode_in_filenames: config.keep_unicode_in_filenames,
+        temp_suffix: config.temp_suffix.clone(),
         state_db,
     };
 

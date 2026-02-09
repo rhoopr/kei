@@ -24,6 +24,7 @@ pub struct Config {
     pub folder_structure: String,
     pub albums: Vec<String>,
     pub library: String,
+    pub temp_suffix: String,
 
     // DateTime fields
     pub skip_created_before: Option<DateTime<Local>>,
@@ -140,6 +141,7 @@ impl Config {
             only_print_filenames: cli.only_print_filenames,
             max_retries: cli.max_retries,
             retry_delay_secs: cli.retry_delay,
+            temp_suffix: cli.temp_suffix,
         })
     }
 }
