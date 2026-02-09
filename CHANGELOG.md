@@ -7,20 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.1.1] - 2026-02-04
-
-### Fixed
-
-- **Streaming regression** — Downloads now start immediately as assets arrive from the API, rather than waiting for all photos to be enumerated first. This fixes a regression introduced in v0.1.0 where large libraries experienced significant delay before the first download began.
-
-### Changed
-
-- Replaced blocking collection loop with channel-based producer-consumer pattern for true streaming behavior
-- Switched from batch `upsert_seen_batch` to per-asset `upsert_seen` calls (trades some DB efficiency for streaming)
-
----
-
-## [0.1.0] - 2025-02-03
+## [0.1.0] - 2026-02-08
 
 Initial release. A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) with full photo/video download capabilities and SQLite state tracking.
 
@@ -67,6 +54,8 @@ Initial release. A ground-up Rust rewrite of [icloud-photos-downloader](https://
 #### Content & Organization
 
 - Photo, video, and live photo MOV downloads with size variants
+- Shared and private library selection (`--library`) with zone discovery (`--list-libraries`)
+- Force exact size variant or skip (`--force-size`)
 - RAW file alignment (`--align-raw`: as-is, original, alternative)
 - Live photo MOV filename policies (`--live-photo-mov-filename-policy`: suffix, original)
 - Independent live photo video size (`--live-photo-size`)
@@ -74,8 +63,9 @@ Initial release. A ground-up Rust rewrite of [icloud-photos-downloader](https://
 - Smart album support (favorites, bursts, time-lapse, slo-mo, videos)
 - Date-based folder structures (`--folder-structure %Y/%m/%d`)
 - EXIF date tag read/write (`--set-exif-datetime`)
-- Filename sanitization (strips invalid characters)
+- Filename sanitization with Unicode control (`--keep-unicode-in-filenames`)
 - Both plain-text and base64-encoded CloudKit filenames supported
+- Fingerprint-based fallback filenames when CloudKit filename is absent
 
 #### Operations
 
@@ -125,13 +115,9 @@ The following Python icloudpd features are not yet available. Links go to tracki
 - [#37](https://github.com/rhoopr/icloudpd-rs/issues/37) — Python LWPCookieJar session import
 
 #### Content & Downloads
-- [#20](https://github.com/rhoopr/icloudpd-rs/issues/20) — Shared library downloads
 - [#19](https://github.com/rhoopr/icloudpd-rs/issues/19) — XMP sidecar export (`--xmp-sidecar`)
 - [#14](https://github.com/rhoopr/icloudpd-rs/issues/14) — Multiple size downloads (`--size` accepting multiple values)
-- [#15](https://github.com/rhoopr/icloudpd-rs/issues/15) — Force size without fallback (`--force-size`)
-- [#25](https://github.com/rhoopr/icloudpd-rs/issues/25) — Keep Unicode in filenames (`--keep-unicode-in-filenames`)
 - [#17](https://github.com/rhoopr/icloudpd-rs/issues/17) — Print filenames only (`--only-print-filenames`)
-- [#35](https://github.com/rhoopr/icloudpd-rs/issues/35) — Fingerprint fallback filenames
 - [#52](https://github.com/rhoopr/icloudpd-rs/issues/52) — HEIC to JPEG conversion (`--convert-heic`)
 
 #### iCloud Lifecycle
@@ -164,3 +150,4 @@ The following Python icloudpd features are not yet available. Links go to tracki
 ---
 
 [0.1.0]: https://github.com/rhoopr/icloudpd-rs/releases/tag/v0.1.0
+

@@ -178,7 +178,6 @@ Run `icloudpd-rs --help` for the complete option reference.
 Planned enhancements include:
 
 - XMP sidecar export for metadata preservation
-- Shared library downloads
 - OS keyring integration for secure password storage
 - Docker images and systemd/launchd service files
 - iCloud lifecycle management (delete-after-download)
