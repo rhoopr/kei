@@ -87,12 +87,33 @@ impl PhotosService {
         format!("{service_root}/database/1/com.apple.photos.cloud/production/{library_type}")
     }
 
-    pub async fn albums(&self) -> anyhow::Result<HashMap<String, PhotoAlbum>> {
-        self.primary_library.albums().await
-    }
-
+    /// Return the "All Photos" album from the primary library.
     pub fn all(&self) -> PhotoAlbum {
         self.primary_library.all()
+    }
+
+    /// Look up a library by zone name.
+    ///
+    /// Checks the primary library first ("PrimarySync"), then searches private
+    /// and shared libraries. Lazily fetches library lists on first call.
+    pub async fn get_library(&mut self, name: &str) -> anyhow::Result<&PhotoLibrary> {
+        if name == "PrimarySync" {
+            return Ok(&self.primary_library);
+        }
+        // Ensure both library lists are fetched
+        self.fetch_private_libraries().await?;
+        self.fetch_shared_libraries().await?;
+
+        if let Some(lib) = self.private_libraries.as_ref().and_then(|m| m.get(name)) {
+            return Ok(lib);
+        }
+        if let Some(lib) = self.shared_libraries.as_ref().and_then(|m| m.get(name)) {
+            return Ok(lib);
+        }
+        anyhow::bail!(
+            "Unknown library: '{}'. Use --list-libraries to see available libraries.",
+            name
+        )
     }
 
     /// Fetch private libraries (lazily, first call triggers the HTTP request).
