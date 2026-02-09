@@ -169,6 +169,15 @@ pub struct SyncArgs {
     /// Change if the default conflicts with your filesystem (e.g. Nextcloud rejects .part).
     #[arg(long, default_value = ".icloudpd-tmp")]
     pub temp_suffix: String,
+
+    /// Send systemd sd_notify messages (READY, STOPPING, STATUS).
+    /// Only effective on Linux with a systemd service unit.
+    #[arg(long)]
+    pub notify_systemd: bool,
+
+    /// Write PID to file (for service managers).
+    #[arg(long)]
+    pub pid_file: Option<std::path::PathBuf>,
 }
 
 /// Arguments for the status command.
@@ -340,6 +349,8 @@ pub struct LegacyCli {
     pub max_retries: u32,
     pub retry_delay: u64,
     pub temp_suffix: String,
+    pub notify_systemd: bool,
+    pub pid_file: Option<std::path::PathBuf>,
 }
 
 impl From<Cli> for LegacyCli {
@@ -381,6 +392,8 @@ impl From<Cli> for LegacyCli {
                     max_retries: sync.max_retries,
                     retry_delay: sync.retry_delay,
                     temp_suffix: sync.temp_suffix,
+                    notify_systemd: sync.notify_systemd,
+                    pid_file: sync.pid_file,
                 }
             }
             // For other commands, provide defaults (they won't use these fields)
@@ -420,6 +433,8 @@ impl From<Cli> for LegacyCli {
                 max_retries: 3,
                 retry_delay: 5,
                 temp_suffix: ".icloudpd-tmp".to_string(),
+                notify_systemd: false,
+                pid_file: None,
             },
             Command::ResetState(args) => Self {
                 username: args.auth.username,
@@ -457,6 +472,8 @@ impl From<Cli> for LegacyCli {
                 max_retries: 3,
                 retry_delay: 5,
                 temp_suffix: ".icloudpd-tmp".to_string(),
+                notify_systemd: false,
+                pid_file: None,
             },
             Command::ImportExisting(args) => Self {
                 username: args.auth.username,
@@ -494,6 +511,8 @@ impl From<Cli> for LegacyCli {
                 max_retries: 3,
                 retry_delay: 5,
                 temp_suffix: ".icloudpd-tmp".to_string(),
+                notify_systemd: false,
+                pid_file: None,
             },
             Command::Verify(args) => Self {
                 username: args.auth.username,
@@ -531,6 +550,8 @@ impl From<Cli> for LegacyCli {
                 max_retries: 3,
                 retry_delay: 5,
                 temp_suffix: ".icloudpd-tmp".to_string(),
+                notify_systemd: false,
+                pid_file: None,
             },
         }
     }
@@ -766,6 +787,41 @@ mod tests {
         } else {
             panic!("Expected ResetState command");
         }
+    }
+
+    #[test]
+    fn test_notify_systemd_default_false() {
+        let cli = parse(&base_args());
+        let legacy: LegacyCli = cli.into();
+        assert!(!legacy.notify_systemd);
+    }
+
+    #[test]
+    fn test_notify_systemd_flag() {
+        let mut args = base_args();
+        args.push("--notify-systemd");
+        let cli = parse(&args);
+        let legacy: LegacyCli = cli.into();
+        assert!(legacy.notify_systemd);
+    }
+
+    #[test]
+    fn test_pid_file_default_none() {
+        let cli = parse(&base_args());
+        let legacy: LegacyCli = cli.into();
+        assert!(legacy.pid_file.is_none());
+    }
+
+    #[test]
+    fn test_pid_file_flag() {
+        let mut args = base_args();
+        args.extend(["--pid-file", "/tmp/claude/test.pid"]);
+        let cli = parse(&args);
+        let legacy: LegacyCli = cli.into();
+        assert_eq!(
+            legacy.pid_file,
+            Some(std::path::PathBuf::from("/tmp/claude/test.pid"))
+        );
     }
 
     #[test]
