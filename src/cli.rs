@@ -105,8 +105,7 @@ pub struct SyncArgs {
     pub skip_live_photos: bool,
 
     /// Only download requested size (don't fall back to original)
-    /// NOTE: Parsed but not yet wired up - hidden until implemented
-    #[arg(long, hide = true)]
+    #[arg(long)]
     pub force_size: bool,
 
     /// Folder structure for organizing downloads
@@ -130,8 +129,7 @@ pub struct SyncArgs {
     pub no_progress_bar: bool,
 
     /// Keep Unicode in filenames
-    /// NOTE: Parsed but not yet wired up - hidden until implemented
-    #[arg(long, hide = true)]
+    #[arg(long)]
     pub keep_unicode_in_filenames: bool,
 
     /// Live photo MOV filename policy
