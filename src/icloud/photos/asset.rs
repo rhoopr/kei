@@ -221,7 +221,10 @@ impl PhotoAsset {
     pub fn asset_date(&self) -> DateTime<Utc> {
         self.asset_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
-            .unwrap_or(DateTime::UNIX_EPOCH)
+            .unwrap_or_else(|| {
+                warn!(asset_id = %self.record_name, "Missing or invalid assetDate, falling back to epoch");
+                DateTime::UNIX_EPOCH
+            })
     }
 
     pub fn created(&self) -> DateTime<Utc> {
@@ -231,7 +234,10 @@ impl PhotoAsset {
     pub fn added_date(&self) -> DateTime<Utc> {
         self.added_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
-            .unwrap_or(DateTime::UNIX_EPOCH)
+            .unwrap_or_else(|| {
+                warn!(asset_id = %self.record_name, "Missing or invalid addedDate, falling back to epoch");
+                DateTime::UNIX_EPOCH
+            })
     }
 
     pub fn item_type(&self) -> Option<AssetItemType> {

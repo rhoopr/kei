@@ -481,13 +481,18 @@ fn filter_asset_to_tasks(
         // Determine the final download path, applying size-based deduplication if needed.
         // Check both on-disk files AND in-flight downloads (claimed_paths) to handle
         // concurrent downloads of assets with the same filename.
-        let final_path = if download_path.exists() {
+        // Check for the file on disk, including AM/PM whitespace variants
+        // (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG")
+        let existing_path = if download_path.exists() {
+            Some(download_path.clone())
+        } else {
+            paths::find_ampm_variant(&download_path)
+        };
+        let final_path = if let Some(existing) = existing_path {
             match config.file_match_policy {
                 FileMatchPolicy::NameSizeDedupWithSuffix => {
                     // If file exists with different size, download with size suffix
-                    let on_disk_size = std::fs::metadata(&download_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
+                    let on_disk_size = std::fs::metadata(&existing).map(|m| m.len()).unwrap_or(0);
                     if on_disk_size == version.size {
                         // Same size — likely already downloaded, skip.
                         None
@@ -708,6 +713,7 @@ const AUTH_ERROR_THRESHOLD: usize = 3;
 #[derive(Debug)]
 struct StreamingResult {
     downloaded: usize,
+    exif_failures: usize,
     failed: Vec<DownloadTask>,
     auth_errors: usize,
 }
@@ -775,6 +781,7 @@ async fn stream_and_download(
         }
         return Ok(StreamingResult {
             downloaded: count,
+            exif_failures: 0,
             failed: Vec::new(),
             auth_errors: 0,
         });
@@ -815,6 +822,7 @@ async fn stream_and_download(
     };
 
     let mut downloaded = 0usize;
+    let mut exif_failures = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
 
@@ -904,13 +912,25 @@ async fn stream_and_download(
                                                 producer_pb.inc(1);
                                             }
                                             Ok(false) => {
-                                                tracing::debug!(
-                                                    asset_id = %task.asset_id,
-                                                    path = %task.download_path.display(),
-                                                    "File missing, will re-download"
-                                                );
-                                                if task_tx.send(task).await.is_err() {
-                                                    return;
+                                                // Check for AM/PM whitespace variant on disk
+                                                if paths::find_ampm_variant(&task.download_path)
+                                                    .is_some()
+                                                {
+                                                    tracing::debug!(
+                                                        asset_id = %task.asset_id,
+                                                        path = %task.download_path.display(),
+                                                        "Skipping (AM/PM variant exists on disk)"
+                                                    );
+                                                    producer_pb.inc(1);
+                                                } else {
+                                                    tracing::debug!(
+                                                        asset_id = %task.asset_id,
+                                                        path = %task.download_path.display(),
+                                                        "File missing, will re-download"
+                                                    );
+                                                    if task_tx.send(task).await.is_err() {
+                                                        return;
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
@@ -972,8 +992,11 @@ async fn stream_and_download(
             .to_string();
         pb.set_message(filename);
         match result {
-            Ok(()) => {
+            Ok(exif_ok) => {
                 downloaded += 1;
+                if !exif_ok {
+                    exif_failures += 1;
+                }
                 if state_db.is_some() {
                     downloaded_batch.push((
                         task.asset_id.clone(),
@@ -1115,6 +1138,7 @@ async fn stream_and_download(
 
     Ok(StreamingResult {
         downloaded,
+        exif_failures,
         failed,
         auth_errors,
     })
@@ -1143,6 +1167,7 @@ pub async fn download_photos(
         stream_and_download(download_client, albums, config, shutdown_token.clone()).await?;
 
     let downloaded = streaming_result.downloaded;
+    let mut exif_failures = streaming_result.exif_failures;
     let failed_tasks = streaming_result.failed;
     let auth_errors = streaming_result.auth_errors;
 
@@ -1183,7 +1208,16 @@ pub async fn download_photos(
 
     if failed_tasks.is_empty() {
         tracing::info!("── Summary ──");
-        tracing::info!("  {} downloaded, 0 failed, {} total", total, total);
+        if exif_failures > 0 {
+            tracing::info!(
+                "  {} downloaded ({} EXIF failures), 0 failed, {} total",
+                total,
+                exif_failures,
+                total
+            );
+        } else {
+            tracing::info!("  {} downloaded, 0 failed, {} total", total, total);
+        }
         tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
         return Ok(DownloadOutcome::Success);
     }
@@ -1216,6 +1250,7 @@ pub async fn download_photos(
 
     let remaining_failed = pass_result.failed;
     let phase2_auth_errors = pass_result.auth_errors;
+    exif_failures += pass_result.exif_failures;
     let total_auth_errors = auth_errors + phase2_auth_errors;
 
     // If auth errors exceeded threshold during phase 2, return for re-auth
@@ -1230,12 +1265,22 @@ pub async fn download_photos(
     let succeeded = downloaded + phase2_succeeded;
     let final_total = succeeded + failed;
     tracing::info!("── Summary ──");
-    tracing::info!(
-        "  {} downloaded, {} failed, {} total",
-        succeeded,
-        failed,
-        final_total
-    );
+    if exif_failures > 0 {
+        tracing::info!(
+            "  {} downloaded ({} EXIF failures), {} failed, {} total",
+            succeeded,
+            exif_failures,
+            failed,
+            final_total
+        );
+    } else {
+        tracing::info!(
+            "  {} downloaded, {} failed, {} total",
+            succeeded,
+            failed,
+            final_total
+        );
+    }
     tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
 
     if failed > 0 {
@@ -1253,6 +1298,7 @@ pub async fn download_photos(
 /// Result of a download pass.
 #[derive(Debug)]
 struct PassResult {
+    exif_failures: usize,
     failed: Vec<DownloadTask>,
     auth_errors: usize,
 }
@@ -1278,7 +1324,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let shutdown_token = config.shutdown_token.clone();
     let concurrency = config.concurrency;
 
-    let results: Vec<(DownloadTask, Result<()>)> = stream::iter(tasks)
+    let results: Vec<(DownloadTask, Result<bool>)> = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
@@ -1293,6 +1339,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
 
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
+    let mut exif_failures = 0usize;
 
     // Collect DB updates for batch write
     let mut downloaded_batch: Vec<(String, String, PathBuf)> = Vec::new();
@@ -1300,7 +1347,10 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
 
     for (task, result) in results {
         match &result {
-            Ok(()) => {
+            Ok(exif_ok) => {
+                if !*exif_ok {
+                    exif_failures += 1;
+                }
                 if state_db.is_some() {
                     downloaded_batch.push((
                         task.asset_id.clone(),
@@ -1360,18 +1410,22 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
 
     pb.finish_and_clear();
     PassResult {
+        exif_failures,
         failed,
         auth_errors,
     }
 }
 
 /// Download a single task, handling mtime and EXIF stamping on success.
+///
+/// Returns `Ok(true)` on full success, `Ok(false)` if the download succeeded
+/// but EXIF stamping failed (the file is usable but lacks EXIF metadata).
 async fn download_single_task(
     client: &Client,
     task: &DownloadTask,
     retry_config: &RetryConfig,
     set_exif: bool,
-) -> Result<()> {
+) -> Result<bool> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -1404,6 +1458,7 @@ async fn download_single_task(
 
     tracing::debug!("Downloaded {}", task.download_path.display());
 
+    let mut exif_ok = true;
     if set_exif {
         let ext = task
             .download_path
@@ -1418,16 +1473,24 @@ async fn download_single_task(
                     Ok(None) => {
                         if let Err(e) = exif::set_photo_exif(&exif_path, &date_str) {
                             tracing::warn!("Failed to set EXIF on {}: {}", exif_path.display(), e);
+                            false
+                        } else {
+                            true
                         }
                     }
-                    Ok(Some(_)) => {}
+                    Ok(Some(_)) => true,
                     Err(e) => {
                         tracing::warn!("Failed to read EXIF from {}: {}", exif_path.display(), e);
+                        false
                     }
                 })
                 .await;
-            if let Err(e) = exif_result {
-                tracing::warn!("EXIF task panicked: {}", e);
+            match exif_result {
+                Ok(ok) => exif_ok = ok,
+                Err(e) => {
+                    tracing::warn!("EXIF task panicked: {}", e);
+                    exif_ok = false;
+                }
             }
 
             // Restore mtime after EXIF modification (EXIF write updates mtime to "now")
@@ -1445,7 +1508,7 @@ async fn download_single_task(
         }
     }
 
-    Ok(())
+    Ok(exif_ok)
 }
 
 fn format_duration(d: Duration) -> String {
@@ -1472,6 +1535,11 @@ fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
     let time = if timestamp >= 0 {
         UNIX_EPOCH + Duration::from_secs(timestamp as u64)
     } else {
+        tracing::warn!(
+            path = %path.display(),
+            timestamp,
+            "Negative timestamp (pre-1970 date), clamping mtime to epoch"
+        );
         UNIX_EPOCH
             .checked_sub(Duration::from_secs(timestamp.unsigned_abs()))
             .unwrap_or(SystemTime::UNIX_EPOCH)

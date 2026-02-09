@@ -24,6 +24,53 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+/// A writer wrapper that redacts a password string from log output.
+///
+/// Wraps any `io::Write` implementor and replaces occurrences of the
+/// configured password with `********` in each `write()` call.
+struct RedactingWriter<W> {
+    inner: W,
+    password: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let password = self.password.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pw) = password.as_deref() {
+            if !pw.is_empty() {
+                let s = String::from_utf8_lossy(buf);
+                if s.contains(pw) {
+                    let redacted = s.replace(pw, "********");
+                    self.inner.write_all(redacted.as_bytes())?;
+                    return Ok(buf.len());
+                }
+            }
+        }
+        self.inner.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A `MakeWriter` implementation that produces `RedactingWriter` instances.
+struct RedactingMakeWriter {
+    password: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
+    type Writer = RedactingWriter<std::io::Stderr>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingWriter {
+            inner: std::io::stderr(),
+            password: Arc::clone(&self.password),
+        }
+    }
+}
+
 use cli::{AuthArgs, Command};
 use state::StateDb;
 
@@ -502,10 +549,18 @@ async fn main() -> anyhow::Result<()> {
         types::LogLevel::Warn => "warn",
         types::LogLevel::Error => "error",
     };
+    // Password redaction: the password is set after config parsing,
+    // but tracing must be initialized earlier. Use a shared slot that
+    // starts as None and is populated once the password is known.
+    let redact_password: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )
+        .with_writer(RedactingMakeWriter {
+            password: Arc::clone(&redact_password),
+        })
         .init();
 
     // Dispatch based on command
@@ -523,6 +578,14 @@ async fn main() -> anyhow::Result<()> {
     // For Sync and RetryFailed, use legacy config path
     let legacy_cli: cli::LegacyCli = cli.into();
     let config = config::Config::from_cli(legacy_cli)?;
+
+    // Install password redaction now that we know the password
+    if let Some(pw) = &config.password {
+        if let Ok(mut guard) = redact_password.lock() {
+            *guard = Some(pw.clone());
+        }
+    }
+
     tracing::info!(concurrency = config.threads_num, "Starting icloudpd-rs");
 
     let password_provider = {
