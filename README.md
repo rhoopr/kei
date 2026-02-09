@@ -33,21 +33,25 @@ A fast, reliable iCloud Photos downloader written in Rust.
 - Two-factor authentication via trusted device codes
 - Persistent sessions with automatic token refresh
 - Lock files prevent concurrent instance corruption
+- Advanced Data Protection (ADP) detection with actionable guidance
 
 ### Downloads
 - Streaming pipeline—downloads begin as first API page returns
-- Resumable `.part` files with SHA256 checksum verification
+- Resumable downloads with SHA256 checksum verification
+- Content-length verification catches CDN truncation before checksum comparison
 - Exponential backoff with transient/permanent error classification
 - Two-phase cleanup pass re-fetches expired CDN URLs
+- Configurable temp file suffix (`--temp-suffix`) for sync-client compatibility
 
 ### Organization
 - Date-based folder structures (`--folder-structure %Y/%m/%d`)
-- Live photo MOV handling with collision detection
+- Live photo MOV handling with collision detection and dedup consistency
 - EXIF date tag read/write (`--set-exif-datetime`)
 - Smart album support (favorites, bursts, time-lapse, slo-mo)
 
 ### Operations
-- Watch mode with configurable intervals (`--watch-with-interval`)
+- Watch mode with configurable intervals, album refresh, and error tolerance
+- systemd integration (`--notify-systemd`) and PID file (`--pid-file`) support
 - Mid-sync session recovery (up to 3 re-auth attempts)
 - Graceful shutdown: first signal finishes in-flight downloads, second force-exits
 - Dry-run mode for safe previews
@@ -180,7 +184,7 @@ Planned enhancements include:
 
 - XMP sidecar export for metadata preservation
 - OS keyring integration for secure password storage
-- Docker images and systemd/launchd service files
+- Docker images
 - iCloud lifecycle management (delete-after-download)
 
 See [open issues](https://github.com/rhoopr/icloudpd-rs/issues) for the complete list.

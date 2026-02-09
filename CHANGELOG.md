@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.2.0] - 2026-02-09
+
 ### Added
 
 - **Watch mode album refresh** — Albums are now re-resolved each watch cycle, so newly created iCloud albums are discovered without restarting the daemon ([#23])
@@ -185,5 +189,7 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
+[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rhoopr/icloudpd-rs/releases/tag/v0.1.0
 
