@@ -256,8 +256,8 @@ impl DownloadContext {
 
     /// Check if an asset should be downloaded based on pre-loaded state.
     ///
-    /// Returns `Some(true)` if definitely needs download, `Some(false)` if
-    /// definitely doesn't, or `None` if we need to check the filesystem.
+    /// Returns `Some(true)` if definitely needs download, or `None` if
+    /// downloaded with matching checksum (need filesystem check to confirm).
     ///
     /// Uses borrowed `&str` keys for zero-allocation lookups.
     fn should_download_fast(
@@ -402,11 +402,23 @@ fn filter_asset_to_tasks(
         }
     }
 
+    let fallback_filename;
     let raw_filename = match asset.filename() {
         Some(f) => f,
         None => {
-            tracing::warn!("Asset {} has no filename, skipping", asset.id());
-            return Vec::new();
+            // Generate fallback from asset ID fingerprint, matching Python behavior.
+            let asset_type = asset
+                .versions()
+                .first()
+                .map(|(_, v)| v.asset_type.as_ref())
+                .unwrap_or("");
+            fallback_filename = paths::generate_fingerprint_filename(asset.id(), asset_type);
+            tracing::info!(
+                asset_id = %asset.id(),
+                filename = %fallback_filename,
+                "Using fingerprint fallback filename"
+            );
+            &fallback_filename
         }
     };
 
@@ -866,11 +878,19 @@ async fn stream_and_download(
                                     task.version_size,
                                     &task.checksum,
                                 ) {
-                                    Some(true) | Some(false) => {
-                                        // Needs download (Some(false) shouldn't happen but download anyway)
+                                    Some(true) => {
                                         if task_tx.send(task).await.is_err() {
                                             return; // Receiver dropped
                                         }
+                                    }
+                                    Some(false) => {
+                                        // Defensive: should_download_fast never returns
+                                        // Some(false) today, but skip if it ever does.
+                                        tracing::debug!(
+                                            asset_id = %task.asset_id,
+                                            "Skipping (state confirms no download needed)"
+                                        );
+                                        producer_pb.inc(1);
                                     }
                                     None => {
                                         // Downloaded with matching checksum — check file exists
@@ -1592,9 +1612,11 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_skips_asset_without_filename() {
+    fn test_filter_uses_fingerprint_fallback_without_filename() {
+        // Asset ID with special chars proves fingerprint sanitization ran:
+        // "AB/CD+EF==GH" → "AB_CD_EF__GH" (non-alphanumeric replaced with _)
         let asset = PhotoAsset::new(
-            json!({"recordName": "NO_NAME", "fields": {
+            json!({"recordName": "AB/CD+EF==GH", "fields": {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 1000,
@@ -1606,7 +1628,16 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
         );
         let config = test_config();
-        assert!(filter_asset_fresh(&asset, &config).is_empty());
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            tasks[0]
+                .download_path
+                .to_string_lossy()
+                .contains("AB_CD_EF__GH.JPG"),
+            "Expected fingerprint fallback filename, got: {:?}",
+            tasks[0].download_path
+        );
     }
 
     #[test]

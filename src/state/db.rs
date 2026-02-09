@@ -118,7 +118,8 @@ pub trait StateDb: Send + Sync {
 /// SQLite implementation of the state database.
 pub struct SqliteStateDb {
     /// Wrapped in Mutex because rusqlite::Connection is not Sync.
-    /// All operations use spawn_blocking to avoid blocking the async runtime.
+    /// Operations hold the lock briefly for fast SQLite queries (WAL mode).
+    /// Only `open()` uses spawn_blocking for the heavier initial setup.
     conn: Mutex<Connection>,
     /// Path to the database file (for error messages).
     path: PathBuf,
@@ -357,7 +358,7 @@ impl StateDb for SqliteStateDb {
             .map_err(StateError::query)?;
 
         let records = stmt
-            .query_map([], |row| Ok(row_to_asset_record(row)))
+            .query_map([], row_to_asset_record)
             .map_err(StateError::query)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StateError::query)?;
@@ -441,7 +442,7 @@ impl StateDb for SqliteStateDb {
             .map_err(StateError::query)?;
 
         let records = stmt
-            .query_map([], |row| Ok(row_to_asset_record(row)))
+            .query_map([], row_to_asset_record)
             .map_err(StateError::query)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StateError::query)?;
@@ -648,23 +649,26 @@ impl StateDb for SqliteStateDb {
 }
 
 /// Convert a database row to an AssetRecord.
-fn row_to_asset_record(row: &rusqlite::Row<'_>) -> AssetRecord {
-    let id: String = row.get(0).unwrap_or_default();
-    let version_size_str: String = row.get(1).unwrap_or_default();
-    let checksum: String = row.get(2).unwrap_or_default();
-    let filename: String = row.get(3).unwrap_or_default();
-    let created_at_ts: i64 = row.get(4).unwrap_or(0);
-    let added_at_ts: Option<i64> = row.get(5).ok();
-    let size_bytes: i64 = row.get(6).unwrap_or(0);
-    let media_type_str: String = row.get(7).unwrap_or_default();
-    let status_str: String = row.get(8).unwrap_or_default();
-    let downloaded_at_ts: Option<i64> = row.get(9).ok();
-    let local_path_str: Option<String> = row.get(10).ok();
-    let last_seen_at_ts: i64 = row.get(11).unwrap_or(0);
-    let download_attempts: i64 = row.get(12).unwrap_or(0);
-    let last_error: Option<String> = row.get(13).ok();
+///
+/// Returns `rusqlite::Error` on column extraction failures instead of silently
+/// falling back to defaults, so schema mismatches or corruption are surfaced.
+fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
+    let id: String = row.get(0)?;
+    let version_size_str: String = row.get(1)?;
+    let checksum: String = row.get(2)?;
+    let filename: String = row.get(3)?;
+    let created_at_ts: i64 = row.get(4)?;
+    let added_at_ts: Option<i64> = row.get(5)?;
+    let size_bytes: i64 = row.get(6)?;
+    let media_type_str: String = row.get(7)?;
+    let status_str: String = row.get(8)?;
+    let downloaded_at_ts: Option<i64> = row.get(9)?;
+    let local_path_str: Option<String> = row.get(10)?;
+    let last_seen_at_ts: i64 = row.get(11)?;
+    let download_attempts: i64 = row.get(12)?;
+    let last_error: Option<String> = row.get(13)?;
 
-    AssetRecord {
+    Ok(AssetRecord {
         id,
         checksum,
         filename,
@@ -686,7 +690,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> AssetRecord {
             .unwrap_or(VersionSizeKey::Original),
         media_type: MediaType::from_str(&media_type_str).unwrap_or(MediaType::Photo),
         status: AssetStatus::from_str(&status_str).unwrap_or(AssetStatus::Pending),
-    }
+    })
 }
 
 #[cfg(test)]

@@ -163,7 +163,7 @@ pub(crate) const VIDEO_VERSION_LOOKUP: &[(AssetVersionSize, &str)] = &[
 
 pub(crate) fn encode_params(params: &HashMap<String, Value>) -> String {
     use std::borrow::Cow;
-    let pairs: Vec<String> = params
+    let mut pairs: Vec<String> = params
         .iter()
         .map(|(k, v)| {
             let val: Cow<'_, str> = match v {
@@ -175,6 +175,7 @@ pub(crate) fn encode_params(params: &HashMap<String, Value>) -> String {
             format!("{}={}", urlencoding::encode(k), urlencoding::encode(&val))
         })
         .collect();
+    pairs.sort();
     pairs.join("&")
 }
 

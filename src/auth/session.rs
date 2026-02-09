@@ -320,31 +320,45 @@ impl Session {
     }
 
     /// Extract Apple session headers from every response and persist to disk.
-    /// This must run after every request because Apple may rotate tokens at any time.
+    ///
+    /// Only writes session/cookie files when values actually changed, avoiding
+    /// redundant I/O during high-frequency API calls (album pagination, etc.).
     async fn extract_and_save(&mut self, response: &Response) -> Result<()> {
         let headers = response.headers();
+        let mut session_changed = false;
         for &(header_name, session_key) in HEADER_DATA {
             if let Some(val) = headers.get(header_name) {
                 if let Ok(val_str) = val.to_str() {
-                    self.session_data
-                        .insert(session_key.to_string(), val_str.to_string());
+                    let existing = self.session_data.get(session_key);
+                    if existing.map(|s| s.as_str()) != Some(val_str) {
+                        self.session_data
+                            .insert(session_key.to_string(), val_str.to_string());
+                        session_changed = true;
+                    }
                 }
             }
         }
 
-        let session_path = self.session_path();
-        let json = serde_json::to_string_pretty(&self.session_data)?;
-        fs::write(&session_path, json).await.with_context(|| {
-            format!("Failed to write session data to {}", session_path.display())
-        })?;
-        #[cfg(unix)]
-        {
-            // Session files contain auth tokens — restrict to owner-only
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&session_path, perms)?;
+        if session_changed {
+            let session_path = self.session_path();
+            let json = serde_json::to_string_pretty(&self.session_data)?;
+            fs::write(&session_path, &json).await.with_context(|| {
+                format!("Failed to write session data to {}", session_path.display())
+            })?;
+            #[cfg(unix)]
+            {
+                // Session files contain auth tokens — restrict to owner-only
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(&session_path, perms)?;
+            }
+            tracing::debug!("Saved session data to file");
         }
-        tracing::debug!("Saved session data to file");
+
+        // Only process cookies when the response contains Set-Cookie headers.
+        if headers.get("set-cookie").is_none() {
+            return Ok(());
+        }
 
         // reqwest::cookie::Jar doesn't expose iteration, so we persist
         // Set-Cookie headers ourselves as a JSON array of {url, cookie}.
@@ -363,6 +377,7 @@ impl Session {
         };
 
         let now = chrono::Utc::now();
+        let mut cookies_changed = false;
         for cookie_header in headers.get_all("set-cookie") {
             if let Ok(val) = cookie_header.to_str() {
                 if is_cookie_expired(val, &now) {
@@ -388,16 +403,21 @@ impl Session {
                     url: url_str.clone(),
                     cookie: val.to_string(),
                 });
+                cookies_changed = true;
             }
         }
-        fs::write(&cookiejar_path, serde_json::to_string_pretty(&entries)?)
-            .await
-            .with_context(|| format!("Failed to write cookies to {}", cookiejar_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&cookiejar_path, perms)?;
+        if cookies_changed {
+            fs::write(&cookiejar_path, serde_json::to_string_pretty(&entries)?)
+                .await
+                .with_context(|| {
+                    format!("Failed to write cookies to {}", cookiejar_path.display())
+                })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(&cookiejar_path, perms)?;
+            }
         }
 
         Ok(())

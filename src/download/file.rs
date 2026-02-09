@@ -11,29 +11,6 @@ use tokio::io::AsyncWriteExt;
 use super::error::DownloadError;
 use crate::retry::{self, RetryAction, RetryConfig};
 
-/// Base32 encode bytes using RFC 4648 alphabet (A-Z, 2-7), no padding.
-fn base32_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let mut result = String::with_capacity((data.len() * 8).div_ceil(5));
-    let mut buffer: u64 = 0;
-    let mut bits_left: u32 = 0;
-
-    for &byte in data {
-        buffer = (buffer << 8) | byte as u64;
-        bits_left += 8;
-        while bits_left >= 5 {
-            bits_left -= 5;
-            let index = ((buffer >> bits_left) & 0x1F) as usize;
-            result.push(ALPHABET[index] as char);
-        }
-    }
-    if bits_left > 0 {
-        let index = ((buffer << (5 - bits_left)) & 0x1F) as usize;
-        result.push(ALPHABET[index] as char);
-    }
-    result
-}
-
 /// Derive a deterministic .part filename from the checksum so that
 /// concurrent downloads of different files don't collide. Base32-encoded
 /// because base64 contains `/` which is invalid in filenames.
@@ -41,7 +18,7 @@ fn temp_download_path(download_path: &Path, checksum: &str) -> anyhow::Result<Pa
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(checksum)
         .context("Failed to decode base64 checksum")?;
-    let encoded = base32_encode(&decoded);
+    let encoded = data_encoding::BASE32_NOPAD.encode(&decoded);
     let download_dir = download_path.parent().unwrap_or_else(|| Path::new("."));
     Ok(download_dir.join(format!("{}.part", encoded)))
 }
@@ -184,6 +161,7 @@ async fn attempt_download(
         bytes_written += chunk.len() as u64;
     }
     file.flush().await?;
+    file.sync_data().await?;
     drop(file);
 
     if let Ok(expected_hash) = base64::engine::general_purpose::STANDARD.decode(checksum) {
@@ -220,12 +198,13 @@ mod tests {
 
     #[test]
     fn test_base32_encode() {
-        // "Hello" -> "JBSWY3DP" (standard base32, no padding)
-        assert_eq!(base32_encode(b"Hello"), "JBSWY3DP");
-        assert_eq!(base32_encode(b""), "");
-        assert_eq!(base32_encode(b"f"), "MY");
-        assert_eq!(base32_encode(b"fo"), "MZXQ");
-        assert_eq!(base32_encode(b"foo"), "MZXW6");
+        // Verify data-encoding produces expected RFC 4648 no-pad output
+        use data_encoding::BASE32_NOPAD;
+        assert_eq!(BASE32_NOPAD.encode(b"Hello"), "JBSWY3DP");
+        assert_eq!(BASE32_NOPAD.encode(b""), "");
+        assert_eq!(BASE32_NOPAD.encode(b"f"), "MY");
+        assert_eq!(BASE32_NOPAD.encode(b"fo"), "MZXQ");
+        assert_eq!(BASE32_NOPAD.encode(b"foo"), "MZXW6");
     }
 
     #[test]

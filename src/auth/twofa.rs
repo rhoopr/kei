@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, Write};
 
 use anyhow::{Context, Result};
@@ -45,14 +44,13 @@ pub async fn request_2fa_code(
         }
     });
 
-    let mut accept_override = HashMap::new();
-    accept_override.insert("Accept".to_string(), "application/json".to_string());
+    let accept_override: [(&str, &str); 1] = [("Accept", "application/json")];
 
     let headers = get_auth_headers(
         domain,
         client_id,
         &session.session_data,
-        Some(accept_override),
+        Some(&accept_override),
     )?;
 
     let url = format!("{}/verify/trusteddevice/securitycode", endpoints.auth);

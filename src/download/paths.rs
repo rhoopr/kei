@@ -184,20 +184,13 @@ const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
 /// is replaced with the mapped uppercase extension. Otherwise the original
 /// filename is returned unchanged.
 pub fn map_filename_extension(filename: &str, asset_type: &str) -> String {
-    let mapped_ext = ITEM_TYPE_EXTENSIONS
-        .iter()
-        .find(|(key, _)| *key == asset_type)
-        .map(|(_, ext)| *ext);
-
-    match mapped_ext {
-        Some(ext) => match filename.rfind('.') {
-            Some(dot) => {
-                let stem = &filename[..dot];
-                format!("{}.{}", stem, ext)
-            }
-            None => format!("{}.{}", filename, ext),
-        },
-        None => filename.to_string(),
+    let ext = item_type_extension(asset_type);
+    if ext == "unknown" {
+        return filename.to_string();
+    }
+    match filename.rfind('.') {
+        Some(dot) => format!("{}.{}", &filename[..dot], ext),
+        None => format!("{}.{}", filename, ext),
     }
 }
 
@@ -241,6 +234,32 @@ pub fn live_photo_mov_path_suffix(filename: &str) -> String {
         }
         None => format!("{}.MOV", filename),
     }
+}
+
+/// Look up the file extension for a UTI asset type string.
+///
+/// Returns the uppercase extension (e.g. `"JPG"`) or `"unknown"` if not mapped.
+pub fn item_type_extension(asset_type: &str) -> &'static str {
+    ITEM_TYPE_EXTENSIONS
+        .iter()
+        .find(|(key, _)| *key == asset_type)
+        .map(|(_, ext)| *ext)
+        .unwrap_or("unknown")
+}
+
+/// Generate a fallback filename from the asset ID when `filenameEnc` is absent.
+///
+/// Replaces non-alphanumeric characters with underscores and truncates to 12 chars,
+/// then appends the extension derived from the asset's UTI type.
+/// Matches Python's `generate_fingerprint_filename()`.
+pub fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String {
+    let fingerprint: String = asset_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .take(12)
+        .collect();
+    let ext = item_type_extension(asset_type);
+    format!("{}.{}", fingerprint, ext)
 }
 
 /// Generate a live photo MOV filename using the "original" policy.
@@ -401,6 +420,39 @@ mod tests {
         assert_eq!(
             insert_suffix("IMG_5526_QUJDMTI.JPG", "medium"),
             "IMG_5526_QUJDMTI-medium.JPG"
+        );
+    }
+
+    #[test]
+    fn test_item_type_extension() {
+        assert_eq!(item_type_extension("public.jpeg"), "JPG");
+        assert_eq!(item_type_extension("public.heic"), "HEIC");
+        assert_eq!(item_type_extension("com.apple.quicktime-movie"), "MOV");
+        assert_eq!(item_type_extension("unknown.type"), "unknown");
+    }
+
+    #[test]
+    fn test_generate_fingerprint_filename() {
+        // Matches Python: re.sub("[^0-9a-zA-Z]", "_", asset_id)[0:12]
+        assert_eq!(
+            generate_fingerprint_filename("CCPO9c3V/MTwWZJ9bw==", "public.jpeg"),
+            "CCPO9c3V_MTw.JPG"
+        );
+        assert_eq!(
+            generate_fingerprint_filename("ABC", "public.heic"),
+            "ABC.HEIC"
+        );
+        assert_eq!(
+            generate_fingerprint_filename("a/b+c=d!e@f#g$h%i", "public.png"),
+            "a_b_c_d_e_f_.PNG"
+        );
+    }
+
+    #[test]
+    fn test_generate_fingerprint_filename_unknown_type() {
+        assert_eq!(
+            generate_fingerprint_filename("asset123", "some.unknown.type"),
+            "asset123.unknown"
         );
     }
 }

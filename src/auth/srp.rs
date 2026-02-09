@@ -154,7 +154,7 @@ pub(crate) fn get_auth_headers(
     domain: &str,
     client_id: &str,
     session_data: &HashMap<String, String>,
-    overrides: Option<HashMap<String, String>>,
+    overrides: Option<&[(&str, &str)]>,
 ) -> Result<HeaderMap> {
     let redirect_uri = if domain == "cn" {
         "https://www.icloud.com.cn"
@@ -210,8 +210,8 @@ pub(crate) fn get_auth_headers(
     }
 
     if let Some(ovr) = overrides {
-        for (key, val) in ovr {
-            if let Ok(v) = HeaderValue::from_str(&val) {
+        for &(key, val) in ovr {
+            if let Ok(v) = HeaderValue::from_str(val) {
                 if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
                     headers.insert(name, v);
                 }
@@ -253,19 +253,11 @@ pub async fn authenticate_srp(
         "protocols": ["s2k", "s2k_fo"],
     });
 
-    let build_overrides = || {
-        let mut ovr = HashMap::new();
-        ovr.insert("Origin".to_string(), endpoints.auth_root.to_string());
-        ovr.insert("Referer".to_string(), format!("{}/", endpoints.auth_root));
-        ovr
-    };
+    let referer = format!("{}/", endpoints.auth_root);
+    let overrides: [(&str, &str); 2] = [("Origin", endpoints.auth_root), ("Referer", &referer)];
 
-    let init_headers = get_auth_headers(
-        domain,
-        client_id,
-        &session.session_data,
-        Some(build_overrides()),
-    )?;
+    let init_headers =
+        get_auth_headers(domain, client_id, &session.session_data, Some(&overrides))?;
 
     tracing::debug!("Initiating SRP authentication for {}", apple_id);
 
@@ -355,12 +347,10 @@ pub async fn authenticate_srp(
     });
 
     // Rebuild headers — init response may have rotated scnt/session_id
-    let complete_headers = get_auth_headers(
-        domain,
-        client_id,
-        &session.session_data,
-        Some(build_overrides()),
-    )?;
+    let referer = format!("{}/", endpoints.auth_root);
+    let overrides: [(&str, &str); 2] = [("Origin", endpoints.auth_root), ("Referer", &referer)];
+    let complete_headers =
+        get_auth_headers(domain, client_id, &session.session_data, Some(&overrides))?;
     let complete_url = format!(
         "{}/signin/complete?isRememberMeEnabled=true",
         endpoints.auth

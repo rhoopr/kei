@@ -494,8 +494,10 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
+    // Scope debug/info to the app crate so dependency crates stay quieter.
+    // Users can override with RUST_LOG env var for full control.
     let filter = match cli.log_level {
-        types::LogLevel::Debug => "debug",
+        types::LogLevel::Debug => "icloudpd_rs=debug,info",
         types::LogLevel::Info => "info",
         types::LogLevel::Warn => "warn",
         types::LogLevel::Error => "error",

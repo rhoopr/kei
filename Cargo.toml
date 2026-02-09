@@ -72,3 +72,4 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 # Memory optimization
 smallvec = "1.15"
 rustc-hash = "2.1"
+data-encoding = "2.10.0"
