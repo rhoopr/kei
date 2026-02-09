@@ -230,6 +230,7 @@ const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
     ("com.olympus.raw-image", "ORF"),
     ("com.canon.cr3-raw-image", "CR3"),
     ("com.olympus.or-raw-image", "ORF"),
+    ("org.webmproject.webp", "WEBP"),
 ];
 
 /// Replace a filename's extension based on the UTI `asset_type` string.
@@ -489,6 +490,14 @@ mod tests {
     }
 
     #[test]
+    fn test_map_filename_extension_webp() {
+        assert_eq!(
+            map_filename_extension("photo.webp", "org.webmproject.webp"),
+            "photo.WEBP"
+        );
+    }
+
+    #[test]
     fn test_map_filename_extension_unknown_type() {
         assert_eq!(
             map_filename_extension("photo.xyz", "com.unknown.type"),
@@ -551,6 +560,7 @@ mod tests {
         assert_eq!(item_type_extension("public.jpeg"), "JPG");
         assert_eq!(item_type_extension("public.heic"), "HEIC");
         assert_eq!(item_type_extension("com.apple.quicktime-movie"), "MOV");
+        assert_eq!(item_type_extension("org.webmproject.webp"), "WEBP");
         assert_eq!(item_type_extension("unknown.type"), "unknown");
     }
 

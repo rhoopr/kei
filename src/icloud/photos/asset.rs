@@ -75,6 +75,7 @@ fn resolve_item_type(fields: &Value, filename: &Option<String>) -> Option<AssetI
             || lower.ends_with(".png")
             || lower.ends_with(".jpg")
             || lower.ends_with(".jpeg")
+            || lower.ends_with(".webp")
         {
             return Some(AssetItemType::Image);
         }
@@ -338,6 +339,27 @@ mod tests {
             json!({"fields": {
                 "itemType": {"value": "unknown.type"},
                 "filenameEnc": {"value": "photo.heic", "type": "STRING"}
+            }}),
+            json!({}),
+        );
+        assert_eq!(asset.item_type(), Some(AssetItemType::Image));
+    }
+
+    #[test]
+    fn test_item_type_webp_from_uti() {
+        let asset = make_asset(
+            json!({"fields": {"itemType": {"value": "org.webmproject.webp"}}}),
+            json!({}),
+        );
+        assert_eq!(asset.item_type(), Some(AssetItemType::Image));
+    }
+
+    #[test]
+    fn test_item_type_webp_from_extension_fallback() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "unknown.type"},
+                "filenameEnc": {"value": "photo.webp", "type": "STRING"}
             }}),
             json!({}),
         );

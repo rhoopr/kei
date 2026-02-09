@@ -173,6 +173,21 @@ async fn attempt_download(
     file.sync_data().await?;
     drop(file);
 
+    // Belt-and-suspenders: verify the server sent the number of bytes it
+    // promised. Catches CDN truncation (e.g. Apple silently cutting off
+    // videos at ~1 GB) before we even reach the checksum comparison.
+    if let Some(expected_len) = content_length {
+        let total_bytes = bytes_written - resume_offset;
+        if total_bytes != expected_len {
+            let _ = fs::remove_file(&part_path).await;
+            return Err(DownloadError::ContentLengthMismatch {
+                path: path_str,
+                expected: expected_len,
+                received: total_bytes,
+            });
+        }
+    }
+
     if let Ok(expected_hash) = base64::engine::general_purpose::STANDARD.decode(checksum) {
         let actual_hash = hasher.finalize();
 

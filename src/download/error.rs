@@ -13,6 +13,13 @@ pub enum DownloadError {
     #[error("Checksum mismatch for {0}")]
     ChecksumMismatch(String),
 
+    #[error("Content-length mismatch for {path}: expected {expected} bytes, received {received}")]
+    ContentLengthMismatch {
+        path: String,
+        expected: u64,
+        received: u64,
+    },
+
     #[error("Disk error: {0}")]
     Disk(#[from] std::io::Error),
 
@@ -38,6 +45,7 @@ impl DownloadError {
         match self {
             DownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
             DownloadError::ChecksumMismatch(_) => true,
+            DownloadError::ContentLengthMismatch { .. } => true,
             DownloadError::Http { .. } => true,
             DownloadError::Disk(_) => false,
             DownloadError::Other(_) => false,
@@ -189,6 +197,17 @@ mod tests {
             status: 404,
             path: "x".into(),
         };
+        assert!(!e.is_session_expired());
+    }
+
+    #[test]
+    fn test_content_length_mismatch_retryable() {
+        let e = DownloadError::ContentLengthMismatch {
+            path: "video.mov".into(),
+            expected: 1_073_741_824,
+            received: 1_060_000_000,
+        };
+        assert!(e.is_retryable());
         assert!(!e.is_session_expired());
     }
 

@@ -136,7 +136,8 @@ pub(crate) fn item_type_from_str(s: &str) -> Option<AssetItemType> {
         | "com.nikon.raw-image"
         | "com.olympus.raw-image"
         | "com.canon.cr3-raw-image"
-        | "com.olympus.or-raw-image" => Some(AssetItemType::Image),
+        | "com.olympus.or-raw-image"
+        | "org.webmproject.webp" => Some(AssetItemType::Image),
         "com.apple.quicktime-movie" => Some(AssetItemType::Movie),
         _ => None,
     }
@@ -196,6 +197,14 @@ mod tests {
         assert_eq!(item_type_from_str("public.png"), Some(AssetItemType::Image));
         assert_eq!(
             item_type_from_str("com.canon.cr2-raw-image"),
+            Some(AssetItemType::Image)
+        );
+    }
+
+    #[test]
+    fn test_item_type_from_str_webp() {
+        assert_eq!(
+            item_type_from_str("org.webmproject.webp"),
             Some(AssetItemType::Image)
         );
     }

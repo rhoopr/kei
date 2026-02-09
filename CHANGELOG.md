@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Resume restart logging** — When a server ignores an HTTP Range header and returns 200 instead of 206, the restart is now logged at info level
 - **Password redaction in logs** — Passwords provided via `--password` or `ICLOUD_PASSWORD` are redacted from all tracing output, replacing occurrences with `********`
 - **AM/PM filename matching** — Files with whitespace variants before AM/PM (regular space, narrow no-break space U+202F, or no space) are now recognized as the same file, preventing duplicate downloads of macOS screenshots across locale configurations
+- **WEBP file type recognition** — WEBP images (`org.webmproject.webp`) are now correctly classified as images instead of defaulting to movie, preventing `--skip-videos` from incorrectly excluding WEBP photos ([#90])
+- **Large video download integrity** — Downloads now verify content-length against bytes received before checksum comparison, catching CDN truncation (e.g. Apple silently cutting off videos at ~1 GB) earlier and triggering automatic retry ([#91])
+- **CAS Op-Lock / TRY_AGAIN_LATER retry** — CloudKit server errors (`TRY_AGAIN_LATER`, `CAS_OP_LOCK`, `RETRY_LATER`, `THROTTLED`) embedded in JSON responses are now detected and automatically retried with exponential backoff, preventing silent page loss during photo enumeration ([#94])
+
+[#90]: https://github.com/rhoopr/icloudpd-rs/issues/90
+[#91]: https://github.com/rhoopr/icloudpd-rs/issues/91
+[#94]: https://github.com/rhoopr/icloudpd-rs/issues/94
 
 ---
 

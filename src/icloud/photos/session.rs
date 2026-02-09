@@ -65,9 +65,84 @@ impl PhotosSession for crate::auth::SharedSession {
     }
 }
 
-/// Classify API errors for retry: network failures and server-side errors
-/// (5xx, 429) are transient; client errors (4xx) indicate a real problem.
+/// CloudKit server error codes that indicate a transient condition.
+/// These arrive as HTTP 200 with a `serverErrorCode` field in the JSON body.
+const RETRYABLE_SERVER_ERRORS: &[&str] =
+    &["RETRY_LATER", "TRY_AGAIN_LATER", "CAS_OP_LOCK", "THROTTLED"];
+
+/// Error type for CloudKit server errors embedded in the JSON response body.
+/// These are distinct from HTTP-level errors and represent API-level failures.
+#[derive(Debug, thiserror::Error)]
+#[error("CloudKit server error: {code} — {reason}")]
+pub struct CloudKitServerError {
+    pub code: String,
+    pub reason: String,
+    pub retryable: bool,
+}
+
+/// Check a CloudKit JSON response for `serverErrorCode` or per-record errors.
+/// Returns `Err` if a server error is found, `Ok(response)` otherwise.
+fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
+    // Top-level serverErrorCode (e.g. from CAS Op-Lock)
+    if let Some(code) = response["serverErrorCode"].as_str() {
+        let reason = response["reason"]
+            .as_str()
+            .or_else(|| response["serverErrorMessage"].as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let retryable = RETRYABLE_SERVER_ERRORS
+            .iter()
+            .any(|&s| s.eq_ignore_ascii_case(code));
+        tracing::warn!(
+            error_code = code,
+            retryable,
+            "CloudKit server error: {reason}"
+        );
+        return Err(CloudKitServerError {
+            code: code.to_string(),
+            reason,
+            retryable,
+        }
+        .into());
+    }
+
+    // Per-record errors in the records array
+    if let Some(records) = response["records"].as_array() {
+        for record in records {
+            if let Some(code) = record["serverErrorCode"].as_str() {
+                let reason = record["reason"].as_str().unwrap_or("unknown").to_string();
+                let retryable = RETRYABLE_SERVER_ERRORS
+                    .iter()
+                    .any(|&s| s.eq_ignore_ascii_case(code));
+                tracing::warn!(
+                    error_code = code,
+                    retryable,
+                    "CloudKit per-record error: {reason}"
+                );
+                return Err(CloudKitServerError {
+                    code: code.to_string(),
+                    reason,
+                    retryable,
+                }
+                .into());
+            }
+        }
+    }
+
+    Ok(response)
+}
+
+/// Classify API errors for retry: network failures, server-side errors
+/// (5xx, 429), and retryable CloudKit server errors are transient;
+/// client errors (4xx) and non-retryable server errors are permanent.
 fn classify_api_error(e: &anyhow::Error) -> RetryAction {
+    if let Some(ck_err) = e.downcast_ref::<CloudKitServerError>() {
+        return if ck_err.retryable {
+            RetryAction::Retry
+        } else {
+            RetryAction::Abort
+        };
+    }
     if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
         if let Some(status) = reqwest_err.status() {
             if status.as_u16() == 429 || status.as_u16() >= 500 {
@@ -81,6 +156,10 @@ fn classify_api_error(e: &anyhow::Error) -> RetryAction {
 }
 
 /// Retry a `session.post()` call with default exponential backoff.
+///
+/// Inspects each response for CloudKit server errors (`serverErrorCode`)
+/// and converts retryable ones (e.g. `TRY_AGAIN_LATER`, `CAS_OP_LOCK`)
+/// into transient errors that trigger automatic retry.
 pub async fn retry_post(
     session: &dyn PhotosSession,
     url: &str,
@@ -88,8 +167,9 @@ pub async fn retry_post(
     headers: &[(&str, &str)],
 ) -> anyhow::Result<Value> {
     let config = RetryConfig::default();
-    retry::retry_with_backoff(&config, classify_api_error, || {
-        session.post(url, body, headers)
+    retry::retry_with_backoff(&config, classify_api_error, || async {
+        let response = session.post(url, body, headers).await?;
+        check_cloudkit_errors(response)
     })
     .await
 }
@@ -129,6 +209,75 @@ mod tests {
 
         // Verify clone_box produces a valid trait object
         let _cloned2 = _cloned.clone_box();
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_pass_through_normal() {
+        let response = serde_json::json!({"records": [{"recordName": "A"}]});
+        let result = check_cloudkit_errors(response.clone());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), response);
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_top_level_retryable() {
+        let response = serde_json::json!({
+            "serverErrorCode": "TRY_AGAIN_LATER",
+            "reason": "Sync zone CAS Op-Lock failed"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert_eq!(ck_err.code, "TRY_AGAIN_LATER");
+        assert!(ck_err.retryable);
+        assert_eq!(classify_api_error(&err), RetryAction::Retry);
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_top_level_non_retryable() {
+        let response = serde_json::json!({
+            "serverErrorCode": "ZONE_NOT_FOUND",
+            "reason": "Zone not found"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert!(!ck_err.retryable);
+        assert_eq!(classify_api_error(&err), RetryAction::Abort);
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_per_record() {
+        let response = serde_json::json!({
+            "records": [
+                {"recordName": "A"},
+                {"serverErrorCode": "RETRY_LATER", "reason": "busy"}
+            ]
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert_eq!(ck_err.code, "RETRY_LATER");
+        assert!(ck_err.retryable);
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_cas_op_lock() {
+        let response = serde_json::json!({
+            "serverErrorCode": "CAS_OP_LOCK",
+            "reason": "concurrent write rejected"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert!(ck_err.retryable);
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_throttled() {
+        let response = serde_json::json!({
+            "serverErrorCode": "THROTTLED",
+            "reason": "rate limited"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert!(ck_err.retryable);
     }
 
     #[test]
