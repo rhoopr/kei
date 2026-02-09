@@ -30,6 +30,9 @@ pub struct Config {
     pub skip_created_before: Option<DateTime<Local>>,
     pub skip_created_after: Option<DateTime<Local>>,
 
+    // Optional paths
+    pub pid_file: Option<PathBuf>,
+
     // 8-byte primitives
     pub watch_with_interval: Option<u64>,
     pub retry_delay_secs: u64,
@@ -65,6 +68,7 @@ pub struct Config {
     pub keep_unicode_in_filenames: bool,
     #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub only_print_filenames: bool,
+    pub notify_systemd: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -142,6 +146,8 @@ impl Config {
             max_retries: cli.max_retries,
             retry_delay_secs: cli.retry_delay,
             temp_suffix: cli.temp_suffix,
+            notify_systemd: cli.notify_systemd,
+            pid_file: cli.pid_file,
         })
     }
 }

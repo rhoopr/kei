@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Watch mode album refresh** — Albums are now re-resolved each watch cycle, so newly created iCloud albums are discovered without restarting the daemon ([#23])
+- **`--notify-systemd` flag** — Sends sd_notify messages (`READY`, `STOPPING`, `STATUS`, `WATCHDOG`) for systemd service integration. Linux-only; no-op on other platforms ([#23])
+- **`--pid-file` flag** — Writes the process PID to a file on startup and removes it on exit, for service managers and monitoring ([#23])
+- **Watch mode error tolerance** — `PartialFailure` outcomes in watch mode now log a warning and continue to the next cycle instead of exiting, since transient failures are expected in long-running sessions ([#23])
+
+[#23]: https://github.com/rhoopr/icloudpd-rs/issues/23
+
 ### Fixed
 
 - **Epoch date fallback warnings** — `asset_date()`, `added_date()`, and file mtime now log warnings when falling back to the Unix epoch or clamping negative timestamps, making silent data loss visible

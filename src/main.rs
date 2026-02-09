@@ -15,6 +15,7 @@ mod icloud;
 pub mod retry;
 mod shutdown;
 mod state;
+mod systemd;
 mod types;
 
 use std::io::IsTerminal;
@@ -73,6 +74,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
 
 use cli::{AuthArgs, Command};
 use state::StateDb;
+use systemd::SystemdNotifier;
 
 /// Maximum number of re-authentication attempts before giving up.
 const MAX_REAUTH_ATTEMPTS: u32 = 3;
@@ -537,6 +539,59 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve which albums to download from.
+///
+/// When no `--album` names are specified, returns `library.all()` (a cheap
+/// in-memory construction, no API call). When names are given, calls
+/// `library.albums().await` to discover user-created albums from iCloud.
+async fn resolve_albums(
+    library: &icloud::photos::PhotoLibrary,
+    album_names: &[String],
+) -> anyhow::Result<Vec<icloud::photos::PhotoAlbum>> {
+    if album_names.is_empty() {
+        Ok(vec![library.all()])
+    } else {
+        let mut album_map = library.albums().await?;
+        let mut matched = Vec::new();
+        for name in album_names {
+            match album_map.remove(name.as_str()) {
+                Some(album) => matched.push(album),
+                None => {
+                    let available: Vec<&String> = album_map.keys().collect();
+                    anyhow::bail!(
+                        "Album '{}' not found. Available albums: {:?}",
+                        name,
+                        available
+                    );
+                }
+            }
+        }
+        Ok(matched)
+    }
+}
+
+/// RAII guard that writes the current PID to a file on creation and removes
+/// it when dropped.
+struct PidFileGuard {
+    path: PathBuf,
+}
+
+impl PidFileGuard {
+    fn new(path: PathBuf) -> std::io::Result<Self> {
+        std::fs::write(&path, std::process::id().to_string())?;
+        tracing::debug!(path = %path.display(), "PID file created");
+        Ok(Self { path })
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::debug!(path = %self.path.display(), error = %e, "Failed to remove PID file");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
@@ -585,6 +640,15 @@ async fn main() -> anyhow::Result<()> {
             *guard = Some(pw.clone());
         }
     }
+
+    // Write PID file if requested (before auth so the PID is visible immediately)
+    let _pid_guard = config
+        .pid_file
+        .as_ref()
+        .map(|p| PidFileGuard::new(p.clone()))
+        .transpose()?;
+
+    let notifier = SystemdNotifier::new(config.notify_systemd);
 
     tracing::info!(concurrency = config.threads_num, "Starting icloudpd-rs");
 
@@ -690,27 +754,6 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--directory is required for downloading");
     }
 
-    let albums = if config.albums.is_empty() {
-        vec![library.all()]
-    } else {
-        let mut album_map = library.albums().await?;
-        let mut matched = Vec::new();
-        for name in &config.albums {
-            match album_map.remove(name.as_str()) {
-                Some(album) => matched.push(album),
-                None => {
-                    let available: Vec<&String> = album_map.keys().collect();
-                    anyhow::bail!(
-                        "Album '{}' not found. Available albums: {:?}",
-                        name,
-                        available
-                    );
-                }
-            }
-        }
-        matched
-    };
-
     // Initialize state database
     let state_db: Option<Arc<dyn state::StateDb>> = {
         let db_path = config.cookie_directory.join(format!(
@@ -783,15 +826,25 @@ async fn main() -> anyhow::Result<()> {
         state_db,
     };
 
-    let shutdown_token = shutdown::install_signal_handler()?;
+    let shutdown_token = shutdown::install_signal_handler(&notifier)?;
 
+    let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
+
+    // Resolve albums once before the loop for the initial cycle.
+    // In watch mode, albums are re-resolved each iteration so new iCloud
+    // albums are discovered automatically.
+    let mut albums = resolve_albums(library, &config.albums).await?;
+    notifier.notify_ready();
 
     loop {
         if shutdown_token.is_cancelled() {
             tracing::info!("Shutdown requested, exiting...");
             break;
         }
+
+        notifier.notify_status("Syncing...");
+        notifier.notify_watchdog();
 
         let download_client = shared_session.read().await.download_client();
         let outcome = download::download_photos(
@@ -833,7 +886,14 @@ async fn main() -> anyhow::Result<()> {
                 continue; // Restart download pass
             }
             download::DownloadOutcome::PartialFailure { failed_count } => {
-                anyhow::bail!("{} downloads failed", failed_count);
+                if is_watch_mode {
+                    tracing::warn!(
+                        failed_count,
+                        "Some downloads failed this cycle, will retry next cycle"
+                    );
+                } else {
+                    anyhow::bail!("{} downloads failed", failed_count);
+                }
             }
         }
 
@@ -842,6 +902,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Shutdown requested, exiting...");
                 break;
             }
+            notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!("Waiting {} seconds...", interval);
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
@@ -861,10 +922,44 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             .ok(); // Best-effort pre-check; mid-sync re-auth handles failures
+
+            // Re-resolve albums to discover newly created iCloud albums
+            match resolve_albums(library, &config.albums).await {
+                Ok(refreshed) => albums = refreshed,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to refresh albums, reusing previous set");
+                }
+            }
         } else {
             break;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_file_guard_creates_and_removes() {
+        let path = std::env::temp_dir().join("icloudpd_test_pid_guard.pid");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let guard = PidFileGuard::new(path.clone()).unwrap();
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(contents, std::process::id().to_string());
+            drop(guard);
+        }
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn pid_file_guard_handles_missing_parent() {
+        let path = std::env::temp_dir().join("nonexistent_dir_abc123/test.pid");
+        assert!(PidFileGuard::new(path).is_err());
+    }
 }
