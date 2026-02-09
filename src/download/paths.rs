@@ -95,6 +95,60 @@ pub fn clean_filename(filename: &str) -> String {
         .collect()
 }
 
+/// Sanitize a path component (e.g. album name) to prevent path traversal
+/// and invalid directory names.
+///
+/// - Strips leading/trailing dots and spaces
+/// - Replaces `..` sequences with `_`
+/// - Removes filesystem-invalid characters via `clean_filename()`
+/// - Prefixes Windows reserved names (CON, NUL, PRN, etc.) with `_`
+pub fn sanitize_path_component(name: &str) -> String {
+    // First clean invalid filesystem characters
+    let cleaned = clean_filename(name);
+
+    // Replace ".." sequences to prevent directory traversal
+    let no_traversal = cleaned.replace("..", "_");
+
+    // Strip leading/trailing dots and spaces
+    let trimmed = no_traversal.trim_matches(|c: char| c == '.' || c == ' ');
+    if trimmed.is_empty() {
+        return "_".to_string();
+    }
+
+    // Check for Windows reserved names (case-insensitive)
+    let upper = trimmed.to_ascii_uppercase();
+    let base = upper.split('.').next().unwrap_or("");
+    if matches!(
+        base,
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    ) {
+        return format!("_{}", trimmed);
+    }
+
+    trimmed.to_string()
+}
+
 /// Remove non-ASCII (unicode) characters from a filename, keeping only
 /// ASCII characters.
 pub fn remove_unicode_chars(filename: &str) -> String {
@@ -260,6 +314,75 @@ pub fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String
         .collect();
     let ext = item_type_extension(asset_type);
     format!("{}.{}", fingerprint, ext)
+}
+
+/// Normalize AM/PM whitespace variants to a canonical no-space form.
+///
+/// macOS uses various whitespace characters before AM/PM:
+/// - Regular space (U+0020): `1.40.01 PM`
+/// - Narrow no-break space (U+202F): `1.40.01\u{202F}PM`
+/// - No space: `1.40.01PM`
+///
+/// This function strips any of these to produce a consistent `1.40.01PM` form,
+/// enabling matching between files created with different locale settings.
+pub fn normalize_ampm(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        // Check if current char is whitespace before "AM" or "PM"
+        if i + 2 < len
+            && (chars[i] == ' ' || chars[i] == '\u{202F}' || chars[i] == '\u{00A0}')
+            && ((chars[i + 1] == 'A' || chars[i + 1] == 'a')
+                && (chars[i + 2] == 'M' || chars[i + 2] == 'm'))
+            || (i + 2 < len
+                && (chars[i] == ' ' || chars[i] == '\u{202F}' || chars[i] == '\u{00A0}')
+                && ((chars[i + 1] == 'P' || chars[i + 1] == 'p')
+                    && (chars[i + 2] == 'M' || chars[i + 2] == 'm')))
+        {
+            // Skip the whitespace, keep AM/PM
+            i += 1;
+            continue;
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
+/// Find a file on disk that differs only in AM/PM whitespace from the expected path.
+///
+/// When the expected file doesn't exist, this checks sibling files in the same
+/// directory for an AM/PM whitespace variant (e.g., `1.40.01 PM.PNG` vs
+/// `1.40.01\u{202F}PM.PNG` vs `1.40.01PM.PNG`).
+///
+/// Returns the matching variant's full path, or `None` if no match is found.
+pub fn find_ampm_variant(path: &Path) -> Option<PathBuf> {
+    let filename = path.file_name()?.to_str()?;
+    let normalized = normalize_ampm(filename);
+
+    // Early exit: if normalizing doesn't change the name, there's no AM/PM to vary
+    if normalized == filename {
+        return None;
+    }
+
+    let parent = path.parent()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name();
+        if let Some(sibling) = entry_name.to_str() {
+            if sibling == filename {
+                continue; // Skip exact match (shouldn't exist, but be safe)
+            }
+            if normalize_ampm(sibling) == normalized {
+                return Some(entry.path());
+            }
+        }
+    }
+
+    None
 }
 
 /// Generate a live photo MOV filename using the "original" policy.
@@ -446,6 +569,109 @@ mod tests {
             generate_fingerprint_filename("a/b+c=d!e@f#g$h%i", "public.png"),
             "a_b_c_d_e_f_.PNG"
         );
+    }
+
+    #[test]
+    fn test_normalize_ampm_strips_space() {
+        assert_eq!(
+            normalize_ampm("Screenshot 2025-04-03 at 1.40.01 PM.PNG"),
+            "Screenshot 2025-04-03 at 1.40.01PM.PNG"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ampm_strips_narrow_no_break_space() {
+        assert_eq!(
+            normalize_ampm("Screenshot 2025-04-03 at 1.40.01\u{202F}PM.PNG"),
+            "Screenshot 2025-04-03 at 1.40.01PM.PNG"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ampm_no_change_without_ampm() {
+        assert_eq!(normalize_ampm("photo.jpg"), "photo.jpg");
+        assert_eq!(normalize_ampm("IMG_0001.HEIC"), "IMG_0001.HEIC");
+    }
+
+    #[test]
+    fn test_normalize_ampm_already_no_space() {
+        assert_eq!(
+            normalize_ampm("Screenshot 2025-04-03 at 1.40.01PM.PNG"),
+            "Screenshot 2025-04-03 at 1.40.01PM.PNG"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ampm_am() {
+        assert_eq!(
+            normalize_ampm("Screenshot at 10.30.00 AM.PNG"),
+            "Screenshot at 10.30.00AM.PNG"
+        );
+    }
+
+    #[test]
+    fn test_find_ampm_variant_finds_match() {
+        use std::fs;
+        let dir = std::env::temp_dir().join("claude").join("ampm_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create a file with space before PM
+        let existing = dir.join("Screenshot at 1.40.01 PM.PNG");
+        fs::write(&existing, b"test").unwrap();
+
+        // Look for the narrow-no-break-space variant
+        let query = dir.join("Screenshot at 1.40.01\u{202F}PM.PNG");
+        let found = find_ampm_variant(&query);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), existing);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_ampm_variant_returns_none_for_non_ampm() {
+        let path = Path::new("/tmp/claude/nonexistent/photo.jpg");
+        assert!(find_ampm_variant(path).is_none());
+    }
+
+    #[test]
+    fn test_sanitize_path_component_traversal() {
+        // clean_filename removes "/" so "../etc/passwd" → "..etcpasswd" → "_etcpasswd"
+        assert_eq!(sanitize_path_component("../etc/passwd"), "_etcpasswd");
+        assert_eq!(sanitize_path_component(".."), "_");
+        // "foo/../bar" → clean removes "/" → "foo..bar" → replace ".." → "foo_bar"
+        assert_eq!(sanitize_path_component("foo/../bar"), "foo_bar");
+    }
+
+    #[test]
+    fn test_sanitize_path_component_dots_and_spaces() {
+        // "...hidden..." → clean → "...hidden..." → replace ".." → "_.hidden_." → trim dots → "_.hidden_"
+        assert_eq!(sanitize_path_component("...hidden..."), "_.hidden_");
+        assert_eq!(sanitize_path_component("  spaced  "), "spaced");
+        assert_eq!(sanitize_path_component(".dotfile"), "dotfile");
+    }
+
+    #[test]
+    fn test_sanitize_path_component_reserved_names() {
+        assert_eq!(sanitize_path_component("CON"), "_CON");
+        assert_eq!(sanitize_path_component("nul"), "_nul");
+        assert_eq!(sanitize_path_component("PRN"), "_PRN");
+        assert_eq!(sanitize_path_component("COM1"), "_COM1");
+        assert_eq!(sanitize_path_component("LPT3"), "_LPT3");
+    }
+
+    #[test]
+    fn test_sanitize_path_component_normal() {
+        assert_eq!(sanitize_path_component("My Album"), "My Album");
+        assert_eq!(sanitize_path_component("Vacation 2024"), "Vacation 2024");
+    }
+
+    #[test]
+    fn test_sanitize_path_component_empty() {
+        assert_eq!(sanitize_path_component(""), "_");
+        assert_eq!(sanitize_path_component("..."), "_");
+        assert_eq!(sanitize_path_component("   "), "_");
     }
 
     #[test]

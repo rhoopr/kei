@@ -127,7 +127,16 @@ async fn attempt_download(
     // 206 = resumed successfully, 200 = server ignored Range (start over)
     let (mut hasher, mut bytes_written, truncate) = match (status, resume_offset, resume_state) {
         (206, offset, Some((h, len))) if offset > 0 => (h, len, false),
-        (_, _, _) if response.status().is_success() => (Sha256::new(), 0u64, true),
+        (_, _, _) if response.status().is_success() => {
+            if resume_offset > 0 {
+                tracing::info!(
+                    "Server returned {} instead of 206 for Range request, restarting download of {}",
+                    status,
+                    path_str,
+                );
+            }
+            (Sha256::new(), 0u64, true)
+        }
         _ => {
             return Err(DownloadError::HttpStatus {
                 status,
@@ -174,6 +183,12 @@ async fn attempt_download(
         } else if expected_hash.len() == 33 {
             actual_hash.as_slice() == &expected_hash[1..]
         } else {
+            tracing::warn!(
+                len = expected_hash.len(),
+                path = %download_path.display(),
+                "Unknown checksum format ({} bytes), skipping verification",
+                expected_hash.len()
+            );
             true
         };
 

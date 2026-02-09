@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Epoch date fallback warnings** — `asset_date()`, `added_date()`, and file mtime now log warnings when falling back to the Unix epoch or clamping negative timestamps, making silent data loss visible
+- **EXIF failure tracking** — Download summary now reports EXIF stamping failures separately (e.g., `10 downloaded (2 EXIF failures), 0 failed`) instead of only logging per-file warnings
+- **Path traversal protection** — Album names from iCloud are sanitized to prevent directory traversal (`../`), Windows reserved names (`CON`, `NUL`, etc.), and leading dot attacks
+- **Unknown checksum format warning** — Checksums with unrecognized formats (not 32 or 33 bytes) now log a warning instead of silently passing verification
+- **Resume restart logging** — When a server ignores an HTTP Range header and returns 200 instead of 206, the restart is now logged at info level
+- **Password redaction in logs** — Passwords provided via `--password` or `ICLOUD_PASSWORD` are redacted from all tracing output, replacing occurrences with `********`
+- **AM/PM filename matching** — Files with whitespace variants before AM/PM (regular space, narrow no-break space U+202F, or no space) are now recognized as the same file, preventing duplicate downloads of macOS screenshots across locale configurations
+
+---
+
 ## [0.1.0] - 2026-02-08
 
 Initial release. A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) with full photo/video download capabilities and SQLite state tracking.

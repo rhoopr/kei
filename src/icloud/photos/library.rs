@@ -132,7 +132,9 @@ impl PhotoLibrary {
                         let decoded = base64::engine::general_purpose::STANDARD
                             .decode(enc)
                             .unwrap_or_default();
-                        String::from_utf8(decoded).unwrap_or_else(|_| folder_id.clone())
+                        let raw_name =
+                            String::from_utf8(decoded).unwrap_or_else(|_| folder_id.clone());
+                        crate::download::paths::sanitize_path_component(&raw_name)
                     }
                     None => folder_id.clone(),
                 };
