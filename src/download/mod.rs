@@ -768,10 +768,11 @@ async fn stream_and_download(
     // multiple download tasks (e.g. live photo MOV companions, RAW
     // alternates). The bar may therefore overshoot pos > len slightly.
     // This matches Python icloudpd's tqdm behavior and keeps the ETA useful.
-    let mut total: u64 = 0;
+    let mut album_counts: Vec<u64> = Vec::with_capacity(albums.len());
     for album in albums {
-        total += album.len().await.unwrap_or(0);
+        album_counts.push(album.len().await.unwrap_or(0));
     }
+    let mut total: u64 = album_counts.iter().sum();
     if let Some(recent) = config.recent {
         total = total.min(recent as u64);
     }
@@ -779,9 +780,14 @@ async fn stream_and_download(
 
     // select_all interleaves across albums so no single large album
     // starves others; each stream's background task provides prefetch.
+    // When concurrency > 1 and counts are available, each album's
+    // photo_stream spawns parallel fetcher tasks for faster enumeration.
     let album_streams: Vec<_> = albums
         .iter()
-        .map(|album| album.photo_stream(config.recent))
+        .zip(&album_counts)
+        .map(|(album, &count)| {
+            album.photo_stream(config.recent, Some(count), config.concurrent_downloads)
+        })
         .collect();
 
     let mut combined = stream::select_all(album_streams);

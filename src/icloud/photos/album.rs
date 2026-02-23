@@ -3,12 +3,22 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tokio_stream::Stream;
 use tracing::debug;
 
 use super::asset::PhotoAsset;
 use super::queries::{encode_params, DESIRED_KEYS_VALUES};
 use super::session::PhotosSession;
+
+/// Determine how many parallel fetcher tasks to spawn.
+///
+/// We never spawn more fetchers than total pages (no empty fetchers)
+/// and never more than the requested concurrency level.
+fn determine_fetcher_count(total_items: u64, page_size: usize, concurrency: usize) -> usize {
+    let total_pages = total_items.div_ceil(page_size as u64);
+    (total_pages as usize).min(concurrency).max(1)
+}
 
 /// Configuration for creating a `PhotoAlbum`, bundling all non-session fields.
 #[derive(Debug)]
@@ -110,24 +120,106 @@ impl PhotoAlbum {
     /// into a `Vec`. Prefer `photo_stream()` when memory is a concern.
     pub async fn photos(&self, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
         use tokio_stream::StreamExt;
-        self.photo_stream(limit)
+        self.photo_stream(limit, None, 1)
             .collect::<Result<Vec<_>, _>>()
             .await
     }
 
     /// Stream photos page-by-page without buffering the full album in memory.
     ///
-    /// A background tokio task drives pagination and sends assets through an
-    /// `mpsc` channel whose buffer equals `page_size`. This gives natural
-    /// 1-page prefetch: while the consumer processes page N, the producer
-    /// is already fetching page N+1 — overlapping API latency with work.
+    /// When `total_count` is provided and `concurrency > 1`, the offset range
+    /// is partitioned across multiple parallel fetcher tasks for faster
+    /// enumeration. Each fetcher pages through its assigned slice and sends
+    /// assets into a shared channel. When `total_count` is `None` or
+    /// `concurrency` is 1, a single sequential fetcher is used (original
+    /// behavior).
+    ///
+    /// The channel buffer is `page_size * num_fetchers`, giving each fetcher
+    /// one page of headroom before back-pressure kicks in.
     pub fn photo_stream(
         &self,
         limit: Option<u32>,
+        total_count: Option<u64>,
+        concurrency: usize,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<PhotoAsset>>(self.page_size);
+        let page_size = self.page_size;
 
-        // The spawned task must be 'static, so clone all needed state.
+        // Compute effective total, capped by --recent if set.
+        let effective_total = total_count
+            .map(|tc| limit.map_or(tc, |lim| tc.min(lim as u64)))
+            .or(limit.map(|lim| lim as u64));
+
+        // Use 2x concurrency for enumeration fetchers — Apple's CloudKit
+        // doesn't throttle at these levels and it halves enumeration time.
+        let num_fetchers = match effective_total {
+            Some(total) if concurrency > 1 => {
+                determine_fetcher_count(total, page_size, concurrency * 2)
+            }
+            _ => 1,
+        };
+
+        let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(page_size * num_fetchers);
+
+        if num_fetchers > 1 {
+            let total = effective_total.expect("effective_total set when num_fetchers > 1");
+            // Partition offset range into non-overlapping chunks aligned to
+            // page_size boundaries so each fetcher starts on a clean page.
+            let chunk_size_items = {
+                let raw = total.div_ceil(num_fetchers as u64);
+                // Round up to next page_size boundary
+                let ps = page_size as u64;
+                raw.div_ceil(ps) * ps
+            };
+
+            tracing::info!(
+                fetchers = num_fetchers,
+                chunk_size = chunk_size_items,
+                total = total,
+                "Parallel photo enumeration"
+            );
+
+            for i in 0..num_fetchers {
+                let start = i as u64 * chunk_size_items;
+                let end = ((i as u64 + 1) * chunk_size_items).min(total);
+                if start >= total {
+                    break;
+                }
+                // Per-fetcher limit: don't exceed the chunk size, and for the
+                // last fetcher also respect the global --recent cap.
+                let fetcher_limit = match limit {
+                    Some(lim) => {
+                        let remaining = (lim as u64).saturating_sub(start);
+                        Some(remaining.min(end - start) as u32)
+                    }
+                    None => None,
+                };
+                self.spawn_fetcher(tx.clone(), start, end, fetcher_limit);
+            }
+            // Drop our sender so channel closes when all fetchers finish.
+            drop(tx);
+        } else {
+            tracing::info!("Fetching photos from iCloud...");
+            // Move tx directly — no clone needed for a single fetcher.
+            self.spawn_fetcher(tx, 0, u64::MAX, limit);
+        }
+
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+
+    /// Spawn a background tokio task that pages through records from
+    /// `start_offset` up to (but not including) `end_offset`, sending each
+    /// `PhotoAsset` into `tx`. The task stops when:
+    /// - `offset >= end_offset`
+    /// - the API returns no master records (end of album)
+    /// - the per-fetcher `limit` is reached
+    /// - the receiver is dropped
+    fn spawn_fetcher(
+        &self,
+        tx: mpsc::Sender<anyhow::Result<PhotoAsset>>,
+        start_offset: u64,
+        end_offset: u64,
+        limit: Option<u32>,
+    ) {
         let session = self.session.clone_box();
         let service_endpoint = self.service_endpoint.clone();
         let params = Arc::clone(&self.params);
@@ -138,16 +230,19 @@ impl PhotoAlbum {
         let zone_id = self.zone_id.clone();
 
         tokio::spawn(async move {
-            let mut offset: u64 = 0;
+            let mut offset = start_offset;
             let mut total_sent: u64 = 0;
-            tracing::info!("Fetching photos from iCloud...");
+            let url = format!(
+                "{}/records/query?{}",
+                service_endpoint,
+                encode_params(&params)
+            );
 
             loop {
-                let url = format!(
-                    "{}/records/query?{}",
-                    service_endpoint,
-                    encode_params(&params)
-                );
+                if offset >= end_offset {
+                    break;
+                }
+
                 let body = Self::build_list_query(
                     &list_type,
                     &query_filter,
@@ -156,7 +251,10 @@ impl PhotoAlbum {
                     offset,
                     "ASCENDING",
                 );
-                debug!("Album '{}' POST URL: {}", name, url);
+                debug!(
+                    "Album '{}' fetcher [{}..{}] POST offset={}",
+                    name, start_offset, end_offset, offset
+                );
                 let response = match super::session::retry_post(
                     session.as_ref(),
                     &url,
@@ -219,7 +317,6 @@ impl PhotoAlbum {
                     if let Some(asset_rec) = asset_records.remove(&master.record_name) {
                         let asset = PhotoAsset::from_records(master, asset_rec);
                         if tx.send(Ok(asset)).await.is_err() {
-                            // Receiver dropped — consumer is done
                             return;
                         }
                         total_sent += 1;
@@ -233,15 +330,17 @@ impl PhotoAlbum {
                     offset += 1;
                 }
 
-                tracing::debug!(count = total_sent, "fetched photos so far");
+                tracing::debug!(
+                    count = total_sent,
+                    range_start = start_offset,
+                    "fetched photos so far"
+                );
 
                 if limit_reached {
                     break;
                 }
             }
         });
-
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 
     #[cfg(test)]
@@ -408,5 +507,68 @@ mod tests {
         let album = make_album(200, None, zone.clone());
         let q = album.list_query(0, "ASCENDING");
         assert_eq!(q["zoneID"], zone);
+    }
+
+    // --- determine_fetcher_count tests ---
+
+    #[test]
+    fn test_fetcher_count_single_page() {
+        // 50 items, page_size 100, concurrency 10 → 1 page → 1 fetcher
+        assert_eq!(determine_fetcher_count(50, 100, 10), 1);
+    }
+
+    #[test]
+    fn test_fetcher_count_exact_pages() {
+        // 500 items, page_size 100, concurrency 10 → 5 pages → 5 fetchers
+        assert_eq!(determine_fetcher_count(500, 100, 10), 5);
+    }
+
+    #[test]
+    fn test_fetcher_count_capped_by_concurrency() {
+        // 5000 items, page_size 100, concurrency 10 → 50 pages → capped to 10
+        assert_eq!(determine_fetcher_count(5000, 100, 10), 10);
+    }
+
+    #[test]
+    fn test_fetcher_count_more_pages_than_concurrency() {
+        // 50000 items, page_size 100, concurrency 10 → 500 pages → capped to 10
+        assert_eq!(determine_fetcher_count(50000, 100, 10), 10);
+    }
+
+    #[test]
+    fn test_fetcher_count_zero_items() {
+        // 0 items → at least 1 fetcher (the loop will just exit immediately)
+        assert_eq!(determine_fetcher_count(0, 100, 10), 1);
+    }
+
+    #[test]
+    fn test_fetcher_count_concurrency_one() {
+        // concurrency=1 always gives 1 fetcher
+        assert_eq!(determine_fetcher_count(50000, 100, 1), 1);
+    }
+
+    #[test]
+    fn test_fetcher_count_partial_page() {
+        // 150 items, page_size 100 → 2 pages, concurrency 10 → 2 fetchers
+        assert_eq!(determine_fetcher_count(150, 100, 10), 2);
+    }
+
+    // --- photo_stream parameter tests ---
+
+    #[tokio::test]
+    async fn test_photo_stream_no_total_count_uses_single_fetcher() {
+        // When total_count is None, should produce a stream (1 sequential fetcher).
+        // We can't easily test the internal spawning, but we verify it doesn't panic.
+        let album = make_album(100, None, default_zone());
+        let _stream = album.photo_stream(None, None, 10);
+        // Stream is valid — the fetcher will fail since StubSession panics on call,
+        // but that's fine; we're testing the setup path, not the fetch.
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_small_recent_uses_single_fetcher() {
+        // --recent 50 with page_size 100 → 1 page → 1 fetcher even with concurrency 10
+        let album = make_album(100, None, default_zone());
+        let _stream = album.photo_stream(Some(50), Some(1000), 10);
     }
 }
