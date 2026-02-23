@@ -447,7 +447,7 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
             .await?;
 
     let all_album = photos_service.all();
-    let stream = all_album.photo_stream(args.recent);
+    let stream = all_album.photo_stream(args.recent, None, 1);
     tokio::pin!(stream);
 
     println!("Scanning iCloud assets and matching with local files...");
