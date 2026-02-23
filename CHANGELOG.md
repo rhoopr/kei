@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.1] - 2026-02-23
+
+### Fixed
+
+- **Parallel photo enumeration** — Library enumeration now runs across multiple parallel API fetchers (2x `--threads-num`), reducing scan time from ~10 minutes to ~30 seconds for a 16k-item library. Previously, pages were fetched sequentially at ~3-4s each ([#114])
+
+[#114]: https://github.com/rhoopr/icloudpd-rs/pull/114
+
+---
+
 ## [0.2.0] - 2026-02-09
 
 ### Added
@@ -189,7 +199,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rhoopr/icloudpd-rs/releases/tag/v0.1.0
 
