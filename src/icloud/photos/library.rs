@@ -14,6 +14,9 @@ use crate::icloud::error::ICloudError;
 const ROOT_FOLDER: &str = "----Root-Folder----";
 const PROJECT_ROOT_FOLDER: &str = "----Project-Root-Folder----";
 
+/// Default page size for CloudKit queries.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
 // CloudKit record/query types for photo enumeration.
 const QUERY_ALL_LIST: &str = "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted";
 const QUERY_ALL_OBJ: &str = "CPLAssetByAssetDateWithoutHiddenOrDeleted";
@@ -111,7 +114,7 @@ impl PhotoLibrary {
                         list_type: def.list_type.to_string(),
                         obj_type: def.obj_type.to_string(),
                         query_filter: def.query_filter,
-                        page_size: 100,
+                        page_size: DEFAULT_PAGE_SIZE,
                         zone_id: self.zone_id.clone(),
                     },
                     self.clone_session(),
@@ -166,7 +169,7 @@ impl PhotoLibrary {
                             list_type: QUERY_FOLDER_LIST.to_string(),
                             obj_type: folder_obj_type,
                             query_filter,
-                            page_size: 100,
+                            page_size: DEFAULT_PAGE_SIZE,
                             zone_id: self.zone_id.clone(),
                         },
                         self.clone_session(),
@@ -187,7 +190,7 @@ impl PhotoLibrary {
                 list_type: QUERY_ALL_LIST.to_string(),
                 obj_type: QUERY_ALL_OBJ.to_string(),
                 query_filter: None,
-                page_size: 100,
+                page_size: DEFAULT_PAGE_SIZE,
                 zone_id: self.zone_id.clone(),
             },
             self.clone_session(),
@@ -204,7 +207,7 @@ impl PhotoLibrary {
                 list_type: QUERY_DELETED_LIST.to_string(),
                 obj_type: QUERY_DELETED_OBJ.to_string(),
                 query_filter: None,
-                page_size: 100,
+                page_size: DEFAULT_PAGE_SIZE,
                 zone_id: self.zone_id.clone(),
             },
             self.clone_session(),
