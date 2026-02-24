@@ -3,10 +3,6 @@
 [![License: MIT](https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e)](LICENSE.md) [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg?logo=rust)](https://www.rust-lang.org/) ![GitHub Downloads](https://img.shields.io/github/downloads/rhoopr/icloudpd-rs/total)
 [![Version](https://img.shields.io/github/v/release/rhoopr/icloudpd-rs?color=blue)](https://github.com/rhoopr/icloudpd-rs/releases) [![Build](https://img.shields.io/github/actions/workflow/status/rhoopr/icloudpd-rs/ci.yml?label=build)](https://github.com/rhoopr/icloudpd-rs/actions) [![Homebrew](https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew)](https://github.com/rhoopr/homebrew-icloudpd-rs)
 
-A Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) for downloading your iCloud Photos library to a local directory.
-
-## About the project
-
 This is a ground-up Rust rewrite of the Python [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader). The goal was a single binary with no runtime dependencies that takes advantage of Rust's concurrency and performance to sync large iCloud Photos libraries quickly. It also adds SQLite-based state management so syncs are resumable and subsequent runs only download what's new or previously failed.
 
 > [!TIP]
