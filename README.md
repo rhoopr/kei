@@ -1,3 +1,5 @@
+> **Blog:** [I Got Suspended from GitHub for 10 Days](https://robhooper.xyz/github-suspension) — what happens when GitHub's automated systems flag your account, and why local backups matter
+
 # icloudpd-rs
 
 [![License: MIT](https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e)](LICENSE.md) [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg?logo=rust)](https://www.rust-lang.org/) ![GitHub Downloads](https://img.shields.io/github/downloads/rhoopr/icloudpd-rs/total)
@@ -156,9 +158,6 @@ cargo fmt -- --check && cargo clippy && cargo test
 
 MIT — see [LICENSE.md](LICENSE.md)
 
-## Blog
-
-- [I Got Suspended from GitHub for 10 Days](https://robhooper.xyz/github-suspension) — what happens when GitHub's automated systems flag your account, and why local backups matter
 
 ## Acknowledgments
 
