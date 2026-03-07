@@ -12,13 +12,13 @@ mod cli;
 mod config;
 mod download;
 mod icloud;
+mod notifications;
 pub mod retry;
 mod shutdown;
 mod state;
 mod systemd;
 mod types;
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -78,17 +78,28 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
 
 use cli::Command;
 use config::TomlConfig;
+use notifications::Notifier;
 use state::StateDb;
 use systemd::SystemdNotifier;
 
 /// Maximum number of re-authentication attempts before giving up.
 const MAX_REAUTH_ATTEMPTS: u32 = 3;
 
+/// Build a password provider closure that returns the given password or
+/// falls back to prompting on stdin.
+fn make_password_provider(password: Option<String>) -> impl Fn() -> Option<String> {
+    move || -> Option<String> {
+        password.clone().or_else(|| {
+            tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
+        })
+    }
+}
+
 /// Attempt to re-authenticate the session.
 ///
 /// First validates the existing session; if invalid, performs full re-authentication.
-/// In headless mode (non-interactive stdin), returns an error suggesting the user
-/// run `--auth-only` interactively since 2FA prompts won't work.
+/// If 2FA is required in headless mode, returns `AuthError::TwoFactorRequired`
+/// so the caller can fire a notification and skip the current cycle.
 async fn attempt_reauth<F>(
     shared_session: &auth::SharedSession,
     cookie_directory: &Path,
@@ -99,15 +110,6 @@ async fn attempt_reauth<F>(
 where
     F: Fn() -> Option<String>,
 {
-    // Check if headless — 2FA won't work without a TTY
-    if !std::io::stdin().is_terminal() {
-        anyhow::bail!(
-            "Session expired and re-authentication may require 2FA.\n\
-             Run `icloudpd-rs --auth-only` interactively to re-authenticate,\n\
-             then restart your sync."
-        );
-    }
-
     let mut session = shared_session.write().await;
 
     // Try validation first
@@ -127,6 +129,7 @@ where
         domain,
         None,
         None,
+        None, // no code — interactive prompt or TwoFactorRequired
     )
     .await?;
 
@@ -347,6 +350,38 @@ async fn verify_checksum(path: &Path, expected: &str) -> anyhow::Result<bool> {
     .await?
 }
 
+/// Run the submit-code command: authenticate with a pre-provided 2FA code.
+async fn run_submit_code(
+    args: cli::SubmitCodeArgs,
+    toml: &Option<TomlConfig>,
+) -> anyhow::Result<()> {
+    let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
+
+    if username.is_empty() {
+        anyhow::bail!("--username is required for submit-code");
+    }
+
+    let password_provider = make_password_provider(password);
+
+    let result = auth::authenticate(
+        &cookie_directory,
+        &username,
+        &password_provider,
+        domain.as_str(),
+        None,
+        None,
+        Some(&args.code),
+    )
+    .await?;
+
+    if result.requires_2fa {
+        println!("2FA code accepted. Session is now authenticated.");
+    } else {
+        println!("Session is already authenticated.");
+    }
+    Ok(())
+}
+
 /// Build the query parameters HashMap for the iCloud Photos CloudKit API.
 ///
 /// Must match Python's `PyiCloudService.params` for API compatibility.
@@ -407,20 +442,14 @@ async fn run_import_existing(
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
     // Authenticate
-    let password_provider = {
-        let pw = password;
-        move || -> Option<String> {
-            pw.clone().or_else(|| {
-                tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
-            })
-        }
-    };
+    let password_provider = make_password_provider(password);
 
     let auth_result = auth::authenticate(
         &cookie_directory,
         &username,
         &password_provider,
         domain.as_str(),
+        None,
         None,
         None,
     )
@@ -649,6 +678,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ResetState(args) => return run_reset_state(args, &toml_config).await,
         Command::Verify(args) => return run_verify(args, &toml_config).await,
         Command::ImportExisting(args) => return run_import_existing(args, &toml_config).await,
+        Command::SubmitCode(args) => return run_submit_code(args, &toml_config).await,
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
@@ -668,28 +698,39 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| PidFileGuard::new(p.clone()))
         .transpose()?;
 
-    let notifier = SystemdNotifier::new(config.notify_systemd);
+    let sd_notifier = SystemdNotifier::new(config.notify_systemd);
+    let notifier = Notifier::new(config.notification_script);
 
     tracing::info!(concurrency = config.threads_num, "Starting icloudpd-rs");
 
-    let password_provider = {
-        let pw = config.password;
-        move || -> Option<String> {
-            pw.clone().or_else(|| {
-                tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
-            })
-        }
-    };
+    let password_provider = make_password_provider(config.password);
 
-    let auth_result = auth::authenticate(
+    let auth_result = match auth::authenticate(
         &config.cookie_directory,
         &config.username,
         &password_provider,
         config.domain.as_str(),
         None,
         None,
+        None,
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(e)
+            if e.downcast_ref::<auth::error::AuthError>()
+                .is_some_and(|ae| ae.is_two_factor_required()) =>
+        {
+            let msg = format!(
+                "2FA required for {}. Run: icloudpd-rs submit-code <CODE> --username {}",
+                config.username, config.username
+            );
+            tracing::warn!("{}", msg);
+            notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
+            anyhow::bail!("{}", msg);
+        }
+        Err(e) => return Err(e),
+    };
 
     if config.auth_only {
         tracing::info!("Authentication completed successfully");
@@ -822,7 +863,7 @@ async fn main() -> anyhow::Result<()> {
         state_db,
     });
 
-    let shutdown_token = shutdown::install_signal_handler(&notifier)?;
+    let shutdown_token = shutdown::install_signal_handler(&sd_notifier)?;
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
@@ -831,7 +872,7 @@ async fn main() -> anyhow::Result<()> {
     // In watch mode, albums are re-resolved each iteration so new iCloud
     // albums are discovered automatically.
     let mut albums = resolve_albums(library, &config.albums).await?;
-    notifier.notify_ready();
+    sd_notifier.notify_ready();
 
     loop {
         if shutdown_token.is_cancelled() {
@@ -839,8 +880,8 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
 
-        notifier.notify_status("Syncing...");
-        notifier.notify_watchdog();
+        sd_notifier.notify_status("Syncing...");
+        sd_notifier.notify_watchdog();
 
         let download_client = shared_session.read().await.download_client();
         let outcome = download::download_photos(
@@ -854,6 +895,11 @@ async fn main() -> anyhow::Result<()> {
         match outcome {
             download::DownloadOutcome::Success => {
                 reauth_attempts = 0;
+                notifier.notify(
+                    notifications::Event::SyncComplete,
+                    "Sync completed successfully",
+                    &config.username,
+                );
             }
             download::DownloadOutcome::SessionExpired { auth_error_count } => {
                 reauth_attempts += 1;
@@ -870,18 +916,54 @@ async fn main() -> anyhow::Result<()> {
                     reauth_attempts,
                     MAX_REAUTH_ATTEMPTS
                 );
-                attempt_reauth(
+                match attempt_reauth(
                     &shared_session,
                     &config.cookie_directory,
                     &config.username,
                     config.domain.as_str(),
                     &password_provider,
                 )
-                .await?;
-                tracing::info!("Re-auth successful, resuming download...");
-                continue; // Restart download pass
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("Re-auth successful, resuming download...");
+                        continue; // Restart download pass
+                    }
+                    Err(e)
+                        if e.downcast_ref::<auth::error::AuthError>()
+                            .is_some_and(|ae| ae.is_two_factor_required()) =>
+                    {
+                        let msg = format!(
+                            "2FA required for {}. Run: icloudpd-rs submit-code <CODE> --username {}",
+                            config.username, config.username
+                        );
+                        tracing::warn!("{}", msg);
+                        notifier.notify(
+                            notifications::Event::TwoFaRequired,
+                            &msg,
+                            &config.username,
+                        );
+                        if !is_watch_mode {
+                            anyhow::bail!("{}", msg);
+                        }
+                        // In watch mode, skip this cycle and retry next interval
+                    }
+                    Err(e) => {
+                        notifier.notify(
+                            notifications::Event::SessionExpired,
+                            &format!("Re-authentication failed: {e}"),
+                            &config.username,
+                        );
+                        return Err(e);
+                    }
+                }
             }
             download::DownloadOutcome::PartialFailure { failed_count } => {
+                notifier.notify(
+                    notifications::Event::SyncFailed,
+                    &format!("{} downloads failed", failed_count),
+                    &config.username,
+                );
                 if is_watch_mode {
                     tracing::warn!(
                         failed_count,
@@ -898,7 +980,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Shutdown requested, exiting...");
                 break;
             }
-            notifier.notify_status(&format!("Waiting {interval} seconds..."));
+            sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!("Waiting {} seconds...", interval);
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}

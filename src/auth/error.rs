@@ -15,6 +15,9 @@ pub enum AuthError {
     #[error("Two-factor authentication failed: {0}")]
     TwoFactorFailed(String),
 
+    #[error("Two-factor authentication is required (no code provided)")]
+    TwoFactorRequired,
+
     #[error(transparent)]
     Http(#[from] reqwest::Error),
 
@@ -23,4 +26,42 @@ pub enum AuthError {
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+impl AuthError {
+    /// Check if this error indicates that 2FA is required but no code was provided.
+    pub fn is_two_factor_required(&self) -> bool {
+        matches!(self, Self::TwoFactorRequired)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_factor_required_is_detected() {
+        assert!(AuthError::TwoFactorRequired.is_two_factor_required());
+    }
+
+    #[test]
+    fn other_variants_are_not_two_factor_required() {
+        assert!(!AuthError::FailedLogin("test".into()).is_two_factor_required());
+        assert!(!AuthError::TwoFactorFailed("test".into()).is_two_factor_required());
+        assert!(!AuthError::InvalidToken("test".into()).is_two_factor_required());
+        assert!(!AuthError::ApiError {
+            code: 401,
+            message: "test".into()
+        }
+        .is_two_factor_required());
+    }
+
+    #[test]
+    fn two_factor_required_display() {
+        let err = AuthError::TwoFactorRequired;
+        assert_eq!(
+            err.to_string(),
+            "Two-factor authentication is required (no code provided)"
+        );
+    }
 }

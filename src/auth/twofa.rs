@@ -11,25 +11,17 @@ use crate::auth::responses::AccountLoginResponse;
 
 const TWO_FA_CODE_LENGTH: usize = 6;
 
-/// Prompt the user for a 6-digit 2FA code from a trusted device, then verify it.
+/// Submit a 6-digit 2FA code to Apple's verification endpoint.
 ///
-/// Sends the code to Apple's `/verify/trusteddevice/securitycode` endpoint.
-/// Returns `true` if verification succeeded.
-pub async fn request_2fa_code(
+/// Sends the code to `/verify/trusteddevice/securitycode`.
+/// Returns `true` if verification succeeded, `false` if the code was wrong.
+pub async fn submit_2fa_code(
     session: &mut Session,
     endpoints: &Endpoints,
     client_id: &str,
     domain: &str,
+    code: &str,
 ) -> Result<bool> {
-    let code = tokio::task::spawn_blocking(|| {
-        print!("Please enter the 2FA code from your trusted device: ");
-        io::stdout().flush()?;
-        let mut code = String::new();
-        io::stdin().read_line(&mut code)?;
-        Ok::<String, io::Error>(code.trim().to_string())
-    })
-    .await??;
-
     if code.len() != TWO_FA_CODE_LENGTH || !code.chars().all(|c| c.is_ascii_digit()) {
         tracing::error!(
             "Invalid 2FA code: must be exactly {} digits",
@@ -75,6 +67,28 @@ pub async fn request_2fa_code(
 
     tracing::debug!("Code verification successful");
     Ok(true)
+}
+
+/// Prompt the user for a 6-digit 2FA code from a trusted device, then verify it.
+///
+/// Interactive wrapper around [`submit_2fa_code`] that reads from stdin.
+/// Returns `true` if verification succeeded.
+pub async fn request_2fa_code(
+    session: &mut Session,
+    endpoints: &Endpoints,
+    client_id: &str,
+    domain: &str,
+) -> Result<bool> {
+    let code = tokio::task::spawn_blocking(|| {
+        print!("Please enter the 2FA code from your trusted device: ");
+        io::stdout().flush()?;
+        let mut code = String::new();
+        io::stdin().read_line(&mut code)?;
+        Ok::<String, io::Error>(code.trim().to_string())
+    })
+    .await??;
+
+    submit_2fa_code(session, endpoints, client_id, domain, &code).await
 }
 
 /// Trust the current session so the user is not prompted for 2FA again.
@@ -172,4 +186,52 @@ pub async fn authenticate_with_token(
     }
 
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::Session;
+    use std::path::PathBuf;
+
+    async fn test_session(name: &str) -> Session {
+        let dir = PathBuf::from("/tmp/claude/twofa_tests").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Session::new(&dir, "test@example.com", "https://example.com", None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_too_short() {
+        let mut session = test_session("short").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "123").await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_too_long() {
+        let mut session = test_session("long").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "1234567").await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_non_digits() {
+        let mut session = test_session("nondigit").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "12345a").await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_empty() {
+        let mut session = test_session("empty").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "").await;
+        assert!(!result.unwrap());
+    }
 }
