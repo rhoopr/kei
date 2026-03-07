@@ -15,6 +15,9 @@ pub enum AuthError {
     #[error("Two-factor authentication failed: {0}")]
     TwoFactorFailed(String),
 
+    #[error("Two-factor authentication is required (no code provided)")]
+    TwoFactorRequired,
+
     #[error(transparent)]
     Http(#[from] reqwest::Error),
 
@@ -23,4 +26,11 @@ pub enum AuthError {
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+impl AuthError {
+    /// Check if this error indicates that 2FA is required but no code was provided.
+    pub fn is_two_factor_required(&self) -> bool {
+        matches!(self, Self::TwoFactorRequired)
+    }
 }

@@ -11,25 +11,17 @@ use crate::auth::responses::AccountLoginResponse;
 
 const TWO_FA_CODE_LENGTH: usize = 6;
 
-/// Prompt the user for a 6-digit 2FA code from a trusted device, then verify it.
+/// Submit a 6-digit 2FA code to Apple's verification endpoint.
 ///
-/// Sends the code to Apple's `/verify/trusteddevice/securitycode` endpoint.
-/// Returns `true` if verification succeeded.
-pub async fn request_2fa_code(
+/// Sends the code to `/verify/trusteddevice/securitycode`.
+/// Returns `true` if verification succeeded, `false` if the code was wrong.
+pub async fn submit_2fa_code(
     session: &mut Session,
     endpoints: &Endpoints,
     client_id: &str,
     domain: &str,
+    code: &str,
 ) -> Result<bool> {
-    let code = tokio::task::spawn_blocking(|| {
-        print!("Please enter the 2FA code from your trusted device: ");
-        io::stdout().flush()?;
-        let mut code = String::new();
-        io::stdin().read_line(&mut code)?;
-        Ok::<String, io::Error>(code.trim().to_string())
-    })
-    .await??;
-
     if code.len() != TWO_FA_CODE_LENGTH || !code.chars().all(|c| c.is_ascii_digit()) {
         tracing::error!(
             "Invalid 2FA code: must be exactly {} digits",
@@ -75,6 +67,28 @@ pub async fn request_2fa_code(
 
     tracing::debug!("Code verification successful");
     Ok(true)
+}
+
+/// Prompt the user for a 6-digit 2FA code from a trusted device, then verify it.
+///
+/// Interactive wrapper around [`submit_2fa_code`] that reads from stdin.
+/// Returns `true` if verification succeeded.
+pub async fn request_2fa_code(
+    session: &mut Session,
+    endpoints: &Endpoints,
+    client_id: &str,
+    domain: &str,
+) -> Result<bool> {
+    let code = tokio::task::spawn_blocking(|| {
+        print!("Please enter the 2FA code from your trusted device: ");
+        io::stdout().flush()?;
+        let mut code = String::new();
+        io::stdin().read_line(&mut code)?;
+        Ok::<String, io::Error>(code.trim().to_string())
+    })
+    .await??;
+
+    submit_2fa_code(session, endpoints, client_id, domain, &code).await
 }
 
 /// Trust the current session so the user is not prompted for 2FA again.

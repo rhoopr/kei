@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug, Clone)]
 pub struct AuthArgs {
     /// Apple ID email address
-    #[arg(short = 'u', long)]
+    #[arg(short = 'u', long, env = "ICLOUD_USERNAME")]
     pub username: Option<String>,
 
     /// iCloud password (if not provided, will prompt).
@@ -156,6 +156,11 @@ pub struct SyncArgs {
     /// Write PID to file (for service managers).
     #[arg(long)]
     pub pid_file: Option<std::path::PathBuf>,
+
+    /// Script to run on events (2FA required, sync complete, etc.).
+    /// Called with ICLOUDPD_EVENT, ICLOUDPD_MESSAGE, ICLOUDPD_USERNAME env vars.
+    #[arg(long)]
+    pub notification_script: Option<String>,
 }
 
 /// Arguments for the status command.
@@ -220,6 +225,16 @@ pub struct VerifyArgs {
     pub checksums: bool,
 }
 
+/// Arguments for the submit-code command.
+#[derive(Parser, Debug, Clone)]
+pub struct SubmitCodeArgs {
+    #[command(flatten)]
+    pub auth: AuthArgs,
+
+    /// 6-digit 2FA code from your trusted device
+    pub code: String,
+}
+
 /// Subcommands for icloudpd-rs.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
@@ -246,6 +261,9 @@ pub enum Command {
 
     /// Verify downloaded files exist and optionally check checksums
     Verify(VerifyArgs),
+
+    /// Submit a 2FA code non-interactively (for Docker / headless use)
+    SubmitCode(SubmitCodeArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -614,5 +632,533 @@ mod tests {
         args.extend(["--log-level", "debug"]);
         let cli = parse(&args);
         assert_eq!(cli.log_level, Some(LogLevel::Debug));
+    }
+
+    // ── Username is optional at clap level ─────────────────────────
+
+    #[test]
+    fn test_bare_invocation_without_username() {
+        let cli = Cli::try_parse_from(["icloudpd-rs"]).unwrap();
+        assert!(cli.auth.username.is_none());
+        assert!(cli.command.is_none());
+    }
+
+    // ── Auth flags ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_password_flag() {
+        let mut args = base_args();
+        args.extend(["--password", "secret123"]);
+        let cli = parse(&args);
+        assert_eq!(cli.auth.password.as_deref(), Some("secret123"));
+    }
+
+    #[test]
+    fn test_password_none_by_default() {
+        let cli = parse(&base_args());
+        assert!(cli.auth.password.is_none());
+    }
+
+    #[test]
+    fn test_cookie_directory_custom() {
+        let mut args = base_args();
+        args.extend(["--cookie-directory", "/tmp/claude/cookies"]);
+        let cli = parse(&args);
+        assert_eq!(
+            cli.auth.cookie_directory.as_deref(),
+            Some("/tmp/claude/cookies")
+        );
+    }
+
+    #[test]
+    fn test_domain_accepts_com() {
+        let mut args = base_args();
+        args.extend(["--domain", "com"]);
+        let cli = parse(&args);
+        assert_eq!(cli.auth.domain, Some(Domain::Com));
+    }
+
+    #[test]
+    fn test_domain_rejects_invalid() {
+        let mut args = base_args();
+        args.extend(["--domain", "uk"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    // ── Boolean flags ──────────────────────────────────────────────
+
+    #[test]
+    fn test_auth_only_flag() {
+        let mut args = base_args();
+        args.push("--auth-only");
+        let cli = parse(&args);
+        assert!(cli.sync.auth_only);
+    }
+
+    #[test]
+    fn test_auth_only_default_false() {
+        let cli = parse(&base_args());
+        assert!(!cli.sync.auth_only);
+    }
+
+    #[test]
+    fn test_list_albums_flag() {
+        let mut args = base_args();
+        args.push("--list-albums");
+        let cli = parse(&args);
+        assert!(cli.sync.list_albums);
+    }
+
+    #[test]
+    fn test_list_libraries_flag() {
+        let mut args = base_args();
+        args.push("--list-libraries");
+        let cli = parse(&args);
+        assert!(cli.sync.list_libraries);
+    }
+
+    #[test]
+    fn test_skip_videos_flag() {
+        let mut args = base_args();
+        args.push("--skip-videos");
+        let cli = parse(&args);
+        assert!(cli.sync.skip_videos);
+    }
+
+    #[test]
+    fn test_skip_photos_flag() {
+        let mut args = base_args();
+        args.push("--skip-photos");
+        let cli = parse(&args);
+        assert!(cli.sync.skip_photos);
+    }
+
+    #[test]
+    fn test_skip_live_photos_flag() {
+        let mut args = base_args();
+        args.push("--skip-live-photos");
+        let cli = parse(&args);
+        assert!(cli.sync.skip_live_photos);
+    }
+
+    #[test]
+    fn test_force_size_flag() {
+        let mut args = base_args();
+        args.push("--force-size");
+        let cli = parse(&args);
+        assert!(cli.sync.force_size);
+    }
+
+    #[test]
+    fn test_set_exif_datetime_flag() {
+        let mut args = base_args();
+        args.push("--set-exif-datetime");
+        let cli = parse(&args);
+        assert!(cli.sync.set_exif_datetime);
+    }
+
+    #[test]
+    fn test_no_progress_bar_flag() {
+        let mut args = base_args();
+        args.push("--no-progress-bar");
+        let cli = parse(&args);
+        assert!(cli.sync.no_progress_bar);
+    }
+
+    #[test]
+    fn test_keep_unicode_in_filenames_flag() {
+        let mut args = base_args();
+        args.push("--keep-unicode-in-filenames");
+        let cli = parse(&args);
+        assert!(cli.sync.keep_unicode_in_filenames);
+    }
+
+    // ── Enum variants ──────────────────────────────────────────────
+
+    #[test]
+    fn test_size_all_variants() {
+        for (input, expected) in [
+            ("original", VersionSize::Original),
+            ("medium", VersionSize::Medium),
+            ("thumb", VersionSize::Thumb),
+            ("adjusted", VersionSize::Adjusted),
+            ("alternative", VersionSize::Alternative),
+        ] {
+            let mut args = base_args();
+            args.extend(["--size", input]);
+            let cli = parse(&args);
+            assert_eq!(cli.sync.size, Some(expected), "size variant: {input}");
+        }
+    }
+
+    #[test]
+    fn test_live_photo_size_all_variants() {
+        for (input, expected) in [
+            ("original", LivePhotoSize::Original),
+            ("medium", LivePhotoSize::Medium),
+            ("thumb", LivePhotoSize::Thumb),
+        ] {
+            let mut args = base_args();
+            args.extend(["--live-photo-size", input]);
+            let cli = parse(&args);
+            assert_eq!(
+                cli.sync.live_photo_size,
+                Some(expected),
+                "live_photo_size variant: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_live_photo_mov_filename_policy_all_variants() {
+        for (input, expected) in [
+            ("suffix", LivePhotoMovFilenamePolicy::Suffix),
+            ("original", LivePhotoMovFilenamePolicy::Original),
+        ] {
+            let mut args = base_args();
+            args.extend(["--live-photo-mov-filename-policy", input]);
+            let cli = parse(&args);
+            assert_eq!(
+                cli.sync.live_photo_mov_filename_policy,
+                Some(expected),
+                "mov policy variant: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_align_raw_accepts_as_is() {
+        let mut args = base_args();
+        args.extend(["--align-raw", "as-is"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.align_raw, Some(RawTreatmentPolicy::Unchanged));
+    }
+
+    #[test]
+    fn test_file_match_policy_all_variants() {
+        for (input, expected) in [
+            (
+                "name-size-dedup-with-suffix",
+                FileMatchPolicy::NameSizeDedupWithSuffix,
+            ),
+            ("name-id7", FileMatchPolicy::NameId7),
+        ] {
+            let mut args = base_args();
+            args.extend(["--file-match-policy", input]);
+            let cli = parse(&args);
+            assert_eq!(
+                cli.sync.file_match_policy,
+                Some(expected),
+                "file_match_policy variant: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_level_all_variants() {
+        for (input, expected) in [
+            ("debug", LogLevel::Debug),
+            ("info", LogLevel::Info),
+            ("warn", LogLevel::Warn),
+            ("error", LogLevel::Error),
+        ] {
+            let mut args = base_args();
+            args.extend(["--log-level", input]);
+            let cli = parse(&args);
+            assert_eq!(cli.log_level, Some(expected), "log_level variant: {input}");
+        }
+    }
+
+    // ── Optional value flags ───────────────────────────────────────
+
+    #[test]
+    fn test_folder_structure_custom() {
+        let mut args = base_args();
+        args.extend(["--folder-structure", "%Y-%m"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.folder_structure.as_deref(), Some("%Y-%m"));
+    }
+
+    #[test]
+    fn test_folder_structure_none_by_default() {
+        let cli = parse(&base_args());
+        assert!(cli.sync.folder_structure.is_none());
+    }
+
+    #[test]
+    fn test_directory_custom() {
+        let mut args = base_args();
+        args.extend(["--directory", "/photos"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.directory.as_deref(), Some("/photos"));
+    }
+
+    #[test]
+    fn test_directory_none_by_default() {
+        let cli = parse(&base_args());
+        assert!(cli.sync.directory.is_none());
+    }
+
+    #[test]
+    fn test_watch_with_interval() {
+        let mut args = base_args();
+        args.extend(["--watch-with-interval", "3600"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.watch_with_interval, Some(3600));
+    }
+
+    #[test]
+    fn test_skip_created_before() {
+        let mut args = base_args();
+        args.extend(["--skip-created-before", "2024-01-01"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.skip_created_before.as_deref(), Some("2024-01-01"));
+    }
+
+    #[test]
+    fn test_skip_created_after() {
+        let mut args = base_args();
+        args.extend(["--skip-created-after", "2025-06-01"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.skip_created_after.as_deref(), Some("2025-06-01"));
+    }
+
+    #[test]
+    fn test_albums_multiple() {
+        let mut args = base_args();
+        args.extend(["--album", "Favorites", "--album", "Vacation"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.albums, vec!["Favorites", "Vacation"]);
+    }
+
+    #[test]
+    fn test_albums_empty_by_default() {
+        let cli = parse(&base_args());
+        assert!(cli.sync.albums.is_empty());
+    }
+
+    // ── Subcommands without username ───────────────────────────────
+
+    #[test]
+    fn test_verify_subcommand_without_username() {
+        let cli = Cli::try_parse_from(["icloudpd-rs", "verify"]).unwrap();
+        if let Some(Command::Verify(args)) = cli.command {
+            assert!(args.auth.username.is_none());
+            assert!(!args.checksums);
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_verify_subcommand_with_checksums() {
+        let cli = Cli::try_parse_from([
+            "icloudpd-rs",
+            "verify",
+            "--username",
+            "test@example.com",
+            "--checksums",
+        ])
+        .unwrap();
+        if let Some(Command::Verify(args)) = cli.command {
+            assert!(args.checksums);
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_reset_state_subcommand_without_username() {
+        let cli = Cli::try_parse_from(["icloudpd-rs", "reset-state"]).unwrap();
+        if let Some(Command::ResetState(args)) = cli.command {
+            assert!(args.auth.username.is_none());
+            assert!(!args.yes);
+        } else {
+            panic!("Expected ResetState command");
+        }
+    }
+
+    #[test]
+    fn test_import_existing_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icloudpd-rs",
+            "import-existing",
+            "--username",
+            "test@example.com",
+            "--directory",
+            "/photos",
+        ])
+        .unwrap();
+        if let Some(Command::ImportExisting(args)) = cli.command {
+            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
+            assert_eq!(args.directory, "/photos");
+            assert_eq!(args.folder_structure, "%Y/%m/%d");
+            assert!(args.recent.is_none());
+        } else {
+            panic!("Expected ImportExisting command");
+        }
+    }
+
+    #[test]
+    fn test_import_existing_without_username() {
+        let cli = Cli::try_parse_from(["icloudpd-rs", "import-existing", "--directory", "/photos"])
+            .unwrap();
+        if let Some(Command::ImportExisting(args)) = cli.command {
+            assert!(args.auth.username.is_none());
+        } else {
+            panic!("Expected ImportExisting command");
+        }
+    }
+
+    #[test]
+    fn test_retry_failed_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icloudpd-rs",
+            "retry-failed",
+            "--username",
+            "test@example.com",
+            "--directory",
+            "/photos",
+        ])
+        .unwrap();
+        if let Some(Command::RetryFailed(args)) = cli.command {
+            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
+            assert_eq!(args.sync.directory.as_deref(), Some("/photos"));
+        } else {
+            panic!("Expected RetryFailed command");
+        }
+    }
+
+    #[test]
+    fn test_retry_failed_without_username() {
+        let cli = Cli::try_parse_from(["icloudpd-rs", "retry-failed"]).unwrap();
+        if let Some(Command::RetryFailed(args)) = cli.command {
+            assert!(args.auth.username.is_none());
+        } else {
+            panic!("Expected RetryFailed command");
+        }
+    }
+
+    // ── --config global flag works with all subcommands ────────────
+
+    #[test]
+    fn test_config_global_with_sync_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icloudpd-rs",
+            "sync",
+            "--config",
+            "/custom/config.toml",
+            "--username",
+            "test@example.com",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, "/custom/config.toml");
+    }
+
+    #[test]
+    fn test_config_global_with_status_subcommand() {
+        let cli = Cli::try_parse_from(["icloudpd-rs", "status", "--config", "/custom/config.toml"])
+            .unwrap();
+        assert_eq!(cli.config, "/custom/config.toml");
+    }
+
+    #[test]
+    fn test_config_global_with_verify_subcommand() {
+        let cli = Cli::try_parse_from(["icloudpd-rs", "verify", "--config", "/custom/config.toml"])
+            .unwrap();
+        assert_eq!(cli.config, "/custom/config.toml");
+    }
+
+    #[test]
+    fn test_config_global_with_reset_state_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icloudpd-rs",
+            "reset-state",
+            "--config",
+            "/custom/config.toml",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, "/custom/config.toml");
+    }
+
+    #[test]
+    fn test_config_global_before_subcommand() {
+        let cli = Cli::try_parse_from(["icloudpd-rs", "--config", "/custom/config.toml", "status"])
+            .unwrap();
+        assert_eq!(cli.config, "/custom/config.toml");
+        assert!(matches!(cli.command, Some(Command::Status(_))));
+    }
+
+    // ── submit-code subcommand ────────────────────────────────────
+
+    #[test]
+    fn test_submit_code_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icloudpd-rs",
+            "submit-code",
+            "--username",
+            "test@example.com",
+            "123456",
+        ])
+        .unwrap();
+        if let Some(Command::SubmitCode(args)) = cli.command {
+            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
+            assert_eq!(args.code, "123456");
+        } else {
+            panic!("Expected SubmitCode command");
+        }
+    }
+
+    #[test]
+    fn test_submit_code_without_username() {
+        let cli = Cli::try_parse_from(["icloudpd-rs", "submit-code", "123456"]).unwrap();
+        if let Some(Command::SubmitCode(args)) = cli.command {
+            assert!(args.auth.username.is_none());
+            assert_eq!(args.code, "123456");
+        } else {
+            panic!("Expected SubmitCode command");
+        }
+    }
+
+    #[test]
+    fn test_submit_code_requires_code_arg() {
+        assert!(Cli::try_parse_from(["icloudpd-rs", "submit-code"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_with_config() {
+        let cli = Cli::try_parse_from([
+            "icloudpd-rs",
+            "submit-code",
+            "--config",
+            "/custom/config.toml",
+            "654321",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, "/custom/config.toml");
+        if let Some(Command::SubmitCode(args)) = cli.command {
+            assert_eq!(args.code, "654321");
+        } else {
+            panic!("Expected SubmitCode command");
+        }
+    }
+
+    // ── notification-script flag ──────────────────────────────────
+
+    #[test]
+    fn test_notification_script_none_by_default() {
+        let cli = parse(&base_args());
+        assert!(cli.sync.notification_script.is_none());
+    }
+
+    #[test]
+    fn test_notification_script_flag() {
+        let mut args = base_args();
+        args.extend(["--notification-script", "/path/to/notify.sh"]);
+        let cli = parse(&args);
+        assert_eq!(
+            cli.sync.notification_script.as_deref(),
+            Some("/path/to/notify.sh")
+        );
     }
 }

@@ -10,6 +10,7 @@ pub mod session;
 pub mod srp;
 pub mod twofa;
 
+use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::Result;
@@ -41,8 +42,13 @@ impl std::fmt::Debug for AuthResult {
 /// 1. Tries to validate the existing session token.
 /// 2. If invalid, obtains a password and performs SRP authentication.
 /// 3. Authenticates with the resulting token.
-/// 4. Checks if 2FA is required; if so, prompts the user.
+/// 4. Checks if 2FA is required; if `code` is `Some`, submits it directly,
+///    otherwise prompts the user interactively.
 /// 5. Returns the authenticated session and account data.
+///
+/// When `code` is `None` and 2FA is required but stdin is not a TTY,
+/// returns `AuthError::TwoFactorRequired` so the caller can handle it
+/// (e.g., fire a notification script and wait).
 pub async fn authenticate(
     cookie_dir: &Path,
     apple_id: &str,
@@ -50,6 +56,7 @@ pub async fn authenticate(
     domain: &str,
     client_id: Option<String>,
     timeout_secs: Option<u64>,
+    code: Option<&str>,
 ) -> Result<AuthResult> {
     let endpoints = Endpoints::for_domain(domain)?;
 
@@ -106,8 +113,17 @@ pub async fn authenticate(
     if requires_2fa {
         tracing::info!("Two-factor authentication is required");
 
-        let verified =
-            twofa::request_2fa_code(&mut session, &endpoints, &client_id, domain).await?;
+        let verified = if let Some(c) = code {
+            // Headless: code provided directly (e.g. submit-code subcommand)
+            twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, c).await?
+        } else if std::io::stdin().is_terminal() {
+            // Interactive: prompt on stdin
+            twofa::request_2fa_code(&mut session, &endpoints, &client_id, domain).await?
+        } else {
+            // Headless with no code: signal the caller
+            return Err(AuthError::TwoFactorRequired.into());
+        };
+
         if !verified {
             return Err(AuthError::TwoFactorFailed("2FA verification failed".into()).into());
         }
