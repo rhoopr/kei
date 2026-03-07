@@ -18,16 +18,16 @@ pub struct AuthArgs {
     pub password: Option<String>,
 
     /// iCloud domain (com or cn)
-    #[arg(long, value_enum, default_value = "com")]
-    pub domain: Domain,
+    #[arg(long, value_enum)]
+    pub domain: Option<Domain>,
 
     /// Directory for cookies/session data
-    #[arg(long, default_value = "~/.icloudpd-rs")]
-    pub cookie_directory: String,
+    #[arg(long)]
+    pub cookie_directory: Option<String>,
 }
 
 /// Top-level auth args (used for backwards compatibility when no subcommand).
-/// Username is validated later in Config::from_cli when needed.
+/// Username is validated later in Config::build when needed.
 #[derive(Parser, Debug, Clone)]
 pub struct TopLevelAuthArgs {
     /// Apple ID email address
@@ -41,16 +41,16 @@ pub struct TopLevelAuthArgs {
     pub password: Option<String>,
 
     /// iCloud domain (com or cn)
-    #[arg(long, value_enum, default_value = "com")]
-    pub domain: Domain,
+    #[arg(long, value_enum)]
+    pub domain: Option<Domain>,
 
     /// Directory for cookies/session data
-    #[arg(long, default_value = "~/.icloudpd-rs")]
-    pub cookie_directory: String,
+    #[arg(long)]
+    pub cookie_directory: Option<String>,
 }
 
 /// Arguments for the sync command (also used as default when no subcommand).
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
     /// Local directory for downloads
     #[arg(short = 'd', long)]
@@ -73,24 +73,24 @@ pub struct SyncArgs {
     pub albums: Vec<String>,
 
     /// Library to download (default: PrimarySync)
-    #[arg(long, default_value = "PrimarySync")]
-    pub library: String,
+    #[arg(long)]
+    pub library: Option<String>,
 
     /// Image size to download
-    #[arg(long, value_enum, default_value = "original")]
-    pub size: VersionSize,
+    #[arg(long, value_enum)]
+    pub size: Option<VersionSize>,
 
     /// Live photo video size
-    #[arg(long, value_enum, default_value = "original")]
-    pub live_photo_size: LivePhotoSize,
+    #[arg(long, value_enum)]
+    pub live_photo_size: Option<LivePhotoSize>,
 
     /// Number of recent photos to download
     #[arg(long)]
     pub recent: Option<u32>,
 
     /// Number of concurrent download threads (default: 10)
-    #[arg(long = "threads-num", default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..))]
-    pub threads_num: u16,
+    #[arg(long = "threads-num", value_parser = clap::value_parser!(u16).range(1..))]
+    pub threads_num: Option<u16>,
 
     /// Don't download videos
     #[arg(long)]
@@ -109,8 +109,8 @@ pub struct SyncArgs {
     pub force_size: bool,
 
     /// Folder structure for organizing downloads
-    #[arg(long, default_value = "%Y/%m/%d")]
-    pub folder_structure: String,
+    #[arg(long)]
+    pub folder_structure: Option<String>,
 
     /// Write DateTimeOriginal EXIF tag if missing
     #[arg(long)]
@@ -133,16 +133,16 @@ pub struct SyncArgs {
     pub keep_unicode_in_filenames: bool,
 
     /// Live photo MOV filename policy
-    #[arg(long, value_enum, default_value = "suffix")]
-    pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
+    #[arg(long, value_enum)]
+    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
     /// RAW treatment policy
-    #[arg(long, value_enum, default_value = "as-is")]
-    pub align_raw: RawTreatmentPolicy,
+    #[arg(long, value_enum)]
+    pub align_raw: Option<RawTreatmentPolicy>,
 
     /// File matching and dedup policy
-    #[arg(long, value_enum, default_value = "name-size-dedup-with-suffix")]
-    pub file_match_policy: FileMatchPolicy,
+    #[arg(long, value_enum)]
+    pub file_match_policy: Option<FileMatchPolicy>,
 
     /// Skip assets created before this ISO date or interval (e.g., 2025-01-02 or 20d)
     #[arg(long)]
@@ -158,17 +158,17 @@ pub struct SyncArgs {
     pub only_print_filenames: bool,
 
     /// Max retries per download (default: 3, 0 = no retries)
-    #[arg(long, default_value_t = 3)]
-    pub max_retries: u32,
+    #[arg(long)]
+    pub max_retries: Option<u32>,
 
     /// Initial retry delay in seconds (default: 5)
-    #[arg(long, default_value_t = 5)]
-    pub retry_delay: u64,
+    #[arg(long)]
+    pub retry_delay: Option<u64>,
 
     /// Temp file suffix for partial downloads (default: .icloudpd-tmp).
     /// Change if the default conflicts with your filesystem (e.g. Nextcloud rejects .part).
-    #[arg(long, default_value = ".icloudpd-tmp")]
-    pub temp_suffix: String,
+    #[arg(long)]
+    pub temp_suffix: Option<String>,
 
     /// Send systemd sd_notify messages (READY, STOPPING, STATUS).
     /// Only effective on Linux with a systemd service unit.
@@ -274,8 +274,12 @@ pub enum Command {
 #[command(name = "icloudpd-rs", about = "Download iCloud photos and videos")]
 pub struct Cli {
     /// Log level
-    #[arg(long, value_enum, default_value = "info", global = true)]
-    pub log_level: LogLevel,
+    #[arg(long, value_enum, global = true)]
+    pub log_level: Option<LogLevel>,
+
+    /// Path to TOML config file
+    #[arg(long, default_value = "~/.config/icloudpd-rs/config.toml")]
+    pub config: String,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -295,7 +299,7 @@ impl Cli {
         match &self.command {
             Some(cmd) => cmd.clone(),
             None => {
-                // Convert top-level args to AuthArgs (username is required at this point)
+                // Convert top-level args to AuthArgs
                 let auth = AuthArgs {
                     username: self.auth.username.clone().unwrap_or_default(),
                     password: self.auth.password.clone(),
@@ -307,252 +311,6 @@ impl Cli {
                     sync: self.sync.clone(),
                 }
             }
-        }
-    }
-}
-
-// Legacy Cli struct for backwards compatibility with existing code.
-// TODO: Remove once main.rs is fully migrated to new command structure.
-#[derive(Debug)]
-pub struct LegacyCli {
-    pub username: String,
-    pub password: Option<String>,
-    pub directory: Option<String>,
-    pub auth_only: bool,
-    pub list_albums: bool,
-    pub list_libraries: bool,
-    pub albums: Vec<String>,
-    pub library: String,
-    pub size: VersionSize,
-    pub live_photo_size: LivePhotoSize,
-    pub recent: Option<u32>,
-    pub threads_num: u16,
-    pub skip_videos: bool,
-    pub skip_photos: bool,
-    pub skip_live_photos: bool,
-    pub force_size: bool,
-    pub folder_structure: String,
-    pub set_exif_datetime: bool,
-    pub dry_run: bool,
-    pub domain: Domain,
-    pub watch_with_interval: Option<u64>,
-    pub log_level: LogLevel,
-    pub no_progress_bar: bool,
-    pub cookie_directory: String,
-    pub keep_unicode_in_filenames: bool,
-    pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
-    pub align_raw: RawTreatmentPolicy,
-    pub file_match_policy: FileMatchPolicy,
-    pub skip_created_before: Option<String>,
-    pub skip_created_after: Option<String>,
-    pub only_print_filenames: bool,
-    pub max_retries: u32,
-    pub retry_delay: u64,
-    pub temp_suffix: String,
-    pub notify_systemd: bool,
-    pub pid_file: Option<std::path::PathBuf>,
-}
-
-impl From<Cli> for LegacyCli {
-    fn from(cli: Cli) -> Self {
-        match cli.effective_command() {
-            Command::Sync { auth, sync } | Command::RetryFailed(RetryFailedArgs { auth, sync }) => {
-                Self {
-                    username: auth.username,
-                    password: auth.password,
-                    directory: sync.directory,
-                    auth_only: sync.auth_only,
-                    list_albums: sync.list_albums,
-                    list_libraries: sync.list_libraries,
-                    albums: sync.albums,
-                    library: sync.library,
-                    size: sync.size,
-                    live_photo_size: sync.live_photo_size,
-                    recent: sync.recent,
-                    threads_num: sync.threads_num,
-                    skip_videos: sync.skip_videos,
-                    skip_photos: sync.skip_photos,
-                    skip_live_photos: sync.skip_live_photos,
-                    force_size: sync.force_size,
-                    folder_structure: sync.folder_structure,
-                    set_exif_datetime: sync.set_exif_datetime,
-                    dry_run: sync.dry_run,
-                    domain: auth.domain,
-                    watch_with_interval: sync.watch_with_interval,
-                    log_level: cli.log_level,
-                    no_progress_bar: sync.no_progress_bar,
-                    cookie_directory: auth.cookie_directory,
-                    keep_unicode_in_filenames: sync.keep_unicode_in_filenames,
-                    live_photo_mov_filename_policy: sync.live_photo_mov_filename_policy,
-                    align_raw: sync.align_raw,
-                    file_match_policy: sync.file_match_policy,
-                    skip_created_before: sync.skip_created_before,
-                    skip_created_after: sync.skip_created_after,
-                    only_print_filenames: sync.only_print_filenames,
-                    max_retries: sync.max_retries,
-                    retry_delay: sync.retry_delay,
-                    temp_suffix: sync.temp_suffix,
-                    notify_systemd: sync.notify_systemd,
-                    pid_file: sync.pid_file,
-                }
-            }
-            // For other commands, provide defaults (they won't use these fields)
-            Command::Status(args) => Self {
-                username: args.auth.username,
-                password: args.auth.password,
-                domain: args.auth.domain,
-                cookie_directory: args.auth.cookie_directory,
-                log_level: cli.log_level,
-                // Defaults for unused fields
-                directory: None,
-                auth_only: false,
-                list_albums: false,
-                list_libraries: false,
-                albums: Vec::new(),
-                library: String::new(),
-                size: VersionSize::Original,
-                live_photo_size: LivePhotoSize::Original,
-                recent: None,
-                threads_num: 10,
-                skip_videos: false,
-                skip_photos: false,
-                skip_live_photos: false,
-                force_size: false,
-                folder_structure: String::new(),
-                set_exif_datetime: false,
-                dry_run: false,
-                watch_with_interval: None,
-                no_progress_bar: false,
-                keep_unicode_in_filenames: false,
-                live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-                align_raw: RawTreatmentPolicy::Unchanged,
-                file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-                skip_created_before: None,
-                skip_created_after: None,
-                only_print_filenames: false,
-                max_retries: 3,
-                retry_delay: 5,
-                temp_suffix: ".icloudpd-tmp".to_string(),
-                notify_systemd: false,
-                pid_file: None,
-            },
-            Command::ResetState(args) => Self {
-                username: args.auth.username,
-                password: args.auth.password,
-                domain: args.auth.domain,
-                cookie_directory: args.auth.cookie_directory,
-                log_level: cli.log_level,
-                // Defaults for unused fields
-                directory: None,
-                auth_only: false,
-                list_albums: false,
-                list_libraries: false,
-                albums: Vec::new(),
-                library: String::new(),
-                size: VersionSize::Original,
-                live_photo_size: LivePhotoSize::Original,
-                recent: None,
-                threads_num: 10,
-                skip_videos: false,
-                skip_photos: false,
-                skip_live_photos: false,
-                force_size: false,
-                folder_structure: String::new(),
-                set_exif_datetime: false,
-                dry_run: false,
-                watch_with_interval: None,
-                no_progress_bar: false,
-                keep_unicode_in_filenames: false,
-                live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-                align_raw: RawTreatmentPolicy::Unchanged,
-                file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-                skip_created_before: None,
-                skip_created_after: None,
-                only_print_filenames: false,
-                max_retries: 3,
-                retry_delay: 5,
-                temp_suffix: ".icloudpd-tmp".to_string(),
-                notify_systemd: false,
-                pid_file: None,
-            },
-            Command::ImportExisting(args) => Self {
-                username: args.auth.username,
-                password: args.auth.password,
-                domain: args.auth.domain,
-                cookie_directory: args.auth.cookie_directory,
-                directory: Some(args.directory),
-                folder_structure: args.folder_structure,
-                recent: args.recent,
-                log_level: cli.log_level,
-                // Defaults for unused fields
-                auth_only: false,
-                list_albums: false,
-                list_libraries: false,
-                albums: Vec::new(),
-                library: String::new(),
-                size: VersionSize::Original,
-                live_photo_size: LivePhotoSize::Original,
-                threads_num: 10,
-                skip_videos: false,
-                skip_photos: false,
-                skip_live_photos: false,
-                force_size: false,
-                set_exif_datetime: false,
-                dry_run: false,
-                watch_with_interval: None,
-                no_progress_bar: false,
-                keep_unicode_in_filenames: false,
-                live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-                align_raw: RawTreatmentPolicy::Unchanged,
-                file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-                skip_created_before: None,
-                skip_created_after: None,
-                only_print_filenames: false,
-                max_retries: 3,
-                retry_delay: 5,
-                temp_suffix: ".icloudpd-tmp".to_string(),
-                notify_systemd: false,
-                pid_file: None,
-            },
-            Command::Verify(args) => Self {
-                username: args.auth.username,
-                password: args.auth.password,
-                domain: args.auth.domain,
-                cookie_directory: args.auth.cookie_directory,
-                log_level: cli.log_level,
-                // Defaults for unused fields
-                directory: None,
-                auth_only: false,
-                list_albums: false,
-                list_libraries: false,
-                albums: Vec::new(),
-                library: String::new(),
-                size: VersionSize::Original,
-                live_photo_size: LivePhotoSize::Original,
-                recent: None,
-                threads_num: 10,
-                skip_videos: false,
-                skip_photos: false,
-                skip_live_photos: false,
-                force_size: false,
-                folder_structure: String::new(),
-                set_exif_datetime: false,
-                dry_run: false,
-                watch_with_interval: None,
-                no_progress_bar: false,
-                keep_unicode_in_filenames: false,
-                live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-                align_raw: RawTreatmentPolicy::Unchanged,
-                file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-                skip_created_before: None,
-                skip_created_after: None,
-                only_print_filenames: false,
-                max_retries: 3,
-                retry_delay: 5,
-                temp_suffix: ".icloudpd-tmp".to_string(),
-                notify_systemd: false,
-                pid_file: None,
-            },
         }
     }
 }
@@ -571,10 +329,9 @@ mod tests {
     }
 
     #[test]
-    fn test_library_default_primary_sync() {
+    fn test_library_none_by_default() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.library, "PrimarySync");
+        assert!(cli.sync.library.is_none());
     }
 
     #[test]
@@ -582,15 +339,13 @@ mod tests {
         let mut args = base_args();
         args.extend(["--library", "SharedSync-ABCD1234"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.library, "SharedSync-ABCD1234");
+        assert_eq!(cli.sync.library.as_deref(), Some("SharedSync-ABCD1234"));
     }
 
     #[test]
-    fn test_threads_num_defaults_to_10() {
+    fn test_threads_num_none_by_default() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.threads_num, 10);
+        assert!(cli.sync.threads_num.is_none());
     }
 
     #[test]
@@ -598,8 +353,7 @@ mod tests {
         let mut args = base_args();
         args.extend(["--threads-num", "8"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.threads_num, 8);
+        assert_eq!(cli.sync.threads_num, Some(8));
     }
 
     #[test]
@@ -612,22 +366,27 @@ mod tests {
     #[test]
     fn test_dry_run_default_false() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert!(!legacy.dry_run);
+        assert!(!cli.sync.dry_run);
     }
 
     #[test]
-    fn test_size_default_original() {
+    fn test_size_none_by_default() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert!(matches!(legacy.size, VersionSize::Original));
+        assert!(cli.sync.size.is_none());
+    }
+
+    #[test]
+    fn test_size_accepts_value() {
+        let mut args = base_args();
+        args.extend(["--size", "medium"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.size, Some(VersionSize::Medium));
     }
 
     #[test]
     fn test_recent_none_by_default() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert!(legacy.recent.is_none());
+        assert!(cli.sync.recent.is_none());
     }
 
     #[test]
@@ -635,15 +394,13 @@ mod tests {
         let mut args = base_args();
         args.extend(["--recent", "50"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.recent, Some(50));
+        assert_eq!(cli.sync.recent, Some(50));
     }
 
     #[test]
-    fn test_max_retries_default() {
+    fn test_max_retries_none_by_default() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.max_retries, 3);
+        assert!(cli.sync.max_retries.is_none());
     }
 
     #[test]
@@ -651,8 +408,7 @@ mod tests {
         let mut args = base_args();
         args.extend(["--max-retries", "10"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.max_retries, 10);
+        assert_eq!(cli.sync.max_retries, Some(10));
     }
 
     #[test]
@@ -660,15 +416,13 @@ mod tests {
         let mut args = base_args();
         args.extend(["--max-retries", "0"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.max_retries, 0);
+        assert_eq!(cli.sync.max_retries, Some(0));
     }
 
     #[test]
-    fn test_retry_delay_default() {
+    fn test_retry_delay_none_by_default() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.retry_delay, 5);
+        assert!(cli.sync.retry_delay.is_none());
     }
 
     #[test]
@@ -676,15 +430,13 @@ mod tests {
         let mut args = base_args();
         args.extend(["--retry-delay", "15"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.retry_delay, 15);
+        assert_eq!(cli.sync.retry_delay, Some(15));
     }
 
     #[test]
-    fn test_temp_suffix_default() {
+    fn test_temp_suffix_none_by_default() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.temp_suffix, ".icloudpd-tmp");
+        assert!(cli.sync.temp_suffix.is_none());
     }
 
     #[test]
@@ -692,15 +444,13 @@ mod tests {
         let mut args = base_args();
         args.extend(["--temp-suffix", ".downloading"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.temp_suffix, ".downloading");
+        assert_eq!(cli.sync.temp_suffix.as_deref(), Some(".downloading"));
     }
 
     #[test]
-    fn test_align_raw_default_as_is() {
+    fn test_align_raw_none_by_default() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert!(matches!(legacy.align_raw, RawTreatmentPolicy::Unchanged));
+        assert!(cli.sync.align_raw.is_none());
     }
 
     #[test]
@@ -708,11 +458,7 @@ mod tests {
         let mut args = base_args();
         args.extend(["--align-raw", "original"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert!(matches!(
-            legacy.align_raw,
-            RawTreatmentPolicy::PreferOriginal
-        ));
+        assert_eq!(cli.sync.align_raw, Some(RawTreatmentPolicy::PreferOriginal));
     }
 
     #[test]
@@ -720,11 +466,10 @@ mod tests {
         let mut args = base_args();
         args.extend(["--align-raw", "alternative"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert!(matches!(
-            legacy.align_raw,
-            RawTreatmentPolicy::PreferAlternative
-        ));
+        assert_eq!(
+            cli.sync.align_raw,
+            Some(RawTreatmentPolicy::PreferAlternative)
+        );
     }
 
     #[test]
@@ -792,8 +537,7 @@ mod tests {
     #[test]
     fn test_notify_systemd_default_false() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert!(!legacy.notify_systemd);
+        assert!(!cli.sync.notify_systemd);
     }
 
     #[test]
@@ -801,15 +545,13 @@ mod tests {
         let mut args = base_args();
         args.push("--notify-systemd");
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
-        assert!(legacy.notify_systemd);
+        assert!(cli.sync.notify_systemd);
     }
 
     #[test]
     fn test_pid_file_default_none() {
         let cli = parse(&base_args());
-        let legacy: LegacyCli = cli.into();
-        assert!(legacy.pid_file.is_none());
+        assert!(cli.sync.pid_file.is_none());
     }
 
     #[test]
@@ -817,16 +559,14 @@ mod tests {
         let mut args = base_args();
         args.extend(["--pid-file", "/tmp/claude/test.pid"]);
         let cli = parse(&args);
-        let legacy: LegacyCli = cli.into();
         assert_eq!(
-            legacy.pid_file,
+            cli.sync.pid_file,
             Some(std::path::PathBuf::from("/tmp/claude/test.pid"))
         );
     }
 
     #[test]
     fn test_backwards_compatibility_no_subcommand() {
-        // Old-style invocation without subcommand should still work
         let cli = Cli::try_parse_from([
             "icloudpd-rs",
             "--username",
@@ -836,8 +576,60 @@ mod tests {
         ])
         .unwrap();
         assert!(cli.command.is_none());
-        let legacy: LegacyCli = cli.into();
-        assert_eq!(legacy.username, "test@example.com");
-        assert_eq!(legacy.directory, Some("/photos".to_string()));
+        match cli.effective_command() {
+            Command::Sync { auth, sync } => {
+                assert_eq!(auth.username, "test@example.com");
+                assert_eq!(sync.directory, Some("/photos".to_string()));
+            }
+            _ => panic!("Expected Sync command"),
+        }
+    }
+
+    #[test]
+    fn test_config_flag_default() {
+        let cli = parse(&base_args());
+        assert_eq!(cli.config, "~/.config/icloudpd-rs/config.toml");
+    }
+
+    #[test]
+    fn test_config_flag_custom() {
+        let mut args = base_args();
+        args.extend(["--config", "/etc/icloudpd-rs.toml"]);
+        let cli = parse(&args);
+        assert_eq!(cli.config, "/etc/icloudpd-rs.toml");
+    }
+
+    #[test]
+    fn test_domain_none_by_default() {
+        let cli = parse(&base_args());
+        assert!(cli.auth.domain.is_none());
+    }
+
+    #[test]
+    fn test_domain_accepts_cn() {
+        let mut args = base_args();
+        args.extend(["--domain", "cn"]);
+        let cli = parse(&args);
+        assert_eq!(cli.auth.domain, Some(Domain::Cn));
+    }
+
+    #[test]
+    fn test_cookie_directory_none_by_default() {
+        let cli = parse(&base_args());
+        assert!(cli.auth.cookie_directory.is_none());
+    }
+
+    #[test]
+    fn test_log_level_none_by_default() {
+        let cli = parse(&base_args());
+        assert!(cli.log_level.is_none());
+    }
+
+    #[test]
+    fn test_log_level_accepts_value() {
+        let mut args = base_args();
+        args.extend(["--log-level", "debug"]);
+        let cli = parse(&args);
+        assert_eq!(cli.log_level, Some(LogLevel::Debug));
     }
 }
