@@ -607,9 +607,11 @@ impl Drop for PidFileGuard {
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
-    // Load TOML config early so it can influence log level
+    // Load TOML config early so it can influence log level.
+    // If the user explicitly set --config, the file must exist.
     let config_path = config::expand_tilde(&cli.config);
-    let toml_config = config::load_toml_config(&config_path)?;
+    let config_explicitly_set = cli.config != "~/.config/icloudpd-rs/config.toml";
+    let toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
 
     // Resolve log level: CLI > TOML > default (info)
     let effective_log_level = cli

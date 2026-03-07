@@ -4,32 +4,10 @@ use crate::types::{
 };
 use clap::{Parser, Subcommand};
 
-/// Common authentication arguments shared across subcommands.
+/// Authentication arguments shared across all commands and subcommands.
+/// Username is optional at the clap level; validated at runtime after TOML merge.
 #[derive(Parser, Debug, Clone)]
 pub struct AuthArgs {
-    /// Apple ID email address
-    #[arg(short = 'u', long)]
-    pub username: String,
-
-    /// iCloud password (if not provided, will prompt).
-    /// WARNING: passing via --password is visible in process listings.
-    /// Prefer the ICLOUD_PASSWORD environment variable instead.
-    #[arg(short = 'p', long, env = "ICLOUD_PASSWORD")]
-    pub password: Option<String>,
-
-    /// iCloud domain (com or cn)
-    #[arg(long, value_enum)]
-    pub domain: Option<Domain>,
-
-    /// Directory for cookies/session data
-    #[arg(long)]
-    pub cookie_directory: Option<String>,
-}
-
-/// Top-level auth args (used for backwards compatibility when no subcommand).
-/// Username is validated later in Config::build when needed.
-#[derive(Parser, Debug, Clone)]
-pub struct TopLevelAuthArgs {
     /// Apple ID email address
     #[arg(short = 'u', long)]
     pub username: Option<String>,
@@ -278,7 +256,11 @@ pub struct Cli {
     pub log_level: Option<LogLevel>,
 
     /// Path to TOML config file
-    #[arg(long, default_value = "~/.config/icloudpd-rs/config.toml")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "~/.config/icloudpd-rs/config.toml"
+    )]
     pub config: String,
 
     #[command(subcommand)]
@@ -287,7 +269,7 @@ pub struct Cli {
     // Backwards compatibility: allow all sync args at top level
     // These are only used when no subcommand is provided
     #[command(flatten)]
-    pub auth: TopLevelAuthArgs,
+    pub auth: AuthArgs,
 
     #[command(flatten)]
     pub sync: SyncArgs,
@@ -298,19 +280,10 @@ impl Cli {
     pub fn effective_command(&self) -> Command {
         match &self.command {
             Some(cmd) => cmd.clone(),
-            None => {
-                // Convert top-level args to AuthArgs
-                let auth = AuthArgs {
-                    username: self.auth.username.clone().unwrap_or_default(),
-                    password: self.auth.password.clone(),
-                    domain: self.auth.domain,
-                    cookie_directory: self.auth.cookie_directory.clone(),
-                };
-                Command::Sync {
-                    auth,
-                    sync: self.sync.clone(),
-                }
-            }
+            None => Command::Sync {
+                auth: self.auth.clone(),
+                sync: self.sync.clone(),
+            },
         }
     }
 }
@@ -501,6 +474,16 @@ mod tests {
     }
 
     #[test]
+    fn test_status_subcommand_without_username() {
+        let cli = Cli::try_parse_from(["icloudpd-rs", "status"]).unwrap();
+        if let Some(Command::Status(args)) = cli.command {
+            assert!(args.auth.username.is_none());
+        } else {
+            panic!("Expected Status command");
+        }
+    }
+
+    #[test]
     fn test_status_with_failed_flag() {
         let cli = Cli::try_parse_from([
             "icloudpd-rs",
@@ -578,7 +561,7 @@ mod tests {
         assert!(cli.command.is_none());
         match cli.effective_command() {
             Command::Sync { auth, sync } => {
-                assert_eq!(auth.username, "test@example.com");
+                assert_eq!(auth.username.as_deref(), Some("test@example.com"));
                 assert_eq!(sync.directory, Some("/photos".to_string()));
             }
             _ => panic!("Expected Sync command"),

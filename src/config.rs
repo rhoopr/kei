@@ -80,8 +80,9 @@ pub(crate) struct TomlWatch {
     pub pid_file: Option<String>,
 }
 
-/// Load a TOML config file. Returns `Ok(None)` if the file doesn't exist.
-pub(crate) fn load_toml_config(path: &Path) -> anyhow::Result<Option<TomlConfig>> {
+/// Load a TOML config file. Returns `Ok(None)` if the file doesn't exist
+/// and `required` is false. Errors if the file doesn't exist and `required` is true.
+pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Option<TomlConfig>> {
     use anyhow::Context;
 
     match std::fs::read_to_string(path) {
@@ -90,7 +91,7 @@ pub(crate) fn load_toml_config(path: &Path) -> anyhow::Result<Option<TomlConfig>
                 .context(format!("Failed to parse config file {}", path.display()))?;
             Ok(Some(config))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
         Err(e) => Err(e).context(format!("Failed to read config file {}", path.display()))?,
     }
 }
@@ -204,13 +205,11 @@ pub(crate) fn resolve_auth(
 ) -> (String, Option<String>, Domain, PathBuf) {
     let toml_auth = toml.as_ref().and_then(|t| t.auth.as_ref());
 
-    let username = if auth.username.is_empty() {
-        toml_auth
-            .and_then(|a| a.username.clone())
-            .unwrap_or_default()
-    } else {
-        auth.username.clone()
-    };
+    let username = resolve(
+        auth.username.clone(),
+        toml_auth.and_then(|a| a.username.clone()),
+        String::new(),
+    );
 
     let password = auth
         .password
@@ -641,16 +640,27 @@ mod tests {
     }
 
     #[test]
-    fn test_load_toml_config_missing_file() {
-        let result = load_toml_config(Path::new("/nonexistent/path/config.toml")).unwrap();
+    fn test_load_toml_config_missing_file_not_required() {
+        let result = load_toml_config(Path::new("/nonexistent/path/config.toml"), false).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_load_toml_config_missing_file_required() {
+        let result = load_toml_config(Path::new("/nonexistent/path/config.toml"), true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to read config file"),
+            "Error should mention config file: {err}"
+        );
     }
 
     // ── Config::build tests ─────────────────────────────────────────
 
     fn default_auth() -> AuthArgs {
         AuthArgs {
-            username: "u@example.com".to_string(),
+            username: Some("u@example.com".to_string()),
             password: None,
             domain: None,
             cookie_directory: None,
@@ -771,7 +781,7 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut auth = default_auth();
-        auth.username = String::new(); // Simulate no CLI username
+        auth.username = None; // Simulate no CLI username
         let cfg = Config::build(auth, default_sync(), None, Some(toml)).unwrap();
         assert_eq!(cfg.username, "toml@example.com");
     }
