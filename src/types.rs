@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VersionSize {
     Original,
     Medium,
@@ -9,14 +10,16 @@ pub enum VersionSize {
     Alternative,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LivePhotoSize {
     Original,
     Medium,
     Thumb,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Domain {
     Com,
     Cn,
@@ -31,7 +34,8 @@ impl Domain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Debug,
     Info,
@@ -39,25 +43,31 @@ pub enum LogLevel {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 pub enum FileMatchPolicy {
     #[value(name = "name-size-dedup-with-suffix")]
+    #[serde(rename = "name-size-dedup-with-suffix")]
     NameSizeDedupWithSuffix,
     #[value(name = "name-id7")]
+    #[serde(rename = "name-id7")]
     NameId7,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 pub enum RawTreatmentPolicy {
     #[value(name = "as-is")]
+    #[serde(rename = "as-is")]
     Unchanged,
     #[value(name = "original")]
+    #[serde(rename = "original")]
     PreferOriginal,
     #[value(name = "alternative")]
+    #[serde(rename = "alternative")]
     PreferAlternative,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LivePhotoMovFilenamePolicy {
     Suffix,
     Original,
