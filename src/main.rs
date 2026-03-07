@@ -76,7 +76,8 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
     }
 }
 
-use cli::{AuthArgs, Command};
+use cli::Command;
+use config::TomlConfig;
 use state::StateDb;
 use systemd::SystemdNotifier;
 
@@ -135,28 +136,18 @@ where
     Ok(())
 }
 
-/// Expand ~ to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
-    }
-    PathBuf::from(path)
-}
-
-/// Get the database path for a given auth config.
-fn get_db_path(auth: &AuthArgs) -> PathBuf {
-    let cookie_dir = expand_tilde(&auth.cookie_directory);
+/// Get the database path for a given auth config, merging with TOML defaults.
+fn get_db_path(auth: &cli::AuthArgs, toml: &Option<TomlConfig>) -> PathBuf {
+    let (username, _, _, cookie_dir) = config::resolve_auth(auth, toml);
     cookie_dir.join(format!(
         "{}.db",
-        auth::session::sanitize_username(&auth.username)
+        auth::session::sanitize_username(&username)
     ))
 }
 
 /// Run the status command.
-async fn run_status(args: cli::StatusArgs) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth);
+async fn run_status(args: cli::StatusArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+    let db_path = get_db_path(&args.auth, toml);
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -210,8 +201,11 @@ async fn run_status(args: cli::StatusArgs) -> anyhow::Result<()> {
 }
 
 /// Run the reset-state command.
-async fn run_reset_state(args: cli::ResetStateArgs) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth);
+async fn run_reset_state(
+    args: cli::ResetStateArgs,
+    toml: &Option<TomlConfig>,
+) -> anyhow::Result<()> {
+    let db_path = get_db_path(&args.auth, toml);
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -247,8 +241,8 @@ async fn run_reset_state(args: cli::ResetStateArgs) -> anyhow::Result<()> {
 }
 
 /// Run the verify command.
-async fn run_verify(args: cli::VerifyArgs) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth);
+async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+    let db_path = get_db_path(&args.auth, toml);
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -390,13 +384,16 @@ fn build_photos_params(
 /// 1. Enumerating all iCloud assets via the photos API
 /// 2. Computing the expected local path for each asset
 /// 3. If the file exists and size matches, marking it as downloaded in the DB
-async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
+async fn run_import_existing(
+    args: cli::ImportArgs,
+    toml: &Option<TomlConfig>,
+) -> anyhow::Result<()> {
     use chrono::Local;
     use futures_util::StreamExt;
     use icloud::photos::AssetVersionSize;
 
-    let db_path = get_db_path(&args.auth);
-    let directory = expand_tilde(&args.directory);
+    let db_path = get_db_path(&args.auth, toml);
+    let directory = config::expand_tilde(&args.directory);
 
     if !directory.exists() {
         anyhow::bail!("Directory does not exist: {}", directory.display());
@@ -406,9 +403,12 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
     let db = Arc::new(state::SqliteStateDb::open(&db_path).await?);
     tracing::info!("State database at {}", db_path.display());
 
+    // Resolve auth from CLI + TOML
+    let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
+
     // Authenticate
     let password_provider = {
-        let pw = args.auth.password.clone();
+        let pw = password;
         move || -> Option<String> {
             pw.clone().or_else(|| {
                 tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
@@ -416,12 +416,11 @@ async fn run_import_existing(args: cli::ImportArgs) -> anyhow::Result<()> {
         }
     };
 
-    let cookie_directory = expand_tilde(&args.auth.cookie_directory);
     let auth_result = auth::authenticate(
         &cookie_directory,
-        &args.auth.username,
+        &username,
         &password_provider,
-        args.auth.domain.as_str(),
+        domain.as_str(),
         None,
         None,
     )
@@ -608,9 +607,21 @@ impl Drop for PidFileGuard {
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
+    // Load TOML config early so it can influence log level.
+    // If the user explicitly set --config, the file must exist.
+    let config_path = config::expand_tilde(&cli.config);
+    let config_explicitly_set = cli.config != "~/.config/icloudpd-rs/config.toml";
+    let toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
+
+    // Resolve log level: CLI > TOML > default (info)
+    let effective_log_level = cli
+        .log_level
+        .or_else(|| toml_config.as_ref().and_then(|t| t.log_level))
+        .unwrap_or(types::LogLevel::Info);
+
     // Scope debug/info to the app crate so dependency crates stay quieter.
     // Users can override with RUST_LOG env var for full control.
-    let filter = match cli.log_level {
+    let filter = match effective_log_level {
         types::LogLevel::Debug => "icloudpd_rs=debug,info",
         types::LogLevel::Info => "info",
         types::LogLevel::Warn => "warn",
@@ -631,20 +642,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Dispatch based on command
-    let is_retry_failed = matches!(cli.effective_command(), Command::RetryFailed(_));
-    match cli.effective_command() {
-        Command::Status(args) => return run_status(args).await,
-        Command::ResetState(args) => return run_reset_state(args).await,
-        Command::Verify(args) => return run_verify(args).await,
-        Command::ImportExisting(args) => return run_import_existing(args).await,
-        Command::Sync { .. } | Command::RetryFailed(_) => {
-            // Continue with sync logic below
-        }
-    }
-
-    // For Sync and RetryFailed, use legacy config path
-    let legacy_cli: cli::LegacyCli = cli.into();
-    let config = config::Config::from_cli(legacy_cli)?;
+    let command = cli.effective_command();
+    let is_retry_failed = matches!(command, Command::RetryFailed(_));
+    let (auth, sync) = match command {
+        Command::Status(args) => return run_status(args, &toml_config).await,
+        Command::ResetState(args) => return run_reset_state(args, &toml_config).await,
+        Command::Verify(args) => return run_verify(args, &toml_config).await,
+        Command::ImportExisting(args) => return run_import_existing(args, &toml_config).await,
+        Command::Sync { auth, sync } => (auth, sync),
+        Command::RetryFailed(args) => (args.auth, args.sync),
+    };
+    let config = config::Config::build(auth, sync, cli.log_level, toml_config)?;
 
     // Install password redaction now that we know the password
     if let Some(pw) = &config.password {
