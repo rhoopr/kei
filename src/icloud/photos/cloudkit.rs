@@ -3,13 +3,13 @@ use serde_json::Value;
 
 /// Response from `/zones/list`.
 #[derive(Debug, Deserialize)]
-pub struct ZoneListResponse {
+pub(crate) struct ZoneListResponse {
     #[serde(default)]
     pub zones: Vec<Zone>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Zone {
+pub(crate) struct Zone {
     #[serde(rename = "zoneID")]
     pub zone_id: ZoneId,
     #[serde(default)]
@@ -18,7 +18,7 @@ pub struct Zone {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ZoneId {
+pub(crate) struct ZoneId {
     pub zone_name: String,
     #[serde(flatten)]
     pub extra: Value,
@@ -26,14 +26,14 @@ pub struct ZoneId {
 
 /// Response from `/records/query`.
 #[derive(Debug, Deserialize)]
-pub struct QueryResponse {
+pub(crate) struct QueryResponse {
     #[serde(default)]
     pub records: Vec<Record>,
 }
 
 /// Response from `/internal/records/query/batch`.
 #[derive(Debug, Deserialize)]
-pub struct BatchQueryResponse {
+pub(crate) struct BatchQueryResponse {
     #[serde(default)]
     pub batch: Vec<QueryResponse>,
 }
@@ -42,7 +42,7 @@ pub struct BatchQueryResponse {
 /// varies by record type and changes without notice.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Record {
+pub(crate) struct Record {
     #[serde(default)]
     pub record_name: String,
     #[serde(default)]
