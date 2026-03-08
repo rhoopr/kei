@@ -40,7 +40,11 @@ RUN export TARGET=$(cat /tmp/target) && \
     cp target/$TARGET/release/icloudpd-rs /icloudpd-rs
 
 # ── Runtime stage ────────────────────────────────────────────────────
-FROM gcr.io/distroless/cc-debian12
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends bash curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /icloudpd-rs /usr/local/bin/icloudpd-rs
 

@@ -11,6 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-03-07
+
+### Added
+
+#### Configuration
+
+- **TOML config file ([#51])** — Settings can now live in a `config.toml` file instead of (or alongside) CLI flags. Loads from `~/.config/icloudpd-rs/config.toml` by default, or a custom path via `--config`. Grouped into sections: `[auth]`, `[download]`, `[filters]`, `[photos]`, `[watch]`, `[notifications]`. Layered resolution: CLI flags override TOML values, which override built-in defaults. The config file is optional — CLI flags still work exactly as before.
+
+[#51]: https://github.com/rhoopr/icloudpd-rs/issues/51
+
+#### Distribution
+
+- **Docker image ([#40])** — Multi-arch images (amd64/arm64) published to `ghcr.io/rhoopr/icloudpd-rs`. Multi-stage build with `debian:bookworm-slim` runtime (includes `bash` and `curl` for notification scripts). Uses `/config` and `/photos` volumes. Supports `ICLOUD_USERNAME`, `ICLOUD_PASSWORD`, and `TZ` environment variables. Includes `docker-compose.yml` example.
+
+[#40]: https://github.com/rhoopr/icloudpd-rs/issues/40
+
+#### Authentication
+
+- **Headless MFA ([#36])** — New `submit-code` subcommand for non-interactive 2FA. Run `icloudpd-rs submit-code 123456` (or `docker exec icloudpd-rs icloudpd-rs submit-code 123456`) to submit a code from outside the running process. In headless mode (non-interactive stdin), the sync returns a `TwoFactorRequired` status and fires a notification instead of blocking on a prompt.
+
+[#36]: https://github.com/rhoopr/icloudpd-rs/issues/36
+
+#### Notifications
+
+- **Notification scripts ([#32])** — `--notification-script <path>` (or `[notifications] script` in TOML) runs a script on sync events. The script receives `ICLOUDPD_EVENT`, `ICLOUDPD_MESSAGE`, and `ICLOUDPD_USERNAME` as environment variables. Events: `2fa_required`, `sync_complete`, `sync_failed`, `session_expired`. Fire-and-forget execution with a 30-second timeout.
+
+[#32]: https://github.com/rhoopr/icloudpd-rs/issues/32
+
+---
+
 ## [0.2.1] - 2026-02-23
 
 ### Fixed
@@ -150,19 +180,21 @@ These are intentional improvements over the Python implementation:
 | **API errors** | Retry loop exists but `MAX_RETRIES = 0` | Automatic retry with jitter on 5xx/429 |
 | **Album fetch** | Sequential (`for album in albums`) | Concurrent (bounded by `--threads-num`) |
 | **Error handling** | No error classification | Classifies transient vs permanent errors |
-| **Cookie format** | LWPCookieJar format | JSON format + legacy LWP import support |
+| **Cookie format** | LWPCookieJar format | JSON format (not compatible with Python's LWP cookies — re-auth required) |
 | **Folder syntax** | Python datetime format (`{:%Y/%m/%d}`) | Both `{:%Y}` and `%Y` strftime accepted |
 
 ### Not Implemented (Planned)
 
 The following Python icloudpd features are not yet available. Links go to tracking issues:
 
+#### Coming in v0.4
+
+- [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) — **Auto-delete** (detect iCloud deletions, optionally remove local copies)
+- [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) — **Delete after download** (`--delete-after-download`)
+
 #### Authentication & Security
 - [#21](https://github.com/rhoopr/icloudpd-rs/issues/21) — SMS-based 2FA (trusted device only currently)
-- [#38](https://github.com/rhoopr/icloudpd-rs/issues/38) — Legacy two-step authentication (2SA)
 - [#22](https://github.com/rhoopr/icloudpd-rs/issues/22) — OS keyring integration for password storage
-- [#36](https://github.com/rhoopr/icloudpd-rs/issues/36) — Headless MFA via `--submit-code` for Docker
-- [#37](https://github.com/rhoopr/icloudpd-rs/issues/37) — Python LWPCookieJar session import
 
 #### Content & Downloads
 - [#19](https://github.com/rhoopr/icloudpd-rs/issues/19) — XMP sidecar export (`--xmp-sidecar`)
@@ -171,26 +203,19 @@ The following Python icloudpd features are not yet available. Links go to tracki
 - [#52](https://github.com/rhoopr/icloudpd-rs/issues/52) — HEIC to JPEG conversion (`--convert-heic`)
 
 #### iCloud Lifecycle
-- [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) — Auto-delete (Recently Deleted album scan)
-- [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) — Delete after download (`--delete-after-download`)
 - [#30](https://github.com/rhoopr/icloudpd-rs/issues/30) — Keep iCloud recent days (`--keep-icloud-recent-days`)
 
 #### Notifications & Monitoring
 - [#31](https://github.com/rhoopr/icloudpd-rs/issues/31) — Email/SMTP notifications on 2FA expiration
-- [#32](https://github.com/rhoopr/icloudpd-rs/issues/32) — Notification scripts (`--notification-script`)
 - [#55](https://github.com/rhoopr/icloudpd-rs/issues/55) — Prometheus metrics export
 
-#### Distribution & Configuration
-- [#40](https://github.com/rhoopr/icloudpd-rs/issues/40) — Docker images and AUR builds
-- [#51](https://github.com/rhoopr/icloudpd-rs/issues/51) — Config file support (TOML)
+#### Configuration
 - [#33](https://github.com/rhoopr/icloudpd-rs/issues/33) — Multi-account support
-- [#34](https://github.com/rhoopr/icloudpd-rs/issues/34) — OS locale date formatting (`--use-os-locale`)
 
 ### Removed (vs Python icloudpd)
 
 - `--until-found` — Replaced by SQLite state tracking; the database knows what's already downloaded
 - `--smtp-*` flags — Email notifications not yet implemented ([#31](https://github.com/rhoopr/icloudpd-rs/issues/31))
-- `--notification-*` flags — Script notifications not yet implemented ([#32](https://github.com/rhoopr/icloudpd-rs/issues/32))
 
 ### Known Issues
 
@@ -199,7 +224,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rhoopr/icloudpd-rs/releases/tag/v0.1.0
