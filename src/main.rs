@@ -1164,4 +1164,116 @@ mod tests {
         let unknown = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
         assert!(verify_checksum(&file_path, &unknown).await.unwrap());
     }
+
+    #[tokio::test]
+    async fn verify_checksum_nonexistent_file_errors() {
+        let result = verify_checksum(
+            Path::new("/tmp/claude/nonexistent_file_abc.bin"),
+            &base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_checksum_invalid_base64_errors() {
+        let dir = PathBuf::from("/tmp/claude/checksum_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("invalid_b64.bin");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let result = verify_checksum(&file_path, "not-valid-base64!!!").await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn redacting_writer_replaces_password() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some("s3cret".to_string())));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(b"Login with s3cret ok").unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains("s3cret"));
+        assert!(output.contains("********"));
+    }
+
+    #[test]
+    fn redacting_writer_no_password_passthrough() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(None));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(b"normal log line").unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, "normal log line");
+    }
+
+    #[test]
+    fn redacting_writer_empty_password_passthrough() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some(String::new())));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(b"normal log line").unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, "normal log line");
+    }
+
+    #[test]
+    fn redacting_writer_short_buffer_passthrough() {
+        use std::io::Write;
+
+        // Buffer shorter than the password can't contain it
+        let password = Arc::new(std::sync::Mutex::new(Some("longpassword".to_string())));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(b"short").unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, "short");
+    }
+
+    #[test]
+    fn redacting_writer_flush() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(None));
+        let mut buf = Vec::new();
+        let mut writer = RedactingWriter {
+            inner: &mut buf,
+            password,
+        };
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn make_password_provider_with_some() {
+        let provider = make_password_provider(Some("mypass".to_string()));
+        assert_eq!(provider(), Some("mypass".to_string()));
+        // Can be called multiple times
+        assert_eq!(provider(), Some("mypass".to_string()));
+    }
 }

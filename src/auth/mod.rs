@@ -240,4 +240,26 @@ mod tests {
         let resp = make_response(2, false, false, true);
         assert!(check_requires_2fa(&resp));
     }
+
+    #[test]
+    fn test_requires_2fa_hsa_version_0() {
+        let resp = make_response(0, true, false, true);
+        assert!(!check_requires_2fa(&resp));
+    }
+
+    #[test]
+    fn test_requires_2fa_challenged_and_trusted() {
+        // Challenge required but browser already trusted — still doesn't need 2FA
+        // because the condition is (challenge OR !trusted), which is true,
+        // so this case should actually require 2FA
+        let resp = make_response(2, true, true, true);
+        assert!(check_requires_2fa(&resp));
+    }
+
+    #[test]
+    fn test_requires_2fa_all_false() {
+        // All flags false — no 2FA needed
+        let resp = make_response(2, false, true, false);
+        assert!(!check_requires_2fa(&resp));
+    }
 }

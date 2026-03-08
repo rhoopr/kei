@@ -231,4 +231,25 @@ mod tests {
         let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "").await;
         assert!(!result.unwrap());
     }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_with_spaces() {
+        let mut session = test_session("spaces").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "12 345").await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_letters() {
+        let mut session = test_session("letters").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "abcdef").await;
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn two_fa_code_length_constant() {
+        assert_eq!(TWO_FA_CODE_LENGTH, 6);
+    }
 }

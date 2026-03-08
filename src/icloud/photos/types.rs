@@ -46,3 +46,113 @@ impl From<VersionSize> for AssetVersionSize {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::VersionSize;
+
+    #[test]
+    fn from_version_size_original() {
+        assert_eq!(
+            AssetVersionSize::from(VersionSize::Original),
+            AssetVersionSize::Original
+        );
+    }
+
+    #[test]
+    fn from_version_size_medium() {
+        assert_eq!(
+            AssetVersionSize::from(VersionSize::Medium),
+            AssetVersionSize::Medium
+        );
+    }
+
+    #[test]
+    fn from_version_size_thumb() {
+        assert_eq!(
+            AssetVersionSize::from(VersionSize::Thumb),
+            AssetVersionSize::Thumb
+        );
+    }
+
+    #[test]
+    fn from_version_size_adjusted() {
+        assert_eq!(
+            AssetVersionSize::from(VersionSize::Adjusted),
+            AssetVersionSize::Adjusted
+        );
+    }
+
+    #[test]
+    fn from_version_size_alternative() {
+        assert_eq!(
+            AssetVersionSize::from(VersionSize::Alternative),
+            AssetVersionSize::Alternative
+        );
+    }
+
+    #[test]
+    fn asset_version_size_is_one_byte() {
+        assert_eq!(std::mem::size_of::<AssetVersionSize>(), 1);
+    }
+
+    #[test]
+    fn asset_item_type_debug_output() {
+        assert_eq!(format!("{:?}", AssetItemType::Image), "Image");
+        assert_eq!(format!("{:?}", AssetItemType::Movie), "Movie");
+    }
+
+    #[test]
+    fn asset_version_construction_and_field_access() {
+        let version = AssetVersion {
+            size: 1024,
+            url: "https://example.com/photo.jpg".into(),
+            asset_type: "public.jpeg".into(),
+            checksum: "abc123".into(),
+        };
+
+        assert_eq!(version.size, 1024);
+        assert_eq!(&*version.url, "https://example.com/photo.jpg");
+        assert_eq!(&*version.asset_type, "public.jpeg");
+        assert_eq!(&*version.checksum, "abc123");
+    }
+
+    #[test]
+    fn asset_version_clone() {
+        let version = AssetVersion {
+            size: 2048,
+            url: "https://example.com/video.mov".into(),
+            asset_type: "public.mpeg-4".into(),
+            checksum: "def456".into(),
+        };
+
+        let cloned = version.clone();
+        assert_eq!(cloned.size, version.size);
+        assert_eq!(&*cloned.url, &*version.url);
+        assert_eq!(&*cloned.asset_type, &*version.asset_type);
+        assert_eq!(&*cloned.checksum, &*version.checksum);
+    }
+
+    #[test]
+    fn asset_version_size_variants_have_distinct_repr_values() {
+        let variants = [
+            AssetVersionSize::Original as u8,
+            AssetVersionSize::Alternative as u8,
+            AssetVersionSize::Medium as u8,
+            AssetVersionSize::Thumb as u8,
+            AssetVersionSize::Adjusted as u8,
+            AssetVersionSize::LiveOriginal as u8,
+            AssetVersionSize::LiveMedium as u8,
+            AssetVersionSize::LiveThumb as u8,
+        ];
+
+        // Check all 8 variants have unique values
+        let unique: std::collections::HashSet<u8> = variants.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            variants.len(),
+            "all repr(u8) values must be distinct"
+        );
+    }
+}

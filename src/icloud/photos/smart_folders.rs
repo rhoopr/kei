@@ -151,4 +151,57 @@ mod tests {
             .unwrap();
         assert!(favorites.1.query_filter.is_some());
     }
+
+    #[test]
+    fn test_hidden_has_no_filter() {
+        let folders = smart_folders();
+        let hidden = folders.iter().find(|(name, _)| *name == "Hidden").unwrap();
+        assert!(hidden.1.query_filter.is_none());
+    }
+
+    #[test]
+    fn test_recently_deleted_has_no_filter() {
+        let folders = smart_folders();
+        let deleted = folders
+            .iter()
+            .find(|(name, _)| *name == "Recently Deleted")
+            .unwrap();
+        assert!(deleted.1.query_filter.is_none());
+        assert_eq!(deleted.1.obj_type, "CPLAssetDeletedByExpungedDate");
+    }
+
+    #[test]
+    fn test_all_smart_folders_have_unique_names() {
+        let folders = smart_folders();
+        let mut names: Vec<&str> = folders.iter().map(|(n, _)| *n).collect();
+        let len_before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            len_before,
+            "Duplicate smart folder names found"
+        );
+    }
+
+    #[test]
+    fn test_all_smart_folders_have_nonempty_types() {
+        let folders = smart_folders();
+        for (name, def) in &folders {
+            assert!(!def.obj_type.is_empty(), "{name} has empty obj_type");
+            assert!(!def.list_type.is_empty(), "{name} has empty list_type");
+        }
+    }
+
+    #[test]
+    fn test_smart_folder_filter_field_structure() {
+        let filter = smart_folder_filter("testField", "TEST_VALUE");
+        let arr = filter.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let entry = &arr[0];
+        assert_eq!(entry["fieldName"], "testField");
+        assert_eq!(entry["comparator"], "EQUALS");
+        assert_eq!(entry["fieldValue"]["type"], "STRING");
+        assert_eq!(entry["fieldValue"]["value"], "TEST_VALUE");
+    }
 }

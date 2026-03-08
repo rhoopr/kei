@@ -368,4 +368,64 @@ mod tests {
             size_of::<AssetRecord>()
         );
     }
+
+    #[test]
+    fn test_version_size_key_is_one_byte() {
+        assert_eq!(size_of::<VersionSizeKey>(), 1);
+    }
+
+    #[test]
+    fn test_asset_status_is_one_byte() {
+        assert_eq!(size_of::<AssetStatus>(), 1);
+    }
+
+    #[test]
+    fn test_media_type_is_one_byte() {
+        assert_eq!(size_of::<MediaType>(), 1);
+    }
+
+    #[test]
+    fn test_sync_run_stats_default() {
+        let stats = SyncRunStats::default();
+        assert_eq!(stats.assets_seen, 0);
+        assert_eq!(stats.assets_downloaded, 0);
+        assert_eq!(stats.assets_failed, 0);
+        assert!(!stats.interrupted);
+    }
+
+    #[test]
+    fn test_asset_record_new_pending_with_added_at() {
+        let now = Utc::now();
+        let added = now - chrono::Duration::hours(1);
+        let record = AssetRecord::new_pending(
+            "XYZ".to_string(),
+            VersionSizeKey::LiveOriginal,
+            "ck".to_string(),
+            "video.mov".to_string(),
+            now,
+            Some(added),
+            99999,
+            MediaType::LivePhotoVideo,
+        );
+        assert_eq!(record.added_at, Some(added));
+        assert_eq!(record.media_type, MediaType::LivePhotoVideo);
+        assert_eq!(record.version_size, VersionSizeKey::LiveOriginal);
+    }
+
+    #[test]
+    fn test_version_size_key_all_from_asset_version_size() {
+        let conversions = [
+            (AssetVersionSize::Original, VersionSizeKey::Original),
+            (AssetVersionSize::Medium, VersionSizeKey::Medium),
+            (AssetVersionSize::Thumb, VersionSizeKey::Thumb),
+            (AssetVersionSize::Adjusted, VersionSizeKey::Adjusted),
+            (AssetVersionSize::Alternative, VersionSizeKey::Alternative),
+            (AssetVersionSize::LiveOriginal, VersionSizeKey::LiveOriginal),
+            (AssetVersionSize::LiveMedium, VersionSizeKey::LiveMedium),
+            (AssetVersionSize::LiveThumb, VersionSizeKey::LiveThumb),
+        ];
+        for (avs, expected) in conversions {
+            assert_eq!(VersionSizeKey::from(avs), expected, "{:?}", avs);
+        }
+    }
 }
