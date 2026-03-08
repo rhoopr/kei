@@ -163,6 +163,21 @@ jobs:
       # Ignore unmaintained warnings (informational, not vulnerabilities)
       - run: cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
 
+  # Verifies the Dockerfile builds successfully
+  # Catches build breakage before it hits the publish workflow on main
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   # Catches spelling mistakes in code, comments, and documentation
   # Small thing but helps maintain a professional codebase
   typos:
