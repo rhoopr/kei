@@ -22,6 +22,8 @@ mod types;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
+use base64::Engine;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -320,32 +322,51 @@ async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow:
     Ok(())
 }
 
-/// Verify a file's SHA256 checksum.
+/// Verify a file's checksum against Apple's expected value.
+///
+/// Apple uses several checksum formats (after base64-decoding):
+///   - 32 bytes: raw SHA-256
+///   - 33 bytes: 0x01 prefix + SHA-256
+///   - 20 bytes: raw SHA-1
+///   - 21 bytes: 0x01 prefix + SHA-1
 async fn verify_checksum(path: &Path, expected: &str) -> anyhow::Result<bool> {
+    use sha1::Sha1;
     use sha2::{Digest, Sha256};
 
     let path = path.to_path_buf();
     let expected = expected.to_string();
 
     tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&path)?;
-        let mut hasher = Sha256::new();
-        std::io::copy(&mut file, &mut hasher)?;
-        let hash = hasher.finalize();
-        use std::fmt::Write;
-        let computed = hash.iter().fold(String::with_capacity(64), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        });
+        let expected_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&expected)
+            .context("Failed to decode base64 checksum")?;
 
-        // Apple sometimes uses a 33-byte format with a leading byte
-        let expected_normalized = if expected.len() == 66 && expected.starts_with("01") {
-            &expected[2..]
-        } else {
-            &expected
+        // Determine which hash algorithm to use based on checksum length
+        let (use_sha1, expected_hash) = match expected_bytes.len() {
+            32 => (false, &expected_bytes[..]),
+            33 => (false, &expected_bytes[1..]),
+            20 => (true, &expected_bytes[..]),
+            21 => (true, &expected_bytes[1..]),
+            len => {
+                tracing::warn!(
+                    len,
+                    path = %path.display(),
+                    "Unknown checksum format ({len} bytes), skipping verification",
+                );
+                return Ok(true);
+            }
         };
 
-        Ok(computed.eq_ignore_ascii_case(expected_normalized))
+        let mut file = std::fs::File::open(&path)?;
+        if use_sha1 {
+            let mut hasher = Sha1::new();
+            std::io::copy(&mut file, &mut hasher)?;
+            Ok(hasher.finalize().as_slice() == expected_hash)
+        } else {
+            let mut hasher = Sha256::new();
+            std::io::copy(&mut file, &mut hasher)?;
+            Ok(hasher.finalize().as_slice() == expected_hash)
+        }
     })
     .await?
 }
@@ -1039,5 +1060,97 @@ mod tests {
     fn pid_file_guard_handles_missing_parent() {
         let path = std::env::temp_dir().join("nonexistent_dir_abc123/test.pid");
         assert!(PidFileGuard::new(path).is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_checksum_sha256_raw_32_bytes() {
+        use sha2::Digest;
+
+        let dir = PathBuf::from("/tmp/claude/checksum_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("sha256_raw.bin");
+        let content = b"hello world";
+        std::fs::write(&file_path, content).unwrap();
+
+        let hash = sha2::Sha256::digest(content);
+        // Raw 32-byte SHA-256, base64-encoded
+        let checksum = base64::engine::general_purpose::STANDARD.encode(hash.as_slice());
+        assert!(verify_checksum(&file_path, &checksum).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn verify_checksum_sha256_prefixed_33_bytes() {
+        use sha2::Digest;
+
+        let dir = PathBuf::from("/tmp/claude/checksum_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("sha256_prefixed.bin");
+        let content = b"hello world";
+        std::fs::write(&file_path, content).unwrap();
+
+        let hash = sha2::Sha256::digest(content);
+        // 0x01 prefix + 32-byte SHA-256
+        let mut prefixed = vec![0x01];
+        prefixed.extend_from_slice(hash.as_slice());
+        let checksum = base64::engine::general_purpose::STANDARD.encode(&prefixed);
+        assert!(verify_checksum(&file_path, &checksum).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn verify_checksum_sha1_raw_20_bytes() {
+        use sha1::Digest;
+
+        let dir = PathBuf::from("/tmp/claude/checksum_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("sha1_raw.bin");
+        let content = b"hello world";
+        std::fs::write(&file_path, content).unwrap();
+
+        let hash = sha1::Sha1::digest(content);
+        // Raw 20-byte SHA-1, base64-encoded
+        let checksum = base64::engine::general_purpose::STANDARD.encode(hash.as_slice());
+        assert!(verify_checksum(&file_path, &checksum).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn verify_checksum_sha1_prefixed_21_bytes() {
+        use sha1::Digest;
+
+        let dir = PathBuf::from("/tmp/claude/checksum_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("sha1_prefixed.bin");
+        let content = b"hello world";
+        std::fs::write(&file_path, content).unwrap();
+
+        let hash = sha1::Sha1::digest(content);
+        // 0x01 prefix + 20-byte SHA-1 (Apple's actual format)
+        let mut prefixed = vec![0x01];
+        prefixed.extend_from_slice(hash.as_slice());
+        let checksum = base64::engine::general_purpose::STANDARD.encode(&prefixed);
+        assert!(verify_checksum(&file_path, &checksum).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn verify_checksum_mismatch_returns_false() {
+        let dir = PathBuf::from("/tmp/claude/checksum_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("mismatch.bin");
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        // Wrong SHA-256 (all zeros)
+        let wrong = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        assert!(!verify_checksum(&file_path, &wrong).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn verify_checksum_unknown_length_skips() {
+        let dir = PathBuf::from("/tmp/claude/checksum_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("unknown_len.bin");
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        // 10-byte unknown format — should return true (skip verification)
+        let unknown = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
+        assert!(verify_checksum(&file_path, &unknown).await.unwrap());
     }
 }

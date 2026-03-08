@@ -4,6 +4,7 @@ use anyhow::Context;
 use base64::Engine;
 use futures_util::StreamExt;
 use reqwest::Client;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -68,9 +69,10 @@ pub async fn download_file(
     result
 }
 
-/// Rebuild SHA256 hash state by re-reading an existing .part file.
-/// Returns the hasher and byte count, or None if the file doesn't exist or is empty.
-async fn resume_hash_state(part_path: &Path) -> Option<(Sha256, u64)> {
+/// Rebuild hash state by re-reading an existing .part file.
+/// Returns both SHA-256 and SHA-1 hashers and byte count, or None if the
+/// file doesn't exist or is empty.
+async fn resume_hash_state(part_path: &Path) -> Option<(Sha256, Sha1, u64)> {
     let meta = fs::metadata(part_path).await.ok()?;
     let existing_len = meta.len();
     if existing_len == 0 {
@@ -79,7 +81,8 @@ async fn resume_hash_state(part_path: &Path) -> Option<(Sha256, u64)> {
 
     let file = fs::File::open(part_path).await.ok()?;
     let mut reader = tokio::io::BufReader::new(file);
-    let mut hasher = Sha256::new();
+    let mut sha256 = Sha256::new();
+    let mut sha1 = Sha1::new();
     let mut buf = [0u8; 262_144]; // 256 KiB for faster resume hashing
     loop {
         let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
@@ -88,9 +91,10 @@ async fn resume_hash_state(part_path: &Path) -> Option<(Sha256, u64)> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        sha256.update(&buf[..n]);
+        sha1.update(&buf[..n]);
     }
-    Some((hasher, existing_len))
+    Some((sha256, sha1, existing_len))
 }
 
 /// Single download attempt with checksum verification and resume support.
@@ -108,7 +112,7 @@ async fn attempt_download(
     let path_str = download_path.display().to_string();
 
     let resume_state = resume_hash_state(part_path).await;
-    let resume_offset = resume_state.as_ref().map(|(_, len)| *len).unwrap_or(0);
+    let resume_offset = resume_state.as_ref().map(|(_, _, len)| *len).unwrap_or(0);
 
     let mut request = client.get(url);
     if resume_offset > 0 {
@@ -134,12 +138,12 @@ async fn attempt_download(
     // `effective_offset` tracks the actual byte offset used for the content-length
     // check. When the server ignores Range and returns 200, we restart from zero
     // so effective_offset must be 0 (not the stale resume_offset).
-    let (mut hasher, mut bytes_written, truncate, effective_offset) = match (
+    let (mut sha256, mut sha1_hasher, mut bytes_written, truncate, effective_offset) = match (
         status,
         resume_offset,
         resume_state,
     ) {
-        (206, offset, Some((h, len))) if offset > 0 => (h, len, false, offset),
+        (206, offset, Some((h256, h1, len))) if offset > 0 => (h256, h1, len, false, offset),
         (_, _, _) if response.status().is_success() => {
             if resume_offset > 0 {
                 tracing::info!(
@@ -148,7 +152,7 @@ async fn attempt_download(
                         path_str,
                     );
             }
-            (Sha256::new(), 0u64, true, 0u64)
+            (Sha256::new(), Sha1::new(), 0u64, true, 0u64)
         }
         _ => {
             return Err(DownloadError::HttpStatus {
@@ -180,7 +184,8 @@ async fn attempt_download(
             content_length,
             bytes_written,
         })?;
-        hasher.update(&chunk);
+        sha256.update(&chunk);
+        sha1_hasher.update(&chunk);
         file.write_all(&chunk).await?;
         bytes_written += chunk.len() as u64;
     }
@@ -204,22 +209,25 @@ async fn attempt_download(
     }
 
     if let Ok(expected_hash) = base64::engine::general_purpose::STANDARD.decode(checksum) {
-        let actual_hash = hasher.finalize();
-
-        // Apple uses two checksum formats: raw 32-byte SHA-256, or 33-byte
-        // with a 1-byte type prefix (0x01 = SHA-256). Handle both.
-        let matches = if expected_hash.len() == 32 {
-            actual_hash.as_slice() == expected_hash.as_slice()
-        } else if expected_hash.len() == 33 {
-            actual_hash.as_slice() == &expected_hash[1..]
-        } else {
-            tracing::warn!(
-                len = expected_hash.len(),
-                path = %download_path.display(),
-                "Unknown checksum format ({} bytes), skipping verification",
-                expected_hash.len()
-            );
-            true
+        // Apple uses several checksum formats:
+        //   - 32 bytes: raw SHA-256
+        //   - 33 bytes: 0x01 prefix + SHA-256
+        //   - 20 bytes: raw SHA-1
+        //   - 21 bytes: 0x01 prefix + SHA-1
+        let matches = match expected_hash.len() {
+            32 => sha256.finalize().as_slice() == expected_hash.as_slice(),
+            33 => sha256.finalize().as_slice() == &expected_hash[1..],
+            20 => sha1_hasher.finalize().as_slice() == expected_hash.as_slice(),
+            21 => sha1_hasher.finalize().as_slice() == &expected_hash[1..],
+            _ => {
+                tracing::warn!(
+                    len = expected_hash.len(),
+                    path = %download_path.display(),
+                    "Unknown checksum format ({} bytes), skipping verification",
+                    expected_hash.len()
+                );
+                true
+            }
         };
 
         if !matches {
