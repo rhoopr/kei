@@ -1494,11 +1494,36 @@ mod tests {
         );
         db.upsert_seen(&record).await.unwrap();
 
+        // Read the original last_seen_at
+        let original_ts: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT last_seen_at FROM assets WHERE id = 'TOUCH_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // Small delay so timestamps differ
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
         // Touch last_seen_at
         db.touch_last_seen("TOUCH_1").await.unwrap();
 
-        // Verify it was updated (asset still exists)
-        let known = db.get_all_known_ids().await.unwrap();
-        assert!(known.contains("TOUCH_1"));
+        // Verify the timestamp was actually updated
+        let updated_ts: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT last_seen_at FROM assets WHERE id = 'TOUCH_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            updated_ts >= original_ts,
+            "last_seen_at should be updated: {updated_ts} >= {original_ts}"
+        );
     }
 }

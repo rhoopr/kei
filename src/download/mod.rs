@@ -2739,4 +2739,157 @@ mod tests {
             Some(true)
         );
     }
+
+    // ── extract_skip_candidates tests ──────────────────────────────
+
+    #[test]
+    fn test_extract_skip_candidates_photo() {
+        let asset = photo_asset_with_version();
+        let config = test_config();
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, VersionSizeKey::Original);
+        assert_eq!(candidates[0].1, "abc123");
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_live_photo() {
+        let asset = photo_asset_with_live_photo();
+        let config = test_config();
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].0, VersionSizeKey::Original);
+        assert_eq!(candidates[0].1, "heic_ck");
+        assert_eq!(candidates[1].0, VersionSizeKey::LiveOriginal);
+        assert_eq!(candidates[1].1, "mov_ck");
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_videos() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "VID_1", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let mut config = test_config();
+        config.skip_videos = true;
+        assert!(extract_skip_candidates(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_photos() {
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        config.skip_photos = true;
+        assert!(extract_skip_candidates(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_live_photos() {
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.skip_live_photos = true;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // Should still have the primary HEIC version, just not the MOV companion
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_date_before_filter() {
+        let asset = photo_asset_with_version(); // assetDate = 1736899200000 = 2025-01-15
+        let mut config = test_config();
+        // Set skip_created_before to a date AFTER the asset's creation
+        config.skip_created_before = Some(
+            DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(extract_skip_candidates(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_date_after_filter() {
+        let asset = photo_asset_with_version(); // assetDate = 1736899200000 = 2025-01-15
+        let mut config = test_config();
+        // Set skip_created_after to a date BEFORE the asset's creation
+        config.skip_created_after = Some(
+            DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(extract_skip_candidates(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_size_fallback_to_original() {
+        let asset = photo_asset_with_version(); // only has resOriginalRes
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium; // not available
+        config.force_size = false;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // Should fall back to Original
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_force_size_no_fallback() {
+        let asset = photo_asset_with_version(); // only has resOriginalRes
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium; // not available
+        config.force_size = true;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // force_size prevents fallback — no primary version
+        assert!(candidates.is_empty());
+    }
+
+    // ── hash_download_config additional sensitivity tests ──────────
+
+    #[test]
+    fn test_hash_download_config_changes_on_file_match_policy() {
+        let mut config1 = test_config();
+        config1.file_match_policy = FileMatchPolicy::NameSizeDedupWithSuffix;
+        let mut config2 = test_config();
+        config2.file_match_policy = FileMatchPolicy::NameId7;
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_changes_on_keep_unicode() {
+        let mut config1 = test_config();
+        config1.keep_unicode_in_filenames = false;
+        let mut config2 = test_config();
+        config2.keep_unicode_in_filenames = true;
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_ignores_unrelated_fields() {
+        let mut config1 = test_config();
+        config1.concurrent_downloads = 1;
+        config1.dry_run = false;
+        let mut config2 = test_config();
+        config2.concurrent_downloads = 16;
+        config2.dry_run = true;
+        // These fields don't affect download paths, so hash should be the same
+        assert_eq!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
 }
