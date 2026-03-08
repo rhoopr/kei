@@ -1,6 +1,6 @@
 # Migrating from Python icloudpd
 
-If you're already running [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (Python icloudpd), switching to icloudpd-rs takes about five minutes. Your existing photos stay where they are — you don't need to re-download anything.
+If you're already running [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (Python icloudpd), switching to icloudpd-rs takes about five minutes. Your existing photos stay where they are - you don't need to re-download anything.
 
 ## Step 1: Import your existing files
 
@@ -12,9 +12,9 @@ icloudpd-rs import-existing --username you@example.com --directory ~/Photos/iClo
 
 This scans your local files and builds a SQLite state database so icloudpd-rs knows what's already been downloaded. The next `sync` run will only fetch what's new or previously failed.
 
-The import matches files by computing the expected path for each iCloud asset (using `--folder-structure` and `--directory`) and checking if a file exists at that path with a matching size. **If your folder structure or directory doesn't match what Python used, the import will silently count those files as unmatched** — it won't error out or download duplicates. The unmatched count is printed at the end. If most files show as unmatched, double-check that your `--folder-structure` matches your existing layout.
+The import matches files by computing the expected path for each iCloud asset (using `--folder-structure` and `--directory`) and checking if a file exists at that path with a matching size. **If your folder structure or directory doesn't match what Python used, the import will silently count those files as unmatched** - it won't error out or download duplicates. The unmatched count is printed at the end. If most files show as unmatched, double-check that your `--folder-structure` matches your existing layout.
 
-The import is idempotent — running it multiple times is safe. It uses `upsert` operations, so re-importing the same files just updates the existing database entries.
+The import is idempotent - running it multiple times is safe. It uses `upsert` operations, so re-importing the same files just updates the existing database entries.
 
 ## Step 2: Run your first sync
 
@@ -22,7 +22,7 @@ The import is idempotent — running it multiple times is safe. It uses `upsert`
 icloudpd-rs --username you@example.com --directory ~/Photos/iCloud
 ```
 
-You'll need to authenticate fresh — icloudpd-rs can't reuse Python's `~/.pyicloud` session cookies (different format). After the first 2FA approval, sessions are persisted to `~/.icloudpd-rs/` and reused on subsequent runs.
+You'll need to authenticate fresh - icloudpd-rs can't reuse Python's `~/.pyicloud` session cookies (different format). After the first 2FA approval, sessions are persisted to `~/.icloudpd-rs/` and reused on subsequent runs.
 
 ## CLI flag mapping
 
@@ -64,7 +64,7 @@ Most flags are the same or very close. Here's the full mapping:
 | Python | Rust | What changed |
 |--------|------|-------------|
 | `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Both Python `{:%Y}` and plain `%Y` strftime syntax accepted. You can keep using the Python format. |
-| `--size original` | `--size original` | Same values, but Python allows multiple `--size` flags (not yet supported in Rust — [#14](https://github.com/rhoopr/icloudpd-rs/issues/14)) |
+| `--size original` | `--size original` | Same values, but Python allows multiple `--size` flags (not yet supported in Rust - [#14](https://github.com/rhoopr/icloudpd-rs/issues/14)) |
 | `--cookie-directory ~/.pyicloud` | `--cookie-directory ~/.icloudpd-rs` | Different default path and cookie format (JSON vs LWPCookieJar). Sessions aren't portable between the two. |
 | `--threads-num` (deprecated, always 1) | `--threads-num 10` | Actually works in Rust. Default: 10 parallel downloads. |
 | `--notification-script` | `--notification-script` | Same flag name, but Rust version passes `ICLOUDPD_EVENT`, `ICLOUDPD_MESSAGE`, `ICLOUDPD_USERNAME` env vars. Python only fired on 2FA expiry; Rust also fires on `sync_complete`, `sync_failed`, `session_expired`. |
@@ -73,16 +73,16 @@ Most flags are the same or very close. Here's the full mapping:
 
 | Python flag | Status | Tracking |
 |-------------|--------|----------|
-| `--until-found` | Replaced by SQLite state — not needed | — |
+| `--until-found` | Replaced by SQLite state - not needed | - |
 | `--auto-delete` | **Coming in v0.4** | [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) |
 | `--delete-after-download` | **Coming in v0.4** | [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) |
 | `--keep-icloud-recent-days` | Planned | [#30](https://github.com/rhoopr/icloudpd-rs/issues/30) |
 | `--xmp-sidecar` | Planned | [#19](https://github.com/rhoopr/icloudpd-rs/issues/19) |
 | `--smtp-*` (all SMTP flags) | Planned | [#31](https://github.com/rhoopr/icloudpd-rs/issues/31) |
 | `--only-print-filenames` | Planned | [#17](https://github.com/rhoopr/icloudpd-rs/issues/17) |
-| `--use-os-locale` | Not planned | — |
-| `--password-provider` | Not applicable — uses `ICLOUD_PASSWORD` env var or interactive prompt | — |
-| `--mfa-provider` | Not applicable — uses trusted device or `submit-code` subcommand | — |
+| `--use-os-locale` | Not planned | - |
+| `--password-provider` | Not applicable - uses `ICLOUD_PASSWORD` env var or interactive prompt | - |
+| `--mfa-provider` | Not applicable - uses trusted device or `submit-code` subcommand | - |
 
 ### New in icloudpd-rs (no Python equivalent)
 
@@ -147,11 +147,11 @@ docker exec icloudpd-rs icloudpd-rs import-existing --directory /photos
 
 ## Known differences in output
 
-- **EXIF file size** — When `--set-exif-datetime` is used, files written by icloudpd-rs may differ by 29-58 bytes compared to the Python version. This is due to a different EXIF library (`little_exif` vs `piexif`) and doesn't affect image quality or metadata correctness. The photos are visually identical.
+- **EXIF file size** - When `--set-exif-datetime` is used, files written by icloudpd-rs may differ by 29-58 bytes compared to the Python version. This is due to a different EXIF library (`little_exif` vs `piexif`) and doesn't affect image quality or metadata correctness. The photos are visually identical.
 
 ## What you don't need to worry about
 
-- **`--until-found`** — The SQLite state database replaces this entirely. icloudpd-rs knows exactly which assets have been downloaded, so it doesn't need to scan backwards looking for familiar files.
-- **Re-downloading** — `import-existing` populates the database from your existing files. After that, only new or failed assets are fetched.
-- **Cookie migration** — You can't reuse Python cookies, but a fresh auth takes 30 seconds. The new session persists the same way.
-- **Folder structure compatibility** — Both Python-style `{:%Y/%m/%d}` and plain `%Y/%m/%d` format strings are accepted. Your existing folder layout works as-is.
+- **`--until-found`** - The SQLite state database replaces this entirely. icloudpd-rs knows exactly which assets have been downloaded, so it doesn't need to scan backwards looking for familiar files.
+- **Re-downloading** - `import-existing` populates the database from your existing files. After that, only new or failed assets are fetched.
+- **Cookie migration** - You can't reuse Python cookies, but a fresh auth takes 30 seconds. The new session persists the same way.
+- **Folder structure compatibility** - Both Python-style `{:%Y/%m/%d}` and plain `%Y/%m/%d` format strings are accepted. Your existing folder layout works as-is.

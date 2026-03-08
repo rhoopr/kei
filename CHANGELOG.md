@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Early state DB skip** - During re-syncs, assets already confirmed in the state DB skip path resolution and filesystem checks entirely. Uses a config hash to detect when download settings change (invalidating trust). Eliminates ~16k path resolutions per cycle for a 16k-photo library with only a handful of new photos. Adds metadata table (schema v2 migration) ([#129])
+
+### Fixed
+
+- **`retry-failed` downloading entire library** - `retry-failed` now only retries assets already known to the state DB, skipping new iCloud assets that appear between runs ([#129])
+- **SHA-1 checksum support** - Apple's 20-byte (raw SHA-1) and 21-byte (0x01 prefix + SHA-1) checksum formats are now handled in both downloads and verify ([#129])
+- **Session cookie persistence** - All cookies from the jar (including those set by redirect responses) are now persisted, so sessions survive process restarts ([#129])
+- **Docker lock contention UX** - Improved error message when the lock file is held by another instance, with Docker-specific troubleshooting guidance ([#129])
+- **Large async futures** - Heap-allocate 256 KiB resume buffer and `Box::pin` deep async chains to prevent ~263 KiB stack futures per concurrent download ([#129])
+- **Write lock timeout** - 30s timeout on session validation prevents a hung HTTP request from starving download tasks ([#129])
+- **Schema migration logic** - `migrate_to_version` now uses a proper `match` on version instead of always applying SCHEMA_V1, which would have broken on future migrations ([#129])
+
+### Changed
+
+- Inline format args across 10 files (~40 instances) ([#129])
+- Narrowed `pub` to `pub(crate)` for 14 functions and 6 structs ([#129])
+- Capped mpsc channel buffer at 500, removed intermediate `.collect()` before `select_all` ([#129])
+- Removed needless raw string hashes in SQL literals ([#129])
+- Merged identical match arms, used `let...else` and `is_some_and` where applicable ([#129])
+- Derived `PartialEq` on `CookieEntry`, flattened nested `if let`, simplified match arms ([#129])
+- Replaced redundant `.to_string().into_boxed_str()` with `.clone()` / `.into()` ([#129])
+
+[#129]: https://github.com/rhoopr/icloudpd-rs/pull/129
+
 ---
 
 ## [0.3.0] - 2026-03-07
@@ -17,25 +43,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Configuration
 
-- **TOML config file ([#51])** — Settings can now live in a `config.toml` file instead of (or alongside) CLI flags. Loads from `~/.config/icloudpd-rs/config.toml` by default, or a custom path via `--config`. Grouped into sections: `[auth]`, `[download]`, `[filters]`, `[photos]`, `[watch]`, `[notifications]`. Layered resolution: CLI flags override TOML values, which override built-in defaults. The config file is optional — CLI flags still work exactly as before.
+- **TOML config file ([#51])** - Settings can now live in a `config.toml` file instead of (or alongside) CLI flags. Loads from `~/.config/icloudpd-rs/config.toml` by default, or a custom path via `--config`. Grouped into sections: `[auth]`, `[download]`, `[filters]`, `[photos]`, `[watch]`, `[notifications]`. Layered resolution: CLI flags override TOML values, which override built-in defaults. The config file is optional - CLI flags still work exactly as before.
 
 [#51]: https://github.com/rhoopr/icloudpd-rs/issues/51
 
 #### Distribution
 
-- **Docker image ([#40])** — Multi-arch images (amd64/arm64) published to `ghcr.io/rhoopr/icloudpd-rs`. Multi-stage build with `debian:bookworm-slim` runtime (includes `bash` and `curl` for notification scripts). Uses `/config` and `/photos` volumes. Supports `ICLOUD_USERNAME`, `ICLOUD_PASSWORD`, and `TZ` environment variables. Includes `docker-compose.yml` example.
+- **Docker image ([#40])** - Multi-arch images (amd64/arm64) published to `ghcr.io/rhoopr/icloudpd-rs`. Multi-stage build with `debian:bookworm-slim` runtime (includes `bash` and `curl` for notification scripts). Uses `/config` and `/photos` volumes. Supports `ICLOUD_USERNAME`, `ICLOUD_PASSWORD`, and `TZ` environment variables. Includes `docker-compose.yml` example.
 
 [#40]: https://github.com/rhoopr/icloudpd-rs/issues/40
 
 #### Authentication
 
-- **Headless MFA ([#36])** — New `submit-code` subcommand for non-interactive 2FA. Run `icloudpd-rs submit-code 123456` (or `docker exec icloudpd-rs icloudpd-rs submit-code 123456`) to submit a code from outside the running process. In headless mode (non-interactive stdin), the sync returns a `TwoFactorRequired` status and fires a notification instead of blocking on a prompt.
+- **Headless MFA ([#36])** - New `submit-code` subcommand for non-interactive 2FA. Run `icloudpd-rs submit-code 123456` (or `docker exec icloudpd-rs icloudpd-rs submit-code 123456`) to submit a code from outside the running process. In headless mode (non-interactive stdin), the sync returns a `TwoFactorRequired` status and fires a notification instead of blocking on a prompt.
 
 [#36]: https://github.com/rhoopr/icloudpd-rs/issues/36
 
 #### Notifications
 
-- **Notification scripts ([#32])** — `--notification-script <path>` (or `[notifications] script` in TOML) runs a script on sync events. The script receives `ICLOUDPD_EVENT`, `ICLOUDPD_MESSAGE`, and `ICLOUDPD_USERNAME` as environment variables. Events: `2fa_required`, `sync_complete`, `sync_failed`, `session_expired`. Fire-and-forget execution with a 30-second timeout.
+- **Notification scripts ([#32])** - `--notification-script <path>` (or `[notifications] script` in TOML) runs a script on sync events. The script receives `ICLOUDPD_EVENT`, `ICLOUDPD_MESSAGE`, and `ICLOUDPD_USERNAME` as environment variables. Events: `2fa_required`, `sync_complete`, `sync_failed`, `session_expired`. Fire-and-forget execution with a 30-second timeout.
 
 [#32]: https://github.com/rhoopr/icloudpd-rs/issues/32
 
@@ -45,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Parallel photo enumeration** — Library enumeration now runs across multiple parallel API fetchers (2x `--threads-num`), reducing scan time from ~10 minutes to ~30 seconds for a 16k-item library. Previously, pages were fetched sequentially at ~3-4s each ([#114])
+- **Parallel photo enumeration** - Library enumeration now runs across multiple parallel API fetchers (2x `--threads-num`), reducing scan time from ~10 minutes to ~30 seconds for a 16k-item library. Previously, pages were fetched sequentially at ~3-4s each ([#114])
 
 [#114]: https://github.com/rhoopr/icloudpd-rs/pull/114
 
@@ -55,28 +81,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Watch mode album refresh** — Albums are now re-resolved each watch cycle, so newly created iCloud albums are discovered without restarting the daemon ([#23])
-- **`--notify-systemd` flag** — Sends sd_notify messages (`READY`, `STOPPING`, `STATUS`, `WATCHDOG`) for systemd service integration. Linux-only; no-op on other platforms ([#23])
-- **`--pid-file` flag** — Writes the process PID to a file on startup and removes it on exit, for service managers and monitoring ([#23])
-- **Watch mode error tolerance** — `PartialFailure` outcomes in watch mode now log a warning and continue to the next cycle instead of exiting, since transient failures are expected in long-running sessions ([#23])
+- **Watch mode album refresh** - Albums are now re-resolved each watch cycle, so newly created iCloud albums are discovered without restarting the daemon ([#23])
+- **`--notify-systemd` flag** - Sends sd_notify messages (`READY`, `STOPPING`, `STATUS`, `WATCHDOG`) for systemd service integration. Linux-only; no-op on other platforms ([#23])
+- **`--pid-file` flag** - Writes the process PID to a file on startup and removes it on exit, for service managers and monitoring ([#23])
+- **Watch mode error tolerance** - `PartialFailure` outcomes in watch mode now log a warning and continue to the next cycle instead of exiting, since transient failures are expected in long-running sessions ([#23])
 
 [#23]: https://github.com/rhoopr/icloudpd-rs/issues/23
 
 ### Fixed
 
-- **Epoch date fallback warnings** — `asset_date()`, `added_date()`, and file mtime now log warnings when falling back to the Unix epoch or clamping negative timestamps, making silent data loss visible
-- **EXIF failure tracking** — Download summary now reports EXIF stamping failures separately (e.g., `10 downloaded (2 EXIF failures), 0 failed`) instead of only logging per-file warnings
-- **Path traversal protection** — Album names from iCloud are sanitized to prevent directory traversal (`../`), Windows reserved names (`CON`, `NUL`, etc.), and leading dot attacks
-- **Unknown checksum format warning** — Checksums with unrecognized formats (not 32 or 33 bytes) now log a warning instead of silently passing verification
-- **Resume restart logging** — When a server ignores an HTTP Range header and returns 200 instead of 206, the restart is now logged at info level
-- **Password redaction in logs** — Passwords provided via `--password` or `ICLOUD_PASSWORD` are redacted from all tracing output, replacing occurrences with `********`
-- **AM/PM filename matching** — Files with whitespace variants before AM/PM (regular space, narrow no-break space U+202F, or no space) are now recognized as the same file, preventing duplicate downloads of macOS screenshots across locale configurations
-- **WEBP file type recognition** — WEBP images (`org.webmproject.webp`) are now correctly classified as images instead of defaulting to movie, preventing `--skip-videos` from incorrectly excluding WEBP photos ([#90])
-- **Large video download integrity** — Downloads now verify content-length against bytes received before checksum comparison, catching CDN truncation (e.g. Apple silently cutting off videos at ~1 GB) earlier and triggering automatic retry ([#91])
-- **CAS Op-Lock / TRY_AGAIN_LATER retry** — CloudKit server errors (`TRY_AGAIN_LATER`, `CAS_OP_LOCK`, `RETRY_LATER`, `THROTTLED`) embedded in JSON responses are now detected and automatically retried with exponential backoff, preventing silent page loss during photo enumeration ([#94])
-- **Configurable temp file suffix** — Partial downloads now use `.icloudpd-tmp` by default instead of `.part`, avoiding conflicts with Nextcloud/WebDAV sync clients that reject `.part` files. Configurable via `--temp-suffix` ([#92])
-- **Live photo dedup suffix consistency** — When two live photos share the same base filename and size-based deduplication adds a suffix to the HEIC, the MOV companion now derives from the deduped HEIC name, keeping the pair visually matched on disk ([#102])
-- **ADP detection and error handling** — Users with Advanced Data Protection (ADP) enabled now receive a clear, actionable error message explaining the incompatibility and how to resolve it, instead of a generic API failure. Detects `ZONE_NOT_FOUND`, `AUTHENTICATION_FAILED`, `ACCESS_DENIED`, and "private db access disabled" responses from CloudKit ([#99])
+- **Epoch date fallback warnings** - `asset_date()`, `added_date()`, and file mtime now log warnings when falling back to the Unix epoch or clamping negative timestamps, making silent data loss visible
+- **EXIF failure tracking** - Download summary now reports EXIF stamping failures separately (e.g., `10 downloaded (2 EXIF failures), 0 failed`) instead of only logging per-file warnings
+- **Path traversal protection** - Album names from iCloud are sanitized to prevent directory traversal (`../`), Windows reserved names (`CON`, `NUL`, etc.), and leading dot attacks
+- **Unknown checksum format warning** - Checksums with unrecognized formats (not 32 or 33 bytes) now log a warning instead of silently passing verification
+- **Resume restart logging** - When a server ignores an HTTP Range header and returns 200 instead of 206, the restart is now logged at info level
+- **Password redaction in logs** - Passwords provided via `--password` or `ICLOUD_PASSWORD` are redacted from all tracing output, replacing occurrences with `********`
+- **AM/PM filename matching** - Files with whitespace variants before AM/PM (regular space, narrow no-break space U+202F, or no space) are now recognized as the same file, preventing duplicate downloads of macOS screenshots across locale configurations
+- **WEBP file type recognition** - WEBP images (`org.webmproject.webp`) are now correctly classified as images instead of defaulting to movie, preventing `--skip-videos` from incorrectly excluding WEBP photos ([#90])
+- **Large video download integrity** - Downloads now verify content-length against bytes received before checksum comparison, catching CDN truncation (e.g. Apple silently cutting off videos at ~1 GB) earlier and triggering automatic retry ([#91])
+- **CAS Op-Lock / TRY_AGAIN_LATER retry** - CloudKit server errors (`TRY_AGAIN_LATER`, `CAS_OP_LOCK`, `RETRY_LATER`, `THROTTLED`) embedded in JSON responses are now detected and automatically retried with exponential backoff, preventing silent page loss during photo enumeration ([#94])
+- **Configurable temp file suffix** - Partial downloads now use `.icloudpd-tmp` by default instead of `.part`, avoiding conflicts with Nextcloud/WebDAV sync clients that reject `.part` files. Configurable via `--temp-suffix` ([#92])
+- **Live photo dedup suffix consistency** - When two live photos share the same base filename and size-based deduplication adds a suffix to the HEIC, the MOV companion now derives from the deduped HEIC name, keeping the pair visually matched on disk ([#102])
+- **ADP detection and error handling** - Users with Advanced Data Protection (ADP) enabled now receive a clear, actionable error message explaining the incompatibility and how to resolve it, instead of a generic API failure. Detects `ZONE_NOT_FOUND`, `AUTHENTICATION_FAILED`, `ACCESS_DENIED`, and "private db access disabled" responses from CloudKit ([#99])
 
 [#90]: https://github.com/rhoopr/icloudpd-rs/issues/90
 [#91]: https://github.com/rhoopr/icloudpd-rs/issues/91
@@ -96,9 +122,9 @@ Initial release. A ground-up Rust rewrite of [icloud-photos-downloader](https://
 #### State Management (New in Rust)
 
 - **SQLite state database** tracks every asset's status (`pending`, `downloaded`, `failed`) with checksums, paths, and error messages
-- **Skip-by-database** — subsequent syncs skip already-downloaded assets without filesystem checks
-- **Automatic re-download** — if database says downloaded but file is missing, re-downloads automatically
-- **Sync run history** — records start time, completion, and statistics for each run
+- **Skip-by-database** - subsequent syncs skip already-downloaded assets without filesystem checks
+- **Automatic re-download** - if database says downloaded but file is missing, re-downloads automatically
+- **Sync run history** - records start time, completion, and statistics for each run
 
 #### CLI Subcommands (New in Rust)
 
@@ -180,7 +206,7 @@ These are intentional improvements over the Python implementation:
 | **API errors** | Retry loop exists but `MAX_RETRIES = 0` | Automatic retry with jitter on 5xx/429 |
 | **Album fetch** | Sequential (`for album in albums`) | Concurrent (bounded by `--threads-num`) |
 | **Error handling** | No error classification | Classifies transient vs permanent errors |
-| **Cookie format** | LWPCookieJar format | JSON format (not compatible with Python's LWP cookies — re-auth required) |
+| **Cookie format** | LWPCookieJar format | JSON format (not compatible with Python's LWP cookies - re-auth required) |
 | **Folder syntax** | Python datetime format (`{:%Y/%m/%d}`) | Both `{:%Y}` and `%Y` strftime accepted |
 
 ### Not Implemented (Planned)
@@ -189,38 +215,38 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 #### Coming in v0.4
 
-- [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) — **Auto-delete** (detect iCloud deletions, optionally remove local copies)
-- [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) — **Delete after download** (`--delete-after-download`)
+- [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) - **Auto-delete** (detect iCloud deletions, optionally remove local copies)
+- [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) - **Delete after download** (`--delete-after-download`)
 
 #### Authentication & Security
-- [#21](https://github.com/rhoopr/icloudpd-rs/issues/21) — SMS-based 2FA (trusted device only currently)
-- [#22](https://github.com/rhoopr/icloudpd-rs/issues/22) — OS keyring integration for password storage
+- [#21](https://github.com/rhoopr/icloudpd-rs/issues/21) - SMS-based 2FA (trusted device only currently)
+- [#22](https://github.com/rhoopr/icloudpd-rs/issues/22) - OS keyring integration for password storage
 
 #### Content & Downloads
-- [#19](https://github.com/rhoopr/icloudpd-rs/issues/19) — XMP sidecar export (`--xmp-sidecar`)
-- [#14](https://github.com/rhoopr/icloudpd-rs/issues/14) — Multiple size downloads (`--size` accepting multiple values)
-- [#17](https://github.com/rhoopr/icloudpd-rs/issues/17) — Print filenames only (`--only-print-filenames`)
-- [#52](https://github.com/rhoopr/icloudpd-rs/issues/52) — HEIC to JPEG conversion (`--convert-heic`)
+- [#19](https://github.com/rhoopr/icloudpd-rs/issues/19) - XMP sidecar export (`--xmp-sidecar`)
+- [#14](https://github.com/rhoopr/icloudpd-rs/issues/14) - Multiple size downloads (`--size` accepting multiple values)
+- [#17](https://github.com/rhoopr/icloudpd-rs/issues/17) - Print filenames only (`--only-print-filenames`)
+- [#52](https://github.com/rhoopr/icloudpd-rs/issues/52) - HEIC to JPEG conversion (`--convert-heic`)
 
 #### iCloud Lifecycle
-- [#30](https://github.com/rhoopr/icloudpd-rs/issues/30) — Keep iCloud recent days (`--keep-icloud-recent-days`)
+- [#30](https://github.com/rhoopr/icloudpd-rs/issues/30) - Keep iCloud recent days (`--keep-icloud-recent-days`)
 
 #### Notifications & Monitoring
-- [#31](https://github.com/rhoopr/icloudpd-rs/issues/31) — Email/SMTP notifications on 2FA expiration
-- [#55](https://github.com/rhoopr/icloudpd-rs/issues/55) — Prometheus metrics export
+- [#31](https://github.com/rhoopr/icloudpd-rs/issues/31) - Email/SMTP notifications on 2FA expiration
+- [#55](https://github.com/rhoopr/icloudpd-rs/issues/55) - Prometheus metrics export
 
 #### Configuration
-- [#33](https://github.com/rhoopr/icloudpd-rs/issues/33) — Multi-account support
+- [#33](https://github.com/rhoopr/icloudpd-rs/issues/33) - Multi-account support
 
 ### Removed (vs Python icloudpd)
 
-- `--until-found` — Replaced by SQLite state tracking; the database knows what's already downloaded
-- `--smtp-*` flags — Email notifications not yet implemented ([#31](https://github.com/rhoopr/icloudpd-rs/issues/31))
+- `--until-found` - Replaced by SQLite state tracking; the database knows what's already downloaded
+- `--smtp-*` flags - Email notifications not yet implemented ([#31](https://github.com/rhoopr/icloudpd-rs/issues/31))
 
 ### Known Issues
 
-- [#47](https://github.com/rhoopr/icloudpd-rs/issues/47) — Progress bar position can overshoot when photos have companion files
-- [#69](https://github.com/rhoopr/icloudpd-rs/issues/69) — Schema migration logic needs improvement before v2
+- [#47](https://github.com/rhoopr/icloudpd-rs/issues/47) - Progress bar position can overshoot when photos have companion files
+- [#69](https://github.com/rhoopr/icloudpd-rs/issues/69) - Schema migration logic needs improvement before v2
 
 ---
 
