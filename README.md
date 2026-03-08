@@ -1,4 +1,4 @@
-> **Blog:** [I Got Suspended from GitHub for 10 Days](https://robhooper.xyz/github-suspension) — what happens when GitHub's automated systems flag your account, and why local backups matter
+> **Blog:** [I Got Suspended from GitHub for 10 Days](https://robhooper.xyz/github-suspension) - what happens when GitHub's automated systems flag your account, and why local backups matter
 
 # icloudpd-rs
 
@@ -7,16 +7,16 @@
 
 A fast, reliable iCloud Photos downloader and **icloudpd alternative**. Single binary, no Python runtime, no dependencies.
 
-Inspired by the excellent [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (icloudpd), which did the hard work of reverse-engineering Apple's private APIs. icloudpd-rs is a ground-up rewrite that adds parallel downloads, persistent state, and resumable transfers — things that are hard to retrofit into an existing codebase:
+Inspired by the excellent [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (icloudpd), which did the hard work of reverse-engineering Apple's private APIs. icloudpd-rs is a ground-up rewrite that adds parallel downloads, persistent state, and resumable transfers - things that are hard to retrofit into an existing codebase:
 
-- **Parallel downloads** with 10 concurrent connections by default — bottleneck shifts to your network speed rather than serial API calls
-- **~30-second enumeration** of a 20k-photo library (vs sequential API calls)
-- **SQLite state tracking** — subsequent syncs skip what's already downloaded, instantly
-- **Resumable transfers** — partial downloads pick up where they left off, with SHA256 verification
-- **Single binary** — download and run. No runtime, no package manager, no virtual environments.
+- **Parallel downloads** - Your download speed becomes the bottleneck, **5x+ faster** than icloudpd in gigabit benchmarks.
+- **Fast library scanning** - 20k-photo library indexed in ~30s, **15x faster** than sequential API calls.
+- **SQLite state tracking** - Subsequent syncs skip what's already downloaded, instantly.
+- **Resumable transfers** - Partial downloads pick up where they left off, with SHA256 verification.
+- **Single binary** - Download and run. No runtime, no package manager, no virtual environments.
 
 > [!TIP]
-> **Coming from Python icloudpd?** See the **[Migration Guide](docs/migration-from-python.md)** — it maps every flag and shows how to pick up where you left off without re-downloading anything.
+> **Coming from Python icloudpd?** See the **[Migration Guide](docs/migration-from-python.md)** - it maps every flag and shows how to pick up where you left off without re-downloading anything.
 
 ## Quick start
 
@@ -123,7 +123,7 @@ Run `icloudpd-rs --help` for the full flag list, or check the **[Wiki](https://g
 | Feature | Details |
 |---------|---------|
 | Parallel downloads | Configurable concurrency, downloads start as the first API page returns |
-| State tracking | SQLite DB tracks downloaded/failed/pending — no re-scanning |
+| State tracking | SQLite DB tracks downloaded/failed/pending - no re-scanning |
 | Resumable transfers | Partial downloads resume via HTTP Range with SHA256 verification |
 | TOML config | Optional `config.toml` with `[auth]`, `[download]`, `[filters]`, `[photos]`, `[watch]`, `[notifications]` sections. CLI flags override config values. [Guide](https://github.com/rhoopr/icloudpd-rs/wiki/Configuration) |
 | Docker | Multi-arch (amd64/arm64) on `ghcr.io/rhoopr/icloudpd-rs`. [Guide](https://github.com/rhoopr/icloudpd-rs/wiki/Docker) |
@@ -136,8 +136,8 @@ Run `icloudpd-rs --help` for the full flag list, or check the **[Wiki](https://g
 ### Not yet implemented
 
 **Coming in v0.4** (next release):
-- [Auto-delete / Recently Deleted scan](https://github.com/rhoopr/icloudpd-rs/issues/28) — detect iCloud deletions and optionally remove local copies
-- [Delete after download](https://github.com/rhoopr/icloudpd-rs/issues/29) — remove photos from iCloud after successful download
+- [Auto-delete / Recently Deleted scan](https://github.com/rhoopr/icloudpd-rs/issues/28) - detect iCloud deletions and optionally remove local copies
+- [Delete after download](https://github.com/rhoopr/icloudpd-rs/issues/29) - remove photos from iCloud after successful download
 
 **Planned:**
 - [XMP sidecar export](https://github.com/rhoopr/icloudpd-rs/issues/19)
@@ -149,9 +149,9 @@ See [all open issues](https://github.com/rhoopr/icloudpd-rs/issues) for the full
 
 ## Documentation
 
-- **[Wiki](https://github.com/rhoopr/icloudpd-rs/wiki)** — guides for every CLI option, configuration, Docker, and troubleshooting
-- **[Migration Guide](docs/migration-from-python.md)** — switching from Python icloudpd
-- **[Changelog](CHANGELOG.md)** — release notes and full diff from the Python version
+- **[Wiki](https://github.com/rhoopr/icloudpd-rs/wiki)** - guides for every CLI option, configuration, Docker, and troubleshooting
+- **[Migration Guide](docs/migration-from-python.md)** - switching from Python icloudpd
+- **[Changelog](CHANGELOG.md)** - release notes and full diff from the Python version
 
 ## Contributing
 
@@ -163,7 +163,7 @@ cargo fmt -- --check && cargo clippy && cargo test
 
 ## License
 
-MIT — see [LICENSE.md](LICENSE.md)
+MIT - see [LICENSE.md](LICENSE.md)
 
 ## Acknowledgments
 
