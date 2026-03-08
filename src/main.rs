@@ -837,16 +837,15 @@ async fn main() -> anyhow::Result<()> {
                 // For retry-failed, reset failed assets to pending
                 if is_retry_failed {
                     match db.reset_failed().await {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(count, "Reset failed assets to pending");
-                        }
                         Ok(0) => {
                             tracing::info!("No failed assets to retry");
                             return Ok(());
                         }
-                        Ok(_) => unreachable!(),
+                        Ok(count) => {
+                            tracing::info!(count, "Reset failed assets to pending");
+                        }
                         Err(e) => {
-                            tracing::warn!("Failed to reset failed assets: {}", e);
+                            tracing::warn!("Failed to reset failed assets: {e}");
                         }
                     }
                 }

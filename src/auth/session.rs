@@ -54,7 +54,7 @@ fn is_cookie_expired(cookie_str: &str, now: &chrono::DateTime<chrono::Utc>) -> b
 }
 
 /// A single persisted cookie entry (URL + Set-Cookie header value).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
 struct CookieEntry {
     url: String,
     cookie: String,
@@ -398,20 +398,22 @@ impl Session {
         };
 
         let mut entries: Vec<CookieEntry> = Vec::new();
-        for domain_url in domains {
-            let url_string = (*domain_url).to_string();
-            if let Ok(url) = url_string.parse::<url::Url>() {
-                if let Some(cookies) = self.cookie_jar.cookies(&url) {
-                    if let Ok(cookie_str) = cookies.to_str() {
-                        for pair in cookie_str.split("; ") {
-                            if !pair.is_empty() {
-                                entries.push(CookieEntry {
-                                    url: url_string.clone(),
-                                    cookie: pair.to_string(),
-                                });
-                            }
-                        }
-                    }
+        for &domain_url in domains {
+            let Ok(url) = domain_url.parse::<url::Url>() else {
+                continue;
+            };
+            let Some(cookies) = self.cookie_jar.cookies(&url) else {
+                continue;
+            };
+            let Ok(cookie_str) = cookies.to_str() else {
+                continue;
+            };
+            for pair in cookie_str.split("; ") {
+                if !pair.is_empty() {
+                    entries.push(CookieEntry {
+                        url: domain_url.to_string(),
+                        cookie: pair.to_string(),
+                    });
                 }
             }
         }
@@ -427,12 +429,7 @@ impl Session {
         if cookiejar_path.exists() {
             if let Ok(contents) = fs::read_to_string(&cookiejar_path).await {
                 if let Ok(existing) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
-                    if existing.len() == entries.len()
-                        && existing
-                            .iter()
-                            .zip(entries.iter())
-                            .all(|(a, b)| a.url == b.url && a.cookie == b.cookie)
-                    {
+                    if existing == entries {
                         return Ok(());
                     }
                 }
