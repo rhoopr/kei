@@ -1,6 +1,6 @@
 # icloudpd-rs v1.0 Roadmap
 
-## Current State (v0.2.1)
+## Current State (v0.3.0)
 
 **Solid foundation.** Core sync, auth, state tracking, parallel downloads, resumable transfers, watch mode, systemd integration, graceful shutdown, shared library support — all shipped.
 
@@ -9,9 +9,9 @@
 | Category | Issue | Feature |
 |----------|-------|---------|
 | ~~Config~~ | ~~#51~~ | ~~TOML config file~~ |
-| Distribution | #40 | Docker images |
+| ~~Distribution~~ | ~~#40~~ | ~~Docker images~~ |
 | Auth | #21 | SMS-based 2FA |
-| Auth | #36 | Headless MFA (`--submit-code`) for Docker |
+| ~~Auth~~ | ~~#36~~ | ~~Headless MFA (`submit-code`) for Docker~~ |
 | Auth | #22 | OS keyring integration |
 | Auth | #38 | Legacy 2SA |
 | Auth | #37 | Python LWPCookieJar import |
@@ -23,7 +23,7 @@
 | Lifecycle | #29 | Delete after download |
 | Lifecycle | #30 | Keep iCloud recent days |
 | Notifications | #31 | Email/SMTP on 2FA expiry |
-| Notifications | #32 | Notification scripts |
+| ~~Notifications~~ | ~~#32~~ | ~~Notification scripts~~ |
 | Notifications | #55 | Prometheus metrics |
 | Config | #33 | Multi-account support |
 | Config | #34 | OS locale date formatting |
@@ -46,27 +46,27 @@
 2. ~~**Kill the `LegacyCli` shim**~~
    - `Config::build()` now merges `Cli` + optional `TomlConfig` directly via `resolve()` helpers
 
-### Phase 1: Docker & Unattended Operation (v0.3)
+### Phase 1: Docker & Unattended Operation (v0.3) ✅ COMPLETE
 
-*The single highest-leverage milestone for user acquisition*
+*Shipped in `feat/docker-headless` branch (PR #119)*
 
-3. **Docker image (#40)**
-   - Multi-stage build, `scratch` or `distroless` base (tiny image, massive selling point vs Python's)
+3. ~~**Docker image (#40)**~~
+   - Multi-stage build with `debian:bookworm-slim` runtime (bash + curl included for notification scripts)
    - Single `/config` volume (cookies, state DB, config.toml) + `/photos` volume
-   - Support `ICLOUD_USERNAME`, `ICLOUD_PASSWORD`, `TZ` env vars
-   - `docker-compose.yml` example in README
-   - GitHub Actions to build + push to `ghcr.io/rhoopr/icloudpd-rs`
+   - `ICLOUD_USERNAME`, `ICLOUD_PASSWORD`, `TZ` env vars
+   - `docker-compose.yml` example
+   - GitHub Actions builds multi-arch (amd64/arm64) and pushes to `ghcr.io/rhoopr/icloudpd-rs`
 
-4. **Headless MFA (#36)**
-   - `--submit-code <code>` to complete 2FA non-interactively
-   - Enables `docker exec icloudpd-rs icloudpd-rs --submit-code 123456`
-   - Critical for Docker — without this, 2FA re-auth in containers is painful
+4. ~~**Headless MFA (#36)**~~
+   - `submit-code <code>` subcommand for non-interactive 2FA
+   - Enables `docker exec icloudpd-rs icloudpd-rs submit-code 123456`
+   - In headless mode, returns `TwoFactorRequired` error with notification instead of bailing
 
-5. **Session expiry notification (#31/#32)**
-   - Start with `--notification-script <path>` — a generic hook that gets called with event type + message
-   - Covers 2FA expiry, sync completion, failures
-   - Users wire it to whatever they want (webhook, Telegram, email, ntfy)
-   - Avoids maintaining N notification integrations
+5. ~~**Session expiry notification (#31/#32)**~~
+   - `--notification-script <path>` and `[notifications] script` TOML config
+   - Events: `2fa_required`, `sync_complete`, `sync_failed`, `session_expired`
+   - Script receives `ICLOUDPD_EVENT`, `ICLOUDPD_MESSAGE`, `ICLOUDPD_USERNAME` env vars
+   - Fire-and-forget via `tokio::spawn` with 30s timeout
 
 ### Phase 2: Lifecycle & Parity (v0.4)
 
@@ -112,10 +112,10 @@ Aligned to engineering phases.
 
 | Trigger | Action | Depends on |
 |---------|--------|------------|
-| **Phase 1 ships** | Write migration guide (wiki page mapping Python flags to Rust flags/TOML, `import-existing` workflow) | Docker + headless MFA |
+| ~~**Phase 1 ships**~~ | ~~Write migration guide (wiki page mapping Python flags to Rust flags/TOML, `import-existing` workflow)~~ | ~~Docker + headless MFA~~ — **READY** |
 | **Python icloudpd breaks or maintainer steps down** | Brief, factual comment on their repo/issues linking to icloudpd-rs | Migration guide exists |
 | **Phase 2 ships** | Show HN / r/selfhosted / r/homelab launch post. Lead with "icloudpd is losing maintenance, here's what I built" + concrete numbers (2.5-3x faster, 30s enumeration, SQLite state) | Auto-delete + Docker = covers most users |
-| **Docker image live** | Post on boredazfcuk wrapper issues / discussions with env var mapping doc | Docker image + compose example |
+| ~~**Docker image live**~~ | ~~Post on boredazfcuk wrapper issues / discussions with env var mapping doc~~ | ~~Docker image + compose example~~ — **READY** |
 
 ### Launch post narrative
 
@@ -132,10 +132,10 @@ Don't lead with "I rewrote X in Rust." Lead with the problem:
 ## Priority Order (what to build next)
 
 1. ~~TOML config (#51)~~ — **DONE**
-2. Docker image (#40) — **unblocks everything else on the strategy side**
-3. Headless MFA (#36) — **makes Docker actually usable for unattended**
-4. Notification script (#32) — **2FA expiry notification is the #1 operational pain**
+2. ~~Docker image (#40)~~ — **DONE**
+3. ~~Headless MFA (#36)~~ — **DONE**
+4. ~~Notification script (#32)~~ — **DONE**
 5. Auto-delete (#28) — **the feature gap most Python users will notice**
 6. Schema migration (#69) — **must be solid before calling it v1.0**
 
-Items 1-4 get you to a launchable state. Items 5-6 get you to v1.0.
+Items 1-4 are complete — the project is in a launchable state. Items 5-6 get you to v1.0.
