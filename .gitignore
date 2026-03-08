@@ -10,3 +10,6 @@ CLAUDE.md
 
 # macOS Junk
 .DS_Store
+
+# Credentials
+.env
