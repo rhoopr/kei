@@ -802,15 +802,10 @@ async fn stream_and_download(
     // starves others; each stream's background task provides prefetch.
     // When concurrency > 1 and counts are available, each album's
     // photo_stream spawns parallel fetcher tasks for faster enumeration.
-    let album_streams: Vec<_> = albums
-        .iter()
-        .zip(&album_counts)
-        .map(|(album, &count)| {
+    let mut combined =
+        stream::select_all(albums.iter().zip(&album_counts).map(|(album, &count)| {
             album.photo_stream(config.recent, Some(count), config.concurrent_downloads)
-        })
-        .collect();
-
-    let mut combined = stream::select_all(album_streams);
+        }));
 
     // Track paths claimed by in-flight downloads to detect collisions between
     // assets with the same filename processed in the same session.
