@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fs4::fs_std::FileExt;
+use reqwest::cookie::CookieStore;
 use reqwest::header::{HeaderMap, HeaderValue, ORIGIN, REFERER, USER_AGENT};
 use reqwest::{Client, Response};
 use serde_json::Value;
@@ -53,7 +54,7 @@ fn is_cookie_expired(cookie_str: &str, now: &chrono::DateTime<chrono::Utc>) -> b
 }
 
 /// A single persisted cookie entry (URL + Set-Cookie header value).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
 struct CookieEntry {
     url: String,
     cookie: String,
@@ -64,11 +65,9 @@ struct CookieEntry {
 pub struct Session {
     client: Client,
     download_client: Client,
-    /// Cookie jar shared with `reqwest::Client`. This field is intentionally
-    /// never read — it exists solely to prevent the `Arc<Jar>` from being
-    /// dropped while the client is in use. The client holds a weak reference
-    /// internally, so we must keep the Arc alive here.
-    #[allow(dead_code)] // Intentional: prevents Arc from dropping
+    /// Cookie jar shared with `reqwest::Client`. Queried by
+    /// `persist_jar_cookies` to save session cookies to disk, and kept alive
+    /// so the client's internal weak reference remains valid.
     cookie_jar: Arc<reqwest::cookie::Jar>,
     pub session_data: HashMap<String, String>,
     cookie_dir: PathBuf,
@@ -112,7 +111,7 @@ impl Session {
 
         // Acquire an exclusive file lock to prevent concurrent instances for
         // the same account from corrupting session/cookie state.
-        let lock_path = cookie_dir.join(format!("{}.lock", sanitized));
+        let lock_path = cookie_dir.join(format!("{sanitized}.lock"));
         let lock_file = tokio::task::spawn_blocking({
             let lock_path = lock_path.clone();
             move || {
@@ -124,7 +123,9 @@ impl Session {
                     .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))?;
                 if !acquired {
                     anyhow::bail!(
-                        "Another icloudpd-rs instance is running for this account (lock: {})",
+                        "Another icloudpd-rs instance is running for this account (lock: {}). \
+                         If running in Docker, check for orphaned containers with \
+                         `docker ps` and stop them with `docker stop <name>`.",
                         lock_path.display()
                     );
                 }
@@ -198,7 +199,7 @@ impl Session {
         default_headers.insert(ORIGIN, HeaderValue::from_str(home_endpoint)?);
         default_headers.insert(
             REFERER,
-            HeaderValue::from_str(&format!("{}/", home_endpoint))?,
+            HeaderValue::from_str(&format!("{home_endpoint}/"))?,
         );
         default_headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
 
@@ -221,7 +222,7 @@ impl Session {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()?;
 
-        let session_path = cookie_dir.join(format!("{}.session", sanitized));
+        let session_path = cookie_dir.join(format!("{sanitized}.session"));
         let session_data = if session_path.exists() {
             match fs::read_to_string(&session_path).await {
                 Ok(contents) => match serde_json::from_str::<HashMap<String, Value>>(&contents) {
@@ -355,69 +356,92 @@ impl Session {
             tracing::debug!("Saved session data to file");
         }
 
-        // Only process cookies when the response contains Set-Cookie headers.
-        if headers.get("set-cookie").is_none() {
+        // Persist ALL cookies the jar would send to known Apple domains.
+        //
+        // Python's icloudpd calls `cookies.save(ignore_discard=True)` after
+        // every request, dumping the entire jar. reqwest's Jar doesn't support
+        // iteration, but we can query it for specific URLs via `cookies()`.
+        //
+        // This is critical for session reuse across process restarts: if
+        // `accountLogin` involves HTTP redirects, cookies set by intermediate
+        // redirect responses live in the jar but don't appear in the final
+        // response's Set-Cookie headers. Without this, those cookies are lost
+        // on the next run, causing validate_token to fail.
+        self.persist_jar_cookies().await?;
+
+        Ok(())
+    }
+
+    /// Persist all cookies from the in-memory jar for known Apple domains.
+    ///
+    /// reqwest's `Jar` doesn't support iteration, but `cookies(&url)` returns
+    /// the `Cookie` header value it would send to a given URL. We query each
+    /// Apple domain, split the semicolon-separated pairs, and save them so
+    /// they can be restored on the next run via `add_cookie_str`.
+    async fn persist_jar_cookies(&self) -> Result<()> {
+        // Derive the relevant Apple domain URLs from the home endpoint.
+        let is_cn = self.home_endpoint.contains(".cn");
+        let domains: &[&str] = if is_cn {
+            &[
+                "https://setup.icloud.com.cn/",
+                "https://www.icloud.com.cn/",
+                "https://idmsa.apple.com.cn/",
+            ]
+        } else {
+            &[
+                "https://setup.icloud.com/",
+                "https://www.icloud.com/",
+                "https://idmsa.apple.com/",
+            ]
+        };
+
+        let mut entries: Vec<CookieEntry> = Vec::new();
+        for &domain_url in domains {
+            let Ok(url) = domain_url.parse::<url::Url>() else {
+                continue;
+            };
+            let Some(cookies) = self.cookie_jar.cookies(&url) else {
+                continue;
+            };
+            let Ok(cookie_str) = cookies.to_str() else {
+                continue;
+            };
+            for pair in cookie_str.split("; ") {
+                if !pair.is_empty() {
+                    entries.push(CookieEntry {
+                        url: domain_url.to_string(),
+                        cookie: pair.to_string(),
+                    });
+                }
+            }
+        }
+
+        if entries.is_empty() {
             return Ok(());
         }
 
-        // reqwest::cookie::Jar doesn't expose iteration, so we persist
-        // Set-Cookie headers ourselves as a JSON array of {url, cookie}.
         let cookiejar_path = self.cookiejar_path();
-        let url_str = response.url().to_string();
-        let mut entries: Vec<CookieEntry> = if cookiejar_path.exists() {
-            let contents = fs::read_to_string(&cookiejar_path).await.with_context(|| {
-                format!(
-                    "Failed to read cookie jar from {}",
-                    cookiejar_path.display()
-                )
-            })?;
-            serde_json::from_str(&contents).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
 
-        let now = chrono::Utc::now();
-        let mut cookies_changed = false;
-        for cookie_header in headers.get_all("set-cookie") {
-            if let Ok(val) = cookie_header.to_str() {
-                if is_cookie_expired(val, &now) {
-                    tracing::debug!(
-                        "Skipping expired Set-Cookie: {}",
-                        val.split('=').next().unwrap_or("")
-                    );
-                    continue;
-                }
-                let new_name = val.split('=').next().unwrap_or("");
-                if new_name.is_empty() {
-                    continue;
-                }
-                // Deduplicate: remove stale entries for the same cookie name + URL
-                entries.retain(|e| {
-                    if e.url == url_str {
-                        let existing_name = e.cookie.split('=').next().unwrap_or("");
-                        return existing_name != new_name;
+        // Check if the cookie file already has the same content to avoid
+        // redundant disk writes during high-frequency API calls.
+        if cookiejar_path.exists() {
+            if let Ok(contents) = fs::read_to_string(&cookiejar_path).await {
+                if let Ok(existing) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
+                    if existing == entries {
+                        return Ok(());
                     }
-                    true
-                });
-                entries.push(CookieEntry {
-                    url: url_str.clone(),
-                    cookie: val.to_string(),
-                });
-                cookies_changed = true;
+                }
             }
         }
-        if cookies_changed {
-            fs::write(&cookiejar_path, serde_json::to_string_pretty(&entries)?)
-                .await
-                .with_context(|| {
-                    format!("Failed to write cookies to {}", cookiejar_path.display())
-                })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                std::fs::set_permissions(&cookiejar_path, perms)?;
-            }
+
+        fs::write(&cookiejar_path, serde_json::to_string_pretty(&entries)?)
+            .await
+            .with_context(|| format!("Failed to write cookies to {}", cookiejar_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&cookiejar_path, perms)?;
         }
 
         Ok(())
@@ -553,5 +577,93 @@ mod tests {
         assert_eq!(sanitize_username("user@example.com"), "userexamplecom");
         assert_eq!(sanitize_username("hello_world"), "hello_world");
         assert_eq!(sanitize_username("a.b-c@d"), "abcd");
+    }
+
+    #[tokio::test]
+    async fn test_persist_jar_cookies_saves_and_reloads() {
+        let dir = test_dir("persist_jar");
+        let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        // Simulate cookies being set in the jar (as reqwest would do from
+        // Set-Cookie headers, including those from redirect responses).
+        let setup_url: url::Url = "https://setup.icloud.com/".parse().unwrap();
+        session
+            .cookie_jar
+            .add_cookie_str("X-APPLE-WEBAUTH-TOKEN=abc123", &setup_url);
+        session
+            .cookie_jar
+            .add_cookie_str("X-APPLE-DS-WEB-SESSION-TOKEN=xyz", &setup_url);
+
+        // Persist cookies from the jar
+        session.persist_jar_cookies().await.unwrap();
+
+        // Verify the cookie file was written
+        let cookie_path = session.cookiejar_path();
+        assert!(cookie_path.exists());
+        let contents = std::fs::read_to_string(&cookie_path).unwrap();
+        let entries: Vec<CookieEntry> = serde_json::from_str(&contents).unwrap();
+        assert!(entries.len() >= 2);
+        assert!(entries
+            .iter()
+            .any(|e| e.cookie.contains("X-APPLE-WEBAUTH-TOKEN")));
+        assert!(entries
+            .iter()
+            .any(|e| e.cookie.contains("X-APPLE-DS-WEB-SESSION-TOKEN")));
+
+        // Drop the session and create a new one — cookies should be loaded back
+        drop(session);
+        let session2 = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        // The jar should now have the cookies we saved
+        let cookies = session2.cookie_jar.cookies(&setup_url);
+        assert!(cookies.is_some());
+        let cookie_header = cookies.unwrap();
+        let cookie_str = cookie_header.to_str().unwrap();
+        assert!(
+            cookie_str.contains("X-APPLE-WEBAUTH-TOKEN=abc123"),
+            "Expected WEBAUTH cookie, got: {}",
+            cookie_str
+        );
+        assert!(
+            cookie_str.contains("X-APPLE-DS-WEB-SESSION-TOKEN=xyz"),
+            "Expected DS-WEB cookie, got: {}",
+            cookie_str
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persist_jar_cookies_no_redundant_writes() {
+        let dir = test_dir("persist_no_dup");
+        let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        let setup_url: url::Url = "https://setup.icloud.com/".parse().unwrap();
+        session
+            .cookie_jar
+            .add_cookie_str("test_cookie=value1", &setup_url);
+
+        // First persist
+        session.persist_jar_cookies().await.unwrap();
+        let mtime1 = std::fs::metadata(session.cookiejar_path())
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Small delay to ensure filesystem mtime would change
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Second persist with same cookies — should skip the write
+        session.persist_jar_cookies().await.unwrap();
+        let mtime2 = std::fs::metadata(session.cookiejar_path())
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        assert_eq!(mtime1, mtime2, "File should not have been rewritten");
     }
 }

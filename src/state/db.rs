@@ -92,6 +92,12 @@ pub trait StateDb: Send + Sync {
     /// Used at sync start to pre-load downloaded state for O(1) skip decisions.
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError>;
 
+    /// Get all known asset IDs (any status: downloaded, pending, failed).
+    ///
+    /// Used in retry-only mode to distinguish assets that were previously
+    /// synced from new assets discovered on iCloud.
+    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError>;
+
     /// Get downloaded asset IDs with their checksums.
     ///
     /// Returns a map of (id, version_size) -> checksum for downloaded assets.
@@ -113,6 +119,16 @@ pub trait StateDb: Send + Sync {
     /// Used by the download engine to reduce per-download DB overhead.
     async fn mark_failed_batch(&self, items: &[(String, String, String)])
         -> Result<(), StateError>;
+
+    /// Get a metadata value by key.
+    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
+
+    /// Set a metadata key-value pair (insert or update).
+    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
+
+    /// Update `last_seen_at` for all versions of an asset without requiring
+    /// full metadata. Used by the early skip path to avoid path resolution.
+    async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError>;
 }
 
 /// SQLite implementation of the state database.
@@ -274,7 +290,7 @@ impl StateDb for SqliteStateDb {
         // Use INSERT OR REPLACE to handle both insert and update
         // But preserve existing status, downloaded_at, local_path, download_attempts, last_error
         conn.execute(
-            r#"
+            r"
             INSERT INTO assets (id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, last_seen_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)
             ON CONFLICT(id, version_size) DO UPDATE SET
@@ -285,7 +301,7 @@ impl StateDb for SqliteStateDb {
                 size_bytes = excluded.size_bytes,
                 media_type = excluded.media_type,
                 last_seen_at = excluded.last_seen_at
-            "#,
+            ",
             rusqlite::params![
                 &record.id,
                 record.version_size.as_str(),
@@ -526,6 +542,25 @@ impl StateDb for SqliteStateDb {
         Ok(ids)
     }
 
+    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        let mut stmt = conn
+            .prepare_cached("SELECT DISTINCT id FROM assets")
+            .map_err(StateError::query)?;
+
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(StateError::query)?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(StateError::query)?;
+
+        Ok(ids)
+    }
+
     async fn get_downloaded_checksums(
         &self,
     ) -> Result<HashMap<(String, String), String>, StateError> {
@@ -645,6 +680,53 @@ impl StateDb for SqliteStateDb {
                 Err(e)
             }
         }
+    }
+
+    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        let value = conn
+            .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(StateError::query)?;
+
+        Ok(value)
+    }
+
+    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .map_err(StateError::query)?;
+
+        Ok(())
+    }
+
+    async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "UPDATE assets SET last_seen_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, asset_id],
+        )
+        .map_err(StateError::query)?;
+
+        Ok(())
     }
 }
 
@@ -1136,6 +1218,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_all_known_ids() {
+        let dir = test_dir("get_all_known_ids");
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Create downloaded assets
+        for i in 0..2 {
+            let record = AssetRecord::new_pending(
+                format!("DL_{}", i),
+                VersionSizeKey::Original,
+                format!("checksum_{}", i),
+                format!("photo_{}.jpg", i),
+                Utc::now(),
+                None,
+                1000,
+                MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+            let path = dir.join(format!("photo_{}.jpg", i));
+            fs::write(&path, b"content").unwrap();
+            db.mark_downloaded(&format!("DL_{}", i), "original", &path)
+                .await
+                .unwrap();
+        }
+
+        // Create a pending asset
+        let pending = AssetRecord::new_pending(
+            "PENDING_1".to_string(),
+            VersionSizeKey::Original,
+            "pending_ck".to_string(),
+            "pending.jpg".to_string(),
+            Utc::now(),
+            None,
+            1000,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&pending).await.unwrap();
+
+        // Create a failed asset
+        let failed = AssetRecord::new_pending(
+            "FAILED_1".to_string(),
+            VersionSizeKey::Original,
+            "failed_ck".to_string(),
+            "failed.jpg".to_string(),
+            Utc::now(),
+            None,
+            1000,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&failed).await.unwrap();
+        db.mark_failed("FAILED_1", "original", "test error")
+            .await
+            .unwrap();
+
+        let known_ids = db.get_all_known_ids().await.unwrap();
+        // Should include all 4 assets regardless of status
+        assert_eq!(known_ids.len(), 4);
+        assert!(known_ids.contains("DL_0"));
+        assert!(known_ids.contains("DL_1"));
+        assert!(known_ids.contains("PENDING_1"));
+        assert!(known_ids.contains("FAILED_1"));
+
+        // get_downloaded_ids should only return 2
+        let downloaded_ids = db.get_downloaded_ids().await.unwrap();
+        assert_eq!(downloaded_ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_retry_failed_returns_zero_when_no_failures() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // With no assets at all, reset_failed returns 0
+        let count = db.reset_failed().await.unwrap();
+        assert_eq!(count, 0);
+
+        // Add a downloaded asset — still no failures
+        let record = AssetRecord::new_pending(
+            "DL_1".to_string(),
+            VersionSizeKey::Original,
+            "ck".to_string(),
+            "photo.jpg".to_string(),
+            Utc::now(),
+            None,
+            1000,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&record).await.unwrap();
+        let dir = test_dir("retry_no_failures");
+        let path = dir.join("photo.jpg");
+        fs::write(&path, b"content").unwrap();
+        db.mark_downloaded("DL_1", "original", &path).await.unwrap();
+
+        let count = db.reset_failed().await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_retry_failed_resets_only_failed() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let dir = test_dir("retry_resets_failed");
+
+        // Add a downloaded asset
+        let dl = AssetRecord::new_pending(
+            "DL_1".to_string(),
+            VersionSizeKey::Original,
+            "ck1".to_string(),
+            "photo1.jpg".to_string(),
+            Utc::now(),
+            None,
+            1000,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&dl).await.unwrap();
+        let path = dir.join("photo1.jpg");
+        fs::write(&path, b"content").unwrap();
+        db.mark_downloaded("DL_1", "original", &path).await.unwrap();
+
+        // Add a failed asset
+        let failed = AssetRecord::new_pending(
+            "FAIL_1".to_string(),
+            VersionSizeKey::Original,
+            "ck2".to_string(),
+            "photo2.jpg".to_string(),
+            Utc::now(),
+            None,
+            1000,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&failed).await.unwrap();
+        db.mark_failed("FAIL_1", "original", "download error")
+            .await
+            .unwrap();
+
+        // reset_failed should reset exactly 1
+        let count = db.reset_failed().await.unwrap();
+        assert_eq!(count, 1);
+
+        // After reset, the failed asset should be in known_ids but not downloaded_ids
+        let known = db.get_all_known_ids().await.unwrap();
+        assert_eq!(known.len(), 2);
+        assert!(known.contains("DL_1"));
+        assert!(known.contains("FAIL_1"));
+
+        let downloaded = db.get_downloaded_ids().await.unwrap();
+        assert_eq!(downloaded.len(), 1);
+        assert!(downloaded.contains(&("DL_1".to_string(), "original".to_string())));
+    }
+
+    #[tokio::test]
     async fn test_mark_downloaded_batch() {
         let dir = test_dir("mark_downloaded_batch");
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -1224,5 +1454,76 @@ mod tests {
     async fn test_mark_failed_batch_empty() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         db.mark_failed_batch(&[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_metadata_get_set() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Missing key returns None
+        assert_eq!(db.get_metadata("config_hash").await.unwrap(), None);
+
+        // Set and retrieve
+        db.set_metadata("config_hash", "abc123").await.unwrap();
+        assert_eq!(
+            db.get_metadata("config_hash").await.unwrap(),
+            Some("abc123".to_string())
+        );
+
+        // Overwrite
+        db.set_metadata("config_hash", "def456").await.unwrap();
+        assert_eq!(
+            db.get_metadata("config_hash").await.unwrap(),
+            Some("def456".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_touch_last_seen() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = AssetRecord::new_pending(
+            "TOUCH_1".to_string(),
+            VersionSizeKey::Original,
+            "ck".to_string(),
+            "photo.jpg".to_string(),
+            Utc::now() - chrono::Duration::hours(1),
+            None,
+            1000,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&record).await.unwrap();
+
+        // Read the original last_seen_at
+        let original_ts: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT last_seen_at FROM assets WHERE id = 'TOUCH_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // Small delay so timestamps differ
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Touch last_seen_at
+        db.touch_last_seen("TOUCH_1").await.unwrap();
+
+        // Verify the timestamp was actually updated
+        let updated_ts: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT last_seen_at FROM assets WHERE id = 'TOUCH_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            updated_ts >= original_ts,
+            "last_seen_at should be updated: {updated_ts} >= {original_ts}"
+        );
     }
 }

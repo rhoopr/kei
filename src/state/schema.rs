@@ -5,10 +5,10 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Schema DDL for version 1.
-const SCHEMA_V1: &str = r#"
+const SCHEMA_V1: &str = r"
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT NOT NULL,
     version_size TEXT NOT NULL,
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     assets_failed INTEGER DEFAULT 0,
     interrupted INTEGER DEFAULT 0
 );
-"#;
+";
 
 /// Get the current schema version from the database.
 pub(crate) fn get_schema_version(conn: &Connection) -> Result<i32, StateError> {
@@ -68,8 +68,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
     }
 
     if current_version == 0 {
-        // Fresh database — apply full schema
+        // Fresh database — apply all schemas
         conn.execute_batch(SCHEMA_V1)?;
+        conn.execute_batch(SCHEMA_V2)?;
         set_schema_version(conn, SCHEMA_VERSION)?;
         tracing::debug!("Initialized database schema at version {}", SCHEMA_VERSION);
     } else if current_version < SCHEMA_VERSION {
@@ -82,23 +83,28 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Schema DDL for version 2 migration: add key-value metadata table.
+const SCHEMA_V2: &str = r"
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+);
+";
+
 /// Apply migration for a specific version.
 fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError> {
-    // Future migrations go here, e.g.:
-    // match version {
-    //     2 => { conn.execute_batch("ALTER TABLE assets ADD COLUMN new_field TEXT")?; }
-    //     _ => {}
-    // }
-    // For now, version 1 just applies the base schema
-    if version != SCHEMA_VERSION {
-        tracing::warn!(
-            "Unexpected schema version {}, applying base schema",
-            version
-        );
+    match version {
+        2 => {
+            conn.execute_batch(SCHEMA_V2)?;
+        }
+        other => {
+            return Err(StateError::Query(format!(
+                "No migration defined for version {other}"
+            )));
+        }
     }
-    conn.execute_batch(SCHEMA_V1)?;
     set_schema_version(conn, version)?;
-    tracing::info!("Migrated database to schema version {}", version);
+    tracing::info!("Migrated database to schema version {version}");
     Ok(())
 }
 
@@ -165,5 +171,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 3); // status, local_path, checksum
+    }
+
+    #[test]
+    fn test_metadata_table_created() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // Verify metadata table exists
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_v1_to_v2_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a v1 database
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 1);
+
+        // Migrate should bring it to v2
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Metadata table should exist
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

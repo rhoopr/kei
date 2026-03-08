@@ -44,11 +44,10 @@ impl DownloadError {
     pub fn is_retryable(&self) -> bool {
         match self {
             DownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
-            DownloadError::ChecksumMismatch(_) => true,
-            DownloadError::ContentLengthMismatch { .. } => true,
-            DownloadError::Http { .. } => true,
-            DownloadError::Disk(_) => false,
-            DownloadError::Other(_) => false,
+            DownloadError::ChecksumMismatch(_)
+            | DownloadError::ContentLengthMismatch { .. }
+            | DownloadError::Http { .. } => true,
+            DownloadError::Disk(_) | DownloadError::Other(_) => false,
         }
     }
 

@@ -267,8 +267,7 @@ impl Config {
         let threads_num = resolve(sync.threads_num, toml_dl.and_then(|d| d.threads_num), 10);
         anyhow::ensure!(
             threads_num >= 1,
-            "threads_num must be >= 1, got {}",
-            threads_num
+            "threads_num must be >= 1, got {threads_num}"
         );
         let temp_suffix = resolve(
             sync.temp_suffix,
@@ -451,9 +450,8 @@ pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>>
         }
     }
     anyhow::bail!(
-        "Cannot parse '{}' as a date. Expected ISO date (2025-01-02), \
-         datetime (2025-01-02T14:30:00), or interval (20d)",
-        s
+        "Cannot parse '{s}' as a date. Expected ISO date (2025-01-02), \
+         datetime (2025-01-02T14:30:00), or interval (20d)"
     )
 }
 

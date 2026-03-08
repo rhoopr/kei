@@ -4,6 +4,10 @@ use anyhow::{Context, Result};
 
 /// Read the `DateTimeOriginal` EXIF tag from an image file.
 ///
+/// Uses `kamadak-exif` (read-only EXIF crate). A separate crate (`little_exif`)
+/// handles writing because no single Rust EXIF library supports both reliable
+/// reading and writing. See [`set_photo_exif`] for the write side.
+///
 /// Returns `Ok(Some(value))` if the tag is present, `Ok(None)` if the file
 /// has no EXIF data or the tag is missing, and `Err` only on I/O failure.
 pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
@@ -28,6 +32,10 @@ pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
 }
 
 /// Write the EXIF date tags to a JPEG file.
+///
+/// Uses `little_exif` (write-capable EXIF crate). A separate crate (`kamadak-exif`)
+/// handles reading because `little_exif` doesn't support fine-grained tag reads.
+/// See [`get_photo_exif`] for the read side.
 ///
 /// Writes `DateTime`, `DateTimeOriginal`, and `DateTimeDigitized` to match
 /// the behavior of the Python icloudpd. The `datetime_str` should be in

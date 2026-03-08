@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 ///
 /// `folder_structure` is a date format string such as `"{:%Y/%m/%d}"`. The
 /// special value `"none"` (case-insensitive) disables date-based folders.
-pub fn local_download_path(
+pub(crate) fn local_download_path(
     directory: &Path,
     folder_structure: &str,
     created_date: &DateTime<Local>,
@@ -90,7 +90,7 @@ fn expand_date_format(format_str: &str, date: &DateTime<Local>) -> String {
 
 /// Clean a filename by removing characters that are invalid on common
 /// filesystems: `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`.
-pub fn clean_filename(filename: &str) -> String {
+pub(crate) fn clean_filename(filename: &str) -> String {
     filename
         .chars()
         .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
@@ -104,7 +104,7 @@ pub fn clean_filename(filename: &str) -> String {
 /// - Replaces `..` sequences with `_`
 /// - Removes filesystem-invalid characters via `clean_filename()`
 /// - Prefixes Windows reserved names (CON, NUL, PRN, etc.) with `_`
-pub fn sanitize_path_component(name: &str) -> String {
+pub(crate) fn sanitize_path_component(name: &str) -> String {
     // First clean invalid filesystem characters
     let cleaned = clean_filename(name);
 
@@ -156,7 +156,7 @@ pub fn sanitize_path_component(name: &str) -> String {
 
 /// Remove non-ASCII (unicode) characters from a filename, keeping only
 /// ASCII characters.
-pub fn remove_unicode_chars(filename: &str) -> String {
+pub(crate) fn remove_unicode_chars(filename: &str) -> String {
     filename.chars().filter(|c| c.is_ascii()).collect()
 }
 
@@ -167,7 +167,7 @@ pub fn remove_unicode_chars(filename: &str) -> String {
 ///
 /// Formats the size directly into the result string, avoiding an intermediate
 /// `size.to_string()` allocation.
-pub fn add_dedup_suffix(path: &str, size: u64) -> String {
+pub(crate) fn add_dedup_suffix(path: &str, size: u64) -> String {
     match path.rfind('.') {
         Some(dot_pos) => {
             let (stem, ext) = path.split_at(dot_pos);
@@ -175,7 +175,7 @@ pub fn add_dedup_suffix(path: &str, size: u64) -> String {
             let mut result = String::with_capacity(stem.len() + 1 + 20 + ext.len());
             result.push_str(stem);
             result.push('-');
-            let _ = write!(result, "{}", size);
+            let _ = write!(result, "{size}");
             result.push_str(ext);
             result
         }
@@ -183,7 +183,7 @@ pub fn add_dedup_suffix(path: &str, size: u64) -> String {
             let mut result = String::with_capacity(path.len() + 1 + 20);
             result.push_str(path);
             result.push('-');
-            let _ = write!(result, "{}", size);
+            let _ = write!(result, "{size}");
             result
         }
     }
@@ -192,7 +192,7 @@ pub fn add_dedup_suffix(path: &str, size: u64) -> String {
 /// Add a string suffix before the file extension.
 ///
 /// For example, `"photo.jpg"` with suffix `"abc"` becomes `"photo-abc.jpg"`.
-pub fn insert_suffix(path: &str, suffix: &str) -> String {
+pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
     match path.rfind('.') {
         Some(dot_pos) => {
             let (stem, ext) = path.split_at(dot_pos);
@@ -243,14 +243,14 @@ const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
 /// If `asset_type` is found in `ITEM_TYPE_EXTENSIONS`, the filename's extension
 /// is replaced with the mapped uppercase extension. Otherwise the original
 /// filename is returned unchanged.
-pub fn map_filename_extension(filename: &str, asset_type: &str) -> String {
+pub(crate) fn map_filename_extension(filename: &str, asset_type: &str) -> String {
     let ext = item_type_extension(asset_type);
     if ext == "unknown" {
         return filename.to_string();
     }
     match filename.rfind('.') {
         Some(dot) => format!("{}.{}", &filename[..dot], ext),
-        None => format!("{}.{}", filename, ext),
+        None => format!("{filename}.{ext}"),
     }
 }
 
@@ -266,14 +266,14 @@ fn base64_id7(id: &str) -> String {
 /// asset ID as a suffix before the file extension, using underscore separator.
 ///
 /// Matches Python's `add_suffix_to_filename(f"_{id_suffix}", filename)`.
-pub fn apply_name_id7(filename: &str, id: &str) -> String {
+pub(crate) fn apply_name_id7(filename: &str, id: &str) -> String {
     let suffix = base64_id7(id);
     match filename.rfind('.') {
         Some(dot) => {
             let (stem, ext) = filename.split_at(dot);
-            format!("{}_{}{}", stem, suffix, ext)
+            format!("{stem}_{suffix}{ext}")
         }
-        None => format!("{}_{}", filename, suffix),
+        None => format!("{filename}_{suffix}"),
     }
 }
 
@@ -281,18 +281,18 @@ pub fn apply_name_id7(filename: &str, id: &str) -> String {
 ///
 /// For HEIC files: `photo.HEIC` → `photo_HEVC.MOV`
 /// For other files: `photo.JPG` → `photo.MOV`
-pub fn live_photo_mov_path_suffix(filename: &str) -> String {
+pub(crate) fn live_photo_mov_path_suffix(filename: &str) -> String {
     match filename.rfind('.') {
         Some(dot) => {
             let (stem, ext) = filename.split_at(dot);
             let ext_lower = ext[1..].to_ascii_lowercase();
             if ext_lower == "heic" {
-                format!("{}_HEVC.MOV", stem)
+                format!("{stem}_HEVC.MOV")
             } else {
-                format!("{}.MOV", stem)
+                format!("{stem}.MOV")
             }
         }
-        None => format!("{}.MOV", filename),
+        None => format!("{filename}.MOV"),
     }
 }
 
@@ -303,7 +303,7 @@ static ITEM_TYPE_MAP: LazyLock<FxHashMap<&'static str, &'static str>> =
 /// Look up the file extension for a UTI asset type string.
 ///
 /// Returns the uppercase extension (e.g. `"JPG"`) or `"unknown"` if not mapped.
-pub fn item_type_extension(asset_type: &str) -> &'static str {
+pub(crate) fn item_type_extension(asset_type: &str) -> &'static str {
     ITEM_TYPE_MAP.get(asset_type).copied().unwrap_or("unknown")
 }
 
@@ -312,14 +312,14 @@ pub fn item_type_extension(asset_type: &str) -> &'static str {
 /// Replaces non-alphanumeric characters with underscores and truncates to 12 chars,
 /// then appends the extension derived from the asset's UTI type.
 /// Matches Python's `generate_fingerprint_filename()`.
-pub fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String {
+pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String {
     let fingerprint: String = asset_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .take(12)
         .collect();
     let ext = item_type_extension(asset_type);
-    format!("{}.{}", fingerprint, ext)
+    format!("{fingerprint}.{ext}")
 }
 
 /// Normalize AM/PM whitespace variants to a canonical no-space form.
@@ -331,7 +331,7 @@ pub fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String
 ///
 /// This function strips any of these to produce a consistent `1.40.01PM` form,
 /// enabling matching between files created with different locale settings.
-pub fn normalize_ampm(s: &str) -> String {
+pub(crate) fn normalize_ampm(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -387,7 +387,7 @@ pub fn normalize_ampm(s: &str) -> String {
 /// repeated `read_dir` syscalls in hot loops.
 ///
 /// Returns the matching variant's full path, or `None` if no match is found.
-pub fn find_ampm_variant_cached(
+pub(crate) fn find_ampm_variant_cached(
     path: &Path,
     dir_cache: &mut std::collections::HashMap<PathBuf, Vec<String>>,
 ) -> Option<PathBuf> {
@@ -427,13 +427,13 @@ pub fn find_ampm_variant_cached(
 /// Generate a live photo MOV filename using the "original" policy.
 ///
 /// Simply replaces the extension with `.MOV`: `photo.HEIC` → `photo.MOV`
-pub fn live_photo_mov_path_original(filename: &str) -> String {
+pub(crate) fn live_photo_mov_path_original(filename: &str) -> String {
     match filename.rfind('.') {
         Some(dot) => {
             let (stem, _) = filename.split_at(dot);
-            format!("{}.MOV", stem)
+            format!("{stem}.MOV")
         }
-        None => format!("{}.MOV", filename),
+        None => format!("{filename}.MOV"),
     }
 }
 

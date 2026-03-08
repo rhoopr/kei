@@ -112,10 +112,7 @@ impl PhotosService {
         if let Some(lib) = self.shared_libraries.as_ref().and_then(|m| m.get(name)) {
             return Ok(lib);
         }
-        anyhow::bail!(
-            "Unknown library: '{}'. Use --list-libraries to see available libraries.",
-            name
-        )
+        anyhow::bail!("Unknown library: '{name}'. Use --list-libraries to see available libraries.")
     }
 
     /// Fetch private libraries (lazily, first call triggers the HTTP request).

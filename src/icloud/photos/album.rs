@@ -158,7 +158,8 @@ impl PhotoAlbum {
             _ => 1,
         };
 
-        let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(page_size * num_fetchers);
+        let (tx, rx) =
+            mpsc::channel::<anyhow::Result<PhotoAsset>>((page_size * num_fetchers).min(500));
 
         if num_fetchers > 1 {
             let total = effective_total.expect("effective_total set when num_fetchers > 1");
