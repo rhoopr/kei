@@ -2,36 +2,31 @@
 
 # icloudpd-rs
 
-[![License: MIT](https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e)](LICENSE.md) [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg?logo=rust)](https://www.rust-lang.org/) ![GitHub Downloads](https://img.shields.io/github/downloads/rhoopr/icloudpd-rs/total)
-[![Version](https://img.shields.io/github/v/release/rhoopr/icloudpd-rs?color=blue)](https://github.com/rhoopr/icloudpd-rs/releases) [![Build](https://img.shields.io/github/actions/workflow/status/rhoopr/icloudpd-rs/ci.yml?label=build)](https://github.com/rhoopr/icloudpd-rs/actions) [![Homebrew](https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew)](https://github.com/rhoopr/homebrew-icloudpd-rs)
+[![License: MIT](https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e)](LICENSE.md) [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
+[![Version](https://img.shields.io/github/v/release/rhoopr/icloudpd-rs?color=blue)](https://github.com/rhoopr/icloudpd-rs/releases) [![Build](https://img.shields.io/github/actions/workflow/status/rhoopr/icloudpd-rs/ci.yml?label=build)](https://github.com/rhoopr/icloudpd-rs/actions) [![Homebrew](https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew)](https://github.com/rhoopr/homebrew-icloudpd-rs) [![Docker](https://img.shields.io/badge/ghcr.io-icloudpd--rs-blue?logo=docker)](https://ghcr.io/rhoopr/icloudpd-rs)
 
-This is a ground-up Rust rewrite of the Python [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader). The goal was a single binary with no runtime dependencies that takes advantage of Rust's concurrency and performance to sync large iCloud Photos libraries quickly. It also adds SQLite-based state management so syncs are resumable and subsequent runs only download what's new or previously failed.
+A fast, reliable iCloud Photos downloader and **icloudpd alternative**. Single binary, no Python runtime, no dependencies.
+
+Inspired by the excellent [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (icloudpd), which did the hard work of reverse-engineering Apple's private APIs. icloudpd-rs is a ground-up rewrite that adds parallel downloads, persistent state, and resumable transfers — things that are hard to retrofit into an existing codebase:
+
+- **Parallel downloads** with 10 concurrent connections by default — bottleneck shifts to your network speed rather than serial API calls
+- **~30-second enumeration** of a 20k-photo library (vs sequential API calls)
+- **SQLite state tracking** — subsequent syncs skip what's already downloaded, instantly
+- **Resumable transfers** — partial downloads pick up where they left off, with SHA256 verification
+- **Single binary** — download and run. No runtime, no package manager, no virtual environments.
 
 > [!TIP]
-> **[Check out the Wiki](https://github.com/rhoopr/icloudpd-rs/wiki)** for in-depth guides on every CLI option, configuration example, and troubleshooting tip.
+> **Coming from Python icloudpd?** See the **[Migration Guide](docs/migration-from-python.md)** — it maps every flag and shows how to pick up where you left off without re-downloading anything.
 
-### Current
+## Quick start
 
-- **Single binary** — no Python, no pip, no virtual environments. Just download and run.
-- **Parallel downloads** — defaults to 10 concurrent threads, configurable. Downloads start streaming as soon as the first API page comes back rather than enumerating the whole library first.
-- **State tracking** — a SQLite database tracks what's been downloaded, what failed, and where to resume, so subsequent syncs skip what's already done.
-- **Resumable transfers** — partial downloads pick up where they left off via HTTP Range requests, with SHA256 verification.
-- **Auth** — implements Apple's SRP-6a variant with 2FA support, persistent sessions, automatic token refresh, and lock files to prevent concurrent instance conflicts.
-- **File organization** — date-based folder structures (`%Y/%m/%d` etc.), live photo MOV pairing, EXIF date writing, and smart album support (favorites, bursts, time-lapse, slo-mo).
-- **Long-running operation** — watch mode for continuous syncing, systemd notify support, mid-sync session recovery, and graceful shutdown (first signal finishes in-flight downloads, second force-exits).
+```sh
+icloudpd-rs --username you@example.com --directory ~/Photos/iCloud
+```
 
-See the [Changelog](CHANGELOG.md) for the full details and differences from the Python version.
+You'll be prompted for your password, then asked to approve 2FA on a trusted device. Downloads start right after authentication. Use `--dry-run` to preview, or `--auth-only` to just verify credentials.
 
-### Planned
-
-- XMP sidecar export for metadata preservation
-- OS keyring integration for password storage
-- Docker images
-- iCloud lifecycle management (delete-after-download)
-
-See [open issues](https://github.com/rhoopr/icloudpd-rs/issues) for the full list.
-
-## Installation
+## Install
 
 ### Homebrew (macOS & Linux)
 
@@ -40,9 +35,38 @@ brew tap rhoopr/icloudpd-rs
 brew install icloudpd-rs
 ```
 
+### Docker
+
+```sh
+docker pull ghcr.io/rhoopr/icloudpd-rs:latest
+```
+
+```yaml
+services:
+  icloudpd-rs:
+    image: ghcr.io/rhoopr/icloudpd-rs:latest
+    container_name: icloudpd-rs
+    restart: unless-stopped
+    environment:
+      - ICLOUD_USERNAME=${ICLOUD_USERNAME}
+      - ICLOUD_PASSWORD=${ICLOUD_PASSWORD}
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./config:/config
+      - /path/to/photos:/photos
+```
+
+When 2FA is needed, submit the code from outside the container:
+
+```sh
+docker exec icloudpd-rs icloudpd-rs submit-code 123456
+```
+
+See the [Docker wiki page](https://github.com/rhoopr/icloudpd-rs/wiki/Docker) for the full setup guide.
+
 ### Pre-built binaries
 
-Grab the right one for your platform from [GitHub Releases](https://github.com/rhoopr/icloudpd-rs/releases):
+Grab the right one from [GitHub Releases](https://github.com/rhoopr/icloudpd-rs/releases):
 
 | Platform | Architecture | Download |
 |----------|--------------|----------|
@@ -52,103 +76,86 @@ Grab the right one for your platform from [GitHub Releases](https://github.com/r
 | Linux | x86_64 | `icloudpd-rs-linux-x86_64.tar.gz` |
 | Windows | x86_64 | `icloudpd-rs-windows-x86_64.zip` |
 
-```sh
-# Example: macOS Apple Silicon
-curl -LO https://github.com/rhoopr/icloudpd-rs/releases/latest/download/icloudpd-rs-macos-aarch64.tar.gz
-tar xzf icloudpd-rs-macos-aarch64.tar.gz
-./icloudpd-rs --help
-```
-
 ### From source
 
-Requires Rust 1.85+.
-
 ```sh
-git clone https://github.com/rhoopr/icloudpd-rs.git
-cd icloudpd-rs
+git clone https://github.com/rhoopr/icloudpd-rs.git && cd icloudpd-rs
 cargo build --release
 ./target/release/icloudpd-rs --help
 ```
 
-### Requirements
-
-- An iCloud account with two-factor authentication enabled
-
-## Quick start
-
-```sh
-# Authenticate and download everything
-icloudpd-rs --username you@example.com --directory ~/Photos/iCloud
-
-# You'll be prompted for your password, then asked to approve 2FA on a trusted device
-# Downloads start right after authentication
-```
-
-You can use `--dry-run` to see what would be downloaded without actually downloading anything, or `--auth-only` to just verify your credentials.
-
 ## Usage
 
-### Commands
-
-The default command is `sync`, so you can omit it if you just want to download.
-
 ```sh
-# These are equivalent
-icloudpd-rs --username you@example.com --directory ~/Photos
-icloudpd-rs sync --username you@example.com --directory ~/Photos
+# Download everything
+icloudpd-rs -u you@example.com -d ~/Photos
 
-# Check what's in the state database
-icloudpd-rs status --username you@example.com
+# Use a config file
+icloudpd-rs --config ~/my-config.toml
 
-# Retry things that failed last time
-icloudpd-rs retry-failed --username you@example.com --directory ~/Photos
+# Only recent 100 photos, skip videos
+icloudpd-rs -u you@example.com -d ~/Photos --recent 100 --skip-videos
 
-# If you already have photos locally, import them into the state database
-# so they don't get re-downloaded
-icloudpd-rs import-existing --username you@example.com --directory ~/Photos
-
-# Verify downloaded files against checksums
-icloudpd-rs verify --username you@example.com --checksums
-
-# Wipe the state database and start over
-icloudpd-rs reset-state --username you@example.com --yes
-```
-
-### Common options
-
-```sh
-# Download specific albums
+# Specific albums
 icloudpd-rs -u you@example.com -d ~/Photos --album "Favorites" --album "Travel"
-
-# Only the most recent 100 photos
-icloudpd-rs -u you@example.com -d ~/Photos --recent 100
 
 # Keep syncing every hour
 icloudpd-rs -u you@example.com -d ~/Photos --watch-with-interval 3600
 
-# Only photos created after a certain date
-icloudpd-rs -u you@example.com -d ~/Photos --skip-created-before 2024-01-01
+# Get notified when 2FA is needed or sync completes
+icloudpd-rs -u you@example.com -d ~/Photos --notification-script ./notify.sh
 
-# Skip videos
-icloudpd-rs -u you@example.com -d ~/Photos --skip-videos
+# Submit a 2FA code non-interactively (Docker / headless)
+icloudpd-rs submit-code 123456
+
+# Check sync status, retry failures, verify downloads
+icloudpd-rs status -u you@example.com
+icloudpd-rs retry-failed -u you@example.com -d ~/Photos
+icloudpd-rs verify -u you@example.com --checksums
 ```
 
-### Environment variables
+Set `ICLOUD_PASSWORD` as an environment variable to avoid being prompted.
 
-> [!NOTE]
-> You can set `ICLOUD_PASSWORD` to avoid being prompted (and to keep your password out of the process list).
+Run `icloudpd-rs --help` for the full flag list, or check the **[Wiki](https://github.com/rhoopr/icloudpd-rs/wiki)** for detailed guides on every option.
 
-Run `icloudpd-rs --help` for everything else.
+## Features
+
+| Feature | Details |
+|---------|---------|
+| Parallel downloads | Configurable concurrency, downloads start as the first API page returns |
+| State tracking | SQLite DB tracks downloaded/failed/pending — no re-scanning |
+| Resumable transfers | Partial downloads resume via HTTP Range with SHA256 verification |
+| TOML config | Optional `config.toml` with `[auth]`, `[download]`, `[filters]`, `[photos]`, `[watch]`, `[notifications]` sections. CLI flags override config values. [Guide](https://github.com/rhoopr/icloudpd-rs/wiki/Configuration) |
+| Docker | Multi-arch (amd64/arm64) on `ghcr.io/rhoopr/icloudpd-rs`. [Guide](https://github.com/rhoopr/icloudpd-rs/wiki/Docker) |
+| Headless MFA | `submit-code` subcommand for Docker/cron 2FA without interactive prompts |
+| Notification scripts | Fire a script on `2fa_required`, `sync_complete`, `sync_failed`, `session_expired` |
+| Watch mode | Continuous sync with interval, systemd notify, graceful shutdown |
+| File organization | Date-based folders, live photo MOV pairing, EXIF writing, smart albums |
+| Auth | Apple SRP-6a, 2FA, persistent sessions, automatic refresh, lock files |
+
+### Not yet implemented
+
+**Coming in v0.4** (next release):
+- [Auto-delete / Recently Deleted scan](https://github.com/rhoopr/icloudpd-rs/issues/28) — detect iCloud deletions and optionally remove local copies
+- [Delete after download](https://github.com/rhoopr/icloudpd-rs/issues/29) — remove photos from iCloud after successful download
+
+**Planned:**
+- [XMP sidecar export](https://github.com/rhoopr/icloudpd-rs/issues/19)
+- [OS keyring integration](https://github.com/rhoopr/icloudpd-rs/issues/22)
+- [HEIC to JPEG conversion](https://github.com/rhoopr/icloudpd-rs/issues/52)
+- [Prometheus metrics](https://github.com/rhoopr/icloudpd-rs/issues/55)
+
+See [all open issues](https://github.com/rhoopr/icloudpd-rs/issues) for the full list.
 
 ## Documentation
 
-- [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) — detailed guides for all CLI options and features
-- [Changelog](CHANGELOG.md) — release notes and differences from the Python version
-- [Issues](https://github.com/rhoopr/icloudpd-rs/issues) — bug reports and feature requests
+- **[Wiki](https://github.com/rhoopr/icloudpd-rs/wiki)** — guides for every CLI option, configuration, Docker, and troubleshooting
+- **[Migration Guide](docs/migration-from-python.md)** — switching from Python icloudpd
+- **[Changelog](CHANGELOG.md)** — release notes and full diff from the Python version
 
 ## Contributing
 
-Contributions welcome. If you're planning something significant, open an issue first so we can discuss it.
+Contributions welcome. If you're planning something big, open an issue first.
 
 ```sh
 cargo fmt -- --check && cargo clippy && cargo test
@@ -158,7 +165,6 @@ cargo fmt -- --check && cargo clippy && cargo test
 
 MIT — see [LICENSE.md](LICENSE.md)
 
-
 ## Acknowledgments
 
-This project is a Rust reimplementation inspired by [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader). Thanks to the original maintainers for their work reverse-engineering Apple's private APIs.
+Built on the reverse-engineering work of the original [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) maintainers.

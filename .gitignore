@@ -2,6 +2,8 @@
 .testplans/
 CLAUDE.md
 TODO.md
+docs/roadmap.md
+docs/phase1-plan.md
 .DS_Store
 
 # Rust
