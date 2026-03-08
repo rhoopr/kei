@@ -9,7 +9,7 @@ A fast, reliable iCloud Photos downloader and **icloudpd alternative**. Single b
 
 Inspired by the excellent [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (icloudpd), which did the hard work of reverse-engineering Apple's private APIs. icloudpd-rs is a ground-up rewrite that adds parallel downloads, persistent state, and resumable transfers - things that are hard to retrofit into an existing codebase:
 
-- **Parallel downloads** - Your download speed becomes the bottleneck, **5x+ faster** than icloudpd in gigabit benchmarks.
+- **Parallel downloads** - Network speed is the bottleneck, **5x+ faster** than icloudpd in gigabit benchmarks.
 - **Fast library scanning** - 20k-photo library indexed in ~30s, **15x faster** than sequential API calls.
 - **SQLite state tracking** - Subsequent syncs skip what's already downloaded, instantly.
 - **Resumable transfers** - Partial downloads pick up where they left off, with SHA256 verification.
