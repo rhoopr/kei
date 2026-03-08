@@ -25,7 +25,7 @@ fn temp_download_path(
         .context("Failed to decode base64 checksum")?;
     let encoded = data_encoding::BASE32_NOPAD.encode(&decoded);
     let download_dir = download_path.parent().unwrap_or_else(|| Path::new("."));
-    Ok(download_dir.join(format!("{}{}", encoded, temp_suffix)))
+    Ok(download_dir.join(format!("{encoded}{temp_suffix}")))
 }
 
 /// Download a file from URL using .part temp files.
@@ -128,7 +128,7 @@ async fn attempt_download(
             path_str,
             resume_offset
         );
-        request = request.header("Range", format!("bytes={}-", resume_offset));
+        request = request.header("Range", format!("bytes={resume_offset}-"));
     }
 
     let response = request.send().await.map_err(|e| DownloadError::Http {
@@ -179,7 +179,7 @@ async fn attempt_download(
         .open(&part_path)
         .await
         .map_err(|e| {
-            DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {}", e))
+            DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
         })?;
 
     let mut stream = response.bytes_stream();

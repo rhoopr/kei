@@ -113,7 +113,7 @@ impl Session {
 
         // Acquire an exclusive file lock to prevent concurrent instances for
         // the same account from corrupting session/cookie state.
-        let lock_path = cookie_dir.join(format!("{}.lock", sanitized));
+        let lock_path = cookie_dir.join(format!("{sanitized}.lock"));
         let lock_file = tokio::task::spawn_blocking({
             let lock_path = lock_path.clone();
             move || {
@@ -201,7 +201,7 @@ impl Session {
         default_headers.insert(ORIGIN, HeaderValue::from_str(home_endpoint)?);
         default_headers.insert(
             REFERER,
-            HeaderValue::from_str(&format!("{}/", home_endpoint))?,
+            HeaderValue::from_str(&format!("{home_endpoint}/"))?,
         );
         default_headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
 
@@ -224,7 +224,7 @@ impl Session {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()?;
 
-        let session_path = cookie_dir.join(format!("{}.session", sanitized));
+        let session_path = cookie_dir.join(format!("{sanitized}.session"));
         let session_data = if session_path.exists() {
             match fs::read_to_string(&session_path).await {
                 Ok(contents) => match serde_json::from_str::<HashMap<String, Value>>(&contents) {

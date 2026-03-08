@@ -324,10 +324,10 @@ async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow:
 
     println!();
     println!("Results:");
-    println!("  Verified:  {}", verified);
-    println!("  Missing:   {}", missing);
+    println!("  Verified:  {verified}");
+    println!("  Missing:   {missing}");
     if args.checksums {
-        println!("  Corrupted: {}", corrupted);
+        println!("  Corrupted: {corrupted}");
     }
 
     if missing > 0 || corrupted > 0 {
@@ -592,7 +592,7 @@ async fn run_import_existing(
 
                         matched += 1;
                         if matched.is_multiple_of(100) {
-                            println!("  Matched {} files so far...", matched);
+                            println!("  Matched {matched} files so far...");
                         }
                     } else {
                         unmatched += 1;
@@ -608,9 +608,9 @@ async fn run_import_existing(
 
     println!();
     println!("Import complete:");
-    println!("  Total assets scanned: {}", total);
-    println!("  Files matched:        {}", matched);
-    println!("  Unmatched versions:   {}", unmatched);
+    println!("  Total assets scanned: {total}");
+    println!("  Files matched:        {matched}");
+    println!("  Unmatched versions:   {unmatched}");
 
     Ok(())
 }
@@ -634,11 +634,7 @@ async fn resolve_albums(
                 Some(album) => matched.push(album),
                 None => {
                     let available: Vec<&String> = album_map.keys().collect();
-                    anyhow::bail!(
-                        "Album '{}' not found. Available albums: {:?}",
-                        name,
-                        available
-                    );
+                    anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
                 }
             }
         }
@@ -763,7 +759,7 @@ async fn main() -> anyhow::Result<()> {
             );
             tracing::warn!("{}", msg);
             notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
-            anyhow::bail!("{}", msg);
+            anyhow::bail!("{msg}");
         }
         Err(e) => return Err(e),
     };
@@ -798,12 +794,12 @@ async fn main() -> anyhow::Result<()> {
         println!("Private libraries:");
         let private = photos_service.fetch_private_libraries().await?;
         for name in private.keys() {
-            println!("  {}", name);
+            println!("  {name}");
         }
         println!("Shared libraries:");
         let shared = photos_service.fetch_shared_libraries().await?;
         for name in shared.keys() {
-            println!("  {}", name);
+            println!("  {name}");
         }
         return Ok(());
     }
@@ -818,7 +814,7 @@ async fn main() -> anyhow::Result<()> {
         let albums = library.albums().await?;
         println!("Albums:");
         for name in albums.keys() {
-            println!("  {}", name);
+            println!("  {name}");
         }
         return Ok(());
     }
@@ -944,9 +940,7 @@ async fn main() -> anyhow::Result<()> {
                 reauth_attempts += 1;
                 if reauth_attempts >= MAX_REAUTH_ATTEMPTS {
                     anyhow::bail!(
-                        "Session expired {} times, giving up after {} re-auth attempts",
-                        auth_error_count,
-                        MAX_REAUTH_ATTEMPTS
+                        "Session expired {auth_error_count} times, giving up after {MAX_REAUTH_ATTEMPTS} re-auth attempts"
                     );
                 }
                 tracing::warn!(
@@ -983,7 +977,7 @@ async fn main() -> anyhow::Result<()> {
                             &config.username,
                         );
                         if !is_watch_mode {
-                            anyhow::bail!("{}", msg);
+                            anyhow::bail!("{msg}");
                         }
                         // In watch mode, skip this cycle and retry next interval
                     }
@@ -1000,7 +994,7 @@ async fn main() -> anyhow::Result<()> {
             download::DownloadOutcome::PartialFailure { failed_count } => {
                 notifier.notify(
                     notifications::Event::SyncFailed,
-                    &format!("{} downloads failed", failed_count),
+                    &format!("{failed_count} downloads failed"),
                     &config.username,
                 );
                 if is_watch_mode {
@@ -1009,7 +1003,7 @@ async fn main() -> anyhow::Result<()> {
                         "Some downloads failed this cycle, will retry next cycle"
                     );
                 } else {
-                    anyhow::bail!("{} downloads failed", failed_count);
+                    anyhow::bail!("{failed_count} downloads failed");
                 }
             }
         }

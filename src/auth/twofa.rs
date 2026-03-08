@@ -166,9 +166,7 @@ pub async fn authenticate_with_token(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(
-            AuthError::FailedLogin(format!("Invalid authentication token: {}", text)).into(),
-        );
+        return Err(AuthError::FailedLogin(format!("Invalid authentication token: {text}")).into());
     }
 
     let body: AccountLoginResponse = response
@@ -180,8 +178,7 @@ pub async fn authenticate_with_token(
     // re-run with --domain cn to use the correct regional endpoint.
     if let Some(domain_to_use) = &body.domain_to_use {
         return Err(anyhow::anyhow!(
-            "Apple insists on using {} for your request. Please use --domain parameter",
-            domain_to_use
+            "Apple insists on using {domain_to_use} for your request. Please use --domain parameter"
         ));
     }
 

@@ -175,7 +175,7 @@ pub fn add_dedup_suffix(path: &str, size: u64) -> String {
             let mut result = String::with_capacity(stem.len() + 1 + 20 + ext.len());
             result.push_str(stem);
             result.push('-');
-            let _ = write!(result, "{}", size);
+            let _ = write!(result, "{size}");
             result.push_str(ext);
             result
         }
@@ -183,7 +183,7 @@ pub fn add_dedup_suffix(path: &str, size: u64) -> String {
             let mut result = String::with_capacity(path.len() + 1 + 20);
             result.push_str(path);
             result.push('-');
-            let _ = write!(result, "{}", size);
+            let _ = write!(result, "{size}");
             result
         }
     }
@@ -250,7 +250,7 @@ pub fn map_filename_extension(filename: &str, asset_type: &str) -> String {
     }
     match filename.rfind('.') {
         Some(dot) => format!("{}.{}", &filename[..dot], ext),
-        None => format!("{}.{}", filename, ext),
+        None => format!("{filename}.{ext}"),
     }
 }
 
@@ -271,9 +271,9 @@ pub fn apply_name_id7(filename: &str, id: &str) -> String {
     match filename.rfind('.') {
         Some(dot) => {
             let (stem, ext) = filename.split_at(dot);
-            format!("{}_{}{}", stem, suffix, ext)
+            format!("{stem}_{suffix}{ext}")
         }
-        None => format!("{}_{}", filename, suffix),
+        None => format!("{filename}_{suffix}"),
     }
 }
 
@@ -287,12 +287,12 @@ pub fn live_photo_mov_path_suffix(filename: &str) -> String {
             let (stem, ext) = filename.split_at(dot);
             let ext_lower = ext[1..].to_ascii_lowercase();
             if ext_lower == "heic" {
-                format!("{}_HEVC.MOV", stem)
+                format!("{stem}_HEVC.MOV")
             } else {
-                format!("{}.MOV", stem)
+                format!("{stem}.MOV")
             }
         }
-        None => format!("{}.MOV", filename),
+        None => format!("{filename}.MOV"),
     }
 }
 
@@ -319,7 +319,7 @@ pub fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String
         .take(12)
         .collect();
     let ext = item_type_extension(asset_type);
-    format!("{}.{}", fingerprint, ext)
+    format!("{fingerprint}.{ext}")
 }
 
 /// Normalize AM/PM whitespace variants to a canonical no-space form.
@@ -431,9 +431,9 @@ pub fn live_photo_mov_path_original(filename: &str) -> String {
     match filename.rfind('.') {
         Some(dot) => {
             let (stem, _) = filename.split_at(dot);
-            format!("{}.MOV", stem)
+            format!("{stem}.MOV")
         }
-        None => format!("{}.MOV", filename),
+        None => format!("{filename}.MOV"),
     }
 }
 

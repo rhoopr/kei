@@ -27,7 +27,7 @@ impl Endpoints {
                 home: "https://www.icloud.com.cn",
                 setup: "https://setup.icloud.com.cn/setup/ws/1",
             }),
-            _ => anyhow::bail!("Domain '{}' is not supported yet", domain),
+            _ => anyhow::bail!("Domain '{domain}' is not supported yet"),
         }
     }
 }

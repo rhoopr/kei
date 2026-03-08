@@ -379,17 +379,15 @@ pub async fn authenticate_srp(
             let text = repair_response.text().await.unwrap_or_default();
             return Err(AuthError::ApiError {
                 code: 412,
-                message: format!("Repair failed: {}", text),
+                message: format!("Repair failed: {text}"),
             }
             .into());
         }
     } else if status.is_client_error() || status.is_server_error() {
         let text = response.text().await.unwrap_or_default();
-        return Err(AuthError::FailedLogin(format!(
-            "Invalid email/password combination: {}",
-            text
-        ))
-        .into());
+        return Err(
+            AuthError::FailedLogin(format!("Invalid email/password combination: {text}")).into(),
+        );
     }
 
     Ok(())
