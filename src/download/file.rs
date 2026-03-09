@@ -168,15 +168,30 @@ async fn attempt_download(
         }
     }
 
-    // Note: Apple's fileChecksum from the CloudKit API does not match a hash
-    // of the CDN-served content (the Python reference implementation also never
-    // validates it). Content-length verification above is sufficient to catch
-    // truncated downloads. The checksum is still used for temp filename
-    // derivation and the `verify --checksums` post-download command.
+    // Note: Apple's fileChecksum from the CloudKit API is an opaque version
+    // token, not a content hash. Content-length verification above is sufficient
+    // to catch truncated downloads. The fileChecksum is used for temp filename
+    // derivation and change detection across syncs.
 
     fs::rename(&part_path, download_path).await?;
 
     Ok(())
+}
+
+/// Compute the SHA-256 hash of a file, returning a hex-encoded string.
+///
+/// Used by the download pipeline to store a locally-computed checksum,
+/// and by `verify --checksums` to verify file integrity.
+pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+    .await?
 }
 
 #[cfg(test)]

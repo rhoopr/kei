@@ -1191,7 +1191,8 @@ async fn stream_and_download(
 
     // Batch DB writes for better throughput — flush every N completions
     const DB_BATCH_SIZE: usize = 50;
-    let mut downloaded_batch: Vec<(String, String, PathBuf)> = Vec::with_capacity(DB_BATCH_SIZE);
+    let mut downloaded_batch: Vec<(String, String, PathBuf, String)> =
+        Vec::with_capacity(DB_BATCH_SIZE);
     let mut failed_batch: Vec<(String, String, String)> = Vec::with_capacity(DB_BATCH_SIZE);
 
     while let Some((task, result)) = download_stream.next().await {
@@ -1207,7 +1208,7 @@ async fn stream_and_download(
             .to_string();
         pb.set_message(filename);
         match result {
-            Ok(exif_ok) => {
+            Ok((exif_ok, local_checksum)) => {
                 downloaded += 1;
                 if !exif_ok {
                     exif_failures += 1;
@@ -1217,6 +1218,7 @@ async fn stream_and_download(
                         task.asset_id.to_string(),
                         task.version_size.as_str().to_string(),
                         task.download_path.clone(),
+                        local_checksum,
                     ));
                 }
             }
@@ -1542,7 +1544,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let concurrency = config.concurrency;
     let temp_suffix: Arc<str> = config.temp_suffix.into();
 
-    let results: Vec<(DownloadTask, Result<bool>)> = stream::iter(tasks)
+    let results: Vec<(DownloadTask, Result<(bool, String)>)> = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
@@ -1568,12 +1570,12 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let mut exif_failures = 0usize;
 
     // Collect DB updates for batch write
-    let mut downloaded_batch: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut downloaded_batch: Vec<(String, String, PathBuf, String)> = Vec::new();
     let mut failed_batch: Vec<(String, String, String)> = Vec::new();
 
     for (task, result) in results {
         match &result {
-            Ok(exif_ok) => {
+            Ok((exif_ok, local_checksum)) => {
                 if !*exif_ok {
                     exif_failures += 1;
                 }
@@ -1582,6 +1584,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                         task.asset_id.to_string(),
                         task.version_size.as_str().to_string(),
                         task.download_path.clone(),
+                        local_checksum.clone(),
                     ));
                 }
             }
@@ -1652,7 +1655,7 @@ async fn download_single_task(
     retry_config: &RetryConfig,
     set_exif: bool,
     temp_suffix: &str,
-) -> Result<bool> {
+) -> Result<(bool, String)> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -1736,7 +1739,10 @@ async fn download_single_task(
         }
     }
 
-    Ok(exif_ok)
+    // Compute SHA-256 of the final file for local verification
+    let local_checksum = file::compute_sha256(&task.download_path).await?;
+
+    Ok((exif_ok, local_checksum))
 }
 
 fn format_duration(d: Duration) -> String {

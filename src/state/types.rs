@@ -155,6 +155,9 @@ pub struct AssetRecord {
     pub local_path: Option<PathBuf>,
     /// Last error message (if failed).
     pub last_error: Option<String>,
+    /// Locally-computed SHA-256 hash of the downloaded file (hex-encoded).
+    /// None for assets downloaded before schema v3.
+    pub local_checksum: Option<String>,
 
     // 8-byte primitives
     /// File size in bytes.
@@ -202,6 +205,7 @@ impl AssetRecord {
             filename,
             local_path: None,
             last_error: None,
+            local_checksum: None,
             size_bytes,
             created_at,
             added_at,
@@ -361,10 +365,10 @@ mod tests {
 
     #[test]
     fn test_asset_record_size() {
-        // Verify struct size is reasonable (goal: <= 256 bytes)
+        // Verify struct size is reasonable (goal: <= 280 bytes)
         assert!(
-            size_of::<AssetRecord>() <= 256,
-            "AssetRecord size {} exceeds 256 bytes",
+            size_of::<AssetRecord>() <= 280,
+            "AssetRecord size {} exceeds 280 bytes",
             size_of::<AssetRecord>()
         );
     }

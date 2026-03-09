@@ -230,6 +230,12 @@ fn verify_after_sync_reports_results() {
     let (username, password, cookie_dir) = common::require_preauth();
     let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
+    // Clear stale DB entries from prior test runs
+    reset_state_cmd(&username, &cookie_dir)
+        .arg("--yes")
+        .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
+        .assert();
+
     sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
         .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
         .assert()
@@ -251,6 +257,12 @@ fn verify_checksums_after_sync() {
     let (username, password, cookie_dir) = common::require_preauth();
     let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
+    // Clear stale DB entries from prior test runs
+    reset_state_cmd(&username, &cookie_dir)
+        .arg("--yes")
+        .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
+        .assert();
+
     sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
         .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
         .assert()
@@ -268,6 +280,12 @@ fn verify_checksums_after_sync() {
 fn verify_detects_missing_files() {
     let (username, password, cookie_dir) = common::require_preauth();
     let download_dir = tempfile::tempdir().expect("failed to create download dir");
+
+    // Clear stale DB entries from prior test runs
+    reset_state_cmd(&username, &cookie_dir)
+        .arg("--yes")
+        .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
+        .assert();
 
     sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
         .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
@@ -293,6 +311,12 @@ fn verify_detects_missing_files() {
 fn verify_checksums_detects_corruption() {
     let (username, password, cookie_dir) = common::require_preauth();
     let download_dir = tempfile::tempdir().expect("failed to create download dir");
+
+    // Clear stale DB entries from prior test runs
+    reset_state_cmd(&username, &cookie_dir)
+        .arg("--yes")
+        .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
+        .assert();
 
     sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
         .args(["--skip-videos"])

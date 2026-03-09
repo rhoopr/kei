@@ -51,6 +51,7 @@ pub trait StateDb: Send + Sync {
         id: &str,
         version_size: &str,
         local_path: &Path,
+        local_checksum: &str,
     ) -> Result<(), StateError>;
 
     /// Mark an asset as failed with an error message.
@@ -111,7 +112,7 @@ pub trait StateDb: Send + Sync {
     /// Used by the download engine to reduce per-download DB overhead.
     async fn mark_downloaded_batch(
         &self,
-        items: &[(String, String, PathBuf)],
+        items: &[(String, String, PathBuf, String)],
     ) -> Result<(), StateError>;
 
     /// Batch mark assets as failed with error messages.
@@ -324,6 +325,7 @@ impl StateDb for SqliteStateDb {
         id: &str,
         version_size: &str,
         local_path: &Path,
+        local_checksum: &str,
     ) -> Result<(), StateError> {
         let downloaded_at = Utc::now().timestamp();
 
@@ -333,8 +335,8 @@ impl StateDb for SqliteStateDb {
             .map_err(|e| StateError::Query(e.to_string()))?;
 
         conn.execute(
-            "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, last_error = NULL WHERE id = ?3 AND version_size = ?4",
-            rusqlite::params![downloaded_at, local_path.to_string_lossy(), id, version_size],
+            "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, local_checksum = ?3, last_error = NULL WHERE id = ?4 AND version_size = ?5",
+            rusqlite::params![downloaded_at, local_path.to_string_lossy(), local_checksum, id, version_size],
         )
         .map_err(StateError::query)?;
 
@@ -369,7 +371,7 @@ impl StateDb for SqliteStateDb {
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error FROM assets WHERE status = 'failed'",
+                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'failed'",
             )
             .map_err(StateError::query)?;
 
@@ -453,7 +455,7 @@ impl StateDb for SqliteStateDb {
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error FROM assets WHERE status = 'downloaded'",
+                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'downloaded'",
             )
             .map_err(StateError::query)?;
 
@@ -591,7 +593,7 @@ impl StateDb for SqliteStateDb {
 
     async fn mark_downloaded_batch(
         &self,
-        items: &[(String, String, PathBuf)],
+        items: &[(String, String, PathBuf, String)],
     ) -> Result<(), StateError> {
         if items.is_empty() {
             return Ok(());
@@ -610,14 +612,15 @@ impl StateDb for SqliteStateDb {
         let result = (|| {
             let mut stmt = conn
                 .prepare_cached(
-                    "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, last_error = NULL WHERE id = ?3 AND version_size = ?4",
+                    "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, local_checksum = ?3, last_error = NULL WHERE id = ?4 AND version_size = ?5",
                 )
                 .map_err(StateError::query)?;
 
-            for (id, version_size, local_path) in items {
+            for (id, version_size, local_path, local_checksum) in items {
                 stmt.execute(rusqlite::params![
                     downloaded_at,
                     local_path.to_string_lossy(),
+                    local_checksum,
                     id,
                     version_size,
                 ])
@@ -749,6 +752,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
     let last_seen_at_ts: i64 = row.get(11)?;
     let download_attempts: i64 = row.get(12)?;
     let last_error: Option<String> = row.get(13)?;
+    let local_checksum: Option<String> = row.get(14)?;
 
     Ok(AssetRecord {
         id,
@@ -756,6 +760,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
         filename,
         local_path: local_path_str.map(PathBuf::from),
         last_error,
+        local_checksum,
         size_bytes: size_bytes as u64,
         created_at: Utc
             .timestamp_opt(created_at_ts, 0)
@@ -859,7 +864,7 @@ mod tests {
         );
 
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("ABC123", "original", &file_path)
+        db.mark_downloaded("ABC123", "original", &file_path, "abc123hash")
             .await
             .unwrap();
 
@@ -887,9 +892,14 @@ mod tests {
         );
 
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("ABC123", "original", Path::new("/nonexistent/file.jpg"))
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "ABC123",
+            "original",
+            Path::new("/nonexistent/file.jpg"),
+            "abc123hash",
+        )
+        .await
+        .unwrap();
 
         // Downloaded asset with missing file should be re-downloaded
         let result = db
@@ -924,7 +934,7 @@ mod tests {
         );
 
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("ABC123", "original", &file_path)
+        db.mark_downloaded("ABC123", "original", &file_path, "oldhash")
             .await
             .unwrap();
 
@@ -1022,7 +1032,7 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.join(format!("dl_photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
-            db.mark_downloaded(&format!("DOWNLOADED_{}", i), "original", &path)
+            db.mark_downloaded(&format!("DOWNLOADED_{}", i), "original", &path, "hash")
                 .await
                 .unwrap();
         }
@@ -1090,7 +1100,7 @@ mod tests {
         );
 
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("ABC123", "original", &file_path)
+        db.mark_downloaded("ABC123", "original", &file_path, "abc123hash")
             .await
             .unwrap();
 
@@ -1124,7 +1134,7 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
-            db.mark_downloaded(&format!("DL_{}", i), "original", &path)
+            db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash")
                 .await
                 .unwrap();
         }
@@ -1155,7 +1165,7 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
-            db.mark_downloaded(&format!("DL_{}", i), "original", &path)
+            db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash")
                 .await
                 .unwrap();
         }
@@ -1200,7 +1210,7 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
-            db.mark_downloaded(&format!("DL_{}", i), "original", &path)
+            db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash")
                 .await
                 .unwrap();
         }
@@ -1237,7 +1247,7 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
-            db.mark_downloaded(&format!("DL_{}", i), "original", &path)
+            db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash")
                 .await
                 .unwrap();
         }
@@ -1307,7 +1317,9 @@ mod tests {
         let dir = test_dir("retry_no_failures");
         let path = dir.join("photo.jpg");
         fs::write(&path, b"content").unwrap();
-        db.mark_downloaded("DL_1", "original", &path).await.unwrap();
+        db.mark_downloaded("DL_1", "original", &path, "hash")
+            .await
+            .unwrap();
 
         let count = db.reset_failed().await.unwrap();
         assert_eq!(count, 0);
@@ -1332,7 +1344,9 @@ mod tests {
         db.upsert_seen(&dl).await.unwrap();
         let path = dir.join("photo1.jpg");
         fs::write(&path, b"content").unwrap();
-        db.mark_downloaded("DL_1", "original", &path).await.unwrap();
+        db.mark_downloaded("DL_1", "original", &path, "hash")
+            .await
+            .unwrap();
 
         // Add a failed asset
         let failed = AssetRecord::new_pending(
@@ -1386,11 +1400,16 @@ mod tests {
         }
 
         // Mark them as downloaded in batch
-        let items: Vec<(String, String, PathBuf)> = (0..3)
+        let items: Vec<(String, String, PathBuf, String)> = (0..3)
             .map(|i| {
                 let path = dir.join(format!("photo_{}.jpg", i));
                 fs::write(&path, b"content").unwrap();
-                (format!("BATCH_{}", i), "original".to_string(), path)
+                (
+                    format!("BATCH_{}", i),
+                    "original".to_string(),
+                    path,
+                    format!("hash_{}", i),
+                )
             })
             .collect();
 
