@@ -279,7 +279,7 @@ Require pre-authenticated session. Run with `--test-threads=1`.
 
 | Test | Flag | Confirms |
 |------|------|----------|
-| `sync_align_raw_controls_raw_naming` | `--align-raw as-is/original/alternative` | DNG present in all variants; file listings differ between variants |
+| `sync_align_raw_controls_raw_naming` | `--align-raw as-is/original/alternative` | DNG present in all variants; flag accepted without error (no RAW+JPEG pairs in library) |
 
 ### Live Photo MOV Policy (1 test)
 

@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn notifier_clone() {
         let n = SystemdNotifier::new(true);
-        let n2 = n.clone();
+        let n2 = n;
         let _ = format!("{:?}", n2);
     }
 }

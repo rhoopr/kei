@@ -529,7 +529,7 @@ fn sync_keep_unicode_preserves_special_chars() {
     let has_unicode = files.iter().any(|p| {
         p.file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.chars().any(|c| !c.is_ascii()))
+            .map(|n| !n.is_ascii())
             .unwrap_or(false)
     });
     assert!(

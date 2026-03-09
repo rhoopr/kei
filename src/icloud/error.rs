@@ -98,7 +98,7 @@ mod tests {
                 code: "C1".into(),
                 reason: "R1".into(),
             },
-            std::io::Error::new(std::io::ErrorKind::Other, "io").into(),
+            std::io::Error::other("io").into(),
             serde_json::from_str::<serde_json::Value>("{bad}")
                 .unwrap_err()
                 .into(),
