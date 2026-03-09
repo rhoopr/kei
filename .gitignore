@@ -13,3 +13,6 @@ CLAUDE.md
 
 # Credentials
 .env
+
+# Test session cookies
+.test-cookies/
