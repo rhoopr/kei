@@ -86,14 +86,11 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 dotenvy = "0.15"
+kamadak-exif = "0.6"
 
 [[test]]
 name = "cli"
 path = "tests/cli.rs"
-
-[[test]]
-name = "auth"
-path = "tests/auth.rs"
 
 [[test]]
 name = "sync"
@@ -102,3 +99,11 @@ path = "tests/sync.rs"
 [[test]]
 name = "state"
 path = "tests/state.rs"
+
+[[test]]
+name = "state_auth"
+path = "tests/state_auth.rs"
+
+[[test]]
+name = "setup_auth"
+path = "tests/setup_auth.rs"

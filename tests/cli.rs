@@ -797,3 +797,17 @@ fn retry_failed_accepts_sync_flags() {
         .assert()
         .success();
 }
+
+// ── submit-code validation ─────────────────────────────────────────────
+
+#[test]
+fn submit_code_fails_without_username() {
+    common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args(["submit-code", "123456"])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicate::str::is_empty().not());
+}

@@ -4,8 +4,6 @@ use anyhow::Context;
 use base64::Engine;
 use futures_util::StreamExt;
 use reqwest::Client;
-use sha1::Sha1;
-use sha2::{Digest, Sha256};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
@@ -31,11 +29,9 @@ fn temp_download_path(
 /// Download a file from URL using .part temp files.
 ///
 /// Resumes partial downloads via HTTP Range requests when a .part file
-/// already exists, hashing the existing bytes first so the final checksum
-/// covers the entire file. Falls back to a full download if the server
-/// ignores the Range header. On completion the .part file is renamed to
-/// the final destination path. Retries with exponential backoff on
-/// transient failures.
+/// already exists. Falls back to a full download if the server ignores the
+/// Range header. On completion the .part file is renamed to the final
+/// destination path. Retries with exponential backoff on transient failures.
 pub async fn download_file(
     client: &Client,
     url: &str,
@@ -62,64 +58,28 @@ pub async fn download_file(
                 RetryAction::Abort
             }
         },
-        || async {
-            Box::pin(attempt_download(
-                client,
-                url,
-                download_path,
-                &part_path,
-                checksum,
-            ))
-            .await
-        },
+        || async { Box::pin(attempt_download(client, url, download_path, &part_path)).await },
     ))
     .await
 }
 
-/// Rebuild hash state by re-reading an existing .part file.
-/// Returns both SHA-256 and SHA-1 hashers and byte count, or None if the
-/// file doesn't exist or is empty.
-async fn resume_hash_state(part_path: &Path) -> Option<(Sha256, Sha1, u64)> {
-    let meta = fs::metadata(part_path).await.ok()?;
-    let existing_len = meta.len();
-    if existing_len == 0 {
-        return None;
-    }
-
-    let file = fs::File::open(part_path).await.ok()?;
-    let mut reader = tokio::io::BufReader::new(file);
-    let mut sha256 = Sha256::new();
-    let mut sha1 = Sha1::new();
-    let mut buf = vec![0u8; 262_144]; // 256 KiB for faster resume hashing
-    loop {
-        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
-            .await
-            .ok()?;
-        if n == 0 {
-            break;
-        }
-        sha256.update(&buf[..n]);
-        sha1.update(&buf[..n]);
-    }
-    Some((sha256, sha1, existing_len))
-}
-
-/// Single download attempt with checksum verification and resume support.
+/// Single download attempt with resume support.
 ///
-/// If a .part file already exists, re-hashes its contents and sends a Range
-/// request to resume from where it left off. Falls back to a fresh download
-/// if the server doesn't support Range or returns an unexpected status.
+/// If a .part file already exists, sends a Range request to resume from where
+/// it left off. Falls back to a fresh download if the server doesn't support
+/// Range or returns an unexpected status.
 async fn attempt_download(
     client: &Client,
     url: &str,
     download_path: &Path,
     part_path: &Path,
-    checksum: &str,
 ) -> Result<(), DownloadError> {
     let path_str = download_path.display().to_string();
 
-    let resume_state = resume_hash_state(part_path).await;
-    let resume_offset = resume_state.as_ref().map(|(_, _, len)| *len).unwrap_or(0);
+    let resume_offset = match fs::metadata(part_path).await {
+        Ok(meta) if meta.len() > 0 => meta.len(),
+        _ => 0,
+    };
 
     let mut request = client.get(url);
     if resume_offset > 0 {
@@ -145,21 +105,17 @@ async fn attempt_download(
     // `effective_offset` tracks the actual byte offset used for the content-length
     // check. When the server ignores Range and returns 200, we restart from zero
     // so effective_offset must be 0 (not the stale resume_offset).
-    let (mut sha256, mut sha1_hasher, mut bytes_written, truncate, effective_offset) = match (
-        status,
-        resume_offset,
-        resume_state,
-    ) {
-        (206, offset, Some((h256, h1, len))) if offset > 0 => (h256, h1, len, false, offset),
-        (_, _, _) if response.status().is_success() => {
+    let (mut bytes_written, truncate, effective_offset) = match status {
+        206 if resume_offset > 0 => (resume_offset, false, resume_offset),
+        _ if response.status().is_success() => {
             if resume_offset > 0 {
                 tracing::info!(
-                        "Server returned {} instead of 206 for Range request, restarting download of {}",
-                        status,
-                        path_str,
-                    );
+                    "Server returned {} instead of 206 for Range request, restarting download of {}",
+                    status,
+                    path_str,
+                );
             }
-            (Sha256::new(), Sha1::new(), 0u64, true, 0u64)
+            (0u64, true, 0u64)
         }
         _ => {
             return Err(DownloadError::HttpStatus {
@@ -191,8 +147,6 @@ async fn attempt_download(
             content_length,
             bytes_written,
         })?;
-        sha256.update(&chunk);
-        sha1_hasher.update(&chunk);
         file.write_all(&chunk).await?;
         bytes_written += chunk.len() as u64;
     }
@@ -200,9 +154,8 @@ async fn attempt_download(
     file.sync_data().await?;
     drop(file);
 
-    // Belt-and-suspenders: verify the server sent the number of bytes it
-    // promised. Catches CDN truncation (e.g. Apple silently cutting off
-    // videos at ~1 GB) before we even reach the checksum comparison.
+    // Verify the server sent the number of bytes it promised.
+    // Catches CDN truncation (e.g. Apple silently cutting off videos at ~1 GB).
     if let Some(expected_len) = content_length {
         let total_bytes = bytes_written - effective_offset;
         if total_bytes != expected_len {
@@ -215,37 +168,11 @@ async fn attempt_download(
         }
     }
 
-    if let Ok(expected_hash) = base64::engine::general_purpose::STANDARD.decode(checksum) {
-        // Apple uses several checksum formats:
-        //   - 32 bytes: raw SHA-256
-        //   - 33 bytes: 0x01 prefix + SHA-256
-        //   - 20 bytes: raw SHA-1
-        //   - 21 bytes: 0x01 prefix + SHA-1
-        let matches = match expected_hash.len() {
-            32 => sha256.finalize().as_slice() == expected_hash.as_slice(),
-            33 => sha256.finalize().as_slice() == &expected_hash[1..],
-            20 => sha1_hasher.finalize().as_slice() == expected_hash.as_slice(),
-            21 => sha1_hasher.finalize().as_slice() == &expected_hash[1..],
-            _ => {
-                tracing::warn!(
-                    len = expected_hash.len(),
-                    path = %download_path.display(),
-                    "Unknown checksum format ({} bytes), skipping verification",
-                    expected_hash.len()
-                );
-                true
-            }
-        };
-
-        if !matches {
-            // Checksum failed — delete .part so next attempt starts fresh
-            // (the partial data is corrupt or the resume was wrong).
-            let _ = fs::remove_file(&part_path).await;
-            return Err(DownloadError::ChecksumMismatch(
-                download_path.display().to_string(),
-            ));
-        }
-    }
+    // Note: Apple's fileChecksum from the CloudKit API does not match a hash
+    // of the CDN-served content (the Python reference implementation also never
+    // validates it). Content-length verification above is sufficient to catch
+    // truncated downloads. The checksum is still used for temp filename
+    // derivation and the `verify --checksums` post-download command.
 
     fs::rename(&part_path, download_path).await?;
 

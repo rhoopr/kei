@@ -8,13 +8,13 @@ target/
 
 # Claude
 .claude/
-.scratch/
 
 # Docs (keep README)
 docs/
 reference/
 *.md
 !README.md
+.scratch/
 
 # Docker
 .dockerignore

@@ -1,13 +1,12 @@
 //! State-management tests that require network credentials.
 //!
 //! Exercises status, reset-state, verify, import-existing, and retry-failed
-//! against real iCloud data. Skipped when `ICLOUD_USERNAME` / `ICLOUD_PASSWORD`
-//! are not set.
+//! against real iCloud data. Requires pre-authentication via
+//! `cargo test --test setup_auth -- --ignored`.
 
 mod common;
 
 use predicates::prelude::*;
-use tempfile::tempdir;
 
 // ══════════════════════════════════════════════════════════════════════════
 //  STATUS
@@ -15,16 +14,8 @@ use tempfile::tempdir;
 
 #[test]
 fn status_after_sync_shows_counts() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Run a small sync to populate the DB
     common::cmd()
@@ -37,7 +28,7 @@ fn status_after_sync_shows_counts() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -53,7 +44,7 @@ fn status_after_sync_shows_counts() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
@@ -75,16 +66,8 @@ fn status_after_sync_shows_counts() {
 
 #[test]
 fn reset_state_deletes_db_after_sync() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Sync to create a DB
     common::cmd()
@@ -97,7 +80,7 @@ fn reset_state_deletes_db_after_sync() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -107,7 +90,7 @@ fn reset_state_deletes_db_after_sync() {
         .success();
 
     // Verify DB exists
-    let db_files: Vec<_> = std::fs::read_dir(cookie_dir.path())
+    let db_files: Vec<_> = std::fs::read_dir(cookie_dir.as_path())
         .expect("read cookie dir")
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -127,7 +110,7 @@ fn reset_state_deletes_db_after_sync() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
@@ -135,7 +118,7 @@ fn reset_state_deletes_db_after_sync() {
         .stdout(predicate::str::contains("State database deleted"));
 
     // Verify DB is gone
-    let db_files_after: Vec<_> = std::fs::read_dir(cookie_dir.path())
+    let db_files_after: Vec<_> = std::fs::read_dir(cookie_dir.as_path())
         .expect("read cookie dir")
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -153,16 +136,8 @@ fn reset_state_deletes_db_after_sync() {
 
 #[test]
 fn reset_state_without_yes_does_not_delete() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Sync to create a DB
     common::cmd()
@@ -175,7 +150,7 @@ fn reset_state_without_yes_does_not_delete() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -185,7 +160,7 @@ fn reset_state_without_yes_does_not_delete() {
         .success();
 
     // Count DB files before
-    let db_count_before = std::fs::read_dir(cookie_dir.path())
+    let db_count_before = std::fs::read_dir(cookie_dir.as_path())
         .expect("read cookie dir")
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -205,7 +180,7 @@ fn reset_state_without_yes_does_not_delete() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
@@ -213,7 +188,7 @@ fn reset_state_without_yes_does_not_delete() {
         .stdout(predicate::str::contains("Cancelled"));
 
     // DB should still exist
-    let db_count_after = std::fs::read_dir(cookie_dir.path())
+    let db_count_after = std::fs::read_dir(cookie_dir.as_path())
         .expect("read cookie dir")
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -235,16 +210,8 @@ fn reset_state_without_yes_does_not_delete() {
 
 #[test]
 fn verify_after_sync_reports_results() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Sync a couple files
     common::cmd()
@@ -257,7 +224,7 @@ fn verify_after_sync_reports_results() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -273,7 +240,7 @@ fn verify_after_sync_reports_results() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
@@ -287,16 +254,8 @@ fn verify_after_sync_reports_results() {
 
 #[test]
 fn verify_checksums_after_sync() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Sync
     common::cmd()
@@ -309,7 +268,7 @@ fn verify_checksums_after_sync() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -326,7 +285,7 @@ fn verify_checksums_after_sync() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
@@ -336,16 +295,8 @@ fn verify_checksums_after_sync() {
 
 #[test]
 fn verify_detects_missing_files() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Sync
     common::cmd()
@@ -358,7 +309,7 @@ fn verify_detects_missing_files() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -379,7 +330,7 @@ fn verify_detects_missing_files() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
@@ -393,16 +344,8 @@ fn verify_detects_missing_files() {
 
 #[test]
 fn verify_checksums_detects_corruption() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Sync
     common::cmd()
@@ -416,7 +359,7 @@ fn verify_checksums_detects_corruption() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -438,7 +381,7 @@ fn verify_checksums_detects_corruption() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
@@ -452,15 +395,7 @@ fn verify_checksums_detects_corruption() {
 
 #[test]
 fn import_existing_with_nonexistent_directory_fails() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::cmd()
         .args([
@@ -470,7 +405,7 @@ fn import_existing_with_nonexistent_directory_fails() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             "/nonexistent/path/that/does/not/exist",
         ])
@@ -482,16 +417,8 @@ fn import_existing_with_nonexistent_directory_fails() {
 
 #[test]
 fn import_existing_matches_synced_files() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Sync a few files first
     common::cmd()
@@ -504,7 +431,7 @@ fn import_existing_matches_synced_files() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -524,7 +451,7 @@ fn import_existing_matches_synced_files() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
@@ -539,7 +466,7 @@ fn import_existing_matches_synced_files() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--recent",
@@ -557,7 +484,7 @@ fn import_existing_matches_synced_files() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
@@ -567,16 +494,8 @@ fn import_existing_matches_synced_files() {
 
 #[test]
 fn import_existing_empty_directory_reports_zero_matches() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     common::cmd()
         .args([
@@ -586,7 +505,7 @@ fn import_existing_empty_directory_reports_zero_matches() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--recent",
@@ -605,16 +524,8 @@ fn import_existing_empty_directory_reports_zero_matches() {
 
 #[test]
 fn import_existing_custom_folder_structure() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Sync with a custom folder structure
     common::cmd()
@@ -629,7 +540,7 @@ fn import_existing_custom_folder_structure() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -649,7 +560,7 @@ fn import_existing_custom_folder_structure() {
             "--username",
             &username,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
@@ -664,7 +575,7 @@ fn import_existing_custom_folder_structure() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--folder-structure",
@@ -684,16 +595,8 @@ fn import_existing_custom_folder_structure() {
 
 #[test]
 fn retry_failed_after_successful_sync_is_noop() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // Sync successfully
     common::cmd()
@@ -706,7 +609,7 @@ fn retry_failed_after_successful_sync_is_noop() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -724,7 +627,7 @@ fn retry_failed_after_successful_sync_is_noop() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
@@ -736,16 +639,8 @@ fn retry_failed_after_successful_sync_is_noop() {
 
 #[test]
 fn retry_failed_with_no_db_succeeds() {
-    let (username, password) = match common::creds_or_skip() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no credentials");
-            return;
-        }
-    };
-
-    let cookie_dir = tempdir().expect("failed to create tempdir");
-    let download_dir = tempdir().expect("failed to create download dir");
+    let (username, password, cookie_dir) = common::require_preauth();
+    let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
     // retry-failed with no prior sync — DB will be created fresh with
     // zero failed assets, so it should report "No failed assets to retry"
@@ -757,7 +652,7 @@ fn retry_failed_with_no_db_succeeds() {
             "--password",
             &password,
             "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
+            cookie_dir.to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",

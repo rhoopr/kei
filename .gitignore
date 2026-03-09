@@ -16,3 +16,6 @@ CLAUDE.md
 
 # Test session cookies
 .test-cookies/
+
+# Test logs
+tests/results.log

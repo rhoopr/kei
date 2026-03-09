@@ -1,55 +1,116 @@
-# Integration Tests
+# Tests
 
-## Structure
-
-| File | Tests | Description |
-|------|-------|-------------|
-| `cli.rs` | 66 | Pure CLI-parsing tests — no network, no credentials. Validates subcommands, flags, enum variants, short aliases, and error cases. |
-| `auth.rs` | 8 | Authentication tests against Apple's real servers. Exercises `sync --auth-only` and `submit-code`. |
-| `sync.rs` | 34 | End-to-end sync tests. Covers download, filtering, folder structure, dry-run, idempotent re-sync, and flag combinations. |
-| `state.rs` | 17 | State management tests for `status`, `reset-state`, `verify`, `import-existing`, and `retry-failed` subcommands. |
-| `common/mod.rs` | — | Shared helpers: `cmd()` builds an `assert_cmd::Command`, `creds_or_skip()` skips tests when credentials are absent. |
-
-## Running Tests
+## Quick Reference
 
 ```sh
-# All integration tests (cli tests run without credentials; others skip gracefully)
-cargo test
+# 1. Pre-commit (runs automatically on git commit)
+cargo fmt -- --check
+cargo clippy -- -D warnings
+cargo test --bin icloudpd-rs --test cli --test state
 
-# Individual test targets
-cargo test --test cli
-cargo test --test auth
-cargo test --test sync
-cargo test --test state
+# 2. One-time auth setup (interactive, prompts for 2FA)
+env (cat .env | grep -v '^#') cargo run -- sync --auth-only --cookie-directory .test-cookies
 
-# Single test
-cargo test --test cli help_flag_succeeds
+# 3. Run all tests
+./tests/run-all-tests.sh
+
+# 4. Run a single test
+cargo test --test sync list_albums_prints_album_names -- --test-threads=1
 ```
 
-## Credentials
+## Setup
 
-Tests in `auth.rs`, `sync.rs`, and `state.rs` require valid iCloud credentials. Without them, those tests print `SKIP: no credentials` and pass.
-
-### Setup
-
-1. Copy the example env file:
+1. Copy the example env file and fill in your credentials:
    ```sh
    cp .env.example .env
    ```
-
-2. Fill in your credentials:
    ```
    ICLOUD_USERNAME=you@icloud.com
    ICLOUD_PASSWORD=your-app-specific-password
    ```
 
-The `.env` file is gitignored. `dotenvy` loads it automatically in the test harness.
+2. Authenticate (creates `.test-cookies/` with session files):
+   ```sh
+   env (cat .env | grep -v '^#') cargo run -- sync --auth-only --cookie-directory .test-cookies
+   ```
+   This prompts for a 2FA code. You only need to redo this when the session expires.
 
-## How It Works
+3. Verify the session works:
+   ```sh
+   cargo test --test setup_auth -- --ignored
+   ```
 
-- Each file is a separate `[[test]]` target in `Cargo.toml`, compiled as its own binary.
-- `common::cmd()` builds an `assert_cmd::Command` pointing at the `icloudpd-rs` binary.
-- `common::creds_or_skip()` returns `Some((username, password))` or `None`, letting credential-dependent tests skip without failure.
-- CLI-only tests append `--help` to argument lists to validate parsing without executing commands.
-- `tempfile::tempdir()` provides isolated directories for cookie stores and downloads.
-- `predicates` crate is used for composable stdout/stderr assertions.
+4. Create an `icloudpd-test` album in iCloud Photos with these assets:
+
+   | Asset | Purpose |
+   |-------|---------|
+   | Regular JPEG photo | Basic download, size comparison, EXIF tests |
+   | Standalone video (MOV/MP4) | Skip-videos/skip-photos filter tests |
+   | Live Photo (HEIC + MOV) | Skip-live-photos, MOV filename policy tests |
+   | Apple ProRAW (.DNG) | RAW+JPEG pair for align-raw tests |
+   | Photo with unicode filename | keep-unicode-in-filenames test |
+
+   The sync tests target this album for deterministic, behavioral assertions.
+
+## Test Structure
+
+| File | Auth? | Description |
+|------|-------|-------------|
+| `cli.rs` | No | CLI argument parsing — no network |
+| `state.rs` | No | State commands against absent DB — no network |
+| `sync.rs` | Yes | Sync, download, filtering — targets `icloudpd-test` album |
+| `state_auth.rs` | Yes | Status, reset-state, verify, import-existing, retry-failed |
+| `setup_auth.rs` | Yes | Verifies pre-auth session is valid (ignored by default) |
+| `common/mod.rs` | — | Shared helpers |
+
+## Running Tests
+
+### No-auth tests (no setup needed)
+
+```sh
+cargo test --bin icloudpd-rs          # unit tests
+cargo test --test cli                  # CLI parsing
+cargo test --test state                # state commands (no DB)
+```
+
+### Auth-required tests (need .test-cookies/)
+
+Auth tests must run single-threaded to avoid Apple API rate limits (503s).
+
+```sh
+cargo test --test sync -- --test-threads=1
+cargo test --test state_auth -- --test-threads=1
+```
+
+### All tests
+
+```sh
+./tests/run-all-tests.sh
+```
+
+Results are logged to `tests/results.log`.
+
+### Single test
+
+```sh
+cargo test --test sync list_albums_prints_album_names -- --test-threads=1
+```
+
+## Apple API Rate Limits
+
+Apple returns HTTP 503 if you hit their API too fast. If you get 503s:
+
+- Wait 10-15 minutes before retrying
+- Always use `--test-threads=1` for auth tests
+- Run test binaries sequentially (the script handles this)
+
+## Files
+
+| Path | Gitignored | Purpose |
+|------|------------|---------|
+| `.env` | Yes | Credentials |
+| `.env.example` | No | Template for `.env` |
+| `.test-cookies/` | Yes | Pre-auth session files |
+| `tests/results.log` | Yes | Test run output |
+| `tests/run-all-tests.sh` | No | Runs all tests sequentially |
+| `tests/TESTS.md` | No | Detailed test reference |
