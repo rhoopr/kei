@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -71,6 +71,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
         // Fresh database — apply all schemas
         conn.execute_batch(SCHEMA_V1)?;
         conn.execute_batch(SCHEMA_V2)?;
+        conn.execute_batch(SCHEMA_V3)?;
         set_schema_version(conn, SCHEMA_VERSION)?;
         tracing::debug!("Initialized database schema at version {}", SCHEMA_VERSION);
     } else if current_version < SCHEMA_VERSION {
@@ -91,11 +92,17 @@ CREATE TABLE IF NOT EXISTS metadata (
 );
 ";
 
+/// Schema DDL for version 3 migration: add locally-computed checksum column.
+const SCHEMA_V3: &str = "ALTER TABLE assets ADD COLUMN local_checksum TEXT;";
+
 /// Apply migration for a specific version.
 fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError> {
     match version {
         2 => {
             conn.execute_batch(SCHEMA_V2)?;
+        }
+        3 => {
+            conn.execute_batch(SCHEMA_V3)?;
         }
         other => {
             return Err(StateError::Query(format!(
@@ -193,7 +200,7 @@ mod tests {
         set_schema_version(&conn, 1).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), 1);
 
-        // Migrate should bring it to v2
+        // Migrate should bring it to current version
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
@@ -202,5 +209,49 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_v2_to_v3_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a v2 database
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        set_schema_version(&conn, 2).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 2);
+
+        // Migrate should bring it to v3
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 3);
+
+        // Verify local_checksum column exists
+        let has_column: bool = conn
+            .prepare("SELECT local_checksum FROM assets LIMIT 0")
+            .is_ok();
+        assert!(
+            has_column,
+            "local_checksum column should exist after v3 migration"
+        );
+    }
+
+    #[test]
+    fn test_v1_to_v3_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 3);
+
+        // Both v2 (metadata table) and v3 (local_checksum column) should be present
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let has_column: bool = conn
+            .prepare("SELECT local_checksum FROM assets LIMIT 0")
+            .is_ok();
+        assert!(has_column);
     }
 }

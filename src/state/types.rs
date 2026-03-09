@@ -155,6 +155,9 @@ pub struct AssetRecord {
     pub local_path: Option<PathBuf>,
     /// Last error message (if failed).
     pub last_error: Option<String>,
+    /// Locally-computed SHA-256 hash of the downloaded file (hex-encoded).
+    /// None for assets downloaded before schema v3.
+    pub local_checksum: Option<String>,
 
     // 8-byte primitives
     /// File size in bytes.
@@ -202,6 +205,7 @@ impl AssetRecord {
             filename,
             local_path: None,
             last_error: None,
+            local_checksum: None,
             size_bytes,
             created_at,
             added_at,
@@ -361,11 +365,71 @@ mod tests {
 
     #[test]
     fn test_asset_record_size() {
-        // Verify struct size is reasonable (goal: <= 256 bytes)
+        // Verify struct size is reasonable (goal: <= 280 bytes)
         assert!(
-            size_of::<AssetRecord>() <= 256,
-            "AssetRecord size {} exceeds 256 bytes",
+            size_of::<AssetRecord>() <= 280,
+            "AssetRecord size {} exceeds 280 bytes",
             size_of::<AssetRecord>()
         );
+    }
+
+    #[test]
+    fn test_version_size_key_is_one_byte() {
+        assert_eq!(size_of::<VersionSizeKey>(), 1);
+    }
+
+    #[test]
+    fn test_asset_status_is_one_byte() {
+        assert_eq!(size_of::<AssetStatus>(), 1);
+    }
+
+    #[test]
+    fn test_media_type_is_one_byte() {
+        assert_eq!(size_of::<MediaType>(), 1);
+    }
+
+    #[test]
+    fn test_sync_run_stats_default() {
+        let stats = SyncRunStats::default();
+        assert_eq!(stats.assets_seen, 0);
+        assert_eq!(stats.assets_downloaded, 0);
+        assert_eq!(stats.assets_failed, 0);
+        assert!(!stats.interrupted);
+    }
+
+    #[test]
+    fn test_asset_record_new_pending_with_added_at() {
+        let now = Utc::now();
+        let added = now - chrono::Duration::hours(1);
+        let record = AssetRecord::new_pending(
+            "XYZ".to_string(),
+            VersionSizeKey::LiveOriginal,
+            "ck".to_string(),
+            "video.mov".to_string(),
+            now,
+            Some(added),
+            99999,
+            MediaType::LivePhotoVideo,
+        );
+        assert_eq!(record.added_at, Some(added));
+        assert_eq!(record.media_type, MediaType::LivePhotoVideo);
+        assert_eq!(record.version_size, VersionSizeKey::LiveOriginal);
+    }
+
+    #[test]
+    fn test_version_size_key_all_from_asset_version_size() {
+        let conversions = [
+            (AssetVersionSize::Original, VersionSizeKey::Original),
+            (AssetVersionSize::Medium, VersionSizeKey::Medium),
+            (AssetVersionSize::Thumb, VersionSizeKey::Thumb),
+            (AssetVersionSize::Adjusted, VersionSizeKey::Adjusted),
+            (AssetVersionSize::Alternative, VersionSizeKey::Alternative),
+            (AssetVersionSize::LiveOriginal, VersionSizeKey::LiveOriginal),
+            (AssetVersionSize::LiveMedium, VersionSizeKey::LiveMedium),
+            (AssetVersionSize::LiveThumb, VersionSizeKey::LiveThumb),
+        ];
+        for (avs, expected) in conversions {
+            assert_eq!(VersionSizeKey::from(avs), expected, "{:?}", avs);
+        }
     }
 }

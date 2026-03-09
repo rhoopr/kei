@@ -10,3 +10,12 @@ CLAUDE.md
 
 # macOS Junk
 .DS_Store
+
+# Credentials
+.env
+
+# Test session cookies
+.test-cookies/
+
+# Test logs
+tests/results.log

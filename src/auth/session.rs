@@ -579,6 +579,21 @@ mod tests {
         assert_eq!(sanitize_username("a.b-c@d"), "abcd");
     }
 
+    #[test]
+    fn test_sanitize_username_unicode() {
+        assert_eq!(sanitize_username("用户@example.com"), "用户examplecom");
+    }
+
+    #[test]
+    fn test_sanitize_username_empty() {
+        assert_eq!(sanitize_username(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_username_all_special() {
+        assert_eq!(sanitize_username("@.+-!"), "");
+    }
+
     #[tokio::test]
     async fn test_persist_jar_cookies_saves_and_reloads() {
         let dir = test_dir("persist_jar");

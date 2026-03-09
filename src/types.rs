@@ -110,4 +110,102 @@ mod tests {
         assert_eq!(Domain::Com.as_str(), "com");
         assert_eq!(Domain::Cn.as_str(), "cn");
     }
+
+    #[test]
+    fn version_size_serde_round_trip() {
+        for (variant, expected) in [
+            (VersionSize::Original, "\"original\""),
+            (VersionSize::Medium, "\"medium\""),
+            (VersionSize::Thumb, "\"thumb\""),
+            (VersionSize::Adjusted, "\"adjusted\""),
+            (VersionSize::Alternative, "\"alternative\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let parsed: VersionSize = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn live_photo_size_serde_round_trip() {
+        for (variant, expected) in [
+            (LivePhotoSize::Original, "\"original\""),
+            (LivePhotoSize::Medium, "\"medium\""),
+            (LivePhotoSize::Thumb, "\"thumb\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let parsed: LivePhotoSize = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn domain_serde_round_trip() {
+        for (variant, expected) in [(Domain::Com, "\"com\""), (Domain::Cn, "\"cn\"")] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let parsed: Domain = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn log_level_serde_round_trip() {
+        for (variant, expected) in [
+            (LogLevel::Debug, "\"debug\""),
+            (LogLevel::Info, "\"info\""),
+            (LogLevel::Warn, "\"warn\""),
+            (LogLevel::Error, "\"error\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let parsed: LogLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn file_match_policy_serde_round_trip() {
+        for (variant, expected) in [
+            (
+                FileMatchPolicy::NameSizeDedupWithSuffix,
+                "\"name-size-dedup-with-suffix\"",
+            ),
+            (FileMatchPolicy::NameId7, "\"name-id7\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let parsed: FileMatchPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn raw_treatment_policy_serde_round_trip() {
+        for (variant, expected) in [
+            (RawTreatmentPolicy::Unchanged, "\"as-is\""),
+            (RawTreatmentPolicy::PreferOriginal, "\"original\""),
+            (RawTreatmentPolicy::PreferAlternative, "\"alternative\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let parsed: RawTreatmentPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn live_photo_mov_filename_policy_serde_round_trip() {
+        for (variant, expected) in [
+            (LivePhotoMovFilenamePolicy::Suffix, "\"suffix\""),
+            (LivePhotoMovFilenamePolicy::Original, "\"original\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let parsed: LivePhotoMovFilenamePolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
 }
