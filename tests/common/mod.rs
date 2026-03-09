@@ -1,12 +1,46 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+
+/// Set when any test detects an Apple 503 rate-limit response.
+static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
+
+const RATE_LIMIT_MARKER: &str = "503 Service Temporarily Unavailable";
 
 /// Load `.env` exactly once across all test functions.
 fn init_env() {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         let _ = dotenvy::from_filename(".env");
+        install_rate_limit_hook();
     });
+}
+
+/// Install a panic hook that aborts the test suite on Apple 503 responses.
+///
+/// When `assert_cmd` assertions fail, the panic message includes the full
+/// stderr output. If that output contains a 503 response, continuing is
+/// pointless — every subsequent test will also 503 due to session
+/// invalidation. We abort immediately to save time and rate-limit budget.
+fn install_rate_limit_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+
+        if msg.contains(RATE_LIMIT_MARKER) {
+            RATE_LIMITED.store(true, Ordering::SeqCst);
+            eprintln!("\n*** ABORTING: Apple 503 rate limit detected ***");
+            eprintln!("*** Wait 10-15 minutes before retrying.      ***\n");
+            std::process::exit(1);
+        }
+
+        default(info);
+    }));
 }
 
 /// Build an `assert_cmd::Command` for the icloudpd-rs binary.
@@ -67,6 +101,10 @@ pub fn cookie_dir() -> PathBuf {
 /// ```
 #[allow(dead_code)]
 pub fn require_preauth() -> (String, String, PathBuf) {
+    if RATE_LIMITED.load(Ordering::SeqCst) {
+        eprintln!("\n*** ABORTING: Apple 503 rate limit detected in earlier test ***");
+        std::process::exit(1);
+    }
     let (username, password) = creds_or_skip().expect(
         "AUTH TESTS REQUIRE ICLOUD_USERNAME and ICLOUD_PASSWORD — set them in .env or environment",
     );
