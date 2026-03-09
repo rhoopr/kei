@@ -1,4 +1,4 @@
-> **Blog:** [I Got Suspended from GitHub for 10 Days](https://robhooper.xyz/github-suspension) - what happens when GitHub's automated systems flag your account, and why local backups matter
+> **Blog:** [GitHub Is a Single Point of Failure (I Got Auto-Suspended 🫠)](https://robhooper.xyz/github-suspension)
 
 # icloudpd-rs
 
