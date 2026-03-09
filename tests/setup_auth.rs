@@ -21,7 +21,9 @@ mod common;
 #[test]
 #[ignore]
 fn verify_preauth_session() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     // Try auth-only with the pre-auth cookies — should succeed without 2FA
     common::cmd()

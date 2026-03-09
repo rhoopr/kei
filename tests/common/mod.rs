@@ -252,19 +252,23 @@ pub fn with_auth_retry(f: impl Fn()) {
 /// - Credentials are not configured
 /// - Session validation/refresh fails
 #[allow(dead_code)]
-pub fn require_preauth() -> (String, String, PathBuf) {
+pub fn require_preauth() -> Option<(String, String, PathBuf)> {
     if RATE_LIMITED.load(Ordering::SeqCst) {
         eprintln!("\n*** ABORTING: Apple 503 rate limit detected in earlier test ***");
         std::process::exit(1);
     }
     throttle();
-    let (username, password) = creds_or_skip().expect(
-        "AUTH TESTS REQUIRE ICLOUD_USERNAME and ICLOUD_PASSWORD — set them in .env or environment",
-    );
+    let (username, password) = match creds_or_skip() {
+        Some(creds) => creds,
+        None => {
+            eprintln!("Skipping: ICLOUD_USERNAME / ICLOUD_PASSWORD not set");
+            return None;
+        }
+    };
     let dir = cookie_dir();
     AUTH_CREDS.get_or_init(|| (username.clone(), password.clone(), dir.clone()));
     ensure_session(&username, &password, &dir);
-    (username, password, dir)
+    Some((username, password, dir))
 }
 
 /// Recursively collect all regular files under `dir`, sorted for deterministic ordering.

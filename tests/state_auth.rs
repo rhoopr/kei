@@ -137,7 +137,9 @@ fn db_file_count(dir: &Path) -> usize {
 
 #[test]
 fn status_after_sync_shows_counts() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -169,7 +171,9 @@ fn status_after_sync_shows_counts() {
 
 #[test]
 fn reset_state_deletes_db_after_sync() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -201,7 +205,9 @@ fn reset_state_deletes_db_after_sync() {
 
 #[test]
 fn reset_state_without_yes_does_not_delete() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -236,7 +242,9 @@ fn reset_state_without_yes_does_not_delete() {
 
 #[test]
 fn verify_after_sync_reports_results() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -266,7 +274,9 @@ fn verify_after_sync_reports_results() {
 
 #[test]
 fn verify_checksums_after_sync() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -293,7 +303,9 @@ fn verify_checksums_after_sync() {
 
 #[test]
 fn verify_detects_missing_files() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -327,7 +339,9 @@ fn verify_detects_missing_files() {
 
 #[test]
 fn verify_checksums_detects_corruption() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -365,7 +379,9 @@ fn verify_checksums_detects_corruption() {
 
 #[test]
 fn import_existing_with_nonexistent_directory_fails() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         common::cmd()
@@ -389,7 +405,9 @@ fn import_existing_with_nonexistent_directory_fails() {
 
 #[test]
 fn import_existing_matches_synced_files() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -425,7 +443,9 @@ fn import_existing_matches_synced_files() {
 
 #[test]
 fn import_existing_empty_directory_reports_zero_matches() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -446,7 +466,9 @@ fn import_existing_empty_directory_reports_zero_matches() {
 
 #[test]
 fn import_existing_custom_folder_structure() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -481,7 +503,9 @@ fn import_existing_custom_folder_structure() {
 
 #[test]
 fn retry_failed_after_successful_sync_is_noop() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
@@ -500,7 +524,9 @@ fn retry_failed_after_successful_sync_is_noop() {
 
 #[test]
 fn retry_failed_with_no_db_succeeds() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");

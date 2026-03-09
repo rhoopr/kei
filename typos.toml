@@ -12,3 +12,5 @@ hsa = "hsa"
 fo = "fo"
 # Appears in base64-encoded test data (e.g. "QUJDMTIz")
 Iz = "Iz"
+# Test data: "Café" stripped to "Caf" by remove_unicode_chars()
+Caf = "Caf"
