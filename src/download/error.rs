@@ -3,15 +3,12 @@ use thiserror::Error;
 /// Typed download errors enabling retry classification.
 ///
 /// The `is_retryable()` method distinguishes transient failures (server errors,
-/// rate limits, checksum mismatches from truncated transfers) from permanent
-/// ones (auth errors, disk failures) so the retry loop can abort early.
+/// rate limits, content-length mismatches from truncated transfers) from
+/// permanent ones (auth errors, disk failures) so the retry loop can abort early.
 #[derive(Debug, Error)]
 pub enum DownloadError {
     #[error("HTTP error {status} downloading {path}")]
     HttpStatus { status: u16, path: String },
-
-    #[error("Checksum mismatch for {0}")]
-    ChecksumMismatch(String),
 
     #[error("Content-length mismatch for {path}: expected {expected} bytes, received {received}")]
     ContentLengthMismatch {
@@ -38,15 +35,10 @@ pub enum DownloadError {
 
 impl DownloadError {
     /// Whether this error is transient and worth retrying.
-    ///
-    /// Checksum mismatches are retryable because they typically indicate a
-    /// truncated transfer or expired CDN URL, not actual data corruption.
     pub fn is_retryable(&self) -> bool {
         match self {
             DownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
-            DownloadError::ChecksumMismatch(_)
-            | DownloadError::ContentLengthMismatch { .. }
-            | DownloadError::Http { .. } => true,
+            DownloadError::ContentLengthMismatch { .. } | DownloadError::Http { .. } => true,
             DownloadError::Disk(_) | DownloadError::Other(_) => false,
         }
     }
@@ -126,12 +118,6 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_mismatch_retryable() {
-        let e = DownloadError::ChecksumMismatch("x".into());
-        assert!(e.is_retryable());
-    }
-
-    #[test]
     fn test_disk_not_retryable() {
         let e = DownloadError::Disk(std::io::Error::other("disk full"));
         assert!(!e.is_retryable());
@@ -207,12 +193,6 @@ mod tests {
             received: 1_060_000_000,
         };
         assert!(e.is_retryable());
-        assert!(!e.is_session_expired());
-    }
-
-    #[test]
-    fn test_checksum_mismatch_not_session_expired() {
-        let e = DownloadError::ChecksumMismatch("x".into());
         assert!(!e.is_session_expired());
     }
 

@@ -240,4 +240,12 @@ mod tests {
         let resp = make_response(2, false, false, true);
         assert!(check_requires_2fa(&resp));
     }
+
+    #[test]
+    fn test_requires_2fa_challenged_and_trusted() {
+        // Both challenged and trusted — still requires 2FA because the
+        // challenge flag alone is sufficient
+        let resp = make_response(2, true, true, true);
+        assert!(check_requires_2fa(&resp));
+    }
 }

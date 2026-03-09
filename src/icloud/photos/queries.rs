@@ -253,4 +253,104 @@ mod tests {
         assert!(DESIRED_KEYS.contains(&"recordName"));
         assert!(DESIRED_KEYS.contains(&"filenameEnc"));
     }
+
+    #[test]
+    fn test_desired_keys_values_matches_keys() {
+        let values = &*DESIRED_KEYS_VALUES;
+        assert_eq!(values.len(), DESIRED_KEYS.len());
+        for (key, val) in DESIRED_KEYS.iter().zip(values.iter()) {
+            assert_eq!(val.as_str().unwrap(), *key);
+        }
+    }
+
+    #[test]
+    fn test_encode_params_number() {
+        let mut params = HashMap::new();
+        params.insert("count".to_string(), Value::Number(42.into()));
+        let encoded = encode_params(&params);
+        assert_eq!(encoded, "count=42");
+    }
+
+    #[test]
+    fn test_encode_params_multiple_sorted() {
+        let mut params = HashMap::new();
+        params.insert("z".to_string(), Value::String("last".to_string()));
+        params.insert("a".to_string(), Value::String("first".to_string()));
+        let encoded = encode_params(&params);
+        assert_eq!(encoded, "a=first&z=last");
+    }
+
+    #[test]
+    fn test_encode_params_empty() {
+        let params = HashMap::new();
+        let encoded = encode_params(&params);
+        assert_eq!(encoded, "");
+    }
+
+    #[test]
+    fn test_item_type_all_raw_images() {
+        let raw_types = [
+            "com.adobe.raw-image",
+            "com.canon.cr2-raw-image",
+            "com.canon.crw-raw-image",
+            "com.sony.arw-raw-image",
+            "com.fuji.raw-image",
+            "com.panasonic.rw2-raw-image",
+            "com.nikon.nrw-raw-image",
+            "com.pentax.raw-image",
+            "com.nikon.raw-image",
+            "com.olympus.raw-image",
+            "com.canon.cr3-raw-image",
+            "com.olympus.or-raw-image",
+        ];
+        for raw in raw_types {
+            assert_eq!(
+                item_type_from_str(raw),
+                Some(AssetItemType::Image),
+                "{raw} should be Image"
+            );
+        }
+    }
+
+    #[test]
+    fn test_photo_version_lookup_contains_all_sizes() {
+        let sizes: Vec<AssetVersionSize> = PHOTO_VERSION_LOOKUP.iter().map(|(s, _)| *s).collect();
+        assert!(sizes.contains(&AssetVersionSize::Original));
+        assert!(sizes.contains(&AssetVersionSize::Alternative));
+        assert!(sizes.contains(&AssetVersionSize::Medium));
+        assert!(sizes.contains(&AssetVersionSize::Thumb));
+        assert!(sizes.contains(&AssetVersionSize::Adjusted));
+        assert!(sizes.contains(&AssetVersionSize::LiveOriginal));
+        assert!(sizes.contains(&AssetVersionSize::LiveMedium));
+        assert!(sizes.contains(&AssetVersionSize::LiveThumb));
+    }
+
+    #[test]
+    fn test_video_version_lookup_has_original() {
+        let sizes: Vec<AssetVersionSize> = VIDEO_VERSION_LOOKUP.iter().map(|(s, _)| *s).collect();
+        assert!(sizes.contains(&AssetVersionSize::Original));
+        assert!(sizes.contains(&AssetVersionSize::Medium));
+        assert!(sizes.contains(&AssetVersionSize::Thumb));
+    }
+
+    #[test]
+    fn test_desired_keys_contains_critical_fields() {
+        // Fields essential for the download pipeline
+        let critical = [
+            "resOriginalRes",
+            "resOriginalFingerprint",
+            "resOriginalFileType",
+            "itemType",
+            "filenameEnc",
+            "assetDate",
+            "addedDate",
+            "isDeleted",
+        ];
+        for field in critical {
+            assert!(
+                DESIRED_KEYS.contains(&field),
+                "Missing critical field: {field}"
+            );
+        }
+    }
 }

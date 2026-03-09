@@ -37,3 +37,81 @@ impl StateError {
         Self::Query(source.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_rusqlite_error() -> rusqlite::Error {
+        // Open an in-memory DB and provoke a real error via invalid SQL.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("INVALID SQL", []).unwrap_err()
+    }
+
+    #[test]
+    fn query_display_format() {
+        let err = StateError::Query("something broke".to_string());
+        assert_eq!(err.to_string(), "Database query failed: something broke");
+    }
+
+    #[test]
+    fn query_helper_creates_correct_variant() {
+        let rusqlite_err = make_rusqlite_error();
+        let msg = rusqlite_err.to_string();
+        let err = StateError::query(rusqlite_err);
+        match &err {
+            StateError::Query(s) => assert_eq!(s, &msg),
+            other => panic!("expected Query variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unsupported_schema_version_display_includes_both_versions() {
+        let err = StateError::UnsupportedSchemaVersion {
+            found: 5,
+            expected: 3,
+        };
+        let display = err.to_string();
+        assert!(
+            display.contains("5") && display.contains("3"),
+            "expected both version numbers in display, got: {display}"
+        );
+        assert_eq!(
+            display,
+            "Database schema version 5 is newer than supported version 3"
+        );
+    }
+
+    #[test]
+    fn migration_from_rusqlite_error() {
+        let rusqlite_err = make_rusqlite_error();
+        let expected_msg = rusqlite_err.to_string();
+        let err: StateError = rusqlite_err.into();
+        match &err {
+            StateError::Migration(_) => {}
+            other => panic!("expected Migration variant, got {:?}", other),
+        }
+        assert!(
+            err.to_string().contains(&expected_msg),
+            "display should contain rusqlite message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn open_error_display_includes_path() {
+        let err = StateError::Open {
+            path: PathBuf::from("/tmp/claude/test.db"),
+            source: make_rusqlite_error(),
+        };
+        let display = err.to_string();
+        assert!(
+            display.contains("/tmp/claude/test.db"),
+            "expected path in display, got: {display}"
+        );
+        assert!(
+            display.starts_with("Failed to open database at"),
+            "unexpected prefix: {display}"
+        );
+    }
+}

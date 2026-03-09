@@ -118,4 +118,34 @@ mod tests {
         let resp: AccountLoginResponse = serde_json::from_str(json).unwrap();
         assert!(resp.hsa_trusted_browser);
     }
+
+    #[test]
+    fn test_account_login_response_domain_to_use() {
+        let json = r#"{"domainToUse": "icloud.com.cn"}"#;
+        let resp: AccountLoginResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.domain_to_use.as_deref(), Some("icloud.com.cn"));
+    }
+
+    #[test]
+    fn test_ds_info_defaults() {
+        let json = r#"{}"#;
+        let ds: DsInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(ds.hsa_version, 0);
+        assert!(ds.dsid.is_none());
+        assert!(!ds.has_i_cloud_qualifying_device);
+    }
+
+    #[test]
+    fn test_webservices_no_ckdatabasews() {
+        let json = r#"{}"#;
+        let ws: Webservices = serde_json::from_str(json).unwrap();
+        assert!(ws.ckdatabasews.is_none());
+    }
+
+    #[test]
+    fn test_webservice_endpoint() {
+        let json = r#"{"url": "https://p99-ckdatabasews.icloud.com:443"}"#;
+        let ep: WebserviceEndpoint = serde_json::from_str(json).unwrap();
+        assert_eq!(ep.url, "https://p99-ckdatabasews.icloud.com:443");
+    }
 }

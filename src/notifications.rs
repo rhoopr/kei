@@ -145,6 +145,44 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn run_script_success() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = PathBuf::from("/tmp/claude/notify_tests");
+        std::fs::create_dir_all(&dir).ok();
+        let script = dir.join("success.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = run_script(&script, "test_event", "msg", "user")
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        let _ = std::fs::remove_file(&script);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_script_nonzero_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = PathBuf::from("/tmp/claude/notify_tests");
+        std::fs::create_dir_all(&dir).ok();
+        let script = dir.join("fail.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = run_script(&script, "test_event", "msg", "user")
+            .await
+            .unwrap();
+        assert!(!status.success());
+
+        let _ = std::fs::remove_file(&script);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn notify_runs_script_with_env_vars() {
         use std::os::unix::fs::PermissionsExt;
 

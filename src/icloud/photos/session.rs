@@ -371,4 +371,73 @@ mod tests {
         let e: anyhow::Error = err.into();
         assert_eq!(classify_api_error(&e), RetryAction::Retry);
     }
+
+    #[test]
+    fn test_classify_retryable_cloudkit_error() {
+        let err: anyhow::Error = CloudKitServerError {
+            code: "RETRY_LATER".into(),
+            reason: "busy".into(),
+            retryable: true,
+            service_not_activated: false,
+        }
+        .into();
+        assert_eq!(classify_api_error(&err), RetryAction::Retry);
+    }
+
+    #[test]
+    fn test_classify_non_retryable_cloudkit_error() {
+        let err: anyhow::Error = CloudKitServerError {
+            code: "ZONE_NOT_FOUND".into(),
+            reason: "missing".into(),
+            retryable: false,
+            service_not_activated: true,
+        }
+        .into();
+        assert_eq!(classify_api_error(&err), RetryAction::Abort);
+    }
+
+    #[test]
+    fn test_is_service_not_activated_normal_error() {
+        assert!(!is_service_not_activated("RETRY_LATER", "busy"));
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_server_error_message_fallback() {
+        let response = serde_json::json!({
+            "serverErrorCode": "SOME_ERROR",
+            "serverErrorMessage": "fallback message"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert_eq!(ck_err.reason, "fallback message");
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_no_reason_defaults_to_unknown() {
+        let response = serde_json::json!({
+            "serverErrorCode": "SOME_ERROR"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert_eq!(ck_err.reason, "unknown");
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_empty_records_ok() {
+        let response = serde_json::json!({"records": []});
+        assert!(check_cloudkit_errors(response).is_ok());
+    }
+
+    #[test]
+    fn test_cloudkit_server_error_display() {
+        let err = CloudKitServerError {
+            code: "TEST".into(),
+            reason: "test reason".into(),
+            retryable: false,
+            service_not_activated: false,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("TEST"));
+        assert!(msg.contains("test reason"));
+    }
 }

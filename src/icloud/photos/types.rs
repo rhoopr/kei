@@ -46,3 +46,49 @@ impl From<VersionSize> for AssetVersionSize {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::VersionSize;
+
+    #[test]
+    fn from_version_size_all_variants() {
+        for (input, expected) in [
+            (VersionSize::Original, AssetVersionSize::Original),
+            (VersionSize::Medium, AssetVersionSize::Medium),
+            (VersionSize::Thumb, AssetVersionSize::Thumb),
+            (VersionSize::Adjusted, AssetVersionSize::Adjusted),
+            (VersionSize::Alternative, AssetVersionSize::Alternative),
+        ] {
+            assert_eq!(AssetVersionSize::from(input), expected, "from {input:?}");
+        }
+    }
+
+    #[test]
+    fn asset_version_size_is_one_byte() {
+        assert_eq!(std::mem::size_of::<AssetVersionSize>(), 1);
+    }
+
+    #[test]
+    fn asset_version_size_variants_have_distinct_repr_values() {
+        let variants = [
+            AssetVersionSize::Original as u8,
+            AssetVersionSize::Alternative as u8,
+            AssetVersionSize::Medium as u8,
+            AssetVersionSize::Thumb as u8,
+            AssetVersionSize::Adjusted as u8,
+            AssetVersionSize::LiveOriginal as u8,
+            AssetVersionSize::LiveMedium as u8,
+            AssetVersionSize::LiveThumb as u8,
+        ];
+
+        // Check all 8 variants have unique values
+        let unique: std::collections::HashSet<u8> = variants.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            variants.len(),
+            "all repr(u8) values must be distinct"
+        );
+    }
+}

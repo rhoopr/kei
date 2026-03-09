@@ -2,8 +2,8 @@
 //!
 //! Downloads photos and videos from iCloud via Apple's private CloudKit APIs.
 //! Authentication uses SRP-6a with Apple's custom variant, followed by optional
-//! 2FA. Photos are streamed with checksum verification and exponential-backoff
-//! retries on transient failures.
+//! 2FA. Photos are streamed with exponential-backoff retries on transient
+//! failures.
 
 #![warn(clippy::all)]
 
@@ -22,8 +22,6 @@ mod types;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
-use base64::Engine;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -301,17 +299,26 @@ async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow:
             }
 
             if args.checksums {
-                // Verify checksum
-                match verify_checksum(local_path, &asset.checksum).await {
-                    Ok(true) => verified += 1,
-                    Ok(false) => {
-                        println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
-                        corrupted += 1;
+                if let Some(local_cksum) = &asset.local_checksum {
+                    // Verify against locally-computed SHA-256
+                    match verify_local_checksum(local_path, local_cksum).await {
+                        Ok(true) => verified += 1,
+                        Ok(false) => {
+                            println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
+                            corrupted += 1;
+                        }
+                        Err(e) => {
+                            println!("ERROR: {} - {}", local_path.display(), e);
+                            corrupted += 1;
+                        }
                     }
-                    Err(e) => {
-                        println!("ERROR: {} - {}", local_path.display(), e);
-                        corrupted += 1;
-                    }
+                } else {
+                    // Pre-v3 asset without local checksum — skip verification
+                    tracing::debug!(
+                        id = %asset.id,
+                        "No local checksum stored, skipping verification"
+                    );
+                    verified += 1;
                 }
             } else {
                 verified += 1;
@@ -337,53 +344,10 @@ async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow:
     Ok(())
 }
 
-/// Verify a file's checksum against Apple's expected value.
-///
-/// Apple uses several checksum formats (after base64-decoding):
-///   - 32 bytes: raw SHA-256
-///   - 33 bytes: 0x01 prefix + SHA-256
-///   - 20 bytes: raw SHA-1
-///   - 21 bytes: 0x01 prefix + SHA-1
-async fn verify_checksum(path: &Path, expected: &str) -> anyhow::Result<bool> {
-    use sha1::Sha1;
-    use sha2::{Digest, Sha256};
-
-    let path = path.to_path_buf();
-    let expected = expected.to_string();
-
-    tokio::task::spawn_blocking(move || {
-        let expected_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&expected)
-            .context("Failed to decode base64 checksum")?;
-
-        // Determine which hash algorithm to use based on checksum length
-        let (use_sha1, expected_hash) = match expected_bytes.len() {
-            32 => (false, &expected_bytes[..]),
-            33 => (false, &expected_bytes[1..]),
-            20 => (true, &expected_bytes[..]),
-            21 => (true, &expected_bytes[1..]),
-            len => {
-                tracing::warn!(
-                    len,
-                    path = %path.display(),
-                    "Unknown checksum format ({len} bytes), skipping verification",
-                );
-                return Ok(true);
-            }
-        };
-
-        let mut file = std::fs::File::open(&path)?;
-        if use_sha1 {
-            let mut hasher = Sha1::new();
-            std::io::copy(&mut file, &mut hasher)?;
-            Ok(hasher.finalize().as_slice() == expected_hash)
-        } else {
-            let mut hasher = Sha256::new();
-            std::io::copy(&mut file, &mut hasher)?;
-            Ok(hasher.finalize().as_slice() == expected_hash)
-        }
-    })
-    .await?
+/// Verify a file's SHA-256 hash against a hex-encoded expected value.
+async fn verify_local_checksum(path: &Path, expected_hex: &str) -> anyhow::Result<bool> {
+    let actual = download::file::compute_sha256(path).await?;
+    Ok(actual == expected_hex)
 }
 
 /// Run the submit-code command: authenticate with a pre-provided 2FA code.
@@ -582,8 +546,23 @@ async fn run_import_existing(
                             continue;
                         }
 
+                        let local_checksum = match download::file::compute_sha256(&expected_path)
+                            .await
+                        {
+                            Ok(hash) => hash,
+                            Err(e) => {
+                                tracing::warn!("Failed to hash {}: {}", expected_path.display(), e);
+                                continue;
+                            }
+                        };
+
                         if let Err(e) = db
-                            .mark_downloaded(asset.id(), version_size.as_str(), &expected_path)
+                            .mark_downloaded(
+                                asset.id(),
+                                version_size.as_str(),
+                                &expected_path,
+                                &local_checksum,
+                            )
                             .await
                         {
                             tracing::warn!("Failed to mark {} as downloaded: {}", asset.id(), e);
@@ -1074,94 +1053,127 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_checksum_sha256_raw_32_bytes() {
-        use sha2::Digest;
-
+    async fn verify_local_checksum_match() {
         let dir = PathBuf::from("/tmp/claude/checksum_tests");
         std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("sha256_raw.bin");
+        let file_path = dir.join("local_match.bin");
         let content = b"hello world";
         std::fs::write(&file_path, content).unwrap();
 
-        let hash = sha2::Sha256::digest(content);
-        // Raw 32-byte SHA-256, base64-encoded
-        let checksum = base64::engine::general_purpose::STANDARD.encode(hash.as_slice());
-        assert!(verify_checksum(&file_path, &checksum).await.unwrap());
+        let hash = download::file::compute_sha256(&file_path).await.unwrap();
+        assert!(verify_local_checksum(&file_path, &hash).await.unwrap());
     }
 
     #[tokio::test]
-    async fn verify_checksum_sha256_prefixed_33_bytes() {
-        use sha2::Digest;
-
+    async fn verify_local_checksum_mismatch() {
         let dir = PathBuf::from("/tmp/claude/checksum_tests");
         std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("sha256_prefixed.bin");
-        let content = b"hello world";
-        std::fs::write(&file_path, content).unwrap();
-
-        let hash = sha2::Sha256::digest(content);
-        // 0x01 prefix + 32-byte SHA-256
-        let mut prefixed = vec![0x01];
-        prefixed.extend_from_slice(hash.as_slice());
-        let checksum = base64::engine::general_purpose::STANDARD.encode(&prefixed);
-        assert!(verify_checksum(&file_path, &checksum).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn verify_checksum_sha1_raw_20_bytes() {
-        use sha1::Digest;
-
-        let dir = PathBuf::from("/tmp/claude/checksum_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("sha1_raw.bin");
-        let content = b"hello world";
-        std::fs::write(&file_path, content).unwrap();
-
-        let hash = sha1::Sha1::digest(content);
-        // Raw 20-byte SHA-1, base64-encoded
-        let checksum = base64::engine::general_purpose::STANDARD.encode(hash.as_slice());
-        assert!(verify_checksum(&file_path, &checksum).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn verify_checksum_sha1_prefixed_21_bytes() {
-        use sha1::Digest;
-
-        let dir = PathBuf::from("/tmp/claude/checksum_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("sha1_prefixed.bin");
-        let content = b"hello world";
-        std::fs::write(&file_path, content).unwrap();
-
-        let hash = sha1::Sha1::digest(content);
-        // 0x01 prefix + 20-byte SHA-1 (Apple's actual format)
-        let mut prefixed = vec![0x01];
-        prefixed.extend_from_slice(hash.as_slice());
-        let checksum = base64::engine::general_purpose::STANDARD.encode(&prefixed);
-        assert!(verify_checksum(&file_path, &checksum).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn verify_checksum_mismatch_returns_false() {
-        let dir = PathBuf::from("/tmp/claude/checksum_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("mismatch.bin");
+        let file_path = dir.join("local_mismatch.bin");
         std::fs::write(&file_path, b"hello world").unwrap();
 
-        // Wrong SHA-256 (all zeros)
-        let wrong = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
-        assert!(!verify_checksum(&file_path, &wrong).await.unwrap());
+        assert!(!verify_local_checksum(
+            &file_path,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
-    async fn verify_checksum_unknown_length_skips() {
-        let dir = PathBuf::from("/tmp/claude/checksum_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("unknown_len.bin");
-        std::fs::write(&file_path, b"hello world").unwrap();
+    async fn verify_local_checksum_nonexistent_file_errors() {
+        let result =
+            verify_local_checksum(Path::new("/tmp/claude/nonexistent_file_abc.bin"), "abcd").await;
+        assert!(result.is_err());
+    }
 
-        // 10-byte unknown format — should return true (skip verification)
-        let unknown = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
-        assert!(verify_checksum(&file_path, &unknown).await.unwrap());
+    #[test]
+    fn redacting_writer_replaces_password() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some("s3cret".to_string())));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(b"Login with s3cret ok").unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains("s3cret"));
+        assert!(output.contains("********"));
+    }
+
+    #[test]
+    fn redacting_writer_no_password_passthrough() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(None));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(b"normal log line").unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, "normal log line");
+    }
+
+    #[test]
+    fn redacting_writer_empty_password_passthrough() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some(String::new())));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(b"normal log line").unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, "normal log line");
+    }
+
+    #[test]
+    fn redacting_writer_short_buffer_passthrough() {
+        use std::io::Write;
+
+        // Buffer shorter than the password can't contain it
+        let password = Arc::new(std::sync::Mutex::new(Some("longpassword".to_string())));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(b"short").unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, "short");
+    }
+
+    #[test]
+    fn redacting_writer_flush() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(None));
+        let mut buf = Vec::new();
+        let mut writer = RedactingWriter {
+            inner: &mut buf,
+            password,
+        };
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn make_password_provider_with_some() {
+        let provider = make_password_provider(Some("mypass".to_string()));
+        assert_eq!(provider(), Some("mypass".to_string()));
+        // Can be called multiple times
+        assert_eq!(provider(), Some("mypass".to_string()));
     }
 }

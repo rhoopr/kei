@@ -27,7 +27,6 @@ serde_json = "1"
 toml = "0.8"
 
 # Crypto (SRP auth)
-sha1 = "0.10"
 sha2 = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 hmac = "0.12"
@@ -80,3 +79,29 @@ data-encoding = "2.10.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sd-notify = "0.4"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+dotenvy = "0.15"
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+
+[[test]]
+name = "sync"
+path = "tests/sync.rs"
+
+[[test]]
+name = "state"
+path = "tests/state.rs"
+
+[[test]]
+name = "state_auth"
+path = "tests/state_auth.rs"
+
+[[test]]
+name = "setup_auth"
+path = "tests/setup_auth.rs"

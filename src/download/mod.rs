@@ -1191,7 +1191,8 @@ async fn stream_and_download(
 
     // Batch DB writes for better throughput — flush every N completions
     const DB_BATCH_SIZE: usize = 50;
-    let mut downloaded_batch: Vec<(String, String, PathBuf)> = Vec::with_capacity(DB_BATCH_SIZE);
+    let mut downloaded_batch: Vec<(String, String, PathBuf, String)> =
+        Vec::with_capacity(DB_BATCH_SIZE);
     let mut failed_batch: Vec<(String, String, String)> = Vec::with_capacity(DB_BATCH_SIZE);
 
     while let Some((task, result)) = download_stream.next().await {
@@ -1207,7 +1208,7 @@ async fn stream_and_download(
             .to_string();
         pb.set_message(filename);
         match result {
-            Ok(exif_ok) => {
+            Ok((exif_ok, local_checksum)) => {
                 downloaded += 1;
                 if !exif_ok {
                     exif_failures += 1;
@@ -1217,6 +1218,7 @@ async fn stream_and_download(
                         task.asset_id.to_string(),
                         task.version_size.as_str().to_string(),
                         task.download_path.clone(),
+                        local_checksum,
                     ));
                 }
             }
@@ -1542,7 +1544,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let concurrency = config.concurrency;
     let temp_suffix: Arc<str> = config.temp_suffix.into();
 
-    let results: Vec<(DownloadTask, Result<bool>)> = stream::iter(tasks)
+    let results: Vec<(DownloadTask, Result<(bool, String)>)> = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
@@ -1568,12 +1570,12 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let mut exif_failures = 0usize;
 
     // Collect DB updates for batch write
-    let mut downloaded_batch: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut downloaded_batch: Vec<(String, String, PathBuf, String)> = Vec::new();
     let mut failed_batch: Vec<(String, String, String)> = Vec::new();
 
     for (task, result) in results {
         match &result {
-            Ok(exif_ok) => {
+            Ok((exif_ok, local_checksum)) => {
                 if !*exif_ok {
                     exif_failures += 1;
                 }
@@ -1582,6 +1584,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                         task.asset_id.to_string(),
                         task.version_size.as_str().to_string(),
                         task.download_path.clone(),
+                        local_checksum.clone(),
                     ));
                 }
             }
@@ -1652,7 +1655,7 @@ async fn download_single_task(
     retry_config: &RetryConfig,
     set_exif: bool,
     temp_suffix: &str,
-) -> Result<bool> {
+) -> Result<(bool, String)> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -1736,7 +1739,10 @@ async fn download_single_task(
         }
     }
 
-    Ok(exif_ok)
+    // Compute SHA-256 of the final file for local verification
+    let local_checksum = file::compute_sha256(&task.download_path).await?;
+
+    Ok((exif_ok, local_checksum))
 }
 
 fn format_duration(d: Duration) -> String {
@@ -2891,5 +2897,311 @@ mod tests {
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
+    }
+
+    // ── determine_media_type tests ──────────────────────────────────────
+
+    #[test]
+    fn test_determine_media_type_image_no_live_is_photo() {
+        let asset = photo_asset_with_version(); // public.jpeg, no live versions
+        assert_eq!(
+            determine_media_type(VersionSizeKey::Original, &asset),
+            MediaType::Photo
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_image_with_live_is_live_photo_image() {
+        let asset = photo_asset_with_live_photo(); // public.heic with live versions
+        assert_eq!(
+            determine_media_type(VersionSizeKey::Original, &asset),
+            MediaType::LivePhotoImage
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_movie_original_is_video() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "MOV_1", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        assert_eq!(
+            determine_media_type(VersionSizeKey::Original, &asset),
+            MediaType::Video
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_live_original_on_image_is_live_photo_video() {
+        let asset = photo_asset_with_live_photo();
+        assert_eq!(
+            determine_media_type(VersionSizeKey::LiveOriginal, &asset),
+            MediaType::LivePhotoVideo
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_live_original_on_movie_is_video() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "MOV_2", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        assert_eq!(
+            determine_media_type(VersionSizeKey::LiveOriginal, &asset),
+            MediaType::Video
+        );
+    }
+
+    // ── NameId7 filter tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_name_id7_produces_task_with_id_suffix() {
+        let asset = photo_asset_with_version(); // recordName "TEST_1"
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // NameId7 uses underscore separator between stem and base64 ID suffix
+        assert!(
+            filename.contains('_'),
+            "NameId7 filename should contain underscore separator, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn test_name_id7_skips_existing_file() {
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let dir = test_tmp_dir("name_id7_skip");
+        config.directory = dir.clone();
+
+        // First call to get the expected path
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let expected_path = &tasks[0].download_path;
+
+        // Create parent directories and write a file with the matching size
+        fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
+        fs::write(expected_path, vec![0u8; 1000]).unwrap();
+
+        // Second call should skip since the file exists with matching size
+        let tasks2 = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks2.is_empty(),
+            "NameId7 should skip existing file, got {} tasks",
+            tasks2.len()
+        );
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_name_id7_live_photo_produces_two_tasks_with_id_suffix() {
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks.len(),
+            2,
+            "Live photo should produce 2 tasks (HEIC + MOV)"
+        );
+
+        for task in &tasks {
+            let filename = task.download_path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                filename.contains('_'),
+                "NameId7 live photo filename should contain underscore separator, got: {filename}"
+            );
+        }
+    }
+
+    // ── keep_unicode_in_filenames tests ─────────────────────────────────
+
+    fn unicode_photo_asset() -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "UNI_1", "fields": {
+                "filenameEnc": {"value": "Café_photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_keep_unicode_preserves_non_ascii() {
+        let asset = unicode_photo_asset();
+        let mut config = test_config();
+        config.keep_unicode_in_filenames = true;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("Café"),
+            "keep_unicode=true should preserve unicode, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn test_default_strips_unicode_from_filename() {
+        let asset = unicode_photo_asset();
+        let config = test_config(); // keep_unicode_in_filenames = false
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("Caf_photo"),
+            "keep_unicode=false should strip non-ASCII, got: {filename}"
+        );
+        assert!(
+            !filename.contains("Café"),
+            "keep_unicode=false should not contain unicode chars, got: {filename}"
+        );
+    }
+
+    // ── Medium/Thumb size suffix tests ──────────────────────────────────
+
+    fn multi_size_photo_asset() -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "MED_1", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "orig_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resJPEGMedRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/med",
+                    "fileChecksum": "med_ck"
+                }},
+                "resJPEGMedFileType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 500,
+                    "downloadURL": "https://example.com/thumb",
+                    "fileChecksum": "thumb_ck"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_medium_size_adds_suffix() {
+        let asset = multi_size_photo_asset();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("-medium"),
+            "Medium size should add '-medium' suffix, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn test_thumb_size_adds_suffix() {
+        let asset = multi_size_photo_asset();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Thumb;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("-thumb"),
+            "Thumb size should add '-thumb' suffix, got: {filename}"
+        );
+    }
+
+    // ── NormalizedPath direct tests ─────────────────────────────────────
+
+    #[test]
+    fn test_normalized_path_lowercases_on_case_insensitive() {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let np = NormalizedPath::new(PathBuf::from("Foo.JPG"));
+            assert_eq!(&*np.0, "foo.jpg");
+        }
+    }
+
+    #[test]
+    fn test_normalized_path_case_equality() {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            assert_eq!(a, b);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            assert_ne!(a, b);
+        }
+    }
+
+    #[test]
+    fn test_normalized_path_borrow_for_hashmap_lookup() {
+        use std::collections::HashMap;
+        let mut map: HashMap<NormalizedPath, u64> = HashMap::new();
+        map.insert(NormalizedPath::new(PathBuf::from("test.jpg")), 42);
+        let key = NormalizedPath::normalize(std::path::Path::new("test.jpg"));
+        assert_eq!(map.get(key.as_ref()), Some(&42));
     }
 }

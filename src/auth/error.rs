@@ -64,4 +64,48 @@ mod tests {
             "Two-factor authentication is required (no code provided)"
         );
     }
+
+    #[test]
+    fn failed_login_display() {
+        let err = AuthError::FailedLogin("bad password".into());
+        assert_eq!(err.to_string(), "Failed login: bad password");
+    }
+
+    #[test]
+    fn invalid_token_display() {
+        let err = AuthError::InvalidToken("expired".into());
+        assert_eq!(err.to_string(), "Invalid authentication token: expired");
+    }
+
+    #[test]
+    fn api_error_display() {
+        let err = AuthError::ApiError {
+            code: 403,
+            message: "forbidden".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("403"));
+        assert!(msg.contains("forbidden"));
+    }
+
+    #[test]
+    fn two_factor_failed_display() {
+        let err = AuthError::TwoFactorFailed("wrong code".into());
+        assert!(err.to_string().contains("wrong code"));
+    }
+
+    #[test]
+    fn from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let err: AuthError = io_err.into();
+        assert!(matches!(err, AuthError::Io(_)));
+        assert!(err.to_string().contains("file missing"));
+    }
+
+    #[test]
+    fn from_json_error() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{{bad}").unwrap_err();
+        let err: AuthError = json_err.into();
+        assert!(matches!(err, AuthError::Json(_)));
+    }
 }
