@@ -6,6 +6,10 @@ use std::sync::OnceLock;
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
 
 const RATE_LIMIT_MARKER: &str = "503 Service Temporarily Unavailable";
+const AUTH_FAILURE_MARKER: &str = "Invalid email/password combination";
+
+/// Cached auth credentials for reactive session refresh mid-run.
+static AUTH_CREDS: OnceLock<(String, String, PathBuf)> = OnceLock::new();
 
 /// Load `.env` exactly once across all test functions.
 fn init_env() {
@@ -98,6 +102,140 @@ pub fn cookie_dir() -> PathBuf {
     manifest.join(".test-cookies")
 }
 
+/// Run `--auth-only` once to ensure the session cookies are fresh.
+///
+/// If the pre-existing session has expired, this re-authenticates and
+/// refreshes the cookies. If authentication genuinely fails (wrong
+/// password, rate-limited), aborts the suite early rather than failing
+/// tests one by one.
+fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
+    static ENSURED: OnceLock<()> = OnceLock::new();
+    ENSURED.get_or_init(|| {
+        eprintln!("Validating authentication session (--auth-only)...");
+        let output = assert_cmd::cargo_bin_cmd!("icloudpd-rs")
+            .args([
+                "sync",
+                "--auth-only",
+                "--username",
+                username,
+                "--password",
+                password,
+                "--cookie-directory",
+                cookie_dir.to_str().unwrap(),
+            ])
+            .timeout(std::time::Duration::from_secs(90))
+            .output()
+            .expect("failed to run --auth-only session validation");
+
+        if output.status.success() {
+            eprintln!("Session OK.");
+            return;
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains(RATE_LIMIT_MARKER) {
+            RATE_LIMITED.store(true, Ordering::SeqCst);
+            eprintln!("\n*** ABORTING: Apple 503 rate limit during session validation ***");
+            std::process::exit(1);
+        }
+
+        panic!(
+            "Session validation (--auth-only) failed — credentials may be invalid.\nstderr: {stderr}"
+        );
+    });
+}
+
+/// Refresh the authentication session by running `--auth-only`.
+///
+/// Called reactively when a test command fails with an authentication error
+/// mid-run (stale session). Panics if the refresh itself fails.
+fn refresh_auth() {
+    let (username, password, cookie_dir) = AUTH_CREDS
+        .get()
+        .expect("refresh_auth called before require_preauth");
+
+    eprintln!("Running --auth-only to refresh session...");
+    let output = assert_cmd::cargo_bin_cmd!("icloudpd-rs")
+        .args([
+            "sync",
+            "--auth-only",
+            "--username",
+            username,
+            "--password",
+            password,
+            "--cookie-directory",
+            cookie_dir.to_str().unwrap(),
+        ])
+        .timeout(std::time::Duration::from_secs(90))
+        .output()
+        .expect("failed to run --auth-only");
+
+    if output.status.success() {
+        eprintln!("Session refreshed OK.");
+        return;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains(RATE_LIMIT_MARKER) {
+        RATE_LIMITED.store(true, Ordering::SeqCst);
+        eprintln!("\n*** ABORTING: Apple 503 rate limit during auth refresh ***");
+        std::process::exit(1);
+    }
+
+    panic!("Auth refresh (--auth-only) failed — aborting.\nstderr: {stderr}");
+}
+
+/// Run a test body with automatic auth retry on stale-session errors.
+///
+/// If the test panics with an "Invalid email/password combination" error,
+/// refreshes the session via `--auth-only` and retries once. If the retry
+/// also hits the same auth error, aborts the entire test suite.
+///
+/// Does **not** retry on 503 rate limits or other errors.
+#[allow(dead_code)]
+pub fn with_auth_retry(f: impl Fn()) {
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+    match catch_unwind(AssertUnwindSafe(&f)) {
+        Ok(()) => {}
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+
+            if !msg.contains(AUTH_FAILURE_MARKER) {
+                resume_unwind(payload);
+            }
+
+            eprintln!("Auth failure detected in test, refreshing session...");
+            refresh_auth();
+            eprintln!("Retrying test after auth refresh...");
+
+            match catch_unwind(AssertUnwindSafe(&f)) {
+                Ok(()) => {}
+                Err(retry_payload) => {
+                    let retry_msg = retry_payload
+                        .downcast_ref::<String>()
+                        .map(|s| s.as_str())
+                        .or_else(|| retry_payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("");
+
+                    if retry_msg.contains(AUTH_FAILURE_MARKER) {
+                        eprintln!(
+                            "\n*** ABORTING: Auth failure persists after session refresh ***"
+                        );
+                        std::process::exit(1);
+                    }
+
+                    resume_unwind(retry_payload);
+                }
+            }
+        }
+    }
+}
+
 /// Require a pre-authenticated session. Returns `(username, password, cookie_dir)`.
 ///
 /// All tests share the same cookie directory so only one Apple API session
@@ -107,15 +245,12 @@ pub fn cookie_dir() -> PathBuf {
 /// cargo test --test sync -- --test-threads=1
 /// ```
 ///
+/// On the first call, runs `--auth-only` to validate (and refresh if needed)
+/// the session cookies. This prevents stale-session failures mid-run.
+///
 /// Panics (aborting the test) if:
 /// - Credentials are not configured
-/// - The shared cookie directory does not contain session files
-///
-/// Pre-auth setup (fish shell — use `$(…)` instead of `(…)` in bash/zsh):
-///
-/// ```sh
-/// env (cat .env | grep -v '^#') cargo run -- sync --auth-only --cookie-directory .test-cookies
-/// ```
+/// - Session validation/refresh fails
 #[allow(dead_code)]
 pub fn require_preauth() -> (String, String, PathBuf) {
     if RATE_LIMITED.load(Ordering::SeqCst) {
@@ -127,16 +262,8 @@ pub fn require_preauth() -> (String, String, PathBuf) {
         "AUTH TESTS REQUIRE ICLOUD_USERNAME and ICLOUD_PASSWORD — set them in .env or environment",
     );
     let dir = cookie_dir();
-    let sanitized: String = username
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    let session_file = dir.join(format!("{sanitized}.session"));
-    assert!(
-        session_file.exists(),
-        "Pre-auth session not found at {}. Run pre-auth setup first (see tests/setup_auth.rs).",
-        session_file.display()
-    );
+    AUTH_CREDS.get_or_init(|| (username.clone(), password.clone(), dir.clone()));
+    ensure_session(&username, &password, &dir);
     (username, password, dir)
 }
 
