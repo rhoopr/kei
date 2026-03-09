@@ -11,6 +11,11 @@ use crate::auth::responses::AccountLoginResponse;
 
 const TWO_FA_CODE_LENGTH: usize = 6;
 
+/// Check whether a string is a valid 6-digit 2FA code.
+fn is_valid_2fa_code(code: &str) -> bool {
+    code.len() == TWO_FA_CODE_LENGTH && code.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Submit a 6-digit 2FA code to Apple's verification endpoint.
 ///
 /// Sends the code to `/verify/trusteddevice/securitycode`.
@@ -22,7 +27,7 @@ pub async fn submit_2fa_code(
     domain: &str,
     code: &str,
 ) -> Result<bool> {
-    if code.len() != TWO_FA_CODE_LENGTH || !code.chars().all(|c| c.is_ascii_digit()) {
+    if !is_valid_2fa_code(code) {
         tracing::error!(
             "Invalid 2FA code: must be exactly {} digits",
             TWO_FA_CODE_LENGTH
@@ -230,5 +235,15 @@ mod tests {
         let endpoints = Endpoints::for_domain("com").unwrap();
         let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "").await;
         assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_is_valid_2fa_code_accepts_valid() {
+        assert!(is_valid_2fa_code("123456"));
+    }
+
+    #[test]
+    fn test_is_valid_2fa_code_accepts_leading_zeros() {
+        assert!(is_valid_2fa_code("000000"));
     }
 }

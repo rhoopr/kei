@@ -2898,4 +2898,310 @@ mod tests {
             hash_download_config(&config2)
         );
     }
+
+    // ── determine_media_type tests ──────────────────────────────────────
+
+    #[test]
+    fn test_determine_media_type_image_no_live_is_photo() {
+        let asset = photo_asset_with_version(); // public.jpeg, no live versions
+        assert_eq!(
+            determine_media_type(VersionSizeKey::Original, &asset),
+            MediaType::Photo
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_image_with_live_is_live_photo_image() {
+        let asset = photo_asset_with_live_photo(); // public.heic with live versions
+        assert_eq!(
+            determine_media_type(VersionSizeKey::Original, &asset),
+            MediaType::LivePhotoImage
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_movie_original_is_video() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "MOV_1", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        assert_eq!(
+            determine_media_type(VersionSizeKey::Original, &asset),
+            MediaType::Video
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_live_original_on_image_is_live_photo_video() {
+        let asset = photo_asset_with_live_photo();
+        assert_eq!(
+            determine_media_type(VersionSizeKey::LiveOriginal, &asset),
+            MediaType::LivePhotoVideo
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_live_original_on_movie_is_video() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "MOV_2", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        assert_eq!(
+            determine_media_type(VersionSizeKey::LiveOriginal, &asset),
+            MediaType::Video
+        );
+    }
+
+    // ── NameId7 filter tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_name_id7_produces_task_with_id_suffix() {
+        let asset = photo_asset_with_version(); // recordName "TEST_1"
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // NameId7 uses underscore separator between stem and base64 ID suffix
+        assert!(
+            filename.contains('_'),
+            "NameId7 filename should contain underscore separator, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn test_name_id7_skips_existing_file() {
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let dir = test_tmp_dir("name_id7_skip");
+        config.directory = dir.clone();
+
+        // First call to get the expected path
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let expected_path = &tasks[0].download_path;
+
+        // Create parent directories and write a file with the matching size
+        fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
+        fs::write(expected_path, vec![0u8; 1000]).unwrap();
+
+        // Second call should skip since the file exists with matching size
+        let tasks2 = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks2.is_empty(),
+            "NameId7 should skip existing file, got {} tasks",
+            tasks2.len()
+        );
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_name_id7_live_photo_produces_two_tasks_with_id_suffix() {
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks.len(),
+            2,
+            "Live photo should produce 2 tasks (HEIC + MOV)"
+        );
+
+        for task in &tasks {
+            let filename = task.download_path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                filename.contains('_'),
+                "NameId7 live photo filename should contain underscore separator, got: {filename}"
+            );
+        }
+    }
+
+    // ── keep_unicode_in_filenames tests ─────────────────────────────────
+
+    fn unicode_photo_asset() -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "UNI_1", "fields": {
+                "filenameEnc": {"value": "Café_photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_keep_unicode_preserves_non_ascii() {
+        let asset = unicode_photo_asset();
+        let mut config = test_config();
+        config.keep_unicode_in_filenames = true;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("Café"),
+            "keep_unicode=true should preserve unicode, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn test_default_strips_unicode_from_filename() {
+        let asset = unicode_photo_asset();
+        let config = test_config(); // keep_unicode_in_filenames = false
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("Caf_photo"),
+            "keep_unicode=false should strip non-ASCII, got: {filename}"
+        );
+        assert!(
+            !filename.contains("Café"),
+            "keep_unicode=false should not contain unicode chars, got: {filename}"
+        );
+    }
+
+    // ── Medium/Thumb size suffix tests ──────────────────────────────────
+
+    fn multi_size_photo_asset() -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "MED_1", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "orig_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resJPEGMedRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/med",
+                    "fileChecksum": "med_ck"
+                }},
+                "resJPEGMedFileType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 500,
+                    "downloadURL": "https://example.com/thumb",
+                    "fileChecksum": "thumb_ck"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_medium_size_adds_suffix() {
+        let asset = multi_size_photo_asset();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("-medium"),
+            "Medium size should add '-medium' suffix, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn test_thumb_size_adds_suffix() {
+        let asset = multi_size_photo_asset();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Thumb;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("-thumb"),
+            "Thumb size should add '-thumb' suffix, got: {filename}"
+        );
+    }
+
+    // ── NormalizedPath direct tests ─────────────────────────────────────
+
+    #[test]
+    fn test_normalized_path_lowercases_on_case_insensitive() {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let np = NormalizedPath::new(PathBuf::from("Foo.JPG"));
+            assert_eq!(&*np.0, "foo.jpg");
+        }
+    }
+
+    #[test]
+    fn test_normalized_path_case_equality() {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            assert_eq!(a, b);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            assert_ne!(a, b);
+        }
+    }
+
+    #[test]
+    fn test_normalized_path_borrow_for_hashmap_lookup() {
+        use std::collections::HashMap;
+        let mut map: HashMap<NormalizedPath, u64> = HashMap::new();
+        map.insert(NormalizedPath::new(PathBuf::from("test.jpg")), 42);
+        let key = NormalizedPath::normalize(std::path::Path::new("test.jpg"));
+        assert_eq!(map.get(key.as_ref()), Some(&42));
+    }
 }

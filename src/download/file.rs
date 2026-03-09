@@ -280,4 +280,25 @@ mod tests {
         let result = temp_download_path(&path, "AAAA", ".part").unwrap();
         assert!(result.to_string_lossy().ends_with(".part"));
     }
+
+    #[tokio::test]
+    async fn test_compute_sha256_known_content() {
+        let dir = PathBuf::from("/tmp/claude/sha256_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("known.bin");
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        let hash = compute_sha256(&file_path).await.unwrap();
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compute_sha256_nonexistent_file() {
+        let file_path = PathBuf::from("/tmp/claude/sha256_test/nonexistent_file.bin");
+        let result = compute_sha256(&file_path).await;
+        assert!(result.is_err());
+    }
 }
