@@ -143,33 +143,6 @@ mod tests {
         notifier.notify(Event::SyncComplete, "test message", "user@example.com");
     }
 
-    #[test]
-    fn notifier_with_path() {
-        let notifier = Notifier::new(Some(PathBuf::from("/tmp/claude/script.sh")));
-        assert!(notifier.script.is_some());
-    }
-
-    #[test]
-    fn event_debug() {
-        let events = [
-            Event::TwoFaRequired,
-            Event::SyncComplete,
-            Event::SyncFailed,
-            Event::SessionExpired,
-        ];
-        for e in events {
-            let debug = format!("{:?}", e);
-            assert!(!debug.is_empty());
-        }
-    }
-
-    #[test]
-    fn event_clone_and_copy() {
-        let e = Event::SyncComplete;
-        let e2 = e; // Copy
-        assert_eq!(e, e2);
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn run_script_success() {

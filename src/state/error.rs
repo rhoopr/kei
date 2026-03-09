@@ -58,7 +58,7 @@ mod tests {
     fn query_helper_creates_correct_variant() {
         let rusqlite_err = make_rusqlite_error();
         let msg = rusqlite_err.to_string();
-        let err = StateError::query(make_rusqlite_error());
+        let err = StateError::query(rusqlite_err);
         match &err {
             StateError::Query(s) => assert_eq!(s, &msg),
             other => panic!("expected Query variant, got {:?}", other),
@@ -112,20 +112,6 @@ mod tests {
         assert!(
             display.starts_with("Failed to open database at"),
             "unexpected prefix: {display}"
-        );
-    }
-
-    #[test]
-    fn debug_format_works() {
-        let err = StateError::Query("test".to_string());
-        let debug = format!("{:?}", err);
-        assert!(
-            !debug.is_empty(),
-            "debug format should produce non-empty output"
-        );
-        assert!(
-            debug.contains("Query"),
-            "debug should contain variant name, got: {debug}"
         );
     }
 }

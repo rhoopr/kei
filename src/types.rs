@@ -208,21 +208,4 @@ mod tests {
             assert_eq!(parsed, variant);
         }
     }
-
-    #[test]
-    fn version_size_debug() {
-        assert_eq!(format!("{:?}", VersionSize::Original), "Original");
-        assert_eq!(format!("{:?}", VersionSize::Alternative), "Alternative");
-    }
-
-    #[test]
-    fn enums_are_copy() {
-        let v = VersionSize::Original;
-        let v2 = v; // Copy
-        assert_eq!(v, v2);
-
-        let d = Domain::Com;
-        let d2 = d;
-        assert_eq!(d, d2);
-    }
 }

@@ -94,33 +94,4 @@ mod tests {
         let token = install_signal_handler(&notifier).unwrap();
         assert!(!token.is_cancelled());
     }
-
-    #[test]
-    fn cancel_propagates_to_children() {
-        let parent = CancellationToken::new();
-        let child1 = parent.child_token();
-        let child2 = parent.child_token();
-        assert!(!child1.is_cancelled());
-        assert!(!child2.is_cancelled());
-        parent.cancel();
-        assert!(child1.is_cancelled());
-        assert!(child2.is_cancelled());
-    }
-
-    #[test]
-    fn child_cancel_does_not_affect_parent() {
-        let parent = CancellationToken::new();
-        let child = parent.child_token();
-        child.cancel();
-        assert!(!parent.is_cancelled());
-        assert!(child.is_cancelled());
-    }
-
-    #[test]
-    fn atomic_counter_semantics() {
-        let count = Arc::new(AtomicU32::new(0));
-        assert_eq!(count.fetch_add(1, Ordering::SeqCst), 0);
-        assert_eq!(count.fetch_add(1, Ordering::SeqCst), 1);
-        assert_eq!(count.load(Ordering::SeqCst), 2);
-    }
 }

@@ -4,13 +4,13 @@
 
 | File | Tests | Auth Required | Network |
 |------|------:|:---:|:---:|
-| Unit tests (`src/`) | 574 | No | No |
+| Unit tests (`src/`) | 541 | No | No |
 | `cli.rs` | 67 | No | No |
 | `state.rs` | 4 | No | No |
 | `state_auth.rs` | 13 | Yes | Yes |
 | `sync.rs` | 27 | Mostly | Yes |
 | `setup_auth.rs` | 1 (ignored) | Yes | Yes |
-| **Total** | **686** | | |
+| **Total** | **652** | | |
 
 ## Running Tests
 
@@ -31,7 +31,7 @@ See `tests/README.md` for setup instructions.
 
 ## Unit Tests (`cargo test --bin icloudpd-rs`)
 
-574 tests across 31 source modules. All offline, no credentials needed. Covers
+541 tests across 31 source modules. All offline, no credentials needed. Covers
 CLI parsing, config, download pipeline, path resolution, EXIF, iCloud API
 client, session management, SRP auth, state DB, retry logic, and shutdown.
 

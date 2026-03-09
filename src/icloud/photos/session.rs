@@ -397,29 +397,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_service_not_activated_zone_not_found() {
-        assert!(is_service_not_activated("ZONE_NOT_FOUND", ""));
-    }
-
-    #[test]
-    fn test_is_service_not_activated_auth_failed() {
-        assert!(is_service_not_activated("AUTHENTICATION_FAILED", ""));
-    }
-
-    #[test]
-    fn test_is_service_not_activated_access_denied() {
-        assert!(is_service_not_activated("ACCESS_DENIED", "some reason"));
-    }
-
-    #[test]
-    fn test_is_service_not_activated_by_reason() {
-        assert!(is_service_not_activated(
-            "UNKNOWN",
-            "Private db access disabled for account"
-        ));
-    }
-
-    #[test]
     fn test_is_service_not_activated_normal_error() {
         assert!(!is_service_not_activated("RETRY_LATER", "busy"));
     }

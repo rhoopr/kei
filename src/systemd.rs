@@ -110,27 +110,4 @@ mod tests {
         n.notify_status("test");
         n.notify_watchdog();
     }
-
-    #[test]
-    fn notifier_is_copy() {
-        let n = SystemdNotifier::new(true);
-        let n2 = n; // Copy
-        n2.notify_ready(); // Use n2 to prove it's a copy
-        n.notify_ready(); // n is still valid
-    }
-
-    #[test]
-    fn notifier_debug() {
-        let n = SystemdNotifier::new(false);
-        let debug = format!("{:?}", n);
-        assert!(debug.contains("SystemdNotifier"));
-        assert!(debug.contains("false"));
-    }
-
-    #[test]
-    fn notifier_clone() {
-        let n = SystemdNotifier::new(true);
-        let n2 = n;
-        let _ = format!("{:?}", n2);
-    }
 }

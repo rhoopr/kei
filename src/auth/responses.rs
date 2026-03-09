@@ -148,18 +148,4 @@ mod tests {
         let ep: WebserviceEndpoint = serde_json::from_str(json).unwrap();
         assert_eq!(ep.url, "https://p99-ckdatabasews.icloud.com:443");
     }
-
-    #[test]
-    fn test_srp_init_response_debug() {
-        let json = r#"{
-            "salt": "s",
-            "b": "b",
-            "c": null,
-            "iteration": 1,
-            "protocol": "s2k"
-        }"#;
-        let resp: SrpInitResponse = serde_json::from_str(json).unwrap();
-        let debug = format!("{:?}", resp);
-        assert!(debug.contains("SrpInitResponse"));
-    }
 }

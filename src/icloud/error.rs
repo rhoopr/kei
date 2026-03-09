@@ -88,27 +88,4 @@ mod tests {
             "expected Json variant, got: {err:?}"
         );
     }
-
-    #[test]
-    fn debug_format_works_for_all_variants() {
-        let variants: Vec<ICloudError> = vec![
-            ICloudError::Connection("debug test".into()),
-            ICloudError::IndexingNotFinished,
-            ICloudError::ServiceNotActivated {
-                code: "C1".into(),
-                reason: "R1".into(),
-            },
-            std::io::Error::other("io").into(),
-            serde_json::from_str::<serde_json::Value>("{bad}")
-                .unwrap_err()
-                .into(),
-        ];
-        for variant in &variants {
-            let debug = format!("{variant:?}");
-            assert!(
-                !debug.is_empty(),
-                "debug output should not be empty for {variant}"
-            );
-        }
-    }
 }

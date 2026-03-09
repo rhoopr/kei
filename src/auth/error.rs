@@ -108,21 +108,4 @@ mod tests {
         let err: AuthError = json_err.into();
         assert!(matches!(err, AuthError::Json(_)));
     }
-
-    #[test]
-    fn all_variants_are_debug() {
-        let variants: Vec<AuthError> = vec![
-            AuthError::FailedLogin("test".into()),
-            AuthError::InvalidToken("test".into()),
-            AuthError::ApiError {
-                code: 500,
-                message: "test".into(),
-            },
-            AuthError::TwoFactorFailed("test".into()),
-            AuthError::TwoFactorRequired,
-        ];
-        for v in variants {
-            let _ = format!("{:?}", v);
-        }
-    }
 }

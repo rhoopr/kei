@@ -53,85 +53,21 @@ mod tests {
     use crate::types::VersionSize;
 
     #[test]
-    fn from_version_size_original() {
-        assert_eq!(
-            AssetVersionSize::from(VersionSize::Original),
-            AssetVersionSize::Original
-        );
-    }
-
-    #[test]
-    fn from_version_size_medium() {
-        assert_eq!(
-            AssetVersionSize::from(VersionSize::Medium),
-            AssetVersionSize::Medium
-        );
-    }
-
-    #[test]
-    fn from_version_size_thumb() {
-        assert_eq!(
-            AssetVersionSize::from(VersionSize::Thumb),
-            AssetVersionSize::Thumb
-        );
-    }
-
-    #[test]
-    fn from_version_size_adjusted() {
-        assert_eq!(
-            AssetVersionSize::from(VersionSize::Adjusted),
-            AssetVersionSize::Adjusted
-        );
-    }
-
-    #[test]
-    fn from_version_size_alternative() {
-        assert_eq!(
-            AssetVersionSize::from(VersionSize::Alternative),
-            AssetVersionSize::Alternative
-        );
+    fn from_version_size_all_variants() {
+        for (input, expected) in [
+            (VersionSize::Original, AssetVersionSize::Original),
+            (VersionSize::Medium, AssetVersionSize::Medium),
+            (VersionSize::Thumb, AssetVersionSize::Thumb),
+            (VersionSize::Adjusted, AssetVersionSize::Adjusted),
+            (VersionSize::Alternative, AssetVersionSize::Alternative),
+        ] {
+            assert_eq!(AssetVersionSize::from(input), expected, "from {input:?}");
+        }
     }
 
     #[test]
     fn asset_version_size_is_one_byte() {
         assert_eq!(std::mem::size_of::<AssetVersionSize>(), 1);
-    }
-
-    #[test]
-    fn asset_item_type_debug_output() {
-        assert_eq!(format!("{:?}", AssetItemType::Image), "Image");
-        assert_eq!(format!("{:?}", AssetItemType::Movie), "Movie");
-    }
-
-    #[test]
-    fn asset_version_construction_and_field_access() {
-        let version = AssetVersion {
-            size: 1024,
-            url: "https://example.com/photo.jpg".into(),
-            asset_type: "public.jpeg".into(),
-            checksum: "abc123".into(),
-        };
-
-        assert_eq!(version.size, 1024);
-        assert_eq!(&*version.url, "https://example.com/photo.jpg");
-        assert_eq!(&*version.asset_type, "public.jpeg");
-        assert_eq!(&*version.checksum, "abc123");
-    }
-
-    #[test]
-    fn asset_version_clone() {
-        let version = AssetVersion {
-            size: 2048,
-            url: "https://example.com/video.mov".into(),
-            asset_type: "public.mpeg-4".into(),
-            checksum: "def456".into(),
-        };
-
-        let cloned = version.clone();
-        assert_eq!(cloned.size, version.size);
-        assert_eq!(&*cloned.url, &*version.url);
-        assert_eq!(&*cloned.asset_type, &*version.asset_type);
-        assert_eq!(&*cloned.checksum, &*version.checksum);
     }
 
     #[test]
