@@ -310,7 +310,7 @@ impl StateDb for SqliteStateDb {
                 &record.filename,
                 record.created_at.timestamp(),
                 record.added_at.map(|dt| dt.timestamp()),
-                record.size_bytes as i64,
+                i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
                 record.media_type.as_str(),
                 last_seen_at,
             ],
@@ -394,7 +394,8 @@ impl StateDb for SqliteStateDb {
             .query_row("SELECT COUNT(*) FROM assets", [], |row| {
                 row.get::<_, i64>(0)
             })
-            .map_err(StateError::query)? as u64;
+            .map(|v| u64::try_from(v).unwrap_or(0))
+            .map_err(StateError::query)?;
 
         let downloaded: u64 = conn
             .query_row(
@@ -402,7 +403,8 @@ impl StateDb for SqliteStateDb {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(StateError::query)? as u64;
+            .map(|v| u64::try_from(v).unwrap_or(0))
+            .map_err(StateError::query)?;
 
         let pending: u64 = conn
             .query_row(
@@ -410,7 +412,8 @@ impl StateDb for SqliteStateDb {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(StateError::query)? as u64;
+            .map(|v| u64::try_from(v).unwrap_or(0))
+            .map_err(StateError::query)?;
 
         let failed: u64 = conn
             .query_row(
@@ -418,7 +421,8 @@ impl StateDb for SqliteStateDb {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(StateError::query)? as u64;
+            .map(|v| u64::try_from(v).unwrap_or(0))
+            .map_err(StateError::query)?;
 
         let last_sync: Option<(Option<i64>, Option<i64>)> = conn
             .query_row(
@@ -488,9 +492,9 @@ impl StateDb for SqliteStateDb {
 
     async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
         let completed_at = Utc::now().timestamp();
-        let assets_seen = stats.assets_seen as i64;
-        let assets_downloaded = stats.assets_downloaded as i64;
-        let assets_failed = stats.assets_failed as i64;
+        let assets_seen = i64::try_from(stats.assets_seen).unwrap_or(i64::MAX);
+        let assets_downloaded = i64::try_from(stats.assets_downloaded).unwrap_or(i64::MAX);
+        let assets_failed = i64::try_from(stats.assets_failed).unwrap_or(i64::MAX);
         let interrupted = if stats.interrupted { 1 } else { 0 };
 
         let conn = self
@@ -520,7 +524,7 @@ impl StateDb for SqliteStateDb {
             )
             .map_err(StateError::query)?;
 
-        Ok(rows as u64)
+        Ok(rows as u64) // usize -> u64 is lossless on 64-bit
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
@@ -761,7 +765,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
         local_path: local_path_str.map(PathBuf::from),
         last_error,
         local_checksum,
-        size_bytes: size_bytes as u64,
+        size_bytes: u64::try_from(size_bytes).unwrap_or(0),
         created_at: Utc
             .timestamp_opt(created_at_ts, 0)
             .single()
@@ -772,7 +776,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
             .timestamp_opt(last_seen_at_ts, 0)
             .single()
             .unwrap_or(DateTime::UNIX_EPOCH),
-        download_attempts: download_attempts as u32,
+        download_attempts: u32::try_from(download_attempts).unwrap_or(u32::MAX),
         version_size: VersionSizeKey::from_str(&version_size_str)
             .unwrap_or(VersionSizeKey::Original),
         media_type: MediaType::from_str(&media_type_str).unwrap_or(MediaType::Photo),
