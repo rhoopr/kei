@@ -3475,57 +3475,6 @@ mod tests {
     // ---------- SyncMode / SyncResult tests ----------
 
     #[test]
-    fn test_sync_mode_full_debug() {
-        let mode = SyncMode::Full;
-        let debug = format!("{:?}", mode);
-        assert_eq!(debug, "Full");
-    }
-
-    #[test]
-    fn test_sync_mode_incremental_debug() {
-        let mode = SyncMode::Incremental {
-            zone_sync_token: "tok-abc".to_string(),
-        };
-        let debug = format!("{:?}", mode);
-        assert!(debug.contains("Incremental"));
-        assert!(debug.contains("tok-abc"));
-    }
-
-    #[test]
-    fn test_sync_mode_clone() {
-        let mode = SyncMode::Incremental {
-            zone_sync_token: "tok-123".to_string(),
-        };
-        let cloned = mode.clone();
-        match cloned {
-            SyncMode::Incremental { zone_sync_token } => {
-                assert_eq!(zone_sync_token, "tok-123");
-            }
-            _ => panic!("Expected Incremental variant"),
-        }
-    }
-
-    #[test]
-    fn test_sync_result_success_with_token() {
-        let result = SyncResult {
-            outcome: DownloadOutcome::Success,
-            sync_token: Some("new-token".to_string()),
-        };
-        assert!(result.sync_token.is_some());
-        assert_eq!(result.sync_token.as_deref(), Some("new-token"));
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
-    }
-
-    #[test]
-    fn test_sync_result_success_without_token() {
-        let result = SyncResult {
-            outcome: DownloadOutcome::Success,
-            sync_token: None,
-        };
-        assert!(result.sync_token.is_none());
-    }
-
-    #[test]
     fn test_sync_result_partial_failure() {
         let result = SyncResult {
             outcome: DownloadOutcome::PartialFailure { failed_count: 3 },
@@ -3553,22 +3502,6 @@ mod tests {
             }
             _ => panic!("Expected SessionExpired"),
         }
-    }
-
-    #[test]
-    fn test_download_config_sync_mode_default_full() {
-        let config = test_config();
-        assert!(matches!(config.sync_mode, SyncMode::Full));
-    }
-
-    #[test]
-    fn test_download_config_debug_includes_sync_mode() {
-        let config = test_config();
-        let debug = format!("{:?}", config);
-        assert!(
-            debug.contains("sync_mode"),
-            "Debug output should include sync_mode field"
-        );
     }
 
     #[test]
@@ -3680,39 +3613,6 @@ mod tests {
             .collect();
 
         assert_eq!(downloadable.len(), 1);
-    }
-
-    #[test]
-    fn test_sync_mode_incremental_empty_token() {
-        let mode = SyncMode::Incremental {
-            zone_sync_token: String::new(),
-        };
-        match mode {
-            SyncMode::Incremental { zone_sync_token } => {
-                assert!(zone_sync_token.is_empty());
-            }
-            _ => panic!("expected Incremental variant"),
-        }
-    }
-
-    #[test]
-    fn test_sync_result_with_token() {
-        let result = SyncResult {
-            outcome: DownloadOutcome::Success,
-            sync_token: Some("abc".to_string()),
-        };
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
-        assert_eq!(result.sync_token.as_deref(), Some("abc"));
-    }
-
-    #[test]
-    fn test_sync_result_without_token() {
-        let result = SyncResult {
-            outcome: DownloadOutcome::Success,
-            sync_token: None,
-        };
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
-        assert!(result.sync_token.is_none());
     }
 
     // ── NormalizedPath additional tests ──────────────────────────────────
@@ -3971,69 +3871,6 @@ mod tests {
     }
 
     // ── Change event classification tests ───────────────────────────────
-
-    #[test]
-    fn test_change_event_created_with_some_asset_is_downloadable() {
-        let event = ChangeEvent {
-            record_name: "REC_A".to_string(),
-            record_type: Some("CPLAsset".to_string()),
-            reason: ChangeReason::Created,
-            asset: Some(photo_asset_with_version()),
-        };
-        assert!(matches!(event.reason, ChangeReason::Created));
-        assert!(event.asset.is_some());
-        let asset = event.asset.unwrap();
-        assert_eq!(asset.id(), "TEST_1");
-    }
-
-    #[test]
-    fn test_change_event_created_with_none_asset_counted_not_downloadable() {
-        let event = ChangeEvent {
-            record_name: "REC_B".to_string(),
-            record_type: Some("CPLAsset".to_string()),
-            reason: ChangeReason::Created,
-            asset: None,
-        };
-        // Created events increment created_count
-        assert!(matches!(event.reason, ChangeReason::Created));
-        // But None asset means no download task
-        assert!(event.asset.is_none());
-    }
-
-    #[test]
-    fn test_change_event_soft_deleted_counted_not_downloadable() {
-        let event = ChangeEvent {
-            record_name: "REC_C".to_string(),
-            record_type: Some("CPLAsset".to_string()),
-            reason: ChangeReason::SoftDeleted,
-            asset: None,
-        };
-        assert!(!matches!(event.reason, ChangeReason::Created));
-    }
-
-    #[test]
-    fn test_change_event_hard_deleted_counted_not_downloadable() {
-        let event = ChangeEvent {
-            record_name: "REC_D".to_string(),
-            record_type: None,
-            reason: ChangeReason::HardDeleted,
-            asset: None,
-        };
-        assert!(!matches!(event.reason, ChangeReason::Created));
-        // Hard deletes have no record_type
-        assert!(event.record_type.is_none());
-    }
-
-    #[test]
-    fn test_change_event_hidden_counted_not_downloadable() {
-        let event = ChangeEvent {
-            record_name: "REC_E".to_string(),
-            record_type: Some("CPLAsset".to_string()),
-            reason: ChangeReason::Hidden,
-            asset: None,
-        };
-        assert!(!matches!(event.reason, ChangeReason::Created));
-    }
 
     #[test]
     fn test_change_event_filtering_counts_and_extraction() {

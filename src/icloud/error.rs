@@ -42,6 +42,8 @@ impl From<serde_json::Error> for ICloudError {
     }
 }
 
+const _: () = assert!(std::mem::size_of::<ICloudError>() <= 80);
+
 #[cfg(test)]
 mod tests {
     use super::*;

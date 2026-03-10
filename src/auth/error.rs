@@ -46,6 +46,8 @@ impl From<serde_json::Error> for AuthError {
     }
 }
 
+const _: () = assert!(std::mem::size_of::<AuthError>() <= 80);
+
 impl AuthError {
     /// Check if this error indicates that 2FA is required but no code was provided.
     pub fn is_two_factor_required(&self) -> bool {

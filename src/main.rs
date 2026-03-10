@@ -386,7 +386,8 @@ async fn run_submit_code(
 ///
 /// Must match Python's `PyiCloudService.params` for API compatibility.
 fn build_photos_params(
-    auth_result: &auth::AuthResult,
+    client_id: &str,
+    dsid: Option<&str>,
 ) -> std::collections::HashMap<String, serde_json::Value> {
     let mut params = std::collections::HashMap::new();
     params.insert(
@@ -399,14 +400,9 @@ fn build_photos_params(
     );
     params.insert(
         "clientId".to_string(),
-        serde_json::Value::String(auth_result.session.client_id().cloned().unwrap_or_default()),
+        serde_json::Value::String(client_id.to_string()),
     );
-    if let Some(dsid) = &auth_result
-        .data
-        .ds_info
-        .as_ref()
-        .and_then(|ds| ds.dsid.as_ref())
-    {
+    if let Some(dsid) = dsid {
         params.insert(
             "dsid".to_string(),
             serde_json::Value::String(dsid.to_string()),
@@ -463,7 +459,13 @@ async fn run_import_existing(
         .map(|ep| ep.url.as_str())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
 
-    let params = build_photos_params(&auth_result);
+    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
+    let dsid = auth_result
+        .data
+        .ds_info
+        .as_ref()
+        .and_then(|ds| ds.dsid.clone());
+    let params = build_photos_params(&client_id, dsid.as_deref());
 
     let shared_session: auth::SharedSession =
         Arc::new(tokio::sync::RwLock::new(auth_result.session));
@@ -756,7 +758,13 @@ async fn main() -> anyhow::Result<()> {
         .map(|ep| ep.url.as_str())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
 
-    let params = build_photos_params(&auth_result);
+    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
+    let dsid = auth_result
+        .data
+        .ds_info
+        .as_ref()
+        .and_then(|ds| ds.dsid.clone());
+    let params = build_photos_params(&client_id, dsid.as_deref());
 
     let shared_session: auth::SharedSession =
         std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
@@ -1305,36 +1313,9 @@ mod tests {
 
     // ── build_photos_params tests ───────────────────────────────────────
 
-    #[tokio::test]
-    async fn build_photos_params_includes_client_id_and_dsid() {
-        let dir = PathBuf::from("/tmp/claude/build_photos_params_test");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut session =
-            auth::session::Session::new(&dir, "test@example.com", "https://example.com", None)
-                .await
-                .unwrap();
-        session.set_client_id("test-client-id-123");
-
-        let data = auth::responses::AccountLoginResponse {
-            ds_info: Some(auth::responses::DsInfo {
-                hsa_version: 2,
-                dsid: Some("99999".to_string()),
-                has_i_cloud_qualifying_device: true,
-            }),
-            webservices: None,
-            hsa_challenge_required: false,
-            hsa_trusted_browser: false,
-            domain_to_use: None,
-        };
-
-        let auth_result = auth::AuthResult {
-            session,
-            data,
-            requires_2fa: false,
-        };
-
-        let params = build_photos_params(&auth_result);
+    #[test]
+    fn build_photos_params_includes_client_id_and_dsid() {
+        let params = build_photos_params("test-client-id-123", Some("99999"));
 
         assert_eq!(
             params.get("clientBuildNumber"),
@@ -1354,76 +1335,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn build_photos_params_no_dsid_when_ds_info_missing() {
-        let dir = PathBuf::from("/tmp/claude/build_photos_params_no_dsid");
-        std::fs::create_dir_all(&dir).unwrap();
+    #[test]
+    fn build_photos_params_no_dsid() {
+        let params = build_photos_params("client-abc", None);
 
-        let session =
-            auth::session::Session::new(&dir, "test2@example.com", "https://example.com", None)
-                .await
-                .unwrap();
-
-        let data = auth::responses::AccountLoginResponse {
-            ds_info: None,
-            webservices: None,
-            hsa_challenge_required: false,
-            hsa_trusted_browser: false,
-            domain_to_use: None,
-        };
-
-        let auth_result = auth::AuthResult {
-            session,
-            data,
-            requires_2fa: false,
-        };
-
-        let params = build_photos_params(&auth_result);
-
-        assert!(
-            !params.contains_key("dsid"),
-            "dsid should be absent when ds_info is None"
+        assert!(!params.contains_key("dsid"));
+        assert_eq!(
+            params.get("clientId"),
+            Some(&serde_json::Value::String("client-abc".to_string()))
         );
-        // client_id should be empty string when not set on session
+    }
+
+    #[test]
+    fn build_photos_params_empty_client_id() {
+        let params = build_photos_params("", Some("12345"));
+
         assert_eq!(
             params.get("clientId"),
             Some(&serde_json::Value::String(String::new()))
         );
-    }
-
-    #[tokio::test]
-    async fn build_photos_params_no_dsid_when_dsid_is_none() {
-        let dir = PathBuf::from("/tmp/claude/build_photos_params_dsid_none");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let session =
-            auth::session::Session::new(&dir, "test3@example.com", "https://example.com", None)
-                .await
-                .unwrap();
-
-        let data = auth::responses::AccountLoginResponse {
-            ds_info: Some(auth::responses::DsInfo {
-                hsa_version: 2,
-                dsid: None,
-                has_i_cloud_qualifying_device: false,
-            }),
-            webservices: None,
-            hsa_challenge_required: false,
-            hsa_trusted_browser: false,
-            domain_to_use: None,
-        };
-
-        let auth_result = auth::AuthResult {
-            session,
-            data,
-            requires_2fa: false,
-        };
-
-        let params = build_photos_params(&auth_result);
-
-        assert!(
-            !params.contains_key("dsid"),
-            "dsid should be absent when dsid field is None"
+        assert_eq!(
+            params.get("dsid"),
+            Some(&serde_json::Value::String("12345".to_string()))
         );
     }
 }
