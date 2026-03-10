@@ -52,6 +52,20 @@ fn sync_help_succeeds() {
 }
 
 #[test]
+fn sync_help_lists_sync_token_flags() {
+    let assert = common::cmd().args(["sync", "--help"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains("--no-incremental"),
+        "sync help missing --no-incremental"
+    );
+    assert!(
+        stdout.contains("--reset-sync-token"),
+        "sync help missing --reset-sync-token"
+    );
+}
+
+#[test]
 fn status_help_succeeds() {
     common::cmd()
         .args(["status", "--help"])
@@ -438,6 +452,8 @@ fn boolean_sync_flags_accepted() {
         "--no-progress-bar",
         "--keep-unicode-in-filenames",
         "--notify-systemd",
+        "--no-incremental",
+        "--reset-sync-token",
     ] {
         common::cmd()
             .args(["sync", flag, "--help"])
@@ -766,6 +782,27 @@ fn retry_failed_accepts_sync_flags() {
             "2",
             "--help",
         ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn retry_failed_accepts_sync_token_flags() {
+    common::cmd()
+        .args([
+            "retry-failed",
+            "--no-incremental",
+            "--reset-sync-token",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn no_incremental_and_reset_sync_token_together() {
+    common::cmd()
+        .args(["sync", "--no-incremental", "--reset-sync-token", "--help"])
         .assert()
         .success();
 }
