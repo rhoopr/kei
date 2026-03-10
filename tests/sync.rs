@@ -3,7 +3,7 @@
 //! Uses the `icloudpd-test` iCloud album with known content:
 //! - GOPR0558.JPG        — regular JPEG photo
 //! - IMG_0962.MOV        — standalone video
-//! - IMG_1127.HEIC       — Live Photo (HEIC + MOV companion)
+//! - IMG_0212.HEIC       — Live Photo (HEIC + MOV companion)
 //! - IMG_0199.DNG        — Apple ProRAW (RAW + JPEG derivative)
 //! - Café_🧠godzill.jpg  — JPEG with unicode filename
 //!
@@ -240,7 +240,7 @@ fn sync_skip_videos_excludes_video_files() {
         // --skip-videos excludes standalone videos, not Live Photo MOV companions
         let standalone_videos: Vec<_> = files
             .iter()
-            .filter(|p| is_video_ext(p) && !file_name_contains(p, "1127"))
+            .filter(|p| is_video_ext(p) && !file_name_contains(p, "0212"))
             .collect();
         assert!(
             standalone_videos.is_empty(),
@@ -314,7 +314,7 @@ fn sync_skip_live_photos_excludes_companions() {
 
         // Live Photo MOV companion should NOT be present
         let live_photo_mov = files.iter().any(|p| {
-            file_name_contains(p, "1127")
+            file_name_contains(p, "0212")
                 && p.extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
@@ -723,7 +723,7 @@ fn sync_live_photo_mov_policy_controls_naming() {
             .assert()
             .success();
 
-        // Find Live Photo MOV files (containing "1127" — the Live Photo asset)
+        // Find Live Photo MOV files (containing "0212" — the Live Photo asset)
         let suffix_movs = live_photo_movs(dir_suffix.path());
         let original_movs = live_photo_movs(dir_original.path());
 
@@ -1078,12 +1078,12 @@ fn strip_ansi(s: &str) -> String {
     result
 }
 
-/// Find Live Photo MOV filenames (files containing "1127" with .mov extension).
+/// Find Live Photo MOV filenames (files containing "0212" with .mov extension).
 fn live_photo_movs(dir: &std::path::Path) -> Vec<String> {
     common::walkdir(dir)
         .iter()
         .filter(|p| {
-            file_name_contains(p, "1127")
+            file_name_contains(p, "0212")
                 && p.extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
