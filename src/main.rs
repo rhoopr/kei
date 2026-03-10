@@ -1302,4 +1302,128 @@ mod tests {
         // Can be called multiple times
         assert_eq!(provider(), Some("mypass".to_string()));
     }
+
+    // ── build_photos_params tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_photos_params_includes_client_id_and_dsid() {
+        let dir = PathBuf::from("/tmp/claude/build_photos_params_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut session =
+            auth::session::Session::new(&dir, "test@example.com", "https://example.com", None)
+                .await
+                .unwrap();
+        session.set_client_id("test-client-id-123");
+
+        let data = auth::responses::AccountLoginResponse {
+            ds_info: Some(auth::responses::DsInfo {
+                hsa_version: 2,
+                dsid: Some("99999".to_string()),
+                has_i_cloud_qualifying_device: true,
+            }),
+            webservices: None,
+            hsa_challenge_required: false,
+            hsa_trusted_browser: false,
+            domain_to_use: None,
+        };
+
+        let auth_result = auth::AuthResult {
+            session,
+            data,
+            requires_2fa: false,
+        };
+
+        let params = build_photos_params(&auth_result);
+
+        assert_eq!(
+            params.get("clientBuildNumber"),
+            Some(&serde_json::Value::String("2522Project44".to_string()))
+        );
+        assert_eq!(
+            params.get("clientMasteringNumber"),
+            Some(&serde_json::Value::String("2522B2".to_string()))
+        );
+        assert_eq!(
+            params.get("clientId"),
+            Some(&serde_json::Value::String("test-client-id-123".to_string()))
+        );
+        assert_eq!(
+            params.get("dsid"),
+            Some(&serde_json::Value::String("99999".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn build_photos_params_no_dsid_when_ds_info_missing() {
+        let dir = PathBuf::from("/tmp/claude/build_photos_params_no_dsid");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let session =
+            auth::session::Session::new(&dir, "test2@example.com", "https://example.com", None)
+                .await
+                .unwrap();
+
+        let data = auth::responses::AccountLoginResponse {
+            ds_info: None,
+            webservices: None,
+            hsa_challenge_required: false,
+            hsa_trusted_browser: false,
+            domain_to_use: None,
+        };
+
+        let auth_result = auth::AuthResult {
+            session,
+            data,
+            requires_2fa: false,
+        };
+
+        let params = build_photos_params(&auth_result);
+
+        assert!(
+            !params.contains_key("dsid"),
+            "dsid should be absent when ds_info is None"
+        );
+        // client_id should be empty string when not set on session
+        assert_eq!(
+            params.get("clientId"),
+            Some(&serde_json::Value::String(String::new()))
+        );
+    }
+
+    #[tokio::test]
+    async fn build_photos_params_no_dsid_when_dsid_is_none() {
+        let dir = PathBuf::from("/tmp/claude/build_photos_params_dsid_none");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let session =
+            auth::session::Session::new(&dir, "test3@example.com", "https://example.com", None)
+                .await
+                .unwrap();
+
+        let data = auth::responses::AccountLoginResponse {
+            ds_info: Some(auth::responses::DsInfo {
+                hsa_version: 2,
+                dsid: None,
+                has_i_cloud_qualifying_device: false,
+            }),
+            webservices: None,
+            hsa_challenge_required: false,
+            hsa_trusted_browser: false,
+            domain_to_use: None,
+        };
+
+        let auth_result = auth::AuthResult {
+            session,
+            data,
+            requires_2fa: false,
+        };
+
+        let params = build_photos_params(&auth_result);
+
+        assert!(
+            !params.contains_key("dsid"),
+            "dsid should be absent when dsid field is None"
+        );
+    }
 }

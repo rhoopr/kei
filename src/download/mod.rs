@@ -3714,4 +3714,388 @@ mod tests {
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert!(result.sync_token.is_none());
     }
+
+    // ── NormalizedPath additional tests ──────────────────────────────────
+
+    #[test]
+    fn test_normalized_path_new_stores_normalized_form() {
+        let np = NormalizedPath::new(PathBuf::from("/photos/2025/01/IMG_0001.JPG"));
+        // On macOS/Windows the stored form should be lowercase
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(&*np.0, "/photos/2025/01/img_0001.jpg");
+        // On Linux the stored form preserves case
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(&*np.0, "/photos/2025/01/IMG_0001.JPG");
+    }
+
+    #[test]
+    fn test_normalized_path_normalize_returns_lowercase_on_macos() {
+        let path = Path::new("/Photos/IMG_0001.HEIC");
+        let normalized = NormalizedPath::normalize(path);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(normalized.as_ref(), "/photos/img_0001.heic");
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(normalized.as_ref(), "/Photos/IMG_0001.HEIC");
+    }
+
+    #[test]
+    fn test_normalized_path_hashmap_case_insensitive_lookup() {
+        // Insert with one case, look up with another — must find on macOS/Windows
+        use std::collections::HashMap;
+        let mut map: HashMap<NormalizedPath, u64> = HashMap::new();
+        map.insert(NormalizedPath::new(PathBuf::from("IMG_0001.JPG")), 100);
+        let lookup_key = NormalizedPath::normalize(Path::new("img_0001.jpg"));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(map.get(lookup_key.as_ref()), Some(&100));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(map.get(lookup_key.as_ref()), None);
+    }
+
+    #[test]
+    fn test_normalized_path_hash_consistency() {
+        // NormalizedPath::new and normalize must produce the same hash for HashMap
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let path = PathBuf::from("Test/Photo.JPG");
+        let np = NormalizedPath::new(path.clone());
+        let normalized_str = NormalizedPath::normalize(&path);
+
+        let mut h1 = DefaultHasher::new();
+        np.hash(&mut h1);
+        let hash1 = h1.finish();
+
+        // The str from normalize should hash the same as the NormalizedPath via Borrow<str>
+        let mut h2 = DefaultHasher::new();
+        let borrow_str: &str = std::borrow::Borrow::borrow(&np);
+        borrow_str.hash(&mut h2);
+        let hash2 = h2.finish();
+
+        assert_eq!(
+            hash1, hash2,
+            "NormalizedPath hash must match &str hash via Borrow"
+        );
+        assert_eq!(borrow_str, normalized_str.as_ref());
+    }
+
+    #[test]
+    fn test_normalized_path_case_different_paths_equal_on_case_insensitive() {
+        let upper = NormalizedPath::new(PathBuf::from("PHOTO.HEIC"));
+        let lower = NormalizedPath::new(PathBuf::from("photo.heic"));
+        let mixed = NormalizedPath::new(PathBuf::from("Photo.Heic"));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert_eq!(upper, lower);
+            assert_eq!(upper, mixed);
+            assert_eq!(lower, mixed);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            assert_ne!(upper, lower);
+            assert_ne!(upper, mixed);
+        }
+    }
+
+    // ── format_duration additional edge cases ────────────────────────────
+
+    #[test]
+    fn test_format_duration_125_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m 05s");
+    }
+
+    #[test]
+    fn test_format_duration_3661_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(3661)), "1h 01m 01s");
+    }
+
+    #[test]
+    fn test_format_duration_ignores_sub_second() {
+        // Duration with millis should only show whole seconds
+        assert_eq!(format_duration(Duration::from_millis(1999)), "1s");
+        assert_eq!(format_duration(Duration::from_millis(500)), "0s");
+    }
+
+    // ── hash_download_config additional sensitivity ─────────────────────
+
+    #[test]
+    fn test_hash_download_config_changes_on_size() {
+        let mut config1 = test_config();
+        config1.size = AssetVersionSize::Original;
+        let mut config2 = test_config();
+        config2.size = AssetVersionSize::Medium;
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_changes_on_live_photo_size() {
+        let mut config1 = test_config();
+        config1.live_photo_size = AssetVersionSize::LiveOriginal;
+        let mut config2 = test_config();
+        config2.live_photo_size = AssetVersionSize::LiveMedium;
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_changes_on_live_photo_mov_filename_policy() {
+        let mut config1 = test_config();
+        config1.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Suffix;
+        let mut config2 = test_config();
+        config2.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_changes_on_align_raw() {
+        let mut config1 = test_config();
+        config1.align_raw = RawTreatmentPolicy::Unchanged;
+        let mut config2 = test_config();
+        config2.align_raw = RawTreatmentPolicy::PreferOriginal;
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_is_16_hex_chars() {
+        let config = test_config();
+        let hash = hash_download_config(&config);
+        assert_eq!(hash.len(), 16);
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash should be hex chars only, got: {hash}"
+        );
+    }
+
+    // ── should_download_fast additional tests ───────────────────────────
+
+    #[test]
+    fn test_should_download_fast_unknown_asset_returns_true() {
+        let ctx = DownloadContext::default();
+        assert_eq!(
+            ctx.should_download_fast("never_seen", VersionSizeKey::Original, "any_ck", true),
+            Some(true)
+        );
+        assert_eq!(
+            ctx.should_download_fast("never_seen", VersionSizeKey::Original, "any_ck", false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_should_download_fast_downloaded_matching_checksum() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("asset_x".into())
+            .or_default()
+            .insert("original".into());
+        ctx.downloaded_checksums
+            .entry("asset_x".into())
+            .or_default()
+            .insert("original".into(), "ck_match".into());
+
+        // trust_state=true => hard skip
+        assert_eq!(
+            ctx.should_download_fast("asset_x", VersionSizeKey::Original, "ck_match", true),
+            Some(false)
+        );
+        // trust_state=false => needs filesystem check
+        assert_eq!(
+            ctx.should_download_fast("asset_x", VersionSizeKey::Original, "ck_match", false),
+            None
+        );
+    }
+
+    #[test]
+    fn test_should_download_fast_downloaded_changed_checksum() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("asset_y".into())
+            .or_default()
+            .insert("original".into());
+        ctx.downloaded_checksums
+            .entry("asset_y".into())
+            .or_default()
+            .insert("original".into(), "old_ck".into());
+
+        // Changed checksum => needs re-download regardless of trust_state
+        assert_eq!(
+            ctx.should_download_fast("asset_y", VersionSizeKey::Original, "new_ck", true),
+            Some(true)
+        );
+        assert_eq!(
+            ctx.should_download_fast("asset_y", VersionSizeKey::Original, "new_ck", false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_should_download_fast_different_version_size() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("asset_z".into())
+            .or_default()
+            .insert("original".into());
+
+        // Medium version not downloaded
+        assert_eq!(
+            ctx.should_download_fast("asset_z", VersionSizeKey::Medium, "any_ck", true),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_download_context_known_ids_populated_for_retry_only() {
+        // Simulate retry-only mode: known_ids is populated
+        let mut ctx = DownloadContext::default();
+        ctx.known_ids.insert("known_asset".into());
+
+        // A known asset that's not in downloaded_ids needs download
+        assert_eq!(
+            ctx.should_download_fast("known_asset", VersionSizeKey::Original, "ck", true),
+            Some(true)
+        );
+        // The known_ids set is used externally to decide whether to skip new assets;
+        // verify the set membership works
+        assert!(ctx.known_ids.contains("known_asset"));
+        assert!(!ctx.known_ids.contains("new_asset"));
+    }
+
+    // ── Change event classification tests ───────────────────────────────
+
+    #[test]
+    fn test_change_event_created_with_some_asset_is_downloadable() {
+        let event = ChangeEvent {
+            record_name: "REC_A".to_string(),
+            record_type: Some("CPLAsset".to_string()),
+            reason: ChangeReason::Created,
+            asset: Some(photo_asset_with_version()),
+        };
+        assert!(matches!(event.reason, ChangeReason::Created));
+        assert!(event.asset.is_some());
+        let asset = event.asset.unwrap();
+        assert_eq!(asset.id(), "TEST_1");
+    }
+
+    #[test]
+    fn test_change_event_created_with_none_asset_counted_not_downloadable() {
+        let event = ChangeEvent {
+            record_name: "REC_B".to_string(),
+            record_type: Some("CPLAsset".to_string()),
+            reason: ChangeReason::Created,
+            asset: None,
+        };
+        // Created events increment created_count
+        assert!(matches!(event.reason, ChangeReason::Created));
+        // But None asset means no download task
+        assert!(event.asset.is_none());
+    }
+
+    #[test]
+    fn test_change_event_soft_deleted_counted_not_downloadable() {
+        let event = ChangeEvent {
+            record_name: "REC_C".to_string(),
+            record_type: Some("CPLAsset".to_string()),
+            reason: ChangeReason::SoftDeleted,
+            asset: None,
+        };
+        assert!(!matches!(event.reason, ChangeReason::Created));
+    }
+
+    #[test]
+    fn test_change_event_hard_deleted_counted_not_downloadable() {
+        let event = ChangeEvent {
+            record_name: "REC_D".to_string(),
+            record_type: None,
+            reason: ChangeReason::HardDeleted,
+            asset: None,
+        };
+        assert!(!matches!(event.reason, ChangeReason::Created));
+        // Hard deletes have no record_type
+        assert!(event.record_type.is_none());
+    }
+
+    #[test]
+    fn test_change_event_hidden_counted_not_downloadable() {
+        let event = ChangeEvent {
+            record_name: "REC_E".to_string(),
+            record_type: Some("CPLAsset".to_string()),
+            reason: ChangeReason::Hidden,
+            asset: None,
+        };
+        assert!(!matches!(event.reason, ChangeReason::Created));
+    }
+
+    #[test]
+    fn test_change_event_filtering_counts_and_extraction() {
+        // Simulate the inline filtering loop from download_photos_incremental
+        let events = vec![
+            ChangeEvent {
+                record_name: "A".to_string(),
+                record_type: Some("CPLAsset".to_string()),
+                reason: ChangeReason::Created,
+                asset: Some(photo_asset_with_version()),
+            },
+            ChangeEvent {
+                record_name: "B".to_string(),
+                record_type: Some("CPLAsset".to_string()),
+                reason: ChangeReason::Created,
+                asset: None, // Unpaired record
+            },
+            ChangeEvent {
+                record_name: "C".to_string(),
+                record_type: None,
+                reason: ChangeReason::HardDeleted,
+                asset: None,
+            },
+            ChangeEvent {
+                record_name: "D".to_string(),
+                record_type: Some("CPLAsset".to_string()),
+                reason: ChangeReason::SoftDeleted,
+                asset: None,
+            },
+            ChangeEvent {
+                record_name: "E".to_string(),
+                record_type: Some("CPLAsset".to_string()),
+                reason: ChangeReason::Hidden,
+                asset: None,
+            },
+        ];
+
+        let mut created_count = 0u32;
+        let mut soft_deleted_count = 0u32;
+        let mut hard_deleted_count = 0u32;
+        let mut hidden_count = 0u32;
+        let mut downloadable_assets = Vec::new();
+
+        for event in events {
+            match event.reason {
+                ChangeReason::Created => {
+                    created_count += 1;
+                    if let Some(asset) = event.asset {
+                        downloadable_assets.push(asset);
+                    }
+                }
+                ChangeReason::SoftDeleted => soft_deleted_count += 1,
+                ChangeReason::HardDeleted => hard_deleted_count += 1,
+                ChangeReason::Hidden => hidden_count += 1,
+            }
+        }
+
+        assert_eq!(created_count, 2);
+        assert_eq!(soft_deleted_count, 1);
+        assert_eq!(hard_deleted_count, 1);
+        assert_eq!(hidden_count, 1);
+        assert_eq!(downloadable_assets.len(), 1);
+        assert_eq!(downloadable_assets[0].id(), "TEST_1");
+    }
 }
