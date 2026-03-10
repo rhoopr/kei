@@ -32,6 +32,18 @@ pub struct PhotoLibrary {
     library_type: String,
 }
 
+impl Clone for PhotoLibrary {
+    fn clone(&self) -> Self {
+        Self {
+            service_endpoint: self.service_endpoint.clone(),
+            params: Arc::clone(&self.params),
+            session: self.session.clone_box(),
+            zone_id: self.zone_id.clone(),
+            library_type: self.library_type.clone(),
+        }
+    }
+}
+
 impl std::fmt::Debug for PhotoLibrary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PhotoLibrary")
@@ -236,9 +248,123 @@ impl PhotoLibrary {
         Ok(query.records)
     }
 
+    /// Returns the zone name (e.g., "PrimarySync", "SharedSync-{UUID}").
+    pub fn zone_name(&self) -> &str {
+        self.zone_id
+            .get("zoneName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("PrimarySync")
+    }
+
     /// Clone the session for a new album/library — preserves the shared
     /// cookie jar via the Arc inside reqwest::Client.
     fn clone_session(&self) -> Box<dyn PhotosSession> {
         self.session.clone_box()
+    }
+}
+
+#[cfg(test)]
+impl PhotoLibrary {
+    /// Test-only constructor that bypasses the indexing check.
+    pub(super) fn new_stub(session: Box<dyn PhotosSession>) -> Self {
+        Self {
+            service_endpoint: "https://stub.example.com".to_string(),
+            params: Arc::new(HashMap::new()),
+            session,
+            zone_id: json!({"zoneName": "PrimarySync"}),
+            library_type: "private".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Minimal stub that satisfies `PhotosSession` for unit tests.
+    struct StubSession;
+
+    #[async_trait::async_trait]
+    impl PhotosSession for StubSession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            panic!("StubSession::post should not be called in zone_name tests");
+        }
+
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<reqwest::Response> {
+            panic!("StubSession::get should not be called in zone_name tests");
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(StubSession)
+        }
+    }
+
+    /// Build a `PhotoLibrary` directly (bypassing `new()` which requires a live session).
+    fn make_library(zone_id: Value) -> PhotoLibrary {
+        PhotoLibrary {
+            service_endpoint: "https://example.com".to_string(),
+            params: Arc::new(HashMap::new()),
+            session: Box::new(StubSession),
+            zone_id,
+            library_type: "personal".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_zone_name_primary() {
+        let lib = make_library(json!({"zoneName": "PrimarySync", "zoneType": "DEFAULT_ZONE"}));
+        assert_eq!(lib.zone_name(), "PrimarySync");
+    }
+
+    #[test]
+    fn test_zone_name_shared() {
+        let lib = make_library(json!({"zoneName": "SharedSync-ABCD-1234"}));
+        assert_eq!(lib.zone_name(), "SharedSync-ABCD-1234");
+    }
+
+    #[test]
+    fn test_zone_name_missing_defaults_to_primary() {
+        let lib = make_library(json!({"zoneType": "DEFAULT_ZONE"}));
+        assert_eq!(lib.zone_name(), "PrimarySync");
+    }
+
+    #[test]
+    fn test_zone_name_null_defaults_to_primary() {
+        let lib = make_library(json!({"zoneName": null}));
+        assert_eq!(lib.zone_name(), "PrimarySync");
+    }
+
+    #[test]
+    fn test_clone_preserves_zone_name() {
+        let lib = make_library(json!({"zoneName": "SharedSync-ABCD-1234"}));
+        let cloned = lib.clone();
+        assert_eq!(cloned.zone_name(), lib.zone_name());
+    }
+
+    #[test]
+    fn test_clone_preserves_service_endpoint() {
+        let lib = make_library(json!({"zoneName": "PrimarySync"}));
+        let cloned = lib.clone();
+        let debug = format!("{:?}", cloned);
+        assert!(debug.contains("https://example.com"));
+    }
+
+    #[test]
+    fn test_clone_independence() {
+        let lib = make_library(json!({"zoneName": "PrimarySync"}));
+        let cloned = lib.clone();
+        drop(lib);
+        assert_eq!(cloned.zone_name(), "PrimarySync");
     }
 }

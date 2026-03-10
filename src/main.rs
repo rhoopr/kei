@@ -787,7 +787,7 @@ async fn main() -> anyhow::Result<()> {
     if config.library != "PrimarySync" {
         tracing::info!(library = %config.library, "Using non-default library");
     }
-    let library = photos_service.get_library(&config.library).await?;
+    let library = photos_service.get_library(&config.library).await?.clone();
 
     if config.list_albums {
         let albums = library.albums().await?;
@@ -842,49 +842,74 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let download_config = Arc::new(download::DownloadConfig {
-        directory: config.directory.clone(),
-        folder_structure: config.folder_structure.clone(),
-        size: config.size.into(),
-        skip_videos: config.skip_videos,
-        skip_photos: config.skip_photos,
-        skip_created_before: config
-            .skip_created_before
-            .map(|d| d.with_timezone(&chrono::Utc)),
-        skip_created_after: config
-            .skip_created_after
-            .map(|d| d.with_timezone(&chrono::Utc)),
-        set_exif_datetime: config.set_exif_datetime,
-        dry_run: config.dry_run,
-        concurrent_downloads: config.threads_num as usize,
-        recent: config.recent,
-        retry: retry::RetryConfig {
-            max_retries: config.max_retries,
-            base_delay_secs: config.retry_delay_secs,
-            max_delay_secs: 60,
-        },
-        skip_live_photos: config.skip_live_photos,
-        live_photo_size: config.live_photo_size.to_asset_version_size(),
-        live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
-        align_raw: config.align_raw,
-        no_progress_bar: config.no_progress_bar,
-        file_match_policy: config.file_match_policy,
-        force_size: config.force_size,
-        keep_unicode_in_filenames: config.keep_unicode_in_filenames,
-        temp_suffix: config.temp_suffix.clone(),
-        state_db,
-        retry_only: is_retry_failed,
-    });
+    // Handle --reset-sync-token: clear stored tokens before the sync loop
+    if config.reset_sync_token {
+        if let Some(ref db) = state_db {
+            let zone_name = library.zone_name();
+            let sync_token_key = format!("sync_token:{}", zone_name);
+            db.set_metadata("db_sync_token", "").await.ok();
+            db.set_metadata(&sync_token_key, "").await.ok();
+            tracing::info!("Cleared stored sync tokens");
+        }
+    }
+
+    // Pre-compute config values used each cycle to build DownloadConfig.
+    // DownloadConfig is rebuilt per-cycle so sync_mode can vary.
+    let skip_created_before = config
+        .skip_created_before
+        .map(|d| d.with_timezone(&chrono::Utc));
+    let skip_created_after = config
+        .skip_created_after
+        .map(|d| d.with_timezone(&chrono::Utc));
+    let retry_config = retry::RetryConfig {
+        max_retries: config.max_retries,
+        base_delay_secs: config.retry_delay_secs,
+        max_delay_secs: 60,
+    };
+    let live_photo_size = config.live_photo_size.to_asset_version_size();
+
+    let build_download_config = |sync_mode: download::SyncMode| -> Arc<download::DownloadConfig> {
+        Arc::new(download::DownloadConfig {
+            directory: config.directory.clone(),
+            folder_structure: config.folder_structure.clone(),
+            size: config.size.into(),
+            skip_videos: config.skip_videos,
+            skip_photos: config.skip_photos,
+            skip_created_before,
+            skip_created_after,
+            set_exif_datetime: config.set_exif_datetime,
+            dry_run: config.dry_run,
+            concurrent_downloads: config.threads_num as usize,
+            recent: config.recent,
+            retry: retry_config,
+            skip_live_photos: config.skip_live_photos,
+            live_photo_size,
+            live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
+            align_raw: config.align_raw,
+            no_progress_bar: config.no_progress_bar,
+            file_match_policy: config.file_match_policy,
+            force_size: config.force_size,
+            keep_unicode_in_filenames: config.keep_unicode_in_filenames,
+            temp_suffix: config.temp_suffix.clone(),
+            state_db: state_db.clone(),
+            retry_only: is_retry_failed,
+            sync_mode,
+        })
+    };
 
     let shutdown_token = shutdown::install_signal_handler(&sd_notifier)?;
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
 
+    // Sync token key for the current library zone
+    let zone_name = library.zone_name().to_string();
+    let sync_token_key = format!("sync_token:{}", zone_name);
+
     // Resolve albums once before the loop for the initial cycle.
     // In watch mode, albums are re-resolved each iteration so new iCloud
     // albums are discovered automatically.
-    let mut albums = resolve_albums(library, &config.albums).await?;
+    let mut albums = resolve_albums(&library, &config.albums).await?;
     sd_notifier.notify_ready();
 
     loop {
@@ -893,98 +918,199 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
 
-        sd_notifier.notify_status("Syncing...");
-        sd_notifier.notify_watchdog();
-
-        let download_client = shared_session.read().await.download_client();
-        let outcome = download::download_photos(
-            &download_client,
-            &albums,
-            Arc::clone(&download_config),
-            shutdown_token.clone(),
-        )
-        .await?;
-
-        match outcome {
-            download::DownloadOutcome::Success => {
-                reauth_attempts = 0;
-                notifier.notify(
-                    notifications::Event::SyncComplete,
-                    "Sync completed successfully",
-                    &config.username,
-                );
+        // Determine sync mode: Full vs Incremental based on stored token + --no-incremental
+        let sync_mode = if config.no_incremental {
+            tracing::info!(
+                "Incremental sync disabled via --no-incremental, performing full enumeration"
+            );
+            download::SyncMode::Full
+        } else if let Some(ref db) = state_db {
+            match db.get_metadata(&sync_token_key).await {
+                Ok(Some(ref token)) if !token.is_empty() => {
+                    tracing::info!(zone = %zone_name, "Stored sync token found, using incremental sync");
+                    download::SyncMode::Incremental {
+                        zone_sync_token: token.clone(),
+                    }
+                }
+                Ok(_) => {
+                    tracing::info!(zone = %zone_name, "No sync token found, performing full enumeration");
+                    download::SyncMode::Full
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to load sync token, falling back to full enumeration");
+                    download::SyncMode::Full
+                }
             }
-            download::DownloadOutcome::SessionExpired { auth_error_count } => {
-                reauth_attempts += 1;
-                if reauth_attempts >= MAX_REAUTH_ATTEMPTS {
-                    anyhow::bail!(
-                        "Session expired {auth_error_count} times, giving up after {MAX_REAUTH_ATTEMPTS} re-auth attempts"
+        } else {
+            download::SyncMode::Full
+        };
+
+        // In watch mode with incremental sync, use changes/database as a
+        // cheap pre-check to skip cycles when nothing has changed.
+        let skip_cycle = if is_watch_mode
+            && matches!(sync_mode, download::SyncMode::Incremental { .. })
+        {
+            if let Some(ref db) = state_db {
+                let db_token = db
+                    .get_metadata("db_sync_token")
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|t| !t.is_empty());
+                match photos_service.changes_database(db_token.as_deref()).await {
+                    Ok(db_resp) => {
+                        if let Err(e) = db.set_metadata("db_sync_token", &db_resp.sync_token).await
+                        {
+                            tracing::warn!(error = %e, "Failed to store db_sync_token");
+                        }
+                        if db_resp.more_coming {
+                            tracing::debug!("changes/database has more pages (moreComing=true)");
+                        }
+                        if db_resp.zones.is_empty() {
+                            tracing::info!(
+                                "No changes detected (changes/database), skipping cycle"
+                            );
+                            true
+                        } else {
+                            for z in &db_resp.zones {
+                                tracing::debug!(
+                                    zone = %z.zone_id.zone_name,
+                                    zone_sync_token = %z.sync_token,
+                                    "changes/database: zone has changes"
+                                );
+                            }
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "changes/database pre-check failed, proceeding with sync"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !skip_cycle {
+            sd_notifier.notify_status("Syncing...");
+            sd_notifier.notify_watchdog();
+
+            let sync_mode_label = match &sync_mode {
+                download::SyncMode::Full => "full",
+                download::SyncMode::Incremental { .. } => "incremental",
+            };
+            tracing::debug!(sync_mode = sync_mode_label, zone = %zone_name, "Starting sync cycle");
+
+            let download_config = build_download_config(sync_mode);
+            let download_client = shared_session.read().await.download_client();
+            let sync_result = download::download_photos_with_sync(
+                &download_client,
+                &albums,
+                download_config,
+                shutdown_token.clone(),
+            )
+            .await?;
+
+            // Store sync token if one was captured (regardless of outcome —
+            // the token represents successfully enumerated changes, even if some
+            // downloads failed)
+            if let Some(ref token) = sync_result.sync_token {
+                if let Some(ref db) = state_db {
+                    if let Err(e) = db.set_metadata(&sync_token_key, token).await {
+                        tracing::warn!(error = %e, "Failed to store sync token");
+                    } else {
+                        tracing::info!(zone = %zone_name, "Stored sync token for next incremental sync");
+                    }
+                }
+            }
+
+            match sync_result.outcome {
+                download::DownloadOutcome::Success => {
+                    reauth_attempts = 0;
+                    notifier.notify(
+                        notifications::Event::SyncComplete,
+                        "Sync completed successfully",
+                        &config.username,
                     );
                 }
-                tracing::warn!(
-                    "Session expired ({} auth errors), attempting re-auth ({}/{})",
-                    auth_error_count,
-                    reauth_attempts,
-                    MAX_REAUTH_ATTEMPTS
-                );
-                match attempt_reauth(
-                    &shared_session,
-                    &config.cookie_directory,
-                    &config.username,
-                    config.domain.as_str(),
-                    &password_provider,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        tracing::info!("Re-auth successful, resuming download...");
-                        continue; // Restart download pass
+                download::DownloadOutcome::SessionExpired { auth_error_count } => {
+                    reauth_attempts += 1;
+                    if reauth_attempts >= MAX_REAUTH_ATTEMPTS {
+                        anyhow::bail!(
+                        "Session expired {auth_error_count} times, giving up after {MAX_REAUTH_ATTEMPTS} re-auth attempts"
+                    );
                     }
-                    Err(e)
-                        if e.downcast_ref::<auth::error::AuthError>()
-                            .is_some_and(|ae| ae.is_two_factor_required()) =>
+                    tracing::warn!(
+                        "Session expired ({} auth errors), attempting re-auth ({}/{})",
+                        auth_error_count,
+                        reauth_attempts,
+                        MAX_REAUTH_ATTEMPTS
+                    );
+                    match attempt_reauth(
+                        &shared_session,
+                        &config.cookie_directory,
+                        &config.username,
+                        config.domain.as_str(),
+                        &password_provider,
+                    )
+                    .await
                     {
-                        let msg = format!(
+                        Ok(()) => {
+                            tracing::info!("Re-auth successful, resuming download...");
+                            continue; // Restart download pass
+                        }
+                        Err(e)
+                            if e.downcast_ref::<auth::error::AuthError>()
+                                .is_some_and(|ae| ae.is_two_factor_required()) =>
+                        {
+                            let msg = format!(
                             "2FA required for {}. Run: icloudpd-rs submit-code <CODE> --username {}",
                             config.username, config.username
                         );
-                        tracing::warn!("{}", msg);
-                        notifier.notify(
-                            notifications::Event::TwoFaRequired,
-                            &msg,
-                            &config.username,
-                        );
-                        if !is_watch_mode {
-                            anyhow::bail!("{msg}");
+                            tracing::warn!("{}", msg);
+                            notifier.notify(
+                                notifications::Event::TwoFaRequired,
+                                &msg,
+                                &config.username,
+                            );
+                            if !is_watch_mode {
+                                anyhow::bail!("{msg}");
+                            }
+                            // In watch mode, skip this cycle and retry next interval
                         }
-                        // In watch mode, skip this cycle and retry next interval
-                    }
-                    Err(e) => {
-                        notifier.notify(
-                            notifications::Event::SessionExpired,
-                            &format!("Re-authentication failed: {e}"),
-                            &config.username,
-                        );
-                        return Err(e);
+                        Err(e) => {
+                            notifier.notify(
+                                notifications::Event::SessionExpired,
+                                &format!("Re-authentication failed: {e}"),
+                                &config.username,
+                            );
+                            return Err(e);
+                        }
                     }
                 }
-            }
-            download::DownloadOutcome::PartialFailure { failed_count } => {
-                notifier.notify(
-                    notifications::Event::SyncFailed,
-                    &format!("{failed_count} downloads failed"),
-                    &config.username,
-                );
-                if is_watch_mode {
-                    tracing::warn!(
-                        failed_count,
-                        "Some downloads failed this cycle, will retry next cycle"
+                download::DownloadOutcome::PartialFailure { failed_count } => {
+                    notifier.notify(
+                        notifications::Event::SyncFailed,
+                        &format!("{failed_count} downloads failed"),
+                        &config.username,
                     );
-                } else {
-                    anyhow::bail!("{failed_count} downloads failed");
+                    if is_watch_mode {
+                        tracing::warn!(
+                            failed_count,
+                            "Some downloads failed this cycle, will retry next cycle"
+                        );
+                    } else {
+                        anyhow::bail!("{failed_count} downloads failed");
+                    }
                 }
             }
-        }
+        } // !skip_cycle
 
         if let Some(interval) = config.watch_with_interval {
             if shutdown_token.is_cancelled() {
@@ -1013,7 +1139,7 @@ async fn main() -> anyhow::Result<()> {
             .ok(); // Best-effort pre-check; mid-sync re-auth handles failures
 
             // Re-resolve albums to discover newly created iCloud albums
-            match resolve_albums(library, &config.albums).await {
+            match resolve_albums(&library, &config.albums).await {
                 Ok(refreshed) => albums = refreshed,
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to refresh albums, reusing previous set");

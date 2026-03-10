@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::types::{AssetItemType, AssetVersionSize};
 
@@ -180,6 +180,37 @@ pub(crate) fn encode_params(params: &HashMap<String, Value>) -> String {
     pairs.join("&")
 }
 
+/// Build the request body for `/changes/database`.
+/// If `sync_token` is `None`, requests full zone listing (bootstrap).
+/// If `Some`, requests only zones with changes since the token.
+pub(crate) fn build_changes_database_request(sync_token: Option<&str>) -> Value {
+    match sync_token {
+        Some(token) => json!({"syncToken": token}),
+        None => json!({}),
+    }
+}
+
+/// Build the request body for `/changes/zone`.
+/// If `sync_token` is `None`, requests full history enumeration.
+/// If `Some`, requests changes since the token.
+///
+/// IMPORTANT: `None` means full history. Empty string means caught-up (returns 0 records).
+/// Always use `Option<&str>` with `None`, never empty string, for "no token".
+pub(crate) fn build_changes_zone_request(
+    zone_id: &Value,
+    sync_token: Option<&str>,
+    results_limit: u32,
+) -> Value {
+    let mut zone_entry = json!({
+        "zoneID": zone_id,
+        "resultsLimit": results_limit,
+    });
+    if let Some(token) = sync_token {
+        zone_entry["syncToken"] = json!(token);
+    }
+    json!({"zones": [zone_entry]})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +383,49 @@ mod tests {
                 "Missing critical field: {field}"
             );
         }
+    }
+
+    #[test]
+    fn test_build_changes_database_request_none() {
+        let body = build_changes_database_request(None);
+        assert_eq!(body, json!({}));
+    }
+
+    #[test]
+    fn test_build_changes_database_request_some() {
+        let body = build_changes_database_request(Some("token123"));
+        assert_eq!(body, json!({"syncToken": "token123"}));
+    }
+
+    #[test]
+    fn test_build_changes_zone_request_without_token() {
+        let zone_id = json!({"zoneName": "PrimarySync", "zoneType": "DEFAULT_ZONE"});
+        let body = build_changes_zone_request(&zone_id, None, 200);
+        let zones = body["zones"].as_array().unwrap();
+        assert_eq!(zones.len(), 1);
+        let entry = &zones[0];
+        assert_eq!(entry["zoneID"], zone_id);
+        assert_eq!(entry["resultsLimit"], 200);
+        assert!(entry.get("syncToken").is_none());
+    }
+
+    #[test]
+    fn test_build_changes_zone_request_with_token() {
+        let zone_id = json!({"zoneName": "PrimarySync"});
+        let body = build_changes_zone_request(&zone_id, Some("tok_abc"), 200);
+        let zones = body["zones"].as_array().unwrap();
+        assert_eq!(zones.len(), 1);
+        let entry = &zones[0];
+        assert_eq!(entry["zoneID"], zone_id);
+        assert_eq!(entry["resultsLimit"], 200);
+        assert_eq!(entry["syncToken"], "tok_abc");
+    }
+
+    #[test]
+    fn test_build_changes_zone_request_custom_limit() {
+        let zone_id = json!({"zoneName": "SharedSync-123"});
+        let body = build_changes_zone_request(&zone_id, None, 50);
+        let entry = &body["zones"][0];
+        assert_eq!(entry["resultsLimit"], 50);
     }
 }

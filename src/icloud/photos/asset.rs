@@ -1,11 +1,13 @@
 use base64::Engine;
 use chrono::{DateTime, TimeZone, Utc};
+use rustc_hash::FxHashMap;
 use serde_json::Value;
 use smallvec::SmallVec;
 use tracing::warn;
 
+use super::cloudkit::Record;
 use super::queries::{item_type_from_str, PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
-use super::types::{AssetItemType, AssetVersion, AssetVersionSize};
+use super::types::{AssetItemType, AssetVersion, AssetVersionSize, ChangeReason};
 
 /// Type alias for the versions map.
 ///
@@ -13,6 +15,20 @@ use super::types::{AssetItemType, AssetVersion, AssetVersionSize};
 /// for the common case of <=4 versions per asset. Most assets have 1-3 versions
 /// (original + optional medium/thumb + optional live photo).
 pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
+
+/// A change event from the `changes/zone` delta API.
+#[derive(Debug)]
+pub struct ChangeEvent {
+    /// The record name (CloudKit record ID)
+    pub record_name: String,
+    /// The record type, if known (None for hard-deletes)
+    pub record_type: Option<String>,
+    /// Why this record changed
+    pub reason: ChangeReason,
+    /// The photo asset, if this is a CPLMaster+CPLAsset pair that was successfully paired.
+    /// None for hard-deletes, non-photo record types, or unpaired records.
+    pub asset: Option<PhotoAsset>,
+}
 
 /// A photo or video asset from iCloud.
 ///
@@ -268,6 +284,176 @@ impl std::fmt::Display for PhotoAsset {
     }
 }
 
+/// Classify a CloudKit record from `changes/zone` into a `ChangeReason`.
+///
+/// Detection logic (from empirical API testing):
+/// - `record.deleted == Some(true)` --> HardDeleted (purged, recordType unknown)
+/// - `fields.isDeleted.value == 1` --> SoftDeleted (trashed, recoverable)
+/// - `fields.isHidden.value == 1` --> Hidden
+/// - Otherwise --> Modified (caller checks state DB for Created/Restored/Unhidden)
+///
+/// Note: "Restored" and "Unhidden" require knowledge of previous state, which this
+/// function does NOT have. Those cases return `Modified`; the caller (download pipeline)
+/// should check the state DB to distinguish them.
+pub(crate) fn classify_change_reason(record: &Record) -> ChangeReason {
+    // Hard delete: record.deleted == true
+    if record.deleted == Some(true) {
+        return ChangeReason::HardDeleted;
+    }
+
+    // Soft delete: fields.isDeleted.value == 1
+    if let Some(is_deleted) = record.fields.get("isDeleted") {
+        if let Some(val) = is_deleted.get("value") {
+            if val.as_i64() == Some(1) {
+                return ChangeReason::SoftDeleted;
+            }
+        }
+    }
+
+    // Hidden: fields.isHidden.value == 1
+    if let Some(is_hidden) = record.fields.get("isHidden") {
+        if let Some(val) = is_hidden.get("value") {
+            if val.as_i64() == Some(1) {
+                return ChangeReason::Hidden;
+            }
+        }
+    }
+
+    // Default: Created (new or modified record)
+    ChangeReason::Created
+}
+
+/// Extract the `masterRef` record name from a CPLAsset's fields.
+fn extract_master_ref(fields: &Value) -> Option<String> {
+    fields
+        .get("masterRef")
+        .and_then(|r| r.get("value"))
+        .and_then(|v| v.get("recordName"))
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Buffers CPLMaster and CPLAsset records from `changes/zone` responses
+/// and pairs them into `ChangeEvent`s when both halves are available.
+///
+/// In `changes/zone`, records arrive in change-log order (not paired like `records/query`).
+/// A CPLAsset references its CPLMaster via the `masterRef` field.
+#[derive(Debug, Default)]
+pub(crate) struct DeltaRecordBuffer {
+    /// Unpaired CPLMaster records, keyed by recordName
+    pending_masters: FxHashMap<String, Record>,
+    /// Unpaired CPLAsset records, keyed by masterRef recordName
+    pending_assets: FxHashMap<String, Record>,
+}
+
+impl DeltaRecordBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process a batch of records from a `changes/zone` page.
+    /// Returns any `ChangeEvent`s that could be assembled (paired master+asset,
+    /// hard-deletes, soft-deletes, etc.).
+    pub fn process_records(&mut self, records: Vec<Record>) -> Vec<ChangeEvent> {
+        let mut events = Vec::new();
+
+        for record in records {
+            let reason = classify_change_reason(&record);
+
+            match reason {
+                ChangeReason::HardDeleted => {
+                    // Hard-deleted: no fields, can't tell if master or asset.
+                    // Emit immediately as-is.
+                    events.push(ChangeEvent {
+                        record_name: record.record_name,
+                        record_type: None,
+                        reason,
+                        asset: None,
+                    });
+                }
+                _ => match record.record_type.as_str() {
+                    "CPLMaster" => {
+                        let master_name = record.record_name.clone();
+                        if let Some(asset_record) = self.pending_assets.remove(&master_name) {
+                            Self::emit_paired(record, asset_record, reason, &mut events);
+                        } else {
+                            self.pending_masters.insert(master_name, record);
+                        }
+                    }
+                    "CPLAsset" => {
+                        let master_ref = extract_master_ref(&record.fields);
+                        if let Some(ref master_name) = master_ref {
+                            if let Some(master_record) = self.pending_masters.remove(master_name) {
+                                Self::emit_paired(master_record, record, reason, &mut events);
+                            } else {
+                                self.pending_assets.insert(master_name.clone(), record);
+                            }
+                        } else {
+                            // CPLAsset with no masterRef -- metadata-only change
+                            events.push(ChangeEvent {
+                                record_name: record.record_name,
+                                record_type: Some("CPLAsset".to_string()),
+                                reason,
+                                asset: None,
+                            });
+                        }
+                    }
+                    _ => {
+                        // Non-photo record types (CPLAlbum, CPLContainerRelation, etc.)
+                        // Skip silently -- we only care about CPLMaster + CPLAsset
+                    }
+                },
+            }
+        }
+
+        events
+    }
+
+    /// Flush any remaining unpaired records as standalone events.
+    /// Call this after all pages have been processed (`moreComing: false`).
+    pub fn flush(&mut self) -> Vec<ChangeEvent> {
+        let mut events = Vec::new();
+
+        for (name, record) in self.pending_masters.drain() {
+            let reason = classify_change_reason(&record);
+            events.push(ChangeEvent {
+                record_name: name,
+                record_type: Some("CPLMaster".to_string()),
+                reason,
+                asset: None,
+            });
+        }
+
+        for (_master_ref, record) in self.pending_assets.drain() {
+            let reason = classify_change_reason(&record);
+            events.push(ChangeEvent {
+                record_name: record.record_name,
+                record_type: Some("CPLAsset".to_string()),
+                reason,
+                asset: None,
+            });
+        }
+
+        events
+    }
+
+    fn emit_paired(
+        master_record: Record,
+        asset_record: Record,
+        reason: ChangeReason,
+        events: &mut Vec<ChangeEvent>,
+    ) {
+        let master_name = master_record.record_name.clone();
+        let asset = PhotoAsset::from_records(master_record, asset_record);
+        events.push(ChangeEvent {
+            record_name: master_name,
+            record_type: Some("CPLMaster".to_string()),
+            reason,
+            asset: Some(asset),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +636,7 @@ mod tests {
                 "resOriginalRes": {"value": {"size": 5000, "downloadURL": "https://example.com/dl", "fileChecksum": "ck1"}},
                 "resOriginalFileType": {"value": "public.jpeg"}
             }),
+            deleted: None,
         };
         let asset_rec = Record {
             record_name: "ASSET_1".to_string(),
@@ -458,6 +645,7 @@ mod tests {
                 "assetDate": {"value": 1736899200000.0},
                 "addedDate": {"value": 1736899200000.0}
             }),
+            deleted: None,
         };
 
         let asset = PhotoAsset::from_records(master, asset_rec);
@@ -564,11 +752,13 @@ mod tests {
             record_name: "M2".to_string(),
             record_type: "CPLMaster".to_string(),
             fields: json!({}),
+            deleted: None,
         };
         let asset_rec = Record {
             record_name: "A2".to_string(),
             record_type: "CPLAsset".to_string(),
             fields: json!({}),
+            deleted: None,
         };
 
         let asset = PhotoAsset::from_records(master, asset_rec);
@@ -616,5 +806,471 @@ mod tests {
         );
         // AssetVersionSize should be 1 byte (repr(u8))
         assert_eq!(size_of::<AssetVersionSize>(), 1);
+    }
+
+    // --- classify_change_reason tests ---
+
+    fn make_record(record_type: &str, fields: Value, deleted: Option<bool>) -> Record {
+        Record {
+            record_name: "test-record".to_string(),
+            record_type: record_type.to_string(),
+            fields,
+            deleted,
+        }
+    }
+
+    #[test]
+    fn test_classify_hard_deleted() {
+        let record = make_record("", json!({}), Some(true));
+        assert_eq!(classify_change_reason(&record), ChangeReason::HardDeleted);
+    }
+
+    #[test]
+    fn test_classify_soft_deleted() {
+        let record = make_record("CPLAsset", json!({"isDeleted": {"value": 1}}), Some(false));
+        assert_eq!(classify_change_reason(&record), ChangeReason::SoftDeleted);
+    }
+
+    #[test]
+    fn test_classify_hidden() {
+        let record = make_record("CPLAsset", json!({"isHidden": {"value": 1}}), Some(false));
+        assert_eq!(classify_change_reason(&record), ChangeReason::Hidden);
+    }
+
+    #[test]
+    fn test_classify_normal_record() {
+        let record = make_record("CPLAsset", json!({}), Some(false));
+        assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
+
+    #[test]
+    fn test_classify_is_deleted_null_value() {
+        // isDeleted field present but value is null -- should NOT be SoftDeleted
+        let record = make_record(
+            "CPLAsset",
+            json!({"isDeleted": {"value": null}}),
+            Some(false),
+        );
+        assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
+
+    #[test]
+    fn test_classify_is_deleted_zero() {
+        // isDeleted == 0 means restored, but we return Created (caller checks state DB)
+        let record = make_record("CPLAsset", json!({"isDeleted": {"value": 0}}), Some(false));
+        assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
+
+    #[test]
+    fn test_classify_is_hidden_zero() {
+        // isHidden == 0 means unhidden, but we return Created (caller checks state DB)
+        let record = make_record("CPLAsset", json!({"isHidden": {"value": 0}}), Some(false));
+        assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
+
+    #[test]
+    fn test_classify_deleted_none() {
+        // deleted field absent (None) with no special flags
+        let record = make_record("CPLMaster", json!({}), None);
+        assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
+
+    #[test]
+    fn test_classify_soft_deleted_takes_priority_over_hidden() {
+        // Both isDeleted and isHidden set -- soft delete should win
+        let record = make_record(
+            "CPLAsset",
+            json!({"isDeleted": {"value": 1}, "isHidden": {"value": 1}}),
+            Some(false),
+        );
+        assert_eq!(classify_change_reason(&record), ChangeReason::SoftDeleted);
+    }
+
+    // --- extract_master_ref tests ---
+
+    #[test]
+    fn test_extract_master_ref_valid() {
+        let fields = json!({
+            "masterRef": {
+                "value": {
+                    "recordName": "MASTER_ABC",
+                    "zoneID": {"zoneName": "PrimarySync"}
+                }
+            }
+        });
+        assert_eq!(extract_master_ref(&fields), Some("MASTER_ABC".to_string()));
+    }
+
+    #[test]
+    fn test_extract_master_ref_missing() {
+        let fields = json!({});
+        assert_eq!(extract_master_ref(&fields), None);
+    }
+
+    #[test]
+    fn test_extract_master_ref_malformed_no_value() {
+        let fields = json!({"masterRef": {}});
+        assert_eq!(extract_master_ref(&fields), None);
+    }
+
+    #[test]
+    fn test_extract_master_ref_malformed_no_record_name() {
+        let fields = json!({"masterRef": {"value": {"zoneID": "PrimarySync"}}});
+        assert_eq!(extract_master_ref(&fields), None);
+    }
+
+    #[test]
+    fn test_extract_master_ref_record_name_not_string() {
+        let fields = json!({"masterRef": {"value": {"recordName": 12345}}});
+        assert_eq!(extract_master_ref(&fields), None);
+    }
+
+    // --- DeltaRecordBuffer tests ---
+
+    fn make_master_record(name: &str) -> Record {
+        Record {
+            record_name: name.to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"}
+            }),
+            deleted: None,
+        }
+    }
+
+    fn make_asset_record(name: &str, master_ref: &str) -> Record {
+        Record {
+            record_name: name.to_string(),
+            record_type: "CPLAsset".to_string(),
+            fields: json!({
+                "masterRef": {
+                    "value": {
+                        "recordName": master_ref,
+                        "zoneID": {"zoneName": "PrimarySync"}
+                    }
+                },
+                "assetDate": {"value": 1736899200000.0},
+                "addedDate": {"value": 1736899200000.0}
+            }),
+            deleted: None,
+        }
+    }
+
+    #[test]
+    fn test_buffer_master_then_asset_pairs() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        // Page 1: master arrives
+        let events = buffer.process_records(vec![make_master_record("M1")]);
+        assert!(events.is_empty(), "master alone should not emit an event");
+
+        // Page 2: asset arrives, referencing M1
+        let events = buffer.process_records(vec![make_asset_record("A1", "M1")]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(events[0].record_type.as_deref(), Some("CPLMaster"));
+        assert_eq!(events[0].reason, ChangeReason::Created);
+        assert!(events[0].asset.is_some());
+        assert_eq!(events[0].asset.as_ref().unwrap().id(), "M1");
+    }
+
+    #[test]
+    fn test_buffer_asset_then_master_pairs() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        // Page 1: asset arrives first
+        let events = buffer.process_records(vec![make_asset_record("A1", "M1")]);
+        assert!(events.is_empty(), "asset alone should not emit an event");
+
+        // Page 2: master arrives
+        let events = buffer.process_records(vec![make_master_record("M1")]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "M1");
+        assert!(events[0].asset.is_some());
+    }
+
+    #[test]
+    fn test_buffer_same_page_pairing() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        // Both on same page, master first
+        let events = buffer.process_records(vec![
+            make_master_record("M1"),
+            make_asset_record("A1", "M1"),
+        ]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "M1");
+        assert!(events[0].asset.is_some());
+    }
+
+    #[test]
+    fn test_buffer_same_page_asset_before_master() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        // Both on same page, asset first
+        let events = buffer.process_records(vec![
+            make_asset_record("A1", "M1"),
+            make_master_record("M1"),
+        ]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "M1");
+        assert!(events[0].asset.is_some());
+    }
+
+    #[test]
+    fn test_buffer_hard_delete_emitted_immediately() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let hard_deleted = Record {
+            record_name: "DELETED_1".to_string(),
+            record_type: String::new(),
+            fields: json!({}),
+            deleted: Some(true),
+        };
+
+        let events = buffer.process_records(vec![hard_deleted]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "DELETED_1");
+        assert_eq!(events[0].record_type, None);
+        assert_eq!(events[0].reason, ChangeReason::HardDeleted);
+        assert!(events[0].asset.is_none());
+    }
+
+    #[test]
+    fn test_buffer_non_photo_records_skipped() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let album_record = Record {
+            record_name: "ALBUM_1".to_string(),
+            record_type: "CPLAlbum".to_string(),
+            fields: json!({"albumName": {"value": "Vacation"}}),
+            deleted: None,
+        };
+        let container_record = Record {
+            record_name: "CR_1".to_string(),
+            record_type: "CPLContainerRelation".to_string(),
+            fields: json!({}),
+            deleted: None,
+        };
+
+        let events = buffer.process_records(vec![album_record, container_record]);
+        assert!(events.is_empty(), "non-photo records should be skipped");
+
+        // Flush should also be empty since non-photo records are not buffered
+        let flushed = buffer.flush();
+        assert!(flushed.is_empty());
+    }
+
+    #[test]
+    fn test_buffer_flush_unpaired_records() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        // Add unpaired master and asset (referencing different masters)
+        let events = buffer.process_records(vec![
+            make_master_record("M_ORPHAN"),
+            make_asset_record("A_ORPHAN", "M_MISSING"),
+        ]);
+        assert!(events.is_empty());
+
+        let flushed = buffer.flush();
+        assert_eq!(flushed.len(), 2);
+
+        // Check that both orphans appear (order not guaranteed due to HashMap)
+        let names: Vec<&str> = flushed.iter().map(|e| e.record_name.as_str()).collect();
+        assert!(names.contains(&"M_ORPHAN"));
+        assert!(names.contains(&"A_ORPHAN"));
+
+        // Verify record types
+        for event in &flushed {
+            assert!(event.asset.is_none());
+            match event.record_name.as_str() {
+                "M_ORPHAN" => {
+                    assert_eq!(event.record_type.as_deref(), Some("CPLMaster"));
+                }
+                "A_ORPHAN" => {
+                    assert_eq!(event.record_type.as_deref(), Some("CPLAsset"));
+                }
+                _ => panic!("unexpected record name: {}", event.record_name),
+            }
+        }
+    }
+
+    #[test]
+    fn test_buffer_multiple_pairs_across_pages() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        // Page 1: two masters
+        let events =
+            buffer.process_records(vec![make_master_record("M1"), make_master_record("M2")]);
+        assert!(events.is_empty());
+
+        // Page 2: one asset for M2, plus a new master M3
+        let events = buffer.process_records(vec![
+            make_asset_record("A2", "M2"),
+            make_master_record("M3"),
+        ]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "M2");
+
+        // Page 3: assets for M1 and M3
+        let events = buffer.process_records(vec![
+            make_asset_record("A1", "M1"),
+            make_asset_record("A3", "M3"),
+        ]);
+        assert_eq!(events.len(), 2);
+        let names: Vec<&str> = events.iter().map(|e| e.record_name.as_str()).collect();
+        assert!(names.contains(&"M1"));
+        assert!(names.contains(&"M3"));
+
+        // All paired, flush should be empty
+        let flushed = buffer.flush();
+        assert!(flushed.is_empty());
+    }
+
+    #[test]
+    fn test_buffer_asset_without_master_ref() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        // CPLAsset with no masterRef field -- metadata-only change
+        let asset_no_ref = Record {
+            record_name: "A_NO_REF".to_string(),
+            record_type: "CPLAsset".to_string(),
+            fields: json!({"assetDate": {"value": 1736899200000.0}}),
+            deleted: None,
+        };
+
+        let events = buffer.process_records(vec![asset_no_ref]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "A_NO_REF");
+        assert_eq!(events[0].record_type.as_deref(), Some("CPLAsset"));
+        assert!(events[0].asset.is_none());
+    }
+
+    #[test]
+    fn test_buffer_soft_deleted_asset_emitted_with_reason() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let soft_deleted_master = Record {
+            record_name: "M_SD".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({"isDeleted": {"value": 1}}),
+            deleted: Some(false),
+        };
+
+        // Master is soft-deleted but still has record_type and fields
+        let events = buffer.process_records(vec![soft_deleted_master]);
+        assert!(events.is_empty()); // buffered, waiting for asset
+
+        let flushed = buffer.flush();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].reason, ChangeReason::SoftDeleted);
+    }
+
+    #[test]
+    fn test_buffer_new_returns_empty() {
+        let buffer = DeltaRecordBuffer::new();
+        assert!(
+            format!("{:?}", buffer).contains("DeltaRecordBuffer"),
+            "should implement Debug"
+        );
+    }
+
+    #[test]
+    fn test_buffer_default_returns_empty() {
+        let buffer = DeltaRecordBuffer::default();
+        let mut buffer = buffer;
+        let flushed = buffer.flush();
+        assert!(flushed.is_empty());
+    }
+
+    #[test]
+    fn test_buffer_multiple_pages_accumulation() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        // Page 1: master M1 only
+        let events = buffer.process_records(vec![make_master_record("M1")]);
+        assert!(events.is_empty(), "page 1 should emit nothing");
+
+        // Page 2: master M2 + asset A1 referencing M1
+        let events = buffer.process_records(vec![
+            make_master_record("M2"),
+            make_asset_record("A1", "M1"),
+        ]);
+        assert_eq!(events.len(), 1, "page 2 should pair M1+A1");
+        assert_eq!(events[0].record_name, "M1");
+        assert!(events[0].asset.is_some());
+
+        // Page 3: asset A2 referencing M2
+        let events = buffer.process_records(vec![make_asset_record("A2", "M2")]);
+        assert_eq!(events.len(), 1, "page 3 should pair M2+A2");
+        assert_eq!(events[0].record_name, "M2");
+        assert!(events[0].asset.is_some());
+
+        // Everything paired, flush empty
+        let flushed = buffer.flush();
+        assert!(flushed.is_empty());
+    }
+
+    #[test]
+    fn test_buffer_soft_deleted_asset_with_master() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let master = make_master_record("M_DEL");
+        let soft_deleted_asset = Record {
+            record_name: "A_DEL".to_string(),
+            record_type: "CPLAsset".to_string(),
+            fields: json!({
+                "isDeleted": {"value": 1},
+                "masterRef": {
+                    "value": {
+                        "recordName": "M_DEL",
+                        "zoneID": {"zoneName": "PrimarySync"}
+                    }
+                },
+                "assetDate": {"value": 1736899200000.0}
+            }),
+            deleted: Some(false),
+        };
+
+        let events = buffer.process_records(vec![master, soft_deleted_asset]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "M_DEL");
+        assert_eq!(events[0].reason, ChangeReason::SoftDeleted);
+        assert!(events[0].asset.is_some());
+    }
+
+    #[test]
+    fn test_classify_is_deleted_string_not_integer() {
+        // isDeleted with value as string "1" instead of integer 1
+        // as_i64() returns None for strings, so this should NOT be SoftDeleted
+        let record = make_record(
+            "CPLAsset",
+            json!({"isDeleted": {"value": "1"}}),
+            Some(false),
+        );
+        assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
+
+    #[test]
+    fn test_buffer_asset_no_master_ref_emits_standalone() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let asset_no_ref = Record {
+            record_name: "A_STANDALONE".to_string(),
+            record_type: "CPLAsset".to_string(),
+            fields: json!({"assetDate": {"value": 1736899200000.0}}),
+            deleted: None,
+        };
+
+        let events = buffer.process_records(vec![asset_no_ref]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "A_STANDALONE");
+        assert_eq!(events[0].record_type.as_deref(), Some("CPLAsset"));
+        assert_eq!(events[0].reason, ChangeReason::Created);
+        assert!(
+            events[0].asset.is_none(),
+            "standalone asset should have no PhotoAsset"
+        );
     }
 }

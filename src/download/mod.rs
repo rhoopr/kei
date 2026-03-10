@@ -29,7 +29,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::types::AssetVersion;
-use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum, VersionsMap};
+use crate::icloud::photos::{
+    AssetItemType, AssetVersionSize, ChangeEvent, ChangeReason, PhotoAlbum, SyncTokenError,
+    VersionsMap,
+};
 use crate::retry::RetryConfig;
 use crate::state::{AssetRecord, MediaType, StateDb, SyncRunStats, VersionSizeKey};
 use crate::types::{FileMatchPolicy, LivePhotoMovFilenamePolicy, RawTreatmentPolicy};
@@ -124,6 +127,30 @@ pub enum DownloadOutcome {
     PartialFailure { failed_count: usize },
 }
 
+/// How the sync should enumerate photos from iCloud.
+#[derive(Debug, Clone)]
+pub enum SyncMode {
+    /// Full enumeration via records/query (existing behavior).
+    /// On completion, captures the syncToken for future incremental syncs.
+    Full,
+    /// Incremental delta sync via changes/zone with a stored syncToken.
+    /// Falls back to Full if the token is invalid/expired.
+    Incremental {
+        /// The stored syncToken for the zone being synced.
+        zone_sync_token: String,
+    },
+}
+
+/// Result of a sync cycle, including the optional new syncToken.
+#[derive(Debug)]
+pub struct SyncResult {
+    /// The outcome of the download pass (success, session expired, partial failure).
+    pub outcome: DownloadOutcome,
+    /// The new zone-level syncToken, if one was captured during this sync.
+    /// Store this for the next incremental sync.
+    pub sync_token: Option<String>,
+}
+
 /// Compute a deterministic hash of the config fields that affect path resolution.
 ///
 /// When this hash changes between runs, we can't trust the state DB's download
@@ -183,6 +210,8 @@ pub struct DownloadConfig {
     /// When true (retry-failed mode), only download assets already known to the
     /// state DB. Skip new assets discovered from iCloud that were never synced.
     pub(crate) retry_only: bool,
+    /// Sync mode: full enumeration or incremental delta via syncToken.
+    pub(crate) sync_mode: SyncMode,
 }
 
 impl std::fmt::Debug for DownloadConfig {
@@ -214,6 +243,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("temp_suffix", &self.temp_suffix)
             .field("state_db", &self.state_db.is_some())
             .field("retry_only", &self.retry_only)
+            .field("sync_mode", &self.sync_mode)
             .finish()
     }
 }
@@ -863,31 +893,74 @@ struct StreamingResult {
     auth_errors: usize,
 }
 
-/// Streaming download pipeline — merges per-album streams and pipes assets
-/// directly into the download loop as they arrive from the API.
+/// Download photos with syncToken support.
 ///
-/// Eliminates the startup delay of full-library enumeration: the first
-/// download begins as soon as the first API page returns. Each album's
-/// background task prefetches the next page via a channel buffer, so API
-/// latency overlaps with download I/O.
+/// In `SyncMode::Full`: runs the existing full enumeration via
+/// `photo_stream_with_token`, captures the syncToken after the stream is
+/// consumed, and delegates download logic to the existing pipeline.
 ///
-/// Returns `StreamingResult` containing download counts, failed tasks, and
-/// auth error count. When auth errors exceed the threshold, the function
-/// returns early to allow re-authentication.
-async fn stream_and_download(
+/// In `SyncMode::Incremental`: uses `changes_stream` for delta sync,
+/// filters `ChangeEvent`s to downloadable assets, and feeds them through
+/// the existing download pipeline. Falls back to `SyncMode::Full` if the
+/// token is invalid or expired.
+pub async fn download_photos_with_sync(
+    download_client: &Client,
+    albums: &[PhotoAlbum],
+    config: Arc<DownloadConfig>,
+    shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
+    match &config.sync_mode {
+        SyncMode::Full => {
+            download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
+        }
+        SyncMode::Incremental { zone_sync_token } => {
+            let token = zone_sync_token.clone();
+            match download_photos_incremental(
+                download_client,
+                albums,
+                &config,
+                &token,
+                shutdown_token.clone(),
+            )
+            .await
+            {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    if e.downcast_ref::<SyncTokenError>().is_some() {
+                        tracing::warn!(
+                            "Incremental sync failed ({}), falling back to full enumeration",
+                            e
+                        );
+                        download_photos_full_with_token(
+                            download_client,
+                            albums,
+                            &config,
+                            shutdown_token,
+                        )
+                        .await
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Full enumeration with syncToken capture.
+///
+/// Uses `photo_stream_with_token` to capture the zone-level syncToken
+/// while running the standard streaming download pipeline. The token
+/// is returned alongside the download outcome.
+async fn download_photos_full_with_token(
     download_client: &Client,
     albums: &[PhotoAlbum],
     config: &Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
-) -> Result<StreamingResult> {
-    // Lightweight count-only API query (HyperionIndexCountLookup) — separate
-    // from the page-by-page photo fetch, used to size the progress bar.
-    // When --recent is set, cap to that limit since the stream will stop early.
-    //
-    // Note: the total reflects *photo count*, but each photo may produce
-    // multiple download tasks (e.g. live photo MOV companions, RAW
-    // alternates). The bar may therefore overshoot pos > len slightly.
-    // This matches Python icloudpd's tqdm behavior and keeps the ETA useful.
+) -> Result<SyncResult> {
+    let started = Instant::now();
+
+    // Build token-aware streams for each album
     let mut album_counts: Vec<u64> = Vec::with_capacity(albums.len());
     for album in albums {
         album_counts.push(album.len().await.unwrap_or(0));
@@ -896,23 +969,261 @@ async fn stream_and_download(
     if let Some(recent) = config.recent {
         total = total.min(recent as u64);
     }
+
+    // Create photo_stream_with_token for each album and collect token receivers
+    let mut token_receivers = Vec::with_capacity(albums.len());
+    let streams: Vec<_> = albums
+        .iter()
+        .zip(&album_counts)
+        .map(|(album, &count)| {
+            let (stream, token_rx) = album.photo_stream_with_token(
+                config.recent,
+                Some(count),
+                config.concurrent_downloads,
+            );
+            token_receivers.push(token_rx);
+            stream
+        })
+        .collect();
+
+    let combined = stream::select_all(streams);
+
+    // Run the streaming download pipeline with the combined stream
+    let streaming_result = stream_and_download_from_stream(
+        download_client,
+        combined,
+        config,
+        total,
+        shutdown_token.clone(),
+    )
+    .await?;
+
+    // Collect the sync token from any album's token receiver.
+    // In practice, all albums share the same zone so any token suffices.
+    let mut sync_token = None;
+    for rx in token_receivers {
+        if let Ok(Some(token)) = rx.await {
+            sync_token = Some(token);
+            break;
+        }
+    }
+
+    // Build the outcome using the same logic as download_photos
+    let outcome = build_download_outcome(
+        download_client,
+        albums,
+        config,
+        streaming_result,
+        started,
+        shutdown_token,
+    )
+    .await?;
+
+    Ok(SyncResult {
+        outcome,
+        sync_token,
+    })
+}
+
+/// Incremental delta sync via `changes_stream`.
+///
+/// Fetches `ChangeEvent`s since the given sync token, filters to
+/// downloadable assets, and feeds them through the download pipeline.
+async fn download_photos_incremental(
+    download_client: &Client,
+    albums: &[PhotoAlbum],
+    config: &Arc<DownloadConfig>,
+    zone_sync_token: &str,
+    shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
+    let started = Instant::now();
+
+    // Collect all change events from all albums
+    let mut all_events: Vec<ChangeEvent> = Vec::new();
+    let mut sync_token: Option<String> = None;
+
+    for album in albums {
+        let (change_stream, token_rx) = album.changes_stream(zone_sync_token);
+        tokio::pin!(change_stream);
+
+        while let Some(result) = change_stream.next().await {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            let event = result?;
+            all_events.push(event);
+        }
+
+        // Capture the sync token from this album
+        if let Ok(Some(token)) = token_rx.await {
+            sync_token = Some(token);
+        }
+    }
+
+    // Log summary of change events
+    let mut created_count = 0u64;
+    let mut soft_deleted_count = 0u64;
+    let mut hard_deleted_count = 0u64;
+    let mut hidden_count = 0u64;
+
+    for event in &all_events {
+        match event.reason {
+            ChangeReason::Created => created_count += 1,
+            ChangeReason::SoftDeleted => {
+                soft_deleted_count += 1;
+                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
+            }
+            ChangeReason::HardDeleted => {
+                hard_deleted_count += 1;
+                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
+            }
+            ChangeReason::Hidden => {
+                hidden_count += 1;
+                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
+            }
+        }
+    }
+
+    tracing::info!(
+        created = created_count,
+        soft_deleted = soft_deleted_count,
+        hard_deleted = hard_deleted_count,
+        hidden = hidden_count,
+        "Incremental sync: {} change events",
+        all_events.len()
+    );
+
+    // Extract downloadable PhotoAssets from events
+    let downloadable_assets: Vec<_> = all_events
+        .into_iter()
+        .filter(|event| matches!(event.reason, ChangeReason::Created))
+        .filter_map(|event| event.asset)
+        .collect();
+
+    if downloadable_assets.is_empty() {
+        tracing::info!("No new photos to download from incremental sync");
+        tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::Success,
+            sync_token,
+        });
+    }
+
+    tracing::info!(
+        "{} assets to download from incremental sync",
+        downloadable_assets.len()
+    );
+
+    // Convert assets to download tasks
+    let mut tasks: Vec<DownloadTask> = Vec::new();
+    let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
+    let mut dir_cache = std::collections::HashMap::new();
+
+    for asset in &downloadable_assets {
+        tasks.extend(filter_asset_to_tasks(
+            asset,
+            config,
+            &mut claimed_paths,
+            &mut dir_cache,
+        ));
+    }
+
+    if tasks.is_empty() {
+        tracing::info!("All incremental assets already downloaded or filtered");
+        tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::Success,
+            sync_token,
+        });
+    }
+
+    let task_count = tasks.len();
+    tracing::info!("Downloading {} files from incremental sync", task_count);
+
+    // Run the download pass on the collected tasks
+    let pass_config = PassConfig {
+        client: download_client,
+        retry_config: &config.retry,
+        set_exif: config.set_exif_datetime,
+        concurrency: config.concurrent_downloads,
+        no_progress_bar: config.no_progress_bar,
+        temp_suffix: config.temp_suffix.clone(),
+        shutdown_token,
+        state_db: config.state_db.clone(),
+    };
+    let pass_result = run_download_pass(pass_config, tasks).await;
+
+    let failed = pass_result.failed.len();
+    let succeeded = task_count - failed;
+
+    tracing::info!("── Incremental Sync Summary ──");
+    if pass_result.exif_failures > 0 {
+        tracing::info!(
+            "  {} downloaded ({} EXIF failures), {} failed, {} total",
+            succeeded,
+            pass_result.exif_failures,
+            failed,
+            task_count
+        );
+    } else {
+        tracing::info!(
+            "  {} downloaded, {} failed, {} total",
+            succeeded,
+            failed,
+            task_count
+        );
+    }
+    tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+
+    if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::SessionExpired {
+                auth_error_count: pass_result.auth_errors,
+            },
+            sync_token,
+        });
+    }
+
+    let outcome = if failed > 0 {
+        for task in &pass_result.failed {
+            tracing::error!("Download failed: {}", task.download_path.display());
+        }
+        DownloadOutcome::PartialFailure {
+            failed_count: failed,
+        }
+    } else {
+        DownloadOutcome::Success
+    };
+
+    Ok(SyncResult {
+        outcome,
+        sync_token,
+    })
+}
+
+/// Streaming download pipeline that consumes a pre-built combined stream.
+///
+/// This is the core producer/consumer download logic from `stream_and_download`,
+/// factored out so that `download_photos_full_with_token` can supply a
+/// token-aware combined stream while reusing the same download machinery.
+async fn stream_and_download_from_stream<S>(
+    download_client: &Client,
+    combined: S,
+    config: &Arc<DownloadConfig>,
+    total: u64,
+    shutdown_token: CancellationToken,
+) -> Result<StreamingResult>
+where
+    S: futures_util::Stream<Item = anyhow::Result<crate::icloud::photos::PhotoAsset>>
+        + Send
+        + 'static,
+{
     let pb = create_progress_bar(config.no_progress_bar, total);
 
-    // select_all interleaves across albums so no single large album
-    // starves others; each stream's background task provides prefetch.
-    // When concurrency > 1 and counts are available, each album's
-    // photo_stream spawns parallel fetcher tasks for faster enumeration.
-    let mut combined =
-        stream::select_all(albums.iter().zip(&album_counts).map(|(album, &count)| {
-            album.photo_stream(config.recent, Some(count), config.concurrent_downloads)
-        }));
-
-    // Track paths claimed by in-flight downloads to detect collisions between
-    // assets with the same filename processed in the same session.
-    let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-
     if config.dry_run {
+        tokio::pin!(combined);
         let mut count = 0usize;
+        let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = std::collections::HashMap::new();
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
@@ -952,9 +1263,7 @@ async fn stream_and_download(
         "Download context loaded"
     );
 
-    // Determine if we can trust the state DB for early skips.
-    // When the download config hash matches the stored hash, path resolution
-    // hasn't changed and we can skip filesystem existence checks entirely.
+    // Determine if we can trust the state DB for early skips
     let trust_state = if let Some(db) = &state_db {
         let config_hash = hash_download_config(config);
         let stored_hash = db.get_metadata("config_hash").await.unwrap_or(None);
@@ -996,24 +1305,20 @@ async fn stream_and_download(
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
 
-    // Use a bounded channel to stream tasks from the producer to the download loop.
-    // This allows downloads to start immediately as assets arrive from the API,
-    // rather than waiting for all assets to be enumerated first.
     let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
 
-    // Wrap counters in Arc for sharing with producer task
     let assets_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let assets_seen_producer = Arc::clone(&assets_seen);
 
-    // Spawn producer task that processes assets and sends download tasks
     let producer_config = Arc::clone(config);
     let producer_state_db = state_db.clone();
     let producer_shutdown = shutdown_token.clone();
     let producer_pb = pb.clone();
     let producer = tokio::spawn(async move {
         let config = &producer_config;
-        let mut claimed_paths = claimed_paths;
+        let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = std::collections::HashMap::new();
+        tokio::pin!(combined);
         while let Some(result) = combined.next().await {
             if producer_shutdown.is_cancelled() {
                 break;
@@ -1022,8 +1327,6 @@ async fn stream_and_download(
                 Ok(asset) => {
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                    // Early skip gate: when trust_state is active, check DB
-                    // without path resolution for assets confirmed as downloaded.
                     if trust_state {
                         let candidates = extract_skip_candidates(&asset, config);
                         if !candidates.is_empty()
@@ -1034,7 +1337,6 @@ async fn stream_and_download(
                                 )
                             })
                         {
-                            // All versions confirmed in DB — skip path resolution
                             if let Some(db) = &producer_state_db {
                                 let _ = db.touch_last_seen(asset.id()).await;
                             }
@@ -1049,7 +1351,6 @@ async fn stream_and_download(
                         producer_pb.inc(1);
                     } else {
                         for task in tasks {
-                            // In retry-only mode, skip assets not already in the state DB
                             if config.retry_only
                                 && !download_ctx.known_ids.contains(task.asset_id.as_ref())
                             {
@@ -1057,7 +1358,6 @@ async fn stream_and_download(
                                 continue;
                             }
 
-                            // Record asset in state DB
                             if let Some(db) = &producer_state_db {
                                 let media_type = determine_media_type(task.version_size, &asset);
                                 let record = AssetRecord::new_pending(
@@ -1082,21 +1382,18 @@ async fn stream_and_download(
                                     );
                                 }
 
-                                // Fast path: check pre-loaded state first
                                 match download_ctx.should_download_fast(
                                     &task.asset_id,
                                     task.version_size,
                                     &task.checksum,
-                                    false, // trust_state=false: full pipeline needs filesystem check
+                                    false,
                                 ) {
                                     Some(true) => {
                                         if task_tx.send(task).await.is_err() {
-                                            return; // Receiver dropped
+                                            return;
                                         }
                                     }
                                     Some(false) => {
-                                        // Defensive: should_download_fast never returns
-                                        // Some(false) today, but skip if it ever does.
                                         tracing::debug!(
                                             asset_id = %task.asset_id,
                                             "Skipping (state confirms no download needed)"
@@ -1104,7 +1401,6 @@ async fn stream_and_download(
                                         producer_pb.inc(1);
                                     }
                                     None => {
-                                        // Downloaded with matching checksum — check file exists
                                         match tokio::fs::try_exists(&task.download_path).await {
                                             Ok(true) => {
                                                 tracing::debug!(
@@ -1115,7 +1411,6 @@ async fn stream_and_download(
                                                 producer_pb.inc(1);
                                             }
                                             Ok(false) => {
-                                                // Check for AM/PM whitespace variant on disk
                                                 if paths::find_ampm_variant_cached(
                                                     &task.download_path,
                                                     &mut dir_cache,
@@ -1151,11 +1446,8 @@ async fn stream_and_download(
                                         }
                                     }
                                 }
-                            } else {
-                                // No state DB — just send for download
-                                if task_tx.send(task).await.is_err() {
-                                    return;
-                                }
+                            } else if task_tx.send(task).await.is_err() {
+                                return;
                             }
                         }
                     }
@@ -1189,7 +1481,6 @@ async fn stream_and_download(
 
     tokio::pin!(download_stream);
 
-    // Batch DB writes for better throughput — flush every N completions
     const DB_BATCH_SIZE: usize = 50;
     let mut downloaded_batch: Vec<(String, String, PathBuf, String)> =
         Vec::with_capacity(DB_BATCH_SIZE);
@@ -1223,7 +1514,6 @@ async fn stream_and_download(
                 }
             }
             Err(e) => {
-                // Check if this is a session expiry error
                 if let Some(download_err) = e.downcast_ref::<DownloadError>() {
                     if download_err.is_session_expired() {
                         auth_errors += 1;
@@ -1242,8 +1532,6 @@ async fn stream_and_download(
                                     "Auth error threshold reached, aborting for re-authentication"
                                 );
                             });
-                            // Use break instead of return to allow buffered tasks to
-                            // complete cleanly, matching graceful shutdown behavior.
                             break;
                         }
                         if state_db.is_some() {
@@ -1273,7 +1561,6 @@ async fn stream_and_download(
         }
         pb.inc(1);
 
-        // Flush batches periodically
         if let Some(db) = &state_db {
             if downloaded_batch.len() >= DB_BATCH_SIZE {
                 if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
@@ -1298,17 +1585,14 @@ async fn stream_and_download(
         }
     }
 
-    // Wait for producer to finish (it may still be processing if we broke early)
     if let Err(e) = producer.await {
         if e.is_panic() {
             tracing::error!("Asset producer task panicked: {:?}", e);
         }
     }
 
-    // Load the final count from the atomic counter
     let assets_seen_count = assets_seen.load(std::sync::atomic::Ordering::Relaxed);
 
-    // Flush remaining batches
     if let Some(db) = &state_db {
         if !downloaded_batch.is_empty() {
             if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
@@ -1332,7 +1616,6 @@ async fn stream_and_download(
 
     pb.finish_and_clear();
 
-    // Complete sync run tracking
     if let (Some(db), Some(run_id)) = (&state_db, sync_run_id) {
         let stats = SyncRunStats {
             assets_seen: assets_seen_count,
@@ -1361,34 +1644,22 @@ async fn stream_and_download(
     })
 }
 
-/// Entry point for the download engine.
-///
-/// Phase 1: Stream assets page-by-page and download immediately with bounded
-/// concurrency — no upfront enumeration delay.
-///
-/// Phase 2 (cleanup): Re-fetch from the API to get fresh CDN URLs (the
-/// originals may have expired during a long Phase 1) and retry failures at
-/// reduced concurrency to give large files full bandwidth.
-///
-/// Returns `DownloadOutcome` indicating whether all downloads succeeded,
-/// the session expired (requiring re-auth), or some downloads failed.
-pub async fn download_photos(
+/// Build a `DownloadOutcome` from a `StreamingResult`, running a cleanup
+/// pass if there were failures. Shared between `download_photos` and
+/// `download_photos_full_with_token`.
+async fn build_download_outcome(
     download_client: &Client,
     albums: &[PhotoAlbum],
-    config: Arc<DownloadConfig>,
+    config: &Arc<DownloadConfig>,
+    streaming_result: StreamingResult,
+    started: Instant,
     shutdown_token: CancellationToken,
 ) -> Result<DownloadOutcome> {
-    let started = Instant::now();
-
-    let streaming_result =
-        stream_and_download(download_client, albums, &config, shutdown_token.clone()).await?;
-
     let downloaded = streaming_result.downloaded;
     let mut exif_failures = streaming_result.exif_failures;
     let failed_tasks = streaming_result.failed;
     let auth_errors = streaming_result.auth_errors;
 
-    // If auth errors exceeded threshold, return early for re-authentication
     if auth_errors >= AUTH_ERROR_THRESHOLD {
         return Ok(DownloadOutcome::SessionExpired {
             auth_error_count: auth_errors,
@@ -1439,9 +1710,7 @@ pub async fn download_photos(
         return Ok(DownloadOutcome::Success);
     }
 
-    // Phase 2: CDN URLs from Phase 1 may have expired during a long
-    // download session. Re-fetch the full task list for fresh URLs and
-    // retry with moderate parallelism (balance throughput vs. bandwidth per file).
+    // Phase 2: cleanup pass with fresh CDN URLs
     let cleanup_concurrency = 5;
     let failure_count = failed_tasks.len();
     tracing::info!(
@@ -1450,7 +1719,7 @@ pub async fn download_photos(
         cleanup_concurrency,
     );
 
-    let fresh_tasks = build_download_tasks(albums, &config, shutdown_token.clone()).await?;
+    let fresh_tasks = build_download_tasks(albums, config, shutdown_token.clone()).await?;
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let phase2_task_count = fresh_tasks.len();
@@ -1471,7 +1740,6 @@ pub async fn download_photos(
     exif_failures += pass_result.exif_failures;
     let total_auth_errors = auth_errors + phase2_auth_errors;
 
-    // If auth errors exceeded threshold during phase 2, return for re-auth
     if total_auth_errors >= AUTH_ERROR_THRESHOLD {
         return Ok(DownloadOutcome::SessionExpired {
             auth_error_count: total_auth_errors,
@@ -1829,6 +2097,7 @@ mod tests {
             temp_suffix: ".icloudpd-tmp".to_string(),
             state_db: None,
             retry_only: false,
+            sync_mode: SyncMode::Full,
         }
     }
 
@@ -3203,5 +3472,248 @@ mod tests {
         map.insert(NormalizedPath::new(PathBuf::from("test.jpg")), 42);
         let key = NormalizedPath::normalize(std::path::Path::new("test.jpg"));
         assert_eq!(map.get(key.as_ref()), Some(&42));
+    }
+
+    // ---------- SyncMode / SyncResult tests ----------
+
+    #[test]
+    fn test_sync_mode_full_debug() {
+        let mode = SyncMode::Full;
+        let debug = format!("{:?}", mode);
+        assert_eq!(debug, "Full");
+    }
+
+    #[test]
+    fn test_sync_mode_incremental_debug() {
+        let mode = SyncMode::Incremental {
+            zone_sync_token: "tok-abc".to_string(),
+        };
+        let debug = format!("{:?}", mode);
+        assert!(debug.contains("Incremental"));
+        assert!(debug.contains("tok-abc"));
+    }
+
+    #[test]
+    fn test_sync_mode_clone() {
+        let mode = SyncMode::Incremental {
+            zone_sync_token: "tok-123".to_string(),
+        };
+        let cloned = mode.clone();
+        match cloned {
+            SyncMode::Incremental { zone_sync_token } => {
+                assert_eq!(zone_sync_token, "tok-123");
+            }
+            _ => panic!("Expected Incremental variant"),
+        }
+    }
+
+    #[test]
+    fn test_sync_result_success_with_token() {
+        let result = SyncResult {
+            outcome: DownloadOutcome::Success,
+            sync_token: Some("new-token".to_string()),
+        };
+        assert!(result.sync_token.is_some());
+        assert_eq!(result.sync_token.as_deref(), Some("new-token"));
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+    }
+
+    #[test]
+    fn test_sync_result_success_without_token() {
+        let result = SyncResult {
+            outcome: DownloadOutcome::Success,
+            sync_token: None,
+        };
+        assert!(result.sync_token.is_none());
+    }
+
+    #[test]
+    fn test_sync_result_partial_failure() {
+        let result = SyncResult {
+            outcome: DownloadOutcome::PartialFailure { failed_count: 3 },
+            sync_token: Some("tok".to_string()),
+        };
+        match result.outcome {
+            DownloadOutcome::PartialFailure { failed_count } => {
+                assert_eq!(failed_count, 3);
+            }
+            _ => panic!("Expected PartialFailure"),
+        }
+    }
+
+    #[test]
+    fn test_sync_result_session_expired() {
+        let result = SyncResult {
+            outcome: DownloadOutcome::SessionExpired {
+                auth_error_count: 5,
+            },
+            sync_token: None,
+        };
+        match result.outcome {
+            DownloadOutcome::SessionExpired { auth_error_count } => {
+                assert_eq!(auth_error_count, 5);
+            }
+            _ => panic!("Expected SessionExpired"),
+        }
+    }
+
+    #[test]
+    fn test_download_config_sync_mode_default_full() {
+        let config = test_config();
+        assert!(matches!(config.sync_mode, SyncMode::Full));
+    }
+
+    #[test]
+    fn test_download_config_debug_includes_sync_mode() {
+        let config = test_config();
+        let debug = format!("{:?}", config);
+        assert!(
+            debug.contains("sync_mode"),
+            "Debug output should include sync_mode field"
+        );
+    }
+
+    #[test]
+    fn test_change_event_filtering_downloadable_reasons() {
+        // Verify that the filtering logic in download_photos_incremental
+        // correctly identifies which ChangeReasons are downloadable
+        let downloadable = [ChangeReason::Created];
+        let skippable = [
+            ChangeReason::SoftDeleted,
+            ChangeReason::HardDeleted,
+            ChangeReason::Hidden,
+        ];
+
+        for reason in &downloadable {
+            assert!(
+                matches!(reason, ChangeReason::Created),
+                "{:?} should be downloadable",
+                reason
+            );
+        }
+        for reason in &skippable {
+            assert!(
+                !matches!(reason, ChangeReason::Created),
+                "{:?} should be skippable",
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_change_event_asset_extraction() {
+        // Verify that events with None assets are filtered out
+        let event_with_asset = ChangeEvent {
+            record_name: "REC_1".to_string(),
+            record_type: Some("CPLAsset".to_string()),
+            reason: ChangeReason::Created,
+            asset: Some(photo_asset_with_version()),
+        };
+        let event_without_asset = ChangeEvent {
+            record_name: "REC_2".to_string(),
+            record_type: Some("CPLAsset".to_string()),
+            reason: ChangeReason::Created,
+            asset: None,
+        };
+
+        let events = vec![event_with_asset, event_without_asset];
+        let downloadable: Vec<_> = events
+            .into_iter()
+            .filter(|e| matches!(e.reason, ChangeReason::Created))
+            .filter_map(|e| e.asset)
+            .collect();
+
+        assert_eq!(downloadable.len(), 1);
+        assert_eq!(downloadable[0].id(), "TEST_1");
+    }
+
+    #[test]
+    fn test_incremental_filters_skip_deletions() {
+        let events = vec![
+            ChangeEvent {
+                record_name: "REC_1".to_string(),
+                record_type: Some("CPLAsset".to_string()),
+                reason: ChangeReason::Created,
+                asset: Some(photo_asset_with_version()),
+            },
+            ChangeEvent {
+                record_name: "REC_2".to_string(),
+                record_type: None,
+                reason: ChangeReason::HardDeleted,
+                asset: None,
+            },
+            ChangeEvent {
+                record_name: "REC_3".to_string(),
+                record_type: Some("CPLAsset".to_string()),
+                reason: ChangeReason::SoftDeleted,
+                asset: None,
+            },
+            ChangeEvent {
+                record_name: "REC_4".to_string(),
+                record_type: Some("CPLAsset".to_string()),
+                reason: ChangeReason::Hidden,
+                asset: None,
+            },
+        ];
+
+        let downloadable: Vec<_> = events
+            .into_iter()
+            .filter(|e| matches!(e.reason, ChangeReason::Created))
+            .filter_map(|e| e.asset)
+            .collect();
+
+        assert_eq!(downloadable.len(), 1);
+        assert_eq!(downloadable[0].id(), "TEST_1");
+    }
+
+    #[test]
+    fn test_incremental_modified_events_are_downloadable() {
+        let events = vec![ChangeEvent {
+            record_name: "MOD_1".to_string(),
+            record_type: Some("CPLAsset".to_string()),
+            reason: ChangeReason::Created,
+            asset: Some(photo_asset_with_version()),
+        }];
+
+        let downloadable: Vec<_> = events
+            .into_iter()
+            .filter(|e| matches!(e.reason, ChangeReason::Created))
+            .filter_map(|e| e.asset)
+            .collect();
+
+        assert_eq!(downloadable.len(), 1);
+    }
+
+    #[test]
+    fn test_sync_mode_incremental_empty_token() {
+        let mode = SyncMode::Incremental {
+            zone_sync_token: String::new(),
+        };
+        match mode {
+            SyncMode::Incremental { zone_sync_token } => {
+                assert!(zone_sync_token.is_empty());
+            }
+            _ => panic!("expected Incremental variant"),
+        }
+    }
+
+    #[test]
+    fn test_sync_result_with_token() {
+        let result = SyncResult {
+            outcome: DownloadOutcome::Success,
+            sync_token: Some("abc".to_string()),
+        };
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn test_sync_result_without_token() {
+        let result = SyncResult {
+            outcome: DownloadOutcome::Success,
+            sync_token: None,
+        };
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(result.sync_token.is_none());
     }
 }

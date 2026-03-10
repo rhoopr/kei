@@ -47,6 +47,19 @@ impl From<VersionSize> for AssetVersionSize {
     }
 }
 
+/// Reason for a record change in a `changes/zone` delta response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeReason {
+    /// New record (new or modified; state DB needed to distinguish)
+    Created,
+    /// Moved to Recently Deleted (fields.isDeleted == 1)
+    SoftDeleted,
+    /// Permanently purged (record.deleted == true, recordType unknown)
+    HardDeleted,
+    /// Moved to Hidden album (fields.isHidden == 1)
+    Hidden,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

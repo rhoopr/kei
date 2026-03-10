@@ -4,12 +4,20 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::Stream;
 use tracing::debug;
 
-use super::asset::PhotoAsset;
-use super::queries::{encode_params, DESIRED_KEYS_VALUES};
-use super::session::PhotosSession;
+use super::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
+use super::cloudkit::ChangesZoneResponse;
+use super::queries::{build_changes_zone_request, encode_params, DESIRED_KEYS_VALUES};
+use super::session::{check_changes_zone_error, PhotosSession};
+
+/// A boxed, pinned stream of photo asset results.
+type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
+
+/// A boxed, pinned stream of change event results.
+type ChangeStream = Pin<Box<dyn Stream<Item = anyhow::Result<ChangeEvent>> + Send + 'static>>;
 
 /// Determine how many parallel fetcher tasks to spawn.
 ///
@@ -141,8 +149,205 @@ impl PhotoAlbum {
         limit: Option<u32>,
         total_count: Option<u64>,
         concurrency: usize,
-    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>> {
+    ) -> PhotoStream {
+        let (stream, _handles) = self.photo_stream_inner(limit, total_count, concurrency, None);
+        stream
+    }
+
+    /// Like [`photo_stream()`](Self::photo_stream), but also returns a
+    /// `oneshot::Receiver` that will yield the zone-level `syncToken` from
+    /// the last API response page once the stream is fully consumed.
+    ///
+    /// The caller should `.await` the receiver **after** the stream is
+    /// exhausted:
+    ///
+    /// ```ignore
+    /// let (stream, token_rx) = album.photo_stream_with_token(limit, count, concurrency);
+    /// tokio::pin!(stream);
+    /// while let Some(item) = stream.next().await { /* ... */ }
+    /// let sync_token = token_rx.await.ok().flatten();
+    /// ```
+    pub fn photo_stream_with_token(
+        &self,
+        limit: Option<u32>,
+        total_count: Option<u64>,
+        concurrency: usize,
+    ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+        let shared_sync_token: Arc<tokio::sync::Mutex<Option<String>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        let (stream, handles) = self.photo_stream_inner(
+            limit,
+            total_count,
+            concurrency,
+            Some(shared_sync_token.clone()),
+        );
+
+        // Spawn a monitor task that waits for all fetcher tasks to complete,
+        // then delivers the captured syncToken through the oneshot channel.
+        // The fetchers' mpsc senders are dropped when they finish, which
+        // closes the ReceiverStream. The caller awaits the oneshot after the
+        // stream is exhausted.
+        tokio::spawn(async move {
+            for handle in handles {
+                let _ = handle.await;
+            }
+            let final_token = shared_sync_token.lock().await.clone();
+            let _ = token_tx.send(final_token);
+        });
+
+        (stream, token_rx)
+    }
+
+    /// Stream record changes since the given syncToken via `changes/zone`.
+    ///
+    /// Returns a stream of `ChangeEvent`s and a oneshot receiver for the final syncToken.
+    /// The syncToken is sent through the oneshot after all pages have been consumed
+    /// (moreComing: false).
+    ///
+    /// This method is inherently sequential -- each page's syncToken feeds the next request.
+    /// No parallel fetchers.
+    pub fn changes_stream(
+        &self,
+        sync_token: &str,
+    ) -> (ChangeStream, tokio::sync::oneshot::Receiver<Option<String>>) {
+        let (tx, rx) = mpsc::channel::<anyhow::Result<ChangeEvent>>(200);
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+
+        let session = self.session.clone_box();
+        let service_endpoint = self.service_endpoint.clone();
+        let params = Arc::clone(&self.params);
+        let zone_id = self.zone_id.clone();
+        let initial_token = sync_token.to_string();
+        let album_name = self.name.clone();
+
+        tokio::spawn(async move {
+            let mut buffer = DeltaRecordBuffer::new();
+            let mut current_token = initial_token;
+
+            let url = format!(
+                "{}/changes/zone?{}",
+                service_endpoint,
+                encode_params(&params)
+            );
+
+            loop {
+                let body = build_changes_zone_request(&zone_id, Some(&current_token), 200);
+                debug!(
+                    album = %album_name,
+                    token = %current_token,
+                    "changes/zone request"
+                );
+
+                let response = match super::session::retry_post(
+                    session.as_ref(),
+                    &url,
+                    &body.to_string(),
+                    &[("Content-type", "text/plain")],
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        let _ = token_tx.send(None);
+                        return;
+                    }
+                };
+
+                let changes_resp: ChangesZoneResponse = match serde_json::from_value(response) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err(e.into())).await;
+                        let _ = token_tx.send(None);
+                        return;
+                    }
+                };
+
+                let zone_result = match changes_resp.zones.into_iter().next() {
+                    Some(zr) => zr,
+                    None => {
+                        let _ = tx
+                            .send(Err(anyhow::anyhow!(
+                                "changes/zone returned empty zones array"
+                            )))
+                            .await;
+                        let _ = token_tx.send(None);
+                        return;
+                    }
+                };
+
+                // Check for zone-level errors
+                let zone_name = zone_result.zone_id.zone_name.clone();
+                if let Err(sync_err) = check_changes_zone_error(
+                    zone_result.server_error_code.as_deref(),
+                    zone_result.reason.as_deref(),
+                    &zone_name,
+                ) {
+                    let _ = tx.send(Err(sync_err.into())).await;
+                    let _ = token_tx.send(None);
+                    return;
+                }
+
+                current_token = zone_result.sync_token;
+                let more_coming = zone_result.more_coming;
+
+                debug!(
+                    album = %album_name,
+                    records = zone_result.records.len(),
+                    more_coming,
+                    new_token = %current_token,
+                    "changes/zone page received"
+                );
+
+                let events = buffer.process_records(zone_result.records);
+                for event in events {
+                    if tx.send(Ok(event)).await.is_err() {
+                        // Receiver dropped
+                        let _ = token_tx.send(Some(current_token));
+                        return;
+                    }
+                }
+
+                if !more_coming {
+                    break;
+                }
+            }
+
+            // Flush remaining unpaired records
+            let flush_events = buffer.flush();
+            for event in flush_events {
+                if tx.send(Ok(event)).await.is_err() {
+                    let _ = token_tx.send(Some(current_token));
+                    return;
+                }
+            }
+
+            let _ = token_tx.send(Some(current_token));
+        });
+
+        (
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            token_rx,
+        )
+    }
+
+    /// Shared implementation for `photo_stream` and `photo_stream_with_token`.
+    ///
+    /// When `shared_sync_token` is `Some`, each fetcher writes its last
+    /// observed `syncToken` into the shared mutex.
+    ///
+    /// Returns the stream and all spawned fetcher `JoinHandle`s.
+    fn photo_stream_inner(
+        &self,
+        limit: Option<u32>,
+        total_count: Option<u64>,
+        concurrency: usize,
+        shared_sync_token: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+    ) -> (PhotoStream, Vec<JoinHandle<()>>) {
         let page_size = self.page_size;
+        let mut handles = Vec::new();
 
         // Compute effective total, capped by --recent if set.
         let effective_total = total_count
@@ -194,17 +399,26 @@ impl PhotoAlbum {
                     }
                     None => None,
                 };
-                self.spawn_fetcher(tx.clone(), start, end, fetcher_limit);
+                handles.push(self.spawn_fetcher(
+                    tx.clone(),
+                    start,
+                    end,
+                    fetcher_limit,
+                    shared_sync_token.clone(),
+                ));
             }
             // Drop our sender so channel closes when all fetchers finish.
             drop(tx);
         } else {
             tracing::info!("Fetching photos from iCloud...");
             // Move tx directly — no clone needed for a single fetcher.
-            self.spawn_fetcher(tx, 0, u64::MAX, limit);
+            handles.push(self.spawn_fetcher(tx, 0, u64::MAX, limit, shared_sync_token));
         }
 
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+        (
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            handles,
+        )
     }
 
     /// Spawn a background tokio task that pages through records from
@@ -214,13 +428,18 @@ impl PhotoAlbum {
     /// - the API returns no master records (end of album)
     /// - the per-fetcher `limit` is reached
     /// - the receiver is dropped
+    ///
+    /// If `shared_sync_token` is provided, the fetcher writes the last non-None
+    /// `syncToken` from each `QueryResponse` page into it. Because the token is
+    /// a zone-level invariant, any fetcher's final value is correct.
     fn spawn_fetcher(
         &self,
         tx: mpsc::Sender<anyhow::Result<PhotoAsset>>,
         start_offset: u64,
         end_offset: u64,
         limit: Option<u32>,
-    ) {
+        shared_sync_token: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+    ) -> JoinHandle<()> {
         let session = self.session.clone_box();
         let service_endpoint = self.service_endpoint.clone();
         let params = Arc::clone(&self.params);
@@ -283,6 +502,14 @@ impl PhotoAlbum {
                         return;
                     }
                 };
+
+                // Capture the zone-level syncToken from each page response.
+                if let Some(ref shared) = shared_sync_token {
+                    if let Some(ref token) = query.sync_token {
+                        *shared.lock().await = Some(token.clone());
+                    }
+                }
+
                 let records = query.records;
 
                 debug!(
@@ -341,7 +568,7 @@ impl PhotoAlbum {
                     break;
                 }
             }
-        });
+        })
     }
 
     #[cfg(test)]
@@ -571,5 +798,487 @@ mod tests {
         // --recent 50 with page_size 100 → 1 page → 1 fetcher even with concurrency 10
         let album = make_album(100, None, default_zone());
         let _stream = album.photo_stream(Some(50), Some(1000), 10);
+    }
+
+    // --- photo_stream_with_token tests ---
+
+    /// A session stub that returns canned QueryResponse JSON. Each call to
+    /// `post()` pops the next response from the front of the queue. If the
+    /// queue is empty, returns an empty records array.
+    struct CannedSession {
+        responses: std::sync::Mutex<std::collections::VecDeque<Value>>,
+    }
+
+    impl CannedSession {
+        fn new(responses: Vec<Value>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for CannedSession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let next = self
+                .responses
+                .lock()
+                .expect("poisoned")
+                .pop_front()
+                .unwrap_or_else(|| json!({"records": []}));
+            Ok(next)
+        }
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<reqwest::Response> {
+            unimplemented!("stub")
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            // Clone-box snapshots remaining responses so the spawned fetcher
+            // task gets its own copy of the queue.
+            let remaining: Vec<Value> = self
+                .responses
+                .lock()
+                .expect("poisoned")
+                .iter()
+                .cloned()
+                .collect();
+            Box::new(CannedSession::new(remaining))
+        }
+    }
+
+    fn make_album_with_session(page_size: usize, session: Box<dyn PhotosSession>) -> PhotoAlbum {
+        PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(HashMap::new()),
+                service_endpoint: "https://example.com".into(),
+                name: "TestAlbum".into(),
+                list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+                obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+                query_filter: None,
+                page_size,
+                zone_id: default_zone(),
+            },
+            session,
+        )
+    }
+
+    /// Build a canned QueryResponse with one paired CPLMaster+CPLAsset
+    /// record and an optional syncToken.
+    fn canned_page(record_name: &str, sync_token: Option<&str>) -> Value {
+        let mut resp = json!({
+            "records": [
+                {
+                    "recordName": record_name,
+                    "recordType": "CPLMaster",
+                    "fields": {
+                        "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
+                        "resOriginalRes": {
+                            "value": {
+                                "downloadURL": "https://example.com/photo.jpg",
+                                "size": 1024,
+                                "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                            }
+                        },
+                        "resOriginalWidth": {"value": 100, "type": "INT64"},
+                        "resOriginalHeight": {"value": 100, "type": "INT64"},
+                        "resOriginalFileType": {"value": "public.jpeg"},
+                        "itemType": {"value": "public.jpeg"},
+                        "adjustmentRenderType": {"value": 0, "type": "INT64"}
+                    },
+                    "recordChangeTag": "ct1"
+                },
+                {
+                    "recordName": format!("asset-{record_name}"),
+                    "recordType": "CPLAsset",
+                    "fields": {
+                        "masterRef": {
+                            "value": {"recordName": record_name, "zoneID": {"zoneName": "PrimarySync"}},
+                            "type": "REFERENCE"
+                        },
+                        "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                        "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                    },
+                    "recordChangeTag": "ct2"
+                }
+            ]
+        });
+        if let Some(token) = sync_token {
+            resp["syncToken"] = json!(token);
+        }
+        resp
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_with_token_returns_sync_token() {
+        use tokio_stream::StreamExt;
+
+        let session = CannedSession::new(vec![
+            canned_page("master-1", Some("st-zone-abc")),
+            // Second call returns empty records to stop the fetcher
+            json!({"records": [], "syncToken": "st-zone-abc"}),
+        ]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        tokio::pin!(stream);
+
+        let mut count = 0u32;
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+            count += 1;
+        }
+        assert_eq!(count, 1, "should yield exactly one photo asset");
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token.as_deref(), Some("st-zone-abc"));
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_with_token_no_sync_token_in_response() {
+        use tokio_stream::StreamExt;
+
+        // Responses without syncToken field
+        let session =
+            CannedSession::new(vec![canned_page("master-1", None), json!({"records": []})]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        tokio::pin!(stream);
+
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+        }
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token, None, "no syncToken in responses means None");
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_with_token_last_token_wins() {
+        use tokio_stream::StreamExt;
+
+        // Two pages with different syncTokens — last one should be captured.
+        // page_size=1 so each page yields 1 master record and the fetcher
+        // advances offset by 1.
+        let session = CannedSession::new(vec![
+            canned_page("master-1", Some("st-first")),
+            canned_page("master-2", Some("st-second")),
+            json!({"records": []}),
+        ]);
+        let album = make_album_with_session(1, Box::new(session));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        tokio::pin!(stream);
+
+        let mut count = 0u32;
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+            count += 1;
+        }
+        assert_eq!(count, 2);
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token.as_deref(), Some("st-second"));
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_with_token_empty_album() {
+        use tokio_stream::StreamExt;
+
+        // Album with no records at all
+        let session = CannedSession::new(vec![json!({"records": []})]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        tokio::pin!(stream);
+
+        let items: Vec<_> = stream.collect().await;
+        assert!(items.is_empty());
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_with_token_setup_does_not_panic() {
+        // Verify photo_stream_with_token setup path works with StubSession
+        // (which panics on call). Same as the photo_stream setup tests.
+        let album = make_album(100, None, default_zone());
+        let (_stream, _token_rx) = album.photo_stream_with_token(None, None, 10);
+    }
+
+    // --- changes_stream tests ---
+
+    /// Build a canned `ChangesZoneResponse` JSON with the given records,
+    /// syncToken, and moreComing flag.
+    fn canned_changes_page(records: Vec<Value>, sync_token: &str, more_coming: bool) -> Value {
+        json!({
+            "zones": [{
+                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "syncToken": sync_token,
+                "moreComing": more_coming,
+                "records": records
+            }]
+        })
+    }
+
+    /// Build a CPLMaster record for changes/zone tests.
+    fn changes_master(record_name: &str) -> Value {
+        json!({
+            "recordName": record_name,
+            "recordType": "CPLMaster",
+            "fields": {
+                "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
+                "resOriginalRes": {
+                    "value": {
+                        "downloadURL": "https://example.com/photo.jpg",
+                        "size": 1024,
+                        "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                    }
+                },
+                "resOriginalWidth": {"value": 100, "type": "INT64"},
+                "resOriginalHeight": {"value": 100, "type": "INT64"},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "itemType": {"value": "public.jpeg"},
+                "adjustmentRenderType": {"value": 0, "type": "INT64"}
+            },
+            "recordChangeTag": "ct1"
+        })
+    }
+
+    /// Build a CPLAsset record that references the given master.
+    fn changes_asset(record_name: &str, master_ref: &str) -> Value {
+        json!({
+            "recordName": record_name,
+            "recordType": "CPLAsset",
+            "fields": {
+                "masterRef": {
+                    "value": {"recordName": master_ref, "zoneID": {"zoneName": "PrimarySync"}},
+                    "type": "REFERENCE"
+                },
+                "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+            },
+            "recordChangeTag": "ct2"
+        })
+    }
+
+    #[tokio::test]
+    async fn test_changes_stream_single_page() {
+        use tokio_stream::StreamExt;
+
+        let records = vec![
+            changes_master("master-1"),
+            changes_asset("asset-1", "master-1"),
+        ];
+        let session = CannedSession::new(vec![canned_changes_page(records, "token-final", false)]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) = album.changes_stream("token-initial");
+        tokio::pin!(stream);
+
+        let mut events = Vec::new();
+        while let Some(result) = stream.next().await {
+            events.push(result.expect("should be Ok"));
+        }
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "master-1");
+        assert!(events[0].asset.is_some());
+        assert_eq!(events[0].record_type.as_deref(), Some("CPLMaster"));
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token.as_deref(), Some("token-final"));
+    }
+
+    #[tokio::test]
+    async fn test_changes_stream_multiple_pages() {
+        use tokio_stream::StreamExt;
+
+        let page1_records = vec![
+            changes_master("master-1"),
+            changes_asset("asset-1", "master-1"),
+        ];
+        let page2_records = vec![
+            changes_master("master-2"),
+            changes_asset("asset-2", "master-2"),
+        ];
+        let session = CannedSession::new(vec![
+            canned_changes_page(page1_records, "token-page1", true),
+            canned_changes_page(page2_records, "token-page2", false),
+        ]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) = album.changes_stream("token-initial");
+        tokio::pin!(stream);
+
+        let mut events = Vec::new();
+        while let Some(result) = stream.next().await {
+            events.push(result.expect("should be Ok"));
+        }
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].record_name, "master-1");
+        assert_eq!(events[1].record_name, "master-2");
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token.as_deref(), Some("token-page2"));
+    }
+
+    #[tokio::test]
+    async fn test_changes_stream_empty_page_continues() {
+        use tokio_stream::StreamExt;
+
+        // First page: empty records but moreComing: true (normal API behavior)
+        // Second page: actual records, moreComing: false
+        let page2_records = vec![
+            changes_master("master-1"),
+            changes_asset("asset-1", "master-1"),
+        ];
+        let session = CannedSession::new(vec![
+            canned_changes_page(vec![], "token-empty", true),
+            canned_changes_page(page2_records, "token-final", false),
+        ]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) = album.changes_stream("token-initial");
+        tokio::pin!(stream);
+
+        let mut events = Vec::new();
+        while let Some(result) = stream.next().await {
+            events.push(result.expect("should be Ok"));
+        }
+
+        assert_eq!(events.len(), 1, "should yield the event from page 2");
+        assert_eq!(events[0].record_name, "master-1");
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token.as_deref(), Some("token-final"));
+    }
+
+    #[tokio::test]
+    async fn test_changes_stream_zone_error() {
+        use tokio_stream::StreamExt;
+
+        let session = CannedSession::new(vec![json!({
+            "zones": [{
+                "zoneID": {"zoneName": "PrimarySync"},
+                "syncToken": "",
+                "moreComing": false,
+                "serverErrorCode": "BAD_REQUEST",
+                "reason": "Unknown sync continuation type"
+            }]
+        })]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) = album.changes_stream("bad-token");
+        tokio::pin!(stream);
+
+        let mut items: Vec<anyhow::Result<ChangeEvent>> = Vec::new();
+        while let Some(result) = stream.next().await {
+            items.push(result);
+        }
+
+        assert_eq!(items.len(), 1, "should have exactly one error item");
+        let err = items.into_iter().next().expect("should have item");
+        assert!(err.is_err());
+        let err_msg = format!("{}", err.unwrap_err());
+        assert!(
+            err_msg.contains("Invalid sync token"),
+            "error should mention invalid sync token, got: {err_msg}"
+        );
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token, None, "token should be None on error");
+    }
+
+    #[tokio::test]
+    async fn test_changes_stream_hard_deleted_record() {
+        use super::super::types::ChangeReason;
+        use tokio_stream::StreamExt;
+
+        let records = vec![json!({
+            "recordName": "deleted-record-1",
+            "recordType": null,
+            "deleted": true,
+            "recordChangeTag": "ct-del"
+        })];
+        let session = CannedSession::new(vec![canned_changes_page(
+            records,
+            "token-after-delete",
+            false,
+        )]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) = album.changes_stream("token-before");
+        tokio::pin!(stream);
+
+        let mut events = Vec::new();
+        while let Some(result) = stream.next().await {
+            events.push(result.expect("should be Ok"));
+        }
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record_name, "deleted-record-1");
+        assert_eq!(events[0].reason, ChangeReason::HardDeleted);
+        assert!(events[0].asset.is_none(), "hard-deleted has no asset");
+        assert!(
+            events[0].record_type.is_none(),
+            "hard-deleted has no record type"
+        );
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token.as_deref(), Some("token-after-delete"));
+    }
+
+    #[tokio::test]
+    async fn test_changes_stream_invalid_token_yields_typed_error() {
+        use crate::icloud::photos::session::SyncTokenError;
+        use tokio_stream::StreamExt;
+
+        let session = CannedSession::new(vec![json!({
+            "zones": [{
+                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "syncToken": "",
+                "moreComing": false,
+                "serverErrorCode": "BAD_REQUEST",
+                "reason": "Unknown sync continuation type"
+            }]
+        })]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, _token_rx) = album.changes_stream("old-token");
+        tokio::pin!(stream);
+
+        let mut items: Vec<anyhow::Result<ChangeEvent>> = Vec::new();
+        while let Some(result) = stream.next().await {
+            items.push(result);
+        }
+
+        assert_eq!(items.len(), 1, "should have exactly one error item");
+        let err = items
+            .into_iter()
+            .next()
+            .expect("should have item")
+            .expect_err("should be an error");
+
+        let sync_err = err
+            .downcast_ref::<SyncTokenError>()
+            .expect("error should downcast to SyncTokenError");
+
+        match sync_err {
+            SyncTokenError::InvalidToken { reason } => {
+                assert_eq!(reason, "Unknown sync continuation type");
+            }
+            other => panic!("expected InvalidToken variant, got: {other:?}"),
+        }
     }
 }

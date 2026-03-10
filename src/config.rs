@@ -169,6 +169,8 @@ pub struct Config {
     pub keep_unicode_in_filenames: bool,
     #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub only_print_filenames: bool,
+    pub no_incremental: bool,
+    pub reset_sync_token: bool,
     pub notify_systemd: bool,
 }
 
@@ -420,6 +422,8 @@ impl Config {
             no_progress_bar,
             keep_unicode_in_filenames,
             only_print_filenames: sync.only_print_filenames,
+            no_incremental: sync.no_incremental,
+            reset_sync_token: sync.reset_sync_token,
             notify_systemd,
         })
     }
