@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::types::AssetVersion;
 use crate::icloud::photos::{
-    AssetItemType, AssetVersionSize, ChangeEvent, ChangeReason, PhotoAlbum, SyncTokenError,
+    AssetItemType, AssetVersionSize, ChangeReason, PhotoAlbum, PhotoAsset, SyncTokenError,
     VersionsMap,
 };
 use crate::retry::RetryConfig;
@@ -1038,9 +1038,14 @@ async fn download_photos_incremental(
 ) -> Result<SyncResult> {
     let started = Instant::now();
 
-    // Collect all change events from all albums
-    let mut all_events: Vec<ChangeEvent> = Vec::new();
+    // Collect change events from all albums, counting and filtering in a single pass
+    let mut downloadable_assets: Vec<PhotoAsset> = Vec::new();
     let mut sync_token: Option<String> = None;
+    let mut created_count = 0u64;
+    let mut soft_deleted_count = 0u64;
+    let mut hard_deleted_count = 0u64;
+    let mut hidden_count = 0u64;
+    let mut total_events = 0u64;
 
     for album in albums {
         let (change_stream, token_rx) = album.changes_stream(zone_sync_token);
@@ -1051,7 +1056,27 @@ async fn download_photos_incremental(
                 break;
             }
             let event = result?;
-            all_events.push(event);
+            total_events += 1;
+            match event.reason {
+                ChangeReason::Created => {
+                    created_count += 1;
+                    if let Some(asset) = event.asset {
+                        downloadable_assets.push(asset);
+                    }
+                }
+                ChangeReason::SoftDeleted => {
+                    soft_deleted_count += 1;
+                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
+                }
+                ChangeReason::HardDeleted => {
+                    hard_deleted_count += 1;
+                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
+                }
+                ChangeReason::Hidden => {
+                    hidden_count += 1;
+                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
+                }
+            }
         }
 
         // Capture the sync token from this album
@@ -1060,45 +1085,13 @@ async fn download_photos_incremental(
         }
     }
 
-    // Log summary of change events
-    let mut created_count = 0u64;
-    let mut soft_deleted_count = 0u64;
-    let mut hard_deleted_count = 0u64;
-    let mut hidden_count = 0u64;
-
-    for event in &all_events {
-        match event.reason {
-            ChangeReason::Created => created_count += 1,
-            ChangeReason::SoftDeleted => {
-                soft_deleted_count += 1;
-                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
-            }
-            ChangeReason::HardDeleted => {
-                hard_deleted_count += 1;
-                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
-            }
-            ChangeReason::Hidden => {
-                hidden_count += 1;
-                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
-            }
-        }
-    }
-
     tracing::info!(
         created = created_count,
         soft_deleted = soft_deleted_count,
         hard_deleted = hard_deleted_count,
         hidden = hidden_count,
-        "Incremental sync: {} change events",
-        all_events.len()
+        "Incremental sync: {total_events} change events",
     );
-
-    // Extract downloadable PhotoAssets from events
-    let downloadable_assets: Vec<_> = all_events
-        .into_iter()
-        .filter(|event| matches!(event.reason, ChangeReason::Created))
-        .filter_map(|event| event.asset)
-        .collect();
 
     if downloadable_assets.is_empty() {
         tracing::info!("No new photos to download from incremental sync");
@@ -2055,6 +2048,7 @@ fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::icloud::photos::asset::ChangeEvent;
     use crate::icloud::photos::PhotoAsset;
     use serde_json::json;
     use std::fs;

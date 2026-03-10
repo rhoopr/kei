@@ -2,7 +2,7 @@
 //! CloudKit-based photos backend. Mirrors the Python `PhotosService` class.
 
 mod album;
-mod asset;
+pub(crate) mod asset;
 pub mod cloudkit;
 pub mod error;
 mod library;
@@ -12,7 +12,7 @@ mod smart_folders;
 pub mod types;
 
 pub use album::PhotoAlbum;
-pub use asset::{ChangeEvent, PhotoAsset, VersionsMap};
+pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
 pub use session::{PhotosSession, SyncTokenError};
 pub use types::{AssetItemType, AssetVersionSize, ChangeReason};
