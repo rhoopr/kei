@@ -39,6 +39,7 @@ fn album_cmd(
         "--directory",
         download_dir.to_str().unwrap(),
         "--no-progress-bar",
+        "--no-incremental",
     ]);
     cmd
 }
@@ -893,6 +894,7 @@ fn sync_bare_invocation_works_like_sync() {
                 "--directory",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
+                "--no-incremental",
             ])
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
             .assert()

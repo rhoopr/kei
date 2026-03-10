@@ -35,6 +35,7 @@ fn sync_cmd(
         "--directory",
         dir.to_str().unwrap(),
         "--no-progress-bar",
+        "--no-incremental",
     ]);
     cmd
 }
