@@ -37,7 +37,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `-d, --directory` | |
 | `-a, --album` | Multiple `--album` flags supported, same as Python |
 | `-l, --list-albums` | |
-| `--library` | Default: `PrimarySync` |
+| `--library` | Default: `PrimarySync`. Use `all` to sync every library at once |
 | `--list-libraries` | |
 | `--recent` | |
 | `--skip-videos` | |

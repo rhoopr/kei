@@ -100,6 +100,9 @@ icloudpd-rs -u you@example.com -d ~/Photos --recent 100 --skip-videos
 # Specific albums
 icloudpd-rs -u you@example.com -d ~/Photos --album "Favorites" --album "Travel"
 
+# All libraries (personal + shared) in one run
+icloudpd-rs -u you@example.com -d ~/Photos --library all
+
 # Keep syncing every hour
 icloudpd-rs -u you@example.com -d ~/Photos --watch-with-interval 3600
 
@@ -132,6 +135,7 @@ Run `icloudpd-rs --help` for the full flag list, or check the **[Wiki](https://g
 | Headless MFA | `submit-code` subcommand for Docker/cron 2FA without interactive prompts |
 | Notification scripts | Fire a script on `2fa_required`, `sync_complete`, `sync_failed`, `session_expired` |
 | Watch mode | Continuous sync with interval, systemd notify, graceful shutdown |
+| Multi-library | `--library all` downloads from personal + shared libraries in one run |
 | File organization | Date-based folders, live photo MOV pairing, EXIF writing, smart albums |
 | Auth | Apple SRP-6a, 2FA, persistent sessions, automatic refresh, lock files |
 
