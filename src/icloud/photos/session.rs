@@ -208,6 +208,25 @@ pub enum SyncTokenError {
     /// Zone no longer exists — stop syncing this zone
     #[error("Zone not found: {zone_name}")]
     ZoneNotFound { zone_name: String },
+    /// Unexpected zone-level error (e.g. RETRY_LATER, THROTTLED) —
+    /// treat as transient; do NOT advance the sync token.
+    #[error("Unexpected zone error in {zone_name}: {error_code}")]
+    UnexpectedZoneError {
+        zone_name: String,
+        error_code: String,
+    },
+}
+
+impl SyncTokenError {
+    /// Whether this error should trigger a fallback from incremental to full sync.
+    /// Only token/zone-level issues warrant full re-enumeration; transient errors
+    /// (THROTTLED, RETRY_LATER) should propagate without triggering an expensive fallback.
+    pub fn should_fallback_to_full(&self) -> bool {
+        matches!(
+            self,
+            SyncTokenError::InvalidToken { .. } | SyncTokenError::ZoneNotFound { .. }
+        )
+    }
 }
 
 /// Check if a `ChangesZoneResult` contains a zone-level error.
@@ -226,7 +245,11 @@ pub fn check_changes_zone_error(
         Some("ZONE_NOT_FOUND") => Err(SyncTokenError::ZoneNotFound {
             zone_name: zone_name.to_string(),
         }),
-        _ => Ok(()),
+        Some(code) => Err(SyncTokenError::UnexpectedZoneError {
+            zone_name: zone_name.to_string(),
+            error_code: code.to_string(),
+        }),
+        None => Ok(()),
     }
 }
 
@@ -479,9 +502,19 @@ mod tests {
     }
 
     #[test]
-    fn test_check_changes_zone_error_unknown_code_is_ok() {
+    fn test_check_changes_zone_error_unknown_code_is_unexpected() {
         let result = check_changes_zone_error(Some("SOME_OTHER_CODE"), None, "PrimarySync");
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SyncTokenError::UnexpectedZoneError {
+                zone_name,
+                error_code,
+            } => {
+                assert_eq!(zone_name, "PrimarySync");
+                assert_eq!(error_code, "SOME_OTHER_CODE");
+            }
+            other => panic!("Expected UnexpectedZoneError, got {other:?}"),
+        }
     }
 
     #[test]

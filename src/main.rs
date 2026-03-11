@@ -1073,15 +1073,28 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
 
-                // Store sync token if one was captured
-                if let Some(ref token) = sync_result.sync_token {
-                    if let Some(ref db) = state_db {
-                        if let Err(e) = db.set_metadata(&lib_state.sync_token_key, token).await {
-                            tracing::warn!(error = %e, "Failed to store sync token");
-                        } else {
-                            tracing::info!(zone = %lib_state.zone_name, "Stored sync token for next incremental sync");
+                // Store sync token only when all downloads succeeded.
+                // For full sync this is safe (state DB tracks individual failures for retry).
+                // For incremental sync, advancing the token on partial failure would lose
+                // change events for failed assets — they'd never appear in the next delta.
+                let should_store_token =
+                    matches!(sync_result.outcome, download::DownloadOutcome::Success);
+                if should_store_token {
+                    if let Some(ref token) = sync_result.sync_token {
+                        if let Some(ref db) = state_db {
+                            if let Err(e) = db.set_metadata(&lib_state.sync_token_key, token).await
+                            {
+                                tracing::warn!(error = %e, "Failed to store sync token");
+                            } else {
+                                tracing::info!(zone = %lib_state.zone_name, "Stored sync token for next incremental sync");
+                            }
                         }
                     }
+                } else if sync_result.sync_token.is_some() {
+                    tracing::info!(
+                        zone = %lib_state.zone_name,
+                        "Sync token NOT advanced (incomplete sync — will replay changes next cycle)"
+                    );
                 }
 
                 match sync_result.outcome {

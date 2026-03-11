@@ -926,7 +926,9 @@ pub async fn download_photos_with_sync(
             {
                 Ok(result) => Ok(result),
                 Err(e) => {
-                    if e.downcast_ref::<SyncTokenError>().is_some() {
+                    if e.downcast_ref::<SyncTokenError>()
+                        .is_some_and(|se| se.should_fallback_to_full())
+                    {
                         tracing::warn!(
                             error = %e,
                             "Incremental sync failed, falling back to full enumeration"
@@ -1102,23 +1104,66 @@ async fn download_photos_incremental(
         });
     }
 
+    // Respect --recent: cap the number of assets to download
+    if let Some(recent) = config.recent {
+        let limit = recent as usize;
+        if downloadable_assets.len() > limit {
+            tracing::info!(
+                total = downloadable_assets.len(),
+                limit,
+                "Capping incremental assets to --recent limit"
+            );
+            downloadable_assets.truncate(limit);
+        }
+    }
+
     tracing::info!(
         count = downloadable_assets.len(),
         "Assets to download from incremental sync"
     );
 
-    // Convert assets to download tasks
+    // Pre-load download context for O(1) state DB skip decisions
+    let download_ctx = if let Some(db) = &config.state_db {
+        DownloadContext::load(db.as_ref(), false).await
+    } else {
+        DownloadContext::default()
+    };
+
+    // Convert assets to download tasks, using state DB fast-skip where possible
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
     let mut dir_cache = std::collections::HashMap::new();
+    let mut skipped_by_state = 0usize;
 
     for asset in &downloadable_assets {
+        // Fast-skip: if state DB confirms all versions are already downloaded
+        // with matching checksums, skip the filesystem check entirely.
+        let candidates = extract_skip_candidates(asset, config);
+        if !candidates.is_empty()
+            && candidates.iter().all(|&(vs, cs)| {
+                matches!(
+                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                    Some(false)
+                )
+            })
+        {
+            skipped_by_state += 1;
+            continue;
+        }
+
         tasks.extend(filter_asset_to_tasks(
             asset,
             config,
             &mut claimed_paths,
             &mut dir_cache,
         ));
+    }
+
+    if skipped_by_state > 0 {
+        tracing::info!(
+            skipped = skipped_by_state,
+            "Skipped already-downloaded assets (state DB)"
+        );
     }
 
     if tasks.is_empty() {
