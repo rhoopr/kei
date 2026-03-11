@@ -23,12 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Sync token not withheld on partial failure** - Incremental sync now only advances the sync token when all downloads succeed. Partial failures and session expiry leave the token unchanged so change events replay on the next cycle instead of being silently lost ([#132])
-- **Zone-level errors silently ignored** - Unknown zone error codes from `changes/zone` (THROTTLED, RETRY_LATER, etc.) were silently swallowed. They now propagate as `UnexpectedZoneError`. Only `InvalidToken` and `ZoneNotFound` trigger fallback to full enumeration; transient errors skip the expensive full re-scan ([#132])
-- **`--recent` ignored in incremental sync** - The `--recent` flag was only applied during full enumeration. Incremental sync now caps downloaded assets to the `--recent` limit ([#132])
-- **No state DB fast-skip in incremental path** - Incremental sync re-checked the filesystem for already-downloaded assets. It now uses the same `DownloadContext` pre-filter as the streaming path, skipping known assets instantly ([#132])
-- **DeltaRecordBuffer pairing used wrong ChangeReason** - When CPLMaster and CPLAsset records arrived with different deletion states, only the second-arriving record's reason was used. A soft-deleted master paired with a normal asset would emit `Created` instead of `SoftDeleted`. Both records' reasons are now reconciled, taking the most severe (HardDeleted > SoftDeleted > Hidden > Created) ([#132])
-- **Watch mode skipped cycle on paginated changes/database** - When `changes/database` returned `zones: []` with `moreComing: true`, the watch cycle was incorrectly skipped. Pagination is now respected before deciding nothing changed ([#132])
 - **SharedSync zone queried for unsupported album types** - Smart folder and user album queries were sent to SharedSync zones, which don't support them. These queries are now skipped for shared libraries ([#98])
 - **`retry-failed` downloading entire library** - `retry-failed` now only retries assets already known to the state DB, skipping new iCloud assets that appear between runs ([#129])
 - **SHA-1 checksum support** - Apple's 20-byte (raw SHA-1) and 21-byte (0x01 prefix + SHA-1) checksum formats are now handled in both downloads and verify ([#129])
@@ -55,7 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced redundant `.to_string().into_boxed_str()` with `.clone()` / `.into()` ([#129])
 
 [#98]: https://github.com/rhoopr/icloudpd-rs/issues/98
-[#132]: https://github.com/rhoopr/icloudpd-rs/pull/132
 [#131]: https://github.com/rhoopr/icloudpd-rs/pull/131
 [#129]: https://github.com/rhoopr/icloudpd-rs/pull/129
 
