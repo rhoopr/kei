@@ -50,7 +50,7 @@ pub struct SyncArgs {
     #[arg(short = 'a', long = "album")]
     pub albums: Vec<String>,
 
-    /// Library to download (default: PrimarySync)
+    /// Library to download (default: PrimarySync, use "all" for all libraries)
     #[arg(long)]
     pub library: Option<String>,
 

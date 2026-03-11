@@ -117,6 +117,25 @@ impl PhotosService {
         anyhow::bail!("Unknown library: '{name}'. Use --list-libraries to see available libraries.")
     }
 
+    /// Return all available libraries: primary + private (non-PrimarySync) + shared.
+    pub async fn all_libraries(&mut self) -> anyhow::Result<Vec<PhotoLibrary>> {
+        let mut libs = vec![self.primary_library.clone()];
+
+        let private = self.fetch_private_libraries().await?;
+        for (name, lib) in private {
+            if name != "PrimarySync" {
+                libs.push(lib.clone());
+            }
+        }
+
+        let shared = self.fetch_shared_libraries().await?;
+        for lib in shared.values() {
+            libs.push(lib.clone());
+        }
+
+        Ok(libs)
+    }
+
     /// Fetch private libraries (lazily, first call triggers the HTTP request).
     pub async fn fetch_private_libraries(
         &mut self,

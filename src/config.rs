@@ -105,6 +105,24 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
 
 // ── Application Config ──────────────────────────────────────────────
 
+/// Which library (or libraries) to sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LibrarySelection {
+    /// A single named library (e.g. "PrimarySync", "SharedSync-ABCD1234").
+    Single(String),
+    /// All available libraries (primary + private + shared).
+    All,
+}
+
+impl std::fmt::Display for LibrarySelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(name) => f.write_str(name),
+            Self::All => f.write_str("all"),
+        }
+    }
+}
+
 /// Application configuration.
 ///
 /// Fields are ordered for optimal memory layout:
@@ -123,7 +141,7 @@ pub struct Config {
     pub cookie_directory: PathBuf,
     pub folder_structure: String,
     pub albums: Vec<String>,
-    pub library: String,
+    pub library: LibrarySelection,
     pub temp_suffix: String,
 
     // DateTime fields
@@ -290,11 +308,16 @@ impl Config {
         let retry_delay_secs = resolve(sync.retry_delay, toml_retry.and_then(|r| r.delay), 5);
 
         // Filters
-        let library = resolve(
+        let library_str = resolve(
             sync.library,
             toml_filters.and_then(|f| f.library.clone()),
             "PrimarySync".to_string(),
         );
+        let library = if library_str.eq_ignore_ascii_case("all") {
+            LibrarySelection::All
+        } else {
+            LibrarySelection::Single(library_str)
+        };
         let albums = if sync.albums.is_empty() {
             toml_filters
                 .and_then(|f| f.albums.clone())
@@ -695,7 +718,10 @@ mod tests {
         assert_eq!(cfg.username, "u@example.com");
         assert_eq!(cfg.threads_num, 10);
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
-        assert_eq!(cfg.library, "PrimarySync");
+        assert_eq!(
+            cfg.library,
+            LibrarySelection::Single("PrimarySync".to_string())
+        );
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.retry_delay_secs, 5);
         assert_eq!(cfg.temp_suffix, ".icloudpd-tmp");
@@ -718,7 +744,10 @@ mod tests {
         let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
         assert_eq!(cfg.threads_num, 4);
         assert_eq!(cfg.folder_structure, "%Y-%m");
-        assert_eq!(cfg.library, "SharedSync-ABC");
+        assert_eq!(
+            cfg.library,
+            LibrarySelection::Single("SharedSync-ABC".to_string())
+        );
     }
 
     #[test]
@@ -738,7 +767,37 @@ mod tests {
 
         let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
         assert_eq!(cfg.threads_num, 8);
-        assert_eq!(cfg.library, "PrimarySync");
+        assert_eq!(
+            cfg.library,
+            LibrarySelection::Single("PrimarySync".to_string())
+        );
+    }
+
+    #[test]
+    fn test_library_all_value() {
+        let mut sync = default_sync();
+        sync.library = Some("all".to_string());
+        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        assert_eq!(cfg.library, LibrarySelection::All);
+    }
+
+    #[test]
+    fn test_library_all_case_insensitive() {
+        let mut sync = default_sync();
+        sync.library = Some("ALL".to_string());
+        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        assert_eq!(cfg.library, LibrarySelection::All);
+    }
+
+    #[test]
+    fn test_library_all_from_toml() {
+        let toml_str = r#"
+            [filters]
+            library = "all"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        assert_eq!(cfg.library, LibrarySelection::All);
     }
 
     #[test]
@@ -1261,7 +1320,10 @@ mod tests {
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.retry_delay_secs, 5);
         // Filters
-        assert_eq!(cfg.library, "PrimarySync");
+        assert_eq!(
+            cfg.library,
+            LibrarySelection::Single("PrimarySync".to_string())
+        );
         assert!(cfg.albums.is_empty());
         assert!(!cfg.skip_videos);
         assert!(!cfg.skip_photos);
@@ -1870,7 +1932,10 @@ mod tests {
         assert!(cfg.no_progress_bar);
         assert_eq!(cfg.max_retries, 1);
         assert_eq!(cfg.retry_delay_secs, 2);
-        assert_eq!(cfg.library, "SharedSync-FULL");
+        assert_eq!(
+            cfg.library,
+            LibrarySelection::Single("SharedSync-FULL".to_string())
+        );
         assert_eq!(cfg.albums, vec!["Album1"]);
         assert!(cfg.skip_videos);
         assert_eq!(cfg.recent, Some(50));
