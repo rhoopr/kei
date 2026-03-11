@@ -7,6 +7,8 @@
 
 A fast, reliable iCloud Photos downloader and **icloudpd alternative**. Single binary, no Python runtime, no dependencies.
 
+> **v0.4.0** - Incremental sync is here. After your first full download, icloudpd-rs tracks changes via Apple's CloudKit syncToken and only fetches what's new. A no-change check takes 1-2 API calls instead of ~75. Also adds `--library all` to sync personal + shared libraries in one run. [Release notes](https://github.com/rhoopr/icloudpd-rs/releases/tag/v0.4.0)
+
 Inspired by the excellent [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (icloudpd), which did the hard work of reverse-engineering Apple's private APIs. icloudpd-rs is a ground-up rewrite that adds parallel downloads, persistent state, and resumable transfers - things that are hard to retrofit into an existing codebase:
 
 - **Parallel downloads** - Network speed is the bottleneck, **5x+ faster** than icloudpd in gigabit benchmarks.
