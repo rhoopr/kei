@@ -115,27 +115,29 @@ impl PhotoLibrary {
     pub async fn albums(&self) -> anyhow::Result<HashMap<String, PhotoAlbum>> {
         let mut albums = HashMap::new();
 
-        for (name, def) in smart_folders() {
-            albums.insert(
-                name.to_string(),
-                PhotoAlbum::new(
-                    PhotoAlbumConfig {
-                        params: Arc::clone(&self.params),
-                        service_endpoint: self.service_endpoint.clone(),
-                        name: name.to_string(),
-                        list_type: def.list_type.to_string(),
-                        obj_type: def.obj_type.to_string(),
-                        query_filter: def.query_filter,
-                        page_size: DEFAULT_PAGE_SIZE,
-                        zone_id: self.zone_id.clone(),
-                    },
-                    self.clone_session(),
-                ),
-            );
-        }
-
-        // Shared libraries use a different album structure — skip user albums
-        if self.library_type != "shared" {
+        // Shared libraries don't support smart folder or user album queries —
+        // their CloudKit zones lack the required indexes. Check the zone name
+        // because Apple's private endpoint also returns SharedSync zones
+        // (library_type reflects the API endpoint, not the zone type).
+        if !self.zone_name().starts_with("SharedSync") {
+            for (name, def) in smart_folders() {
+                albums.insert(
+                    name.to_string(),
+                    PhotoAlbum::new(
+                        PhotoAlbumConfig {
+                            params: Arc::clone(&self.params),
+                            service_endpoint: self.service_endpoint.clone(),
+                            name: name.to_string(),
+                            list_type: def.list_type.to_string(),
+                            obj_type: def.obj_type.to_string(),
+                            query_filter: def.query_filter,
+                            page_size: DEFAULT_PAGE_SIZE,
+                            zone_id: self.zone_id.clone(),
+                        },
+                        self.clone_session(),
+                    ),
+                );
+            }
             let folders = self.fetch_folders().await?;
             for folder in &folders {
                 let record_name = &folder.record_name;
