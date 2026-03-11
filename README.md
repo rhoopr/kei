@@ -112,10 +112,18 @@ icloudpd-rs -u you@example.com -d ~/Photos --notification-script ./notify.sh
 # Submit a 2FA code non-interactively (Docker / headless)
 icloudpd-rs submit-code 123456
 
+# Force full sync (skip incremental delta)
+icloudpd-rs -u you@example.com -d ~/Photos --no-incremental
+
+# Clear sync tokens and start fresh incremental tracking
+icloudpd-rs -u you@example.com -d ~/Photos --reset-sync-token
+
 # Check sync status, retry failures, verify downloads
 icloudpd-rs status -u you@example.com
 icloudpd-rs retry-failed -u you@example.com -d ~/Photos
 icloudpd-rs verify -u you@example.com --checksums
+icloudpd-rs reset-state -u you@example.com --yes
+icloudpd-rs import-existing -u you@example.com -d ~/Photos
 ```
 
 Set `ICLOUD_PASSWORD` as an environment variable to avoid being prompted.
@@ -141,7 +149,7 @@ Run `icloudpd-rs --help` for the full flag list, or check the **[Wiki](https://g
 
 ### Not yet implemented
 
-**Coming in v0.4** (next release):
+**Coming in v0.5** (next release):
 - [Auto-delete / Recently Deleted scan](https://github.com/rhoopr/icloudpd-rs/issues/28) - detect iCloud deletions and optionally remove local copies
 - [Delete after download](https://github.com/rhoopr/icloudpd-rs/issues/29) - remove photos from iCloud after successful download
 

@@ -92,8 +92,8 @@ Most flags are the same or very close. Here's the full mapping:
 | `--max-retries` | Retry limit per download (Python hardcoded `MAX_RETRIES = 0`) |
 | `--retry-delay` | Base delay for exponential backoff |
 | `--temp-suffix` | Suffix for partial downloads (default: `.icloudpd-tmp`) |
-| `--no-incremental` | Force full library scan (skip syncToken delta sync) |
-| `--reset-sync-token` | Clear stored sync tokens before syncing |
+| `--no-incremental` | Force full library scan instead of syncToken delta sync. Use when you suspect the incremental state is stale, or to verify that incremental results match a full enumeration. |
+| `--reset-sync-token` | Clear stored sync tokens before syncing. Unlike `--no-incremental`, this also stores the fresh token from the full scan, so the next run resumes incremental from that point. Use after recovering from a bad state or after a long gap between syncs. |
 | `--notify-systemd` | systemd sd_notify integration |
 | `--pid-file` | PID file for service managers |
 | `submit-code <code>` | Submit 2FA code non-interactively (for Docker/headless) |
