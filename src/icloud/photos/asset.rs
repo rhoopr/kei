@@ -377,7 +377,9 @@ impl DeltaRecordBuffer {
                     "CPLMaster" => {
                         let master_name = record.record_name.clone();
                         if let Some(asset_record) = self.pending_assets.remove(&master_name) {
-                            Self::emit_paired(record, asset_record, reason, &mut events);
+                            let asset_reason = classify_change_reason(&asset_record);
+                            let final_reason = Self::reconcile_reasons(reason, asset_reason);
+                            Self::emit_paired(record, asset_record, final_reason, &mut events);
                         } else {
                             self.pending_masters.insert(master_name, record);
                         }
@@ -386,7 +388,9 @@ impl DeltaRecordBuffer {
                         let master_ref = extract_master_ref(&record.fields);
                         if let Some(ref master_name) = master_ref {
                             if let Some(master_record) = self.pending_masters.remove(master_name) {
-                                Self::emit_paired(master_record, record, reason, &mut events);
+                                let master_reason = classify_change_reason(&master_record);
+                                let final_reason = Self::reconcile_reasons(master_reason, reason);
+                                Self::emit_paired(master_record, record, final_reason, &mut events);
                             } else {
                                 self.pending_assets.insert(master_name.clone(), record);
                             }
@@ -437,6 +441,28 @@ impl DeltaRecordBuffer {
         }
 
         events
+    }
+
+    /// Pick the more severe reason from a pair of records.
+    ///
+    /// When CPLMaster and CPLAsset arrive on different pages, we classify
+    /// each independently. A soft-deleted master paired with a non-deleted
+    /// asset should emit `SoftDeleted`, not `Created`. Severity order:
+    /// HardDeleted > SoftDeleted > Hidden > Created.
+    fn reconcile_reasons(a: ChangeReason, b: ChangeReason) -> ChangeReason {
+        fn severity(r: ChangeReason) -> u8 {
+            match r {
+                ChangeReason::HardDeleted => 3,
+                ChangeReason::SoftDeleted => 2,
+                ChangeReason::Hidden => 1,
+                ChangeReason::Created => 0,
+            }
+        }
+        if severity(a) >= severity(b) {
+            a
+        } else {
+            b
+        }
     }
 
     fn emit_paired(
@@ -1240,6 +1266,87 @@ mod tests {
         assert_eq!(events[0].record_name, "M_DEL");
         assert_eq!(events[0].reason, ChangeReason::SoftDeleted);
         assert!(events[0].asset.is_some());
+    }
+
+    #[test]
+    fn test_buffer_soft_deleted_master_with_normal_asset_reconciles() {
+        // Bug fix: when CPLMaster has isDeleted=1 but CPLAsset does not,
+        // the pair should be SoftDeleted (most severe reason wins).
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let soft_deleted_master = Record {
+            record_name: "M_SD".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({
+                "isDeleted": {"value": 1},
+                "filenameEnc": {"value": "deleted.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"}
+            }),
+            deleted: Some(false),
+        };
+        let normal_asset = make_asset_record("A_SD", "M_SD");
+
+        // Master arrives first (soft-deleted), asset arrives second (normal)
+        let events = buffer.process_records(vec![soft_deleted_master, normal_asset]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, ChangeReason::SoftDeleted);
+        assert!(events[0].asset.is_some());
+    }
+
+    #[test]
+    fn test_buffer_normal_master_with_soft_deleted_asset_reconciles() {
+        // Reverse order: normal master, soft-deleted asset
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let normal_master = make_master_record("M_SD2");
+        let soft_deleted_asset = Record {
+            record_name: "A_SD2".to_string(),
+            record_type: "CPLAsset".to_string(),
+            fields: json!({
+                "isDeleted": {"value": 1},
+                "masterRef": {
+                    "value": {
+                        "recordName": "M_SD2",
+                        "zoneID": {"zoneName": "PrimarySync"}
+                    }
+                },
+                "assetDate": {"value": 1736899200000.0}
+            }),
+            deleted: Some(false),
+        };
+
+        let events = buffer.process_records(vec![normal_master, soft_deleted_asset]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, ChangeReason::SoftDeleted);
+        assert!(events[0].asset.is_some());
+    }
+
+    #[test]
+    fn test_buffer_cross_page_soft_deleted_master_reconciles() {
+        // Master arrives on page 1, asset on page 2 — tests the pending path
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let soft_deleted_master = Record {
+            record_name: "M_XP".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({
+                "isDeleted": {"value": 1},
+                "filenameEnc": {"value": "cross_page.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"}
+            }),
+            deleted: Some(false),
+        };
+
+        // Page 1: only the soft-deleted master
+        let events1 = buffer.process_records(vec![soft_deleted_master]);
+        assert!(events1.is_empty()); // buffered, waiting for asset
+
+        // Page 2: normal asset arrives
+        let normal_asset = make_asset_record("A_XP", "M_XP");
+        let events2 = buffer.process_records(vec![normal_asset]);
+        assert_eq!(events2.len(), 1);
+        assert_eq!(events2[0].reason, ChangeReason::SoftDeleted);
+        assert!(events2[0].asset.is_some());
     }
 
     #[test]

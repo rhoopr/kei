@@ -88,7 +88,7 @@ Response:
 
 **Key facts:**
 - `syncToken` is returned at the top level alongside `records`
-- **Our `QueryResponse` struct currently drops `syncToken` silently** — only captures `records`
+- **Our `QueryResponse` struct captures `syncToken`** via the `sync_token: Option<String>` field
 - `getCurrentSyncToken=true` query param is required to get the token; without it, no token
 - We already send `getCurrentSyncToken=true` (set in `PhotosService::new()` at mod.rs:56)
 - Token is zone-level: same value regardless of `startRank` offset or `resultsLimit`

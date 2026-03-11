@@ -984,7 +984,7 @@ async fn main() -> anyhow::Result<()> {
                                     "changes/database has more pages (moreComing=true)"
                                 );
                             }
-                            if db_resp.zones.is_empty() {
+                            if db_resp.zones.is_empty() && !db_resp.more_coming {
                                 tracing::info!(
                                     "No changes detected (changes/database), skipping cycle"
                                 );
