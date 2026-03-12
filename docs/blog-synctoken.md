@@ -33,25 +33,15 @@ The only "documentation" for the Photos-specific layer is the source code of too
 
 ## The Testing Methodology (And the Rate Limits)
 
-There's no sandbox for Apple's private API, and no test accounts with predictable behavior, so every test ran against a real iCloud account with a real photo library. Every API call counted against real rate limits.
+There's no sandbox for Apple's private API, so every test ran against a real iCloud account with a real photo library. Too many calls too quickly gets you HTTP 503 responses or temporary session blocks.
 
-Apple doesn't publish rate limit documentation for the private API either. What I can tell you is that too many calls too quickly gets you HTTP 503 responses or temporary session blocks. I learned the boundaries the hard way.
+1. **Observe and probe.** The standard `records/query` response includes a `syncToken` field. If it's a change bookmark, there should be an endpoint that accepts it. Apple's public CloudKit has `/changes/zone` — the private API does too, and it accepts the token.
 
-The process looked roughly like this:
+2. **Brute force the semantics.** Each property of the token required its own tests. Is it deterministic? Idempotent? Does it support random access? Survive session refresh? Work across endpoints? Every test means API calls against rate limits and careful comparison of response bodies.
 
-1. **Observe.** Make a standard `records/query` call (the endpoint existing tools use to list all photos). The response includes a `syncToken` field alongside the records.
+3. **Mutate and observe.** Delete 5 photos, add 2, check the delta. Edit a photo, restore one from trash, take a Live Photo, check the delta. Hide one, favorite one. Every mutation changes library state irreversibly, so I had to plan test sequences carefully. Batch operations (deleting 15 photos at once) were important because I needed to know whether the API coalesces them. It doesn't — each photo gets its own set of records.
 
-2. **Hypothesize.** If this token is a change bookmark, there should be an endpoint that accepts it and returns only what's changed. Apple's public CloudKit has `/changes/zone`. Does the private API?
-
-3. **Probe.** Try the endpoint. It exists, it accepts a token, and it returns records. Now: what are the semantics?
-
-4. **Brute force.** Each property of the token required its own set of tests. Is it deterministic? (Call the same token five times rapidly, compare results.) Idempotent? (Reuse a page token, check if results change.) Does it support random access? (Save a token from page 5, skip ahead, go back.) Session-independent? (Save token, re-authenticate, reuse.) Cross-endpoint compatible? (Take a `records/query` token, feed it to `changes/zone`.) Every test means a separate set of API calls, risks hitting rate limits, and requires careful comparison of response bodies.
-
-5. **Mutate and observe.** The hardest tests required making actual changes to the photo library, then observing the delta - what the API reports as changed. Delete 5 photos, add 2, check the delta. Edit a photo, restore one from trash, take a Live Photo, check the delta. Add a photo to an album, hide one, favorite one.
-
-   Every mutation test is irreversible in the sense that it changes the library state. I had to plan test sequences carefully and record state at each step. Batch operations (deleting 15 photos at once) were particularly important because I needed to know whether the API coalesces them or represents each individually. It doesn't coalesce - each photo gets its own set of records, whether you deleted 1 or 15.
-
-6. **Document.** Write down every finding immediately, with the raw evidence - the actual response fields, record counts, and token values, not interpretations.
+4. **Document.** Write down every finding immediately — actual response fields, record counts, and token values, not interpretations.
 
 Some tests had to be repeated after edge cases invalidated earlier assumptions. One thing I didn't expect: during full history enumeration, pages 27 through 96 returned zero records with `moreComing: true`. Sixty-nine consecutive empty pages (nice), apparently from the API walking through internal log segments that had been compacted. A naive implementation would bail out early and miss the rest of the data.
 
