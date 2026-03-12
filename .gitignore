@@ -1,5 +1,6 @@
 # Local Repo
 .scratch/
+docs/synctoken-spec.md
 
 # Rust
 /target
