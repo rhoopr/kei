@@ -237,6 +237,11 @@ fn sync_skip_videos_excludes_video_files() {
             .success();
 
         let files = common::walkdir(download_dir.path());
+        assert!(
+            !files.is_empty(),
+            "should download files when skipping videos"
+        );
+
         // --skip-videos excludes standalone videos, not Live Photo MOV companions
         let standalone_videos: Vec<_> = files
             .iter()
@@ -245,6 +250,13 @@ fn sync_skip_videos_excludes_video_files() {
         assert!(
             standalone_videos.is_empty(),
             "--skip-videos should exclude standalone video files, found: {standalone_videos:?}"
+        );
+
+        // Live Photo MOV companion (IMG_0212) should still be present
+        let live_movs = live_photo_movs(download_dir.path());
+        assert!(
+            !live_movs.is_empty(),
+            "--skip-videos should keep Live Photo MOV companions, but none found"
         );
 
         let image_files: Vec<_> = files.iter().filter(|p| is_image_ext(p)).collect();
@@ -424,8 +436,15 @@ fn sync_size_medium_produces_smaller_files() {
         let files = common::walkdir(download_dir.path());
         assert!(!files.is_empty(), "should download files at medium size");
 
-        // Medium photos should be well under 2MB (originals are typically 3-15MB)
-        for f in &files {
+        // Medium photos should be well under 2MB (originals are typically 3-15MB).
+        // RAW files (.dng, .cr2, .nef) lack medium/thumb alternatives and silently
+        // fall back to the original size, so exclude them from the size check.
+        let non_raw_files: Vec<_> = files.iter().filter(|p| !is_raw_ext(p)).collect();
+        assert!(
+            !non_raw_files.is_empty(),
+            "should have non-RAW files at medium size"
+        );
+        for f in &non_raw_files {
             let size = std::fs::metadata(f).unwrap().len();
             assert!(
                 size < 2_097_152,
@@ -458,6 +477,18 @@ fn sync_force_size_succeeds_when_available() {
             !files.is_empty(),
             "--force-size with available size should download files"
         );
+
+        // With --force-size medium, non-RAW files should be smaller than originals
+        let non_raw_files: Vec<_> = files.iter().filter(|p| !is_raw_ext(p)).collect();
+        for f in &non_raw_files {
+            let size = std::fs::metadata(f).unwrap().len();
+            assert!(
+                size < 2_097_152,
+                "--force-size medium file should be under 2MB, got {} bytes: {}",
+                size,
+                f.display()
+            );
+        }
     });
 }
 
@@ -571,6 +602,10 @@ fn sync_keep_unicode_preserves_special_chars() {
             .success();
 
         let files = common::walkdir(download_dir.path());
+        assert!(
+            !files.is_empty(),
+            "should download files to check for unicode filenames"
+        );
         let has_unicode = files.iter().any(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
@@ -763,8 +798,13 @@ fn sync_temp_suffix_leaves_no_remnants() {
             .assert()
             .success();
 
-        let temp_files: Vec<_> = common::walkdir(download_dir.path())
-            .into_iter()
+        let all_files = common::walkdir(download_dir.path());
+        assert!(
+            !all_files.is_empty(),
+            "should download files with --temp-suffix"
+        );
+        let temp_files: Vec<_> = all_files
+            .iter()
             .filter(|p| p.to_str().unwrap_or("").ends_with(".downloading"))
             .collect();
         assert!(
@@ -838,8 +878,9 @@ fn sync_notification_script_fires_event() {
         );
         let content = std::fs::read_to_string(&marker).expect("read marker");
         assert!(
-            !content.trim().is_empty(),
-            "marker file should contain event name"
+            content.trim() == "sync_complete" || content.trim() == "sync_failed",
+            "marker file should contain a known event name, got: {:?}",
+            content.trim()
         );
     });
 }
@@ -865,6 +906,13 @@ fn sync_pid_file_cleaned_up_after_sync() {
         assert!(
             !pid_file.exists(),
             "PID file should be removed after sync completes"
+        );
+
+        // Verify sync actually ran (downloaded files)
+        let files = common::walkdir(download_dir.path());
+        assert!(
+            !files.is_empty(),
+            "sync with --pid-file should still download files"
         );
     });
 }
@@ -901,7 +949,15 @@ fn sync_bare_invocation_works_like_sync() {
             .success();
 
         let files = common::walkdir(download_dir.path());
-        assert!(!files.is_empty(), "bare invocation should download files");
+        assert!(
+            files.len() >= 5,
+            "bare invocation should download all test album files, got {}",
+            files.len()
+        );
+        for f in &files {
+            let size = std::fs::metadata(f).unwrap().len();
+            assert!(size > 0, "file should be non-empty: {}", f.display());
+        }
     });
 }
 
@@ -1039,6 +1095,15 @@ fn is_video_ext(p: &std::path::Path) -> bool {
         .unwrap_or("")
         .to_lowercase();
     ext == "mp4" || ext == "mov"
+}
+
+fn is_raw_ext(p: &std::path::Path) -> bool {
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(ext.as_str(), "dng" | "cr2" | "nef")
 }
 
 fn is_image_ext(p: &std::path::Path) -> bool {

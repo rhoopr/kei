@@ -288,6 +288,7 @@ mod tests {
     #[test]
     fn test_desired_keys_values_matches_keys() {
         let values = &*DESIRED_KEYS_VALUES;
+        assert!(!values.is_empty(), "DESIRED_KEYS_VALUES must not be empty");
         assert_eq!(values.len(), DESIRED_KEYS.len());
         for (key, val) in DESIRED_KEYS.iter().zip(values.iter()) {
             assert_eq!(val.as_str().unwrap(), *key);

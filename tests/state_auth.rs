@@ -322,7 +322,12 @@ fn verify_detects_missing_files() {
             .assert()
             .success();
 
-        for entry in common::walkdir(download_dir.path()) {
+        let files = common::walkdir(download_dir.path());
+        assert!(
+            !files.is_empty(),
+            "need files to delete for missing-file test"
+        );
+        for entry in files {
             std::fs::remove_file(&entry).ok();
         }
 
@@ -516,10 +521,16 @@ fn retry_failed_after_successful_sync_is_noop() {
             .assert()
             .success();
 
-        retry_failed_cmd(&username, &password, &cookie_dir, download_dir.path())
+        let assertion = retry_failed_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(60))
             .assert()
             .success();
+
+        let stderr = String::from_utf8_lossy(&assertion.get_output().stderr);
+        assert!(
+            stderr.contains("No failed assets to retry"),
+            "retry-failed after successful sync should report no failures, stderr:\n{stderr}"
+        );
     });
 }
 
@@ -532,9 +543,81 @@ fn retry_failed_with_no_db_succeeds() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        retry_failed_cmd(&username, &password, &cookie_dir, download_dir.path())
+        let output = retry_failed_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
-            .success();
+            .success()
+            .get_output()
+            .clone();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No failed assets to retry"),
+            "retry-failed with no DB should report nothing to retry, stderr:\n{stderr}"
+        );
+    });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  DRY-RUN SIDE EFFECTS
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Document known behavior: --dry-run writes sync tokens to the state DB.
+/// This is arguably a bug — dry runs should not have side effects.
+/// If this test starts failing, the bug may have been fixed.
+#[test]
+fn dry_run_stores_sync_token_bug() {
+    let Some((username, password, cookie_dir)) = common::require_preauth() else {
+        return;
+    };
+
+    common::with_auth_retry(|| {
+        let isolated_cookies = tempfile::tempdir().expect("tempdir for isolated cookies");
+
+        // Copy session cookies from shared cookie dir so we can auth without
+        // contaminating the shared state DB.
+        for entry in std::fs::read_dir(&cookie_dir).expect("read cookie dir") {
+            let entry = entry.expect("dir entry");
+            let src = entry.path();
+            if src.is_file() {
+                let dest = isolated_cookies.path().join(entry.file_name());
+                std::fs::copy(&src, &dest).expect("copy cookie file");
+            }
+        }
+
+        let download_dir = tempfile::tempdir().expect("tempdir for downloads");
+
+        // Run a dry-run sync
+        sync_cmd(
+            &username,
+            &password,
+            isolated_cookies.path(),
+            download_dir.path(),
+            2,
+        )
+        .args(["--dry-run"])
+        .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
+        .assert()
+        .success();
+
+        // Check if any .db file was created in the isolated cookie dir
+        let db_files: Vec<_> = std::fs::read_dir(isolated_cookies.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext == "db")
+            })
+            .collect();
+
+        // Known bug: dry-run creates a state DB with sync tokens.
+        // If this assertion starts failing, the bug may have been fixed —
+        // update this test to assert the opposite.
+        assert!(
+            !db_files.is_empty(),
+            "known bug: --dry-run should not create a state DB, but currently does"
+        );
     });
 }

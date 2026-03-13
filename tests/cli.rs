@@ -32,6 +32,10 @@ fn help_flag_succeeds() {
 
 #[test]
 fn help_lists_all_subcommands() {
+    assert!(
+        !ALL_SUBCOMMANDS.is_empty(),
+        "ALL_SUBCOMMANDS must not be empty"
+    );
     let assert = common::cmd().arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     for sub in ALL_SUBCOMMANDS {
@@ -598,7 +602,7 @@ fn password_from_env_var() {
 fn config_explicit_nonexistent_path_fails_at_runtime() {
     // When the user explicitly sets --config to a path that doesn't exist
     // (not the default), the binary should fail at runtime.
-    common::cmd()
+    let output = common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
         .args([
@@ -610,7 +614,15 @@ fn config_explicit_nonexistent_path_fails_at_runtime() {
         ])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
-        .failure();
+        .failure()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("config") || stderr.contains("nonexistent"),
+        "error should mention the config file, stderr:\n{stderr}"
+    );
 }
 
 // ── Auth flags on non-sync subcommands ──────────────────────────────────
