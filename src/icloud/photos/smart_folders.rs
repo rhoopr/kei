@@ -187,6 +187,7 @@ mod tests {
     #[test]
     fn test_all_smart_folders_have_nonempty_types() {
         let folders = smart_folders();
+        assert!(!folders.is_empty(), "smart_folders() must not be empty");
         for (name, def) in &folders {
             assert!(!def.obj_type.is_empty(), "{name} has empty obj_type");
             assert!(!def.list_type.is_empty(), "{name} has empty list_type");

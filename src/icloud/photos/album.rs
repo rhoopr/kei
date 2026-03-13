@@ -545,18 +545,18 @@ impl PhotoAlbum {
 
                 let mut limit_reached = false;
                 for master in master_records {
+                    if let Some(n) = limit {
+                        if total_sent >= n as u64 {
+                            limit_reached = true;
+                            break;
+                        }
+                    }
                     if let Some(asset_rec) = asset_records.remove(&master.record_name) {
                         let asset = PhotoAsset::from_records(master, asset_rec);
                         if tx.send(Ok(asset)).await.is_err() {
                             return;
                         }
                         total_sent += 1;
-                        if let Some(n) = limit {
-                            if total_sent >= n as u64 {
-                                limit_reached = true;
-                                break;
-                            }
-                        }
                     }
                     offset += 1;
                 }
@@ -1016,6 +1016,44 @@ mod tests {
         // (which panics on call). Same as the photo_stream setup tests.
         let album = make_album(100, None, default_zone());
         let (_stream, _token_rx) = album.photo_stream_with_token(None, None, 10);
+    }
+
+    // --- limit / --recent edge case tests ---
+
+    #[tokio::test]
+    async fn test_photo_stream_limit_zero_yields_nothing() {
+        use tokio_stream::StreamExt;
+
+        // --recent 0 should produce 0 items. The CannedSession has a valid
+        // page available, but limit=0 means the fetcher should never send it.
+        let session =
+            CannedSession::new(vec![canned_page("master-1", None), json!({"records": []})]);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, _handles) = album.photo_stream_inner(Some(0), Some(10), 1, None);
+        tokio::pin!(stream);
+
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 0, "--recent 0 should yield 0 items");
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_limit_one_yields_exactly_one() {
+        use tokio_stream::StreamExt;
+
+        let session = CannedSession::new(vec![
+            canned_page("master-1", None),
+            canned_page("master-2", None),
+            json!({"records": []}),
+        ]);
+        let album = make_album_with_session(1, Box::new(session));
+
+        let (stream, _handles) = album.photo_stream_inner(Some(1), Some(10), 1, None);
+        tokio::pin!(stream);
+
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1, "--recent 1 should yield exactly 1 item");
+        items[0].as_ref().expect("item should be Ok");
     }
 
     // --- changes_stream tests ---
