@@ -137,7 +137,7 @@ impl Session {
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
 
         let cookiejar_path = cookie_dir.join(&sanitized);
-        if cookiejar_path.exists() {
+        if cookiejar_path.is_file() {
             match fs::read_to_string(&cookiejar_path).await {
                 Ok(contents) => {
                     let now = chrono::Utc::now();

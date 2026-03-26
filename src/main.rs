@@ -572,7 +572,7 @@ async fn run_import_existing(
                         }
 
                         matched += 1;
-                        if matched.is_multiple_of(100) {
+                        if !args.no_progress_bar && matched.is_multiple_of(100) {
                             println!("  Matched {matched} files so far...");
                         }
                     } else {

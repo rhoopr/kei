@@ -220,6 +220,10 @@ pub struct ImportArgs {
     /// Number of recent photos to check
     #[arg(long)]
     pub recent: Option<u32>,
+
+    /// Disable progress bar
+    #[arg(long)]
+    pub no_progress_bar: bool,
 }
 
 /// Arguments for the verify command.
@@ -275,7 +279,11 @@ pub enum Command {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "icloudpd-rs", about = "Download iCloud photos and videos")]
+#[command(
+    name = "icloudpd-rs",
+    about = "Download iCloud photos and videos",
+    version
+)]
 pub struct Cli {
     /// Log level
     #[arg(long, value_enum, global = true)]

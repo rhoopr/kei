@@ -819,6 +819,28 @@ fn no_incremental_and_reset_sync_token_together() {
         .success();
 }
 
+// ── Version flag ────────────────────────────────────────────────────────
+
+#[test]
+fn version_flag() {
+    common::cmd()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
+}
+
+// ── import-existing --no-progress-bar ───────────────────────────────────
+
+#[test]
+fn import_existing_accepts_no_progress_bar() {
+    common::cmd()
+        .args(["import-existing", "--no-progress-bar", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-progress-bar"));
+}
+
 // ── submit-code validation ─────────────────────────────────────────────
 
 #[test]
