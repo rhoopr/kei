@@ -1395,7 +1395,6 @@ where
                             if config.retry_only
                                 && !download_ctx.known_ids.contains(task.asset_id.as_ref())
                             {
-                                producer_pb.inc(1);
                                 continue;
                             }
 
@@ -1439,7 +1438,6 @@ where
                                             asset_id = %task.asset_id,
                                             "Skipping (state confirms no download needed)"
                                         );
-                                        producer_pb.inc(1);
                                     }
                                     None => {
                                         match tokio::fs::try_exists(&task.download_path).await {
@@ -1449,7 +1447,6 @@ where
                                                     path = %task.download_path.display(),
                                                     "Skipping (already downloaded)"
                                                 );
-                                                producer_pb.inc(1);
                                             }
                                             Ok(false) => {
                                                 if paths::find_ampm_variant_cached(
@@ -1463,7 +1460,6 @@ where
                                                         path = %task.download_path.display(),
                                                         "Skipping (AM/PM variant exists on disk)"
                                                     );
-                                                    producer_pb.inc(1);
                                                 } else {
                                                     tracing::debug!(
                                                         asset_id = %task.asset_id,
@@ -1491,6 +1487,7 @@ where
                                 return;
                             }
                         }
+                        producer_pb.inc(1);
                     }
                 }
                 Err(e) => {
@@ -1583,7 +1580,6 @@ where
                             ));
                         }
                         failed.push(task);
-                        pb.inc(1);
                         continue;
                     }
                 }
@@ -1600,7 +1596,6 @@ where
                 failed.push(task);
             }
         }
-        pb.inc(1);
 
         if let Some(db) = &state_db {
             if downloaded_batch.len() >= DB_BATCH_SIZE {
