@@ -1008,11 +1008,14 @@ async fn download_photos_full_with_token(
 
     // Collect the sync token from any album's token receiver.
     // In practice, all albums share the same zone so any token suffices.
+    // Don't advance the token for read-only operations like --only-print-filenames.
     let mut sync_token = None;
-    for rx in token_receivers {
-        if let Ok(Some(token)) = rx.await {
-            sync_token = Some(token);
-            break;
+    if !config.only_print_filenames {
+        for rx in token_receivers {
+            if let Ok(Some(token)) = rx.await {
+                sync_token = Some(token);
+                break;
+            }
         }
     }
 
@@ -1185,9 +1188,10 @@ async fn download_photos_incremental(
         for task in &tasks {
             println!("{}", task.download_path.display());
         }
+        // Don't advance the sync token — this is a read-only operation.
         return Ok(SyncResult {
             outcome: DownloadOutcome::Success,
-            sync_token,
+            sync_token: None,
         });
     }
 
