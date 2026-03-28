@@ -44,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Progress / UI
 indicatif = "0.18"
 rpassword = "7"
+dialoguer = "0.11"
 
 # EXIF — two libraries because no single crate handles both read and write.
 # kamadak-exif: read-only, used for reading DateTimeOriginal from existing files.
