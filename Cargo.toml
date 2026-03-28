@@ -12,7 +12,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive", "env"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 # HTTP
 reqwest = { version = "0.13", features = ["cookies", "json", "stream", "http2"] }
@@ -24,7 +24,7 @@ cookie = "0.18"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 
 # Crypto (SRP auth)
 sha2 = "0.10"
@@ -56,12 +56,10 @@ anyhow = "1"
 thiserror = "2"
 
 # Random
-rand = "0.9"
+rand = "0.10"
 
 # File locking
 fs4 = "0.13"
-
-time = "0.3"
 
 # Misc
 url = "2"
@@ -70,7 +68,7 @@ async-trait = "0.1"
 urlencoding = "2"
 
 # SQLite state tracking
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Memory optimization
 smallvec = "1.15"
@@ -78,14 +76,14 @@ rustc-hash = "2.1"
 data-encoding = "2.10.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-sd-notify = "0.4"
+sd-notify = "0.5"
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 dotenvy = "0.15"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 [[test]]
 name = "cli"

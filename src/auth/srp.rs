@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use num_bigint::BigUint;
-use rand::Rng;
+use rand::RngExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 
