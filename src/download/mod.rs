@@ -200,6 +200,7 @@ pub struct DownloadConfig {
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub(crate) align_raw: RawTreatmentPolicy,
     pub(crate) no_progress_bar: bool,
+    pub(crate) only_print_filenames: bool,
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_size: bool,
     pub(crate) keep_unicode_in_filenames: bool,
@@ -237,6 +238,7 @@ impl std::fmt::Debug for DownloadConfig {
             )
             .field("align_raw", &self.align_raw)
             .field("no_progress_bar", &self.no_progress_bar)
+            .field("only_print_filenames", &self.only_print_filenames)
             .field("file_match_policy", &self.file_match_policy)
             .field("force_size", &self.force_size)
             .field("keep_unicode_in_filenames", &self.keep_unicode_in_filenames)
@@ -863,11 +865,15 @@ fn filter_asset_to_tasks(
 
 /// Create a progress bar with a consistent template.
 ///
-/// Returns `ProgressBar::hidden()` when the user passed `--no-progress-bar` or
-/// stdout is not a TTY (e.g. piped output, cron jobs) — this prevents output
-/// corruption and honours the user's preference.
-fn create_progress_bar(no_progress_bar: bool, total: u64) -> ProgressBar {
-    if no_progress_bar || !std::io::stdout().is_terminal() {
+/// Returns `ProgressBar::hidden()` when the user passed `--no-progress-bar`,
+/// `--only-print-filenames`, or stdout is not a TTY (e.g. piped output, cron
+/// jobs) — this prevents output corruption and honours the user's preference.
+fn create_progress_bar(
+    no_progress_bar: bool,
+    only_print_filenames: bool,
+    total: u64,
+) -> ProgressBar {
+    if no_progress_bar || only_print_filenames || !std::io::stdout().is_terminal() {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new(total);
@@ -1002,11 +1008,14 @@ async fn download_photos_full_with_token(
 
     // Collect the sync token from any album's token receiver.
     // In practice, all albums share the same zone so any token suffices.
+    // Don't advance the token for read-only operations like --only-print-filenames.
     let mut sync_token = None;
-    for rx in token_receivers {
-        if let Ok(Some(token)) = rx.await {
-            sync_token = Some(token);
-            break;
+    if !config.only_print_filenames {
+        for rx in token_receivers {
+            if let Ok(Some(token)) = rx.await {
+                sync_token = Some(token);
+                break;
+            }
         }
     }
 
@@ -1175,6 +1184,17 @@ async fn download_photos_incremental(
         });
     }
 
+    if config.only_print_filenames {
+        for task in &tasks {
+            println!("{}", task.download_path.display());
+        }
+        // Don't advance the sync token — this is a read-only operation.
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::Success,
+            sync_token: None,
+        });
+    }
+
     let task_count = tasks.len();
     tracing::info!(
         count = task_count,
@@ -1259,7 +1279,56 @@ where
         + Send
         + 'static,
 {
-    let pb = create_progress_bar(config.no_progress_bar, total);
+    let pb = create_progress_bar(config.no_progress_bar, config.only_print_filenames, total);
+
+    if config.only_print_filenames {
+        // Load state DB context so we skip already-downloaded assets,
+        // matching the incremental path's behavior.
+        let download_ctx = if let Some(db) = &config.state_db {
+            DownloadContext::load(db.as_ref(), false).await
+        } else {
+            DownloadContext::default()
+        };
+
+        tokio::pin!(combined);
+        let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
+        let mut dir_cache = std::collections::HashMap::new();
+        while let Some(result) = combined.next().await {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            match result {
+                Ok(asset) => {
+                    let candidates = extract_skip_candidates(&asset, config);
+                    if !candidates.is_empty()
+                        && candidates.iter().all(|&(vs, cs)| {
+                            matches!(
+                                download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                                Some(false)
+                            )
+                        })
+                    {
+                        continue;
+                    }
+
+                    let tasks =
+                        filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
+                    for task in &tasks {
+                        println!("{}", task.download_path.display());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Error fetching asset");
+                }
+            }
+        }
+        return Ok(StreamingResult {
+            downloaded: 0,
+            exif_failures: 0,
+            failed: Vec::new(),
+            auth_errors: 0,
+        });
+    }
 
     if config.dry_run {
         tokio::pin!(combined);
@@ -1395,7 +1464,6 @@ where
                             if config.retry_only
                                 && !download_ctx.known_ids.contains(task.asset_id.as_ref())
                             {
-                                producer_pb.inc(1);
                                 continue;
                             }
 
@@ -1439,7 +1507,6 @@ where
                                             asset_id = %task.asset_id,
                                             "Skipping (state confirms no download needed)"
                                         );
-                                        producer_pb.inc(1);
                                     }
                                     None => {
                                         match tokio::fs::try_exists(&task.download_path).await {
@@ -1449,7 +1516,6 @@ where
                                                     path = %task.download_path.display(),
                                                     "Skipping (already downloaded)"
                                                 );
-                                                producer_pb.inc(1);
                                             }
                                             Ok(false) => {
                                                 if paths::find_ampm_variant_cached(
@@ -1463,7 +1529,6 @@ where
                                                         path = %task.download_path.display(),
                                                         "Skipping (AM/PM variant exists on disk)"
                                                     );
-                                                    producer_pb.inc(1);
                                                 } else {
                                                     tracing::debug!(
                                                         asset_id = %task.asset_id,
@@ -1491,6 +1556,7 @@ where
                                 return;
                             }
                         }
+                        producer_pb.inc(1);
                     }
                 }
                 Err(e) => {
@@ -1583,7 +1649,6 @@ where
                             ));
                         }
                         failed.push(task);
-                        pb.inc(1);
                         continue;
                     }
                 }
@@ -1600,7 +1665,6 @@ where
                 failed.push(task);
             }
         }
-        pb.inc(1);
 
         if let Some(db) = &state_db {
             if downloaded_batch.len() >= DB_BATCH_SIZE {
@@ -1845,7 +1909,7 @@ struct PassConfig<'a> {
 
 /// Execute a download pass over the given tasks, returning any that failed.
 async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> PassResult {
-    let pb = create_progress_bar(config.no_progress_bar, tasks.len() as u64);
+    let pb = create_progress_bar(config.no_progress_bar, false, tasks.len() as u64);
     let client = config.client.clone();
     let retry_config = config.retry_config;
     let set_exif = config.set_exif;
@@ -2134,6 +2198,7 @@ mod tests {
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             align_raw: RawTreatmentPolicy::Unchanged,
             no_progress_bar: true,
+            only_print_filenames: false,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
@@ -2783,7 +2848,13 @@ mod tests {
 
     #[test]
     fn test_create_progress_bar_hidden_when_disabled() {
-        let pb = create_progress_bar(true, 100);
+        let pb = create_progress_bar(true, false, 100);
+        assert!(pb.is_hidden());
+    }
+
+    #[test]
+    fn test_create_progress_bar_hidden_when_only_print_filenames() {
+        let pb = create_progress_bar(false, true, 100);
         assert!(pb.is_hidden());
     }
 
@@ -2873,7 +2944,7 @@ mod tests {
         // When not disabled, the bar should have the correct length.
         // In CI/test environments stdout may not be a TTY, so the bar
         // may be hidden — we test both branches.
-        let pb = create_progress_bar(false, 42);
+        let pb = create_progress_bar(false, false, 42);
         if std::io::stdout().is_terminal() {
             assert!(!pb.is_hidden());
             assert_eq!(pb.length(), Some(42));

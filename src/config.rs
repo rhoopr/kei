@@ -185,7 +185,6 @@ pub struct Config {
     pub dry_run: bool,
     pub no_progress_bar: bool,
     pub keep_unicode_in_filenames: bool,
-    #[allow(dead_code)] // CLI flag parsed but not yet wired
     pub only_print_filenames: bool,
     pub no_incremental: bool,
     pub reset_sync_token: bool,

@@ -137,7 +137,7 @@ impl Session {
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
 
         let cookiejar_path = cookie_dir.join(&sanitized);
-        if cookiejar_path.exists() {
+        if cookiejar_path.is_file() {
             match fs::read_to_string(&cookiejar_path).await {
                 Ok(contents) => {
                     let now = chrono::Utc::now();
@@ -523,6 +523,23 @@ mod tests {
         let _s2 = Session::new(&dir, "user@test.com", "https://example.com", None)
             .await
             .expect("Lock should be released after drop");
+    }
+
+    #[tokio::test]
+    async fn test_cookiejar_directory_at_path_skipped() {
+        let dir = test_dir("cookie_dir_skip");
+        let sanitized = sanitize_username("user@test.com");
+        let cookiejar_path = dir.join(&sanitized);
+
+        // Create a directory where the cookiejar file would be
+        std::fs::create_dir_all(&cookiejar_path).unwrap();
+        assert!(cookiejar_path.is_dir());
+
+        // Session should initialize without error (directory silently skipped)
+        let session = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .unwrap();
+        assert!(session.cookiejar_path().is_dir());
     }
 
     #[tokio::test]

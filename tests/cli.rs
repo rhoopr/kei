@@ -661,14 +661,15 @@ fn log_level_before_subcommand() {
         .success();
 }
 
-// ── Hidden flags ────────────────────────────────────────────────────────
+// ── --only-print-filenames ──────────────────────────────────────────────
 
 #[test]
-fn only_print_filenames_hidden_flag_accepted() {
+fn only_print_filenames_visible_in_help() {
     common::cmd()
-        .args(["sync", "--only-print-filenames", "--help"])
+        .args(["sync", "--help"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("--only-print-filenames"));
 }
 
 // ── import-existing short -d flag ───────────────────────────────────────
@@ -817,6 +818,28 @@ fn no_incremental_and_reset_sync_token_together() {
         .args(["sync", "--no-incremental", "--reset-sync-token", "--help"])
         .assert()
         .success();
+}
+
+// ── Version flag ────────────────────────────────────────────────────────
+
+#[test]
+fn version_flag() {
+    common::cmd()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
+}
+
+// ── import-existing --no-progress-bar ───────────────────────────────────
+
+#[test]
+fn import_existing_accepts_no_progress_bar() {
+    common::cmd()
+        .args(["import-existing", "--no-progress-bar", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-progress-bar"));
 }
 
 // ── submit-code validation ─────────────────────────────────────────────

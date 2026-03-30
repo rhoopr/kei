@@ -1,12 +1,6 @@
 # Roadmap
 
-Current version: **v0.4.0**
-
-## v0.4.1 — Bug fix + complete existing flags
-
-- [#17](https://github.com/rhoopr/icloudpd-rs/issues/17) Wire up `--only-print-filenames`
-- [#47](https://github.com/rhoopr/icloudpd-rs/issues/47) Progress bar overshoot fix
-- [#127](https://github.com/rhoopr/icloudpd-rs/issues/127) CLI polish (already addressed on `feat/delete-and-v040`)
+Current version: **v0.4.1**
 
 ## v0.5.0 — Config, env vars, validation
 

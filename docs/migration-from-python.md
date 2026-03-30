@@ -52,6 +52,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--align-raw` | `as-is`, `original`, `alternative` |
 | `--file-match-policy` | `name-size-dedup-with-suffix` or `name-id7` |
 | `--live-photo-size` | `original`, `medium`, `thumb` |
+| `--only-print-filenames` | Prints paths that would be downloaded, one per line. Doesn't download or delete. |
 | `--no-progress-bar` | |
 | `--dry-run` | |
 | `--auth-only` | |
@@ -74,12 +75,11 @@ Most flags are the same or very close. Here's the full mapping:
 | Python flag | Status | Tracking |
 |-------------|--------|----------|
 | `--until-found` | Replaced by SQLite state - not needed | - |
-| `--auto-delete` | **Coming in v0.4** | [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) |
-| `--delete-after-download` | **Coming in v0.4** | [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) |
+| `--auto-delete` | Planned | [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) |
+| `--delete-after-download` | Planned | [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) |
 | `--keep-icloud-recent-days` | Planned | [#30](https://github.com/rhoopr/icloudpd-rs/issues/30) |
 | `--xmp-sidecar` | Planned | [#19](https://github.com/rhoopr/icloudpd-rs/issues/19) |
 | `--smtp-*` (all SMTP flags) | Planned | [#31](https://github.com/rhoopr/icloudpd-rs/issues/31) |
-| `--only-print-filenames` | Planned | [#17](https://github.com/rhoopr/icloudpd-rs/issues/17) |
 | `--use-os-locale` | Not planned | - |
 | `--password-provider` | Not applicable - uses `ICLOUD_PASSWORD` env var or interactive prompt | - |
 | `--mfa-provider` | Not applicable - uses trusted device or `submit-code` subcommand | - |

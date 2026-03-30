@@ -7,7 +7,7 @@
 
 A fast iCloud Photos downloader and **icloudpd alternative**. Single binary, no Python runtime, no dependencies.
 
-> **v0.4.0** - Incremental sync via Apple's CloudKit syncToken. After the first full download, only new/changed photos are fetched - a no-change check takes 1-2 API calls instead of ~75. Also adds `--library all` for personal + shared libraries in one run. [Release notes](https://github.com/rhoopr/icloudpd-rs/releases/tag/v0.4.0)
+> **v0.4.1** - Adds `--only-print-filenames` to preview what would be downloaded, fixes progress bar overshoot with live photos, and adds `--version` and `--no-progress-bar` for `import-existing`. [Release notes](https://github.com/rhoopr/icloudpd-rs/releases/tag/v0.4.1) | [Changelog](CHANGELOG.md)
 
 A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (icloudpd), which did the hard work of reverse-engineering Apple's private APIs.
 

@@ -480,7 +480,9 @@ async fn run_import_existing(
     let stream = all_album.photo_stream(args.recent, None, 1);
     tokio::pin!(stream);
 
-    println!("Scanning iCloud assets and matching with local files...");
+    if !args.no_progress_bar {
+        println!("Scanning iCloud assets and matching with local files...");
+    }
 
     let mut matched = 0u64;
     let mut unmatched = 0u64;
@@ -572,7 +574,7 @@ async fn run_import_existing(
                         }
 
                         matched += 1;
-                        if matched.is_multiple_of(100) {
+                        if !args.no_progress_bar && matched.is_multiple_of(100) {
                             println!("  Matched {matched} files so far...");
                         }
                     } else {
@@ -587,11 +589,13 @@ async fn run_import_existing(
         }
     }
 
-    println!();
-    println!("Import complete:");
-    println!("  Total assets scanned: {total}");
-    println!("  Files matched:        {matched}");
-    println!("  Unmatched versions:   {unmatched}");
+    if !args.no_progress_bar {
+        println!();
+        println!("Import complete:");
+        println!("  Total assets scanned: {total}");
+        println!("  Files matched:        {matched}");
+        println!("  Unmatched versions:   {unmatched}");
+    }
 
     Ok(())
 }
@@ -911,6 +915,7 @@ async fn main() -> anyhow::Result<()> {
             live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
             align_raw: config.align_raw,
             no_progress_bar: config.no_progress_bar,
+            only_print_filenames: config.only_print_filenames,
             file_match_policy: config.file_match_policy,
             force_size: config.force_size,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,

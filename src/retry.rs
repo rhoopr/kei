@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use rand::Rng;
+use rand::RngExt;
 
 /// Retry decision returned by the error classifier callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

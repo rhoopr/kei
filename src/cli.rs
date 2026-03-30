@@ -131,8 +131,7 @@ pub struct SyncArgs {
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
-    /// NOTE: Parsed but not yet wired up - hidden until implemented
-    #[arg(long, hide = true)]
+    #[arg(long)]
     pub only_print_filenames: bool,
 
     /// Max retries per download (default: 3, 0 = no retries)
@@ -220,6 +219,10 @@ pub struct ImportArgs {
     /// Number of recent photos to check
     #[arg(long)]
     pub recent: Option<u32>,
+
+    /// Disable progress bar
+    #[arg(long)]
+    pub no_progress_bar: bool,
 }
 
 /// Arguments for the verify command.
@@ -275,7 +278,11 @@ pub enum Command {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "icloudpd-rs", about = "Download iCloud photos and videos")]
+#[command(
+    name = "icloudpd-rs",
+    about = "Download iCloud photos and videos",
+    version
+)]
 pub struct Cli {
     /// Log level
     #[arg(long, value_enum, global = true)]

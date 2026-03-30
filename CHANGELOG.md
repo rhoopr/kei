@@ -11,6 +11,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.1] - 2026-03-28
+
+### Added
+
+- **`--only-print-filenames` flag** - Prints the paths of files that would be downloaded, one per line to stdout, without actually downloading them. Progress bar is suppressed. Respects state DB filtering so only undownloaded files are listed. Doesn't advance the sync token - safe to run before a real sync ([#17])
+- **`--version` flag** - Standard `-V` / `--version` support ([#127])
+- **`--no-progress-bar` for `import-existing`** - Suppresses all progress output (header, periodic counter, summary), matching the behavior of `sync` and `retry-failed` ([#127])
+
+### Fixed
+
+- **Progress bar overshoot with companion files** - Live photos produce two download tasks (image + MOV), but the progress bar total is the photo count. The bar now increments once per photo in the producer instead of once per task in the consumer, so it no longer shows "53/50" ([#47])
+- **Confusing cookiejar warning on first run** - Changed the cookiejar existence check from `.exists()` to `.is_file()`, preventing the misleading "Failed to read cookiejar: Is a directory" warning when the cookie path isn't a regular file ([#127])
+
+### Changed
+
+- Updated `aws-lc-sys` to 0.39.1 and `rustls-webpki` to 0.103.10 (RUSTSEC-2026-0044, RUSTSEC-2026-0048, RUSTSEC-2026-0049)
+- Bumped `rand` 0.9→0.10, `rusqlite` 0.38→0.39, `sd-notify` 0.4→0.5, `toml` 0.8→1.0, `clap` 4.5→4.6
+- Narrowed `tokio` features from `"full"` to minimal set; removed unused direct `time` dependency
+
+[#17]: https://github.com/rhoopr/icloudpd-rs/issues/17
+[#47]: https://github.com/rhoopr/icloudpd-rs/issues/47
+[#127]: https://github.com/rhoopr/icloudpd-rs/issues/127
+
+---
+
 ## [0.4.0] - 2026-03-11
 
 ### Added
@@ -242,7 +267,6 @@ The following Python icloudpd features are not yet available. Links go to tracki
 #### Content & Downloads
 - [#19](https://github.com/rhoopr/icloudpd-rs/issues/19) - XMP sidecar export (`--xmp-sidecar`)
 - [#14](https://github.com/rhoopr/icloudpd-rs/issues/14) - Multiple size downloads (`--size` accepting multiple values)
-- [#17](https://github.com/rhoopr/icloudpd-rs/issues/17) - Print filenames only (`--only-print-filenames`)
 - [#52](https://github.com/rhoopr/icloudpd-rs/issues/52) - HEIC to JPEG conversion (`--convert-heic`)
 
 #### iCloud Lifecycle
@@ -262,12 +286,12 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ### Known Issues
 
-- [#47](https://github.com/rhoopr/icloudpd-rs/issues/47) - Progress bar position can overshoot when photos have companion files
 - [#69](https://github.com/rhoopr/icloudpd-rs/issues/69) - Schema migration logic needs improvement before v2
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.0...v0.2.1

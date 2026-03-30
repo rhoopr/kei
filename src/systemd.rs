@@ -49,7 +49,7 @@ impl SystemdNotifier {
 
     #[cfg(target_os = "linux")]
     fn send_impl_ready(&self) {
-        if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+        if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
             tracing::debug!(error = %e, "sd_notify READY failed");
         }
     }
@@ -59,7 +59,7 @@ impl SystemdNotifier {
 
     #[cfg(target_os = "linux")]
     fn send_impl_stopping(&self) {
-        if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]) {
+        if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Stopping]) {
             tracing::debug!(error = %e, "sd_notify STOPPING failed");
         }
     }
@@ -69,7 +69,7 @@ impl SystemdNotifier {
 
     #[cfg(target_os = "linux")]
     fn send_impl_status(&self, msg: &str) {
-        if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Status(msg)]) {
+        if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Status(msg)]) {
             tracing::debug!(error = %e, "sd_notify STATUS failed");
         }
     }
@@ -79,7 +79,7 @@ impl SystemdNotifier {
 
     #[cfg(target_os = "linux")]
     fn send_impl_watchdog(&self) {
-        if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]) {
+        if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]) {
             tracing::debug!(error = %e, "sd_notify WATCHDOG failed");
         }
     }
