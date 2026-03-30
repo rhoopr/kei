@@ -4,8 +4,6 @@ use thiserror::Error;
 pub enum ICloudError {
     #[error("Connection error: {0}")]
     Connection(String),
-    #[error("Photo library not finished indexing")]
-    IndexingNotFinished,
     #[error(
         "iCloud service not activated ({code}): {reason}\n\n\
          This usually means one of:\n  \
@@ -55,16 +53,6 @@ mod tests {
         assert!(
             display.contains("timeout reached"),
             "expected display to contain the message, got: {display}"
-        );
-    }
-
-    #[test]
-    fn indexing_not_finished_display_contains_indexing() {
-        let err = ICloudError::IndexingNotFinished;
-        let display = err.to_string();
-        assert!(
-            display.to_lowercase().contains("indexing"),
-            "expected display to mention indexing, got: {display}"
         );
     }
 

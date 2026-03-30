@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use serde_json::{json, Value};
+use tracing::warn;
 
 use super::album::{PhotoAlbum, PhotoAlbumConfig};
 use super::queries::encode_params;
@@ -54,7 +55,7 @@ impl std::fmt::Debug for PhotoLibrary {
 }
 
 impl PhotoLibrary {
-    /// Create a new `PhotoLibrary`, verifying that indexing has finished.
+    /// Create a new `PhotoLibrary`, warning if indexing has not finished.
     pub async fn new(
         service_endpoint: String,
         params: Arc<HashMap<String, Value>>,
@@ -99,7 +100,11 @@ impl PhotoLibrary {
             .and_then(|r| r.fields["state"]["value"].as_str())
             .unwrap_or("");
         if indexing_state != "FINISHED" {
-            return Err(ICloudError::IndexingNotFinished);
+            warn!(
+                state = indexing_state,
+                "Photo library indexing state is not FINISHED — proceeding anyway, \
+                 results may be incomplete"
+            );
         }
 
         Ok(Self {
