@@ -275,6 +275,13 @@ pub enum Command {
 
     /// Submit a 2FA code non-interactively (for Docker / headless use)
     SubmitCode(SubmitCodeArgs),
+
+    /// Interactively generate a config file
+    Setup {
+        /// Output path (overrides --config)
+        #[arg(short = 'o', long)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Parser, Debug)]

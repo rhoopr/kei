@@ -14,6 +14,7 @@ mod download;
 mod icloud;
 mod notifications;
 pub mod retry;
+mod setup;
 mod shutdown;
 mod state;
 mod systemd;
@@ -657,7 +658,7 @@ async fn main() -> anyhow::Result<()> {
     // If the user explicitly set --config, the file must exist.
     let config_path = config::expand_tilde(&cli.config);
     let config_explicitly_set = cli.config != "~/.config/icloudpd-rs/config.toml";
-    let toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
+    let mut toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
 
     // Resolve log level: CLI > TOML > default (info)
     let effective_log_level = cli
@@ -696,6 +697,44 @@ async fn main() -> anyhow::Result<()> {
         Command::Verify(args) => return run_verify(args, &toml_config).await,
         Command::ImportExisting(args) => return run_import_existing(args, &toml_config).await,
         Command::SubmitCode(args) => return run_submit_code(args, &toml_config).await,
+        Command::Setup { output } => {
+            let path = output
+                .map(|o| config::expand_tilde(&o))
+                .unwrap_or_else(|| config_path.clone());
+            match setup::run_setup(&path)? {
+                setup::SetupResult::SyncNow {
+                    config_path: cfg_path,
+                    env_path,
+                } => {
+                    // Load .env into process environment for this session
+                    let mut env_username = None;
+                    let mut env_password = None;
+                    if let Ok(contents) = std::fs::read_to_string(&env_path) {
+                        for line in contents.lines() {
+                            if let Some((key, value)) = line.split_once('=') {
+                                let key = key.trim();
+                                let value = value.trim();
+                                if key == "ICLOUD_USERNAME" {
+                                    env_username = Some(value.to_string());
+                                } else if key == "ICLOUD_PASSWORD" {
+                                    env_password = Some(value.to_string());
+                                }
+                            }
+                        }
+                    }
+                    // Reload TOML from the newly written config
+                    toml_config = config::load_toml_config(&cfg_path, true)?;
+                    let sync_auth = cli::AuthArgs {
+                        username: env_username,
+                        password: env_password,
+                        domain: None,
+                        cookie_directory: None,
+                    };
+                    (sync_auth, cli::SyncArgs::default())
+                }
+                setup::SetupResult::Done => return Ok(()),
+            }
+        }
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
