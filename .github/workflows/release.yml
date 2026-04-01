@@ -142,6 +142,6 @@ jobs:
         with:
           formula-name: kei
           homebrew-tap: rhoopr/homebrew-kei
-          download-url: https://github.com/rhoopr/icloudpd-rs/releases/download/${{ github.ref_name }}/kei-macos-aarch64.tar.gz
+          download-url: https://github.com/rhoopr/kei/releases/download/${{ github.ref_name }}/kei-macos-aarch64.tar.gz
         env:
           COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

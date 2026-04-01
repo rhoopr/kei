@@ -5,10 +5,10 @@
 <h1 align="center">kei: photo sync engine</h1>
 
 <p align="center">
-  <a href="https://github.com/rhoopr/icloudpd-rs/releases"><img src="https://img.shields.io/github/v/release/rhoopr/icloudpd-rs?color=blue&label=version" alt="Version"></a>
-  <a href="https://github.com/rhoopr/icloudpd-rs/actions"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/icloudpd-rs/ci.yml?label=build" alt="Build"></a>
-  <a href="LICENSE.md"><img src="https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e" alt="License: MIT"></a>
-  <a href="https://github.com/rhoopr/icloudpd-rs/releases"><img src="https://img.shields.io/github/downloads/rhoopr/icloudpd-rs/total?color=green" alt="Downloads"></a>
+  <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a>
+  <a href="https://github.com/rhoopr/kei/actions"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/ci.yml?label=build" alt="Build"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
+  <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/downloads/rhoopr/kei/total?color=green" alt="Downloads"></a>
   <a href="https://github.com/rhoopr/homebrew-kei"><img src="https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew" alt="Homebrew"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
 </p>
@@ -38,16 +38,16 @@ brew install rhoopr/kei/kei
 docker pull ghcr.io/rhoopr/kei:latest
 ```
 
-See the [Docker guide](https://github.com/rhoopr/icloudpd-rs/wiki/Docker) for compose files and headless 2FA.
+See the [Docker guide](https://github.com/rhoopr/kei/wiki/Docker) for compose files and headless 2FA.
 
 **Pre-built binaries**
 
-Grab one from [GitHub Releases](https://github.com/rhoopr/icloudpd-rs/releases). macOS (Apple Silicon + Intel), Linux (ARM64 + x86_64), Windows (x86_64).
+Grab one from [GitHub Releases](https://github.com/rhoopr/kei/releases). macOS (Apple Silicon + Intel), Linux (ARM64 + x86_64), Windows (x86_64).
 
 **From source**
 
 ```sh
-git clone https://github.com/rhoopr/icloudpd-rs.git kei && cd kei
+git clone https://github.com/rhoopr/kei.git kei && cd kei
 cargo build --release
 ```
 
@@ -132,7 +132,7 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 
 ## Docs
 
-- [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) - configuration, Docker, troubleshooting
+- [Wiki](https://github.com/rhoopr/kei/wiki) - configuration, Docker, troubleshooting
 - [Migration Guide](docs/migration-from-python.md) - switching from `icloudpd`
 - [Changelog](CHANGELOG.md)
 - [Roadmap](docs/roadmap.md)

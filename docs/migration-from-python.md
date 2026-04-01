@@ -65,7 +65,7 @@ Most flags are the same or very close. Here's the full mapping:
 | Python | Rust | What changed |
 |--------|------|-------------|
 | `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Both Python `{:%Y}` and plain `%Y` strftime syntax accepted. You can keep using the Python format. |
-| `--size original` | `--size original` | Same values, but Python allows multiple `--size` flags (not yet supported in Rust - [#14](https://github.com/rhoopr/icloudpd-rs/issues/14)) |
+| `--size original` | `--size original` | Same values, but Python allows multiple `--size` flags (not yet supported in Rust - [#14](https://github.com/rhoopr/kei/issues/14)) |
 | `--cookie-directory ~/.pyicloud` | `--cookie-directory ~/.config/kei/cookies` | Different default path and cookie format (JSON vs LWPCookieJar). Sessions aren't portable between the two. |
 | `--threads-num` (deprecated, always 1) | `--threads-num 10` | Actually works in Rust. Default: 10 parallel downloads. |
 | `--notification-script` | `--notification-script` | Same flag name, but kei passes `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars. Python only fired on 2FA expiry; kei also fires on `sync_complete`, `sync_failed`, `session_expired`. |
@@ -75,11 +75,11 @@ Most flags are the same or very close. Here's the full mapping:
 | Python flag | Status | Tracking |
 |-------------|--------|----------|
 | `--until-found` | Replaced by SQLite state - not needed | - |
-| `--auto-delete` | Planned | [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) |
-| `--delete-after-download` | Planned | [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) |
-| `--keep-icloud-recent-days` | Planned | [#30](https://github.com/rhoopr/icloudpd-rs/issues/30) |
-| `--xmp-sidecar` | Planned | [#19](https://github.com/rhoopr/icloudpd-rs/issues/19) |
-| `--smtp-*` (all SMTP flags) | Planned | [#31](https://github.com/rhoopr/icloudpd-rs/issues/31) |
+| `--auto-delete` | Planned | [#28](https://github.com/rhoopr/kei/issues/28) |
+| `--delete-after-download` | Planned | [#29](https://github.com/rhoopr/kei/issues/29) |
+| `--keep-icloud-recent-days` | Planned | [#30](https://github.com/rhoopr/kei/issues/30) |
+| `--xmp-sidecar` | Planned | [#19](https://github.com/rhoopr/kei/issues/19) |
+| `--smtp-*` (all SMTP flags) | Planned | [#31](https://github.com/rhoopr/kei/issues/31) |
 | `--use-os-locale` | Not planned | - |
 | `--password-provider` | Not applicable - uses `ICLOUD_PASSWORD` env var or interactive prompt | - |
 | `--mfa-provider` | Not applicable - uses trusted device or `submit-code` subcommand | - |
@@ -88,7 +88,7 @@ Most flags are the same or very close. Here's the full mapping:
 
 | Flag / command | What it does |
 |----------------|-------------|
-| `--config <path>` | TOML config file. [Guide](https://github.com/rhoopr/icloudpd-rs/wiki/Configuration) |
+| `--config <path>` | TOML config file. [Guide](https://github.com/rhoopr/kei/wiki/Configuration) |
 | `--max-retries` | Retry limit per download (Python hardcoded `MAX_RETRIES = 0`) |
 | `--retry-delay` | Base delay for exponential backoff |
 | `--temp-suffix` | Suffix for partial downloads (default: `.kei-tmp`) |
