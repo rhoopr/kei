@@ -47,7 +47,7 @@ Grab one from [GitHub Releases](https://github.com/rhoopr/icloudpd-rs/releases).
 **From source**
 
 ```sh
-git clone https://github.com/rhoopr/icloudpd-rs.git && cd icloudpd-rs
+git clone https://github.com/rhoopr/icloudpd-rs.git kei && cd kei
 cargo build --release
 ```
 
