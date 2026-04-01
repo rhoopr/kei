@@ -358,7 +358,7 @@ impl Session {
 
         // Persist ALL cookies the jar would send to known Apple domains.
         //
-        // Python's icloudpd calls `cookies.save(ignore_discard=True)` after
+        // `icloudpd` calls `cookies.save(ignore_discard=True)` after
         // every request, dumping the entire jar. reqwest's Jar doesn't support
         // iteration, but we can query it for specific URLs via `cookies()`.
         //

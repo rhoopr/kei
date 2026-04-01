@@ -38,7 +38,7 @@ pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
 /// See [`get_photo_exif`] for the read side.
 ///
 /// Writes `DateTime`, `DateTimeOriginal`, and `DateTimeDigitized` to match
-/// the behavior of the Python icloudpd. The `datetime_str` should be in
+/// the behavior of `icloudpd`. The `datetime_str` should be in
 /// `"YYYY:MM:DD HH:MM:SS"` format.
 pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
     use little_exif::exif_tag::ExifTag;

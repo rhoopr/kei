@@ -216,7 +216,7 @@ pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
 
 /// Map UTI asset_type strings to standardized uppercase file extensions.
 ///
-/// Matches Python icloudpd's `ITEM_TYPE_EXTENSIONS` mapping.
+/// Matches `icloudpd`'s `ITEM_TYPE_EXTENSIONS` mapping.
 const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
     ("public.heic", "HEIC"),
     ("public.heif", "HEIF"),

@@ -22,7 +22,7 @@ Right now kei supports iCloud Photos. Google Takeout, Immich, and other sources 
 It scans large libraries in seconds using incremental sync, downloads in parallel with resumable transfers, and tracks everything in a local SQLite database so it never re-downloads what it already has.
 
 > [!TIP]
-> Coming from Python icloudpd? The [Migration Guide](docs/migration-from-python.md) maps every flag and shows how to pick up where you left off without re-downloading.
+> Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) maps every flag and shows how to pick up where you left off without re-downloading.
 
 ## Install
 
@@ -133,7 +133,7 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 ## Docs
 
 - [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) - configuration, Docker, troubleshooting
-- [Migration Guide](docs/migration-from-python.md) - switching from Python icloudpd
+- [Migration Guide](docs/migration-from-python.md) - switching from `icloudpd`
 - [Changelog](CHANGELOG.md)
 - [Roadmap](docs/roadmap.md)
 - [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - deep dive on CloudKit syncTokens

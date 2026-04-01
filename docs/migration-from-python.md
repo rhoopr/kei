@@ -1,6 +1,6 @@
-# Migrating from Python icloudpd
+# Migrating from `icloudpd`
 
-If you're already running [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (Python icloudpd), switching to kei takes about five minutes. Your existing photos stay where they are - you don't need to re-download anything.
+If you're already running [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (`icloudpd`), switching to kei takes about five minutes. Your existing photos stay where they are - you don't need to re-download anything.
 
 ## Step 1: Import your existing files
 
@@ -105,7 +105,7 @@ Most flags are the same or very close. Here's the full mapping:
 
 ## Docker migration
 
-If you're using a Python icloudpd Docker wrapper (like boredazfcuk's), here are the key differences:
+If you're using a `icloudpd` Docker wrapper (like boredazfcuk's), here are the key differences:
 
 | Python Docker | kei Docker |
 |---------------|-------------------|
@@ -155,6 +155,6 @@ docker exec kei kei import-existing --directory /photos
 
 - **`--until-found`** - The SQLite state database replaces this entirely. kei knows exactly which assets have been downloaded, so it doesn't need to scan backwards looking for familiar files.
 - **Re-downloading** - `import-existing` populates the database from your existing files. After that, only new or failed assets are fetched.
-- **Full re-scans** - After the first sync, kei uses Apple's CloudKit syncToken to fetch only what's changed. A no-change cycle takes 1-2 API calls. Python icloudpd re-enumerates the entire library every run.
+- **Full re-scans** - After the first sync, kei uses Apple's CloudKit syncToken to fetch only what's changed. A no-change cycle takes 1-2 API calls. `icloudpd` re-enumerates the entire library every run.
 - **Cookie migration** - You can't reuse Python cookies, but a fresh auth takes 30 seconds. The new session persists the same way.
 - **Folder structure compatibility** - Both Python-style `{:%Y/%m/%d}` and plain `%Y/%m/%d` format strings are accepted. Your existing folder layout works as-is.
