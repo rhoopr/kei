@@ -664,7 +664,7 @@ These fields are on CPLContainerRelation records, not CPLAsset, but are included
 
 ## DESIRED_KEYS
 
-When making `records/query` requests, the `desiredKeys` array specifies which fields to include in the response. The complete list of field names requested by icloudpd-rs:
+When making `records/query` requests, the `desiredKeys` array specifies which fields to include in the response. The complete list of field names requested by kei:
 
 ```
 resJPEGFullWidth, resJPEGFullHeight, resJPEGFullFileType, resJPEGFullFingerprint, resJPEGFullRes,

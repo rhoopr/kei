@@ -97,9 +97,9 @@ async fn run_script(
     username: &str,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let mut child = tokio::process::Command::new(script)
-        .env("ICLOUDPD_EVENT", event)
-        .env("ICLOUDPD_MESSAGE", message)
-        .env("ICLOUDPD_USERNAME", username)
+        .env("KEI_EVENT", event)
+        .env("KEI_MESSAGE", message)
+        .env("KEI_ICLOUD_USERNAME", username)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
@@ -196,7 +196,7 @@ mod tests {
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\necho \"$ICLOUDPD_EVENT|$ICLOUDPD_MESSAGE|$ICLOUDPD_USERNAME\" > {}\n",
+                "#!/bin/sh\necho \"$KEI_EVENT|$KEI_MESSAGE|$KEI_ICLOUD_USERNAME\" > {}\n",
                 output_path.display()
             ),
         )

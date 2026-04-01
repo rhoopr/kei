@@ -1,6 +1,6 @@
 //! iCloud authentication via Apple's SRP-6a variant with optional 2FA.
 //!
-//! The flow mirrors Python icloudpd's `PyiCloudService` authentication:
+//! The flow mirrors `icloudpd`'s `PyiCloudService` authentication:
 //! session token validation → SRP login → 2FA challenge → session trust.
 
 pub mod endpoints;

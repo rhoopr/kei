@@ -25,9 +25,7 @@ fn help_flag_succeeds() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Download iCloud photos and videos",
-        ));
+        .stdout(predicate::str::contains("kei: photo sync engine"));
 }
 
 #[test]

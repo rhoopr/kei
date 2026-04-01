@@ -248,7 +248,7 @@ pub(crate) fn resolve_auth(
     let cookie_dir_str = resolve(
         auth.cookie_directory.clone(),
         toml_auth.and_then(|a| a.cookie_directory.clone()),
-        "~/.icloudpd-rs".to_string(),
+        "~/.config/kei/cookies".to_string(),
     );
     let cookie_directory = expand_tilde(&cookie_dir_str);
 
@@ -291,7 +291,7 @@ impl Config {
         let temp_suffix = resolve(
             sync.temp_suffix,
             toml_dl.and_then(|d| d.temp_suffix.clone()),
-            ".icloudpd-tmp".to_string(),
+            ".kei-tmp".to_string(),
         );
         let set_exif_datetime = resolve_flag(
             sync.set_exif_datetime,
@@ -576,13 +576,13 @@ mod tests {
             [auth]
             username = "user@example.com"
             domain = "com"
-            cookie_directory = "~/.icloudpd-rs"
+            cookie_directory = "~/.config/kei/cookies"
 
             [download]
             directory = "/photos"
             folder_structure = "%Y/%m/%d"
             threads_num = 10
-            temp_suffix = ".icloudpd-tmp"
+            temp_suffix = ".kei-tmp"
             set_exif_datetime = true
             no_progress_bar = false
 
@@ -612,7 +612,7 @@ mod tests {
             [watch]
             interval = 3600
             notify_systemd = false
-            pid_file = "/run/icloudpd-rs.pid"
+            pid_file = "/run/kei.pid"
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.log_level, Some(LogLevel::Debug));
@@ -723,7 +723,7 @@ mod tests {
         );
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.retry_delay_secs, 5);
-        assert_eq!(cfg.temp_suffix, ".icloudpd-tmp");
+        assert_eq!(cfg.temp_suffix, ".kei-tmp");
         assert!(matches!(cfg.size, VersionSize::Original));
         assert!(matches!(cfg.domain, Domain::Com));
         assert!(matches!(cfg.log_level, LogLevel::Info));
@@ -1308,11 +1308,11 @@ mod tests {
         assert_eq!(cfg.username, "u@example.com");
         assert!(cfg.password.is_none());
         assert!(matches!(cfg.domain, Domain::Com));
-        assert!(cfg.cookie_directory.ends_with(".icloudpd-rs"));
+        assert!(cfg.cookie_directory.ends_with("kei/cookies"));
         // Download
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
         assert_eq!(cfg.threads_num, 10);
-        assert_eq!(cfg.temp_suffix, ".icloudpd-tmp");
+        assert_eq!(cfg.temp_suffix, ".kei-tmp");
         assert!(!cfg.set_exif_datetime);
         assert!(!cfg.no_progress_bar);
         // Retry
@@ -2015,7 +2015,7 @@ mod tests {
         assert!(username.is_empty());
         assert!(password.is_none());
         assert!(matches!(domain, Domain::Com));
-        assert!(cookie_dir.ends_with(".icloudpd-rs"));
+        assert!(cookie_dir.ends_with("kei/cookies"));
     }
 
     // ── Config::build: albums edge cases ───────────────────────────

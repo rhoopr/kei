@@ -204,7 +204,7 @@ pub struct DownloadConfig {
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_size: bool,
     pub(crate) keep_unicode_in_filenames: bool,
-    /// Temp file suffix for partial downloads (e.g. `.icloudpd-tmp`).
+    /// Temp file suffix for partial downloads (e.g. `.kei-tmp`).
     pub(crate) temp_suffix: String,
     /// State database for tracking download progress.
     pub(crate) state_db: Option<Arc<dyn StateDb>>,
@@ -2202,7 +2202,7 @@ mod tests {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
-            temp_suffix: ".icloudpd-tmp".to_string(),
+            temp_suffix: ".kei-tmp".to_string(),
             state_db: None,
             retry_only: false,
             sync_mode: SyncMode::Full,
@@ -3003,7 +3003,7 @@ mod tests {
             set_exif: false,
             concurrency: 1,
             no_progress_bar: true,
-            temp_suffix: ".icloudpd-tmp".to_string(),
+            temp_suffix: ".kei-tmp".to_string(),
             shutdown_token: token,
             state_db: None,
         };
@@ -3040,7 +3040,7 @@ mod tests {
             set_exif: false,
             concurrency: 1,
             no_progress_bar: true,
-            temp_suffix: ".icloudpd-tmp".to_string(),
+            temp_suffix: ".kei-tmp".to_string(),
             shutdown_token: token,
             state_db: None,
         };

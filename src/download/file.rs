@@ -235,16 +235,16 @@ mod tests {
     fn test_temp_download_path_valid_checksum() {
         // Base64 "AAAA" decodes to [0, 0, 0], base32 encodes to "AAAAA"
         let path = PathBuf::from("/photos/test.jpg");
-        let result = temp_download_path(&path, "AAAA", ".icloudpd-tmp").unwrap();
+        let result = temp_download_path(&path, "AAAA", ".kei-tmp").unwrap();
         assert_eq!(result.parent().unwrap(), Path::new("/photos"));
-        assert!(result.to_string_lossy().ends_with(".icloudpd-tmp"));
+        assert!(result.to_string_lossy().ends_with(".kei-tmp"));
     }
 
     #[test]
     fn test_temp_download_path_derives_from_checksum() {
         let path = PathBuf::from("/photos/test.jpg");
-        let result1 = temp_download_path(&path, "AAAA", ".icloudpd-tmp").unwrap();
-        let result2 = temp_download_path(&path, "AAAB", ".icloudpd-tmp").unwrap();
+        let result1 = temp_download_path(&path, "AAAA", ".kei-tmp").unwrap();
+        let result2 = temp_download_path(&path, "AAAB", ".kei-tmp").unwrap();
         // Different checksums should produce different temp filenames
         assert_ne!(result1, result2);
     }
@@ -253,8 +253,8 @@ mod tests {
     fn test_temp_download_path_same_checksum_same_result() {
         let path1 = PathBuf::from("/photos/a.jpg");
         let path2 = PathBuf::from("/photos/b.jpg");
-        let result1 = temp_download_path(&path1, "AAAA", ".icloudpd-tmp").unwrap();
-        let result2 = temp_download_path(&path2, "AAAA", ".icloudpd-tmp").unwrap();
+        let result1 = temp_download_path(&path1, "AAAA", ".kei-tmp").unwrap();
+        let result2 = temp_download_path(&path2, "AAAA", ".kei-tmp").unwrap();
         // Same checksum, same directory -> same temp file (for resume)
         assert_eq!(result1, result2);
     }
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn test_temp_download_path_invalid_base64() {
         let path = PathBuf::from("/photos/test.jpg");
-        let result = temp_download_path(&path, "not-valid-base64!!!", ".icloudpd-tmp");
+        let result = temp_download_path(&path, "not-valid-base64!!!", ".kei-tmp");
         assert!(result.is_err());
     }
 

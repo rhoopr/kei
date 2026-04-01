@@ -6,7 +6,7 @@
 # 1. Pre-commit (runs automatically on git commit)
 cargo fmt -- --check
 cargo clippy -- -D warnings
-cargo test --bin icloudpd-rs --test cli --test state
+cargo test --bin kei --test cli --test state
 
 # 2. One-time auth setup (interactive, prompts for 2FA)
 # fish:
@@ -74,7 +74,7 @@ env $(grep -v '^#' .env | xargs) cargo run -- sync --auth-only --cookie-director
 ### No-auth tests (no setup needed)
 
 ```sh
-cargo test --bin icloudpd-rs          # unit tests
+cargo test --bin kei          # unit tests
 cargo test --test cli                  # CLI parsing
 cargo test --test state                # state commands (no DB)
 ```

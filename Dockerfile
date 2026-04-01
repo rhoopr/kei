@@ -30,14 +30,14 @@ RUN export TARGET=$(cat /tmp/target) && \
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
     mkdir src && echo 'fn main() {}' > src/main.rs && \
     cargo build --release --target $TARGET && \
-    rm -rf src target/$TARGET/release/deps/icloudpd*
+    rm -rf src target/$TARGET/release/deps/kei*
 
 COPY src/ src/
 
 RUN export TARGET=$(cat /tmp/target) && \
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
     cargo build --release --target $TARGET && \
-    cp target/$TARGET/release/icloudpd-rs /icloudpd-rs
+    cp target/$TARGET/release/kei /kei
 
 # ── Runtime stage ────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -46,9 +46,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends bash curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /icloudpd-rs /usr/local/bin/icloudpd-rs
+COPY --from=builder /kei /usr/local/bin/kei
 
 VOLUME ["/config", "/photos"]
 
-ENTRYPOINT ["icloudpd-rs"]
+ENTRYPOINT ["kei"]
 CMD ["sync", "--config", "/config/config.toml", "--cookie-directory", "/config", "--directory", "/photos"]
