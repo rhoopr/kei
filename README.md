@@ -15,6 +15,9 @@
 
 ---
 
+> [!NOTE]
+> This project was previously called **icloudpd-rs**. As it grows beyond an iCloud-only tool to support multiple photo sources (Google Takeout, Immich, and more), we renamed it to **kei**. If you're upgrading from icloudpd-rs, your config and cookies are migrated automatically on first run.
+
 kei syncs your photos from cloud services to local storage. Single binary, small footprint, runs unattended.
 
 Right now kei supports iCloud Photos. Google Takeout, Immich, and other sources are on the roadmap.
