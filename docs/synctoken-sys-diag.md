@@ -1,4 +1,4 @@
-# icloudpd-rs System Diagram
+# kei System Diagram
 
 Full lifecycle of authentication, photo enumeration, incremental sync, file downloads, and SQLite state management.
 
@@ -36,7 +36,7 @@ Full lifecycle of authentication, photo enumeration, incremental sync, file down
 src/auth/mod.rs :: authenticate()
 │
 ├─ Session::new()
-│  ├─ Load cookies from ~/.icloudpd-rs/{user}
+│  ├─ Load cookies from ~/.config/kei/cookies/{user}
 │  ├─ Load session data from {user}.session
 │  └─ Acquire exclusive lock file ({user}.lock)
 │
@@ -67,9 +67,9 @@ src/auth/mod.rs :: authenticate()
 └─ Return AuthResult { session, data }
 
 Persistence:
-  ~/.icloudpd-rs/{user}          JSON cookie jar
-  ~/.icloudpd-rs/{user}.session  JSON session data
-  ~/.icloudpd-rs/{user}.lock     Exclusive lock (prevents concurrent runs)
+  ~/.config/kei/cookies/{user}          JSON cookie jar
+  ~/.config/kei/cookies/{user}.session  JSON session data
+  ~/.config/kei/cookies/{user}.lock     Exclusive lock (prevents concurrent runs)
 ```
 
 ---
@@ -281,7 +281,7 @@ stream_and_download_from_stream()
 src/state/schema.rs (version 3)
 src/state/db.rs     (SqliteStateDb)
 
-Database: ~/.icloudpd-rs/{user}.db  (WAL mode, NORMAL sync)
+Database: ~/.config/kei/cookies/{user}.db  (WAL mode, NORMAL sync)
 
 ┌─────────────────────────── assets ───────────────────────────────────┐
 │ PRIMARY KEY (id, version_size)                                       │

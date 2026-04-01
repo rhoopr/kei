@@ -34,7 +34,7 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/rhoopr/icloudpd-rs
+          images: ghcr.io/rhoopr/kei
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

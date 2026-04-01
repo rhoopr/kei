@@ -14,19 +14,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            name: icloudpd-rs-linux-x86_64
+            name: kei-linux-x86_64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            name: icloudpd-rs-linux-aarch64
+            name: kei-linux-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
-            name: icloudpd-rs-macos-x86_64
+            name: kei-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: icloudpd-rs-macos-aarch64
+            name: kei-macos-aarch64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            name: icloudpd-rs-windows-x86_64
+            name: kei-windows-x86_64
 
     runs-on: ${{ matrix.os }}
 
@@ -56,14 +56,14 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czvf ../../../${{ matrix.name }}.tar.gz icloudpd-rs
+          tar czvf ../../../${{ matrix.name }}.tar.gz kei
           cd -
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }}.zip icloudpd-rs.exe
+          7z a ../../../${{ matrix.name }}.zip kei.exe
           cd -
 
       - name: Upload artifact
@@ -140,8 +140,8 @@ jobs:
       - name: Update Homebrew formula
         uses: mislav/bump-homebrew-formula-action@v3
         with:
-          formula-name: icloudpd-rs
-          homebrew-tap: rhoopr/homebrew-icloudpd-rs
-          download-url: https://github.com/rhoopr/icloudpd-rs/releases/download/${{ github.ref_name }}/icloudpd-rs-macos-aarch64.tar.gz
+          formula-name: kei
+          homebrew-tap: rhoopr/homebrew-kei
+          download-url: https://github.com/rhoopr/icloudpd-rs/releases/download/${{ github.ref_name }}/kei-macos-aarch64.tar.gz
         env:
           COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

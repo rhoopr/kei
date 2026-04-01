@@ -1,10 +1,10 @@
 [package]
-name = "icloudpd-rs"
+name = "kei"
 version = "0.4.2"
 edition = "2021"
 
 [[bin]]
-name = "icloudpd-rs"
+name = "kei"
 path = "src/main.rs"
 
 [dependencies]

@@ -142,7 +142,7 @@ pub struct SyncArgs {
     #[arg(long)]
     pub retry_delay: Option<u64>,
 
-    /// Temp file suffix for partial downloads (default: .icloudpd-tmp).
+    /// Temp file suffix for partial downloads (default: .kei-tmp).
     /// Change if the default conflicts with your filesystem (e.g. Nextcloud rejects .part).
     #[arg(long)]
     pub temp_suffix: Option<String>,
@@ -165,7 +165,7 @@ pub struct SyncArgs {
     pub pid_file: Option<std::path::PathBuf>,
 
     /// Script to run on events (2FA required, sync complete, etc.).
-    /// Called with ICLOUDPD_EVENT, ICLOUDPD_MESSAGE, ICLOUDPD_USERNAME env vars.
+    /// Called with KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME env vars.
     #[arg(long)]
     pub notification_script: Option<String>,
 }
@@ -246,7 +246,7 @@ pub struct SubmitCodeArgs {
     pub code: String,
 }
 
-/// Subcommands for icloudpd-rs.
+/// Subcommands for kei.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Download photos from iCloud (default command)
@@ -285,22 +285,14 @@ pub enum Command {
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "icloudpd-rs",
-    about = "Download iCloud photos and videos",
-    version
-)]
+#[command(name = "kei", about = "kei: photo sync engine", version)]
 pub struct Cli {
     /// Log level
     #[arg(long, value_enum, global = true)]
     pub log_level: Option<LogLevel>,
 
     /// Path to TOML config file
-    #[arg(
-        long,
-        global = true,
-        default_value = "~/.config/icloudpd-rs/config.toml"
-    )]
+    #[arg(long, global = true, default_value = "~/.config/kei/config.toml")]
     pub config: String,
 
     #[command(subcommand)]
@@ -338,7 +330,7 @@ mod tests {
     }
 
     fn base_args() -> Vec<&'static str> {
-        vec!["icloudpd-rs", "--username", "test@example.com"]
+        vec!["kei", "--username", "test@example.com"]
     }
 
     #[test]
@@ -495,7 +487,7 @@ mod tests {
     #[test]
     fn test_sync_subcommand() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "sync",
             "--username",
             "test@example.com",
@@ -508,14 +500,13 @@ mod tests {
 
     #[test]
     fn test_status_subcommand() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "status", "--username", "test@example.com"])
-            .unwrap();
+        let cli = Cli::try_parse_from(["kei", "status", "--username", "test@example.com"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Status(_))));
     }
 
     #[test]
     fn test_status_subcommand_without_username() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["kei", "status"]).unwrap();
         if let Some(Command::Status(args)) = cli.command {
             assert!(args.auth.username.is_none());
         } else {
@@ -526,7 +517,7 @@ mod tests {
     #[test]
     fn test_status_with_failed_flag() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "status",
             "--username",
             "test@example.com",
@@ -543,7 +534,7 @@ mod tests {
     #[test]
     fn test_reset_state_subcommand() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "reset-state",
             "--username",
             "test@example.com",
@@ -591,7 +582,7 @@ mod tests {
     #[test]
     fn test_backwards_compatibility_no_subcommand() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "--username",
             "test@example.com",
             "--directory",
@@ -611,15 +602,15 @@ mod tests {
     #[test]
     fn test_config_flag_default() {
         let cli = parse(&base_args());
-        assert_eq!(cli.config, "~/.config/icloudpd-rs/config.toml");
+        assert_eq!(cli.config, "~/.config/kei/config.toml");
     }
 
     #[test]
     fn test_config_flag_custom() {
         let mut args = base_args();
-        args.extend(["--config", "/etc/icloudpd-rs.toml"]);
+        args.extend(["--config", "/etc/kei.toml"]);
         let cli = parse(&args);
-        assert_eq!(cli.config, "/etc/icloudpd-rs.toml");
+        assert_eq!(cli.config, "/etc/kei.toml");
     }
 
     #[test]
@@ -660,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_bare_invocation_without_username() {
-        let cli = Cli::try_parse_from(["icloudpd-rs"]).unwrap();
+        let cli = Cli::try_parse_from(["kei"]).unwrap();
         assert!(cli.auth.username.is_none());
         assert!(cli.command.is_none());
     }
@@ -963,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_verify_subcommand_without_username() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "verify"]).unwrap();
+        let cli = Cli::try_parse_from(["kei", "verify"]).unwrap();
         if let Some(Command::Verify(args)) = cli.command {
             assert!(args.auth.username.is_none());
             assert!(!args.checksums);
@@ -975,7 +966,7 @@ mod tests {
     #[test]
     fn test_verify_subcommand_with_checksums() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "verify",
             "--username",
             "test@example.com",
@@ -991,7 +982,7 @@ mod tests {
 
     #[test]
     fn test_reset_state_subcommand_without_username() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "reset-state"]).unwrap();
+        let cli = Cli::try_parse_from(["kei", "reset-state"]).unwrap();
         if let Some(Command::ResetState(args)) = cli.command {
             assert!(args.auth.username.is_none());
             assert!(!args.yes);
@@ -1003,7 +994,7 @@ mod tests {
     #[test]
     fn test_import_existing_subcommand() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "import-existing",
             "--username",
             "test@example.com",
@@ -1023,8 +1014,8 @@ mod tests {
 
     #[test]
     fn test_import_existing_without_username() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "import-existing", "--directory", "/photos"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["kei", "import-existing", "--directory", "/photos"]).unwrap();
         if let Some(Command::ImportExisting(args)) = cli.command {
             assert!(args.auth.username.is_none());
         } else {
@@ -1035,7 +1026,7 @@ mod tests {
     #[test]
     fn test_retry_failed_subcommand() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "retry-failed",
             "--username",
             "test@example.com",
@@ -1053,7 +1044,7 @@ mod tests {
 
     #[test]
     fn test_retry_failed_without_username() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "retry-failed"]).unwrap();
+        let cli = Cli::try_parse_from(["kei", "retry-failed"]).unwrap();
         if let Some(Command::RetryFailed(args)) = cli.command {
             assert!(args.auth.username.is_none());
         } else {
@@ -1066,7 +1057,7 @@ mod tests {
     #[test]
     fn test_config_global_with_sync_subcommand() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "sync",
             "--config",
             "/custom/config.toml",
@@ -1079,34 +1070,29 @@ mod tests {
 
     #[test]
     fn test_config_global_with_status_subcommand() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "status", "--config", "/custom/config.toml"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["kei", "status", "--config", "/custom/config.toml"]).unwrap();
         assert_eq!(cli.config, "/custom/config.toml");
     }
 
     #[test]
     fn test_config_global_with_verify_subcommand() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "verify", "--config", "/custom/config.toml"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["kei", "verify", "--config", "/custom/config.toml"]).unwrap();
         assert_eq!(cli.config, "/custom/config.toml");
     }
 
     #[test]
     fn test_config_global_with_reset_state_subcommand() {
-        let cli = Cli::try_parse_from([
-            "icloudpd-rs",
-            "reset-state",
-            "--config",
-            "/custom/config.toml",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["kei", "reset-state", "--config", "/custom/config.toml"]).unwrap();
         assert_eq!(cli.config, "/custom/config.toml");
     }
 
     #[test]
     fn test_config_global_before_subcommand() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "--config", "/custom/config.toml", "status"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["kei", "--config", "/custom/config.toml", "status"]).unwrap();
         assert_eq!(cli.config, "/custom/config.toml");
         assert!(matches!(cli.command, Some(Command::Status(_))));
     }
@@ -1116,7 +1102,7 @@ mod tests {
     #[test]
     fn test_submit_code_subcommand() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "submit-code",
             "--username",
             "test@example.com",
@@ -1133,7 +1119,7 @@ mod tests {
 
     #[test]
     fn test_submit_code_without_username() {
-        let cli = Cli::try_parse_from(["icloudpd-rs", "submit-code", "123456"]).unwrap();
+        let cli = Cli::try_parse_from(["kei", "submit-code", "123456"]).unwrap();
         if let Some(Command::SubmitCode(args)) = cli.command {
             assert!(args.auth.username.is_none());
             assert_eq!(args.code, "123456");
@@ -1144,13 +1130,13 @@ mod tests {
 
     #[test]
     fn test_submit_code_requires_code_arg() {
-        assert!(Cli::try_parse_from(["icloudpd-rs", "submit-code"]).is_err());
+        assert!(Cli::try_parse_from(["kei", "submit-code"]).is_err());
     }
 
     #[test]
     fn test_submit_code_with_config() {
         let cli = Cli::try_parse_from([
-            "icloudpd-rs",
+            "kei",
             "submit-code",
             "--config",
             "/custom/config.toml",

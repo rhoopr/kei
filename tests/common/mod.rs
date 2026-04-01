@@ -67,13 +67,13 @@ fn throttle() {
     }
 }
 
-/// Build an `assert_cmd::Command` for the icloudpd-rs binary.
+/// Build an `assert_cmd::Command` for the kei binary.
 ///
 /// Loads `.env` from the repo root (if present) so that `ICLOUD_USERNAME`
 /// and `ICLOUD_PASSWORD` are available to the child process.
 pub fn cmd() -> assert_cmd::Command {
     init_env();
-    assert_cmd::cargo_bin_cmd!("icloudpd-rs")
+    assert_cmd::cargo_bin_cmd!("kei")
 }
 
 /// Skip the current test when credentials are not configured.
@@ -115,7 +115,7 @@ fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
     static ENSURED: OnceLock<()> = OnceLock::new();
     ENSURED.get_or_init(|| {
         eprintln!("Validating authentication session (--auth-only)...");
-        let output = assert_cmd::cargo_bin_cmd!("icloudpd-rs")
+        let output = assert_cmd::cargo_bin_cmd!("kei")
             .args([
                 "sync",
                 "--auth-only",
@@ -158,7 +158,7 @@ fn refresh_auth() {
         .expect("refresh_auth called before require_preauth");
 
     eprintln!("Running --auth-only to refresh session...");
-    let output = assert_cmd::cargo_bin_cmd!("icloudpd-rs")
+    let output = assert_cmd::cargo_bin_cmd!("kei")
         .args([
             "sync",
             "--auth-only",

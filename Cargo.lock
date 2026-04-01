@@ -990,53 +990,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "icloudpd-rs"
-version = "0.4.2"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "async-trait",
- "base64",
- "chrono",
- "clap",
- "cookie",
- "data-encoding",
- "dialoguer",
- "dirs",
- "dotenvy",
- "fs4",
- "futures-util",
- "hmac",
- "indicatif",
- "kamadak-exif",
- "little_exif",
- "num-bigint",
- "pbkdf2",
- "predicates",
- "rand 0.10.0",
- "reqwest",
- "rpassword",
- "rusqlite",
- "rustc-hash",
- "sd-notify",
- "serde",
- "serde_json",
- "sha2",
- "smallvec",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "url",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1270,6 +1223,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1130d80c7374efad55a117d715a3af9368f0fa7a2c54573afc15a188cd984837"
 dependencies = [
  "mutate_once",
+]
+
+[[package]]
+name = "kei"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clap",
+ "cookie",
+ "data-encoding",
+ "dialoguer",
+ "dirs",
+ "dotenvy",
+ "fs4",
+ "futures-util",
+ "hmac",
+ "indicatif",
+ "kamadak-exif",
+ "little_exif",
+ "num-bigint",
+ "pbkdf2",
+ "predicates",
+ "rand 0.10.0",
+ "reqwest",
+ "rpassword",
+ "rusqlite",
+ "rustc-hash",
+ "sd-notify",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]

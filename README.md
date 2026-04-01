@@ -1,13 +1,17 @@
-# icloudpd-rs
+# kei
 
-[![Version](https://img.shields.io/github/v/release/rhoopr/icloudpd-rs?color=blue)](https://github.com/rhoopr/icloudpd-rs/releases)
+*photo sync engine*
+
+> Previously known as icloudpd-rs.
+
+[![Version](https://img.shields.io/github/v/release/rhoopr/icloudpd-rs?color=blue&label=version)](https://github.com/rhoopr/icloudpd-rs/releases)
 [![Build](https://img.shields.io/github/actions/workflow/status/rhoopr/icloudpd-rs/ci.yml?label=build)](https://github.com/rhoopr/icloudpd-rs/actions)
 [![License: MIT](https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e)](LICENSE.md)
 [![Downloads](https://img.shields.io/github/downloads/rhoopr/icloudpd-rs/total?color=green)](https://github.com/rhoopr/icloudpd-rs/releases)
-[![Homebrew](https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew)](https://github.com/rhoopr/homebrew-icloudpd-rs)
-[![Docker](https://img.shields.io/badge/ghcr.io-icloudpd--rs-blue?logo=docker)](https://ghcr.io/rhoopr/icloudpd-rs)
+[![Homebrew](https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew)](https://github.com/rhoopr/homebrew-kei)
+[![Docker](https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker)](https://ghcr.io/rhoopr/kei)
 
-Modern iCloud photo downloader. Enumerates large libraries in seconds, tracks state across runs, downloads in parallel, and runs unattended in Docker: all in a single binary.
+Modern photo sync engine. Enumerates large libraries in seconds, tracks state across runs, downloads in parallel, and runs unattended in Docker: all in a single binary.
 
 A Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (icloudpd). 5x+ faster downloads, 15x faster library scanning, incremental sync that only fetches what changed, and resumable transfers with SHA256 verification.
 
@@ -21,14 +25,13 @@ A Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-do
 ### Homebrew (macOS & Linux)
 
 ```sh
-brew tap rhoopr/icloudpd-rs
-brew install icloudpd-rs
+brew install rhoopr/kei/kei
 ```
 
 ### Docker
 
 ```sh
-docker pull ghcr.io/rhoopr/icloudpd-rs:latest
+docker pull ghcr.io/rhoopr/kei:latest
 ```
 
 See the [Docker wiki page](https://github.com/rhoopr/icloudpd-rs/wiki/Docker) for the full setup guide, including compose files and headless 2FA via `submit-code`.
@@ -51,19 +54,19 @@ cargo build --release
 The `setup` wizard walks you through config interactively:
 
 ```sh
-icloudpd-rs setup
+kei setup
 ```
 
-This generates a TOML config file at `~/.config/icloudpd-rs/config.toml`. Then run:
+This generates a TOML config file at `~/.config/kei/config.toml`. Then run:
 
 ```sh
-icloudpd-rs
+kei
 ```
 
 Or skip the wizard and pass flags directly:
 
 ```sh
-icloudpd-rs -u you@example.com -d ~/Photos/iCloud
+kei -u you@example.com -d ~/Photos/iCloud
 ```
 
 You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after.
@@ -74,22 +77,22 @@ You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to a
 
 ```sh
 # Specific albums, skip videos, last 100 photos only
-icloudpd-rs -u you@example.com -d ~/Photos --album "Favorites" --recent 100 --skip-videos
+kei -u you@example.com -d ~/Photos --album "Favorites" --recent 100 --skip-videos
 
 # All libraries (personal + shared) in one run
-icloudpd-rs -u you@example.com -d ~/Photos --library all
+kei -u you@example.com -d ~/Photos --library all
 
 # Keep syncing every hour with notifications
-icloudpd-rs -u you@example.com -d ~/Photos --watch-with-interval 3600 --notification-script ./notify.sh
+kei -u you@example.com -d ~/Photos --watch-with-interval 3600 --notification-script ./notify.sh
 
 # Preview what would be downloaded
-icloudpd-rs -u you@example.com -d ~/Photos --only-print-filenames
+kei -u you@example.com -d ~/Photos --only-print-filenames
 
 # Dry run (no writes to disk or iCloud)
-icloudpd-rs -u you@example.com -d ~/Photos --dry-run
+kei -u you@example.com -d ~/Photos --dry-run
 ```
 
-Run `icloudpd-rs --help` for all flags. The [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) has detailed guides.
+Run `kei --help` for all flags. The [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) has detailed guides.
 
 ---
 

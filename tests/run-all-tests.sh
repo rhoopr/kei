@@ -93,7 +93,7 @@ auth_delay() {
 STARTED=$(date +%s)
 
 # ── No-auth tests (always run all) ──────────────────────────────────────
-run "Unit tests"              cargo test --bin icloudpd-rs
+run "Unit tests"              cargo test --bin kei
 run "CLI integration tests"   cargo test --test cli
 run "State tests (no-auth)"   cargo test --test state
 

@@ -123,7 +123,7 @@ impl Session {
                     .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))?;
                 if !acquired {
                     anyhow::bail!(
-                        "Another icloudpd-rs instance is running for this account (lock: {}). \
+                        "Another kei instance is running for this account (lock: {}). \
                          If running in Docker, check for orphaned containers with \
                          `docker ps` and stop them with `docker stop <name>`.",
                         lock_path.display()
@@ -494,7 +494,7 @@ mod tests {
         match result {
             Ok(_) => panic!("Second session should have failed"),
             Err(e) => assert!(
-                e.to_string().contains("Another icloudpd-rs instance"),
+                e.to_string().contains("Another kei instance"),
                 "Unexpected error: {}",
                 e
             ),

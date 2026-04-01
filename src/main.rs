@@ -1,4 +1,4 @@
-//! icloudpd-rs — Rust rewrite of icloud-photos-downloader.
+//! kei: photo sync engine — Rust rewrite of icloud-photos-downloader.
 //!
 //! Downloads photos and videos from iCloud via Apple's private CloudKit APIs.
 //! Authentication uses SRP-6a with Apple's custom variant, followed by optional
@@ -12,6 +12,7 @@ mod cli;
 mod config;
 mod download;
 mod icloud;
+mod migration;
 mod notifications;
 pub mod retry;
 mod setup;
@@ -654,10 +655,14 @@ impl Drop for PidFileGuard {
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
+    // Migrate legacy icloudpd-rs paths before loading config, so the
+    // copied config.toml is found at the new location.
+    let migration_report = migration::migrate_legacy_paths();
+
     // Load TOML config early so it can influence log level.
     // If the user explicitly set --config, the file must exist.
     let config_path = config::expand_tilde(&cli.config);
-    let config_explicitly_set = cli.config != "~/.config/icloudpd-rs/config.toml";
+    let config_explicitly_set = cli.config != "~/.config/kei/config.toml";
     let mut toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
 
     // Resolve log level: CLI > TOML > default (info)
@@ -669,7 +674,7 @@ async fn main() -> anyhow::Result<()> {
     // Scope debug/info to the app crate so dependency crates stay quieter.
     // Users can override with RUST_LOG env var for full control.
     let filter = match effective_log_level {
-        types::LogLevel::Debug => "icloudpd_rs=debug,info",
+        types::LogLevel::Debug => "kei=debug,info",
         types::LogLevel::Info => "info",
         types::LogLevel::Warn => "warn",
         types::LogLevel::Error => "error",
@@ -687,6 +692,13 @@ async fn main() -> anyhow::Result<()> {
             password: Arc::clone(&redact_password),
         })
         .init();
+
+    // Log migration warnings now that tracing is initialized.
+    if let Some(report) = &migration_report {
+        for msg in &report.warnings {
+            tracing::warn!("{msg}");
+        }
+    }
 
     // Dispatch based on command
     let command = cli.effective_command();
@@ -757,7 +769,7 @@ async fn main() -> anyhow::Result<()> {
     let sd_notifier = SystemdNotifier::new(config.notify_systemd);
     let notifier = Notifier::new(config.notification_script);
 
-    tracing::info!(concurrency = config.threads_num, "Starting icloudpd-rs");
+    tracing::info!(concurrency = config.threads_num, "Starting kei");
 
     let password_provider = make_password_provider(config.password);
 
@@ -778,7 +790,7 @@ async fn main() -> anyhow::Result<()> {
                 .is_some_and(|ae| ae.is_two_factor_required()) =>
         {
             let msg = format!(
-                "2FA required for {}. Run: icloudpd-rs submit-code <CODE> --username {}",
+                "2FA required for {}. Run: kei submit-code <CODE> --username {}",
                 config.username, config.username
             );
             tracing::warn!(message = %msg, "2FA required");
@@ -1189,7 +1201,7 @@ async fn main() -> anyhow::Result<()> {
                             .is_some_and(|ae| ae.is_two_factor_required()) =>
                     {
                         let msg = format!(
-                            "2FA required for {}. Run: icloudpd-rs submit-code <CODE> --username {}",
+                            "2FA required for {}. Run: kei submit-code <CODE> --username {}",
                             config.username, config.username
                         );
                         tracing::warn!(message = %msg, "2FA required");

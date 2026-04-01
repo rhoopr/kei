@@ -16,7 +16,7 @@
 
 ```sh
 # Pre-commit safe (no auth, no network)
-cargo test --bin icloudpd-rs --test cli --test state
+cargo test --bin kei --test cli --test state
 
 # Full suite (requires pre-auth session + icloudpd-test album)
 ./tests/run-all-tests.sh
@@ -29,7 +29,7 @@ See `tests/README.md` for setup instructions.
 
 ---
 
-## Unit Tests (`cargo test --bin icloudpd-rs`)
+## Unit Tests (`cargo test --bin kei`)
 
 541 tests across 31 source modules. All offline, no credentials needed. Covers
 CLI parsing, config, download pipeline, path resolution, EXIF, iCloud API
@@ -293,7 +293,7 @@ Require pre-authenticated session. Run with `--test-threads=1`.
 |------|------|----------|
 | `sync_temp_suffix_leaves_no_remnants` | `--temp-suffix .downloading` | No `.downloading` files remain after sync |
 | `sync_threads_num_reflected_in_log` | `--threads-num 1` | Stderr contains `concurrency=1` |
-| `sync_notification_script_fires_event` | `--notification-script` | Marker file created; contains `ICLOUDPD_EVENT` value |
+| `sync_notification_script_fires_event` | `--notification-script` | Marker file created; contains `KEI_EVENT` value |
 | `sync_pid_file_cleaned_up_after_sync` | `--pid-file` | PID file does not exist after completion |
 
 ### Bare Invocation (1 test)

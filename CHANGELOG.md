@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Renamed project from icloudpd-rs to kei.** Binary, crate, Docker image, Homebrew formula, and default paths have all changed. See migration guide.
+- Default cookie directory: `~/.icloudpd-rs` → `~/.config/kei/cookies`
+- Default config path: `~/.config/icloudpd-rs/config.toml` → `~/.config/kei/config.toml`
+- Default temp suffix: `.icloudpd-tmp` → `.kei-tmp`
+- Notification env vars: `ICLOUDPD_EVENT` → `KEI_EVENT`, `ICLOUDPD_MESSAGE` → `KEI_MESSAGE`, `ICLOUDPD_USERNAME` → `KEI_ICLOUD_USERNAME`
+- Docker image: `ghcr.io/rhoopr/icloudpd-rs` → `ghcr.io/rhoopr/kei`
+- Auto-migration: existing `~/.icloudpd-rs/` and `~/.config/icloudpd-rs/` data is automatically copied to new paths on first run.
+
 ---
 
 ## [0.4.2] - 2026-03-30
