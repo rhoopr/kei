@@ -928,7 +928,7 @@ mod tests {
             skip_created_after: Some("2025-01-01".to_string()),
             watch_interval: Some(1800),
             notify_systemd: true,
-            pid_file: Some("/var/run/icloudpd.pid".to_string()),
+            pid_file: Some("/var/run/kei.pid".to_string()),
             notification_script: Some("/usr/local/bin/notify.sh".to_string()),
             threads_num: Some(4),
             max_retries: Some(5),
