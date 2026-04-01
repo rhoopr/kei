@@ -16,7 +16,7 @@
 ---
 
 > [!IMPORTANT]
-> **icloudpd-rs is now kei.** We're building a universal photo sync engine. iCloud is just the first source - Google Takeout, Immich, and more are coming. Same fast downloads, same single binary, way bigger ambitions. Upgrading? Your config and cookies migrate automatically on first run.
+> **`icloudpd-rs` is now `kei`.** We're building a universal photo sync engine. iCloud is just the first source - Google Takeout, Immich, and more are coming. Same fast downloads, same single binary, way bigger ambitions. Upgrading? Your config and cookies migrate automatically on first run.
 
 kei syncs your photos from cloud services to local storage. Single binary, small footprint, runs unattended.
 
