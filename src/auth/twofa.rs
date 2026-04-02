@@ -63,7 +63,10 @@ pub async fn trigger_push_notification(
 
     let status = response.status();
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
+        let text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to read response body");
+            String::new()
+        });
         anyhow::bail!("Push notification failed (HTTP {status}): {text}");
     }
     Ok(())
@@ -115,7 +118,10 @@ pub async fn submit_2fa_code(
 
     let status = response.status();
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
+        let text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to read response body");
+            String::new()
+        });
         // Apple error code -21669 = incorrect verification code
         if text.contains("-21669") {
             tracing::error!("Code verification failed: wrong code");
@@ -195,7 +201,10 @@ pub async fn validate_token(
 
     let status = response.status();
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
+        let text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to read response body");
+            String::new()
+        });
         tracing::debug!("Invalid authentication token");
         return Err(AuthError::InvalidToken(text).into());
     }
@@ -231,7 +240,10 @@ pub async fn authenticate_with_token(
     // extract_and_save) before consuming the response body.
     let apple_rscd = session.session_data.apple_rscd.clone();
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
+        let text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to read response body");
+            String::new()
+        });
         return Err(
             crate::auth::parse_auth_error(status.as_u16(), &text, apple_rscd.as_deref()).into(),
         );

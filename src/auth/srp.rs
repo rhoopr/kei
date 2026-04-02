@@ -267,7 +267,10 @@ pub async fn authenticate_srp(
 
     let status = response.status();
     if !status.is_success() && status.as_u16() != 409 {
-        let text = response.text().await.unwrap_or_default();
+        let text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to read response body");
+            String::new()
+        });
         return Err(super::parse_auth_error(
             status.as_u16(),
             &text,
@@ -374,7 +377,10 @@ pub async fn authenticate_srp(
             .post(&repair_url, Some("{}".to_string()), Some(repair_headers))
             .await?;
         if !repair_response.status().is_success() {
-            let text = repair_response.text().await.unwrap_or_default();
+            let text = repair_response.text().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to read response body");
+                String::new()
+            });
             return Err(AuthError::ApiError {
                 code: 412,
                 message: format!("Repair failed: {text}"),
@@ -382,7 +388,10 @@ pub async fn authenticate_srp(
             .into());
         }
     } else if status.is_client_error() || status.is_server_error() {
-        let text = response.text().await.unwrap_or_default();
+        let text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to read response body");
+            String::new()
+        });
         return Err(super::parse_auth_error(
             status.as_u16(),
             &text,
