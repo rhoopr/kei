@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,20 +7,69 @@ use fs4::fs_std::FileExt;
 use reqwest::cookie::CookieStore;
 use reqwest::header::{HeaderMap, HeaderValue, ORIGIN, REFERER, USER_AGENT};
 use reqwest::{Client, Response};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-/// Apple's auth APIs return session state in custom HTTP headers.
-/// We capture these after every request to maintain session continuity.
-const HEADER_DATA: &[(&str, &str)] = &[
-    ("X-Apple-ID-Account-Country", "account_country"),
-    ("X-Apple-ID-Session-Id", "session_id"),
-    ("X-Apple-Session-Token", "session_token"),
-    ("X-Apple-TwoSV-Trust-Token", "trust_token"),
-    ("X-Apple-TwoSV-Trust-Eligible", "trust_eligible"),
-    ("X-Apple-I-Rscd", "apple_rscd"),
-    ("X-Apple-I-Ercd", "apple_ercd"),
-    ("scnt", "scnt"),
+/// Typed session state persisted to `{username}.session` as JSON.
+///
+/// Replaces the previous `HashMap<String, String>` with compile-time field
+/// safety. All fields use `Option<String>` with serde defaults so existing
+/// `.session` files deserialize without loss.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_eligible: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apple_rscd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apple_ercd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scnt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+/// Maps an HTTP header name to the corresponding `SessionData` field,
+/// returning `true` if the value changed.
+fn capture_header(data: &mut SessionData, header: &str, value: String) -> bool {
+    let slot = match header {
+        "X-Apple-ID-Account-Country" => &mut data.account_country,
+        "X-Apple-ID-Session-Id" => &mut data.session_id,
+        "X-Apple-Session-Token" => &mut data.session_token,
+        "X-Apple-TwoSV-Trust-Token" => &mut data.trust_token,
+        "X-Apple-TwoSV-Trust-Eligible" => &mut data.trust_eligible,
+        "X-Apple-I-Rscd" => &mut data.apple_rscd,
+        "X-Apple-I-Ercd" => &mut data.apple_ercd,
+        "scnt" => &mut data.scnt,
+        _ => return false,
+    };
+    if slot.as_deref() != Some(&value) {
+        *slot = Some(value);
+        true
+    } else {
+        false
+    }
+}
+
+/// Header names to capture from Apple API responses.
+const SESSION_HEADERS: &[&str] = &[
+    "X-Apple-ID-Account-Country",
+    "X-Apple-ID-Session-Id",
+    "X-Apple-Session-Token",
+    "X-Apple-TwoSV-Trust-Token",
+    "X-Apple-TwoSV-Trust-Eligible",
+    "X-Apple-I-Rscd",
+    "X-Apple-I-Ercd",
+    "scnt",
 ];
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
@@ -69,7 +117,7 @@ pub struct Session {
     /// `persist_jar_cookies` to save session cookies to disk, and kept alive
     /// so the client's internal weak reference remains valid.
     cookie_jar: Arc<reqwest::cookie::Jar>,
-    pub session_data: HashMap<String, String>,
+    pub session_data: SessionData,
     cookie_dir: PathBuf,
     sanitized_username: String,
     home_endpoint: String,
@@ -225,29 +273,24 @@ impl Session {
         let session_path = cookie_dir.join(format!("{sanitized}.session"));
         let session_data = if session_path.exists() {
             match fs::read_to_string(&session_path).await {
-                Ok(contents) => match serde_json::from_str::<HashMap<String, Value>>(&contents) {
-                    Ok(map) => {
+                Ok(contents) => match serde_json::from_str::<SessionData>(&contents) {
+                    Ok(data) => {
                         tracing::debug!(path = %session_path.display(), "Loaded session data");
-                        map.into_iter()
-                            .map(|(k, v)| match v {
-                                Value::String(s) => (k, s),
-                                other => (k, other.to_string()),
-                            })
-                            .collect()
+                        data
                     }
                     Err(_) => {
                         tracing::info!("Session file corrupt, starting fresh");
-                        HashMap::new()
+                        SessionData::default()
                     }
                 },
                 Err(_) => {
                     tracing::info!("Session file does not exist");
-                    HashMap::new()
+                    SessionData::default()
                 }
             }
         } else {
             tracing::info!("Session file does not exist");
-            HashMap::new()
+            SessionData::default()
         };
 
         tracing::debug!(path = %session_path.display(), "Using session file");
@@ -277,15 +320,6 @@ impl Session {
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
     pub fn release_lock(&self) -> Result<()> {
         FileExt::unlock(&self.lock_file).context("Failed to release session lock file")
-    }
-
-    pub fn client_id(&self) -> Option<&String> {
-        self.session_data.get("client_id")
-    }
-
-    pub fn set_client_id(&mut self, client_id: &str) {
-        self.session_data
-            .insert("client_id".to_string(), client_id.to_string());
     }
 
     pub async fn post(
@@ -327,13 +361,10 @@ impl Session {
     async fn extract_and_save(&mut self, response: &Response) -> Result<()> {
         let headers = response.headers();
         let mut session_changed = false;
-        for &(header_name, session_key) in HEADER_DATA {
+        for &header_name in SESSION_HEADERS {
             if let Some(val) = headers.get(header_name) {
                 if let Ok(val_str) = val.to_str() {
-                    let existing = self.session_data.get(session_key);
-                    if existing.map(|s| s.as_str()) != Some(val_str) {
-                        self.session_data
-                            .insert(session_key.to_string(), val_str.to_string());
+                    if capture_header(&mut self.session_data, header_name, val_str.to_string()) {
                         session_changed = true;
                     }
                 }
@@ -566,49 +597,34 @@ mod tests {
     }
 
     #[test]
-    fn test_is_cookie_expired_past() {
+    fn test_is_cookie_expired() {
         let now = chrono::Utc::now();
+        // Past → expired
         assert!(is_cookie_expired(
             "foo=bar; Expires=Thu, 01 Jan 2020 00:00:00 GMT",
             &now
         ));
-    }
-
-    #[test]
-    fn test_is_cookie_expired_future() {
-        let now = chrono::Utc::now();
+        // Future → not expired
         assert!(!is_cookie_expired(
             "foo=bar; Expires=Thu, 01 Jan 2099 00:00:00 GMT",
             &now
         ));
-    }
-
-    #[test]
-    fn test_is_cookie_expired_no_expiry() {
-        let now = chrono::Utc::now();
+        // No expiry → not expired
         assert!(!is_cookie_expired("foo=bar", &now));
     }
 
     #[test]
     fn test_sanitize_username() {
-        assert_eq!(sanitize_username("user@example.com"), "userexamplecom");
-        assert_eq!(sanitize_username("hello_world"), "hello_world");
-        assert_eq!(sanitize_username("a.b-c@d"), "abcd");
-    }
-
-    #[test]
-    fn test_sanitize_username_unicode() {
-        assert_eq!(sanitize_username("用户@example.com"), "用户examplecom");
-    }
-
-    #[test]
-    fn test_sanitize_username_empty() {
-        assert_eq!(sanitize_username(""), "");
-    }
-
-    #[test]
-    fn test_sanitize_username_all_special() {
-        assert_eq!(sanitize_username("@.+-!"), "");
+        for (input, expected) in [
+            ("user@example.com", "userexamplecom"),
+            ("hello_world", "hello_world"),
+            ("a.b-c@d", "abcd"),
+            ("用户@example.com", "用户examplecom"),
+            ("", ""),
+            ("@.+-!", ""),
+        ] {
+            assert_eq!(sanitize_username(input), expected, "input: {input:?}");
+        }
     }
 
     #[tokio::test]
@@ -697,5 +713,83 @@ mod tests {
             .unwrap();
 
         assert_eq!(mtime1, mtime2, "File should not have been rewritten");
+    }
+
+    #[test]
+    fn session_data_serialization_round_trip() {
+        let data = SessionData {
+            session_token: Some("tok123".into()),
+            scnt: Some("scnt456".into()),
+            client_id: Some("client-789".into()),
+            ..SessionData::default()
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SessionData = serde_json::from_str(&json).unwrap();
+        assert_eq!(data, back);
+    }
+
+    #[test]
+    fn session_data_deserializes_legacy_with_unknown_keys() {
+        // Old HashMap-based files may contain keys we don't model.
+        // serde(default) + deny_unknown_fields NOT set → these are silently ignored.
+        let json = r#"{"session_token":"abc","unknown_key":"val"}"#;
+        let data: SessionData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.session_token.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn session_data_deserializes_empty_object() {
+        let data: SessionData = serde_json::from_str("{}").unwrap();
+        assert_eq!(data, SessionData::default());
+    }
+
+    #[test]
+    fn session_data_omits_none_fields() {
+        let data = SessionData {
+            session_token: Some("tok".into()),
+            ..SessionData::default()
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("session_token"));
+        assert!(!json.contains("scnt"));
+        assert!(!json.contains("client_id"));
+    }
+
+    #[test]
+    fn capture_header_returns_changed() {
+        let mut data = SessionData::default();
+        assert!(capture_header(&mut data, "scnt", "val".into()));
+        assert_eq!(data.scnt.as_deref(), Some("val"));
+        // Same value → no change
+        assert!(!capture_header(&mut data, "scnt", "val".into()));
+        // Different value → changed
+        assert!(capture_header(&mut data, "scnt", "new".into()));
+        assert_eq!(data.scnt.as_deref(), Some("new"));
+        // Unknown header → false
+        assert!(!capture_header(&mut data, "X-Unknown", "x".into()));
+    }
+
+    #[tokio::test]
+    async fn session_data_persisted_and_reloaded() {
+        let dir = test_dir("session_data_persist");
+        let mut session = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .unwrap();
+
+        session.session_data.session_token = Some("tok".into());
+        session.session_data.scnt = Some("scnt_val".into());
+
+        // Manually persist (simulating what extract_and_save does)
+        let session_path = session.session_path();
+        let json = serde_json::to_string_pretty(&session.session_data).unwrap();
+        std::fs::write(&session_path, &json).unwrap();
+
+        drop(session);
+        let session2 = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .unwrap();
+        assert_eq!(session2.session_data.session_token.as_deref(), Some("tok"));
+        assert_eq!(session2.session_data.scnt.as_deref(), Some("scnt_val"));
+        assert!(session2.session_data.client_id.is_none());
     }
 }

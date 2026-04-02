@@ -6,10 +6,8 @@ use rand::RngExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 
-use std::collections::HashMap;
-
 use super::endpoints::Endpoints;
-use super::session::Session;
+use super::session::{Session, SessionData};
 use crate::auth::error::AuthError;
 
 /// Apple's public OAuth widget key — embedded in icloud.com's JavaScript.
@@ -154,7 +152,7 @@ fn compute_m2(a_pub: &BigUint, m1: &[u8], key: &[u8]) -> [u8; 32] {
 pub(crate) fn get_auth_headers(
     domain: &str,
     client_id: &str,
-    session_data: &HashMap<String, String>,
+    session_data: &SessionData,
     overrides: Option<&[(&str, &str)]>,
 ) -> Result<HeaderMap> {
     let redirect_uri = if domain == "cn" {
@@ -199,12 +197,12 @@ pub(crate) fn get_auth_headers(
         HeaderValue::from_static(APPLE_WIDGET_KEY),
     );
 
-    if let Some(scnt) = session_data.get("scnt") {
+    if let Some(scnt) = &session_data.scnt {
         if let Ok(v) = HeaderValue::from_str(scnt) {
             headers.insert("scnt", v);
         }
     }
-    if let Some(session_id) = session_data.get("session_id") {
+    if let Some(session_id) = &session_data.session_id {
         if let Ok(v) = HeaderValue::from_str(session_id) {
             headers.insert("X-Apple-ID-Session-Id", v);
         }
@@ -268,15 +266,13 @@ pub async fn authenticate_srp(
         .await?;
 
     let status = response.status();
-    if status.as_u16() == 401 {
-        return Err(AuthError::FailedLogin("Failed to initiate SRP authentication".into()).into());
-    }
     if !status.is_success() && status.as_u16() != 409 {
         let text = response.text().await.unwrap_or_default();
-        return Err(AuthError::ApiError {
-            code: status.as_u16(),
-            message: text,
-        }
+        return Err(super::parse_auth_error(
+            status.as_u16(),
+            &text,
+            session.session_data.apple_rscd.as_deref(),
+        )
         .into());
     }
 
@@ -333,7 +329,8 @@ pub async fn authenticate_srp(
 
     let trust_tokens: Vec<String> = session
         .session_data
-        .get("trust_token")
+        .trust_token
+        .as_ref()
         .filter(|t| !t.is_empty())
         .map(|t| vec![t.clone()])
         .unwrap_or_default();
@@ -386,9 +383,12 @@ pub async fn authenticate_srp(
         }
     } else if status.is_client_error() || status.is_server_error() {
         let text = response.text().await.unwrap_or_default();
-        return Err(
-            AuthError::FailedLogin(format!("Invalid email/password combination: {text}")).into(),
-        );
+        return Err(super::parse_auth_error(
+            status.as_u16(),
+            &text,
+            session.session_data.apple_rscd.as_deref(),
+        )
+        .into());
     }
 
     Ok(())
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_get_auth_headers_com_domain() {
-        let session_data = HashMap::new();
+        let session_data = SessionData::default();
         let headers = get_auth_headers("com", "client123", &session_data, None).unwrap();
         assert_eq!(
             headers.get("X-Apple-OAuth-Redirect-URI").unwrap(),
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_get_auth_headers_cn_domain() {
-        let session_data = HashMap::new();
+        let session_data = SessionData::default();
         let headers = get_auth_headers("cn", "client123", &session_data, None).unwrap();
         assert_eq!(
             headers.get("X-Apple-OAuth-Redirect-URI").unwrap(),
@@ -480,9 +480,11 @@ mod tests {
 
     #[test]
     fn test_get_auth_headers_with_session_data() {
-        let mut session_data = HashMap::new();
-        session_data.insert("scnt".to_string(), "test_scnt".to_string());
-        session_data.insert("session_id".to_string(), "test_session".to_string());
+        let session_data = SessionData {
+            scnt: Some("test_scnt".to_string()),
+            session_id: Some("test_session".to_string()),
+            ..SessionData::default()
+        };
         let headers = get_auth_headers("com", "client123", &session_data, None).unwrap();
         assert_eq!(headers.get("scnt").unwrap(), "test_scnt");
         assert_eq!(

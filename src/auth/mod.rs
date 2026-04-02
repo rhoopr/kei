@@ -72,14 +72,15 @@ pub async fn authenticate(
 
     // Prefer persisted client_id to maintain session continuity across runs
     let client_id = session
-        .client_id()
-        .cloned()
+        .session_data
+        .client_id
+        .clone()
         .or(client_id)
         .unwrap_or_else(|| format!("auth-{}", Uuid::new_v4()));
-    session.set_client_id(&client_id);
+    session.session_data.client_id = Some(client_id.clone());
 
     let mut data: Option<AccountLoginResponse> = None;
-    if session.session_data.contains_key("session_token") {
+    if session.session_data.session_token.is_some() {
         tracing::debug!("Checking session token validity");
         match twofa::validate_token(&mut session, &endpoints).await {
             Ok(d) => {
@@ -185,13 +186,14 @@ pub async fn send_2fa_push(
     let mut session = Session::new(cookie_dir, apple_id, endpoints.home, None).await?;
 
     let client_id = session
-        .client_id()
-        .cloned()
+        .session_data
+        .client_id
+        .clone()
         .unwrap_or_else(|| format!("auth-{}", Uuid::new_v4()));
-    session.set_client_id(&client_id);
+    session.session_data.client_id = Some(client_id.clone());
 
     let mut data: Option<AccountLoginResponse> = None;
-    if session.session_data.contains_key("session_token") {
+    if session.session_data.session_token.is_some() {
         if let Ok(d) = twofa::validate_token(&mut session, &endpoints).await {
             data = Some(d);
         }
@@ -229,6 +231,60 @@ pub async fn validate_session(session: &mut Session, domain: &str) -> Result<boo
     match twofa::validate_token(session, &endpoints).await {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
+    }
+}
+
+/// Inspect an HTTP response status and body for Apple-specific error patterns.
+///
+/// Apple often returns HTTP 200 with an error payload, or uses non-standard
+/// status codes (421, 450) that need special handling. `apple_rscd` should be
+/// the `X-Apple-I-Rscd` header value from the *current* response (not session
+/// state), to avoid stale values from prior requests.
+pub(crate) fn parse_auth_error(status: u16, body: &str, apple_rscd: Option<&str>) -> AuthError {
+    // X-Apple-I-Rscd == "401" → invalid credentials even on HTTP 200
+    if apple_rscd == Some("401") {
+        return AuthError::FailedLogin("Invalid username or password".into());
+    }
+
+    // JSON body errors take precedence — Apple often returns structured errors
+    // with specific codes that override the HTTP status.
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+        if json.get("hasError").and_then(|v| v.as_bool()) == Some(true) {
+            if let Some(errors) = json.get("service_errors").and_then(|v| v.as_array()) {
+                let messages: Vec<&str> = errors
+                    .iter()
+                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                    .collect();
+                if !messages.is_empty() {
+                    return AuthError::ServiceError(messages.join("; "));
+                }
+            }
+            return AuthError::ServiceError("Unknown service error".into());
+        }
+
+        let error_code = json
+            .get("reason")
+            .or_else(|| json.get("errorCode"))
+            .and_then(|v| v.as_str());
+        match error_code {
+            Some("ZONE_NOT_FOUND" | "AUTHENTICATION_FAILED") => return AuthError::SetupRequired,
+            Some("ACCESS_DENIED") => return AuthError::RateLimited,
+            _ => {}
+        }
+    }
+
+    // HTTP status fallback when body has no recognized error pattern
+    match status {
+        401 => AuthError::FailedLogin("Invalid username or password".into()),
+        421 => AuthError::WrongRegion,
+        450 => AuthError::AccountLocked(
+            "Apple has locked this account. Check your email for details.".into(),
+        ),
+        503 => AuthError::RateLimited,
+        _ => AuthError::ApiError {
+            code: status,
+            message: body.to_string(),
+        },
     }
 }
 
@@ -319,5 +375,88 @@ mod tests {
         // challenge flag alone is sufficient
         let resp = make_response(2, true, true, true);
         assert!(check_requires_2fa(&resp));
+    }
+
+    // ── parse_auth_error tests ──────────────────────────────────
+
+    #[test]
+    fn parse_error_apple_rscd_401() {
+        let err = parse_auth_error(200, "", Some("401"));
+        assert!(matches!(err, AuthError::FailedLogin(_)));
+        assert!(err.to_string().contains("Invalid username or password"));
+    }
+
+    #[test]
+    fn parse_error_http_401_failed_login() {
+        let err = parse_auth_error(401, "", None);
+        assert!(matches!(err, AuthError::FailedLogin(_)));
+    }
+
+    #[test]
+    fn parse_error_http_421_wrong_region() {
+        let err = parse_auth_error(421, "", None);
+        assert!(matches!(err, AuthError::WrongRegion));
+    }
+
+    #[test]
+    fn parse_error_http_450_account_locked() {
+        let err = parse_auth_error(450, "", None);
+        assert!(matches!(err, AuthError::AccountLocked(_)));
+    }
+
+    #[test]
+    fn parse_error_http_503_rate_limited() {
+        let err = parse_auth_error(503, "", None);
+        assert!(matches!(err, AuthError::RateLimited));
+    }
+
+    #[test]
+    fn parse_error_has_error_with_service_errors() {
+        let body = r#"{"hasError":true,"service_errors":[{"message":"Account locked"}]}"#;
+        let err = parse_auth_error(200, body, None);
+        assert!(matches!(err, AuthError::ServiceError(_)));
+        assert!(err.to_string().contains("Account locked"));
+    }
+
+    #[test]
+    fn parse_error_has_error_no_messages() {
+        let body = r#"{"hasError":true}"#;
+        let err = parse_auth_error(200, body, None);
+        assert!(matches!(err, AuthError::ServiceError(_)));
+    }
+
+    #[test]
+    fn parse_error_zone_not_found() {
+        let body = r#"{"reason":"ZONE_NOT_FOUND"}"#;
+        let err = parse_auth_error(400, body, None);
+        assert!(matches!(err, AuthError::SetupRequired));
+    }
+
+    #[test]
+    fn parse_error_authentication_failed_in_body_overrides_401_status() {
+        // JSON body error codes take precedence over HTTP status
+        let body = r#"{"errorCode":"AUTHENTICATION_FAILED"}"#;
+        let err = parse_auth_error(401, body, None);
+        assert!(matches!(err, AuthError::SetupRequired));
+    }
+
+    #[test]
+    fn parse_error_access_denied_reason() {
+        let body = r#"{"reason":"ACCESS_DENIED"}"#;
+        let err = parse_auth_error(403, body, None);
+        assert!(matches!(err, AuthError::RateLimited));
+    }
+
+    #[test]
+    fn parse_error_access_denied_error_code() {
+        let body = r#"{"errorCode":"ACCESS_DENIED"}"#;
+        let err = parse_auth_error(403, body, None);
+        assert!(matches!(err, AuthError::RateLimited));
+    }
+
+    #[test]
+    fn parse_error_generic_fallback() {
+        let err = parse_auth_error(500, "server error", None);
+        assert!(matches!(err, AuthError::ApiError { code: 500, .. }));
     }
 }

@@ -18,6 +18,26 @@ pub enum AuthError {
     #[error("Two-factor authentication is required (no code provided)")]
     TwoFactorRequired,
 
+    /// Apple returned HTTP 421 — wrong regional endpoint (com vs cn).
+    #[error("Wrong regional endpoint (HTTP 421). Try --domain cn or --domain com.")]
+    WrongRegion,
+
+    /// Account locked or disabled by Apple.
+    #[error("Account locked or disabled: {0}")]
+    AccountLocked(String),
+
+    /// Apple rate-limiting (HTTP 503 or ACCESS_DENIED).
+    #[error("Rate limited by Apple. Please wait a few minutes then try again.")]
+    RateLimited,
+
+    /// Apple's response body contained `hasError: true` with service_errors.
+    #[error("iCloud service error: {0}")]
+    ServiceError(String),
+
+    /// iCloud setup incomplete (ZONE_NOT_FOUND / AUTHENTICATION_FAILED in auth).
+    #[error("iCloud account setup may be incomplete. Please sign in to https://icloud.com and complete setup, then try again.")]
+    SetupRequired,
+
     #[error(transparent)]
     Http(Box<reqwest::Error>),
 

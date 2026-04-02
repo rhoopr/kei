@@ -46,6 +46,9 @@ indicatif = "0.18"
 rpassword = "7"
 dialoguer = "0.11"
 
+# OS keyring
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
 # EXIF — two libraries because no single crate handles both read and write.
 # kamadak-exif: read-only, used for reading DateTimeOriginal from existing files.
 # little_exif:  write-capable, used for stamping EXIF dates on downloaded photos.

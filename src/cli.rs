@@ -19,11 +19,11 @@ pub struct AuthArgs {
     pub password: Option<String>,
 
     /// iCloud domain (com or cn)
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, env = "ICLOUD_DOMAIN")]
     pub domain: Option<Domain>,
 
     /// Directory for cookies/session data
-    #[arg(long)]
+    #[arg(long, env = "ICLOUD_COOKIE_DIRECTORY")]
     pub cookie_directory: Option<String>,
 }
 
@@ -31,8 +31,12 @@ pub struct AuthArgs {
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
     /// Local directory for downloads
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, env = "KEI_DIRECTORY")]
     pub directory: Option<String>,
+
+    /// Print resolved configuration as TOML and exit
+    #[arg(long)]
+    pub print_config: bool,
 
     /// Only authenticate (create/update session tokens)
     #[arg(long)]
@@ -51,23 +55,23 @@ pub struct SyncArgs {
     pub albums: Vec<String>,
 
     /// Library to download (default: PrimarySync, use "all" for all libraries)
-    #[arg(long)]
+    #[arg(long, env = "KEI_LIBRARY")]
     pub library: Option<String>,
 
     /// Image size to download
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, env = "KEI_SIZE")]
     pub size: Option<VersionSize>,
 
     /// Live photo video size
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, env = "KEI_LIVE_PHOTO_SIZE")]
     pub live_photo_size: Option<LivePhotoSize>,
 
     /// Number of recent photos to download
-    #[arg(long)]
+    #[arg(long, env = "KEI_RECENT")]
     pub recent: Option<u32>,
 
     /// Number of concurrent download threads (default: 10)
-    #[arg(long = "threads-num", value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..))]
     pub threads_num: Option<u16>,
 
     /// Don't download videos
@@ -87,7 +91,7 @@ pub struct SyncArgs {
     pub force_size: bool,
 
     /// Folder structure for organizing downloads
-    #[arg(long)]
+    #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
 
     /// Write DateTimeOriginal EXIF tag if missing
@@ -99,7 +103,7 @@ pub struct SyncArgs {
     pub dry_run: bool,
 
     /// Run continuously, waiting N seconds between runs
-    #[arg(long)]
+    #[arg(long, env = "KEI_WATCH_WITH_INTERVAL")]
     pub watch_with_interval: Option<u64>,
 
     /// Disable progress bar
@@ -111,23 +115,23 @@ pub struct SyncArgs {
     pub keep_unicode_in_filenames: bool,
 
     /// Live photo MOV filename policy
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, env = "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY")]
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
     /// RAW treatment policy
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, env = "KEI_ALIGN_RAW")]
     pub align_raw: Option<RawTreatmentPolicy>,
 
     /// File matching and dedup policy
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, env = "KEI_FILE_MATCH_POLICY")]
     pub file_match_policy: Option<FileMatchPolicy>,
 
     /// Skip assets created before this ISO date or interval (e.g., 2025-01-02 or 20d)
-    #[arg(long)]
+    #[arg(long, env = "KEI_SKIP_CREATED_BEFORE")]
     pub skip_created_before: Option<String>,
 
     /// Skip assets created after this ISO date or interval
-    #[arg(long)]
+    #[arg(long, env = "KEI_SKIP_CREATED_AFTER")]
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
@@ -135,16 +139,16 @@ pub struct SyncArgs {
     pub only_print_filenames: bool,
 
     /// Max retries per download (default: 3, 0 = no retries)
-    #[arg(long)]
+    #[arg(long, env = "KEI_MAX_RETRIES")]
     pub max_retries: Option<u32>,
 
     /// Initial retry delay in seconds (default: 5)
-    #[arg(long)]
+    #[arg(long, env = "KEI_RETRY_DELAY")]
     pub retry_delay: Option<u64>,
 
     /// Temp file suffix for partial downloads (default: .kei-tmp).
     /// Change if the default conflicts with your filesystem (e.g. Nextcloud rejects .part).
-    #[arg(long)]
+    #[arg(long, env = "KEI_TEMP_SUFFIX")]
     pub temp_suffix: Option<String>,
 
     /// Force full library enumeration even if a sync token exists
@@ -161,12 +165,12 @@ pub struct SyncArgs {
     pub notify_systemd: bool,
 
     /// Write PID to file (for service managers).
-    #[arg(long)]
+    #[arg(long, env = "KEI_PID_FILE")]
     pub pid_file: Option<std::path::PathBuf>,
 
     /// Script to run on events (2FA required, sync complete, etc.).
     /// Called with KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME env vars.
-    #[arg(long)]
+    #[arg(long, env = "KEI_NOTIFICATION_SCRIPT")]
     pub notification_script: Option<String>,
 }
 
@@ -250,7 +254,17 @@ pub struct SubmitCodeArgs {
     pub auth: AuthArgs,
 
     /// 6-digit 2FA code from your trusted device
+    #[arg(value_parser = parse_2fa_code)]
     pub code: String,
+}
+
+/// Validate that a 2FA code is exactly 6 ASCII digits.
+fn parse_2fa_code(s: &str) -> Result<String, String> {
+    if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
+        Ok(s.to_string())
+    } else {
+        Err("2FA code must be exactly 6 digits".to_string())
+    }
 }
 
 /// Subcommands for kei.
@@ -286,6 +300,18 @@ pub enum Command {
     /// Submit a 2FA code non-interactively (for Docker / headless use)
     SubmitCode(SubmitCodeArgs),
 
+    /// Store a password in the OS keyring for headless use
+    StorePassword {
+        #[command(flatten)]
+        auth: AuthArgs,
+    },
+
+    /// Delete a stored password from the OS keyring
+    DeletePassword {
+        #[command(flatten)]
+        auth: AuthArgs,
+    },
+
     /// Interactively generate a config file
     Setup {
         /// Output path (overrides --config)
@@ -298,11 +324,16 @@ pub enum Command {
 #[command(name = "kei", about = "kei: photo sync engine", version)]
 pub struct Cli {
     /// Log level
-    #[arg(long, value_enum, global = true)]
+    #[arg(long, value_enum, global = true, env = "KEI_LOG_LEVEL")]
     pub log_level: Option<LogLevel>,
 
     /// Path to TOML config file
-    #[arg(long, global = true, default_value = "~/.config/kei/config.toml")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "~/.config/kei/config.toml",
+        env = "KEI_CONFIG"
+    )]
     pub config: String,
 
     #[command(subcommand)]
@@ -1192,6 +1223,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_store_password_parses() {
+        let cli = Cli::try_parse_from(["kei", "store-password", "--username", "test@example.com"])
+            .unwrap();
+        assert!(matches!(cli.command, Some(Command::StorePassword { .. })));
+    }
+
+    #[test]
+    fn test_delete_password_parses() {
+        let cli = Cli::try_parse_from(["kei", "delete-password", "--username", "test@example.com"])
+            .unwrap();
+        assert!(matches!(cli.command, Some(Command::DeletePassword { .. })));
+    }
+
+    #[test]
+    fn test_submit_code_rejects_non_digits() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", "abcdef"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_too_short() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", "12345"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_too_long() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", "1234567"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_empty() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", ""]).is_err());
+    }
+
     // ── no-incremental / reset-sync-token flags ───────────────────
 
     #[test]
@@ -1232,6 +1297,22 @@ mod tests {
         assert!(cli.sync.reset_sync_token);
     }
 
+    // ── print-config flag ──────────────────────────────────────────
+
+    #[test]
+    fn test_print_config_flag() {
+        let mut args = base_args();
+        args.push("--print-config");
+        let cli = parse(&args);
+        assert!(cli.sync.print_config);
+    }
+
+    #[test]
+    fn test_print_config_default_false() {
+        let cli = parse(&base_args());
+        assert!(!cli.sync.print_config);
+    }
+
     // ── notification-script flag ──────────────────────────────────
 
     #[test]
@@ -1249,5 +1330,51 @@ mod tests {
             cli.sync.notification_script.as_deref(),
             Some("/path/to/notify.sh")
         );
+    }
+
+    // ── environment variable support ─────────────────────────────
+    //
+    // Env var tests use KEI_TEMP_SUFFIX (not used by other tests) to
+    // avoid races with the parallel test runner. Clap's env integration
+    // works identically for all `env = "..."` attributes.
+
+    #[test]
+    fn test_env_var_picked_up_by_clap() {
+        let _guard = EnvGuard::new("KEI_TEMP_SUFFIX", ".env-test");
+        let cli = parse(&base_args());
+        assert_eq!(cli.sync.temp_suffix.as_deref(), Some(".env-test"));
+    }
+
+    #[test]
+    fn test_cli_overrides_env_var() {
+        let _guard = EnvGuard::new("KEI_TEMP_SUFFIX", ".env-test");
+        let mut args = base_args();
+        args.extend(["--temp-suffix", ".cli-test"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.temp_suffix.as_deref(), Some(".cli-test"));
+    }
+
+    /// RAII guard that sets an env var on construction and restores the
+    /// previous value on drop, preventing cross-test pollution.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 }

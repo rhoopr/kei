@@ -217,19 +217,28 @@ pub async fn authenticate_with_token(
     endpoints: &Endpoints,
 ) -> Result<AccountLoginResponse> {
     let data = serde_json::json!({
-        "accountCountryCode": session.session_data.get("account_country").cloned().unwrap_or_default(),
-        "dsWebAuthToken": session.session_data.get("session_token").cloned().unwrap_or_default(),
+        "accountCountryCode": session.session_data.account_country.clone().unwrap_or_default(),
+        "dsWebAuthToken": session.session_data.session_token.clone().unwrap_or_default(),
         "extended_login": true,
-        "trustToken": session.session_data.get("trust_token").cloned().unwrap_or_default(),
+        "trustToken": session.session_data.trust_token.clone().unwrap_or_default(),
     });
 
     let url = format!("{}/accountLogin", endpoints.setup);
     let response = session.post(&url, Some(data.to_string()), None).await?;
 
     let status = response.status();
+    // Grab apple_rscd from this specific response (captured by session.post →
+    // extract_and_save) before consuming the response body.
+    let apple_rscd = session.session_data.apple_rscd.clone();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(AuthError::FailedLogin(format!("Invalid authentication token: {text}")).into());
+        return Err(
+            crate::auth::parse_auth_error(status.as_u16(), &text, apple_rscd.as_deref()).into(),
+        );
+    }
+    // Apple may return HTTP 200 but signal an error via the X-Apple-I-Rscd header.
+    if apple_rscd.as_deref() == Some("401") {
+        return Err(AuthError::FailedLogin("Invalid username or password".into()).into());
     }
 
     let body: AccountLoginResponse = response

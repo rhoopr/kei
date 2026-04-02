@@ -123,6 +123,12 @@ impl std::fmt::Display for LibrarySelection {
     }
 }
 
+impl serde::Serialize for LibrarySelection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// Application configuration.
 ///
 /// Fields are ordered for optimal memory layout:
@@ -133,6 +139,7 @@ impl std::fmt::Display for LibrarySelection {
 /// - 2-byte primitives (u16)
 /// - 1-byte enums
 /// - All booleans grouped at the end
+#[derive(serde::Serialize)]
 pub struct Config {
     // Heap types first
     pub username: String,
@@ -167,7 +174,6 @@ pub struct Config {
     pub size: VersionSize,
     pub live_photo_size: LivePhotoSize,
     pub domain: Domain,
-    #[allow(dead_code)] // Copied from CLI but read from cli.log_level directly in main.rs
     pub log_level: LogLevel,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub align_raw: RawTreatmentPolicy,
@@ -237,7 +243,6 @@ pub(crate) fn resolve_auth(
         toml_auth.and_then(|a| a.username.clone()),
         String::new(),
     );
-
     let password = auth
         .password
         .clone()
@@ -265,6 +270,11 @@ impl Config {
         toml: Option<TomlConfig>,
     ) -> anyhow::Result<Self> {
         let (username, password, domain, cookie_directory) = resolve_auth(&auth, &toml);
+
+        anyhow::ensure!(!username.is_empty(), "username is required");
+
+        // Treat empty password as absent so the provider chain prompts instead
+        let password = password.filter(|p| !p.is_empty());
 
         let toml_dl = toml.as_ref().and_then(|t| t.download.as_ref());
         let toml_retry = toml_dl.and_then(|d| d.retry.as_ref());
@@ -305,6 +315,10 @@ impl Config {
         // Retry
         let max_retries = resolve(sync.max_retries, toml_retry.and_then(|r| r.max_retries), 3);
         let retry_delay_secs = resolve(sync.retry_delay, toml_retry.and_then(|r| r.delay), 5);
+        anyhow::ensure!(
+            retry_delay_secs >= 1,
+            "retry-delay must be >= 1 second, got {retry_delay_secs}"
+        );
 
         // Filters
         let library_str = resolve(
@@ -383,6 +397,12 @@ impl Config {
         let watch_with_interval = sync
             .watch_with_interval
             .or_else(|| toml_watch.and_then(|w| w.interval));
+        if let Some(interval) = watch_with_interval {
+            anyhow::ensure!(
+                interval >= 60,
+                "watch-with-interval must be >= 60 seconds, got {interval}"
+            );
+        }
         let notify_systemd = resolve_flag(
             sync.notify_systemd,
             toml_watch.and_then(|w| w.notify_systemd),
@@ -534,6 +554,43 @@ mod tests {
         let expected = before - chrono::Duration::days(10);
         assert!(dt >= expected - chrono::Duration::seconds(1));
         assert!(dt <= after - chrono::Duration::days(10) + chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn test_library_selection_serialize_single() {
+        let sel = LibrarySelection::Single("PrimarySync".to_string());
+        let toml_val = toml::Value::try_from(&sel).unwrap();
+        assert_eq!(toml_val.as_str(), Some("PrimarySync"));
+    }
+
+    #[test]
+    fn test_library_selection_serialize_all() {
+        let sel = LibrarySelection::All;
+        let toml_val = toml::Value::try_from(&sel).unwrap();
+        assert_eq!(toml_val.as_str(), Some("all"));
+    }
+
+    #[test]
+    fn test_config_serializes_to_toml() {
+        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        assert!(toml_str.contains("username = \"u@example.com\""));
+        assert!(toml_str.contains("threads_num = 10"));
+    }
+
+    #[test]
+    fn test_config_serialize_redacts_password() {
+        let auth = AuthArgs {
+            username: Some("u@example.com".to_string()),
+            password: Some("secret".to_string()),
+            domain: None,
+            cookie_directory: None,
+        };
+        let mut cfg = Config::build(auth, default_sync(), None, None).unwrap();
+        cfg.password = Some("********".to_string());
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        assert!(toml_str.contains("password = \"********\""));
+        assert!(!toml_str.contains("secret"));
     }
 
     #[test]
@@ -2064,5 +2121,74 @@ mod tests {
         assert!(cfg.list_albums);
         assert!(cfg.list_libraries);
         assert!(cfg.dry_run);
+    }
+
+    // ── Config::build: input validation ─────────────────────────────
+
+    #[test]
+    fn test_build_rejects_empty_username() {
+        let auth = AuthArgs {
+            username: Some(String::new()),
+            password: None,
+            domain: None,
+            cookie_directory: None,
+        };
+        let err = Config::build(auth, default_sync(), None, None).unwrap_err();
+        assert!(err.to_string().contains("username is required"), "{err}");
+    }
+
+    #[test]
+    fn test_build_rejects_missing_username() {
+        let auth = AuthArgs {
+            username: None,
+            password: None,
+            domain: None,
+            cookie_directory: None,
+        };
+        let err = Config::build(auth, default_sync(), None, None).unwrap_err();
+        assert!(err.to_string().contains("username is required"), "{err}");
+    }
+
+    #[test]
+    fn test_build_empty_password_treated_as_none() {
+        let auth = AuthArgs {
+            username: Some("u@example.com".to_string()),
+            password: Some(String::new()),
+            domain: None,
+            cookie_directory: None,
+        };
+        let cfg = Config::build(auth, default_sync(), None, None).unwrap();
+        assert!(cfg.password.is_none());
+    }
+
+    #[test]
+    fn test_build_rejects_zero_retry_delay() {
+        let mut sync = default_sync();
+        sync.retry_delay = Some(0);
+        let err = Config::build(default_auth(), sync, None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("retry-delay must be >= 1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_low_watch_interval() {
+        let mut sync = default_sync();
+        sync.watch_with_interval = Some(30);
+        let err = Config::build(default_auth(), sync, None, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("watch-with-interval must be >= 60"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_build_accepts_valid_watch_interval() {
+        let mut sync = default_sync();
+        sync.watch_with_interval = Some(60);
+        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        assert_eq!(cfg.watch_with_interval, Some(60));
     }
 }

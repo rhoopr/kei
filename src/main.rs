@@ -88,13 +88,39 @@ use systemd::SystemdNotifier;
 /// Maximum number of re-authentication attempts before giving up.
 const MAX_REAUTH_ATTEMPTS: u32 = 3;
 
-/// Build a password provider closure that returns the given password or
-/// falls back to prompting on stdin.
-fn make_password_provider(password: Option<String>) -> impl Fn() -> Option<String> {
-    move || -> Option<String> {
-        password.clone().or_else(|| {
-            tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
-        })
+/// Build a password provider closure: CLI/env → OS keyring → interactive prompt.
+fn make_password_provider(
+    password: Option<String>,
+    username: String,
+) -> impl Fn() -> Option<String> {
+    move || {
+        if let Some(pw) = &password {
+            return Some(pw.clone());
+        }
+
+        // Try OS keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager)
+        if let Some(pw) = keyring::Entry::new("kei", &username)
+            .ok()
+            .and_then(|entry| match entry.get_password() {
+                Ok(pw) => {
+                    tracing::debug!("Password retrieved from OS keyring");
+                    Some(pw)
+                }
+                Err(keyring::Error::NoEntry) => {
+                    tracing::debug!("No password stored in OS keyring");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "OS keyring unavailable");
+                    None
+                }
+            })
+        {
+            return Some(pw);
+        }
+
+        // Fall back to interactive prompt
+        tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
     }
 }
 
@@ -387,7 +413,7 @@ async fn run_get_code(args: cli::GetCodeArgs, toml: &Option<TomlConfig>) -> anyh
         anyhow::bail!("--username is required for get-code");
     }
 
-    let password_provider = make_password_provider(password);
+    let password_provider = make_password_provider(password, username.clone());
 
     auth::send_2fa_push(
         &cookie_directory,
@@ -402,7 +428,43 @@ async fn run_get_code(args: cli::GetCodeArgs, toml: &Option<TomlConfig>) -> anyh
     Ok(())
 }
 
-/// Run the submit-code command: authenticate with a pre-provided 2FA code.
+fn keyring_entry(username: &str) -> anyhow::Result<keyring::Entry> {
+    keyring::Entry::new("kei", username).map_err(|e| anyhow::anyhow!("OS keyring unavailable: {e}"))
+}
+
+fn run_store_password(auth: cli::AuthArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+    let (username, _, _, _) = config::resolve_auth(&auth, toml);
+    anyhow::ensure!(
+        !username.is_empty(),
+        "--username is required for store-password"
+    );
+
+    let password = rpassword::prompt_password("iCloud Password: ")?;
+    anyhow::ensure!(!password.is_empty(), "password cannot be empty");
+
+    keyring_entry(&username)?
+        .set_password(&password)
+        .map_err(|e| anyhow::anyhow!("Failed to store password: {e}"))?;
+
+    println!("Password stored in OS keyring for {username}");
+    Ok(())
+}
+
+fn run_delete_password(auth: cli::AuthArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+    let (username, _, _, _) = config::resolve_auth(&auth, toml);
+    anyhow::ensure!(
+        !username.is_empty(),
+        "--username is required for delete-password"
+    );
+
+    match keyring_entry(&username)?.delete_credential() {
+        Ok(()) => println!("Password deleted from OS keyring for {username}"),
+        Err(keyring::Error::NoEntry) => println!("No password stored for {username}"),
+        Err(e) => return Err(anyhow::anyhow!("Failed to delete password: {e}")),
+    }
+    Ok(())
+}
+
 async fn run_submit_code(
     args: cli::SubmitCodeArgs,
     toml: &Option<TomlConfig>,
@@ -413,7 +475,7 @@ async fn run_submit_code(
         anyhow::bail!("--username is required for submit-code");
     }
 
-    let password_provider = make_password_provider(password);
+    let password_provider = make_password_provider(password, username.clone());
 
     let result = auth::authenticate(
         &cookie_directory,
@@ -490,7 +552,7 @@ async fn run_import_existing(
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
     // Authenticate
-    let password_provider = make_password_provider(password);
+    let password_provider = make_password_provider(password, username.clone());
 
     let auth_result = auth::authenticate(
         &cookie_directory,
@@ -511,7 +573,12 @@ async fn run_import_existing(
         .map(|ep| ep.url.as_str())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
 
-    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
+    let client_id = auth_result
+        .session
+        .session_data
+        .client_id
+        .clone()
+        .unwrap_or_default();
     let dsid = auth_result
         .data
         .ds_info
@@ -779,6 +846,12 @@ async fn run() -> anyhow::Result<()> {
         Command::ImportExisting(args) => return run_import_existing(args, &toml_config).await,
         Command::GetCode(args) => return run_get_code(args, &toml_config).await,
         Command::SubmitCode(args) => return run_submit_code(args, &toml_config).await,
+        Command::StorePassword { auth } => {
+            return run_store_password(auth, &toml_config);
+        }
+        Command::DeletePassword { auth } => {
+            return run_delete_password(auth, &toml_config);
+        }
         Command::Setup { output } => {
             let path = output
                 .map(|o| config::expand_tilde(&o))
@@ -820,7 +893,15 @@ async fn run() -> anyhow::Result<()> {
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
+    let print_config = sync.print_config;
     let config = config::Config::build(auth, sync, cli.log_level, toml_config)?;
+
+    if print_config {
+        let mut display = config;
+        display.password = display.password.map(|_| "********".to_string());
+        println!("{}", toml::to_string_pretty(&display)?);
+        return Ok(());
+    }
 
     // Install password redaction now that we know the password
     if let Some(pw) = &config.password {
@@ -841,7 +922,7 @@ async fn run() -> anyhow::Result<()> {
 
     tracing::info!(concurrency = config.threads_num, "Starting kei");
 
-    let password_provider = make_password_provider(config.password);
+    let password_provider = make_password_provider(config.password, config.username.clone());
 
     let auth_result = match auth::authenticate(
         &config.cookie_directory,
@@ -925,7 +1006,12 @@ async fn run() -> anyhow::Result<()> {
         .map(|ep| ep.url.as_str())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
 
-    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
+    let client_id = auth_result
+        .session
+        .session_data
+        .client_id
+        .clone()
+        .unwrap_or_default();
     let dsid = auth_result
         .data
         .ds_info
@@ -1557,7 +1643,8 @@ mod tests {
 
     #[test]
     fn make_password_provider_with_some() {
-        let provider = make_password_provider(Some("mypass".to_string()));
+        let provider =
+            make_password_provider(Some("mypass".to_string()), "user@test.com".to_string());
         assert_eq!(provider(), Some("mypass".to_string()));
         // Can be called multiple times
         assert_eq!(provider(), Some("mypass".to_string()));
