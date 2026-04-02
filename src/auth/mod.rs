@@ -11,7 +11,7 @@ pub mod srp;
 pub mod twofa;
 
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -21,6 +21,12 @@ use self::error::AuthError;
 pub use self::responses::AccountLoginResponse;
 use self::session::Session;
 pub use self::session::SharedSession;
+
+/// Path to the session data file for a given user, without needing a `Session`.
+pub fn session_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
+    let sanitized = session::sanitize_username(apple_id);
+    cookie_dir.join(format!("{sanitized}.session"))
+}
 
 /// Result of a successful authentication, including the account data payload.
 pub struct AuthResult {
@@ -115,6 +121,13 @@ pub async fn authenticate(
     if requires_2fa {
         tracing::info!("Two-factor authentication is required");
 
+        // Headless with no code: bail early before making any further Apple
+        // API requests. In a Docker restart loop this prevents repeated
+        // bridge/push calls that can trigger Apple's securityCodeLocked.
+        if code.is_none() && !std::io::stdin().is_terminal() {
+            return Err(AuthError::TwoFactorRequired.into());
+        }
+
         // Trigger push notification to trusted devices. Some Apple accounts
         // require this bridge step to receive 2FA codes; without it they only
         // get a "website login" email. Non-fatal: we log and continue if it
@@ -128,12 +141,9 @@ pub async fn authenticate(
         let verified = if let Some(c) = code {
             // Headless: code provided directly (e.g. submit-code subcommand)
             twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, c).await?
-        } else if std::io::stdin().is_terminal() {
-            // Interactive: prompt on stdin
-            twofa::request_2fa_code(&mut session, &endpoints, &client_id, domain).await?
         } else {
-            // Headless with no code: signal the caller
-            return Err(AuthError::TwoFactorRequired.into());
+            // Interactive: prompt on stdin (terminal confirmed above)
+            twofa::request_2fa_code(&mut session, &endpoints, &client_id, domain).await?
         };
 
         if !verified {

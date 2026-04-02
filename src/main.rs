@@ -22,6 +22,7 @@ mod systemd;
 mod types;
 
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -154,6 +155,32 @@ where
     *session = new_auth.session;
     tracing::info!("Re-authentication successful");
     Ok(())
+}
+
+/// Wait for `submit-code` to update the session file, with no network traffic.
+///
+/// Polls the session file's modification time every 5 seconds. When
+/// `submit-code` trusts the session it writes updated cookies/session data,
+/// changing the mtime and breaking the loop.
+async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
+    let session_path = auth::session_file_path(cookie_dir, username);
+    let initial_mtime = std::fs::metadata(&session_path)
+        .and_then(|m| m.modified())
+        .ok();
+
+    tracing::info!("Waiting for 2FA code submission...");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let current_mtime = std::fs::metadata(&session_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if current_mtime != initial_mtime {
+            tracing::info!("Session file updated, retrying authentication");
+            break;
+        }
+    }
 }
 
 /// Get the database path for a given auth config, merging with TOML defaults.
@@ -652,7 +679,26 @@ impl Drop for PidFileGuard {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // 2FA required is not a failure — kei checked auth, told the user
+            // what to do, and is done. Exit 0 so `restart: on-failure` won't
+            // restart into a loop that hammers Apple's auth endpoints.
+            if e.downcast_ref::<auth::error::AuthError>()
+                .is_some_and(|ae| ae.is_two_factor_required())
+            {
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("Error: {e:#}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
     // Migrate legacy icloudpd-rs paths before loading config, so the
@@ -795,7 +841,21 @@ async fn main() -> anyhow::Result<()> {
             );
             tracing::warn!(message = %msg, "2FA required");
             notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
-            anyhow::bail!("{msg}");
+
+            // Wait for submit-code to update the session file, then retry
+            // auth. No Apple API calls while waiting.
+            wait_for_2fa_submit(&config.cookie_directory, &config.username).await;
+
+            auth::authenticate(
+                &config.cookie_directory,
+                &config.username,
+                &password_provider,
+                config.domain.as_str(),
+                None,
+                None,
+                None,
+            )
+            .await?
         }
         Err(e) => return Err(e),
     };
@@ -1211,8 +1271,10 @@ async fn main() -> anyhow::Result<()> {
                             &config.username,
                         );
                         if !is_watch_mode {
-                            anyhow::bail!("{msg}");
+                            return Err(e);
                         }
+                        wait_for_2fa_submit(&config.cookie_directory, &config.username).await;
+                        continue;
                     }
                     Err(e) => {
                         notifier.notify(
