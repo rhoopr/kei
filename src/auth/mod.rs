@@ -115,6 +115,16 @@ pub async fn authenticate(
     if requires_2fa {
         tracing::info!("Two-factor authentication is required");
 
+        // Trigger push notification to trusted devices. Some Apple accounts
+        // require this bridge step to receive 2FA codes; without it they only
+        // get a "website login" email. Non-fatal: we log and continue if it
+        // fails, since the user can still enter a code from a trusted device.
+        if let Err(e) =
+            twofa::trigger_push_notification(&mut session, &endpoints, &client_id, domain).await
+        {
+            tracing::warn!(error = %e, "Failed to trigger push notification");
+        }
+
         let verified = if let Some(c) = code {
             // Headless: code provided directly (e.g. submit-code subcommand)
             twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, c).await?

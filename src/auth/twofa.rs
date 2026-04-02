@@ -1,15 +1,77 @@
+use std::fmt::Write as _;
 use std::io::{self, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use rand::Rng;
 use reqwest::header::HeaderMap;
+use uuid::Uuid;
 
 use super::endpoints::Endpoints;
 use super::session::Session;
-use super::srp::get_auth_headers;
+use super::srp::{get_auth_headers, APPLE_WIDGET_KEY};
 use crate::auth::error::AuthError;
 use crate::auth::responses::AccountLoginResponse;
 
 const TWO_FA_CODE_LENGTH: usize = 6;
+
+/// Trigger a push notification to trusted devices for 2FA code entry.
+///
+/// Apple requires a POST to `/auth/bridge/step/0` to initiate the push
+/// notification flow. Without this, some accounts receive a "website login"
+/// email instead of a 2FA code on their trusted devices.
+///
+/// See: icloud-photos-downloader/icloud_photos_downloader#1327
+pub async fn trigger_push_notification(
+    session: &mut Session,
+    endpoints: &Endpoints,
+    client_id: &str,
+    domain: &str,
+) -> Result<()> {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock before UNIX epoch")?
+        .as_millis();
+    let session_uuid = format!("{}-{}", Uuid::new_v4(), timestamp_ms);
+
+    let mut ptkn_bytes = [0u8; 64];
+    rand::rng().fill_bytes(&mut ptkn_bytes);
+    let mut ptkn = String::with_capacity(128);
+    for b in &ptkn_bytes {
+        write!(ptkn, "{b:02x}").expect("writing to String cannot fail");
+    }
+
+    let data = serde_json::json!({
+        "sessionUUID": session_uuid,
+        "ptkn": ptkn,
+    });
+
+    let overrides: [(&str, &str); 4] = [
+        ("Accept", "application/json, text/plain, */*"),
+        ("Content-type", "application/json; charset=utf-8"),
+        ("X-Apple-App-Id", APPLE_WIDGET_KEY),
+        ("X-Apple-Domain-Id", "3"),
+    ];
+    let headers = get_auth_headers(domain, client_id, &session.session_data, Some(&overrides))?;
+
+    let url = format!("{}/bridge/step/0", endpoints.auth);
+    tracing::debug!(url = %url, "Triggering push notification to trusted devices");
+
+    let response = session
+        .post(&url, Some(data.to_string()), Some(headers))
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        tracing::warn!(
+            status = %status,
+            body = %text,
+            "Bridge step failed, continuing with standard 2FA flow"
+        );
+    }
+    Ok(())
+}
 
 /// Check whether a string is a valid 6-digit 2FA code.
 fn is_valid_2fa_code(code: &str) -> bool {

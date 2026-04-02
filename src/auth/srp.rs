@@ -13,7 +13,8 @@ use super::session::Session;
 use crate::auth::error::AuthError;
 
 /// Apple's public OAuth widget key — embedded in icloud.com's JavaScript.
-const APPLE_WIDGET_KEY: &str = "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
+pub(crate) const APPLE_WIDGET_KEY: &str =
+    "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
 
 /// RFC 5054 2048-bit SRP group prime (same as srp::groups::G_2048).
 const N_HEX: &str = concat!(
