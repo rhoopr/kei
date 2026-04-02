@@ -692,10 +692,11 @@ fn filter_asset_to_tasks(
                     None
                 }
             }
-        } else if let Some(&claimed_size) =
-            // Use normalize() for lookup to avoid PathBuf clone
-            claimed_paths.get(NormalizedPath::normalize(&download_path).as_ref())
-        {
+        } else if let Some(&claimed_size) = {
+            // Pre-compute normalized key for the primary download path
+            let norm_key = NormalizedPath::normalize(&download_path);
+            claimed_paths.get(norm_key.as_ref())
+        } {
             // Path is claimed by an in-flight download — check for size collision.
             // Use normalized paths for collision detection to handle case-insensitive
             // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
