@@ -157,7 +157,7 @@ pub(crate) fn sanitize_path_component(name: &str) -> String {
 /// Remove non-ASCII (unicode) characters from a filename, keeping only
 /// ASCII characters.
 pub(crate) fn remove_unicode_chars(filename: &str) -> String {
-    filename.chars().filter(|c| c.is_ascii()).collect()
+    filename.chars().filter(char::is_ascii).collect()
 }
 
 /// Add a size-based deduplication suffix to a filename.
@@ -214,7 +214,7 @@ pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
     }
 }
 
-/// Map UTI asset_type strings to standardized uppercase file extensions.
+/// Map UTI `asset_type` strings to standardized uppercase file extensions.
 ///
 /// Matches `icloudpd`'s `ITEM_TYPE_EXTENSIONS` mapping.
 const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
@@ -296,7 +296,7 @@ pub(crate) fn live_photo_mov_path_suffix(filename: &str) -> String {
     }
 }
 
-/// Pre-built HashMap for O(1) asset type lookups instead of linear scan.
+/// Pre-built `HashMap` for O(1) asset type lookups instead of linear scan.
 static ITEM_TYPE_MAP: LazyLock<FxHashMap<&'static str, &'static str>> =
     LazyLock::new(|| ITEM_TYPE_EXTENSIONS.iter().copied().collect());
 

@@ -65,16 +65,16 @@ impl PhotosSession for crate::auth::SharedSession {
     }
 }
 
-/// CloudKit server error codes that indicate a transient condition.
+/// `CloudKit` server error codes that indicate a transient condition.
 /// These arrive as HTTP 200 with a `serverErrorCode` field in the JSON body.
 const RETRYABLE_SERVER_ERRORS: &[&str] =
     &["RETRY_LATER", "TRY_AGAIN_LATER", "CAS_OP_LOCK", "THROTTLED"];
 
-/// CloudKit server error codes that indicate the iCloud service is not
+/// `CloudKit` server error codes that indicate the iCloud service is not
 /// activated or accessible (e.g. ADP enabled, incomplete iCloud setup).
 const SERVICE_NOT_ACTIVATED_ERRORS: &[&str] = &["ZONE_NOT_FOUND", "AUTHENTICATION_FAILED"];
 
-/// Error type for CloudKit server errors embedded in the JSON response body.
+/// Error type for `CloudKit` server errors embedded in the JSON response body.
 /// These are distinct from HTTP-level errors and represent API-level failures.
 #[derive(Debug, thiserror::Error)]
 #[error("CloudKit server error: {code} — {reason}")]
@@ -99,7 +99,7 @@ fn is_service_not_activated(code: &str, reason: &str) -> bool {
             .contains("private db access disabled")
 }
 
-/// Check a CloudKit JSON response for `serverErrorCode` or per-record errors.
+/// Check a `CloudKit` JSON response for `serverErrorCode` or per-record errors.
 /// Returns `Err` if a server error is found, `Ok(response)` otherwise.
 fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
     // Top-level serverErrorCode (e.g. from CAS Op-Lock)
@@ -158,7 +158,7 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
 }
 
 /// Classify API errors for retry: network failures, server-side errors
-/// (5xx, 429), and retryable CloudKit server errors are transient;
+/// (5xx, 429), and retryable `CloudKit` server errors are transient;
 /// client errors (4xx) and non-retryable server errors are permanent.
 fn classify_api_error(e: &anyhow::Error) -> RetryAction {
     if let Some(ck_err) = e.downcast_ref::<CloudKitServerError>() {
@@ -182,7 +182,7 @@ fn classify_api_error(e: &anyhow::Error) -> RetryAction {
 
 /// Retry a `session.post()` call with default exponential backoff.
 ///
-/// Inspects each response for CloudKit server errors (`serverErrorCode`)
+/// Inspects each response for `CloudKit` server errors (`serverErrorCode`)
 /// and converts retryable ones (e.g. `TRY_AGAIN_LATER`, `CAS_OP_LOCK`)
 /// into transient errors that trigger automatic retry.
 pub async fn retry_post(
@@ -208,7 +208,7 @@ pub enum SyncTokenError {
     /// Zone no longer exists — stop syncing this zone
     #[error("Zone not found: {zone_name}")]
     ZoneNotFound { zone_name: String },
-    /// Unexpected zone-level error (e.g. RETRY_LATER, THROTTLED) —
+    /// Unexpected zone-level error (e.g. `RETRY_LATER`, THROTTLED) —
     /// treat as transient; do NOT advance the sync token.
     #[error("Unexpected zone error in {zone_name}: {error_code}")]
     UnexpectedZoneError {
@@ -220,7 +220,7 @@ pub enum SyncTokenError {
 impl SyncTokenError {
     /// Whether this error should trigger a fallback from incremental to full sync.
     /// Only token/zone-level issues warrant full re-enumeration; transient errors
-    /// (THROTTLED, RETRY_LATER) should propagate without triggering an expensive fallback.
+    /// (THROTTLED, `RETRY_LATER`) should propagate without triggering an expensive fallback.
     pub fn should_fallback_to_full(&self) -> bool {
         matches!(
             self,

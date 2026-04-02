@@ -1,4 +1,4 @@
-//! State database trait and SQLite implementation.
+//! State database trait and `SQLite` implementation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +31,7 @@ pub trait StateDb: Send + Sync {
     /// Note: In the optimized flow, the caller pre-loads downloaded IDs and
     /// checksums using `get_downloaded_ids()` and `get_downloaded_checksums()`
     /// for O(1) skip decisions, falling back to filesystem checks for edge cases.
+    // Retained: part of StateDb trait API, used in tests and for edge-case fallback
     #[allow(dead_code)]
     async fn should_download(
         &self,
@@ -58,6 +59,7 @@ pub trait StateDb: Send + Sync {
     ///
     /// Note: The download engine uses `mark_failed_batch` for efficiency.
     /// This method is retained for API completeness with `mark_downloaded`.
+    // Retained: symmetric with mark_downloaded for API completeness, used in tests
     #[allow(dead_code)]
     async fn mark_failed(
         &self,
@@ -88,7 +90,7 @@ pub trait StateDb: Send + Sync {
 
     // ── Batch operations for performance optimization ──
 
-    /// Get all downloaded asset IDs as (id, version_size) pairs.
+    /// Get all downloaded asset IDs as (id, `version_size`) pairs.
     ///
     /// Used at sync start to pre-load downloaded state for O(1) skip decisions.
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError>;
@@ -101,7 +103,7 @@ pub trait StateDb: Send + Sync {
 
     /// Get downloaded asset IDs with their checksums.
     ///
-    /// Returns a map of (id, version_size) -> checksum for downloaded assets.
+    /// Returns a map of (id, `version_size`) -> checksum for downloaded assets.
     /// Used to detect checksum changes without querying the DB per asset.
     async fn get_downloaded_checksums(
         &self,
@@ -132,11 +134,11 @@ pub trait StateDb: Send + Sync {
     async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError>;
 }
 
-/// SQLite implementation of the state database.
+/// `SQLite` implementation of the state database.
 pub struct SqliteStateDb {
-    /// Wrapped in Mutex because rusqlite::Connection is not Sync.
-    /// Operations hold the lock briefly for fast SQLite queries (WAL mode).
-    /// Only `open()` uses spawn_blocking for the heavier initial setup.
+    /// Wrapped in Mutex because `rusqlite::Connection` is not Sync.
+    /// Operations hold the lock briefly for fast `SQLite` queries (WAL mode).
+    /// Only `open()` uses `spawn_blocking` for the heavier initial setup.
     conn: Mutex<Connection>,
     /// Path to the database file (for error messages).
     path: PathBuf,
@@ -737,7 +739,7 @@ impl StateDb for SqliteStateDb {
     }
 }
 
-/// Convert a database row to an AssetRecord.
+/// Convert a database row to an `AssetRecord`.
 ///
 /// Returns `rusqlite::Error` on column extraction failures instead of silently
 /// falling back to defaults, so schema mismatches or corruption are surfaced.

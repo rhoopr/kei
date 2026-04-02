@@ -26,7 +26,7 @@ pub struct MigrationReport {
 
 /// Check for legacy icloudpd-rs paths and copy data to the new kei locations.
 ///
-/// Called early in main(), before config loading. Returns `None` if no
+/// Called early in `main()`, before config loading. Returns `None` if no
 /// migration was needed (new paths already exist or no old paths found).
 pub fn migrate_legacy_paths() -> Option<MigrationReport> {
     let new_config = expand_tilde(NEW_CONFIG_PATH);

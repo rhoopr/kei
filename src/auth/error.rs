@@ -26,15 +26,15 @@ pub enum AuthError {
     #[error("Account locked or disabled: {0}")]
     AccountLocked(String),
 
-    /// Apple rate-limiting (HTTP 503 or ACCESS_DENIED).
+    /// Apple rate-limiting (HTTP 503 or `ACCESS_DENIED`).
     #[error("Rate limited by Apple. Please wait a few minutes then try again.")]
     RateLimited,
 
-    /// Apple's response body contained `hasError: true` with service_errors.
+    /// Apple's response body contained `hasError: true` with `service_errors`.
     #[error("iCloud service error: {0}")]
     ServiceError(String),
 
-    /// iCloud setup incomplete (ZONE_NOT_FOUND / AUTHENTICATION_FAILED in auth).
+    /// iCloud setup incomplete (`ZONE_NOT_FOUND` / `AUTHENTICATION_FAILED` in auth).
     #[error("iCloud account setup may be incomplete. Please sign in to https://icloud.com and complete setup, then try again.")]
     SetupRequired,
 

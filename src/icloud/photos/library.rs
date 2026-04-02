@@ -15,7 +15,7 @@ use crate::icloud::error::ICloudError;
 const ROOT_FOLDER: &str = "----Root-Folder----";
 const PROJECT_ROOT_FOLDER: &str = "----Project-Root-Folder----";
 
-/// Default page size for CloudKit queries.
+/// Default page size for `CloudKit` queries.
 const DEFAULT_PAGE_SIZE: usize = 100;
 
 // CloudKit record/query types for photo enumeration.
@@ -255,7 +255,7 @@ impl PhotoLibrary {
         Ok(query.records)
     }
 
-    /// Returns the zone name (e.g., "PrimarySync", "SharedSync-{UUID}").
+    /// Returns the zone name (e.g., "`PrimarySync`", "SharedSync-{UUID}").
     pub fn zone_name(&self) -> &str {
         self.zone_id
             .get("zoneName")
@@ -264,7 +264,7 @@ impl PhotoLibrary {
     }
 
     /// Clone the session for a new album/library — preserves the shared
-    /// cookie jar via the Arc inside reqwest::Client.
+    /// cookie jar via the Arc inside `reqwest::Client`.
     fn clone_session(&self) -> Box<dyn PhotosSession> {
         self.session.clone_box()
     }

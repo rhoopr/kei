@@ -7,7 +7,7 @@ fn string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Option::<String>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+    Option::<String>::deserialize(deserializer).map(std::option::Option::unwrap_or_default)
 }
 
 /// Response from `/zones/list`.
@@ -49,7 +49,7 @@ pub(crate) struct BatchQueryResponse {
     pub batch: Vec<QueryResponse>,
 }
 
-/// A CloudKit record. Fields are kept as dynamic JSON because Apple's schema
+/// A `CloudKit` record. Fields are kept as dynamic JSON because Apple's schema
 /// varies by record type and changes without notice.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

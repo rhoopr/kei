@@ -9,7 +9,7 @@ use crate::icloud::photos::AssetVersionSize;
 /// Version size key for state tracking.
 ///
 /// This is a 1-byte enum representing the version size, saving ~23 bytes
-/// per AssetRecord compared to storing as a String.
+/// per `AssetRecord` compared to storing as a String.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum VersionSizeKey {
@@ -139,7 +139,7 @@ impl MediaType {
 /// Fields are ordered for optimal memory layout:
 /// - 8-byte aligned heap types first (String, `Option<PathBuf>`, `Option<String>`)
 /// - 8-byte primitives (u64)
-/// - DateTime fields (12-16 bytes each)
+/// - `DateTime` fields (12-16 bytes each)
 /// - 4-byte primitives (u32)
 /// - 1-byte enums grouped at the end
 #[derive(Debug, Clone)]
@@ -178,7 +178,7 @@ pub struct AssetRecord {
     pub download_attempts: u32,
 
     // 1-byte enums grouped together
-    /// Version size key (e.g., Original, Medium, LiveOriginal).
+    /// Version size key (e.g., Original, Medium, `LiveOriginal`).
     pub version_size: VersionSizeKey,
     /// Type of media (photo, video, live photo).
     pub media_type: MediaType,

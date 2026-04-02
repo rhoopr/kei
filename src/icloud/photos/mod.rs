@@ -98,7 +98,7 @@ impl PhotosService {
 
     /// Look up a library by zone name.
     ///
-    /// Checks the primary library first ("PrimarySync"), then searches private
+    /// Checks the primary library first ("`PrimarySync`"), then searches private
     /// and shared libraries. Lazily fetches library lists on first call.
     pub async fn get_library(&mut self, name: &str) -> anyhow::Result<&PhotoLibrary> {
         if name == "PrimarySync" {

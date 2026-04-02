@@ -249,7 +249,7 @@ pub(crate) fn parse_auth_error(status: u16, body: &str, apple_rscd: Option<&str>
     // JSON body errors take precedence — Apple often returns structured errors
     // with specific codes that override the HTTP status.
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-        if json.get("hasError").and_then(|v| v.as_bool()) == Some(true) {
+        if json.get("hasError").and_then(serde_json::Value::as_bool) == Some(true) {
             if let Some(errors) = json.get("service_errors").and_then(|v| v.as_array()) {
                 let messages: Vec<&str> = errors
                     .iter()
@@ -289,7 +289,7 @@ pub(crate) fn parse_auth_error(status: u16, body: &str, apple_rscd: Option<&str>
 }
 
 /// Apple's HSA2 (two-step verification v2) requires all three conditions:
-/// the account uses HSAv2, the browser isn't trusted yet, and the account
+/// the account uses `HSAv2`, the browser isn't trusted yet, and the account
 /// has a device capable of receiving verification codes.
 fn check_requires_2fa(data: &AccountLoginResponse) -> bool {
     let (hsa_version, has_qualifying_device) = match &data.ds_info {

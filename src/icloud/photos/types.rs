@@ -2,7 +2,7 @@ use crate::types::VersionSize;
 
 /// Information about a downloadable asset version.
 ///
-/// Uses `Box<str>` instead of `String` for url, asset_type, and checksum
+/// Uses `Box<str>` instead of `String` for url, `asset_type`, and checksum
 /// to save 8 bytes per field (16 vs 24 bytes) since these strings are
 /// never mutated after construction.
 #[derive(Debug, Clone)]

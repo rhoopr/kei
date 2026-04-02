@@ -79,13 +79,13 @@ pub fn determine_media_type(
 /// paths like `IMG_0996.mov` and `IMG_0996.MOV`. This stores the normalized (lowercased)
 /// form as a `Box<str>` and implements `Borrow<str>` to enable zero-copy lookups.
 ///
-/// Use `NormalizedPath::normalize()` for temporary lookup keys to avoid PathBuf cloning.
+/// Use `NormalizedPath::normalize()` for temporary lookup keys to avoid `PathBuf` cloning.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NormalizedPath(Box<str>);
 
 impl NormalizedPath {
-    /// Create a new normalized path from an owned PathBuf.
-    /// For lookup operations, prefer `normalize()` to avoid PathBuf cloning.
+    /// Create a new normalized path from an owned `PathBuf`.
+    /// For lookup operations, prefer `normalize()` to avoid `PathBuf` cloning.
     fn new(path: PathBuf) -> Self {
         Self(Self::normalize(&path).into_owned().into_boxed_str())
     }
@@ -96,7 +96,7 @@ impl NormalizedPath {
     /// On case-sensitive systems (Linux), returns a borrowed view when possible.
     ///
     /// Use with `claimed_paths.contains_key(NormalizedPath::normalize(&path).as_ref())`
-    /// to avoid allocating a PathBuf just for the lookup.
+    /// to avoid allocating a `PathBuf` just for the lookup.
     fn normalize(path: &Path) -> std::borrow::Cow<'_, str> {
         let s = path.to_string_lossy();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -253,9 +253,9 @@ impl std::fmt::Debug for DownloadConfig {
 /// A unit of work produced by the filter phase and consumed by the download phase.
 ///
 /// Fields ordered for optimal memory layout:
-/// - Heap types first (`Box<str>`, PathBuf)
+/// - Heap types first (`Box<str>`, `PathBuf`)
 /// - 8-byte primitives (u64)
-/// - DateTime (12-16 bytes)
+/// - `DateTime` (12-16 bytes)
 /// - 1-byte enum last
 #[derive(Debug, Clone)]
 struct DownloadTask {
@@ -280,15 +280,15 @@ struct DownloadTask {
 /// in-memory lookups instead of per-asset DB queries. For 100K+ asset
 /// libraries, this significantly reduces DB roundtrips.
 ///
-/// Uses a two-level map structure (asset_id -> version_sizes) to enable
+/// Uses a two-level map structure (`asset_id` -> `version_sizes`) to enable
 /// zero-allocation lookups via `&str` keys, avoiding the need to allocate
 /// `(String, String)` tuples for each lookup.
 #[derive(Debug, Default)]
 struct DownloadContext {
-    /// Nested map: asset_id -> set of version_sizes that are already downloaded.
+    /// Nested map: `asset_id` -> set of `version_sizes` that are already downloaded.
     /// Two-level structure enables O(1) borrowed lookups without allocation.
     downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
-    /// Nested map: asset_id -> (version_size -> checksum) for downloaded assets.
+    /// Nested map: `asset_id` -> (`version_size` -> checksum) for downloaded assets.
     /// Used to detect checksum changes (iCloud asset updated) without DB queries.
     downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
@@ -471,7 +471,7 @@ fn apply_raw_policy(
     std::borrow::Cow::Owned(swapped)
 }
 
-/// Lightweight pre-check: extract (version_size, checksum) pairs for an asset
+/// Lightweight pre-check: extract (`version_size`, checksum) pairs for an asset
 /// after applying content/date filters but WITHOUT path resolution or disk I/O.
 ///
 /// Returns the candidate versions that would be downloaded. Used by the early
@@ -932,9 +932,9 @@ pub async fn download_photos_with_sync(
             {
                 Ok(result) => Ok(result),
                 Err(e) => {
-                    if e.downcast_ref::<SyncTokenError>()
-                        .is_some_and(|se| se.should_fallback_to_full())
-                    {
+                    if e.downcast_ref::<SyncTokenError>().is_some_and(
+                        super::icloud::photos::session::SyncTokenError::should_fallback_to_full,
+                    ) {
                         tracing::warn!(
                             error = %e,
                             "Incremental sync failed, falling back to full enumeration"

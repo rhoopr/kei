@@ -1,4 +1,4 @@
-//! Thin wrapper around systemd sd_notify integration.
+//! Thin wrapper around systemd `sd_notify` integration.
 //!
 //! All functions are no-ops when `enabled` is false or on non-Linux platforms.
 //! This keeps the rest of the codebase free from `#[cfg]` conditionals.

@@ -108,7 +108,7 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
 /// Which library (or libraries) to sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibrarySelection {
-    /// A single named library (e.g. "PrimarySync", "SharedSync-ABCD1234").
+    /// A single named library (e.g. "`PrimarySync`", "SharedSync-ABCD1234").
     Single(String),
     /// All available libraries (primary + private + shared).
     All,
@@ -132,8 +132,8 @@ impl serde::Serialize for LibrarySelection {
 /// Application configuration.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (String, PathBuf, Vec, `Option<String>`)
-/// - DateTime fields (12-16 bytes each)
+/// - Heap types first (String, `PathBuf`, Vec, `Option<String>`)
+/// - `DateTime` fields (12-16 bytes each)
 /// - 8-byte primitives (u64, `Option<u64>`)
 /// - 4-byte primitives (u32, `Option<u32>`)
 /// - 2-byte primitives (u16)
@@ -231,7 +231,7 @@ fn resolve_flag(cli_flag: bool, toml_val: Option<bool>) -> bool {
 }
 
 /// Resolve auth fields from CLI auth args + optional TOML config.
-/// Returns (username, password, domain, cookie_directory).
+/// Returns (username, password, domain, `cookie_directory`).
 pub(crate) fn resolve_auth(
     auth: &crate::cli::AuthArgs,
     toml: &Option<TomlConfig>,

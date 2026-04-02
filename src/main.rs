@@ -1,6 +1,6 @@
 //! kei: photo sync engine — Rust rewrite of icloud-photos-downloader.
 //!
-//! Downloads photos and videos from iCloud via Apple's private CloudKit APIs.
+//! Downloads photos and videos from iCloud via Apple's private `CloudKit` APIs.
 //! Authentication uses SRP-6a with Apple's custom variant, followed by optional
 //! 2FA. Photos are streamed with exponential-backoff retries on transient
 //! failures.
@@ -39,7 +39,10 @@ struct RedactingWriter<W> {
 
 impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let password = self.password.lock().unwrap_or_else(|e| e.into_inner());
+        let password = self
+            .password
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(pw) = password.as_deref() {
             if !pw.is_empty() {
                 // A buffer shorter than the password can't contain it,
@@ -496,7 +499,7 @@ async fn run_submit_code(
     Ok(())
 }
 
-/// Build the query parameters HashMap for the iCloud Photos CloudKit API.
+/// Build the query parameters `HashMap` for the iCloud Photos `CloudKit` API.
 ///
 /// Must match Python's `PyiCloudService.params` for API compatibility.
 fn build_photos_params(
@@ -777,7 +780,7 @@ async fn main() -> ExitCode {
             // what to do, and is done. Exit 0 so `restart: on-failure` won't
             // restart into a loop that hammers Apple's auth endpoints.
             if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(|ae| ae.is_two_factor_required())
+                .is_some_and(auth::error::AuthError::is_two_factor_required)
             {
                 ExitCode::SUCCESS
             } else {
@@ -938,7 +941,7 @@ async fn run() -> anyhow::Result<()> {
         Ok(result) => result,
         Err(e)
             if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(|ae| ae.is_two_factor_required()) =>
+                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
         {
             let msg = format!(
                 "2FA required for {u}. Run: kei get-code",
@@ -1396,7 +1399,7 @@ async fn run() -> anyhow::Result<()> {
                     }
                     Err(e)
                         if e.downcast_ref::<auth::error::AuthError>()
-                            .is_some_and(|ae| ae.is_two_factor_required()) =>
+                            .is_some_and(auth::error::AuthError::is_two_factor_required) =>
                     {
                         // 2FA is user action, not a failed attempt — don't
                         // burn reauth_attempts so false wakeups from get-code

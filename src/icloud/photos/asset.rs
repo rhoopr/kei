@@ -11,7 +11,7 @@ use super::types::{AssetItemType, AssetVersion, AssetVersionSize, ChangeReason};
 
 /// Type alias for the versions map.
 ///
-/// Uses SmallVec with capacity 4 to store versions inline (no heap allocation)
+/// Uses `SmallVec` with capacity 4 to store versions inline (no heap allocation)
 /// for the common case of <=4 versions per asset. Most assets have 1-3 versions
 /// (original + optional medium/thumb + optional live photo).
 pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
@@ -19,7 +19,7 @@ pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
 /// A change event from the `changes/zone` delta API.
 #[derive(Debug)]
 pub struct ChangeEvent {
-    /// The record name (CloudKit record ID)
+    /// The record name (`CloudKit` record ID)
     pub record_name: String,
     /// The record type, if known (None for hard-deletes)
     pub record_type: Option<String>,
@@ -34,7 +34,7 @@ pub struct ChangeEvent {
 ///
 /// Fields are ordered for optimal memory layout:
 /// - Heap types first (String, `Option<String>`)
-/// - VersionsMap (SmallVec inline storage)
+/// - `VersionsMap` (`SmallVec` inline storage)
 /// - f64 primitives
 /// - Small enums last
 #[derive(Debug, Clone)]
@@ -51,8 +51,8 @@ pub struct PhotoAsset {
     item_type_val: Option<AssetItemType>,
 }
 
-/// Decode filename from CloudKit's `filenameEnc` field.
-/// Apple uses either plain STRING or base64-encoded ENCRYPTED_BYTES depending
+/// Decode filename from `CloudKit`'s `filenameEnc` field.
+/// Apple uses either plain STRING or base64-encoded `ENCRYPTED_BYTES` depending
 /// on the user's iCloud configuration.
 fn decode_filename(fields: &Value) -> Option<String> {
     let enc = &fields["filenameEnc"];
@@ -76,7 +76,7 @@ fn decode_filename(fields: &Value) -> Option<String> {
     }
 }
 
-/// Determine asset type from the `itemType` CloudKit field, falling back to
+/// Determine asset type from the `itemType` `CloudKit` field, falling back to
 /// file extension heuristics. Defaults to Movie for unknown types because
 /// videos are more likely to have non-standard UTI strings.
 fn resolve_item_type(fields: &Value, filename: &Option<String>) -> Option<AssetItemType> {
@@ -86,14 +86,18 @@ fn resolve_item_type(fields: &Value, filename: &Option<String>) -> Option<AssetI
         }
     }
     if let Some(name) = &filename {
-        let lower = name.to_lowercase();
-        if lower.ends_with(".heic")
-            || lower.ends_with(".png")
-            || lower.ends_with(".jpg")
-            || lower.ends_with(".jpeg")
-            || lower.ends_with(".webp")
+        if let Some(ext) = std::path::Path::new(name.as_str())
+            .extension()
+            .and_then(|e| e.to_str())
         {
-            return Some(AssetItemType::Image);
+            if ext.eq_ignore_ascii_case("heic")
+                || ext.eq_ignore_ascii_case("png")
+                || ext.eq_ignore_ascii_case("jpg")
+                || ext.eq_ignore_ascii_case("jpeg")
+                || ext.eq_ignore_ascii_case("webp")
+            {
+                return Some(AssetItemType::Image);
+            }
         }
     }
     Some(AssetItemType::Movie)
@@ -286,11 +290,11 @@ impl std::fmt::Display for PhotoAsset {
     }
 }
 
-/// Classify a CloudKit record from `changes/zone` into a `ChangeReason`.
+/// Classify a `CloudKit` record from `changes/zone` into a `ChangeReason`.
 ///
 /// Detection logic (from empirical API testing):
-/// - `record.deleted == Some(true)` --> HardDeleted (purged, recordType unknown)
-/// - `fields.isDeleted.value == 1` --> SoftDeleted (trashed, recoverable)
+/// - `record.deleted == Some(true)` --> `HardDeleted` (purged, recordType unknown)
+/// - `fields.isDeleted.value == 1` --> `SoftDeleted` (trashed, recoverable)
 /// - `fields.isHidden.value == 1` --> Hidden
 /// - Otherwise --> Modified (caller checks state DB for Created/Restored/Unhidden)
 ///
@@ -325,26 +329,26 @@ pub(crate) fn classify_change_reason(record: &Record) -> ChangeReason {
     ChangeReason::Created
 }
 
-/// Extract the `masterRef` record name from a CPLAsset's fields.
+/// Extract the `masterRef` record name from a `CPLAsset`'s fields.
 fn extract_master_ref(fields: &Value) -> Option<String> {
     fields
         .get("masterRef")
         .and_then(|r| r.get("value"))
         .and_then(|v| v.get("recordName"))
         .and_then(|n| n.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
-/// Buffers CPLMaster and CPLAsset records from `changes/zone` responses
+/// Buffers `CPLMaster` and `CPLAsset` records from `changes/zone` responses
 /// and pairs them into `ChangeEvent`s when both halves are available.
 ///
 /// In `changes/zone`, records arrive in change-log order (not paired like `records/query`).
-/// A CPLAsset references its CPLMaster via the `masterRef` field.
+/// A `CPLAsset` references its `CPLMaster` via the `masterRef` field.
 #[derive(Debug, Default)]
 pub(crate) struct DeltaRecordBuffer {
-    /// Unpaired CPLMaster records, keyed by recordName
+    /// Unpaired `CPLMaster` records, keyed by recordName
     pending_masters: FxHashMap<String, Record>,
-    /// Unpaired CPLAsset records, keyed by masterRef recordName
+    /// Unpaired `CPLAsset` records, keyed by masterRef recordName
     pending_assets: FxHashMap<String, Record>,
 }
 
@@ -445,10 +449,10 @@ impl DeltaRecordBuffer {
 
     /// Pick the more severe reason from a pair of records.
     ///
-    /// When CPLMaster and CPLAsset arrive on different pages, we classify
+    /// When `CPLMaster` and `CPLAsset` arrive on different pages, we classify
     /// each independently. A soft-deleted master paired with a non-deleted
     /// asset should emit `SoftDeleted`, not `Created`. Severity order:
-    /// HardDeleted > SoftDeleted > Hidden > Created.
+    /// `HardDeleted` > `SoftDeleted` > Hidden > Created.
     fn reconcile_reasons(a: ChangeReason, b: ChangeReason) -> ChangeReason {
         fn severity(r: ChangeReason) -> u8 {
             match r {
