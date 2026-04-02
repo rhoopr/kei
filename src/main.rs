@@ -157,6 +157,32 @@ where
     Ok(())
 }
 
+/// Wait for `submit-code` to update the session file, with no network traffic.
+///
+/// Polls the session file's modification time every 5 seconds. When
+/// `submit-code` trusts the session it writes updated cookies/session data,
+/// changing the mtime and breaking the loop.
+async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
+    let session_path = auth::session_file_path(cookie_dir, username);
+    let initial_mtime = std::fs::metadata(&session_path)
+        .and_then(|m| m.modified())
+        .ok();
+
+    tracing::info!("Waiting for 2FA code submission...");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let current_mtime = std::fs::metadata(&session_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if current_mtime != initial_mtime {
+            tracing::info!("Session file updated, retrying authentication");
+            break;
+        }
+    }
+}
+
 /// Get the database path for a given auth config, merging with TOML defaults.
 fn get_db_path(auth: &cli::AuthArgs, toml: &Option<TomlConfig>) -> PathBuf {
     let (username, _, _, cookie_dir) = config::resolve_auth(auth, toml);
@@ -815,7 +841,25 @@ async fn run() -> anyhow::Result<()> {
             );
             tracing::warn!(message = %msg, "2FA required");
             notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
-            return Err(e);
+
+            if config.watch_with_interval.is_none() {
+                return Err(e);
+            }
+
+            // Watch mode: wait for submit-code to update the session file,
+            // then retry auth. No Apple API calls while waiting.
+            wait_for_2fa_submit(&config.cookie_directory, &config.username).await;
+
+            auth::authenticate(
+                &config.cookie_directory,
+                &config.username,
+                &password_provider,
+                config.domain.as_str(),
+                None,
+                None,
+                None,
+            )
+            .await?
         }
         Err(e) => return Err(e),
     };
@@ -1233,6 +1277,8 @@ async fn run() -> anyhow::Result<()> {
                         if !is_watch_mode {
                             return Err(e);
                         }
+                        wait_for_2fa_submit(&config.cookie_directory, &config.username).await;
+                        continue;
                     }
                     Err(e) => {
                         notifier.notify(

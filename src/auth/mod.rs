@@ -11,7 +11,7 @@ pub mod srp;
 pub mod twofa;
 
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -21,6 +21,12 @@ use self::error::AuthError;
 pub use self::responses::AccountLoginResponse;
 use self::session::Session;
 pub use self::session::SharedSession;
+
+/// Path to the session data file for a given user, without needing a `Session`.
+pub fn session_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
+    let sanitized = session::sanitize_username(apple_id);
+    cookie_dir.join(format!("{sanitized}.session"))
+}
 
 /// Result of a successful authentication, including the account data payload.
 pub struct AuthResult {
