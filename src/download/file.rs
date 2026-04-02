@@ -4,6 +4,7 @@ use anyhow::Context;
 use base64::Engine;
 use futures_util::StreamExt;
 use reqwest::Client;
+use sha2::{Digest, Sha256};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
@@ -32,6 +33,9 @@ fn temp_download_path(
 /// already exists. Falls back to a full download if the server ignores the
 /// Range header. On completion the .part file is renamed to the final
 /// destination path. Retries with exponential backoff on transient failures.
+///
+/// Returns the hex-encoded SHA-256 hash computed during streaming, avoiding
+/// a separate full-file read for checksumming.
 pub async fn download_file(
     client: &Client,
     url: &str,
@@ -40,10 +44,10 @@ pub async fn download_file(
     dry_run: bool,
     retry_config: &RetryConfig,
     temp_suffix: &str,
-) -> Result<(), DownloadError> {
+) -> Result<String, DownloadError> {
     if dry_run {
         tracing::info!(path = %download_path.display(), "[DRY RUN] Would download");
-        return Ok(());
+        return Ok(String::new());
     }
 
     let part_path =
@@ -68,12 +72,14 @@ pub async fn download_file(
 /// If a .part file already exists, sends a Range request to resume from where
 /// it left off. Falls back to a fresh download if the server doesn't support
 /// Range or returns an unexpected status.
+///
+/// Returns the hex-encoded SHA-256 of the complete file content.
 async fn attempt_download(
     client: &Client,
     url: &str,
     download_path: &Path,
     part_path: &Path,
-) -> Result<(), DownloadError> {
+) -> Result<String, DownloadError> {
     let path_str = download_path.display().to_string();
 
     let resume_offset = match fs::metadata(part_path).await {
@@ -127,6 +133,39 @@ async fn attempt_download(
 
     let content_length = response.content_length();
 
+    let mut hasher = Sha256::new();
+
+    // When resuming, hash the existing bytes so the final digest covers the whole file
+    if !truncate && resume_offset > 0 {
+        let part_path_owned = part_path.to_path_buf();
+        let resume_bytes = resume_offset;
+        hasher = tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::open(&part_path_owned).map_err(|e| {
+                DownloadError::Other(anyhow::anyhow!(
+                    "Failed to open part file for resume hashing: {e}"
+                ))
+            })?;
+            let mut h = Sha256::new();
+            let mut buf = [0u8; 8192];
+            let mut remaining = resume_bytes;
+            while remaining > 0 {
+                let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
+                use std::io::Read;
+                let n = file.read(&mut buf[..to_read]).map_err(|e| {
+                    DownloadError::Other(anyhow::anyhow!("Failed to read part file: {e}"))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+                remaining -= n as u64;
+            }
+            Ok::<_, DownloadError>(h)
+        })
+        .await
+        .map_err(|e| DownloadError::Other(anyhow::anyhow!("Resume hash task failed: {e}")))??;
+    }
+
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -147,6 +186,7 @@ async fn attempt_download(
             content_length,
             bytes_written,
         })?;
+        hasher.update(&chunk);
         file.write_all(&chunk).await?;
         bytes_written += chunk.len() as u64;
     }
@@ -175,7 +215,7 @@ async fn attempt_download(
 
     fs::rename(&part_path, download_path).await?;
 
-    Ok(())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Compute the SHA-256 hash of a file, returning a hex-encoded string.

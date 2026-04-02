@@ -2040,7 +2040,7 @@ async fn download_single_task(
         "downloading",
     );
 
-    Box::pin(file::download_file(
+    let streaming_hash = Box::pin(file::download_file(
         client,
         &task.url,
         &task.download_path,
@@ -2113,8 +2113,18 @@ async fn download_single_task(
         }
     }
 
-    // Compute SHA-256 of the final file for local verification
-    let local_checksum = file::compute_sha256(&task.download_path).await?;
+    // Use the streaming hash when EXIF was not written (file content unchanged).
+    // Re-compute only when EXIF modification altered the file after download.
+    let is_jpeg = task
+        .download_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"));
+    let local_checksum = if set_exif && exif_ok && is_jpeg {
+        file::compute_sha256(&task.download_path).await?
+    } else {
+        streaming_hash
+    };
 
     Ok((exif_ok, local_checksum))
 }
