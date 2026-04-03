@@ -379,6 +379,29 @@ async fn verify_local_checksum(path: &Path, expected_hex: &str) -> anyhow::Resul
     Ok(actual == expected_hex)
 }
 
+/// Run the get-code command: trigger push notification for 2FA.
+async fn run_get_code(args: cli::GetCodeArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+    let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
+
+    if username.is_empty() {
+        anyhow::bail!("--username is required for get-code");
+    }
+
+    let password_provider = make_password_provider(password);
+
+    auth::send_2fa_push(
+        &cookie_directory,
+        &username,
+        &password_provider,
+        domain.as_str(),
+    )
+    .await?;
+
+    println!("2FA code requested. Check your trusted devices, then run:");
+    println!("  kei submit-code <CODE>");
+    Ok(())
+}
+
 /// Run the submit-code command: authenticate with a pre-provided 2FA code.
 async fn run_submit_code(
     args: cli::SubmitCodeArgs,
@@ -754,6 +777,7 @@ async fn run() -> anyhow::Result<()> {
         Command::ResetState(args) => return run_reset_state(args, &toml_config).await,
         Command::Verify(args) => return run_verify(args, &toml_config).await,
         Command::ImportExisting(args) => return run_import_existing(args, &toml_config).await,
+        Command::GetCode(args) => return run_get_code(args, &toml_config).await,
         Command::SubmitCode(args) => return run_submit_code(args, &toml_config).await,
         Command::Setup { output } => {
             let path = output
@@ -836,26 +860,54 @@ async fn run() -> anyhow::Result<()> {
                 .is_some_and(|ae| ae.is_two_factor_required()) =>
         {
             let msg = format!(
-                "2FA required for {}. Run: kei submit-code <CODE> --username {}",
-                config.username, config.username
+                "2FA required for {u}. Run: kei get-code",
+                u = config.username
             );
             tracing::warn!(message = %msg, "2FA required");
             notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
 
             // Wait for submit-code to update the session file, then retry
-            // auth. No Apple API calls while waiting.
-            wait_for_2fa_submit(&config.cookie_directory, &config.username).await;
+            // auth. Loop because get-code also writes to the session file
+            // (during SRP), which changes the mtime and wakes us up before
+            // the session is actually trusted.
+            'wait_2fa: loop {
+                wait_for_2fa_submit(&config.cookie_directory, &config.username).await;
 
-            auth::authenticate(
-                &config.cookie_directory,
-                &config.username,
-                &password_provider,
-                config.domain.as_str(),
-                None,
-                None,
-                None,
-            )
-            .await?
+                // Retry auth with back-off for lock contention — submit-code
+                // may still be running when we detect the mtime change.
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                    match auth::authenticate(
+                        &config.cookie_directory,
+                        &config.username,
+                        &password_provider,
+                        config.domain.as_str(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(result) => break 'wait_2fa result,
+                        Err(e)
+                            if e.downcast_ref::<auth::error::AuthError>()
+                                .is_some_and(|ae| ae.is_two_factor_required()) =>
+                        {
+                            tracing::info!("Session not yet trusted, continuing to wait...");
+                            continue 'wait_2fa;
+                        }
+                        Err(e) if e.to_string().contains("Another kei instance") => {
+                            tracing::debug!("Lock held by another process, retrying...");
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                // Exhausted lock retries — back to waiting for next file change
+                tracing::debug!("Lock still held after retries, resuming wait...");
+            }
         }
         Err(e) => return Err(e),
     };
@@ -1260,9 +1312,14 @@ async fn run() -> anyhow::Result<()> {
                         if e.downcast_ref::<auth::error::AuthError>()
                             .is_some_and(|ae| ae.is_two_factor_required()) =>
                     {
+                        // 2FA is user action, not a failed attempt — don't
+                        // burn reauth_attempts so false wakeups from get-code
+                        // can't exhaust the limit.
+                        reauth_attempts -= 1;
+
                         let msg = format!(
-                            "2FA required for {}. Run: kei submit-code <CODE> --username {}",
-                            config.username, config.username
+                            "2FA required for {u}. Run: kei get-code",
+                            u = config.username
                         );
                         tracing::warn!(message = %msg, "2FA required");
                         notifier.notify(

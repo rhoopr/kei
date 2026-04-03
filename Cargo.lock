@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "kei"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "assert_cmd",

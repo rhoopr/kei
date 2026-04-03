@@ -7,11 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.3] - 2026-04-03
+
+### Added
+
+- **`get-code` subcommand** - Triggers Apple to send a 2FA code to your trusted devices. In Docker, run `docker exec kei kei get-code` when you're ready to receive a code, then `docker exec kei kei submit-code <CODE>` to submit it.
+
+### Fixed
+
+- **Docker 2FA flow reworked** - v0.5.2 never triggered the push notification in headless mode, so users were told to submit a code that was never sent. The container now detects 2FA, logs what to do, and waits. `get-code` and `submit-code` are separate manual steps - no surprise notifications from unattended restarts. `submit-code` no longer fires a new push notification, which was invalidating the code being submitted. ([#153])
+- **False wakeups during 2FA wait** - `get-code` writes to the session file during SRP auth, which woke the waiting container before the session was actually trusted. The wait loop now retries on `TwoFactorRequired` instead of exiting.
+- **Lock contention with `submit-code`** - If `submit-code` was still running when the container woke up, the lock error crashed the process. The retry now backs off and retries up to 3 times.
+- **Push notification errors swallowed** - `get-code` now reports when Apple's bridge endpoint rejects the push request instead of telling you a code was sent.
+
+[#153]: https://github.com/rhoopr/kei/pull/153
+
+---
+
 ## [0.5.2] - 2026-04-02
 
 ### Fixed
 
-- **Docker restart loop during 2FA** — v0.5.1's push notification bridge call fired before checking whether a code could be collected, causing repeated Apple API hits in a non-TTY restart loop until `securityCodeLocked`. kei now bails before the bridge call in headless mode and stays running while waiting for `submit-code` instead of exiting. ([#152])
+- **Docker restart loop during 2FA** - v0.5.1's push notification bridge call fired before checking whether a code could be collected, causing repeated Apple API hits in a non-TTY restart loop until `securityCodeLocked`. kei now bails before the bridge call in headless mode and stays running while waiting for `submit-code` instead of exiting. ([#152])
 
 [#152]: https://github.com/rhoopr/kei/pull/152
 

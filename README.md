@@ -116,6 +116,7 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 | `retry-failed` | Reset failed downloads to pending and re-sync. |
 | `reset-state` | Delete the state database and start fresh. |
 | `import-existing` | Import local files into the state DB so they aren't re-downloaded. |
+| `get-code` | Request a 2FA code from Apple. Triggers a push to your trusted devices. |
 | `submit-code` | Submit a 2FA code non-interactively. For Docker and headless setups. |
 
 ## Features
@@ -127,7 +128,7 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 - Watch mode with configurable interval, systemd notify, PID file, graceful shutdown
 - Multi-library sync (`--library all` for personal + shared)
 - Date-based folder structure, live photo MOV pairing, EXIF datetime stamping
-- Multi-arch Docker images (amd64/arm64) with headless 2FA via `submit-code`
+- Multi-arch Docker images (amd64/arm64) with headless 2FA via `get-code` + `submit-code`
 - Notification scripts on events: `2fa_required`, `sync_complete`, `sync_failed`, `session_expired`
 - Content filtering: skip videos/photos/live photos, date ranges, `--recent N`
 - Exponential backoff retries with transient vs. permanent error classification

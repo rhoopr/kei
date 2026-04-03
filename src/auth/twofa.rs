@@ -64,11 +64,7 @@ pub async fn trigger_push_notification(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        tracing::warn!(
-            status = %status,
-            body = %text,
-            "Bridge step failed, continuing with standard 2FA flow"
-        );
+        anyhow::bail!("Push notification failed (HTTP {status}): {text}");
     }
     Ok(())
 }
