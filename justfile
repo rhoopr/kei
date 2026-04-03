@@ -51,3 +51,7 @@ run *ARGS:
 # Clean build artifacts
 clean:
     cargo clean
+
+# Run full codebase code review via Claude
+code-review:
+    claude -p "$(cat ~/git/codereview/RUST_CODE_REVIEW_PROMPT.md)" --allowedTools 'Bash(cargo*) Bash(wc*) Bash(date*) Read Write Glob Grep Edit'
