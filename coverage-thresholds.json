@@ -21,6 +21,6 @@
     "src/auth/twofa.rs": 23,
     "src/notifications.rs": 85,
     "src/setup.rs": 47,
-    "src/main.rs": 27
+    "src/main.rs": 26
   }
 }
