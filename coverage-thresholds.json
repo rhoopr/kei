@@ -16,11 +16,11 @@
     "src/state/db.rs": 93,
     "src/state/schema.rs": 94,
     "src/auth/session.rs": 82,
-    "src/auth/srp.rs": 54,
-    "src/auth/mod.rs": 49,
+    "src/auth/srp.rs": 65,
+    "src/auth/mod.rs": 61,
     "src/auth/twofa.rs": 23,
     "src/notifications.rs": 85,
     "src/setup.rs": 47,
-    "src/main.rs": 15
+    "src/main.rs": 27
   }
 }
