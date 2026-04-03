@@ -147,7 +147,6 @@ pub(crate) fn item_type_from_str(s: &str) -> Option<AssetItemType> {
 /// Pre-built to avoid `format!()` allocations in the hot asset-parsing loop.
 pub(crate) struct VersionFieldNames {
     pub key: AssetVersionSize,
-    pub prefix: &'static str,
     pub res_field: &'static str,
     pub type_field: &'static str,
 }
@@ -155,49 +154,41 @@ pub(crate) struct VersionFieldNames {
 pub(crate) const PHOTO_VERSION_LOOKUP: &[VersionFieldNames] = &[
     VersionFieldNames {
         key: AssetVersionSize::Original,
-        prefix: "resOriginal",
         res_field: "resOriginalRes",
         type_field: "resOriginalFileType",
     },
     VersionFieldNames {
         key: AssetVersionSize::Alternative,
-        prefix: "resOriginalAlt",
         res_field: "resOriginalAltRes",
         type_field: "resOriginalAltFileType",
     },
     VersionFieldNames {
         key: AssetVersionSize::Medium,
-        prefix: "resJPEGMed",
         res_field: "resJPEGMedRes",
         type_field: "resJPEGMedFileType",
     },
     VersionFieldNames {
         key: AssetVersionSize::Thumb,
-        prefix: "resJPEGThumb",
         res_field: "resJPEGThumbRes",
         type_field: "resJPEGThumbFileType",
     },
     VersionFieldNames {
         key: AssetVersionSize::Adjusted,
-        prefix: "resJPEGFull",
         res_field: "resJPEGFullRes",
         type_field: "resJPEGFullFileType",
     },
     VersionFieldNames {
         key: AssetVersionSize::LiveOriginal,
-        prefix: "resOriginalVidCompl",
         res_field: "resOriginalVidComplRes",
         type_field: "resOriginalVidComplFileType",
     },
     VersionFieldNames {
         key: AssetVersionSize::LiveMedium,
-        prefix: "resVidMed",
         res_field: "resVidMedRes",
         type_field: "resVidMedFileType",
     },
     VersionFieldNames {
         key: AssetVersionSize::LiveThumb,
-        prefix: "resVidSmall",
         res_field: "resVidSmallRes",
         type_field: "resVidSmallFileType",
     },
@@ -206,19 +197,16 @@ pub(crate) const PHOTO_VERSION_LOOKUP: &[VersionFieldNames] = &[
 pub(crate) const VIDEO_VERSION_LOOKUP: &[VersionFieldNames] = &[
     VersionFieldNames {
         key: AssetVersionSize::Original,
-        prefix: "resOriginal",
         res_field: "resOriginalRes",
         type_field: "resOriginalFileType",
     },
     VersionFieldNames {
         key: AssetVersionSize::Medium,
-        prefix: "resVidMed",
         res_field: "resVidMedRes",
         type_field: "resVidMedFileType",
     },
     VersionFieldNames {
         key: AssetVersionSize::Thumb,
-        prefix: "resVidSmall",
         res_field: "resVidSmallRes",
         type_field: "resVidSmallFileType",
     },

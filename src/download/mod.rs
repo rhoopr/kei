@@ -2064,6 +2064,9 @@ async fn download_single_task(
 
     tracing::debug!(path = %task.download_path.display(), "Downloaded");
 
+    // Track whether EXIF was actually written (file content modified after download).
+    // false = no modification, true = set_photo_exif wrote new tags.
+    let mut exif_written = false;
     let mut exif_ok = true;
     if set_exif {
         let ext = task
@@ -2071,28 +2074,30 @@ async fn download_single_task(
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        if matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg") {
+        if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
             let exif_path = task.download_path.clone();
             let date_str = task.created_local.format("%Y:%m:%d %H:%M:%S").to_string();
             let exif_result =
                 tokio::task::spawn_blocking(move || match exif::get_photo_exif(&exif_path) {
-                    Ok(None) => {
-                        if let Err(e) = exif::set_photo_exif(&exif_path, &date_str) {
+                    Ok(None) => match exif::set_photo_exif(&exif_path, &date_str) {
+                        Ok(()) => (true, true), // (ok, written)
+                        Err(e) => {
                             tracing::warn!(path = %exif_path.display(), error = %e, "Failed to set EXIF");
-                            false
-                        } else {
-                            true
+                            (false, false)
                         }
-                    }
-                    Ok(Some(_)) => true,
+                    },
+                    Ok(Some(_)) => (true, false), // already present, not modified
                     Err(e) => {
                         tracing::warn!(path = %exif_path.display(), error = %e, "Failed to read EXIF");
-                        false
+                        (false, false)
                     }
                 })
                 .await;
             match exif_result {
-                Ok(ok) => exif_ok = ok,
+                Ok((ok, written)) => {
+                    exif_ok = ok;
+                    exif_written = written;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "EXIF task panicked");
                     exif_ok = false;
@@ -2100,28 +2105,25 @@ async fn download_single_task(
             }
 
             // Restore mtime after EXIF modification (EXIF write updates mtime to "now")
-            let mtime_path2 = task.download_path.clone();
-            let ts2 = task.created_local.timestamp();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || set_file_mtime(&mtime_path2, ts2)).await?
-            {
-                tracing::warn!(
-                    path = %task.download_path.display(),
-                    error = %e,
-                    "Could not restore mtime"
-                );
+            if exif_written {
+                let mtime_path2 = task.download_path.clone();
+                let ts2 = task.created_local.timestamp();
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || set_file_mtime(&mtime_path2, ts2)).await?
+                {
+                    tracing::warn!(
+                        path = %task.download_path.display(),
+                        error = %e,
+                        "Could not restore mtime"
+                    );
+                }
             }
         }
     }
 
-    // Use the streaming hash when EXIF was not written (file content unchanged).
-    // Re-compute only when EXIF modification altered the file after download.
-    let is_jpeg = task
-        .download_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"));
-    let local_checksum = if set_exif && exif_ok && is_jpeg {
+    // Re-compute SHA-256 only when EXIF tags were actually written to the file.
+    // Otherwise use the hash computed during the download stream.
+    let local_checksum = if exif_written {
         file::compute_sha256(&task.download_path).await?
     } else {
         streaming_hash

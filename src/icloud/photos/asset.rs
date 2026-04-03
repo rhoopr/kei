@@ -143,7 +143,7 @@ fn extract_versions(
             None => {
                 warn!(
                     asset = %record_name,
-                    field = format_args!("{}.downloadURL", entry.prefix),
+                    field = entry.res_field,
                     "Missing downloadURL, skipping version"
                 );
                 continue;
@@ -155,7 +155,7 @@ fn extract_versions(
             None => {
                 warn!(
                     asset = %record_name,
-                    field = format_args!("{}.fileChecksum", entry.prefix),
+                    field = entry.res_field,
                     "Missing fileChecksum, skipping version"
                 );
                 continue;

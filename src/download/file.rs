@@ -138,32 +138,16 @@ async fn attempt_download(
     // When resuming, hash the existing bytes so the final digest covers the whole file
     if !truncate && resume_offset > 0 {
         let part_path_owned = part_path.to_path_buf();
-        let resume_bytes = resume_offset;
         hasher = tokio::task::spawn_blocking(move || {
-            let mut file = std::fs::File::open(&part_path_owned).map_err(|e| {
-                DownloadError::Other(anyhow::anyhow!(
-                    "Failed to open part file for resume hashing: {e}"
-                ))
-            })?;
+            use std::io::Read;
+            let file = std::fs::File::open(&part_path_owned)?;
+            let mut reader = std::io::BufReader::new(file).take(resume_offset);
             let mut h = Sha256::new();
-            let mut buf = [0u8; 8192];
-            let mut remaining = resume_bytes;
-            while remaining > 0 {
-                let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
-                use std::io::Read;
-                let n = file.read(&mut buf[..to_read]).map_err(|e| {
-                    DownloadError::Other(anyhow::anyhow!("Failed to read part file: {e}"))
-                })?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-                remaining -= n as u64;
-            }
-            Ok::<_, DownloadError>(h)
+            std::io::copy(&mut reader, &mut h)?;
+            Ok::<_, std::io::Error>(h)
         })
         .await
-        .map_err(|e| DownloadError::Other(anyhow::anyhow!("Resume hash task failed: {e}")))??;
+        .map_err(|e| DownloadError::Other(e.into()))??;
     }
 
     let mut file = OpenOptions::new()
