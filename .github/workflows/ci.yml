@@ -103,8 +103,9 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
         run: |
-          # Exclude state_auth and setup_auth (require live iCloud credentials)
-          cargo llvm-cov --all-features --test cli --test state --lcov --output-path lcov.info
+          # Include unit tests (--bin kei) + integration tests (--test cli --test state)
+          # Exclude sync and state_auth tests (require live iCloud credentials)
+          cargo llvm-cov --all-features --bin kei --test cli --test state --lcov --output-path lcov.info
           cargo llvm-cov report --all-features > coverage.txt
           cargo llvm-cov report --all-features --json --output-path coverage.json
           cargo llvm-cov report --all-features --html --output-dir coverage-html
