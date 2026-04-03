@@ -56,9 +56,10 @@ src/auth/mod.rs :: authenticate()
 ├─ check_requires_2fa()
 │  │
 │  ├─ YES: HSAv2 required
-│  │  ├─ Interactive: prompt for 6-digit code
-│  │  ├─ submit-code: use provided code
-│  │  └─ Headless: return AuthError::TwoFactorRequired
+│  │  ├─ Interactive: trigger push, prompt for 6-digit code
+│  │  ├─ submit-code: use provided code (no push)
+│  │  ├─ get-code: trigger push only
+│  │  └─ Headless: return AuthError::TwoFactorRequired (no push)
 │  │
 │  └─ NO: proceed
 │

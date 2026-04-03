@@ -47,12 +47,13 @@ every subcommand, flag, and enum value is accepted or rejected correctly.
 | Test | Confirms |
 |------|----------|
 | `help_flag_succeeds` | `--help` exits 0, prints "Download iCloud photos and videos" |
-| `help_lists_all_subcommands` | Help output contains all 7 subcommands |
+| `help_lists_all_subcommands` | Help output contains all 8 subcommands |
 | `sync_help_succeeds` | `sync --help` shows `--directory` |
 | `status_help_succeeds` | `status --help` shows `--failed` |
 | `reset_state_help_succeeds` | `reset-state --help` shows `--yes` |
 | `import_existing_help_succeeds` | `import-existing --help` shows `--directory` |
 | `verify_help_succeeds` | `verify --help` shows `--checksums` |
+| `get_code_help_succeeds` | `get-code --help` shows "2FA" |
 | `submit_code_help_succeeds` | `submit-code --help` shows "2FA" |
 | `retry_failed_help_succeeds` | `retry-failed --help` shows `--directory` |
 
@@ -64,7 +65,7 @@ every subcommand, flag, and enum value is accepted or rejected correctly.
 | `unknown_flag_fails` | `--nonexistent-flag` → failure |
 | `unknown_flag_on_subcommand_fails` | `sync --bogus-flag` → failure |
 | `unknown_flag_on_status_fails` | `status --bogus-flag` → failure |
-| `unknown_flag_on_all_subcommands_fails` | `--bogus-flag` rejected on verify, reset-state, import-existing, submit-code, retry-failed |
+| `unknown_flag_on_all_subcommands_fails` | `--bogus-flag` rejected on verify, reset-state, import-existing, get-code, submit-code, retry-failed |
 
 ### Global Flags (3 tests)
 
@@ -123,8 +124,8 @@ every subcommand, flag, and enum value is accepted or rejected correctly.
 | `value_sync_flags_accepted` | 14 value flags parse OK |
 | `album_flag_accepts_multiple` | Multiple `--album` flags accepted |
 | `bare_invocation_with_username_and_directory_parses` | No subcommand defaults to sync |
-| `config_global_flag_works_with_all_subcommands` | `--config` works on all 7 subcommands |
-| `log_level_global_flag_works_with_all_subcommands` | `--log-level` works on all 7 subcommands |
+| `config_global_flag_works_with_all_subcommands` | `--config` works on all 8 subcommands |
+| `log_level_global_flag_works_with_all_subcommands` | `--log-level` works on all 8 subcommands |
 | `auth_flags_accepted_on_all_subcommands` | --username, --password, --domain, --cookie-directory on all |
 | `log_level_all_variants_accepted` | debug, info, warn, error all accepted |
 | `log_level_before_subcommand` | `--log-level error sync` works (global before subcommand) |

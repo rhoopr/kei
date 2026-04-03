@@ -121,21 +121,21 @@ pub async fn authenticate(
     if requires_2fa {
         tracing::info!("Two-factor authentication is required");
 
-        // Headless with no code: bail early before making any further Apple
-        // API requests. In a Docker restart loop this prevents repeated
-        // bridge/push calls that can trigger Apple's securityCodeLocked.
+        // Headless with no code: bail without any Apple API calls.
+        // The user triggers the push manually via `get-code`.
         if code.is_none() && !std::io::stdin().is_terminal() {
             return Err(AuthError::TwoFactorRequired.into());
         }
 
-        // Trigger push notification to trusted devices. Some Apple accounts
-        // require this bridge step to receive 2FA codes; without it they only
-        // get a "website login" email. Non-fatal: we log and continue if it
-        // fails, since the user can still enter a code from a trusted device.
-        if let Err(e) =
-            twofa::trigger_push_notification(&mut session, &endpoints, &client_id, domain).await
-        {
-            tracing::warn!(error = %e, "Failed to trigger push notification");
+        // Interactive (TTY, no code): trigger push before prompting.
+        // Skip when code is already provided (submit-code) to avoid
+        // sending a new code that invalidates the one being submitted.
+        if code.is_none() {
+            if let Err(e) =
+                twofa::trigger_push_notification(&mut session, &endpoints, &client_id, domain).await
+            {
+                tracing::warn!(error = %e, "Failed to trigger push notification");
+            }
         }
 
         let verified = if let Some(c) = code {
@@ -168,6 +168,58 @@ pub async fn authenticate(
         data,
         requires_2fa: false,
     })
+}
+
+/// Trigger a 2FA push notification to trusted devices.
+///
+/// Performs SRP authentication (if needed) to establish a valid session,
+/// then sends the push notification via Apple's bridge endpoint. This is
+/// the `get-code` command's backend.
+pub async fn send_2fa_push(
+    cookie_dir: &Path,
+    apple_id: &str,
+    password_provider: &dyn Fn() -> Option<String>,
+    domain: &str,
+) -> Result<()> {
+    let endpoints = Endpoints::for_domain(domain)?;
+    let mut session = Session::new(cookie_dir, apple_id, endpoints.home, None).await?;
+
+    let client_id = session
+        .client_id()
+        .cloned()
+        .unwrap_or_else(|| format!("auth-{}", Uuid::new_v4()));
+    session.set_client_id(&client_id);
+
+    let mut data: Option<AccountLoginResponse> = None;
+    if session.session_data.contains_key("session_token") {
+        if let Ok(d) = twofa::validate_token(&mut session, &endpoints).await {
+            data = Some(d);
+        }
+    }
+
+    if data.is_none() {
+        let password = password_provider()
+            .ok_or_else(|| AuthError::FailedLogin("Password provider returned no data".into()))?;
+        srp::authenticate_srp(
+            &mut session,
+            &endpoints,
+            apple_id,
+            &password,
+            &client_id,
+            domain,
+        )
+        .await?;
+        let account_data = twofa::authenticate_with_token(&mut session, &endpoints).await?;
+        data = Some(account_data);
+    }
+
+    let data = data.ok_or_else(|| anyhow::anyhow!("Authentication produced no account data"))?;
+
+    if !check_requires_2fa(&data) {
+        anyhow::bail!("Session is already authenticated, 2FA is not required");
+    }
+
+    twofa::trigger_push_notification(&mut session, &endpoints, &client_id, domain).await
 }
 
 /// Check if the current session token is still valid by calling Apple's

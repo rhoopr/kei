@@ -13,6 +13,7 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "reset-state",
     "verify",
     "retry-failed",
+    "get-code",
     "submit-code",
     "import-existing",
 ];
@@ -101,6 +102,15 @@ fn verify_help_succeeds() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--checksums"));
+}
+
+#[test]
+fn get_code_help_succeeds() {
+    common::cmd()
+        .args(["get-code", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2FA"));
 }
 
 #[test]

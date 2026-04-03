@@ -236,6 +236,13 @@ pub struct VerifyArgs {
     pub checksums: bool,
 }
 
+/// Arguments for the get-code command.
+#[derive(Parser, Debug, Clone)]
+pub struct GetCodeArgs {
+    #[command(flatten)]
+    pub auth: AuthArgs,
+}
+
 /// Arguments for the submit-code command.
 #[derive(Parser, Debug, Clone)]
 pub struct SubmitCodeArgs {
@@ -272,6 +279,9 @@ pub enum Command {
 
     /// Verify downloaded files exist and optionally check checksums
     Verify(VerifyArgs),
+
+    /// Request a 2FA code be sent to your trusted devices
+    GetCode(GetCodeArgs),
 
     /// Submit a 2FA code non-interactively (for Docker / headless use)
     SubmitCode(SubmitCodeArgs),
@@ -1095,6 +1105,37 @@ mod tests {
             Cli::try_parse_from(["kei", "--config", "/custom/config.toml", "status"]).unwrap();
         assert_eq!(cli.config, "/custom/config.toml");
         assert!(matches!(cli.command, Some(Command::Status(_))));
+    }
+
+    // ── get-code subcommand ─────────────────────────────────────
+
+    #[test]
+    fn test_get_code_subcommand() {
+        let cli =
+            Cli::try_parse_from(["kei", "get-code", "--username", "test@example.com"]).unwrap();
+        if let Some(Command::GetCode(args)) = cli.command {
+            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
+        } else {
+            panic!("Expected GetCode command");
+        }
+    }
+
+    #[test]
+    fn test_get_code_without_username() {
+        let cli = Cli::try_parse_from(["kei", "get-code"]).unwrap();
+        if let Some(Command::GetCode(args)) = cli.command {
+            assert!(args.auth.username.is_none());
+        } else {
+            panic!("Expected GetCode command");
+        }
+    }
+
+    #[test]
+    fn test_get_code_with_config() {
+        let cli =
+            Cli::try_parse_from(["kei", "get-code", "--config", "/custom/config.toml"]).unwrap();
+        assert_eq!(cli.config, "/custom/config.toml");
+        assert!(matches!(cli.command, Some(Command::GetCode(_))));
     }
 
     // ── submit-code subcommand ────────────────────────────────────

@@ -82,7 +82,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--smtp-*` (all SMTP flags) | Planned | [#31](https://github.com/rhoopr/kei/issues/31) |
 | `--use-os-locale` | Not planned | - |
 | `--password-provider` | Not applicable - uses `ICLOUD_PASSWORD` env var or interactive prompt | - |
-| `--mfa-provider` | Not applicable - uses trusted device or `submit-code` subcommand | - |
+| `--mfa-provider` | Not applicable - uses trusted device with `get-code` + `submit-code` | - |
 
 ### New in kei (no Python equivalent)
 
@@ -96,6 +96,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--reset-sync-token` | Clear stored sync tokens before syncing. Unlike `--no-incremental`, this also stores the fresh token from the full scan, so the next run resumes incremental from that point. Use after recovering from a bad state or after a long gap between syncs. |
 | `--notify-systemd` | systemd sd_notify integration |
 | `--pid-file` | PID file for service managers |
+| `get-code` | Trigger Apple to send a 2FA code to trusted devices |
 | `submit-code <code>` | Submit 2FA code non-interactively (for Docker/headless) |
 | `status` | Show sync status and database summary |
 | `retry-failed` | Reset failed downloads and re-sync |
@@ -111,7 +112,7 @@ If you're using a `icloudpd` Docker wrapper (like boredazfcuk's), here are the k
 |---------------|-------------------|
 | Multiple env vars for every setting | `ICLOUD_USERNAME`, `ICLOUD_PASSWORD`, `TZ` + optional `config.toml` |
 | Cron-based scheduling | Built-in `--watch-with-interval` (set `interval` in config) |
-| Interactive 2FA via console | `docker exec kei kei submit-code 123456` |
+| Interactive 2FA via console | `docker exec kei kei get-code` then `docker exec kei kei submit-code 123456` |
 | Various notification mechanisms | `--notification-script` with env vars |
 
 Minimal `docker-compose.yml`:
