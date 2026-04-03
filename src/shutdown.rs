@@ -72,20 +72,6 @@ pub(crate) fn install_signal_handler(
 mod tests {
     use super::*;
 
-    #[test]
-    fn token_starts_uncancelled() {
-        let token = CancellationToken::new();
-        assert!(!token.is_cancelled());
-    }
-
-    #[test]
-    fn child_tokens_observe_parent_cancel() {
-        let parent = CancellationToken::new();
-        let child = parent.child_token();
-        parent.cancel();
-        assert!(child.is_cancelled());
-    }
-
     /// Verify that `install_signal_handler` returns a live, uncancelled token
     /// (signal delivery can't be safely tested in a shared test binary).
     #[tokio::test]

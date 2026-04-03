@@ -92,22 +92,28 @@ impl SystemdNotifier {
 mod tests {
     use super::*;
 
+    /// Verify that enabled/disabled flag controls whether methods dispatch.
+    /// On non-Linux, `send_impl_*` are no-ops, so we can only test the guard.
     #[test]
-    fn disabled_notifier_is_noop() {
+    fn disabled_notifier_skips_dispatch() {
+        // This is a no-op on all platforms — the guard returns early.
         let n = SystemdNotifier::new(false);
         n.notify_ready();
         n.notify_stopping();
-        n.notify_status("test");
+        n.notify_status("test status");
         n.notify_watchdog();
+        // No way to assert "method returned early" without instrumenting,
+        // but this documents that false => no-op.
     }
 
     #[test]
-    fn enabled_notifier_does_not_panic() {
-        // On non-Linux this is still a no-op; on Linux without a socket it logs debug
+    fn enabled_notifier_dispatches_without_panic() {
+        // On non-Linux: send_impl_* are empty bodies, so this tests the guard passes through.
+        // On Linux without NOTIFY_SOCKET: sd_notify logs a debug message but doesn't error.
         let n = SystemdNotifier::new(true);
         n.notify_ready();
         n.notify_stopping();
-        n.notify_status("test");
+        n.notify_status("syncing 42 photos");
         n.notify_watchdog();
     }
 }

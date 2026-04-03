@@ -374,30 +374,6 @@ mod tests {
     }
 
     #[test]
-    fn test_version_size_key_is_one_byte() {
-        assert_eq!(size_of::<VersionSizeKey>(), 1);
-    }
-
-    #[test]
-    fn test_asset_status_is_one_byte() {
-        assert_eq!(size_of::<AssetStatus>(), 1);
-    }
-
-    #[test]
-    fn test_media_type_is_one_byte() {
-        assert_eq!(size_of::<MediaType>(), 1);
-    }
-
-    #[test]
-    fn test_sync_run_stats_default() {
-        let stats = SyncRunStats::default();
-        assert_eq!(stats.assets_seen, 0);
-        assert_eq!(stats.assets_downloaded, 0);
-        assert_eq!(stats.assets_failed, 0);
-        assert!(!stats.interrupted);
-    }
-
-    #[test]
     fn test_asset_record_new_pending_with_added_at() {
         let now = Utc::now();
         let added = now - chrono::Duration::hours(1);

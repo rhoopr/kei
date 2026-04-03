@@ -1482,6 +1482,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_should_download_after_failure() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = AssetRecord::new_pending(
+            "FAIL_1".to_string(),
+            VersionSizeKey::Original,
+            "checksum_abc".to_string(),
+            "photo.jpg".to_string(),
+            Utc::now(),
+            None,
+            5000,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_failed("FAIL_1", "original", "HTTP 503")
+            .await
+            .unwrap();
+
+        // Failed assets should be re-downloaded
+        let result = db
+            .should_download(
+                "FAIL_1",
+                "original",
+                "checksum_abc",
+                Path::new("/tmp/photo.jpg"),
+            )
+            .await
+            .unwrap();
+        assert!(result, "Failed assets should be re-downloaded");
+    }
+
+    #[tokio::test]
+    async fn test_mark_failed_accumulates_attempts() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = AssetRecord::new_pending(
+            "RETRY_1".to_string(),
+            VersionSizeKey::Original,
+            "ck".to_string(),
+            "photo.jpg".to_string(),
+            Utc::now(),
+            None,
+            1000,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&record).await.unwrap();
+
+        // Fail three times
+        for msg in ["timeout", "503 Server Error", "connection reset"] {
+            db.mark_failed("RETRY_1", "original", msg).await.unwrap();
+        }
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].download_attempts, 3);
+        // Last error should be the most recent
+        assert_eq!(failed[0].last_error.as_deref(), Some("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn test_upsert_updates_checksum_preserves_status() {
+        let dir = test_dir("upsert_checksum");
+        let file_path = dir.join("photo.jpg");
+        fs::write(&file_path, b"test content").unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let mut record = AssetRecord::new_pending(
+            "CK_1".to_string(),
+            VersionSizeKey::Original,
+            "old_checksum".to_string(),
+            "photo.jpg".to_string(),
+            Utc::now(),
+            None,
+            12345,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("CK_1", "original", &file_path, "local_hash")
+            .await
+            .unwrap();
+
+        // Upsert with a new checksum
+        record.checksum = "new_checksum".to_string();
+        db.upsert_seen(&record).await.unwrap();
+
+        // The stored checksum should now be "new_checksum",
+        // so should_download with "new_checksum" should return false (file exists, checksum matches)
+        let result = db
+            .should_download("CK_1", "original", "new_checksum", &file_path)
+            .await
+            .unwrap();
+        assert!(
+            !result,
+            "After upsert with new checksum, should_download with matching checksum should skip"
+        );
+
+        // But querying with the old checksum should trigger re-download
+        let result = db
+            .should_download("CK_1", "original", "old_checksum", &file_path)
+            .await
+            .unwrap();
+        assert!(result, "Mismatched checksum should trigger re-download");
+    }
+
+    #[tokio::test]
     async fn test_metadata_get_set() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 

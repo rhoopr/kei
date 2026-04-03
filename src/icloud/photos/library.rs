@@ -374,4 +374,177 @@ mod tests {
         drop(lib);
         assert_eq!(cloned.zone_name(), "PrimarySync");
     }
+
+    // ── albums() tests with a stub that returns mock CloudKit responses ──
+
+    /// Stub session that returns configurable CloudKit query responses.
+    struct FolderStubSession {
+        /// Response to return for any post() call (simulating records/query).
+        response: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for FolderStubSession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            Ok(self.response.clone())
+        }
+
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<reqwest::Response> {
+            panic!("FolderStubSession::get not expected");
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(FolderStubSession {
+                response: self.response.clone(),
+            })
+        }
+    }
+
+    fn make_library_with_session(zone_id: Value, session: Box<dyn PhotosSession>) -> PhotoLibrary {
+        PhotoLibrary {
+            service_endpoint: "https://example.com".to_string(),
+            params: Arc::new(HashMap::new()),
+            session,
+            zone_id,
+            library_type: "personal".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_albums_includes_smart_folders() {
+        // Empty folder response — no user albums, just smart folders
+        let session = Box::new(FolderStubSession {
+            response: json!({"records": []}),
+        });
+        let lib = make_library_with_session(json!({"zoneName": "PrimarySync"}), session);
+        let albums = lib.albums().await.unwrap();
+
+        // Should have smart folders (Time-lapse, Videos, Slo-mo, Bursts, etc.)
+        assert!(
+            !albums.is_empty(),
+            "PrimarySync library should have smart folders"
+        );
+        assert!(
+            albums.contains_key("Videos"),
+            "Should contain 'Videos' smart folder. Got: {:?}",
+            albums.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_albums_shared_library_skips_smart_folders() {
+        // Shared libraries should NOT have smart folders or user albums
+        let session = Box::new(FolderStubSession {
+            response: json!({"records": []}),
+        });
+        let lib = make_library_with_session(json!({"zoneName": "SharedSync-ABC-123"}), session);
+        let albums = lib.albums().await.unwrap();
+        assert!(
+            albums.is_empty(),
+            "SharedSync library should have no albums (no smart folders, no user albums)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_albums_includes_user_folders() {
+        use base64::Engine;
+        let folder_name_b64 = base64::engine::general_purpose::STANDARD.encode(b"Vacation 2024");
+        let session = Box::new(FolderStubSession {
+            response: json!({"records": [{
+                "recordName": "folder-uuid-1234",
+                "recordType": "CPLAlbumByPositionLive",
+                "fields": {
+                    "albumNameEnc": {"value": folder_name_b64},
+                    "isDeleted": {"value": false}
+                }
+            }]}),
+        });
+        let lib = make_library_with_session(json!({"zoneName": "PrimarySync"}), session);
+        let albums = lib.albums().await.unwrap();
+        assert!(
+            albums.contains_key("Vacation 2024"),
+            "Should contain decoded user folder name. Got: {:?}",
+            albums.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_albums_skips_root_folders() {
+        let session = Box::new(FolderStubSession {
+            response: json!({"records": [
+                {
+                    "recordName": "----Root-Folder----",
+                    "recordType": "CPLAlbumByPositionLive",
+                    "fields": {"albumNameEnc": {"value": "Um9vdA=="}}
+                },
+                {
+                    "recordName": "----Project-Root-Folder----",
+                    "recordType": "CPLAlbumByPositionLive",
+                    "fields": {"albumNameEnc": {"value": "Um9vdA=="}}
+                }
+            ]}),
+        });
+        let lib = make_library_with_session(json!({"zoneName": "PrimarySync"}), session);
+        let albums = lib.albums().await.unwrap();
+        // Smart folders should be present, but NOT the root/project-root sentinels
+        assert!(
+            !albums.contains_key("----Root-Folder----"),
+            "Root sentinel should be filtered out"
+        );
+        assert!(
+            !albums.contains_key("----Project-Root-Folder----"),
+            "Project root sentinel should be filtered out"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_albums_skips_deleted_folders() {
+        use base64::Engine;
+        let name = base64::engine::general_purpose::STANDARD.encode(b"Deleted Album");
+        let session = Box::new(FolderStubSession {
+            response: json!({"records": [{
+                "recordName": "folder-deleted",
+                "recordType": "CPLAlbumByPositionLive",
+                "fields": {
+                    "albumNameEnc": {"value": name},
+                    "isDeleted": {"value": true}
+                }
+            }]}),
+        });
+        let lib = make_library_with_session(json!({"zoneName": "PrimarySync"}), session);
+        let albums = lib.albums().await.unwrap();
+        assert!(
+            !albums.contains_key("Deleted Album"),
+            "Deleted folders should be filtered out"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_albums_folder_without_name_uses_id() {
+        let session = Box::new(FolderStubSession {
+            response: json!({"records": [{
+                "recordName": "folder-no-name-abc",
+                "recordType": "CPLAlbumByPositionLive",
+                "fields": {
+                    "isDeleted": {"value": false}
+                }
+            }]}),
+        });
+        let lib = make_library_with_session(json!({"zoneName": "PrimarySync"}), session);
+        let albums = lib.albums().await.unwrap();
+        assert!(
+            albums.contains_key("folder-no-name-abc"),
+            "Folder without albumNameEnc should use recordName as key. Got: {:?}",
+            albums.keys().collect::<Vec<_>>()
+        );
+    }
 }

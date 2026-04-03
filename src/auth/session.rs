@@ -611,6 +611,10 @@ mod tests {
         ));
         // No expiry → not expired
         assert!(!is_cookie_expired("foo=bar", &now));
+        // Malformed cookie string → not expired (safe default)
+        assert!(!is_cookie_expired("totally garbage", &now));
+        // Empty string → not expired
+        assert!(!is_cookie_expired("", &now));
     }
 
     #[test]

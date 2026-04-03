@@ -816,6 +816,68 @@ mod tests {
     }
 
     #[test]
+    fn test_filename_encrypted_bytes_invalid_base64() {
+        let asset = make_asset(
+            json!({"fields": {"filenameEnc": {"value": "!!!not-base64!!!", "type": "ENCRYPTED_BYTES"}}}),
+            json!({}),
+        );
+        // Invalid base64 should gracefully return None (no filename)
+        assert_eq!(asset.filename(), None);
+    }
+
+    #[test]
+    fn test_filename_encrypted_bytes_invalid_utf8() {
+        use base64::Engine;
+        // Encode invalid UTF-8 bytes
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&[0xFF, 0xFE, 0x00]);
+        let asset = make_asset(
+            json!({"fields": {"filenameEnc": {"value": encoded, "type": "ENCRYPTED_BYTES"}}}),
+            json!({}),
+        );
+        // Invalid UTF-8 should gracefully return None
+        assert_eq!(asset.filename(), None);
+    }
+
+    #[test]
+    fn test_filename_unknown_encoding_type() {
+        let asset = make_asset(
+            json!({"fields": {"filenameEnc": {"value": "file.jpg", "type": "UNKNOWN_TYPE"}}}),
+            json!({}),
+        );
+        // Unknown encoding type should return None
+        assert_eq!(asset.filename(), None);
+    }
+
+    #[test]
+    fn test_item_type_unknown_uti_no_filename_defaults_to_movie() {
+        // When UTI is unknown and there's no filename for extension fallback,
+        // the code defaults to Movie (since videos are more likely to have
+        // non-standard UTI strings)
+        let asset = make_asset(
+            json!({"fields": {"itemType": {"value": "com.custom.weird-format"}}}),
+            json!({}),
+        );
+        assert_eq!(asset.item_type(), Some(AssetItemType::Movie));
+    }
+
+    #[test]
+    fn test_item_type_missing_uti_with_jpg_extension() {
+        // When itemType field is completely missing, extension should still work
+        let asset = make_asset(
+            json!({"fields": {"filenameEnc": {"value": "photo.jpg", "type": "STRING"}}}),
+            json!({}),
+        );
+        assert_eq!(asset.item_type(), Some(AssetItemType::Image));
+    }
+
+    #[test]
+    fn test_asset_date_missing_falls_back_to_epoch() {
+        let asset = make_asset(json!({}), json!({}));
+        let dt = asset.asset_date();
+        assert_eq!(dt, DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
     fn test_struct_sizes() {
         use std::mem::size_of;
         // AssetVersion should be <= 64 bytes

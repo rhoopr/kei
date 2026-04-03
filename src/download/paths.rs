@@ -448,6 +448,7 @@ pub(crate) fn live_photo_mov_path_original(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn test_clean_filename() {
@@ -748,5 +749,116 @@ mod tests {
             generate_fingerprint_filename("asset123", "some.unknown.type"),
             "asset123.unknown"
         );
+    }
+
+    // ── expand_date_format tests ──
+
+    #[test]
+    fn test_expand_date_format_all_tokens() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 1, 5, 9, 7, 3)
+            .single()
+            .unwrap();
+        assert_eq!(expand_date_format("%Y/%m/%d", &date), "2025/01/05");
+        assert_eq!(expand_date_format("%H-%M-%S", &date), "09-07-03");
+        assert_eq!(
+            expand_date_format("%Y-%m-%d_%H%M%S", &date),
+            "2025-01-05_090703"
+        );
+    }
+
+    #[test]
+    fn test_expand_date_format_unknown_token_preserved() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 12, 0, 0)
+            .single()
+            .unwrap();
+        // %Z is not a recognized token — should preserve the literal "%"
+        assert_eq!(expand_date_format("%Y/%Z/%d", &date), "2025/%Z/15");
+    }
+
+    #[test]
+    fn test_expand_date_format_trailing_percent() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+            .single()
+            .unwrap();
+        // Trailing % with no following char should be preserved
+        assert_eq!(expand_date_format("prefix%", &date), "prefix%");
+    }
+
+    #[test]
+    fn test_expand_date_format_no_tokens() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+            .single()
+            .unwrap();
+        assert_eq!(expand_date_format("static/path", &date), "static/path");
+        assert_eq!(expand_date_format("", &date), "");
+    }
+
+    // ── local_download_path tests ──
+
+    #[test]
+    fn test_local_download_path_with_date_format() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 3, 15, 14, 30, 0)
+            .single()
+            .unwrap();
+        let result =
+            local_download_path(Path::new("/photos"), "{:%Y/%m/%d}", &date, "IMG_0001.JPG");
+        assert_eq!(result, PathBuf::from("/photos/2025/03/15/IMG_0001.JPG"));
+    }
+
+    #[test]
+    fn test_local_download_path_none_folder_structure() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+            .single()
+            .unwrap();
+        let result = local_download_path(Path::new("/photos"), "none", &date, "IMG_0001.JPG");
+        assert_eq!(result, PathBuf::from("/photos/IMG_0001.JPG"));
+    }
+
+    #[test]
+    fn test_local_download_path_none_case_insensitive() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+            .single()
+            .unwrap();
+        let result = local_download_path(Path::new("/photos"), "NONE", &date, "photo.jpg");
+        assert_eq!(result, PathBuf::from("/photos/photo.jpg"));
+
+        let result = local_download_path(Path::new("/photos"), "None", &date, "photo.jpg");
+        assert_eq!(result, PathBuf::from("/photos/photo.jpg"));
+    }
+
+    #[test]
+    fn test_local_download_path_cleans_filename() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 1, 0, 0, 0)
+            .single()
+            .unwrap();
+        let result = local_download_path(
+            Path::new("/photos"),
+            "{:%Y/%m}",
+            &date,
+            "photo:with*bad<chars>.jpg",
+        );
+        assert_eq!(
+            result,
+            PathBuf::from("/photos/2025/06/photowithbadchars.jpg")
+        );
+    }
+
+    #[test]
+    fn test_local_download_path_plain_format_no_braces() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 12, 25, 0, 0, 0)
+            .single()
+            .unwrap();
+        // Without {: } wrapper — should still expand tokens
+        let result = local_download_path(Path::new("/photos"), "%Y-%m", &date, "photo.jpg");
+        assert_eq!(result, PathBuf::from("/photos/2025-12/photo.jpg"));
     }
 }

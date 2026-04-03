@@ -86,7 +86,8 @@ jobs:
       - run: cargo fetch --locked
 
   # Measures what percentage of code is exercised by tests
-  # Posts coverage summary as PR comment
+  # Fails the PR if overall or per-file coverage drops below thresholds
+  # Thresholds are configured in coverage-thresholds.json
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -102,36 +103,71 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
         run: |
-          cargo llvm-cov --all-features > coverage.txt
+          # Exclude state_auth and setup_auth (require live iCloud credentials)
+          cargo llvm-cov --all-features --test cli --test state --lcov --output-path lcov.info
+          cargo llvm-cov report --all-features > coverage.txt
+          cargo llvm-cov report --all-features --json --output-path coverage.json
+          cargo llvm-cov report --all-features --html --output-dir coverage-html
           cat coverage.txt
+      - name: Enforce coverage thresholds
+        run: scripts/check-coverage.sh coverage.json
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage-html/
+            lcov.info
+          retention-days: 14
       - name: Post coverage comment
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Extract stats from coverage output
-          TOTAL=$(grep "^TOTAL" coverage.txt | awk '{print $10}')
+          OVERALL=$(jq '.data[0].totals.lines.percent' coverage.json)
+          THRESHOLD=$(jq '.overall' coverage-thresholds.json)
           TESTS=$(grep -E "^test result:" coverage.txt | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
 
-          # Find files with 0% and 100% coverage
-          ZERO_COV=$(grep "0.00%" coverage.txt | grep -v "^TOTAL" | awk '{print $1}' | head -5 | tr '\n' ', ' | sed 's/,$//')
-          FULL_COV=$(grep "100.00%" coverage.txt | awk '{print $1}' | tr '\n' ', ' | sed 's/,$//')
+          # Build per-file table from thresholds config
+          FILE_TABLE=""
+          for file in $(jq -r '.files | keys[]' coverage-thresholds.json); do
+            ft=$(jq -r --arg f "$file" '.files[$f]' coverage-thresholds.json)
+            fc=$(jq -r --arg f "$file" '.data[0].files[] | select(.filename | endswith($f)) | .summary.lines.percent' coverage.json)
+            if [ -n "$fc" ]; then
+              if [ "$(echo "$fc < $ft" | bc -l)" -eq 1 ]; then
+                FILE_TABLE="${FILE_TABLE}| \`${file}\` | ${fc}% | ${ft}% | :x: |\n"
+              else
+                FILE_TABLE="${FILE_TABLE}| \`${file}\` | ${fc}% | ${ft}% | :white_check_mark: |\n"
+              fi
+            fi
+          done
+
+          if [ "$(echo "$OVERALL < $THRESHOLD" | bc -l)" -eq 1 ]; then
+            STATUS=":red_circle: **FAILED** — below ${THRESHOLD}% threshold"
+          else
+            STATUS=":green_circle: **Passed** — meets ${THRESHOLD}% threshold"
+          fi
 
           {
             echo "## Coverage Report"
             echo ""
+            echo "${STATUS}"
+            echo ""
             echo "| Metric | Value |"
             echo "|--------|-------|"
-            echo "| **Line Coverage** | ${TOTAL} |"
+            echo "| **Line Coverage** | ${OVERALL}% |"
+            echo "| **Threshold** | ${THRESHOLD}% |"
             echo "| **Tests Passed** | ${TESTS} |"
             echo ""
-            if [ -n "$FULL_COV" ]; then
-              echo "**100% coverage:** \`${FULL_COV}\`"
+            if [ -n "$FILE_TABLE" ]; then
+              echo "<details><summary>Per-file coverage</summary>"
               echo ""
-            fi
-            if [ -n "$ZERO_COV" ]; then
-              echo "**Needs tests:** \`${ZERO_COV}\`"
+              echo "| File | Coverage | Threshold | Status |"
+              echo "|------|----------|-----------|--------|"
+              echo -e "$FILE_TABLE"
+              echo "</details>"
             fi
           } > comment.md
 

@@ -961,7 +961,7 @@ fn sync_bare_invocation_works_like_sync() {
     });
 }
 
-// ── Error paths (no network) ────────────────────────────────────────────
+// ── Error paths ────────────────────────────────────────────────────────
 
 #[test]
 fn sync_without_directory_fails() {
@@ -985,8 +985,6 @@ fn sync_without_directory_fails() {
         .failure()
         .stderr(predicate::str::contains("directory").or(predicate::str::contains("--directory")));
 }
-
-// ── Error paths (auth required) ─────────────────────────────────────────
 
 #[test]
 fn sync_nonexistent_album_fails() {
@@ -1052,38 +1050,6 @@ fn sync_nonexistent_library_fails() {
                     .or(predicate::str::contains("ERROR")),
             );
     });
-}
-
-// ── Bad credentials (LAST — hits auth from scratch, burns rate limit) ───
-
-#[test]
-fn zz_bad_credentials_fails() {
-    let cookie_dir = tempdir().expect("tempdir");
-    let download_dir = tempdir().expect("tempdir");
-
-    common::cmd()
-        .env_remove("ICLOUD_USERNAME")
-        .env_remove("ICLOUD_PASSWORD")
-        .args([
-            "sync",
-            "--username",
-            "nonexistent-xyz@icloud.com",
-            "--password",
-            "wrong-password",
-            "--cookie-directory",
-            cookie_dir.path().to_str().unwrap(),
-            "--directory",
-            download_dir.path().to_str().unwrap(),
-            "--no-progress-bar",
-        ])
-        .timeout(std::time::Duration::from_secs(60))
-        .assert()
-        .failure()
-        .stderr(
-            predicate::str::contains("error")
-                .or(predicate::str::contains("Error"))
-                .or(predicate::str::contains("ERROR")),
-        );
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

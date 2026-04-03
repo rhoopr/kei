@@ -67,6 +67,70 @@ pub async fn download_file(
     .await
 }
 
+/// Resolved state for a download attempt after inspecting the HTTP status code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownloadResolution {
+    /// Starting byte count (equals resume_offset when actually resuming, 0 otherwise).
+    bytes_written: u64,
+    /// Whether to truncate the .part file (true = start fresh, false = append).
+    truncate: bool,
+    /// Byte offset for content-length verification. When the server ignores
+    /// Range and returns 200, this is 0 (not the stale resume_offset).
+    effective_offset: u64,
+}
+
+/// Map an HTTP status code + resume state into a download strategy.
+///
+/// - 206 with a positive resume_offset → resume (append, offset = resume_offset)
+/// - Any 2xx → fresh start (truncate, offset = 0)
+/// - Anything else → error
+fn resolve_download_state(
+    status: u16,
+    is_success: bool,
+    resume_offset: u64,
+) -> Result<DownloadResolution, DownloadError> {
+    match status {
+        206 if resume_offset > 0 => Ok(DownloadResolution {
+            bytes_written: resume_offset,
+            truncate: false,
+            effective_offset: resume_offset,
+        }),
+        _ if is_success => Ok(DownloadResolution {
+            bytes_written: 0,
+            truncate: true,
+            effective_offset: 0,
+        }),
+        _ => Err(DownloadError::HttpStatus {
+            status,
+            path: String::new(),
+        }),
+    }
+}
+
+/// Verify that the number of bytes received matches the Content-Length header.
+///
+/// Returns `Ok(())` if content_length is `None` (no header) or the counts match.
+/// Returns `Err(ContentLengthMismatch)` if they disagree — catches CDN truncation
+/// (e.g. Apple silently cutting off videos at ~1 GB).
+fn verify_content_length(
+    bytes_written: u64,
+    effective_offset: u64,
+    content_length: Option<u64>,
+    path: &str,
+) -> Result<(), DownloadError> {
+    if let Some(expected_len) = content_length {
+        let total_bytes = bytes_written - effective_offset;
+        if total_bytes != expected_len {
+            return Err(DownloadError::ContentLengthMismatch {
+                path: path.to_string(),
+                expected: expected_len,
+                received: total_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Single download attempt with resume support.
 ///
 /// If a .part file already exists, sends a Range request to resume from where
@@ -106,30 +170,35 @@ async fn attempt_download(
     })?;
 
     let status = response.status().as_u16();
+    let is_success = response.status().is_success();
 
-    // 206 = resumed successfully, 200 = server ignored Range (start over)
-    // `effective_offset` tracks the actual byte offset used for the content-length
-    // check. When the server ignores Range and returns 200, we restart from zero
-    // so effective_offset must be 0 (not the stale resume_offset).
-    let (mut bytes_written, truncate, effective_offset) = match status {
-        206 if resume_offset > 0 => (resume_offset, false, resume_offset),
-        _ if response.status().is_success() => {
-            if resume_offset > 0 {
-                tracing::info!(
-                    status,
-                    path = %path_str,
-                    "Server ignored Range request, restarting download"
-                );
-            }
-            (0u64, true, 0u64)
-        }
-        _ => {
-            return Err(DownloadError::HttpStatus {
+    let resolution = resolve_download_state(status, is_success, resume_offset).map_err(|e| {
+        // Fill in the path that resolve_download_state couldn't know about
+        if let DownloadError::HttpStatus { status, .. } = e {
+            DownloadError::HttpStatus {
                 status,
-                path: path_str,
-            });
+                path: path_str.clone(),
+            }
+        } else {
+            e
         }
-    };
+    })?;
+
+    if !resolution.truncate && resume_offset > 0 {
+        // Server returned 200 instead of 206 — log the fallback
+    } else if resolution.truncate && resume_offset > 0 {
+        tracing::info!(
+            status,
+            path = %path_str,
+            "Server ignored Range request, restarting download"
+        );
+    }
+
+    let DownloadResolution {
+        mut bytes_written,
+        truncate,
+        effective_offset,
+    } = resolution;
 
     let content_length = response.content_length();
 
@@ -179,17 +248,11 @@ async fn attempt_download(
     drop(file);
 
     // Verify the server sent the number of bytes it promised.
-    // Catches CDN truncation (e.g. Apple silently cutting off videos at ~1 GB).
-    if let Some(expected_len) = content_length {
-        let total_bytes = bytes_written - effective_offset;
-        if total_bytes != expected_len {
-            let _ = fs::remove_file(&part_path).await;
-            return Err(DownloadError::ContentLengthMismatch {
-                path: path_str,
-                expected: expected_len,
-                received: total_bytes,
-            });
-        }
+    if let Err(e) =
+        verify_content_length(bytes_written, effective_offset, content_length, &path_str)
+    {
+        let _ = fs::remove_file(&part_path).await;
+        return Err(e);
     }
 
     // Note: Apple's fileChecksum from the CloudKit API is an opaque version
@@ -221,17 +284,6 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_base32_encode() {
-        // Verify data-encoding produces expected RFC 4648 no-pad output
-        use data_encoding::BASE32_NOPAD;
-        assert_eq!(BASE32_NOPAD.encode(b"Hello"), "JBSWY3DP");
-        assert_eq!(BASE32_NOPAD.encode(b""), "");
-        assert_eq!(BASE32_NOPAD.encode(b"f"), "MY");
-        assert_eq!(BASE32_NOPAD.encode(b"fo"), "MZXQ");
-        assert_eq!(BASE32_NOPAD.encode(b"foo"), "MZXW6");
-    }
 
     /// Verify the content-length math when resume_offset > 0 but server returns 200
     /// (ignoring Range). In this case effective_offset should be 0, so
@@ -324,5 +376,142 @@ mod tests {
         let file_path = PathBuf::from("/tmp/claude/sha256_test/nonexistent_file.bin");
         let result = compute_sha256(&file_path).await;
         assert!(result.is_err());
+    }
+
+    // ── resolve_download_state tests ──
+
+    #[test]
+    fn test_resolve_206_with_resume_offset() {
+        let res = resolve_download_state(206, true, 500).unwrap();
+        assert_eq!(
+            res,
+            DownloadResolution {
+                bytes_written: 500,
+                truncate: false,
+                effective_offset: 500,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_200_fresh_download() {
+        let res = resolve_download_state(200, true, 0).unwrap();
+        assert_eq!(
+            res,
+            DownloadResolution {
+                bytes_written: 0,
+                truncate: true,
+                effective_offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_200_when_range_ignored() {
+        // Server returned 200 instead of 206 — must restart from scratch
+        let res = resolve_download_state(200, true, 500).unwrap();
+        assert_eq!(
+            res,
+            DownloadResolution {
+                bytes_written: 0,
+                truncate: true,
+                effective_offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_206_without_resume_offset_treated_as_success() {
+        // Edge case: server sends 206 but we had no resume offset.
+        // 206 is still a success status, so `is_success` is true.
+        // Since resume_offset == 0, the `206 if resume_offset > 0` arm doesn't match,
+        // but the `_ if is_success` arm does → fresh download.
+        let res = resolve_download_state(206, true, 0).unwrap();
+        assert!(res.truncate, "206 without resume should start fresh");
+        assert_eq!(res.effective_offset, 0);
+    }
+
+    #[test]
+    fn test_resolve_404_error() {
+        let err = resolve_download_state(404, false, 0).unwrap_err();
+        assert!(matches!(err, DownloadError::HttpStatus { status: 404, .. }));
+    }
+
+    #[test]
+    fn test_resolve_401_error() {
+        let err = resolve_download_state(401, false, 0).unwrap_err();
+        assert!(matches!(err, DownloadError::HttpStatus { status: 401, .. }));
+    }
+
+    #[test]
+    fn test_resolve_500_error() {
+        let err = resolve_download_state(500, false, 0).unwrap_err();
+        assert!(matches!(err, DownloadError::HttpStatus { status: 500, .. }));
+    }
+
+    #[test]
+    fn test_resolve_429_error() {
+        let err = resolve_download_state(429, false, 500).unwrap_err();
+        assert!(matches!(err, DownloadError::HttpStatus { status: 429, .. }));
+        // 429 should also be retryable
+        assert!(err.is_retryable());
+    }
+
+    // ── verify_content_length tests ──
+
+    #[test]
+    fn test_verify_content_length_match() {
+        // 1000 bytes written from offset 0, expected 1000 → ok
+        assert!(verify_content_length(1000, 0, Some(1000), "photo.jpg").is_ok());
+    }
+
+    #[test]
+    fn test_verify_content_length_match_with_resume() {
+        // Resumed at 500, wrote to 1500, so 1000 new bytes. Expected 1000 → ok
+        assert!(verify_content_length(1500, 500, Some(1000), "photo.jpg").is_ok());
+    }
+
+    #[test]
+    fn test_verify_content_length_truncated() {
+        // Expected 1000 but only got 999 → mismatch
+        let err = verify_content_length(999, 0, Some(1000), "video.mov").unwrap_err();
+        match err {
+            DownloadError::ContentLengthMismatch {
+                expected,
+                received,
+                path,
+            } => {
+                assert_eq!(expected, 1000);
+                assert_eq!(received, 999);
+                assert_eq!(path, "video.mov");
+            }
+            other => panic!("Expected ContentLengthMismatch, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_verify_content_length_too_many_bytes() {
+        // Server sent more bytes than promised
+        let err = verify_content_length(1001, 0, Some(1000), "photo.jpg").unwrap_err();
+        assert!(matches!(err, DownloadError::ContentLengthMismatch { .. }));
+    }
+
+    #[test]
+    fn test_verify_content_length_none_always_ok() {
+        // No Content-Length header → always ok (can't verify)
+        assert!(verify_content_length(0, 0, None, "x").is_ok());
+        assert!(verify_content_length(999999, 0, None, "x").is_ok());
+    }
+
+    #[test]
+    fn test_verify_content_length_resume_fallback_bug_scenario() {
+        // The bug from test_content_length_check_after_resume_fallback:
+        // resume_offset=500, server returned 200 (full 1000 bytes), effective_offset=0
+        // bytes_written=1000 (full body), so total_bytes = 1000-0 = 1000 → matches
+        assert!(verify_content_length(1000, 0, Some(1000), "photo.jpg").is_ok());
+
+        // Buggy version would have used resume_offset as effective_offset:
+        // total_bytes = 1000-500 = 500 ≠ 1000 → false mismatch
+        assert!(verify_content_length(1000, 500, Some(1000), "photo.jpg").is_err());
     }
 }

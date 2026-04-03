@@ -1,0 +1,14 @@
+{
+  "overall": 70,
+  "files": {
+    "src/main.rs": 15,
+    "src/auth/twofa.rs": 23,
+    "src/auth/mod.rs": 49,
+    "src/auth/srp.rs": 53,
+    "src/icloud/photos/library.rs": 27,
+    "src/icloud/photos/mod.rs": 47,
+    "src/download/file.rs": 39,
+    "src/download/mod.rs": 55,
+    "src/setup.rs": 47
+  }
+}
