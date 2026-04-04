@@ -390,38 +390,32 @@ impl StateDb for SqliteStateDb {
             .lock()
             .map_err(|e| StateError::Query(e.to_string()))?;
 
-        let total_assets: u64 = conn
-            .query_row("SELECT COUNT(*) FROM assets", [], |row| {
-                row.get::<_, i64>(0)
+        let (total_assets, downloaded, pending, failed) = conn
+            .query_row(
+                "SELECT \
+                     COUNT(*), \
+                     COALESCE(SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END), 0), \
+                     COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0), \
+                     COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) \
+                 FROM assets",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map(|(t, d, p, f)| {
+                (
+                    u64::try_from(t).unwrap_or(0),
+                    u64::try_from(d).unwrap_or(0),
+                    u64::try_from(p).unwrap_or(0),
+                    u64::try_from(f).unwrap_or(0),
+                )
             })
-            .map(|v| u64::try_from(v).unwrap_or(0))
-            .map_err(StateError::query)?;
-
-        let downloaded: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assets WHERE status = 'downloaded'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|v| u64::try_from(v).unwrap_or(0))
-            .map_err(StateError::query)?;
-
-        let pending: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assets WHERE status = 'pending'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|v| u64::try_from(v).unwrap_or(0))
-            .map_err(StateError::query)?;
-
-        let failed: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assets WHERE status = 'failed'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|v| u64::try_from(v).unwrap_or(0))
             .map_err(StateError::query)?;
 
         let last_sync: Option<(Option<i64>, Option<i64>)> = conn
