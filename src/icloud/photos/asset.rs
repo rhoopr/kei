@@ -116,21 +116,18 @@ fn extract_versions(
     };
 
     let mut versions = VersionsMap::new();
-    for (key, prefix) in lookup {
-        let res_field = format!("{prefix}Res");
-        let type_field = format!("{prefix}FileType");
-
+    for (key, res_field, type_field, prefix) in lookup {
         // Asset record has adjusted versions; master has originals.
         // Prefer asset record so adjusted/edited versions take priority.
-        let fields = if !asset_fields[&res_field].is_null() {
+        let fields = if !asset_fields[res_field].is_null() {
             asset_fields
-        } else if !master_fields[&res_field].is_null() {
+        } else if !master_fields[res_field].is_null() {
             master_fields
         } else {
             continue;
         };
 
-        let res_entry = &fields[&res_field]["value"];
+        let res_entry = &fields[res_field]["value"];
         if res_entry.is_null() {
             continue;
         }
@@ -161,7 +158,7 @@ fn extract_versions(
             }
         };
 
-        let asset_type: Box<str> = fields[&type_field]["value"]
+        let asset_type: Box<str> = fields[type_field]["value"]
             .as_str()
             .unwrap_or_else(|| {
                 tracing::warn!("Missing expected field: {type_field}");
