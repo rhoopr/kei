@@ -69,13 +69,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
         });
     }
 
-    let start_version = if current_version == 0 {
-        1
-    } else {
-        current_version + 1
-    };
-
-    for version in start_version..=SCHEMA_VERSION {
+    for version in (current_version + 1)..=SCHEMA_VERSION {
         conn.execute_batch("SAVEPOINT migration")?;
         match migrate_to_version(conn, version) {
             Ok(()) => conn.execute_batch("RELEASE migration")?,
@@ -102,22 +96,17 @@ const SCHEMA_V3: &str = "ALTER TABLE assets ADD COLUMN local_checksum TEXT;";
 
 /// Apply migration for a specific version.
 fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError> {
-    match version {
-        1 => {
-            conn.execute_batch(SCHEMA_V1)?;
-        }
-        2 => {
-            conn.execute_batch(SCHEMA_V2)?;
-        }
-        3 => {
-            conn.execute_batch(SCHEMA_V3)?;
-        }
+    let ddl = match version {
+        1 => SCHEMA_V1,
+        2 => SCHEMA_V2,
+        3 => SCHEMA_V3,
         other => {
             return Err(StateError::Query(format!(
                 "No migration defined for version {other}"
             )));
         }
-    }
+    };
+    conn.execute_batch(ddl)?;
     set_schema_version(conn, version)?;
     tracing::info!(version, "Migrated database schema");
     Ok(())
