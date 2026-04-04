@@ -394,9 +394,9 @@ impl StateDb for SqliteStateDb {
             .query_row(
                 "SELECT \
                      COUNT(*), \
-                     COALESCE(SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END), 0), \
-                     COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0), \
-                     COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) \
+                     COUNT(CASE WHEN status = 'downloaded' THEN 1 END), \
+                     COUNT(CASE WHEN status = 'pending' THEN 1 END), \
+                     COUNT(CASE WHEN status = 'failed' THEN 1 END) \
                  FROM assets",
                 [],
                 |row| {
