@@ -408,7 +408,7 @@ async fn build_download_tasks(
 
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-    let mut dir_cache = std::collections::HashMap::new();
+    let mut dir_cache = paths::DirCache::new();
     for album_result in album_results {
         let assets = album_result?;
 
@@ -543,7 +543,7 @@ fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
-    dir_cache: &mut std::collections::HashMap<PathBuf, Vec<String>>,
+    dir_cache: &mut paths::DirCache,
 ) -> SmallVec<[DownloadTask; 2]> {
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         return SmallVec::new();
@@ -648,16 +648,16 @@ fn filter_asset_to_tasks(
         // concurrent downloads of assets with the same filename.
         // Check for the file on disk, including AM/PM whitespace variants
         // (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG")
-        let existing_path = if download_path.exists() {
+        let existing_path = if dir_cache.exists(&download_path) {
             Some(download_path.clone())
         } else {
-            paths::find_ampm_variant_cached(&download_path, dir_cache)
+            dir_cache.find_ampm_variant(&download_path)
         };
         let final_path = if let Some(existing) = existing_path {
             match config.file_match_policy {
                 FileMatchPolicy::NameSizeDedupWithSuffix => {
                     // If file exists with different size, download with size suffix
-                    let on_disk_size = std::fs::metadata(&existing).map(|m| m.len()).unwrap_or(0);
+                    let on_disk_size = dir_cache.file_size(&existing).unwrap_or(0);
                     if on_disk_size == version.size {
                         // Same size — likely already downloaded, skip.
                         None
@@ -672,7 +672,9 @@ fn filter_asset_to_tasks(
                         );
                         // Use normalize() for lookup to avoid PathBuf clone
                         let dedup_key = NormalizedPath::normalize(&dedup_path);
-                        if dedup_path.exists() || claimed_paths.contains_key(dedup_key.as_ref()) {
+                        if dir_cache.exists(&dedup_path)
+                            || claimed_paths.contains_key(dedup_key.as_ref())
+                        {
                             None // deduped version already downloaded or claimed
                         } else {
                             tracing::debug!(
@@ -715,7 +717,9 @@ fn filter_asset_to_tasks(
                         );
                         // Use normalize() for lookup to avoid PathBuf clone
                         let dedup_key = NormalizedPath::normalize(&dedup_path);
-                        if dedup_path.exists() || claimed_paths.contains_key(dedup_key.as_ref()) {
+                        if dir_cache.exists(&dedup_path)
+                            || claimed_paths.contains_key(dedup_key.as_ref())
+                        {
                             None // deduped version already downloaded or claimed
                         } else {
                             tracing::debug!(
@@ -790,8 +794,8 @@ fn filter_asset_to_tasks(
             // Use normalized paths for collision detection to handle case-insensitive
             // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
             let mov_key = NormalizedPath::normalize(&mov_path);
-            let final_mov_path = if mov_path.exists() {
-                let on_disk_size = std::fs::metadata(&mov_path).map(|m| m.len()).unwrap_or(0);
+            let final_mov_path = if dir_cache.exists(&mov_path) {
+                let on_disk_size = dir_cache.file_size(&mov_path).unwrap_or(0);
                 if on_disk_size == live_version.size {
                     // Same size — likely already downloaded, skip.
                     None
@@ -805,7 +809,9 @@ fn filter_asset_to_tasks(
                         &dedup_filename,
                     );
                     let dedup_key = NormalizedPath::normalize(&dedup_path);
-                    if dedup_path.exists() || claimed_paths.contains_key(dedup_key.as_ref()) {
+                    if dir_cache.exists(&dedup_path)
+                        || claimed_paths.contains_key(dedup_key.as_ref())
+                    {
                         None // deduped version already downloaded or claimed
                     } else {
                         tracing::debug!(
@@ -830,7 +836,9 @@ fn filter_asset_to_tasks(
                         &dedup_filename,
                     );
                     let dedup_key = NormalizedPath::normalize(&dedup_path);
-                    if dedup_path.exists() || claimed_paths.contains_key(dedup_key.as_ref()) {
+                    if dir_cache.exists(&dedup_path)
+                        || claimed_paths.contains_key(dedup_key.as_ref())
+                    {
                         None
                     } else {
                         tracing::debug!(
@@ -1141,7 +1149,7 @@ async fn download_photos_incremental(
     // Convert assets to download tasks, using state DB fast-skip where possible
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-    let mut dir_cache = std::collections::HashMap::new();
+    let mut dir_cache = paths::DirCache::new();
     let mut skipped_by_state = 0usize;
 
     for asset in &downloadable_assets {
@@ -1292,7 +1300,7 @@ where
 
         tokio::pin!(combined);
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-        let mut dir_cache = std::collections::HashMap::new();
+        let mut dir_cache = paths::DirCache::new();
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
                 break;
@@ -1334,7 +1342,7 @@ where
         tokio::pin!(combined);
         let mut count = 0usize;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-        let mut dir_cache = std::collections::HashMap::new();
+        let mut dir_cache = paths::DirCache::new();
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, stopping dry run");
@@ -1427,7 +1435,7 @@ where
     let producer = tokio::spawn(async move {
         let config = &producer_config;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-        let mut dir_cache = std::collections::HashMap::new();
+        let mut dir_cache = paths::DirCache::new();
         tokio::pin!(combined);
         while let Some(result) = combined.next().await {
             if producer_shutdown.is_cancelled() {
@@ -1518,11 +1526,9 @@ where
                                                 );
                                             }
                                             Ok(false) => {
-                                                if paths::find_ampm_variant_cached(
-                                                    &task.download_path,
-                                                    &mut dir_cache,
-                                                )
-                                                .is_some()
+                                                if dir_cache
+                                                    .find_ampm_variant(&task.download_path)
+                                                    .is_some()
                                                 {
                                                     tracing::debug!(
                                                         asset_id = %task.asset_id,
@@ -2216,7 +2222,7 @@ mod tests {
         config: &DownloadConfig,
     ) -> SmallVec<[DownloadTask; 2]> {
         let mut claimed_paths = FxHashMap::default();
-        let mut dir_cache = std::collections::HashMap::new();
+        let mut dir_cache = paths::DirCache::new();
         filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache)
     }
 
@@ -2575,7 +2581,7 @@ mod tests {
 
         // Process asset1: creates IMG_0001.HEIC (2000 bytes) and its MOV
         let mut claimed_paths = FxHashMap::default();
-        let mut dir_cache = std::collections::HashMap::new();
+        let mut dir_cache = paths::DirCache::new();
         let tasks1 = filter_asset_to_tasks(&asset1, &config, &mut claimed_paths, &mut dir_cache);
         assert_eq!(tasks1.len(), 2);
         let heic1_path = &tasks1[0].download_path;
@@ -2907,7 +2913,7 @@ mod tests {
 
         // Process both assets through claimed_paths
         let mut claimed_paths = FxHashMap::default();
-        let mut dir_cache = std::collections::HashMap::new();
+        let mut dir_cache = paths::DirCache::new();
         let video_tasks =
             filter_asset_to_tasks(&video_asset, &config, &mut claimed_paths, &mut dir_cache);
         assert_eq!(video_tasks.len(), 1);

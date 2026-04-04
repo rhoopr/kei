@@ -376,52 +376,93 @@ pub(crate) fn normalize_ampm(s: &str) -> String {
     result
 }
 
-/// Find a file on disk that differs only in AM/PM whitespace from the expected path.
+/// Cached directory listing that amortizes filesystem syscalls.
 ///
-/// When the expected file doesn't exist, this checks sibling files in the same
-/// directory for an AM/PM whitespace variant (e.g., `1.40.01 PM.PNG` vs
-/// `1.40.01\u{202F}PM.PNG` vs `1.40.01PM.PNG`).
-///
-/// On first call for a given parent directory, reads and caches all filenames.
-/// Subsequent calls for files in the same directory reuse the cache, avoiding
-/// repeated `read_dir` syscalls in hot loops.
-///
-/// Returns the matching variant's full path, or `None` if no match is found.
-pub(crate) fn find_ampm_variant_cached(
-    path: &Path,
-    dir_cache: &mut std::collections::HashMap<PathBuf, Vec<String>>,
-) -> Option<PathBuf> {
-    let filename = path.file_name()?.to_str()?;
-    let normalized = normalize_ampm(filename);
+/// For each parent directory, a single `read_dir` populates a filename→size map.
+/// All subsequent existence checks and size lookups for files in that directory
+/// are served from the cache — eliminating per-file `stat()` calls that would
+/// otherwise block the tokio runtime when called from an async task.
+pub(crate) struct DirCache {
+    dirs: std::collections::HashMap<PathBuf, FxHashMap<String, u64>>,
+}
 
-    // Early exit: if normalizing doesn't change the name, there's no AM/PM to vary
-    if normalized == filename {
-        return None;
-    }
-
-    let parent = path.parent()?;
-    let filenames = dir_cache.entry(parent.to_path_buf()).or_insert_with(|| {
-        std::fs::read_dir(parent)
-            .ok()
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter_map(|e| e.file_name().to_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
-
-    for sibling in filenames {
-        if sibling == filename {
-            continue;
-        }
-        if normalize_ampm(sibling) == normalized {
-            return Some(parent.join(sibling));
+impl DirCache {
+    pub fn new() -> Self {
+        Self {
+            dirs: std::collections::HashMap::new(),
         }
     }
 
-    None
+    /// Invalidate all cached entries. Use after writing files to disk.
+    pub fn clear(&mut self) {
+        self.dirs.clear();
+    }
+
+    /// Check whether `path` exists on disk, using cached directory listings.
+    pub fn exists(&mut self, path: &Path) -> bool {
+        let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        self.ensure_dir(parent).contains_key(filename)
+    }
+
+    /// Return the file size for `path` if it exists, using cached directory listings.
+    /// Avoids a separate `std::fs::metadata()` call.
+    pub fn file_size(&mut self, path: &Path) -> Option<u64> {
+        let filename = path.file_name()?.to_str()?;
+        let parent = path.parent()?;
+        self.ensure_dir(parent).get(filename).copied()
+    }
+
+    /// Find a file on disk that differs only in AM/PM whitespace from `path`.
+    ///
+    /// Checks sibling files in the same directory for an AM/PM whitespace variant
+    /// (e.g., `1.40.01 PM.PNG` vs `1.40.01\u{202F}PM.PNG` vs `1.40.01PM.PNG`).
+    pub fn find_ampm_variant(&mut self, path: &Path) -> Option<PathBuf> {
+        let filename = path.file_name()?.to_str()?;
+        let normalized = normalize_ampm(filename);
+
+        // Early exit: if normalizing doesn't change the name, there's no AM/PM to vary
+        if normalized == filename {
+            return None;
+        }
+
+        let parent = path.parent()?;
+        let entries = self.ensure_dir(parent);
+
+        for sibling in entries.keys() {
+            if sibling == filename {
+                continue;
+            }
+            if normalize_ampm(sibling) == normalized {
+                return Some(parent.join(sibling.as_str()));
+            }
+        }
+
+        None
+    }
+
+    /// Populate the cache for `dir` if not already present.
+    fn ensure_dir(&mut self, dir: &Path) -> &FxHashMap<String, u64> {
+        self.dirs.entry(dir.to_path_buf()).or_insert_with(|| {
+            std::fs::read_dir(dir)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| {
+                            let name = e.file_name().to_str()?.to_string();
+                            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                            Some((name, size))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
 }
 
 /// Generate a live photo MOV filename using the "original" policy.
@@ -670,8 +711,8 @@ mod tests {
 
         // Look for the narrow-no-break-space variant
         let query = dir.join("Screenshot at 1.40.01\u{202F}PM.PNG");
-        let mut cache = std::collections::HashMap::new();
-        let found = find_ampm_variant_cached(&query, &mut cache);
+        let mut cache = DirCache::new();
+        let found = cache.find_ampm_variant(&query);
         assert!(found.is_some());
         assert_eq!(found.unwrap(), existing);
 
@@ -681,8 +722,52 @@ mod tests {
     #[test]
     fn test_find_ampm_variant_returns_none_for_non_ampm() {
         let path = Path::new("/tmp/claude/nonexistent/photo.jpg");
-        let mut cache = std::collections::HashMap::new();
-        assert!(find_ampm_variant_cached(path, &mut cache).is_none());
+        let mut cache = DirCache::new();
+        assert!(cache.find_ampm_variant(path).is_none());
+    }
+
+    #[test]
+    fn test_dir_cache_exists() {
+        use std::fs;
+        let dir = std::env::temp_dir().join("claude").join("dir_cache_exists");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("photo.jpg"), b"data").unwrap();
+
+        let mut cache = DirCache::new();
+        assert!(cache.exists(&dir.join("photo.jpg")));
+        assert!(!cache.exists(&dir.join("missing.jpg")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dir_cache_file_size() {
+        use std::fs;
+        let dir = std::env::temp_dir()
+            .join("claude")
+            .join("dir_cache_file_size");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("photo.jpg"), b"12345").unwrap();
+
+        let mut cache = DirCache::new();
+        assert_eq!(cache.file_size(&dir.join("photo.jpg")), Some(5));
+        assert_eq!(cache.file_size(&dir.join("missing.jpg")), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dir_cache_nonexistent_directory() {
+        let mut cache = DirCache::new();
+        assert!(!cache.exists(Path::new("/tmp/claude/no_such_dir_xyz/file.jpg")));
+        assert_eq!(
+            cache.file_size(Path::new("/tmp/claude/no_such_dir_xyz/file.jpg")),
+            None
+        );
     }
 
     #[test]
