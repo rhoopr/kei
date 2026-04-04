@@ -144,76 +144,65 @@ pub(crate) fn item_type_from_str(s: &str) -> Option<AssetItemType> {
 }
 
 /// Maps logical version sizes to pre-computed CloudKit field names.
-/// Tuple: (size, resource field, file-type field, display prefix for warnings).
-pub(crate) const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str, &str, &str)] = &[
+/// Tuple: (size, resource field, file-type field).
+pub(crate) const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str, &str)] = &[
     (
         AssetVersionSize::Original,
         "resOriginalRes",
         "resOriginalFileType",
-        "resOriginal",
     ),
     (
         AssetVersionSize::Alternative,
         "resOriginalAltRes",
         "resOriginalAltFileType",
-        "resOriginalAlt",
     ),
     (
         AssetVersionSize::Medium,
         "resJPEGMedRes",
         "resJPEGMedFileType",
-        "resJPEGMed",
     ),
     (
         AssetVersionSize::Thumb,
         "resJPEGThumbRes",
         "resJPEGThumbFileType",
-        "resJPEGThumb",
     ),
     (
         AssetVersionSize::Adjusted,
         "resJPEGFullRes",
         "resJPEGFullFileType",
-        "resJPEGFull",
     ),
     (
         AssetVersionSize::LiveOriginal,
         "resOriginalVidComplRes",
         "resOriginalVidComplFileType",
-        "resOriginalVidCompl",
     ),
     (
         AssetVersionSize::LiveMedium,
         "resVidMedRes",
         "resVidMedFileType",
-        "resVidMed",
     ),
     (
         AssetVersionSize::LiveThumb,
         "resVidSmallRes",
         "resVidSmallFileType",
-        "resVidSmall",
     ),
 ];
 
-pub(crate) const VIDEO_VERSION_LOOKUP: &[(AssetVersionSize, &str, &str, &str)] = &[
+pub(crate) const VIDEO_VERSION_LOOKUP: &[(AssetVersionSize, &str, &str)] = &[
     (
         AssetVersionSize::Original,
         "resOriginalRes",
         "resOriginalFileType",
-        "resOriginal",
     ),
     (
         AssetVersionSize::Medium,
         "resVidMedRes",
         "resVidMedFileType",
-        "resVidMed",
     ),
     (
         AssetVersionSize::Thumb,
         "resVidSmallRes",
         "resVidSmallFileType",
-        "resVidSmall",
     ),
 ];
 

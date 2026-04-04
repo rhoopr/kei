@@ -116,7 +116,7 @@ fn extract_versions(
     };
 
     let mut versions = VersionsMap::new();
-    for (key, res_field, type_field, prefix) in lookup {
+    for (key, res_field, type_field) in lookup {
         // Asset record has adjusted versions; master has originals.
         // Prefer asset record so adjusted/edited versions take priority.
         let fields = if !asset_fields[res_field].is_null() {
@@ -139,7 +139,7 @@ fn extract_versions(
             None => {
                 warn!(
                     asset = %record_name,
-                    field = format_args!("{prefix}Res.downloadURL"),
+                    field = format_args!("{res_field}.downloadURL"),
                     "Missing downloadURL, skipping version"
                 );
                 continue;
@@ -151,7 +151,7 @@ fn extract_versions(
             None => {
                 warn!(
                     asset = %record_name,
-                    field = format_args!("{prefix}Res.fileChecksum"),
+                    field = format_args!("{res_field}.fileChecksum"),
                     "Missing fileChecksum, skipping version"
                 );
                 continue;
