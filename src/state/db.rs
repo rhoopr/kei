@@ -55,10 +55,6 @@ pub trait StateDb: Send + Sync {
     ) -> Result<(), StateError>;
 
     /// Mark an asset as failed with an error message.
-    ///
-    /// Note: The download engine uses `mark_failed_batch` for efficiency.
-    /// This method is retained for API completeness with `mark_downloaded`.
-    #[cfg(test)]
     async fn mark_failed(
         &self,
         id: &str,
@@ -86,7 +82,7 @@ pub trait StateDb: Send + Sync {
     /// Returns the number of assets reset.
     async fn reset_failed(&self) -> Result<u64, StateError>;
 
-    // ── Batch operations for performance optimization ──
+    // ── Bulk read operations ──
 
     /// Get all downloaded asset IDs as (id, `version_size`) pairs.
     ///
@@ -106,20 +102,6 @@ pub trait StateDb: Send + Sync {
     async fn get_downloaded_checksums(
         &self,
     ) -> Result<HashMap<(String, String), String>, StateError>;
-
-    /// Batch mark assets as successfully downloaded.
-    ///
-    /// Used by the download engine to reduce per-download DB overhead.
-    async fn mark_downloaded_batch(
-        &self,
-        items: &[(String, String, PathBuf, String)],
-    ) -> Result<(), StateError>;
-
-    /// Batch mark assets as failed with error messages.
-    ///
-    /// Used by the download engine to reduce per-download DB overhead.
-    async fn mark_failed_batch(&self, items: &[(String, String, String)])
-        -> Result<(), StateError>;
 
     /// Get a metadata value by key.
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
@@ -344,7 +326,6 @@ impl StateDb for SqliteStateDb {
         Ok(())
     }
 
-    #[cfg(test)]
     async fn mark_failed(
         &self,
         id: &str,
@@ -589,102 +570,6 @@ impl StateDb for SqliteStateDb {
             .map_err(|e| StateError::query(&e))?;
 
         Ok(checksums)
-    }
-
-    async fn mark_downloaded_batch(
-        &self,
-        items: &[(String, String, PathBuf, String)],
-    ) -> Result<(), StateError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
-
-        let downloaded_at = Utc::now().timestamp();
-
-        conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| StateError::query(&e))?;
-
-        let result = (|| {
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, local_checksum = ?3, last_error = NULL WHERE id = ?4 AND version_size = ?5",
-                )
-                .map_err(|e| StateError::query(&e))?;
-
-            for (id, version_size, local_path, local_checksum) in items {
-                stmt.execute(rusqlite::params![
-                    downloaded_at,
-                    local_path.to_string_lossy(),
-                    local_checksum,
-                    id,
-                    version_size,
-                ])
-                .map_err(|e| StateError::query(&e))?;
-            }
-
-            Ok::<_, StateError>(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.execute("COMMIT", [])
-                    .map_err(|e| StateError::query(&e))?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK", []);
-                Err(e)
-            }
-        }
-    }
-
-    async fn mark_failed_batch(
-        &self,
-        items: &[(String, String, String)],
-    ) -> Result<(), StateError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
-
-        conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| StateError::query(&e))?;
-
-        let result = (|| {
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, last_error = ?1 WHERE id = ?2 AND version_size = ?3",
-                )
-                .map_err(|e| StateError::query(&e))?;
-
-            for (id, version_size, error) in items {
-                stmt.execute(rusqlite::params![error, id, version_size])
-                    .map_err(|e| StateError::query(&e))?;
-            }
-
-            Ok::<_, StateError>(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.execute("COMMIT", [])
-                    .map_err(|e| StateError::query(&e))?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK", []);
-                Err(e)
-            }
-        }
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
@@ -1382,102 +1267,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mark_downloaded_batch() {
-        let dir = test_dir("mark_downloaded_batch");
-        let db = SqliteStateDb::open_in_memory().unwrap();
-
-        // First insert assets
-        for i in 0..3 {
-            let record = AssetRecord::new_pending(
-                format!("BATCH_{}", i),
-                VersionSizeKey::Original,
-                format!("checksum_{}", i),
-                format!("photo_{}.jpg", i),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
-            db.upsert_seen(&record).await.unwrap();
-        }
-
-        // Mark them as downloaded in batch
-        let items: Vec<(String, String, PathBuf, String)> = (0..3)
-            .map(|i| {
-                let path = dir.join(format!("photo_{}.jpg", i));
-                fs::write(&path, b"content").unwrap();
-                (
-                    format!("BATCH_{}", i),
-                    "original".to_string(),
-                    path,
-                    format!("hash_{}", i),
-                )
-            })
-            .collect();
-
-        db.mark_downloaded_batch(&items).await.unwrap();
-
-        let summary = db.get_summary().await.unwrap();
-        assert_eq!(summary.downloaded, 3);
-        assert_eq!(summary.pending, 0);
-    }
-
-    #[tokio::test]
-    async fn test_mark_downloaded_batch_empty() {
-        let db = SqliteStateDb::open_in_memory().unwrap();
-        db.mark_downloaded_batch(&[]).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_mark_failed_batch() {
-        let db = SqliteStateDb::open_in_memory().unwrap();
-
-        // First insert assets
-        for i in 0..3 {
-            let record = AssetRecord::new_pending(
-                format!("FAIL_{}", i),
-                VersionSizeKey::Original,
-                format!("checksum_{}", i),
-                format!("photo_{}.jpg", i),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
-            db.upsert_seen(&record).await.unwrap();
-        }
-
-        // Mark them as failed in batch
-        let items: Vec<(String, String, String)> = (0..3)
-            .map(|i| {
-                (
-                    format!("FAIL_{}", i),
-                    "original".to_string(),
-                    format!("Error {}", i),
-                )
-            })
-            .collect();
-
-        db.mark_failed_batch(&items).await.unwrap();
-
-        let failed = db.get_failed().await.unwrap();
-        assert_eq!(failed.len(), 3);
-
-        // Check each has the correct error
-        for record in &failed {
-            let idx: usize = record.id.strip_prefix("FAIL_").unwrap().parse().unwrap();
-            assert_eq!(record.last_error, Some(format!("Error {}", idx)));
-            assert_eq!(record.download_attempts, 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_mark_failed_batch_empty() {
-        let db = SqliteStateDb::open_in_memory().unwrap();
-        db.mark_failed_batch(&[]).await.unwrap();
-    }
-
-    #[tokio::test]
     async fn test_metadata_get_set() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
@@ -1693,54 +1482,6 @@ mod tests {
         assert_eq!(s3.downloaded, 2);
         assert_eq!(s3.failed, 0);
         assert_eq!(s3.pending, 2);
-    }
-
-    #[tokio::test]
-    async fn mark_downloaded_batch_duplicate_entries_idempotent() {
-        // Arrange: insert one asset, then call mark_downloaded_batch with the same entry twice
-        let db = SqliteStateDb::open_in_memory().unwrap();
-        let dir = test_dir("batch_dup");
-
-        let record = AssetRecord::new_pending(
-            "ARm4pKz8W1".to_string(),
-            VersionSizeKey::Original,
-            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_string(),
-            "DSC_0042.NEF".to_string(),
-            Utc::now(),
-            None,
-            25_165_824,
-            MediaType::Photo,
-        );
-        db.upsert_seen(&record).await.unwrap();
-
-        let path = dir.join("DSC_0042.NEF");
-        fs::write(&path, b"RAW sensor data placeholder").unwrap();
-
-        // Act: batch with the same (id, version_size) repeated
-        let items = vec![
-            (
-                "ARm4pKz8W1".to_string(),
-                "original".to_string(),
-                path.clone(),
-                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
-            ),
-            (
-                "ARm4pKz8W1".to_string(),
-                "original".to_string(),
-                path.clone(),
-                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
-            ),
-        ];
-        db.mark_downloaded_batch(&items).await.unwrap();
-
-        // Assert: only one downloaded record exists, not two
-        let summary = db.get_summary().await.unwrap();
-        assert_eq!(summary.total_assets, 1);
-        assert_eq!(summary.downloaded, 1);
-
-        let downloaded = db.get_all_downloaded().await.unwrap();
-        assert_eq!(downloaded.len(), 1);
-        assert_eq!(downloaded[0].id, "ARm4pKz8W1");
     }
 
     #[tokio::test]

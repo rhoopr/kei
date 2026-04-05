@@ -1290,7 +1290,6 @@ where
         + Send
         + 'static,
 {
-    const DB_BATCH_SIZE: usize = 50;
     let pb = create_progress_bar(config.no_progress_bar, config.only_print_filenames, total);
 
     if config.only_print_filenames {
@@ -1598,10 +1597,6 @@ where
 
     tokio::pin!(download_stream);
 
-    let mut downloaded_batch: Vec<(String, String, PathBuf, String)> =
-        Vec::with_capacity(DB_BATCH_SIZE);
-    let mut failed_batch: Vec<(String, String, String)> = Vec::with_capacity(DB_BATCH_SIZE);
-
     while let Some((task, result)) = download_stream.next().await {
         if shutdown_token.is_cancelled() {
             pb.suspend(|| tracing::info!("Shutdown requested, stopping new downloads"));
@@ -1620,13 +1615,22 @@ where
                 if !exif_ok {
                     exif_failures += 1;
                 }
-                if state_db.is_some() {
-                    downloaded_batch.push((
-                        task.asset_id.to_string(),
-                        task.version_size.as_str().to_string(),
-                        task.download_path.clone(),
-                        local_checksum,
-                    ));
+                if let Some(db) = &state_db {
+                    if let Err(e) = db
+                        .mark_downloaded(
+                            &task.asset_id,
+                            task.version_size.as_str(),
+                            &task.download_path,
+                            &local_checksum,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            asset_id = %task.asset_id,
+                            error = %e,
+                            "Failed to mark download"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -1650,51 +1654,25 @@ where
                             });
                             break;
                         }
-                        if state_db.is_some() {
-                            failed_batch.push((
-                                task.asset_id.to_string(),
-                                task.version_size.as_str().to_string(),
-                                e.to_string(),
-                            ));
-                        }
-                        failed.push(task);
-                        continue;
+                    }
+                } else {
+                    pb.suspend(|| {
+                        tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
+                    });
+                }
+                if let Some(db) = &state_db {
+                    if let Err(e) = db
+                        .mark_failed(&task.asset_id, task.version_size.as_str(), &e.to_string())
+                        .await
+                    {
+                        tracing::warn!(
+                            asset_id = %task.asset_id,
+                            error = %e,
+                            "Failed to mark failure"
+                        );
                     }
                 }
-                pb.suspend(|| {
-                    tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
-                });
-                if state_db.is_some() {
-                    failed_batch.push((
-                        task.asset_id.to_string(),
-                        task.version_size.as_str().to_string(),
-                        e.to_string(),
-                    ));
-                }
                 failed.push(task);
-            }
-        }
-
-        if let Some(db) = &state_db {
-            if downloaded_batch.len() >= DB_BATCH_SIZE {
-                if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
-                    tracing::warn!(
-                        count = downloaded_batch.len(),
-                        error = %e,
-                        "Failed to batch mark downloads"
-                    );
-                }
-                downloaded_batch.clear();
-            }
-            if failed_batch.len() >= DB_BATCH_SIZE {
-                if let Err(e) = db.mark_failed_batch(&failed_batch).await {
-                    tracing::warn!(
-                        count = failed_batch.len(),
-                        error = %e,
-                        "Failed to batch mark failures"
-                    );
-                }
-                failed_batch.clear();
             }
         }
     }
@@ -1708,27 +1686,6 @@ where
     };
 
     let assets_seen_count = assets_seen.load(std::sync::atomic::Ordering::Relaxed);
-
-    if let Some(db) = &state_db {
-        if !downloaded_batch.is_empty() {
-            if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
-                tracing::warn!(
-                    count = downloaded_batch.len(),
-                    error = %e,
-                    "Failed to batch mark downloads"
-                );
-            }
-        }
-        if !failed_batch.is_empty() {
-            if let Err(e) = db.mark_failed_batch(&failed_batch).await {
-                tracing::warn!(
-                    count = failed_batch.len(),
-                    error = %e,
-                    "Failed to batch mark failures"
-                );
-            }
-        }
-    }
 
     pb.finish_and_clear();
 
@@ -1964,27 +1921,31 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let mut auth_errors = 0usize;
     let mut exif_failures = 0usize;
 
-    // Collect DB updates for batch write
-    let mut downloaded_batch: Vec<(String, String, PathBuf, String)> = Vec::new();
-    let mut failed_batch: Vec<(String, String, String)> = Vec::new();
-
     for (task, result) in results {
         match &result {
             Ok((exif_ok, local_checksum)) => {
                 if !*exif_ok {
                     exif_failures += 1;
                 }
-                if state_db.is_some() {
-                    downloaded_batch.push((
-                        task.asset_id.to_string(),
-                        task.version_size.as_str().to_string(),
-                        task.download_path.clone(),
-                        local_checksum.clone(),
-                    ));
+                if let Some(db) = &state_db {
+                    if let Err(e) = db
+                        .mark_downloaded(
+                            &task.asset_id,
+                            task.version_size.as_str(),
+                            &task.download_path,
+                            local_checksum,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            asset_id = %task.asset_id,
+                            error = %e,
+                            "Failed to mark download"
+                        );
+                    }
                 }
             }
             Err(e) => {
-                // Check if this is a session expiry error
                 if let Some(download_err) = e.downcast_ref::<DownloadError>() {
                     if download_err.is_session_expired() {
                         auth_errors += 1;
@@ -1997,39 +1958,22 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                         tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
                     });
                 }
-                if state_db.is_some() {
-                    failed_batch.push((
-                        task.asset_id.to_string(),
-                        task.version_size.as_str().to_string(),
-                        e.to_string(),
-                    ));
+                if let Some(db) = &state_db {
+                    if let Err(e) = db
+                        .mark_failed(&task.asset_id, task.version_size.as_str(), &e.to_string())
+                        .await
+                    {
+                        tracing::warn!(
+                            asset_id = %task.asset_id,
+                            error = %e,
+                            "Failed to mark failure"
+                        );
+                    }
                 }
                 failed.push(task);
             }
         }
         pb.inc(1);
-    }
-
-    // Batch write DB updates
-    if let Some(db) = &state_db {
-        if !downloaded_batch.is_empty() {
-            if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
-                tracing::warn!(
-                    count = downloaded_batch.len(),
-                    error = %e,
-                    "Failed to batch mark downloads"
-                );
-            }
-        }
-        if !failed_batch.is_empty() {
-            if let Err(e) = db.mark_failed_batch(&failed_batch).await {
-                tracing::warn!(
-                    count = failed_batch.len(),
-                    error = %e,
-                    "Failed to batch mark failures"
-                );
-            }
-        }
     }
 
     pb.finish_and_clear();
