@@ -16,6 +16,20 @@ use super::session::{check_changes_zone_error, PhotosSession};
 /// A boxed, pinned stream of photo asset results.
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
 
+/// Await all fetcher handles, logging and returning `true` if any panicked.
+async fn await_fetcher_handles(handles: Vec<JoinHandle<()>>) -> bool {
+    let mut panicked = false;
+    for handle in handles {
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                tracing::error!(error = ?e, "Photo fetcher task panicked");
+                panicked = true;
+            }
+        }
+    }
+    panicked
+}
+
 /// A boxed, pinned stream of change event results.
 type ChangeStream = Pin<Box<dyn Stream<Item = anyhow::Result<ChangeEvent>> + Send + 'static>>;
 
@@ -151,16 +165,7 @@ impl PhotoAlbum {
         concurrency: usize,
     ) -> PhotoStream {
         let (stream, handles) = self.photo_stream_inner(limit, total_count, concurrency, None);
-        // Await fetcher handles so panics are logged instead of silently lost.
-        tokio::spawn(async move {
-            for handle in handles {
-                if let Err(e) = handle.await {
-                    if e.is_panic() {
-                        tracing::error!(error = ?e, "Photo fetcher task panicked");
-                    }
-                }
-            }
-        });
+        tokio::spawn(await_fetcher_handles(handles));
         stream
     }
 
@@ -200,15 +205,7 @@ impl PhotoAlbum {
         // closes the ReceiverStream. The caller awaits the oneshot after the
         // stream is exhausted.
         tokio::spawn(async move {
-            let mut fetcher_panicked = false;
-            for handle in handles {
-                if let Err(e) = handle.await {
-                    if e.is_panic() {
-                        tracing::error!(error = ?e, "Photo fetcher task panicked");
-                        fetcher_panicked = true;
-                    }
-                }
-            }
+            let fetcher_panicked = await_fetcher_handles(handles).await;
             // Suppress sync token if any fetcher panicked — the enumeration
             // is incomplete and the next sync must do a full re-enumeration.
             let final_token = if fetcher_panicked {
