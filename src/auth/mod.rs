@@ -267,6 +267,8 @@ mod tests {
             hsa_challenge_required: challenge,
             hsa_trusted_browser: trusted,
             domain_to_use: None,
+            has_error: false,
+            service_errors: Vec::new(),
         }
     }
 
@@ -302,6 +304,8 @@ mod tests {
             hsa_challenge_required: true,
             hsa_trusted_browser: false,
             domain_to_use: None,
+            has_error: false,
+            service_errors: Vec::new(),
         };
         assert!(!check_requires_2fa(&resp));
     }

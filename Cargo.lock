@@ -1228,6 +1228,7 @@ dependencies = [
  "fs4",
  "futures-util",
  "hmac",
+ "http",
  "indicatif",
  "kamadak-exif",
  "little_exif",

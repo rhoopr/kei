@@ -85,6 +85,7 @@ predicates = "3"
 tempfile = "3"
 dotenvy = "0.15"
 rusqlite = { version = "0.39", features = ["bundled"] }
+http = "1"
 
 [[test]]
 name = "cli"

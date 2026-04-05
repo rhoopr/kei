@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rand::Rng;
 use reqwest::header::HeaderMap;
+use reqwest::Response;
+use serde_json::Value;
 use uuid::Uuid;
 
 use super::endpoints::Endpoints;
@@ -14,6 +16,78 @@ use crate::auth::error::AuthError;
 use crate::auth::responses::AccountLoginResponse;
 
 const TWO_FA_CODE_LENGTH: usize = 6;
+
+/// Check if the `X-Apple-I-Rscd` response header indicates an authentication
+/// failure. Apple sometimes returns HTTP 200 but sets this header to the "real"
+/// status code (e.g. 401, 403, 421).
+fn check_apple_rscd(response: &Response) -> Option<u16> {
+    response
+        .headers()
+        .get("X-Apple-I-Rscd")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|&code| code == 401 || code == 403 || code == 421)
+}
+
+/// If `X-Apple-I-Rscd` indicates an auth failure, consume the response body
+/// and return a `ServiceError`. Otherwise return `Ok(response)` unchanged.
+async fn reject_on_rscd(response: Response) -> Result<Response, AuthError> {
+    if let Some(rscd) = check_apple_rscd(&response) {
+        let text = response.text().await.unwrap_or_default();
+        tracing::debug!(rscd, "Apple rejected session via rscd header");
+        return Err(AuthError::ServiceError {
+            code: format!("rscd_{rscd}"),
+            message: format!("Apple rejected the session (response code {rscd}): {text}"),
+        });
+    }
+    Ok(response)
+}
+
+/// Inspect a JSON response body for Apple's error indicators.
+///
+/// Apple auth APIs sometimes return HTTP 200 with `hasError: true` and/or
+/// a `service_errors` array containing error details. This function detects
+/// those cases for endpoints whose responses aren't typed structs.
+fn check_apple_service_errors(body: &Value) -> Result<(), AuthError> {
+    let has_error = body
+        .get("hasError")
+        .or_else(|| body.get("has_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let errors = body
+        .get("service_errors")
+        .or_else(|| body.get("serviceErrors"))
+        .and_then(Value::as_array);
+
+    if let Some(errors) = errors {
+        if let Some(first) = errors.first() {
+            let code = first
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let message = first
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .or_else(|| first.get("title").and_then(Value::as_str))
+                .unwrap_or("Apple reported an error");
+            return Err(AuthError::ServiceError {
+                code: code.to_string(),
+                message: message.to_string(),
+            });
+        }
+    }
+
+    if has_error {
+        return Err(AuthError::ServiceError {
+            code: "unknown".to_string(),
+            message: "Apple reported an error but provided no details".to_string(),
+        });
+    }
+
+    Ok(())
+}
 
 /// Trigger a push notification to trusted devices for 2FA code entry.
 ///
@@ -66,6 +140,13 @@ pub async fn trigger_push_notification(
         let text = response.text().await.unwrap_or_default();
         anyhow::bail!("Push notification failed (HTTP {status}): {text}");
     }
+
+    // Apple can return HTTP 200 with error indicators in the body
+    let text = response.text().await.unwrap_or_default();
+    if let Ok(body) = serde_json::from_str::<Value>(&text) {
+        check_apple_service_errors(&body)?;
+    }
+
     Ok(())
 }
 
@@ -126,6 +207,15 @@ pub async fn submit_2fa_code(
             message: text,
         }
         .into());
+    }
+
+    // Apple can return HTTP 200 with error indicators in the body
+    let text = response.text().await.unwrap_or_default();
+    if let Ok(body) = serde_json::from_str::<Value>(&text) {
+        if let Err(e) = check_apple_service_errors(&body) {
+            tracing::error!(error = %e, "2FA verification returned service error");
+            return Ok(false);
+        }
     }
 
     tracing::debug!("Code verification successful");
@@ -200,11 +290,14 @@ pub async fn validate_token(
         return Err(AuthError::InvalidToken(text).into());
     }
 
+    let response = reject_on_rscd(response).await?;
+
     tracing::debug!("Session token is still valid");
     let data: AccountLoginResponse = response
         .json()
         .await
         .context("Failed to parse validate response as JSON")?;
+    data.check_errors()?;
     Ok(data)
 }
 
@@ -232,10 +325,15 @@ pub async fn authenticate_with_token(
         return Err(AuthError::FailedLogin(format!("Invalid authentication token: {text}")).into());
     }
 
+    let response = reject_on_rscd(response).await?;
+
     let body: AccountLoginResponse = response
         .json()
         .await
         .context("Failed to parse accountLogin response as JSON")?;
+
+    // Check for body-level error indicators before proceeding
+    body.check_errors()?;
 
     // Apple redirects China mainland accounts to .com.cn — users must
     // re-run with --domain cn to use the correct regional endpoint.
@@ -303,5 +401,134 @@ mod tests {
     #[test]
     fn test_is_valid_2fa_code_accepts_leading_zeros() {
         assert!(is_valid_2fa_code("000000"));
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_clean_body() {
+        let body = serde_json::json!({"status": "ok"});
+        assert!(check_apple_service_errors(&body).is_ok());
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_has_error_camel_case() {
+        let body = serde_json::json!({"hasError": true});
+        let err = check_apple_service_errors(&body).unwrap_err();
+        assert!(err.to_string().contains("Apple reported an error"));
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_has_error_snake_case() {
+        let body = serde_json::json!({"has_error": true});
+        assert!(check_apple_service_errors(&body).is_err());
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_service_errors_array() {
+        let body = serde_json::json!({
+            "hasError": true,
+            "service_errors": [
+                {"code": "AUTH-401", "message": "Authentication required"}
+            ]
+        });
+        let err = check_apple_service_errors(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("AUTH-401"));
+        assert!(msg.contains("Authentication required"));
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_camel_case_key() {
+        let body = serde_json::json!({
+            "serviceErrors": [
+                {"code": "ERR-500", "message": "Internal error"}
+            ]
+        });
+        let err = check_apple_service_errors(&body).unwrap_err();
+        assert!(err.to_string().contains("ERR-500"));
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_title_fallback() {
+        let body = serde_json::json!({
+            "service_errors": [
+                {"code": "ERR", "message": "", "title": "Something failed"}
+            ]
+        });
+        let err = check_apple_service_errors(&body).unwrap_err();
+        assert!(err.to_string().contains("Something failed"));
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_empty_array_ok() {
+        let body = serde_json::json!({"service_errors": []});
+        assert!(check_apple_service_errors(&body).is_ok());
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_has_error_false_ok() {
+        let body = serde_json::json!({"hasError": false});
+        assert!(check_apple_service_errors(&body).is_ok());
+    }
+
+    #[test]
+    fn test_check_apple_rscd_no_header() {
+        let response = http::Response::builder().status(200).body("").unwrap();
+        let resp = Response::from(response);
+        assert!(check_apple_rscd(&resp).is_none());
+    }
+
+    #[test]
+    fn test_check_apple_rscd_200_ok() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("X-Apple-I-Rscd", "200")
+            .body("")
+            .unwrap();
+        let resp = Response::from(response);
+        assert!(check_apple_rscd(&resp).is_none());
+    }
+
+    #[test]
+    fn test_check_apple_rscd_401() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("X-Apple-I-Rscd", "401")
+            .body("")
+            .unwrap();
+        let resp = Response::from(response);
+        assert_eq!(check_apple_rscd(&resp), Some(401));
+    }
+
+    #[test]
+    fn test_check_apple_rscd_403() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("X-Apple-I-Rscd", "403")
+            .body("")
+            .unwrap();
+        let resp = Response::from(response);
+        assert_eq!(check_apple_rscd(&resp), Some(403));
+    }
+
+    #[test]
+    fn test_check_apple_rscd_421() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("X-Apple-I-Rscd", "421")
+            .body("")
+            .unwrap();
+        let resp = Response::from(response);
+        assert_eq!(check_apple_rscd(&resp), Some(421));
+    }
+
+    #[test]
+    fn test_check_apple_rscd_non_numeric() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("X-Apple-I-Rscd", "not-a-number")
+            .body("")
+            .unwrap();
+        let resp = Response::from(response);
+        assert!(check_apple_rscd(&resp).is_none());
     }
 }

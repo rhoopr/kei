@@ -15,6 +15,9 @@ pub enum AuthError {
     #[error("Two-factor authentication failed: {0}")]
     TwoFactorFailed(String),
 
+    #[error("Apple service error ({code}): {message}")]
+    ServiceError { code: String, message: String },
+
     #[error("Two-factor authentication is required (no code provided)")]
     TwoFactorRequired,
 
@@ -46,7 +49,7 @@ impl From<serde_json::Error> for AuthError {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<AuthError>() <= 80);
+const _: () = assert!(std::mem::size_of::<AuthError>() <= 96);
 
 impl AuthError {
     /// Check if this error indicates that 2FA is required but no code was provided.
@@ -71,6 +74,11 @@ mod tests {
         assert!(!AuthError::InvalidToken("test".into()).is_two_factor_required());
         assert!(!AuthError::ApiError {
             code: 401,
+            message: "test".into()
+        }
+        .is_two_factor_required());
+        assert!(!AuthError::ServiceError {
+            code: "test".into(),
             message: "test".into()
         }
         .is_two_factor_required());
@@ -112,6 +120,26 @@ mod tests {
     fn two_factor_failed_display() {
         let err = AuthError::TwoFactorFailed("wrong code".into());
         assert!(err.to_string().contains("wrong code"));
+    }
+
+    #[test]
+    fn service_error_display() {
+        let err = AuthError::ServiceError {
+            code: "AUTH-401".into(),
+            message: "Authentication required".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("AUTH-401"));
+        assert!(msg.contains("Authentication required"));
+    }
+
+    #[test]
+    fn service_error_is_not_two_factor_required() {
+        let err = AuthError::ServiceError {
+            code: "test".into(),
+            message: "test".into(),
+        };
+        assert!(!err.is_two_factor_required());
     }
 
     #[test]
