@@ -389,6 +389,9 @@ impl Config {
         let watch_with_interval = sync
             .watch_with_interval
             .or_else(|| toml_watch.and_then(|w| w.interval));
+        if let Some(0) = watch_with_interval {
+            anyhow::bail!("watch interval must be >= 1, got 0");
+        }
         let notify_systemd = resolve_flag(
             sync.notify_systemd,
             toml_watch.and_then(|w| w.notify_systemd),
@@ -905,6 +908,21 @@ mod tests {
         let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(1800));
         assert_eq!(cfg.pid_file, Some(PathBuf::from("/run/test.pid")));
+    }
+
+    #[test]
+    fn test_build_watch_interval_zero_from_toml_rejected() {
+        let toml_str = r#"
+            [watch]
+            interval = 0
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(default_auth(), default_sync(), Some(toml));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("watch interval"),
+            "Error should mention watch interval"
+        );
     }
 
     #[test]

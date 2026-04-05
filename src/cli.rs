@@ -99,8 +99,8 @@ pub struct SyncArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Run continuously, waiting N seconds between runs
-    #[arg(long)]
+    /// Run continuously, waiting N seconds between runs (minimum: 1)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub watch_with_interval: Option<u64>,
 
     /// Disable progress bar
@@ -929,6 +929,13 @@ mod tests {
         args.extend(["--watch-with-interval", "3600"]);
         let cli = parse(&args);
         assert_eq!(cli.sync.watch_with_interval, Some(3600));
+    }
+
+    #[test]
+    fn test_watch_with_interval_rejects_zero() {
+        let mut args = base_args();
+        args.extend(["--watch-with-interval", "0"]);
+        assert!(Cli::try_parse_from(&args).is_err());
     }
 
     #[test]
