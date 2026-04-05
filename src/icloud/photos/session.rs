@@ -613,6 +613,71 @@ mod tests {
         assert_eq!(err.to_string(), "Invalid sync token: ");
     }
 
+    /// T-2: Mock session returns HTTP 503 on first call, 200 on second.
+    /// `retry_post` should retry the call and return the successful response.
+    #[tokio::test]
+    async fn test_retry_post_retries_on_503() {
+        struct RetrySession {
+            call_count: std::sync::atomic::AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl PhotosSession for RetrySession {
+            async fn post(
+                &self,
+                _url: &str,
+                _body: &str,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                let n = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // First call: simulate 503 via CloudKit serverErrorCode
+                    Ok(serde_json::json!({
+                        "serverErrorCode": "TRY_AGAIN_LATER",
+                        "reason": "Service Unavailable"
+                    }))
+                } else {
+                    // Second call: success
+                    Ok(serde_json::json!({
+                        "records": [{"recordName": "A1"}]
+                    }))
+                }
+            }
+
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                panic!("not needed for test")
+            }
+        }
+
+        let session = RetrySession {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        };
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        let result = retry_post(&session, "https://example.com/api", "{}", &[], &config).await;
+        assert!(
+            result.is_ok(),
+            "retry_post should succeed on second attempt"
+        );
+
+        let response = result.unwrap();
+        let records = response["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["recordName"], "A1");
+
+        // Verify exactly 2 calls were made (1 retry + 1 success)
+        assert_eq!(
+            session.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
     /// Build a reqwest::Error with the given HTTP status code (no network needed).
     fn reqwest_status_error(status: u16) -> anyhow::Error {
         let http_resp = http::Response::builder()

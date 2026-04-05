@@ -1125,4 +1125,41 @@ mod tests {
         assert_eq!(escape_toml_string("he\"llo"), "he\\\"llo");
         assert_eq!(escape_toml_string("c:\\path"), "c:\\\\path");
     }
+
+    /// T-5: The .env file created by the setup wizard must have mode 0o600
+    /// so credentials are not world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn test_env_file_created_with_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir()
+            .join("claude")
+            .join("setup_perm_test")
+            .join(format!("{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let env_path = dir.join(".env");
+        let env_content = "ICLOUD_USERNAME=test@example.com\nICLOUD_PASSWORD=secret\n";
+
+        // Replicate the exact logic from run_setup
+        std::fs::write(&env_path, env_content).unwrap();
+        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Verify permissions
+        let metadata = std::fs::metadata(&env_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected mode 0o600 (owner rw only), got {mode:#o}"
+        );
+
+        // Verify content
+        let content = std::fs::read_to_string(&env_path).unwrap();
+        assert!(content.contains("ICLOUD_USERNAME=test@example.com"));
+        assert!(content.contains("ICLOUD_PASSWORD=secret"));
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

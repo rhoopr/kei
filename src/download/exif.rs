@@ -120,6 +120,78 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    /// T-1: Simulate the two-phase download flow (download → EXIF on .part → rename).
+    /// If EXIF write panics/fails mid-operation, only the .part file exists — the
+    /// final path is never created, preventing corrupt files from reaching the user.
+    /// On retry, the .part file contains the unmodified download and can be reprocessed.
+    #[test]
+    fn test_exif_crash_leaves_no_corrupt_file() {
+        let dir = &test_tmp_dir("exif_crash_test");
+        fs::create_dir_all(dir).unwrap();
+
+        let final_path = dir.join("photo.jpg");
+        // The real download pipeline uses a base32-encoded .part filename, but
+        // little_exif requires a recognizable image extension. Use .part.jpg so
+        // the EXIF library can identify the file type on retry.
+        let part_path = dir.join("photo_part.jpg");
+
+        // Clean up from any previous run
+        let _ = fs::remove_file(&final_path);
+        let _ = fs::remove_file(&part_path);
+
+        // Phase 1: "Download" — write a valid JPEG to the .part file
+        let jpeg_bytes = minimal_jpeg();
+        fs::write(&part_path, &jpeg_bytes).unwrap();
+
+        // At this point: .part exists, final path does NOT
+        assert!(part_path.exists());
+        assert!(
+            !final_path.exists(),
+            "final path must not exist before rename"
+        );
+
+        // Phase 2: Simulate EXIF crash — attempt EXIF write on a corrupt/non-JPEG file
+        let corrupt_part = dir.join("corrupt_part.jpg");
+        fs::write(&corrupt_part, b"not a jpeg at all").unwrap();
+        let exif_result = set_photo_exif(&corrupt_part, "2023:06:15 14:30:00");
+        assert!(
+            exif_result.is_err(),
+            "EXIF write on corrupt file should fail"
+        );
+
+        // Critical invariant: final path still does not exist because we never renamed
+        assert!(
+            !final_path.exists(),
+            "final path must not exist after EXIF failure"
+        );
+
+        // The original .part file is still intact (unmodified download)
+        assert!(
+            part_path.exists(),
+            ".part file should still exist for retry"
+        );
+        assert_eq!(
+            fs::read(&part_path).unwrap(),
+            jpeg_bytes,
+            ".part file should contain the unmodified download"
+        );
+
+        // Phase 3: Retry — EXIF write succeeds on the valid .part, then rename
+        set_photo_exif(&part_path, "2023:06:15 14:30:00").unwrap();
+        fs::rename(&part_path, &final_path).unwrap();
+
+        // After successful retry: final path exists, .part is gone
+        assert!(
+            final_path.exists(),
+            "final path should exist after successful retry"
+        );
+        assert!(!part_path.exists(), ".part should be gone after rename");
+
+        // Verify EXIF was written correctly
+        let result = get_photo_exif(&final_path).unwrap();
+        assert_eq!(result, Some("2023-06-15 14:30:00".to_string()));
+    }
+
     #[test]
     fn test_set_exif_preserves_existing() {
         let dir = &test_tmp_dir("exif_tests");

@@ -1597,6 +1597,52 @@ mod tests {
         assert_eq!(summary.failed, 0);
     }
 
+    /// T-3: Each download is reflected in the state DB immediately, not batched.
+    /// After marking each of 5 files as downloaded, the summary should reflect
+    /// the cumulative count at every step.
+    #[tokio::test]
+    async fn test_downloads_reflected_immediately_not_batched() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let dir = test_dir("immediate_state");
+
+        for i in 0..5u32 {
+            let id = format!("ASSET_{i}");
+            let record = AssetRecord::new_pending(
+                id.clone(),
+                VersionSizeKey::Original,
+                format!("checksum_{i}"),
+                format!("photo_{i}.jpg"),
+                Utc::now(),
+                None,
+                1000,
+                MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+
+            let path = dir.join(format!("photo_{i}.jpg"));
+            fs::write(&path, b"jpeg data").unwrap();
+            db.mark_downloaded(&id, "original", &path, &format!("local_ck_{i}"), None)
+                .await
+                .unwrap();
+
+            // Query immediately after each download
+            let summary = db.get_summary().await.unwrap();
+            assert_eq!(
+                summary.downloaded,
+                u64::from(i + 1),
+                "after downloading asset {i}, DB should show {} downloaded",
+                i + 1
+            );
+        }
+
+        // Final check: all 5 are downloaded
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 5);
+        assert_eq!(summary.downloaded, 5);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+    }
+
     #[tokio::test]
     async fn sync_run_zero_value_stats() {
         // Arrange

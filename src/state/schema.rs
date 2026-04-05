@@ -320,4 +320,41 @@ mod tests {
             .is_ok();
         assert!(has_column);
     }
+
+    /// T-9: Simulate crash after V3+V4 columns added but version left at V2.
+    /// Re-running migration must not fail with "duplicate column name".
+    #[test]
+    fn test_recovery_after_crash_during_v4_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Set up V1+V2 schema, then manually add both V3 and V4 columns
+        // without bumping the version — simulates crash after ALTER but
+        // before the version was persisted.
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        set_schema_version(&conn, 2).unwrap();
+        conn.execute_batch("ALTER TABLE assets ADD COLUMN local_checksum TEXT")
+            .unwrap();
+        conn.execute_batch("ALTER TABLE assets ADD COLUMN download_checksum TEXT")
+            .unwrap();
+
+        // Migration should succeed (idempotent column checks)
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Both columns should exist and be queryable
+        assert!(conn
+            .prepare("SELECT local_checksum, download_checksum FROM assets LIMIT 0")
+            .is_ok());
+
+        // Database should be fully usable (insert + query round-trip)
+        conn.execute(
+            "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, media_type, last_seen_at) \
+             VALUES ('test', 'original', 'ck', 'photo.jpg', 0, 100, 'photo', 0)",
+            [],
+        ).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }

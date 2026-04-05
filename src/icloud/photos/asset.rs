@@ -1513,4 +1513,67 @@ mod tests {
         assert_eq!(asset.asset_date(), DateTime::UNIX_EPOCH);
         assert_eq!(asset.added_date(), DateTime::UNIX_EPOCH);
     }
+
+    /// T-10: CPLMaster on page 1 with no matching CPLAsset; CPLAsset arrives
+    /// on page 2. The buffer must pair them and emit a PhotoAsset.
+    #[test]
+    fn test_unpaired_master_buffered_across_pages() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        // Page 1: CPLMaster only — no matching CPLAsset yet
+        let events = buffer.process_records(vec![Record {
+            record_name: "M_SPLIT".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({
+                "filenameEnc": {"value": "split.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 4096,
+                    "downloadURL": "https://example.com/split",
+                    "fileChecksum": "split_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }),
+            deleted: None,
+        }]);
+        assert!(
+            events.is_empty(),
+            "page 1 should buffer the unpaired master"
+        );
+
+        // Page 2: matching CPLAsset arrives
+        let events = buffer.process_records(vec![Record {
+            record_name: "A_SPLIT".to_string(),
+            record_type: "CPLAsset".to_string(),
+            fields: json!({
+                "masterRef": {
+                    "value": {
+                        "recordName": "M_SPLIT",
+                        "zoneID": {"zoneName": "PrimarySync"}
+                    }
+                },
+                "assetDate": {"value": 1736899200000.0},
+                "addedDate": {"value": 1736899200000.0}
+            }),
+            deleted: None,
+        }]);
+        assert_eq!(events.len(), 1, "page 2 should pair M_SPLIT + A_SPLIT");
+        assert_eq!(events[0].record_name, "M_SPLIT");
+        assert_eq!(events[0].reason, ChangeReason::Created);
+
+        let asset = events[0]
+            .asset
+            .as_ref()
+            .expect("paired event should have a PhotoAsset");
+        assert_eq!(asset.id(), "M_SPLIT");
+        assert_eq!(asset.filename(), Some("split.jpg"));
+        assert!(
+            asset.contains_version(AssetVersionSize::Original),
+            "paired asset should have the Original version from the master"
+        );
+
+        // Flush should be empty — everything was paired
+        let flushed = buffer.flush();
+        assert!(flushed.is_empty());
+    }
 }
