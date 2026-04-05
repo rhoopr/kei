@@ -150,7 +150,17 @@ impl PhotoAlbum {
         total_count: Option<u64>,
         concurrency: usize,
     ) -> PhotoStream {
-        let (stream, _handles) = self.photo_stream_inner(limit, total_count, concurrency, None);
+        let (stream, handles) = self.photo_stream_inner(limit, total_count, concurrency, None);
+        // Await fetcher handles so panics are logged instead of silently lost.
+        tokio::spawn(async move {
+            for handle in handles {
+                if let Err(e) = handle.await {
+                    if e.is_panic() {
+                        tracing::error!(error = ?e, "Photo fetcher task panicked");
+                    }
+                }
+            }
+        });
         stream
     }
 
@@ -190,10 +200,22 @@ impl PhotoAlbum {
         // closes the ReceiverStream. The caller awaits the oneshot after the
         // stream is exhausted.
         tokio::spawn(async move {
+            let mut fetcher_panicked = false;
             for handle in handles {
-                let _ = handle.await;
+                if let Err(e) = handle.await {
+                    if e.is_panic() {
+                        tracing::error!(error = ?e, "Photo fetcher task panicked");
+                        fetcher_panicked = true;
+                    }
+                }
             }
-            let final_token = shared_sync_token.lock().await.clone();
+            // Suppress sync token if any fetcher panicked — the enumeration
+            // is incomplete and the next sync must do a full re-enumeration.
+            let final_token = if fetcher_panicked {
+                None
+            } else {
+                shared_sync_token.lock().await.clone()
+            };
             let _ = token_tx.send(final_token);
         });
 

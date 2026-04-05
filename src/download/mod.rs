@@ -1696,11 +1696,13 @@ where
         }
     }
 
-    if let Err(e) = producer.await {
-        if e.is_panic() {
+    let producer_panicked = match producer.await {
+        Err(e) if e.is_panic() => {
             tracing::error!(error = ?e, "Asset producer task panicked");
+            true
         }
-    }
+        _ => false,
+    };
 
     let assets_seen_count = assets_seen.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -1732,7 +1734,9 @@ where
             assets_seen: assets_seen_count,
             assets_downloaded: downloaded as u64,
             assets_failed: failed.len() as u64,
-            interrupted: shutdown_token.is_cancelled() || auth_errors >= AUTH_ERROR_THRESHOLD,
+            interrupted: shutdown_token.is_cancelled()
+                || auth_errors >= AUTH_ERROR_THRESHOLD
+                || producer_panicked,
         };
         if let Err(e) = db.complete_sync_run(run_id, &stats).await {
             tracing::warn!(error = %e, "Failed to complete sync run tracking");
@@ -1745,6 +1749,12 @@ where
                 "Completed sync run"
             );
         }
+    }
+
+    if producer_panicked {
+        return Err(anyhow::anyhow!(
+            "Asset producer panicked — sync may be incomplete"
+        ));
     }
 
     Ok(StreamingResult {
