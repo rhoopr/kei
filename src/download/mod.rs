@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
@@ -983,7 +983,7 @@ async fn download_photos_full_with_token(
     }
     let mut total: u64 = album_counts.iter().sum();
     if let Some(recent) = config.recent {
-        total = total.min(recent as u64);
+        total = total.min(u64::from(recent));
     }
 
     // Create photo_stream_with_token for each album and collect token receivers
@@ -2047,7 +2047,9 @@ async fn download_single_task(
     temp_suffix: &str,
 ) -> Result<(bool, String)> {
     if let Some(parent) = task.download_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
     tracing::debug!(

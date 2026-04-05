@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use base64::Engine;
 use serde_json::{json, Value};
 use tracing::warn;
@@ -232,7 +233,8 @@ impl PhotoLibrary {
         )
         .await?;
 
-        let query: super::cloudkit::QueryResponse = serde_json::from_value(response)?;
+        let query: super::cloudkit::QueryResponse =
+            serde_json::from_value(response).context("failed to parse library query response")?;
         Ok(query.records)
     }
 

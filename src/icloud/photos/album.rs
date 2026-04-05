@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use anyhow::Context;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -128,7 +129,8 @@ impl PhotoAlbum {
         )
         .await?;
 
-        let batch: super::cloudkit::BatchQueryResponse = serde_json::from_value(response)?;
+        let batch: super::cloudkit::BatchQueryResponse =
+            serde_json::from_value(response).context("failed to parse album count response")?;
         let count = batch
             .batch
             .first()

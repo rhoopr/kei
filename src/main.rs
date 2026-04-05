@@ -441,7 +441,7 @@ fn build_photos_params(
     client_id: &str,
     dsid: Option<&str>,
 ) -> std::collections::HashMap<String, serde_json::Value> {
-    let mut params = std::collections::HashMap::new();
+    let mut params = std::collections::HashMap::with_capacity(4);
     params.insert(
         "clientBuildNumber".to_string(),
         serde_json::Value::String("2522Project44".to_string()),

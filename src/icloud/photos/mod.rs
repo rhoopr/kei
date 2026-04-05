@@ -20,6 +20,7 @@ pub use types::{AssetItemType, AssetVersionSize, ChangeReason};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use serde_json::{json, Value};
 use tracing::{debug, error};
 
@@ -182,7 +183,8 @@ impl PhotosService {
         )
         .await?;
 
-        let zone_list: cloudkit::ZoneListResponse = serde_json::from_value(response)?;
+        let zone_list: cloudkit::ZoneListResponse =
+            serde_json::from_value(response).context("failed to parse zone list response")?;
 
         for zone in &zone_list.zones {
             if zone.deleted.unwrap_or(false) {
@@ -239,7 +241,8 @@ impl PhotosService {
             &[("Content-type", "text/plain")],
         )
         .await?;
-        let parsed: ChangesDatabaseResponse = serde_json::from_value(response)?;
+        let parsed: ChangesDatabaseResponse = serde_json::from_value(response)
+            .context("failed to parse changes database response")?;
         Ok(parsed)
     }
 }

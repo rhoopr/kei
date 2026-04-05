@@ -368,6 +368,7 @@ pub(crate) fn normalize_ampm(s: &str) -> String {
             i += 1;
         } else {
             // Multi-byte UTF-8: decode the char and advance past it
+            // Safe: i < len and bytes[i] >= 0x80 guarantees a multi-byte char starts here
             let ch = s[i..].chars().next().unwrap();
             result.push(ch);
             i += ch.len_utf8();
