@@ -5090,7 +5090,6 @@ mod tests {
                 base_delay_secs: 0,
                 max_delay_secs: 0,
             },
-            no_progress_bar: true,
             ..test_config()
         });
 
