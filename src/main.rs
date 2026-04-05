@@ -275,14 +275,14 @@ async fn run_reset_state(
         }
     }
 
-    std::fs::remove_file(&db_path)?;
+    tokio::fs::remove_file(&db_path).await?;
     println!("State database deleted.");
 
     // Also remove WAL and SHM files if they exist
     let wal_path = db_path.with_extension("db-wal");
     let shm_path = db_path.with_extension("db-shm");
-    let _ = std::fs::remove_file(&wal_path);
-    let _ = std::fs::remove_file(&shm_path);
+    let _ = tokio::fs::remove_file(&wal_path).await;
+    let _ = tokio::fs::remove_file(&shm_path).await;
 
     Ok(())
 }
@@ -791,7 +791,7 @@ async fn run() -> anyhow::Result<()> {
                     // Load .env into process environment for this session
                     let mut env_username = None;
                     let mut env_password = None;
-                    if let Ok(contents) = std::fs::read_to_string(&env_path) {
+                    if let Ok(contents) = tokio::fs::read_to_string(&env_path).await {
                         for line in contents.lines() {
                             if let Some((key, value)) = line.split_once('=') {
                                 let key = key.trim();

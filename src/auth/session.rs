@@ -175,10 +175,12 @@ impl Session {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        if let Err(e) = std::fs::set_permissions(
+                        if let Err(e) = fs::set_permissions(
                             &cookiejar_path,
                             std::fs::Permissions::from_mode(0o600),
-                        ) {
+                        )
+                        .await
+                        {
                             tracing::warn!(error = %e, "Could not set cookie file permissions");
                         }
                     }
@@ -351,7 +353,7 @@ impl Session {
                 // Session files contain auth tokens — restrict to owner-only
                 use std::os::unix::fs::PermissionsExt;
                 let perms = std::fs::Permissions::from_mode(0o600);
-                std::fs::set_permissions(&session_path, perms)?;
+                fs::set_permissions(&session_path, perms).await?;
             }
             tracing::debug!("Saved session data to file");
         }
@@ -441,7 +443,7 @@ impl Session {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&cookiejar_path, perms)?;
+            fs::set_permissions(&cookiejar_path, perms).await?;
         }
 
         Ok(())
