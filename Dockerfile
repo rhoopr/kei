@@ -43,12 +43,17 @@ RUN export TARGET=$(cat /tmp/target) && \
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends bash curl ca-certificates && \
+    apt-get install -y --no-install-recommends bash curl jq ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /kei /usr/local/bin/kei
 
 VOLUME ["/config", "/photos"]
+
+HEALTHCHECK --interval=60s --timeout=5s --retries=3 \
+  CMD test -f /config/health.json \
+   && test "$(jq -r '.consecutive_failures' /config/health.json)" -lt 5 \
+   && test "$(( $(date +%s) - $(date -d "$(jq -r '.last_sync_at' /config/health.json)" +%s) ))" -lt 7200
 
 ENTRYPOINT ["kei"]
 CMD ["sync", "--config", "/config/config.toml", "--cookie-directory", "/config", "--directory", "/photos"]

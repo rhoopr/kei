@@ -11,3 +11,8 @@ services:
     volumes:
       - ./config:/config
       - /path/to/photos:/photos
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /config/health.json && test \"$(jq -r '.consecutive_failures' /config/health.json)\" -lt 5 && test \"$(( $(date +%s) - $(date -d \"$(jq -r '.last_sync_at' /config/health.json)\" +%s) ))\" -lt 7200"]
+      interval: 60s
+      timeout: 5s
+      retries: 3

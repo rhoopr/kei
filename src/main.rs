@@ -11,6 +11,7 @@ mod auth;
 mod cli;
 mod config;
 mod download;
+mod health;
 mod icloud;
 mod migration;
 mod notifications;
@@ -1204,6 +1205,8 @@ async fn run() -> anyhow::Result<()> {
     }
     sd_notifier.notify_ready();
 
+    let mut health = health::HealthStatus::new();
+
     loop {
         if shutdown_token.is_cancelled() {
             tracing::info!("Shutdown requested, exiting...");
@@ -1372,6 +1375,16 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            // Update health status for Docker HEALTHCHECK observability.
+            if cycle_session_expired {
+                health.record_failure("session expired");
+            } else if cycle_failed_count > 0 {
+                health.record_failure(&format!("{cycle_failed_count} downloads failed"));
+            } else {
+                health.record_success();
+            }
+            health.write(&config.cookie_directory);
 
             // Handle aggregate outcome across all libraries
             if cycle_session_expired {
