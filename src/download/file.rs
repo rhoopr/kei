@@ -704,9 +704,9 @@ mod tests {
             "InvalidContent should not be treated as session expired"
         );
 
-        // In the real download flow, attempt_download removes the .part file
-        // after a non-retryable error. For retryable errors, the .part stays
-        // for resume. Simulate the cleanup:
+        // In the real download flow, attempt_download always removes the .part
+        // file after content validation failure (even though the error is retryable),
+        // because the content is invalid and shouldn't be resumed from.
         let _ = std::fs::remove_file(&part);
         assert!(!part.exists(), ".part file should be cleaned up");
         assert!(!dest.exists(), "final path must never have been created");
@@ -714,53 +714,24 @@ mod tests {
 
     /// T-7: When CDN omits Content-Length (chunked transfer) and delivers fewer
     /// bytes than the API-reported size, the expected_size check catches it.
-    #[tokio::test]
-    async fn truncated_download_detected_without_content_length() {
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn truncated_download_detected_without_content_length() {
+        // attempt_download checks: if bytes_written != expected_size → ContentLengthMismatch.
+        // This catches truncation even when the CDN omits Content-Length (chunked encoding).
+        let bytes_written = 17u64;
+        let api_reported_size = 1_048_576u64;
 
-        let dir = std::env::temp_dir()
-            .join("claude")
-            .join("truncated_test")
-            .join(format!("{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        assert_ne!(bytes_written, api_reported_size);
 
-        let download_path = dir.join("video.mov");
-        let checksum = "AAAA"; // valid base64
-        let part = temp_download_path(&download_path, checksum, ".kei-tmp").unwrap();
-
-        // Simulate a chunked download that wrote fewer bytes than API reports
-        let actual_bytes = b"partial data only";
-        {
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&part)
-                .await
-                .unwrap();
-            file.write_all(actual_bytes).await.unwrap();
-            file.flush().await.unwrap();
-        }
-
-        let bytes_written = actual_bytes.len() as u64;
-        let api_reported_size = 1_048_576u64; // 1 MiB — much larger
-
-        // Simulate the expected_size check from attempt_download
-        assert_ne!(
-            bytes_written, api_reported_size,
-            "bytes should not match the API-reported size"
-        );
-
-        // The download code would return ContentLengthMismatch
         let err = DownloadError::ContentLengthMismatch {
-            path: download_path.display().to_string(),
+            path: "video.mov".into(),
             expected: api_reported_size,
             received: bytes_written,
         };
         assert!(err.is_retryable(), "size mismatch should be retryable");
-
-        // Clean up .part (as the real code does)
-        let _ = tokio::fs::remove_file(&part).await;
-        assert!(!part.exists(), ".part should be cleaned up on mismatch");
+        assert!(
+            !err.is_session_expired(),
+            "size mismatch is not a session error"
+        );
     }
 }

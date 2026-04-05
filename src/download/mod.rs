@@ -4942,70 +4942,48 @@ mod tests {
         assert_eq!(db.success_count(), 5);
     }
 
+    /// Compute `hash_download_config`'s hash with a synthetic timezone offset,
+    /// bypassing `chrono::Local::now()` which can't be overridden in-process.
+    fn config_hash_with_offset(config: &DownloadConfig, tz_offset_secs: i32) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+
+        let mut hasher = Sha256::new();
+        hasher.update(config.directory.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        hasher.update(config.folder_structure.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(format!("{:?}", config.size).as_bytes());
+        hasher.update(format!("{:?}", config.live_photo_size).as_bytes());
+        hasher.update(format!("{:?}", config.file_match_policy).as_bytes());
+        hasher.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
+        hasher.update(format!("{:?}", config.align_raw).as_bytes());
+        hasher.update([u8::from(config.keep_unicode_in_filenames)]);
+        hasher.update(tz_offset_secs.to_le_bytes());
+        let hash = hasher.finalize();
+        let mut hex = String::with_capacity(16);
+        for &b in &hash[..8] {
+            let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+        }
+        hex
+    }
+
     /// T-8: Changing the timezone changes the config hash, invalidating
     /// the trust-state cache so all files are re-verified against the filesystem.
     #[test]
     fn test_timezone_change_invalidates_config_hash() {
         let config = test_config();
 
-        // Capture hash with current timezone
-        let hash1 = hash_download_config(&config);
-
-        // The hash includes chrono::Local::now().offset().local_minus_utc().
-        // We can't change TZ reliably in-process (chrono caches it), but we
-        // can verify the hash depends on the timezone offset by checking that
-        // a different offset value would produce a different hash.
-        //
-        // Directly test the invariant: the offset bytes are part of the hash input.
-        use sha2::{Digest, Sha256};
-        use std::fmt::Write;
-
-        let mut hasher1 = Sha256::new();
-        hasher1.update(config.directory.as_os_str().as_encoded_bytes());
-        hasher1.update(b"\0");
-        hasher1.update(config.folder_structure.as_bytes());
-        hasher1.update(b"\0");
-        hasher1.update(format!("{:?}", config.size).as_bytes());
-        hasher1.update(format!("{:?}", config.live_photo_size).as_bytes());
-        hasher1.update(format!("{:?}", config.file_match_policy).as_bytes());
-        hasher1.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
-        hasher1.update(format!("{:?}", config.align_raw).as_bytes());
-        hasher1.update([u8::from(config.keep_unicode_in_filenames)]);
-        // Use a different timezone offset (+5 hours vs current)
-        let fake_offset: i32 = 5 * 3600;
-        hasher1.update(fake_offset.to_le_bytes());
-        let h1 = hasher1.finalize();
-        let mut hex1 = String::with_capacity(16);
-        for &b in &h1[..8] {
-            let _ = Write::write_fmt(&mut hex1, format_args!("{b:02x}"));
-        }
-
-        let mut hasher2 = Sha256::new();
-        hasher2.update(config.directory.as_os_str().as_encoded_bytes());
-        hasher2.update(b"\0");
-        hasher2.update(config.folder_structure.as_bytes());
-        hasher2.update(b"\0");
-        hasher2.update(format!("{:?}", config.size).as_bytes());
-        hasher2.update(format!("{:?}", config.live_photo_size).as_bytes());
-        hasher2.update(format!("{:?}", config.file_match_policy).as_bytes());
-        hasher2.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
-        hasher2.update(format!("{:?}", config.align_raw).as_bytes());
-        hasher2.update([u8::from(config.keep_unicode_in_filenames)]);
-        // Use a different timezone offset (-8 hours)
-        let fake_offset_2: i32 = -8 * 3600;
-        hasher2.update(fake_offset_2.to_le_bytes());
-        let h2 = hasher2.finalize();
-        let mut hex2 = String::with_capacity(16);
-        for &b in &h2[..8] {
-            let _ = Write::write_fmt(&mut hex2, format_args!("{b:02x}"));
-        }
-
+        // Different timezone offsets must produce different hashes
+        let east = config_hash_with_offset(&config, 5 * 3600); // UTC+5
+        let west = config_hash_with_offset(&config, -8 * 3600); // UTC-8
         assert_ne!(
-            hex1, hex2,
+            east, west,
             "different timezone offsets must produce different config hashes"
         );
 
-        // Verify the real hash_download_config is deterministic (same TZ → same hash)
+        // The real function should be deterministic (same TZ → same hash)
+        let hash1 = hash_download_config(&config);
         let hash2 = hash_download_config(&config);
         assert_eq!(hash1, hash2, "same config should produce the same hash");
     }
