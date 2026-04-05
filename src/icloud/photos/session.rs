@@ -111,29 +111,58 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
         .into());
     }
 
-    // Per-record errors in the records array
+    // Per-record errors: filter out errored records and keep valid ones.
+    // Only return Err if ALL records are errored.
     if let Some(records) = response["records"].as_array() {
-        for record in records {
-            if let Some(code) = record["serverErrorCode"].as_str() {
-                let reason = record["reason"].as_str().unwrap_or("unknown").to_string();
-                let retryable = RETRYABLE_SERVER_ERRORS
-                    .iter()
-                    .any(|&s| s.eq_ignore_ascii_case(code));
-                let service_not_activated = is_service_not_activated(code, &reason);
-                tracing::warn!(
-                    error_code = code,
-                    retryable,
-                    service_not_activated,
-                    "CloudKit per-record error: {reason}"
-                );
-                return Err(CloudKitServerError {
-                    code: code.to_string(),
-                    reason,
-                    retryable,
-                    service_not_activated,
+        let total = records.len();
+        let mut last_error: Option<CloudKitServerError> = None;
+        let mut error_count = 0usize;
+
+        let valid_records: Vec<Value> = records
+            .iter()
+            .filter(|record| {
+                if let Some(code) = record["serverErrorCode"].as_str() {
+                    let reason = record["reason"].as_str().unwrap_or("unknown").to_string();
+                    let retryable = RETRYABLE_SERVER_ERRORS
+                        .iter()
+                        .any(|&s| s.eq_ignore_ascii_case(code));
+                    let service_not_activated = is_service_not_activated(code, &reason);
+                    tracing::warn!(
+                        error_code = code,
+                        retryable,
+                        service_not_activated,
+                        "CloudKit per-record error: {reason}"
+                    );
+                    error_count += 1;
+                    last_error = Some(CloudKitServerError {
+                        code: code.to_string(),
+                        reason,
+                        retryable,
+                        service_not_activated,
+                    });
+                    false
+                } else {
+                    true
                 }
-                .into());
+            })
+            .cloned()
+            .collect();
+
+        if error_count > 0 {
+            if valid_records.is_empty() {
+                // All records errored — propagate the last error for retry
+                return Err(last_error.expect("error_count > 0").into());
             }
+            tracing::warn!(
+                errored = error_count,
+                valid = valid_records.len(),
+                total,
+                "Filtered errored records from CloudKit response"
+            );
+            // Replace the records array with only valid records
+            let mut response = response;
+            response["records"] = Value::Array(valid_records);
+            return Ok(response);
         }
     }
 
@@ -173,9 +202,9 @@ pub async fn retry_post(
     url: &str,
     body: &str,
     headers: &[(&str, &str)],
+    retry_config: &RetryConfig,
 ) -> anyhow::Result<Value> {
-    let config = RetryConfig::default();
-    retry::retry_with_backoff(&config, classify_api_error, || async {
+    retry::retry_with_backoff(retry_config, classify_api_error, || async {
         let response = session.post(url, body, headers).await?;
         check_cloudkit_errors(response)
     })
@@ -309,18 +338,33 @@ mod tests {
     }
 
     #[test]
-    fn test_check_cloudkit_errors_per_record() {
+    fn test_check_cloudkit_errors_per_record_mixed() {
+        // When some records are valid and some errored, valid ones are kept
         let response = serde_json::json!({
             "records": [
                 {"recordName": "A"},
                 {"serverErrorCode": "RETRY_LATER", "reason": "busy"}
             ]
         });
+        let result = check_cloudkit_errors(response).unwrap();
+        let records = result["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["recordName"], "A");
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_per_record_all_errored() {
+        // When ALL records are errored, return Err
+        let response = serde_json::json!({
+            "records": [
+                {"serverErrorCode": "RETRY_LATER", "reason": "busy"},
+                {"serverErrorCode": "RETRY_LATER", "reason": "still busy"}
+            ]
+        });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
         assert_eq!(ck_err.code, "RETRY_LATER");
         assert!(ck_err.retryable);
-        assert!(!ck_err.service_not_activated);
     }
 
     #[test]

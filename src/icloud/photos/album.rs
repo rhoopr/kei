@@ -13,6 +13,7 @@ use super::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
 use super::cloudkit::ChangesZoneResponse;
 use super::queries::{build_changes_zone_request, encode_params, DESIRED_KEYS_VALUES};
 use super::session::{check_changes_zone_error, PhotosSession};
+use crate::retry::RetryConfig;
 
 /// A boxed, pinned stream of photo asset results.
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
@@ -55,6 +56,7 @@ pub struct PhotoAlbumConfig {
     pub query_filter: Option<Arc<Value>>,
     pub page_size: usize,
     pub zone_id: Arc<Value>,
+    pub retry_config: RetryConfig,
 }
 
 pub struct PhotoAlbum {
@@ -67,6 +69,7 @@ pub struct PhotoAlbum {
     query_filter: Option<Arc<Value>>,
     page_size: usize,
     zone_id: Arc<Value>,
+    retry_config: RetryConfig,
 }
 
 impl std::fmt::Debug for PhotoAlbum {
@@ -93,6 +96,7 @@ impl PhotoAlbum {
             query_filter: config.query_filter,
             page_size: config.page_size,
             zone_id: config.zone_id,
+            retry_config: config.retry_config,
         }
     }
 
@@ -127,6 +131,7 @@ impl PhotoAlbum {
             &url,
             &body.to_string(),
             &[("Content-type", "text/plain")],
+            &self.retry_config,
         )
         .await?;
 
@@ -243,6 +248,7 @@ impl PhotoAlbum {
         let zone_id = Arc::clone(&self.zone_id);
         let initial_token = sync_token.to_string();
         let album_name = Arc::clone(&self.name);
+        let retry_config = self.retry_config;
 
         tokio::spawn(async move {
             let mut buffer = DeltaRecordBuffer::new();
@@ -267,6 +273,7 @@ impl PhotoAlbum {
                     &url,
                     &body.to_string(),
                     &[("Content-type", "text/plain")],
+                    &retry_config,
                 )
                 .await
                 {
@@ -467,12 +474,14 @@ impl PhotoAlbum {
         let name = Arc::clone(&self.name);
         let list_type = Arc::clone(&self.list_type);
         let query_filter = self.query_filter.as_ref().map(Arc::clone);
+        let retry_config = self.retry_config;
         let page_size = self.page_size;
         let zone_id = Arc::clone(&self.zone_id);
 
         tokio::spawn(async move {
             let mut offset = start_offset;
             let mut total_sent: u64 = 0;
+            let mut pending_masters: HashMap<String, super::cloudkit::Record> = HashMap::new();
             let url = format!(
                 "{}/records/query?{}",
                 service_endpoint,
@@ -504,6 +513,7 @@ impl PhotoAlbum {
                     &url,
                     &body.to_string(),
                     &[("Content-type", "text/plain")],
+                    &retry_config,
                 )
                 .await
                 {
@@ -548,8 +558,10 @@ impl PhotoAlbum {
                     "Got records"
                 );
 
-                let mut asset_records: HashMap<String, super::cloudkit::Record> = HashMap::new();
-                let mut master_records: Vec<super::cloudkit::Record> = Vec::new();
+                // Collect current page's records, trying to pair with
+                // buffered unpaired records from previous pages.
+                let mut page_assets: HashMap<String, super::cloudkit::Record> = HashMap::new();
+                let mut page_masters: Vec<super::cloudkit::Record> = Vec::new();
 
                 for rec in records {
                     debug!(record_type = %rec.record_type, "  record");
@@ -558,43 +570,67 @@ impl PhotoAlbum {
                             rec.fields["masterRef"]["value"]["recordName"].as_str()
                         {
                             let master_id = master_id.to_string();
-                            asset_records.insert(master_id, rec);
+                            // Try to pair with a buffered master from a previous page
+                            if let Some(master) = pending_masters.remove(&master_id) {
+                                let asset = PhotoAsset::from_records(master, rec);
+                                if tx.send(Ok(asset)).await.is_err() {
+                                    return;
+                                }
+                                total_sent += 1;
+                            } else {
+                                page_assets.insert(master_id, rec);
+                            }
                         }
                     } else if rec.record_type == "CPLMaster" {
-                        master_records.push(rec);
+                        page_masters.push(rec);
                     }
                 }
 
-                if master_records.is_empty() {
+                if page_masters.is_empty() && pending_masters.is_empty() {
                     break;
                 }
 
                 let mut limit_reached = false;
-                for master in master_records {
+                for master in page_masters {
                     if let Some(n) = limit {
                         if total_sent >= u64::from(n) {
                             limit_reached = true;
                             break;
                         }
                     }
-                    if let Some(asset_rec) = asset_records.remove(&master.record_name) {
+                    if let Some(asset_rec) = page_assets.remove(&master.record_name) {
                         let asset = PhotoAsset::from_records(master, asset_rec);
                         if tx.send(Ok(asset)).await.is_err() {
                             return;
                         }
                         total_sent += 1;
+                    } else {
+                        // Buffer unpaired master for pairing on subsequent pages
+                        pending_masters.insert(master.record_name.clone(), master);
                     }
                     offset += 1;
                 }
 
                 tracing::debug!(
                     count = total_sent,
+                    pending = pending_masters.len(),
                     range_start = start_offset,
                     "fetched photos so far"
                 );
 
                 if limit_reached {
                     break;
+                }
+            }
+
+            // Log any remaining unpaired masters that couldn't be paired
+            if !pending_masters.is_empty() {
+                tracing::warn!(
+                    count = pending_masters.len(),
+                    "Unpaired CPLMaster records after full enumeration (no matching CPLAsset found)"
+                );
+                for id in pending_masters.keys() {
+                    tracing::debug!(master_id = %id, "Unpaired CPLMaster");
                 }
             }
         })
@@ -712,6 +748,7 @@ mod tests {
                 query_filter,
                 page_size,
                 zone_id: Arc::new(zone_id),
+                retry_config: RetryConfig::default(),
             },
             Box::new(StubSession),
         )
@@ -884,6 +921,7 @@ mod tests {
                 query_filter: None,
                 page_size,
                 zone_id: Arc::new(default_zone()),
+                retry_config: RetryConfig::default(),
             },
             session,
         )

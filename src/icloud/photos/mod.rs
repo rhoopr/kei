@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use serde_json::{json, Value};
+
+use crate::retry::RetryConfig;
 use tracing::{debug, error};
 
 use crate::icloud::error::ICloudError;
@@ -35,6 +37,7 @@ pub struct PhotosService {
     primary_library: PhotoLibrary,
     private_libraries: Option<HashMap<String, PhotoLibrary>>,
     shared_libraries: Option<HashMap<String, PhotoLibrary>>,
+    retry_config: RetryConfig,
 }
 
 impl std::fmt::Debug for PhotosService {
@@ -54,6 +57,7 @@ impl PhotosService {
         service_root: String,
         session: Box<dyn PhotosSession>,
         mut params: HashMap<String, Value>,
+        retry_config: RetryConfig,
     ) -> Result<Self, ICloudError> {
         params.insert("remapEnums".to_string(), Value::Bool(true));
         params.insert("getCurrentSyncToken".to_string(), Value::Bool(true));
@@ -70,6 +74,7 @@ impl PhotosService {
             lib_session,
             zone_id,
             "private".to_string(),
+            retry_config,
         )
         .await?;
 
@@ -80,6 +85,7 @@ impl PhotosService {
             primary_library,
             private_libraries: None,
             shared_libraries: None,
+            retry_config,
         })
     }
 
@@ -180,6 +186,7 @@ impl PhotosService {
             &url,
             "{}",
             &[("Content-type", "text/plain")],
+            &self.retry_config,
         )
         .await?;
 
@@ -201,6 +208,7 @@ impl PhotosService {
                 lib_session,
                 zone_id,
                 library_type.to_string(),
+                self.retry_config,
             )
             .await
             {
@@ -239,6 +247,7 @@ impl PhotosService {
             &url,
             &body.to_string(),
             &[("Content-type", "text/plain")],
+            &self.retry_config,
         )
         .await?;
         let parsed: ChangesDatabaseResponse = serde_json::from_value(response)
@@ -299,6 +308,7 @@ mod tests {
             primary_library: dummy_library,
             private_libraries: None,
             shared_libraries: None,
+            retry_config: RetryConfig::default(),
         }
     }
 

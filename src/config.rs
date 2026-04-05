@@ -96,6 +96,23 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
         Ok(contents) => {
             let config: TomlConfig = toml::from_str(&contents)
                 .context(format!("Failed to parse config file {}", path.display()))?;
+            // Warn if config contains a password and file permissions are too open
+            #[cfg(unix)]
+            if config.auth.as_ref().is_some_and(|a| a.password.is_some()) {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let mode = meta.mode();
+                    if mode & 0o077 != 0 {
+                        tracing::warn!(
+                            path = %path.display(),
+                            mode = format_args!("{mode:o}"),
+                            "Config file contains password but is group/world-readable. \
+                             Consider: chmod 600 {}",
+                            path.display()
+                        );
+                    }
+                }
+            }
             Ok(Some(config))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),

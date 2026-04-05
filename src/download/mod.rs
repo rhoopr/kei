@@ -176,6 +176,14 @@ fn hash_download_config(config: &DownloadConfig) -> String {
     hasher.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
     hasher.update(format!("{:?}", config.align_raw).as_bytes());
     hasher.update([u8::from(config.keep_unicode_in_filenames)]);
+    // Include timezone offset so TZ changes invalidate trust-state cache
+    // (different TZ → different folder paths for date-based structures)
+    hasher.update(
+        chrono::Local::now()
+            .offset()
+            .local_minus_utc()
+            .to_le_bytes(),
+    );
     let hash = hasher.finalize();
     let mut hex = String::with_capacity(16);
     // First 8 bytes is plenty for collision avoidance in this context
@@ -307,7 +315,10 @@ impl DownloadContext {
     async fn load(db: &dyn StateDb, retry_only: bool) -> Self {
         // Build nested map structure for zero-allocation lookups
         let mut downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>> = FxHashMap::default();
-        for (asset_id, version_size) in db.get_downloaded_ids().await.unwrap_or_default() {
+        for (asset_id, version_size) in db.get_downloaded_ids().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
+            Default::default()
+        }) {
             downloaded_ids
                 .entry(asset_id.into_boxed_str())
                 .or_default()
@@ -317,7 +328,10 @@ impl DownloadContext {
         let mut downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
         for ((asset_id, version_size), checksum) in
-            db.get_downloaded_checksums().await.unwrap_or_default()
+            db.get_downloaded_checksums().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to load checksums from state DB");
+                Default::default()
+            })
         {
             downloaded_checksums
                 .entry(asset_id.into_boxed_str())
@@ -330,7 +344,10 @@ impl DownloadContext {
         let known_ids = if retry_only {
             db.get_all_known_ids()
                 .await
-                .unwrap_or_default()
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load known IDs from state DB");
+                    Default::default()
+                })
                 .into_iter()
                 .map(String::into_boxed_str)
                 .collect()
@@ -686,8 +703,14 @@ fn filter_asset_to_tasks(
         let final_path = if let Some((_, on_disk_size)) = existing_with_size {
             match config.file_match_policy {
                 FileMatchPolicy::NameSizeDedupWithSuffix => {
-                    if on_disk_size == version.size {
+                    if version.size > 0 && on_disk_size == version.size {
                         // Same size — likely already downloaded, skip.
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %download_path.display(),
+                            size = version.size,
+                            "Skipping asset: file exists with same name and size"
+                        );
                         None
                     } else {
                         // Different size — deduplicate by appending file size to filename.
@@ -731,8 +754,14 @@ fn filter_asset_to_tasks(
             // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
             match config.file_match_policy {
                 FileMatchPolicy::NameSizeDedupWithSuffix => {
-                    if claimed_size == version.size {
+                    if version.size > 0 && claimed_size == version.size {
                         // Same size — likely duplicate asset, skip.
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %download_path.display(),
+                            size = version.size,
+                            "Skipping asset: in-flight download has same name and size"
+                        );
                         None
                     } else {
                         // Different size — deduplicate by appending file size to filename.
@@ -943,6 +972,7 @@ struct PendingStateWrite {
     version_size: VersionSizeKey,
     download_path: PathBuf,
     local_checksum: String,
+    download_checksum: Option<String>,
 }
 
 /// Retry all pending state writes that failed during the download loop.
@@ -964,6 +994,7 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
                     write.version_size.as_str(),
                     &write.download_path,
                     &write.local_checksum,
+                    write.download_checksum.as_deref(),
                 )
                 .await
             {
@@ -1015,6 +1046,7 @@ struct StreamingResult {
     failed: Vec<DownloadTask>,
     auth_errors: usize,
     state_write_failures: usize,
+    enumeration_errors: usize,
 }
 
 /// Download photos with syncToken support.
@@ -1448,6 +1480,7 @@ where
             failed: Vec::new(),
             auth_errors: 0,
             state_write_failures: 0,
+            enumeration_errors: 0,
         });
     }
 
@@ -1474,6 +1507,7 @@ where
             failed: Vec::new(),
             auth_errors: 0,
             state_write_failures: 0,
+            enumeration_errors: 0,
         });
     }
 
@@ -1499,14 +1533,43 @@ where
     let trust_state = if let Some(db) = &state_db {
         let config_hash = hash_download_config(config);
         let stored_hash = db.get_metadata("config_hash").await.unwrap_or(None);
-        let trust = stored_hash.as_deref() == Some(&config_hash);
+        let mut trust = stored_hash.as_deref() == Some(&config_hash);
         if !trust {
             if stored_hash.is_some() {
                 tracing::info!("Download config changed since last sync, verifying all files");
             }
             let _ = db.set_metadata("config_hash", &config_hash).await;
         }
-        trust && !download_ctx.downloaded_ids.is_empty()
+        trust = trust && !download_ctx.downloaded_ids.is_empty();
+
+        // Sample-check that "downloaded" files still exist on disk
+        if trust {
+            let sample_count = download_ctx
+                .downloaded_ids
+                .len()
+                .div_ceil(100) // ~1% sample
+                .clamp(1, 100);
+            match db.sample_downloaded_paths(sample_count).await {
+                Ok(paths) => {
+                    let missing: Vec<_> = paths.iter().filter(|p| !p.exists()).collect();
+                    if !missing.is_empty() {
+                        tracing::warn!(
+                            sampled = paths.len(),
+                            missing = missing.len(),
+                            "Sample check found missing files, disabling trust-state"
+                        );
+                        for p in &missing {
+                            tracing::debug!(path = %p.display(), "Missing downloaded file");
+                        }
+                        trust = false;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to sample downloaded paths");
+                }
+            }
+        }
+        trust
     } else {
         false
     };
@@ -1542,6 +1605,8 @@ where
 
     let assets_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let assets_seen_producer = Arc::clone(&assets_seen);
+    let enum_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let enum_errors_producer = Arc::clone(&enum_errors);
 
     let producer_config = Arc::clone(config);
     let producer_state_db = state_db.clone();
@@ -1681,6 +1746,7 @@ where
                     }
                 }
                 Err(e) => {
+                    enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     producer_pb.suspend(|| tracing::error!(error = %e, "Error fetching asset"));
                 }
             }
@@ -1722,7 +1788,7 @@ where
             .to_string();
         pb.set_message(filename);
         match result {
-            Ok((exif_ok, local_checksum)) => {
+            Ok((exif_ok, local_checksum, download_checksum)) => {
                 downloaded += 1;
                 if !exif_ok {
                     exif_failures += 1;
@@ -1734,6 +1800,7 @@ where
                             task.version_size.as_str(),
                             &task.download_path,
                             &local_checksum,
+                            download_checksum.as_deref(),
                         )
                         .await
                     {
@@ -1749,6 +1816,7 @@ where
                             version_size: task.version_size,
                             download_path: task.download_path.clone(),
                             local_checksum,
+                            download_checksum,
                         });
                     }
                 }
@@ -1850,6 +1918,7 @@ where
         failed,
         auth_errors,
         state_write_failures,
+        enumeration_errors: enum_errors.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -1870,6 +1939,7 @@ async fn build_download_outcome(
     let failed_tasks = streaming_result.failed;
     let auth_errors = streaming_result.auth_errors;
     let mut state_write_failures = streaming_result.state_write_failures;
+    let enumeration_errors = streaming_result.enumeration_errors;
 
     if auth_errors >= AUTH_ERROR_THRESHOLD {
         return Ok(DownloadOutcome::SessionExpired {
@@ -1904,11 +1974,12 @@ async fn build_download_outcome(
 
     if failed_tasks.is_empty() {
         tracing::info!("── Summary ──");
-        if exif_failures > 0 || state_write_failures > 0 {
+        if exif_failures > 0 || state_write_failures > 0 || enumeration_errors > 0 {
             tracing::info!(
                 downloaded = total,
                 exif_failures,
                 state_write_failures,
+                enumeration_errors,
                 failed = 0,
                 total,
                 "  sync results"
@@ -1917,9 +1988,9 @@ async fn build_download_outcome(
             tracing::info!(downloaded = total, failed = 0, total, "  sync results");
         }
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
-        if state_write_failures > 0 {
+        if state_write_failures > 0 || enumeration_errors > 0 {
             return Ok(DownloadOutcome::PartialFailure {
-                failed_count: state_write_failures,
+                failed_count: state_write_failures + enumeration_errors,
             });
         }
         return Ok(DownloadOutcome::Success);
@@ -2035,7 +2106,8 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let concurrency = config.concurrency;
     let temp_suffix: Arc<str> = config.temp_suffix.into();
 
-    let results: Vec<(DownloadTask, Result<(bool, String)>)> = stream::iter(tasks)
+    type DownloadResult = (DownloadTask, Result<(bool, String, Option<String>)>);
+    let results: Vec<DownloadResult> = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
@@ -2063,7 +2135,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
 
     for (task, result) in results {
         match &result {
-            Ok((exif_ok, local_checksum)) => {
+            Ok((exif_ok, local_checksum, download_checksum)) => {
                 if !*exif_ok {
                     exif_failures += 1;
                 }
@@ -2074,6 +2146,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                             task.version_size.as_str(),
                             &task.download_path,
                             local_checksum,
+                            download_checksum.as_deref(),
                         )
                         .await
                     {
@@ -2089,6 +2162,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                             version_size: task.version_size,
                             download_path: task.download_path.clone(),
                             local_checksum: local_checksum.clone(),
+                            download_checksum: download_checksum.clone(),
                         });
                     }
                 }
@@ -2150,7 +2224,7 @@ async fn download_single_task(
     retry_config: &RetryConfig,
     set_exif: bool,
     temp_suffix: &str,
-) -> Result<(bool, String)> {
+) -> Result<(bool, String, Option<String>)> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -2181,7 +2255,10 @@ async fn download_single_task(
         &task.checksum,
         retry_config,
         temp_suffix,
-        needs_exif,
+        file::DownloadOpts {
+            skip_rename: needs_exif,
+            expected_size: if task.size > 0 { Some(task.size) } else { None },
+        },
     ))
     .await?;
 
@@ -2192,6 +2269,14 @@ async fn download_single_task(
             file::temp_download_path(&task.download_path, &task.checksum, temp_suffix)
                 .context("failed to compute part path")?,
         )
+    } else {
+        None
+    };
+
+    // Compute SHA-256 of the downloaded content before EXIF modification
+    // so we have a checksum that reflects the original download bytes.
+    let download_checksum = if let Some(ref path) = part_path {
+        Some(file::compute_sha256(path).await?)
     } else {
         None
     };
@@ -2259,7 +2344,7 @@ async fn download_single_task(
     // Compute SHA-256 of the final file for local verification
     let local_checksum = file::compute_sha256(&task.download_path).await?;
 
-    Ok((exif_ok, local_checksum))
+    Ok((exif_ok, local_checksum, download_checksum))
 }
 
 fn format_duration(d: Duration) -> String {
@@ -4658,6 +4743,7 @@ mod tests {
             _: &str,
             _: &Path,
             _: &str,
+            _: Option<&str>,
         ) -> Result<(), StateError> {
             let prev = self.remaining_failures.fetch_sub(1, Ordering::Relaxed);
             if prev > 0 {
@@ -4709,6 +4795,12 @@ mod tests {
         async fn touch_last_seen(&self, _: &str) -> Result<(), StateError> {
             unimplemented!()
         }
+        async fn sample_downloaded_paths(
+            &self,
+            _: usize,
+        ) -> Result<Vec<std::path::PathBuf>, StateError> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]
@@ -4727,6 +4819,7 @@ mod tests {
             version_size: VersionSizeKey::Original,
             download_path: PathBuf::from("/tmp/claude/photo.jpg"),
             local_checksum: "abc".into(),
+            download_checksum: None,
         }];
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 0);
@@ -4742,6 +4835,7 @@ mod tests {
             version_size: VersionSizeKey::Original,
             download_path: PathBuf::from("/tmp/claude/photo.jpg"),
             local_checksum: "abc".into(),
+            download_checksum: None,
         }];
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 0);
@@ -4757,6 +4851,7 @@ mod tests {
             version_size: VersionSizeKey::Original,
             download_path: PathBuf::from("/tmp/claude/photo.jpg"),
             local_checksum: "abc".into(),
+            download_checksum: None,
         }];
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 1);
@@ -4777,12 +4872,14 @@ mod tests {
                 version_size: VersionSizeKey::Original,
                 download_path: PathBuf::from("/tmp/claude/photo1.jpg"),
                 local_checksum: "abc".into(),
+                download_checksum: None,
             },
             PendingStateWrite {
                 asset_id: "A2".into(),
                 version_size: VersionSizeKey::Original,
                 download_path: PathBuf::from("/tmp/claude/photo2.jpg"),
                 local_checksum: "def".into(),
+                download_checksum: None,
             },
         ];
         let failures = flush_pending_state_writes(&db, &pending).await;

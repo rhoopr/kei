@@ -34,6 +34,16 @@ pub(super) fn temp_download_path(
 /// the final destination on success. When true, the .part file is left in
 /// place so the caller can modify it before performing the rename.
 /// Retries with exponential backoff on transient failures.
+/// Download options that control post-download behavior and verification.
+pub(super) struct DownloadOpts {
+    /// Keep the `.part` file instead of renaming to the final path.
+    pub skip_rename: bool,
+    /// API-reported file size. When set, verifies total bytes written match,
+    /// catching truncation even when the CDN omits `Content-Length`.
+    pub expected_size: Option<u64>,
+}
+
+/// Download a file with retry support and optional expected-size verification.
 pub(super) async fn download_file(
     client: &Client,
     url: &str,
@@ -41,7 +51,7 @@ pub(super) async fn download_file(
     checksum: &str,
     retry_config: &RetryConfig,
     temp_suffix: &str,
-    skip_rename: bool,
+    opts: DownloadOpts,
 ) -> Result<(), DownloadError> {
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
@@ -61,7 +71,8 @@ pub(super) async fn download_file(
                 url,
                 download_path,
                 &part_path,
-                skip_rename,
+                opts.skip_rename,
+                opts.expected_size,
             ))
             .await
         },
@@ -80,6 +91,7 @@ async fn attempt_download(
     download_path: &Path,
     part_path: &Path,
     skip_rename: bool,
+    expected_size: Option<u64>,
 ) -> Result<(), DownloadError> {
     let path_str = download_path.display().to_string();
 
@@ -146,20 +158,30 @@ async fn attempt_download(
         })?;
 
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| DownloadError::Http {
-            source: Box::new(e),
-            path: path_str.clone(),
-            status,
-            content_length,
-            bytes_written,
-        })?;
-        file.write_all(&chunk).await?;
-        bytes_written += chunk.len() as u64;
+    let stream_result: Result<(), DownloadError> = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DownloadError::Http {
+                source: Box::new(e),
+                path: path_str.clone(),
+                status,
+                content_length,
+                bytes_written,
+            })?;
+            file.write_all(&chunk).await?;
+            bytes_written += chunk.len() as u64;
+        }
+        file.flush().await?;
+        file.sync_data().await?;
+        Ok(())
     }
-    file.flush().await?;
-    file.sync_data().await?;
+    .await;
     drop(file);
+    if let Err(e) = &stream_result {
+        if !e.is_retryable() {
+            let _ = fs::remove_file(&part_path).await;
+        }
+        return Err(stream_result.unwrap_err());
+    }
 
     // Verify the server sent the number of bytes it promised.
     // Catches CDN truncation (e.g. Apple silently cutting off videos at ~1 GB).
@@ -175,10 +197,18 @@ async fn attempt_download(
         }
     }
 
-    // Note: Apple's fileChecksum from the CloudKit API is an opaque version
-    // token, not a content hash. Content-length verification above is sufficient
-    // to catch truncated downloads. The fileChecksum is used for temp filename
-    // derivation and change detection across syncs.
+    // Verify total bytes written matches the API-reported size (if known).
+    // Catches truncation when the CDN omits Content-Length (chunked transfer).
+    if let Some(expected) = expected_size {
+        if bytes_written != expected {
+            let _ = fs::remove_file(&part_path).await;
+            return Err(DownloadError::ContentLengthMismatch {
+                path: path_str,
+                expected,
+                received: bytes_written,
+            });
+        }
+    }
 
     // Validate content looks like actual media, not an HTML error page.
     // Apple's CDN occasionally returns HTTP 200 with HTML (rate limit, CAPTCHA,

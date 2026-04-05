@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -94,19 +94,43 @@ CREATE TABLE IF NOT EXISTS metadata (
 /// Schema DDL for version 3 migration: add locally-computed checksum column.
 const SCHEMA_V3: &str = "ALTER TABLE assets ADD COLUMN local_checksum TEXT;";
 
+/// Schema DDL for version 4 migration: add pre-EXIF download checksum column.
+const SCHEMA_V4: &str = "ALTER TABLE assets ADD COLUMN download_checksum TEXT;";
+
+/// Check whether a column exists on a table using `PRAGMA table_info`.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StateError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| StateError::query(&e))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| StateError::query(&e))?
+        .any(|name| name.is_ok_and(|n| n == column));
+    Ok(exists)
+}
+
 /// Apply migration for a specific version.
 fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError> {
-    let ddl = match version {
-        1 => SCHEMA_V1,
-        2 => SCHEMA_V2,
-        3 => SCHEMA_V3,
+    match version {
+        1 => conn.execute_batch(SCHEMA_V1)?,
+        2 => conn.execute_batch(SCHEMA_V2)?,
+        3 => {
+            // Idempotent: skip ALTER if column already exists (e.g. crash recovery)
+            if !column_exists(conn, "assets", "local_checksum")? {
+                conn.execute_batch(SCHEMA_V3)?;
+            }
+        }
+        4 => {
+            if !column_exists(conn, "assets", "download_checksum")? {
+                conn.execute_batch(SCHEMA_V4)?;
+            }
+        }
         other => {
             return Err(StateError::Query(format!(
                 "No migration defined for version {other}"
             )));
         }
     };
-    conn.execute_batch(ddl)?;
     set_schema_version(conn, version)?;
     tracing::info!(version, "Migrated database schema");
     Ok(())
@@ -209,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_to_v3_migration() {
+    fn test_v2_to_current_migration() {
         let conn = Connection::open_in_memory().unwrap();
         // Simulate a v2 database
         conn.execute_batch(SCHEMA_V1).unwrap();
@@ -217,9 +241,9 @@ mod tests {
         set_schema_version(&conn, 2).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), 2);
 
-        // Migrate should bring it to v3
+        // Migrate should bring it to current version
         migrate(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 3);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
         // Verify local_checksum column exists
         let has_column: bool = conn
@@ -227,28 +251,25 @@ mod tests {
             .is_ok();
         assert!(
             has_column,
-            "local_checksum column should exist after v3 migration"
+            "local_checksum column should exist after migration"
         );
     }
 
     #[test]
-    fn test_failed_migration_rolls_back() {
+    fn test_v3_migration_idempotent_when_column_exists() {
         let conn = Connection::open_in_memory().unwrap();
         // Set up a v2 database
         conn.execute_batch(SCHEMA_V1).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
         set_schema_version(&conn, 2).unwrap();
 
-        // Manually add the local_checksum column so the v3 ALTER TABLE fails
+        // Manually add the local_checksum column (simulates crash recovery)
         conn.execute_batch("ALTER TABLE assets ADD COLUMN local_checksum TEXT")
             .unwrap();
 
-        // Migration should fail on v3
-        let result = migrate(&conn);
-        assert!(result.is_err());
-
-        // Version should still be 2 — the failed step was rolled back
-        assert_eq!(get_schema_version(&conn).unwrap(), 2);
+        // Migration should succeed despite column already existing
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
         // Database should still be usable
         let count: i64 = conn
@@ -258,15 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_to_v3_migration() {
+    fn test_v1_to_current_migration() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_V1).unwrap();
         set_schema_version(&conn, 1).unwrap();
 
         migrate(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 3);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
-        // Both v2 (metadata table) and v3 (local_checksum column) should be present
+        // All migration artifacts should be present
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
             .unwrap();
@@ -279,27 +300,17 @@ mod tests {
     }
 
     #[test]
-    fn test_recovery_after_failed_migration() {
+    fn test_recovery_after_crash_during_migration() {
         let conn = Connection::open_in_memory().unwrap();
-        // Set up a v2 database with the v3 column pre-existing (causes failure)
+        // Set up a v2 database with the v3 column pre-existing
+        // (simulates crash after ALTER but before version update)
         conn.execute_batch(SCHEMA_V1).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
         set_schema_version(&conn, 2).unwrap();
         conn.execute_batch("ALTER TABLE assets ADD COLUMN local_checksum TEXT")
             .unwrap();
 
-        // First migrate() fails
-        assert!(migrate(&conn).is_err());
-        assert_eq!(get_schema_version(&conn).unwrap(), 2);
-
-        // "Fix" the issue by dropping and recreating the table without the
-        // conflicting column, simulating a repaired database.
-        conn.execute_batch("DROP TABLE assets; DROP TABLE sync_runs;")
-            .unwrap();
-        conn.execute_batch(SCHEMA_V1).unwrap();
-        conn.execute_batch(SCHEMA_V2).unwrap();
-
-        // Retry should succeed now
+        // Migration succeeds (idempotent) and advances version
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 

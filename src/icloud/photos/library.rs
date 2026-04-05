@@ -11,6 +11,7 @@ use super::queries::encode_params;
 use super::session::PhotosSession;
 use super::smart_folders::smart_folders;
 use crate::icloud::error::ICloudError;
+use crate::retry::RetryConfig;
 
 // Apple's sentinel folder IDs — these are containers, not real albums.
 const ROOT_FOLDER: &str = "----Root-Folder----";
@@ -30,6 +31,7 @@ pub struct PhotoLibrary {
     session: Box<dyn PhotosSession>,
     zone_id: Arc<Value>,
     library_type: Arc<str>,
+    retry_config: RetryConfig,
 }
 
 impl Clone for PhotoLibrary {
@@ -40,6 +42,7 @@ impl Clone for PhotoLibrary {
             session: self.session.clone_box(),
             zone_id: Arc::clone(&self.zone_id),
             library_type: Arc::clone(&self.library_type),
+            retry_config: self.retry_config,
         }
     }
 }
@@ -61,6 +64,7 @@ impl PhotoLibrary {
         session: Box<dyn PhotosSession>,
         zone_id: Arc<Value>,
         library_type: String,
+        retry_config: RetryConfig,
     ) -> Result<Self, ICloudError> {
         let url = format!(
             "{}/records/query?{}",
@@ -79,6 +83,7 @@ impl PhotoLibrary {
             &url,
             &body.to_string(),
             &[("Content-type", "text/plain")],
+            &retry_config,
         )
         .await
         .map_err(|e| {
@@ -114,6 +119,7 @@ impl PhotoLibrary {
             session,
             zone_id,
             library_type,
+            retry_config,
         })
     }
 
@@ -139,6 +145,7 @@ impl PhotoLibrary {
                             query_filter: def.query_filter,
                             page_size: DEFAULT_PAGE_SIZE,
                             zone_id: Arc::clone(&self.zone_id),
+                            retry_config: self.retry_config,
                         },
                         self.clone_session(),
                     ),
@@ -191,6 +198,7 @@ impl PhotoLibrary {
                             query_filter,
                             page_size: DEFAULT_PAGE_SIZE,
                             zone_id: Arc::clone(&self.zone_id),
+                            retry_config: self.retry_config,
                         },
                         self.clone_session(),
                     ),
@@ -212,6 +220,7 @@ impl PhotoLibrary {
                 query_filter: None,
                 page_size: DEFAULT_PAGE_SIZE,
                 zone_id: Arc::clone(&self.zone_id),
+                retry_config: self.retry_config,
             },
             self.clone_session(),
         )
@@ -232,6 +241,7 @@ impl PhotoLibrary {
             &url,
             &body.to_string(),
             &[("Content-type", "text/plain")],
+            &self.retry_config,
         )
         .await?;
 
@@ -265,6 +275,7 @@ impl PhotoLibrary {
             session,
             zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
             library_type: Arc::from("private"),
+            retry_config: RetryConfig::default(),
         }
     }
 }
@@ -302,6 +313,7 @@ mod tests {
             session: Box::new(StubSession),
             zone_id: Arc::new(zone_id),
             library_type: Arc::from("personal"),
+            retry_config: RetryConfig::default(),
         }
     }
 

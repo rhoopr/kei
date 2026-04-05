@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -528,9 +529,13 @@ async fn run_import_existing(
     let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
 
     tracing::info!("Initializing photos service...");
-    let photos_service =
-        icloud::photos::PhotosService::new(ckdatabasews_url.to_string(), session_box, params)
-            .await?;
+    let photos_service = icloud::photos::PhotosService::new(
+        ckdatabasews_url.to_string(),
+        session_box,
+        params,
+        retry::RetryConfig::default(),
+    )
+    .await?;
 
     let all_album = photos_service.all();
     let stream = all_album.photo_stream(args.recent, None, 1);
@@ -621,6 +626,7 @@ async fn run_import_existing(
                                 version_size.as_str(),
                                 &expected_path,
                                 &local_checksum,
+                                None,
                             )
                             .await
                         {
@@ -852,6 +858,10 @@ async fn run() -> anyhow::Result<()> {
 
     tracing::info!(concurrency = config.threads_num, "Starting kei");
 
+    if config.username.is_empty() {
+        anyhow::bail!("--username is required");
+    }
+
     let password_provider = make_password_provider(config.password);
 
     let auth_result = match auth::authenticate(
@@ -947,10 +957,20 @@ async fn run() -> anyhow::Result<()> {
         std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
     let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
 
+    let api_retry_config = retry::RetryConfig {
+        max_retries: config.max_retries,
+        base_delay_secs: config.retry_delay_secs,
+        max_delay_secs: 60,
+    };
+
     tracing::info!("Initializing photos service...");
-    let photos_service =
-        icloud::photos::PhotosService::new(ckdatabasews_url.to_string(), session_box, params)
-            .await?;
+    let photos_service = icloud::photos::PhotosService::new(
+        ckdatabasews_url.to_string(),
+        session_box,
+        params,
+        api_retry_config,
+    )
+    .await?;
 
     let mut photos_service = photos_service;
 
@@ -1002,6 +1022,24 @@ async fn run() -> anyhow::Result<()> {
         anyhow::bail!("--directory is required for downloading");
     }
 
+    // Validate download directory is writable before spending time on enumeration
+    tokio::fs::create_dir_all(&config.directory)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create download directory {}",
+                config.directory.display()
+            )
+        })?;
+    let probe = config.directory.join(".kei_probe");
+    tokio::fs::write(&probe, b"").await.with_context(|| {
+        format!(
+            "Download directory {} is not writable",
+            config.directory.display()
+        )
+    })?;
+    let _ = tokio::fs::remove_file(&probe).await;
+
     // Initialize state database
     let state_db: Option<Arc<dyn state::StateDb>> = {
         let db_path = config.cookie_directory.join(format!(
@@ -1032,12 +1070,7 @@ async fn run() -> anyhow::Result<()> {
                 Some(db as Arc<dyn state::StateDb>)
             }
             Err(e) => {
-                tracing::warn!(
-                    path = %db_path.display(),
-                    error = %e,
-                    "Failed to open state database, continuing without state tracking"
-                );
-                None
+                anyhow::bail!("Failed to open state database {}: {e}", db_path.display());
             }
         }
     };
@@ -1062,11 +1095,7 @@ async fn run() -> anyhow::Result<()> {
     let skip_created_after = config
         .skip_created_after
         .map(|d| d.with_timezone(&chrono::Utc));
-    let retry_config = retry::RetryConfig {
-        max_retries: config.max_retries,
-        base_delay_secs: config.retry_delay_secs,
-        max_delay_secs: 60,
-    };
+    let retry_config = api_retry_config;
     let live_photo_size = config.live_photo_size.to_asset_version_size();
 
     let build_download_config = |sync_mode: download::SyncMode| -> Arc<download::DownloadConfig> {
@@ -1247,6 +1276,9 @@ async fn run() -> anyhow::Result<()> {
                 // For full sync this is safe (state DB tracks individual failures for retry).
                 // For incremental sync, advancing the token on partial failure would lose
                 // change events for failed assets — they'd never appear in the next delta.
+                // Note: the token is stored after download_photos_with_sync returns, which
+                // means all batch flushes are complete. A crash here means the token is
+                // NOT advanced, so assets will replay on next sync (safe, not data loss).
                 let should_store_token =
                     matches!(sync_result.outcome, download::DownloadOutcome::Success);
                 if should_store_token {
