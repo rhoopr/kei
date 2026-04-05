@@ -224,10 +224,7 @@ mod tests {
         let msg = e.to_string();
 
         // Assert
-        assert!(
-            msg.contains("photo.jpg"),
-            "Display should include the path"
-        );
+        assert!(msg.contains("photo.jpg"), "Display should include the path");
         assert!(
             msg.contains("5000"),
             "Display should include expected bytes"
@@ -372,6 +369,9 @@ mod tests {
         let msg = e.to_string();
 
         // Assert
-        assert_eq!(msg, inner_msg, "Other variant Display should match inner error");
+        assert_eq!(
+            msg, inner_msg,
+            "Other variant Display should match inner error"
+        );
     }
 }

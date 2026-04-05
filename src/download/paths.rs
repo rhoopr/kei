@@ -862,13 +862,18 @@ mod tests {
     #[test]
     fn test_sanitize_path_component_unicode_with_traversal() {
         // Unicode album name with path traversal attempt
-        assert_eq!(sanitize_path_component("日本語/../secrets"), "日本語_secrets");
+        assert_eq!(
+            sanitize_path_component("日本語/../secrets"),
+            "日本語_secrets"
+        );
     }
 
     #[test]
     fn test_local_download_path_none_folder_structure() {
         let dir = Path::new("/photos");
-        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
         let result = local_download_path(dir, "none", &date, "IMG_0001.JPG");
         assert_eq!(result, PathBuf::from("/photos/IMG_0001.JPG"));
     }
@@ -876,7 +881,9 @@ mod tests {
     #[test]
     fn test_local_download_path_none_case_insensitive() {
         let dir = Path::new("/photos");
-        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
         assert_eq!(
             local_download_path(dir, "NONE", &date, "photo.jpg"),
             PathBuf::from("/photos/photo.jpg")
@@ -890,7 +897,9 @@ mod tests {
     #[test]
     fn test_local_download_path_date_based_folder() {
         let dir = Path::new("/photos");
-        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
         let result = local_download_path(dir, "{:%Y/%m/%d}", &date, "IMG_0001.JPG");
         assert_eq!(result, PathBuf::from("/photos/2025/06/15/IMG_0001.JPG"));
     }
@@ -907,15 +916,22 @@ mod tests {
     #[test]
     fn test_local_download_path_with_time_components() {
         let dir = Path::new("/photos");
-        let date = chrono::Local.with_ymd_and_hms(2025, 12, 31, 23, 59, 59).unwrap();
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 12, 31, 23, 59, 59)
+            .unwrap();
         let result = local_download_path(dir, "{:%Y/%m/%d/%H-%M-%S}", &date, "photo.jpg");
-        assert_eq!(result, PathBuf::from("/photos/2025/12/31/23-59-59/photo.jpg"));
+        assert_eq!(
+            result,
+            PathBuf::from("/photos/2025/12/31/23-59-59/photo.jpg")
+        );
     }
 
     #[test]
     fn test_expand_date_format_unknown_token_preserved() {
         // Unknown % tokens should keep the % sign
-        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
         let result = expand_date_format("%Y-%Z-%d", &date);
         // %Z is unknown, so "%" is kept, then "Z" is processed as literal
         assert_eq!(result, "2025-%Z-15");
@@ -923,7 +939,9 @@ mod tests {
 
     #[test]
     fn test_expand_date_format_trailing_percent() {
-        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
         let result = expand_date_format("%Y/%m/%d%", &date);
         assert_eq!(result, "2025/06/15%");
     }
@@ -937,7 +955,9 @@ mod tests {
     #[test]
     fn test_local_download_path_cleans_invalid_chars_in_filename() {
         let dir = Path::new("/photos");
-        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
         let result = local_download_path(dir, "none", &date, "photo:1.jpg");
         assert_eq!(result, PathBuf::from("/photos/photo1.jpg"));
     }

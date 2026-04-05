@@ -1629,7 +1629,10 @@ mod tests {
             let record = AssetRecord::new_pending(
                 id.to_string(),
                 VersionSizeKey::Original,
-                format!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8{:02x}", i),
+                format!(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8{:02x}",
+                    i
+                ),
                 format!("IMG_{}.JPG", 1000 + i),
                 now,
                 Some(now - chrono::Duration::days(1)),
@@ -1649,15 +1652,25 @@ mod tests {
         // Act: download two, fail one, leave one pending
         let path0 = dir.join("IMG_1000.JPG");
         fs::write(&path0, b"JPEG data").unwrap();
-        db.mark_downloaded(ids[0], "original", &path0, "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592")
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            ids[0],
+            "original",
+            &path0,
+            "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
+        )
+        .await
+        .unwrap();
 
         let path1 = dir.join("IMG_1001.JPG");
         fs::write(&path1, b"JPEG data 2").unwrap();
-        db.mark_downloaded(ids[1], "original", &path1, "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d")
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            ids[1],
+            "original",
+            &path1,
+            "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d",
+        )
+        .await
+        .unwrap();
 
         db.mark_failed(ids[2], "original", "HTTP 503 Service Unavailable")
             .await
@@ -1841,7 +1854,10 @@ mod tests {
             let record = AssetRecord::new_pending(
                 id.clone(),
                 VersionSizeKey::Original,
-                format!("ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48b{}", i),
+                format!(
+                    "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48b{}",
+                    i
+                ),
                 format!("IMG_{}.HEIC", 2000 + i),
                 Utc::now(),
                 None,
@@ -1861,7 +1877,10 @@ mod tests {
             let record = AssetRecord::new_pending(
                 format!("APn{}rWx5Z{}", i, i),
                 VersionSizeKey::Original,
-                format!("3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009{}", i),
+                format!(
+                    "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009{}",
+                    i
+                ),
                 format!("IMG_{}.JPG", 3000 + i),
                 Utc::now(),
                 None,
@@ -1877,7 +1896,10 @@ mod tests {
             let record = AssetRecord::new_pending(
                 id.clone(),
                 VersionSizeKey::Original,
-                format!("d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab3{}", i),
+                format!(
+                    "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab3{}",
+                    i
+                ),
                 format!("IMG_{}.MOV", 4000 + i),
                 Utc::now(),
                 None,

@@ -1446,10 +1446,7 @@ mod tests {
 
     #[test]
     fn asset_date_zero_timestamp_returns_epoch() {
-        let asset = make_asset(
-            json!({}),
-            json!({"fields": {"assetDate": {"value": 0.0}}}),
-        );
+        let asset = make_asset(json!({}), json!({"fields": {"assetDate": {"value": 0.0}}}));
         let dt = asset.asset_date();
         assert_eq!(dt, DateTime::UNIX_EPOCH);
     }
