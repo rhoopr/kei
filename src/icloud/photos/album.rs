@@ -47,23 +47,23 @@ fn determine_fetcher_count(total_items: u64, page_size: usize, concurrency: usiz
 #[derive(Debug)]
 pub struct PhotoAlbumConfig {
     pub params: Arc<HashMap<String, Value>>,
-    pub service_endpoint: String,
-    pub name: String,
-    pub list_type: String,
-    pub obj_type: String,
-    pub query_filter: Option<Value>,
+    pub service_endpoint: Arc<str>,
+    pub name: Arc<str>,
+    pub list_type: Arc<str>,
+    pub obj_type: Arc<str>,
+    pub query_filter: Option<Arc<Value>>,
     pub page_size: usize,
     pub zone_id: Arc<Value>,
 }
 
 pub struct PhotoAlbum {
-    pub(crate) name: String,
+    pub(crate) name: Arc<str>,
     params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
-    service_endpoint: String,
-    list_type: String,
-    obj_type: String,
-    query_filter: Option<Value>,
+    service_endpoint: Arc<str>,
+    list_type: Arc<str>,
+    obj_type: Arc<str>,
+    query_filter: Option<Arc<Value>>,
     page_size: usize,
     zone_id: Arc<Value>,
 }
@@ -110,7 +110,7 @@ impl PhotoAlbum {
                         "fieldName": "indexCountID",
                         "fieldValue": {
                             "type": "STRING_LIST",
-                            "value": [&self.obj_type]
+                            "value": [&*self.obj_type]
                         },
                         "comparator": "IN",
                     },
@@ -237,11 +237,11 @@ impl PhotoAlbum {
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
 
         let session = self.session.clone_box();
-        let service_endpoint = self.service_endpoint.clone();
+        let service_endpoint = Arc::clone(&self.service_endpoint);
         let params = Arc::clone(&self.params);
         let zone_id = Arc::clone(&self.zone_id);
         let initial_token = sync_token.to_string();
-        let album_name = self.name.clone();
+        let album_name = Arc::clone(&self.name);
 
         tokio::spawn(async move {
             let mut buffer = DeltaRecordBuffer::new();
@@ -462,11 +462,11 @@ impl PhotoAlbum {
         shared_sync_token: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
     ) -> JoinHandle<()> {
         let session = self.session.clone_box();
-        let service_endpoint = self.service_endpoint.clone();
+        let service_endpoint = Arc::clone(&self.service_endpoint);
         let params = Arc::clone(&self.params);
-        let name = self.name.clone();
-        let list_type = self.list_type.clone();
-        let query_filter = self.query_filter.clone();
+        let name = Arc::clone(&self.name);
+        let list_type = Arc::clone(&self.list_type);
+        let query_filter = self.query_filter.as_ref().map(Arc::clone);
         let page_size = self.page_size;
         let zone_id = Arc::clone(&self.zone_id);
 
@@ -609,7 +609,7 @@ impl PhotoAlbum {
 
     fn build_list_query(
         list_type: &str,
-        query_filter: &Option<Value>,
+        query_filter: &Option<Arc<Value>>,
         page_size: usize,
         zone_id: &Value,
         offset: u64,
@@ -692,14 +692,14 @@ mod tests {
         }
     }
 
-    fn make_album(page_size: usize, query_filter: Option<Value>, zone_id: Value) -> PhotoAlbum {
+    fn make_album(page_size: usize, query_filter: Option<Arc<Value>>, zone_id: Value) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
-                service_endpoint: "https://example.com".into(),
-                name: "TestAlbum".into(),
-                list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
-                obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("TestAlbum"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
                 query_filter,
                 page_size,
                 zone_id: Arc::new(zone_id),
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn test_list_query_with_extra_filter() {
         let extra = json!([{"fieldName": "albumName", "comparator": "EQUALS", "fieldValue": {"type": "STRING", "value": "Favorites"}}]);
-        let album = make_album(200, Some(extra), default_zone());
+        let album = make_album(200, Some(Arc::new(extra)), default_zone());
         let q = album.list_query(0, "ASCENDING");
         let filters = q["query"]["filterBy"].as_array().unwrap();
         assert_eq!(filters.len(), 3);
@@ -868,10 +868,10 @@ mod tests {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
-                service_endpoint: "https://example.com".into(),
-                name: "TestAlbum".into(),
-                list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
-                obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("TestAlbum"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
                 query_filter: None,
                 page_size,
                 zone_id: Arc::new(default_zone()),

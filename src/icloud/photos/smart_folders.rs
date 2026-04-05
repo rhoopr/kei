@@ -2,13 +2,15 @@
 //! for every iCloud account and use server-side query filters rather than
 //! explicit membership lists.
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 
 #[derive(Debug)]
 pub(crate) struct FolderDef {
     pub(crate) obj_type: &'static str,
     pub(crate) list_type: &'static str,
-    pub(crate) query_filter: Option<Value>,
+    pub(crate) query_filter: Option<Arc<Value>>,
 }
 
 pub(crate) fn smart_folder_filter(field: &str, value: &str) -> Value {
@@ -26,7 +28,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
             FolderDef {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Timelapse",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
-                query_filter: Some(smart_folder_filter("smartAlbum", "TIMELAPSE")),
+                query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "TIMELAPSE"))),
             },
         ),
         (
@@ -34,7 +36,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
             FolderDef {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Video",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
-                query_filter: Some(smart_folder_filter("smartAlbum", "VIDEO")),
+                query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "VIDEO"))),
             },
         ),
         (
@@ -42,7 +44,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
             FolderDef {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Slomo",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
-                query_filter: Some(smart_folder_filter("smartAlbum", "SLOMO")),
+                query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "SLOMO"))),
             },
         ),
         (
@@ -58,7 +60,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
             FolderDef {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Favorite",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
-                query_filter: Some(smart_folder_filter("smartAlbum", "FAVORITE")),
+                query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "FAVORITE"))),
             },
         ),
         (
@@ -66,7 +68,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
             FolderDef {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Panorama",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
-                query_filter: Some(smart_folder_filter("smartAlbum", "PANORAMA")),
+                query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "PANORAMA"))),
             },
         ),
         (
@@ -74,7 +76,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
             FolderDef {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Screenshot",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
-                query_filter: Some(smart_folder_filter("smartAlbum", "SCREENSHOT")),
+                query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "SCREENSHOT"))),
             },
         ),
         (
@@ -82,7 +84,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
             FolderDef {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Live",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
-                query_filter: Some(smart_folder_filter("smartAlbum", "LIVE")),
+                query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "LIVE"))),
             },
         ),
         (

@@ -25,21 +25,21 @@ const QUERY_ALL_OBJ: &str = "CPLAssetByAssetDateWithoutHiddenOrDeleted";
 const QUERY_FOLDER_LIST: &str = "CPLContainerRelationLiveByAssetDate";
 
 pub struct PhotoLibrary {
-    service_endpoint: String,
+    service_endpoint: Arc<str>,
     params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
     zone_id: Arc<Value>,
-    library_type: String,
+    library_type: Arc<str>,
 }
 
 impl Clone for PhotoLibrary {
     fn clone(&self) -> Self {
         Self {
-            service_endpoint: self.service_endpoint.clone(),
+            service_endpoint: Arc::clone(&self.service_endpoint),
             params: Arc::clone(&self.params),
             session: self.session.clone_box(),
             zone_id: Arc::clone(&self.zone_id),
-            library_type: self.library_type.clone(),
+            library_type: Arc::clone(&self.library_type),
         }
     }
 }
@@ -64,9 +64,11 @@ impl PhotoLibrary {
     ) -> Result<Self, ICloudError> {
         let url = format!(
             "{}/records/query?{}",
-            service_endpoint,
+            &service_endpoint,
             encode_params(&params)
         );
+        let service_endpoint: Arc<str> = Arc::from(service_endpoint);
+        let library_type: Arc<str> = Arc::from(library_type);
         let body = json!({
             "query": {"recordType": "CheckIndexingState"},
             "zoneID": &*zone_id,
@@ -130,10 +132,10 @@ impl PhotoLibrary {
                     PhotoAlbum::new(
                         PhotoAlbumConfig {
                             params: Arc::clone(&self.params),
-                            service_endpoint: self.service_endpoint.clone(),
-                            name: name.to_string(),
-                            list_type: def.list_type.to_string(),
-                            obj_type: def.obj_type.to_string(),
+                            service_endpoint: Arc::clone(&self.service_endpoint),
+                            name: Arc::from(name),
+                            list_type: Arc::from(def.list_type),
+                            obj_type: Arc::from(def.obj_type),
                             query_filter: def.query_filter,
                             page_size: DEFAULT_PAGE_SIZE,
                             zone_id: Arc::clone(&self.zone_id),
@@ -171,21 +173,21 @@ impl PhotoLibrary {
                     None => folder_id.clone(),
                 };
 
-                let query_filter = Some(json!([{
+                let query_filter = Some(Arc::new(json!([{
                     "fieldName": "parentId",
                     "comparator": "EQUALS",
                     "fieldValue": {"type": "STRING", "value": &folder_id},
-                }]));
+                }])));
 
                 albums.insert(
                     folder_name.clone(),
                     PhotoAlbum::new(
                         PhotoAlbumConfig {
                             params: Arc::clone(&self.params),
-                            service_endpoint: self.service_endpoint.clone(),
-                            name: folder_name,
-                            list_type: QUERY_FOLDER_LIST.to_string(),
-                            obj_type: folder_obj_type,
+                            service_endpoint: Arc::clone(&self.service_endpoint),
+                            name: Arc::from(folder_name),
+                            list_type: Arc::from(QUERY_FOLDER_LIST),
+                            obj_type: Arc::from(folder_obj_type),
                             query_filter,
                             page_size: DEFAULT_PAGE_SIZE,
                             zone_id: Arc::clone(&self.zone_id),
@@ -203,10 +205,10 @@ impl PhotoLibrary {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::clone(&self.params),
-                service_endpoint: self.service_endpoint.clone(),
-                name: String::new(),
-                list_type: QUERY_ALL_LIST.to_string(),
-                obj_type: QUERY_ALL_OBJ.to_string(),
+                service_endpoint: Arc::clone(&self.service_endpoint),
+                name: Arc::from(""),
+                list_type: Arc::from(QUERY_ALL_LIST),
+                obj_type: Arc::from(QUERY_ALL_OBJ),
                 query_filter: None,
                 page_size: DEFAULT_PAGE_SIZE,
                 zone_id: Arc::clone(&self.zone_id),
@@ -258,11 +260,11 @@ impl PhotoLibrary {
     /// Test-only constructor that bypasses the indexing check.
     pub(super) fn new_stub(session: Box<dyn PhotosSession>) -> Self {
         Self {
-            service_endpoint: "https://stub.example.com".to_string(),
+            service_endpoint: Arc::from("https://stub.example.com"),
             params: Arc::new(HashMap::new()),
             session,
             zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
-            library_type: "private".to_string(),
+            library_type: Arc::from("private"),
         }
     }
 }
@@ -295,11 +297,11 @@ mod tests {
     /// Build a `PhotoLibrary` directly (bypassing `new()` which requires a live session).
     fn make_library(zone_id: Value) -> PhotoLibrary {
         PhotoLibrary {
-            service_endpoint: "https://example.com".to_string(),
+            service_endpoint: Arc::from("https://example.com"),
             params: Arc::new(HashMap::new()),
             session: Box::new(StubSession),
             zone_id: Arc::new(zone_id),
-            library_type: "personal".to_string(),
+            library_type: Arc::from("personal"),
         }
     }
 
