@@ -1129,6 +1129,55 @@ mod tests {
         items[0].as_ref().expect("item should be Ok");
     }
 
+    // --- pagination edge case tests ---
+
+    /// CF-1: When a page returns only CPLAsset records (no CPLMaster), the
+    /// fetcher must advance the offset and continue to subsequent pages
+    /// instead of terminating prematurely.
+    #[tokio::test]
+    async fn test_photo_stream_continues_past_master_less_page() {
+        use tokio_stream::StreamExt;
+
+        // Page 1: Only CPLAsset records — no matching CPLMaster on this page.
+        let page1 = json!({
+            "records": [
+                {
+                    "recordName": "asset-orphan-1",
+                    "recordType": "CPLAsset",
+                    "fields": {
+                        "masterRef": {
+                            "value": {"recordName": "orphan-master", "zoneID": {"zoneName": "PrimarySync"}},
+                            "type": "REFERENCE"
+                        },
+                        "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                        "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                    },
+                    "recordChangeTag": "ct1"
+                }
+            ]
+        });
+
+        // Page 2: Valid paired CPLMaster + CPLAsset.
+        let page2 = canned_page("master-ok", None);
+
+        // Page 3: Empty → terminates.
+        let session = CannedSession::new(vec![page1, page2, json!({"records": []})]);
+        let album = make_album_with_session(1, Box::new(session));
+
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        tokio::pin!(stream);
+
+        let mut count = 0u32;
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+            count += 1;
+        }
+        assert_eq!(
+            count, 1,
+            "page 2's paired asset should be yielded despite page 1 having no masters"
+        );
+    }
+
     // --- changes_stream tests ---
 
     /// Build a canned `ChangesZoneResponse` JSON with the given records,

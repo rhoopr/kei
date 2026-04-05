@@ -5048,4 +5048,79 @@ mod tests {
 
         assert_eq!(seen_ids.len(), 2, "only 2 unique IDs should be tracked");
     }
+
+    /// NB-1: When a CancellationToken fires during a download pass with
+    /// concurrent tasks, the function must return promptly (well within the
+    /// Docker stop_grace_period) rather than blocking on the remaining stream.
+    #[tokio::test]
+    async fn shutdown_cancellation_exits_download_pass_promptly() {
+        use futures_util::stream;
+        use std::time::{Duration, Instant};
+        use tokio_util::sync::CancellationToken;
+
+        // Build a slow infinite stream of photo assets — yields one every 50ms.
+        // Without cancellation this would run forever.
+        let asset_stream = stream::unfold(0u32, |i| async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let asset = PhotoAsset::new(
+                json!({"recordName": format!("SHUTDOWN_{i}"), "fields": {
+                    "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                    "itemType": {"value": "public.jpeg"},
+                    "resOriginalRes": {"value": {
+                        "size": 100,
+                        "downloadURL": "http://127.0.0.1:1/photo.jpg",
+                        "fileChecksum": format!("ck_{i}")
+                    }},
+                    "resOriginalFileType": {"value": "public.jpeg"}
+                }}),
+                json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+            );
+            Some((Ok(asset) as anyhow::Result<PhotoAsset>, i + 1))
+        });
+
+        let dir = test_tmp_dir("shutdown_cancel_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let config = Arc::new(DownloadConfig {
+            directory: dir.clone(),
+            concurrent_downloads: 10,
+            retry: crate::retry::RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            },
+            no_progress_bar: true,
+            ..test_config()
+        });
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .build()
+            .expect("client");
+
+        let shutdown_token = CancellationToken::new();
+        let token_clone = shutdown_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            token_clone.cancel();
+        });
+
+        let start = Instant::now();
+        let result =
+            stream_and_download_from_stream(&client, asset_stream, &config, 10_000, shutdown_token)
+                .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "should return Ok after cancellation, got: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should exit promptly after cancellation, took {elapsed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
