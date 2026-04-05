@@ -4083,15 +4083,13 @@ mod tests {
             },
         );
 
-        let result =
+        let err =
             stream_and_download_from_stream(&client, panicking_stream, &config, 0, shutdown_token)
-                .await;
-
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+                .await
+                .expect_err("should propagate producer panic");
         assert!(
-            err_msg.contains("producer panicked"),
-            "Expected producer panic error, got: {err_msg}"
+            err.to_string().contains("producer panicked"),
+            "Expected producer panic error, got: {err}"
         );
     }
 }
