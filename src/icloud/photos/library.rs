@@ -64,7 +64,7 @@ impl PhotoLibrary {
     ) -> Result<Self, ICloudError> {
         let url = format!(
             "{}/records/query?{}",
-            &service_endpoint,
+            service_endpoint,
             encode_params(&params)
         );
         let service_endpoint: Arc<str> = Arc::from(service_endpoint);

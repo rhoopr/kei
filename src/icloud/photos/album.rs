@@ -486,7 +486,7 @@ impl PhotoAlbum {
 
                 let body = Self::build_list_query(
                     &list_type,
-                    &query_filter,
+                    query_filter.as_deref(),
                     page_size,
                     &zone_id,
                     offset,
@@ -599,7 +599,7 @@ impl PhotoAlbum {
     fn list_query(&self, offset: u64, direction: &str) -> Value {
         Self::build_list_query(
             &self.list_type,
-            &self.query_filter,
+            self.query_filter.as_deref(),
             self.page_size,
             &self.zone_id,
             offset,
@@ -609,7 +609,7 @@ impl PhotoAlbum {
 
     fn build_list_query(
         list_type: &str,
-        query_filter: &Option<Arc<Value>>,
+        query_filter: Option<&Value>,
         page_size: usize,
         zone_id: &Value,
         offset: u64,
