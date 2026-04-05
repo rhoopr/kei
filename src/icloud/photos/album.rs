@@ -452,7 +452,7 @@ impl PhotoAlbum {
     /// `start_offset` up to (but not including) `end_offset`, sending each
     /// `PhotoAsset` into `tx`. The task stops when:
     /// - `offset >= end_offset`
-    /// - the API returns no master records (end of album)
+    /// - the API returns zero records (end of album)
     /// - the per-fetcher `limit` is reached
     /// - the receiver is dropped
     ///
@@ -550,13 +550,19 @@ impl PhotoAlbum {
                 }
 
                 let records = query.records;
+                let record_count = records.len();
 
                 debug!(
                     album = %name,
-                    count = records.len(),
+                    count = record_count,
                     offset,
                     "Got records"
                 );
+
+                // No records at all means the API has no more data.
+                if record_count == 0 {
+                    break;
+                }
 
                 // Collect current page's records, trying to pair with
                 // buffered unpaired records from previous pages.
@@ -586,8 +592,22 @@ impl PhotoAlbum {
                     }
                 }
 
-                if page_masters.is_empty() && pending_masters.is_empty() {
-                    break;
+                if page_masters.is_empty() {
+                    // No masters on this page. Advance offset to avoid
+                    // re-requesting the same page forever. Use the unmatched
+                    // asset count as a proxy for rank positions covered
+                    // (each asset references one master/rank), with a minimum
+                    // of 1 to guarantee forward progress.
+                    let advance = page_assets.len().max(1) as u64;
+                    offset += advance;
+                    tracing::warn!(
+                        album = %name,
+                        record_count,
+                        advance,
+                        offset,
+                        "Page returned {record_count} records but no CPLMaster entries; \
+                         advancing offset by {advance}",
+                    );
                 }
 
                 let mut limit_reached = false;
