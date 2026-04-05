@@ -525,11 +525,21 @@ fn extract_skip_candidates<'a>(
         result.push((VersionSizeKey::from(effective_size), v.checksum.as_ref()));
     }
 
-    // Live photo companion
+    // Live photo companion (with fallback to LiveOriginal, mirrors primary logic)
     if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
-        if let Some(v) = get_version(&config.live_photo_size) {
+        let live = match get_version(&config.live_photo_size) {
+            Some(v) => Some((v, config.live_photo_size)),
+            None if config.live_photo_size != AssetVersionSize::LiveOriginal
+                && !config.force_size =>
+            {
+                get_version(&AssetVersionSize::LiveOriginal)
+                    .map(|v| (v, AssetVersionSize::LiveOriginal))
+            }
+            _ => None,
+        };
+        if let Some((v, effective_live_size)) = live {
             result.push((
-                VersionSizeKey::from(config.live_photo_size),
+                VersionSizeKey::from(effective_live_size),
                 v.checksum.as_ref(),
             ));
         }
@@ -768,8 +778,22 @@ fn filter_asset_to_tasks(
     }
 
     // Live photo MOV companion — only for images
+    // Falls back from LiveAdjusted → LiveOriginal when adjusted isn't available
+    // (mirrors the primary version fallback logic), unless --force-size is set.
     if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
-        if let Some(live_version) = get_version(&config.live_photo_size) {
+        let (live_version_opt, effective_live_size) = match get_version(&config.live_photo_size) {
+            Some(v) => (Some(v), config.live_photo_size),
+            None if config.live_photo_size != AssetVersionSize::LiveOriginal
+                && !config.force_size =>
+            {
+                match get_version(&AssetVersionSize::LiveOriginal) {
+                    Some(v) => (Some(v), AssetVersionSize::LiveOriginal),
+                    None => (None, config.live_photo_size),
+                }
+            }
+            _ => (None, config.live_photo_size),
+        };
+        if let Some(live_version) = live_version_opt {
             // Derive the MOV filename from the effective primary filename (which
             // includes any dedup suffix) so the HEIC and MOV remain visually paired.
             // Fall back to the base filename when no primary was produced (e.g. skipped).
@@ -867,7 +891,7 @@ fn filter_asset_to_tasks(
                     asset_id: asset.id().into(),
                     size: live_version.size,
                     created_local,
-                    version_size: VersionSizeKey::from(config.live_photo_size),
+                    version_size: VersionSizeKey::from(effective_live_size),
                 });
             }
         }
@@ -3350,6 +3374,53 @@ mod tests {
         let candidates = extract_skip_candidates(&asset, &config);
         // force_size prevents fallback — no primary version
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_live_adjusted_falls_back_to_live_original() {
+        let asset = photo_asset_with_live_photo(); // has LiveOriginal, no LiveAdjusted
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.force_size = false;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // Primary + live companion (fallback to LiveOriginal)
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[1].0, VersionSizeKey::LiveOriginal);
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_live_adjusted_force_size_no_fallback() {
+        let asset = photo_asset_with_live_photo(); // has LiveOriginal, no LiveAdjusted
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.force_size = true;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // force_size prevents fallback — only primary, no live companion
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_live_adjusted_falls_back_to_live_original() {
+        let asset = photo_asset_with_live_photo(); // has LiveOriginal, no LiveAdjusted
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.force_size = false;
+        let tasks = filter_asset_fresh(&asset, &config);
+        // Should produce 2 tasks: primary + live companion (fallback to LiveOriginal)
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].version_size, VersionSizeKey::LiveOriginal);
+        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+    }
+
+    #[test]
+    fn test_filter_live_adjusted_force_size_no_fallback() {
+        let asset = photo_asset_with_live_photo(); // has LiveOriginal, no LiveAdjusted
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.force_size = true;
+        let tasks = filter_asset_fresh(&asset, &config);
+        // force_size prevents fallback — only primary, no live companion
+        assert_eq!(tasks.len(), 1);
     }
 
     // ── hash_download_config additional sensitivity tests ──────────

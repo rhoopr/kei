@@ -66,15 +66,16 @@ fn check_apple_service_errors(body: &Value) -> Result<(), AuthError> {
                 .get("code")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            let message = first
+            let raw_message = first
                 .get("message")
                 .and_then(Value::as_str)
                 .filter(|m| !m.is_empty())
                 .or_else(|| first.get("title").and_then(Value::as_str))
                 .unwrap_or("Apple reported an error");
+            let message = enrich_service_error_message(code, raw_message);
             return Err(AuthError::ServiceError {
                 code: code.to_string(),
-                message: message.to_string(),
+                message,
             });
         }
     }
@@ -87,6 +88,21 @@ fn check_apple_service_errors(body: &Value) -> Result<(), AuthError> {
     }
 
     Ok(())
+}
+
+/// Enrich service error messages with user-friendly context based on the error code.
+fn enrich_service_error_message(code: &str, raw_message: &str) -> String {
+    let upper = code.to_ascii_uppercase();
+    if upper == "ZONE_NOT_FOUND" || upper == "AUTHENTICATION_FAILED" {
+        format!(
+            "{raw_message}. Your iCloud account may not be fully set up — \
+             please sign in at https://icloud.com to complete setup."
+        )
+    } else if upper == "ACCESS_DENIED" {
+        format!("{raw_message}. Please wait a few minutes then try again.")
+    } else {
+        raw_message.to_string()
+    }
 }
 
 /// Trigger a push notification to trusted devices for 2FA code entry.
@@ -286,8 +302,23 @@ pub async fn validate_token(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        tracing::debug!("Invalid authentication token");
-        return Err(AuthError::InvalidToken(text).into());
+        return match status.as_u16() {
+            421 | 450 => Err(AuthError::ServiceError {
+                code: format!("http_{}", status.as_u16()),
+                message: "Authentication required for this account. Please re-authenticate."
+                    .to_string(),
+            }
+            .into()),
+            s if s >= 500 => Err(AuthError::ServiceError {
+                code: format!("http_{s}"),
+                message: format!("Apple server error during validation (HTTP {s}): {text}"),
+            }
+            .into()),
+            _ => {
+                tracing::debug!("Invalid authentication token");
+                Err(AuthError::InvalidToken(text).into())
+            }
+        };
     }
 
     let response = reject_on_rscd(response).await?;
@@ -322,7 +353,22 @@ pub async fn authenticate_with_token(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(AuthError::FailedLogin(format!("Invalid authentication token: {text}")).into());
+        return match status.as_u16() {
+            421 | 450 => Err(AuthError::ServiceError {
+                code: format!("http_{}", status.as_u16()),
+                message: "Authentication required for this account. Please re-authenticate."
+                    .to_string(),
+            }
+            .into()),
+            s if s >= 500 => Err(AuthError::ServiceError {
+                code: format!("http_{s}"),
+                message: format!("Apple server error during login (HTTP {s}): {text}"),
+            }
+            .into()),
+            _ => {
+                Err(AuthError::FailedLogin(format!("Invalid authentication token: {text}")).into())
+            }
+        };
     }
 
     let response = reject_on_rscd(response).await?;
@@ -530,5 +576,60 @@ mod tests {
             .unwrap();
         let resp = Response::from(response);
         assert!(check_apple_rscd(&resp).is_none());
+    }
+
+    #[test]
+    fn test_enrich_zone_not_found() {
+        let msg = enrich_service_error_message("ZONE_NOT_FOUND", "Zone not found");
+        assert!(msg.contains("icloud.com"));
+        assert!(msg.contains("set up"));
+    }
+
+    #[test]
+    fn test_enrich_authentication_failed() {
+        let msg = enrich_service_error_message("AUTHENTICATION_FAILED", "Auth failed");
+        assert!(msg.contains("set up"));
+    }
+
+    #[test]
+    fn test_enrich_access_denied() {
+        let msg = enrich_service_error_message("ACCESS_DENIED", "Denied");
+        assert!(msg.contains("wait a few minutes"));
+    }
+
+    #[test]
+    fn test_enrich_other_code_unchanged() {
+        let msg = enrich_service_error_message("UNKNOWN_ERROR", "Something broke");
+        assert_eq!(msg, "Something broke");
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_zone_not_found_enriched() {
+        let body = serde_json::json!({
+            "service_errors": [
+                {"code": "ZONE_NOT_FOUND", "message": "Zone not found"}
+            ]
+        });
+        let err = check_apple_service_errors(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("icloud.com"),
+            "should mention icloud.com: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_check_apple_service_errors_access_denied_enriched() {
+        let body = serde_json::json!({
+            "service_errors": [
+                {"code": "ACCESS_DENIED", "message": "Access denied"}
+            ]
+        });
+        let err = check_apple_service_errors(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wait a few minutes"),
+            "should suggest waiting: {msg}"
+        );
     }
 }

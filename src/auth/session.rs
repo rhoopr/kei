@@ -31,13 +31,29 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7
 /// (HTTP requests) with exclusive writes (session refresh / re-auth).
 pub type SharedSession = Arc<tokio::sync::RwLock<Session>>;
 
+/// Maximum length for sanitized usernames used in file paths.
+/// Long usernames are truncated and suffixed with a hash to stay under OS limits.
+const MAX_SANITIZED_USERNAME_LEN: usize = 64;
+
 /// Sanitize a username by keeping only word characters (alphanumeric + underscore).
 /// Equivalent to Python's `re.match(r"\w", c)` filter.
+/// Truncates to [`MAX_SANITIZED_USERNAME_LEN`] with a hash suffix if too long,
+/// preventing OS "File name too long" errors.
 pub fn sanitize_username(username: &str) -> String {
-    username
+    let sanitized: String = username
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_')
-        .collect()
+        .collect();
+    if sanitized.len() <= MAX_SANITIZED_USERNAME_LEN {
+        sanitized
+    } else {
+        // Use a simple hash (FNV-like) to keep uniqueness in truncated names
+        let hash = sanitized.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let prefix_len = MAX_SANITIZED_USERNAME_LEN - 17; // room for "_" + 16 hex digits
+        format!("{}_{:016x}", &sanitized[..prefix_len], hash)
+    }
 }
 
 /// Check if a Set-Cookie header string represents an expired cookie.
@@ -608,6 +624,37 @@ mod tests {
     #[test]
     fn test_sanitize_username_empty() {
         assert_eq!(sanitize_username(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_username_long_truncated() {
+        let long_name = "a".repeat(500);
+        let sanitized = sanitize_username(&long_name);
+        assert!(
+            sanitized.len() <= MAX_SANITIZED_USERNAME_LEN,
+            "sanitized length {} exceeds max {}",
+            sanitized.len(),
+            MAX_SANITIZED_USERNAME_LEN
+        );
+    }
+
+    #[test]
+    fn test_sanitize_username_long_is_deterministic() {
+        let long_name = "a".repeat(500);
+        assert_eq!(sanitize_username(&long_name), sanitize_username(&long_name));
+    }
+
+    #[test]
+    fn test_sanitize_username_different_long_names_differ() {
+        let name1 = "a".repeat(500);
+        let name2 = "b".repeat(500);
+        assert_ne!(sanitize_username(&name1), sanitize_username(&name2));
+    }
+
+    #[test]
+    fn test_sanitize_username_at_boundary_not_truncated() {
+        let name = "a".repeat(MAX_SANITIZED_USERNAME_LEN);
+        assert_eq!(sanitize_username(&name), name);
     }
 
     #[test]

@@ -265,6 +265,39 @@ impl Config {
     ) -> anyhow::Result<Self> {
         let (username, password, domain, cookie_directory) = resolve_auth(&auth, toml.as_ref());
 
+        // Reject explicitly provided empty username/password (CLI value_parser
+        // catches the CLI case; this catches empty strings from TOML).
+        if auth.username.is_some()
+            || toml
+                .as_ref()
+                .and_then(|t| t.auth.as_ref()?.username.as_ref())
+                .is_some()
+        {
+            anyhow::ensure!(!username.is_empty(), "username must not be empty");
+        }
+        if let Some(ref pw) = password {
+            anyhow::ensure!(!pw.is_empty(), "password must not be empty");
+        }
+
+        // Validate cookie directory early when explicitly provided: check that
+        // the deepest existing ancestor is a directory (not a file), so we fail
+        // with a clear message rather than erroring deep in auth setup.
+        let cookie_dir_explicit = auth.cookie_directory.is_some()
+            || toml
+                .as_ref()
+                .and_then(|t| t.auth.as_ref()?.cookie_directory.as_ref())
+                .is_some();
+        if cookie_dir_explicit {
+            // Walk up until we find something that exists
+            if let Some(existing) = cookie_directory.ancestors().find(|a| a.exists()) {
+                anyhow::ensure!(
+                    existing.is_dir(),
+                    "cookie directory path contains a non-directory component: {}",
+                    existing.display()
+                );
+            }
+        }
+
         let toml_dl = toml.as_ref().and_then(|t| t.download.as_ref());
         let toml_retry = toml_dl.and_then(|d| d.retry.as_ref());
         let toml_filters = toml.as_ref().and_then(|t| t.filters.as_ref());
@@ -304,6 +337,9 @@ impl Config {
         // Retry
         let max_retries = resolve(sync.max_retries, toml_retry.and_then(|r| r.max_retries), 3);
         let retry_delay_secs = resolve(sync.retry_delay, toml_retry.and_then(|r| r.delay), 5);
+        if retry_delay_secs == 0 {
+            anyhow::bail!("retry delay must be >= 1, got 0");
+        }
 
         // Filters
         let library_str = resolve(
@@ -922,6 +958,71 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("watch interval"),
             "Error should mention watch interval"
+        );
+    }
+
+    #[test]
+    fn test_build_retry_delay_zero_from_toml_rejected() {
+        let toml_str = r#"
+            [download.retry]
+            delay = 0
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(default_auth(), default_sync(), Some(toml));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("retry delay"),
+            "Error should mention retry delay"
+        );
+    }
+
+    #[test]
+    fn test_build_empty_username_from_toml_rejected() {
+        let toml_str = r#"
+            [auth]
+            username = ""
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut auth = default_auth();
+        auth.username = None;
+        let result = Config::build(auth, default_sync(), Some(toml));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("username"),
+            "Error should mention username"
+        );
+    }
+
+    #[test]
+    fn test_build_empty_password_from_toml_rejected() {
+        let toml_str = r#"
+            [auth]
+            password = ""
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(default_auth(), default_sync(), Some(toml));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("password"),
+            "Error should mention password"
+        );
+    }
+
+    #[test]
+    fn test_build_cookie_directory_under_file_rejected() {
+        // Create a regular file, then try to use a path under it as cookie dir
+        let tmp = std::env::temp_dir().join("kei_config_test_cookie_file");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::write(&tmp, b"not a dir").unwrap();
+        let path = tmp.join("nested").join("cookies");
+        let mut auth = default_auth();
+        auth.cookie_directory = Some(path.to_string_lossy().to_string());
+        let result = Config::build(auth, default_sync(), None);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("cookie directory"),
+            "Error should mention cookie directory"
         );
     }
 

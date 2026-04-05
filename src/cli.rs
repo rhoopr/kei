@@ -4,18 +4,36 @@ use crate::types::{
 };
 use clap::{Parser, Subcommand};
 
+/// Reject empty strings at CLI parse time.
+fn non_empty_string(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        Err("value must not be empty".to_string())
+    } else {
+        Ok(s.to_string())
+    }
+}
+
+/// Validate that a string is exactly 6 ASCII digits.
+fn parse_2fa_code(s: &str) -> Result<String, String> {
+    if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
+        Ok(s.to_string())
+    } else {
+        Err("must be exactly 6 digits".to_string())
+    }
+}
+
 /// Authentication arguments shared across all commands and subcommands.
 /// Username is optional at the clap level; validated at runtime after TOML merge.
 #[derive(Parser, Debug, Clone)]
 pub struct AuthArgs {
     /// Apple ID email address
-    #[arg(short = 'u', long, env = "ICLOUD_USERNAME")]
+    #[arg(short = 'u', long, env = "ICLOUD_USERNAME", value_parser = non_empty_string)]
     pub username: Option<String>,
 
     /// iCloud password (if not provided, will prompt).
     /// WARNING: passing via --password is visible in process listings.
     /// Prefer the `ICLOUD_PASSWORD` environment variable instead.
-    #[arg(short = 'p', long, env = "ICLOUD_PASSWORD")]
+    #[arg(short = 'p', long, env = "ICLOUD_PASSWORD", value_parser = non_empty_string)]
     pub password: Option<String>,
 
     /// iCloud domain (com or cn)
@@ -139,8 +157,8 @@ pub struct SyncArgs {
     #[arg(long)]
     pub max_retries: Option<u32>,
 
-    /// Initial retry delay in seconds (default: 5)
-    #[arg(long)]
+    /// Initial retry delay in seconds (default: 5, minimum: 1)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub retry_delay: Option<u64>,
 
     /// Temp file suffix for partial downloads (default: .kei-tmp).
@@ -251,6 +269,7 @@ pub struct SubmitCodeArgs {
     pub auth: AuthArgs,
 
     /// 6-digit 2FA code from your trusted device
+    #[arg(value_parser = parse_2fa_code)]
     pub code: String,
 }
 
@@ -1198,6 +1217,56 @@ mod tests {
         } else {
             panic!("Expected SubmitCode command");
         }
+    }
+
+    // ── input validation ────────────────────────────────────────────
+
+    #[test]
+    fn test_empty_username_rejected() {
+        let args = ["kei", "--username", ""];
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_empty_password_rejected() {
+        let mut args = base_args();
+        args.extend(["--password", ""]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_non_digits() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", "abcdef"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_too_short() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", "12345"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_too_long() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", "1234567"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_empty() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", ""]).is_err());
+    }
+
+    #[test]
+    fn test_retry_delay_rejects_zero() {
+        let mut args = base_args();
+        args.extend(["--retry-delay", "0"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_retry_delay_accepts_one() {
+        let mut args = base_args();
+        args.extend(["--retry-delay", "1"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.retry_delay, Some(1));
     }
 
     // ── no-incremental / reset-sync-token flags ───────────────────

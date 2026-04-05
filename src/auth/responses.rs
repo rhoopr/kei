@@ -60,13 +60,15 @@ impl AccountLoginResponse {
     /// `hasError` is true or `service_errors` is non-empty.
     pub fn check_errors(&self) -> Result<(), AuthError> {
         if let Some(err) = self.service_errors.first() {
+            let raw_message = if err.message.is_empty() {
+                err.title.clone().unwrap_or_else(|| "unknown".to_string())
+            } else {
+                err.message.clone()
+            };
+            let message = enrich_error_message(&err.code, &raw_message);
             return Err(AuthError::ServiceError {
                 code: err.code.clone(),
-                message: if err.message.is_empty() {
-                    err.title.clone().unwrap_or_else(|| "unknown".to_string())
-                } else {
-                    err.message.clone()
-                },
+                message,
             });
         }
         if self.has_error {
@@ -76,6 +78,21 @@ impl AccountLoginResponse {
             });
         }
         Ok(())
+    }
+}
+
+/// Enrich service error messages with user-friendly context based on the error code.
+fn enrich_error_message(code: &str, raw_message: &str) -> String {
+    let upper = code.to_ascii_uppercase();
+    if upper == "ZONE_NOT_FOUND" || upper == "AUTHENTICATION_FAILED" {
+        format!(
+            "{raw_message}. Your iCloud account may not be fully set up — \
+             please sign in at https://icloud.com to complete setup."
+        )
+    } else if upper == "ACCESS_DENIED" {
+        format!("{raw_message}. Please wait a few minutes then try again.")
+    } else {
+        raw_message.to_string()
     }
 }
 
@@ -230,6 +247,45 @@ mod tests {
         let json = r#"{"hsaTrustedBrowser": true}"#;
         let resp: AccountLoginResponse = serde_json::from_str(json).unwrap();
         assert!(resp.check_errors().is_ok());
+    }
+
+    #[test]
+    fn test_check_errors_zone_not_found_enriched() {
+        let json = r#"{
+            "service_errors": [{"code": "ZONE_NOT_FOUND", "message": "Zone not found"}]
+        }"#;
+        let resp: AccountLoginResponse = serde_json::from_str(json).unwrap();
+        let err = resp.check_errors().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("icloud.com"),
+            "should mention icloud.com: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_check_errors_authentication_failed_enriched() {
+        let json = r#"{
+            "service_errors": [{"code": "AUTHENTICATION_FAILED", "message": "Auth failed"}]
+        }"#;
+        let resp: AccountLoginResponse = serde_json::from_str(json).unwrap();
+        let err = resp.check_errors().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("set up"), "should suggest setup: {msg}");
+    }
+
+    #[test]
+    fn test_check_errors_access_denied_enriched() {
+        let json = r#"{
+            "service_errors": [{"code": "ACCESS_DENIED", "message": "Access denied"}]
+        }"#;
+        let resp: AccountLoginResponse = serde_json::from_str(json).unwrap();
+        let err = resp.check_errors().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wait a few minutes"),
+            "should suggest waiting: {msg}"
+        );
     }
 
     #[test]
