@@ -88,12 +88,19 @@ fn expand_date_format(format_str: &str, date: &DateTime<Local>) -> String {
     result
 }
 
-/// Clean a filename by removing characters that are invalid on common
-/// filesystems: `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`.
+/// Clean a filename by replacing characters that are invalid on common
+/// filesystems (`/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`) and control
+/// characters (including NUL) with `_`.
 pub(crate) fn clean_filename(filename: &str) -> String {
     filename
         .chars()
-        .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -102,7 +109,7 @@ pub(crate) fn clean_filename(filename: &str) -> String {
 ///
 /// - Strips leading/trailing dots and spaces
 /// - Replaces `..` sequences with `_`
-/// - Removes filesystem-invalid characters via `clean_filename()`
+/// - Replaces filesystem-invalid characters via `clean_filename()`
 /// - Prefixes Windows reserved names (CON, NUL, PRN, etc.) with `_`
 pub(crate) fn sanitize_path_component(name: &str) -> String {
     // First clean invalid filesystem characters
@@ -481,8 +488,8 @@ mod tests {
 
     #[test]
     fn test_clean_filename() {
-        assert_eq!(clean_filename("photo:1.jpg"), "photo1.jpg");
-        assert_eq!(clean_filename("a/b\\c*d?e\"f<g>h|i"), "abcdefghi");
+        assert_eq!(clean_filename("photo:1.jpg"), "photo_1.jpg");
+        assert_eq!(clean_filename("a/b\\c*d?e\"f<g>h|i"), "a_b_c_d_e_f_g_h_i");
         assert_eq!(clean_filename("normal.jpg"), "normal.jpg");
     }
 
@@ -769,11 +776,11 @@ mod tests {
 
     #[test]
     fn test_sanitize_path_component_traversal() {
-        // clean_filename removes "/" so "../etc/passwd" → "..etcpasswd" → "_etcpasswd"
-        assert_eq!(sanitize_path_component("../etc/passwd"), "_etcpasswd");
+        // clean_filename replaces "/" with "_" so "../etc/passwd" → ".._etc_passwd" → "__etc_passwd"
+        assert_eq!(sanitize_path_component("../etc/passwd"), "__etc_passwd");
         assert_eq!(sanitize_path_component(".."), "_");
-        // "foo/../bar" → clean removes "/" → "foo..bar" → replace ".." → "foo_bar"
-        assert_eq!(sanitize_path_component("foo/../bar"), "foo_bar");
+        // "foo/../bar" → clean replaces "/" → "foo_.._bar" → replace ".." → "foo___bar"
+        assert_eq!(sanitize_path_component("foo/../bar"), "foo___bar");
     }
 
     #[test]
@@ -826,11 +833,7 @@ mod tests {
 
     #[test]
     fn test_clean_filename_null_bytes() {
-        // Null bytes could exploit C-based filesystem APIs
-        assert_eq!(clean_filename("photo\0.jpg"), "photo\0.jpg");
-        // Note: clean_filename only strips /:*?"<>|\ — null bytes pass through.
-        // This documents current behavior. If null byte sanitization is needed,
-        // it should be added to clean_filename.
+        assert_eq!(clean_filename("photo\0.jpg"), "photo_.jpg");
     }
 
     #[test]
@@ -840,15 +843,13 @@ mod tests {
 
     #[test]
     fn test_clean_filename_all_invalid_chars() {
-        assert_eq!(clean_filename("/:*?\"<>|\\"), "");
+        assert_eq!(clean_filename("/:*?\"<>|\\"), "_________");
     }
 
     #[test]
     fn test_sanitize_path_component_control_characters() {
-        // Control characters (tabs, newlines) should be kept by current impl
-        // since clean_filename only removes specific chars
         let result = sanitize_path_component("album\ttab\nnewline");
-        assert_eq!(result, "album\ttab\nnewline");
+        assert_eq!(result, "album_tab_newline");
     }
 
     #[test]
@@ -864,7 +865,7 @@ mod tests {
         // Unicode album name with path traversal attempt
         assert_eq!(
             sanitize_path_component("日本語/../secrets"),
-            "日本語_secrets"
+            "日本語___secrets"
         );
     }
 
@@ -959,7 +960,7 @@ mod tests {
             .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
             .unwrap();
         let result = local_download_path(dir, "none", &date, "photo:1.jpg");
-        assert_eq!(result, PathBuf::from("/photos/photo1.jpg"));
+        assert_eq!(result, PathBuf::from("/photos/photo_1.jpg"));
     }
 
     #[test]
