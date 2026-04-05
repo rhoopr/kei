@@ -23,7 +23,7 @@ impl PhotosSession for reqwest::Client {
         for &(k, v) in headers {
             builder = builder.header(k, v);
         }
-        let resp = builder.send().await?;
+        let resp = builder.send().await?.error_for_status()?;
         let json: Value = resp.json().await?;
         Ok(json)
     }
@@ -575,5 +575,54 @@ mod tests {
             reason: String::new(),
         };
         assert_eq!(err.to_string(), "Invalid sync token: ");
+    }
+
+    /// Helper: start a TCP listener that responds with the given HTTP status code.
+    async fn spawn_status_server(status_line: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            let response = format!("{status_line}\r\nContent-Length: 0\r\n\r\n");
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_post_503_is_retryable() {
+        let addr = spawn_status_server("HTTP/1.1 503 Service Unavailable").await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/test");
+        let err = PhotosSession::post(&client, &url, "{}", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(classify_api_error(&err), RetryAction::Retry);
+    }
+
+    #[tokio::test]
+    async fn test_post_429_is_retryable() {
+        let addr = spawn_status_server("HTTP/1.1 429 Too Many Requests").await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/test");
+        let err = PhotosSession::post(&client, &url, "{}", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(classify_api_error(&err), RetryAction::Retry);
+    }
+
+    #[tokio::test]
+    async fn test_post_421_aborts() {
+        let addr = spawn_status_server("HTTP/1.1 421 Misdirected Request").await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/test");
+        let err = PhotosSession::post(&client, &url, "{}", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(classify_api_error(&err), RetryAction::Abort);
     }
 }
