@@ -116,7 +116,7 @@ GET  {cdn_url}                File download (supports Range headers)
 ## 3. Sync Mode Decision
 
 ```
-src/main.rs (lines 921-946)
+src/main.rs (lines ~1295-1330)
 
                     ┌───────────────────┐
                     │ --no-incremental  │──── YES ──▶ SyncMode::Full
@@ -143,7 +143,7 @@ src/main.rs (lines 921-946)
 ## 4. Watch Mode Pre-Check
 
 ```
-src/main.rs (lines 950-998)
+src/main.rs (lines ~1226-1280)
 
 Only in watch mode + incremental sync:
 
@@ -258,9 +258,9 @@ stream_and_download_from_stream()
   │    ├─ Optionally set EXIF DateTimeOriginal            │
   │    └─ Compute local SHA256 for DB storage             │
   │                                                       │
-  │  Batch DB updates (50-item batches):                  │
-  │    ├─ mark_downloaded_batch() on success              │
-  │    └─ mark_failed_batch() on exhausted retries        │
+  │  Per-item DB updates (inline, after each download):   │
+  │    ├─ mark_downloaded() on success                    │
+  │    └─ mark_failed() on exhausted retries              │
   └───────────────────────────────────────────────────────┘
 ```
 
@@ -279,7 +279,7 @@ stream_and_download_from_stream()
 ## 6. SQLite State Management
 
 ```
-src/state/schema.rs (version 3)
+src/state/schema.rs (version 4)
 src/state/db.rs     (SqliteStateDb)
 
 Database: ~/.config/kei/cookies/{user}.db  (WAL mode, NORMAL sync)
@@ -302,6 +302,7 @@ Database: ~/.config/kei/cookies/{user}.db  (WAL mode, NORMAL sync)
 │ download_attempts INTEGER Number of download attempts                │
 │ last_error       TEXT     Last error message (if failed)             │
 │ local_checksum   TEXT     SHA256 of the downloaded file              │
+│ download_checksum TEXT    Checksum at time of download (v4)          │
 └──────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────── sync_runs ────────────────────────────────────┐
@@ -335,9 +336,9 @@ Per-sync pre-load (O(1) lookups during stream):
 Per-asset (during stream):
   upsert_seen()              Mark asset as pending (insert or update)
 
-Per-download (batch, every 50 items):
-  mark_downloaded_batch()    Status → downloaded, store local_path + checksum
-  mark_failed_batch()        Status → failed, store error message
+Per-download (inline, after each item):
+  mark_downloaded()          Status → downloaded, store local_path + checksum
+  mark_failed()              Status → failed, store error message
 
 Token management:
   get_metadata(key)          Load stored sync token
