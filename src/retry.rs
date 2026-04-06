@@ -67,7 +67,7 @@ where
     C: Fn(&E) -> RetryAction,
     E: std::fmt::Display,
 {
-    let total_attempts = config.max_retries + 1;
+    let total_attempts = config.max_retries.saturating_add(1);
 
     for attempt in 0..total_attempts {
         match operation().await {
