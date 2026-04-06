@@ -1,14 +1,63 @@
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use anyhow::Context;
 use base64::Engine;
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 use super::error::DownloadError;
 use crate::retry::{self, RetryAction, RetryConfig};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// HTTP response from a download request.
+pub(super) struct DownloadResponse {
+    pub status: u16,
+    pub content_length: Option<u64>,
+    pub stream: Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>,
+}
+
+/// Trait abstracting HTTP GET for the download pipeline.
+///
+/// Implemented by `reqwest::Client` for production use and by test stubs
+/// for exercising the full download-to-disk flow without a network.
+#[async_trait::async_trait]
+pub(super) trait DownloadClient: Send + Sync {
+    async fn fetch(
+        &self,
+        url: &str,
+        resume_from: Option<u64>,
+    ) -> Result<DownloadResponse, BoxError>;
+}
+
+#[async_trait::async_trait]
+impl DownloadClient for Client {
+    async fn fetch(
+        &self,
+        url: &str,
+        resume_from: Option<u64>,
+    ) -> Result<DownloadResponse, BoxError> {
+        let mut request = Client::get(self, url);
+        if let Some(offset) = resume_from {
+            request = request.header("Range", format!("bytes={offset}-"));
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let content_length = response.content_length();
+        let stream = response
+            .bytes_stream()
+            .map(|r| r.map_err(|e| Box::new(e) as BoxError));
+        Ok(DownloadResponse {
+            status,
+            content_length,
+            stream: Box::pin(stream),
+        })
+    }
+}
 
 /// Derive a deterministic .part filename from the checksum so that
 /// concurrent downloads of different files don't collide. Base32-encoded
@@ -44,8 +93,8 @@ pub(super) struct DownloadOpts {
 }
 
 /// Download a file with retry support and optional expected-size verification.
-pub(super) async fn download_file(
-    client: &Client,
+pub(super) async fn download_file<C: DownloadClient>(
+    client: &C,
     url: &str,
     download_path: &Path,
     checksum: &str,
@@ -85,8 +134,8 @@ pub(super) async fn download_file(
 /// If a .part file already exists, sends a Range request to resume from where
 /// it left off. Falls back to a fresh download if the server doesn't support
 /// Range or returns an unexpected status.
-async fn attempt_download(
-    client: &Client,
+async fn attempt_download<C: DownloadClient>(
+    client: &C,
     url: &str,
     download_path: &Path,
     part_path: &Path,
@@ -100,25 +149,30 @@ async fn attempt_download(
         _ => 0,
     };
 
-    let mut request = client.get(url);
-    if resume_offset > 0 {
+    let resume_from = if resume_offset > 0 {
         tracing::info!(
             path = %path_str,
             resume_offset,
             "Resuming download (partial file exists)"
         );
-        request = request.header("Range", format!("bytes={resume_offset}-"));
-    }
+        Some(resume_offset)
+    } else {
+        None
+    };
 
-    let response = request.send().await.map_err(|e| DownloadError::Http {
-        source: Box::new(e),
-        path: path_str.clone(),
-        status: 0,
-        content_length: None,
-        bytes_written: 0,
-    })?;
+    let response = client
+        .fetch(url, resume_from)
+        .await
+        .map_err(|e| DownloadError::Http {
+            source: e,
+            path: path_str.clone(),
+            status: 0,
+            content_length: None,
+            bytes_written: 0,
+        })?;
 
-    let status = response.status().as_u16();
+    let status = response.status;
+    let is_success = (200..300).contains(&status);
 
     // 206 = resumed successfully, 200 = server ignored Range (start over)
     // `effective_offset` tracks the actual byte offset used for the content-length
@@ -126,7 +180,7 @@ async fn attempt_download(
     // so effective_offset must be 0 (not the stale resume_offset).
     let (mut bytes_written, truncate, effective_offset) = match status {
         206 if resume_offset > 0 => (resume_offset, false, resume_offset),
-        _ if response.status().is_success() => {
+        _ if is_success => {
             if resume_offset > 0 {
                 tracing::info!(
                     status,
@@ -144,7 +198,7 @@ async fn attempt_download(
         }
     };
 
-    let content_length = response.content_length();
+    let content_length = response.content_length;
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -157,11 +211,11 @@ async fn attempt_download(
             DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
         })?;
 
-    let mut stream = response.bytes_stream();
+    let mut stream = response.stream;
     let stream_result: Result<(), DownloadError> = async {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| DownloadError::Http {
-                source: Box::new(e),
+                source: e,
                 path: path_str.clone(),
                 status,
                 content_length,
@@ -732,6 +786,358 @@ mod tests {
         assert!(
             !err.is_session_expired(),
             "size mismatch is not a session error"
+        );
+    }
+
+    // --- attempt_download end-to-end tests via StubDownloadClient ---
+
+    /// Stub HTTP client for testing the download pipeline without a network.
+    struct StubDownloadClient {
+        status: u16,
+        content_length: Option<u64>,
+        body: Vec<u8>,
+    }
+
+    impl StubDownloadClient {
+        fn ok(body: &[u8]) -> Self {
+            Self {
+                status: 200,
+                content_length: Some(body.len() as u64),
+                body: body.to_vec(),
+            }
+        }
+
+        fn with_status(mut self, status: u16) -> Self {
+            self.status = status;
+            self
+        }
+
+        fn without_content_length(mut self) -> Self {
+            self.content_length = None;
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DownloadClient for StubDownloadClient {
+        async fn fetch(
+            &self,
+            _url: &str,
+            _resume_from: Option<u64>,
+        ) -> Result<DownloadResponse, BoxError> {
+            let chunks: Vec<Result<Bytes, BoxError>> = vec![Ok(Bytes::from(self.body.clone()))];
+            Ok(DownloadResponse {
+                status: self.status,
+                content_length: self.content_length,
+                stream: Box::pin(futures_util::stream::iter(chunks)),
+            })
+        }
+    }
+
+    /// Helper: set up a temp directory with download and part paths.
+    fn setup_download_dir(name: &str, ext: &str) -> (PathBuf, PathBuf) {
+        let dir = PathBuf::from("/tmp/claude/attempt_download_test").join(format!(
+            "{}_{}",
+            std::process::id(),
+            name
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let download_path = dir.join(format!("{name}.{ext}"));
+        let part_path = dir.join(format!("{name}.part"));
+        // Clean up any leftover files from previous runs
+        let _ = std::fs::remove_file(&download_path);
+        let _ = std::fs::remove_file(&part_path);
+        (download_path, part_path)
+    }
+
+    #[tokio::test]
+    async fn attempt_download_happy_path_writes_and_renames() {
+        let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = StubDownloadClient::ok(&jpeg_body);
+        let (download_path, part_path) = setup_download_dir("happy", "jpg");
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(download_path.exists(), "final file should exist");
+        assert!(
+            !part_path.exists(),
+            ".part file should be gone after rename"
+        );
+        assert_eq!(std::fs::read(&download_path).unwrap(), jpeg_body);
+    }
+
+    #[tokio::test]
+    async fn attempt_download_skip_rename_leaves_part_file() {
+        let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0];
+        let client = StubDownloadClient::ok(&jpeg_body);
+        let (download_path, part_path) = setup_download_dir("skip_rename", "jpg");
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(part_path.exists(), ".part file should remain");
+        assert!(!download_path.exists(), "final path should not exist");
+        assert_eq!(std::fs::read(&part_path).unwrap(), jpeg_body);
+    }
+
+    #[tokio::test]
+    async fn attempt_download_content_length_mismatch_removes_part() {
+        // Server claims 100 bytes but body is only 8
+        let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = StubDownloadClient {
+            status: 200,
+            content_length: Some(100),
+            body: body.to_vec(),
+        };
+        let (download_path, part_path) = setup_download_dir("cl_mismatch", "jpg");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::ContentLengthMismatch { .. }),
+            "expected ContentLengthMismatch, got: {err}"
+        );
+        assert!(!part_path.exists(), ".part should be removed on mismatch");
+        assert!(!download_path.exists(), "final path must not exist");
+    }
+
+    #[tokio::test]
+    async fn attempt_download_expected_size_mismatch_removes_part() {
+        // Body is 8 bytes but caller expects 1024
+        let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = StubDownloadClient::ok(&body).without_content_length();
+        let (download_path, part_path) = setup_download_dir("size_mismatch", "jpg");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            Some(1024),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::ContentLengthMismatch { .. }),
+            "expected ContentLengthMismatch, got: {err}"
+        );
+        assert!(!part_path.exists(), ".part should be removed");
+    }
+
+    #[tokio::test]
+    async fn attempt_download_invalid_content_removes_part() {
+        // HTML error page served as a .heic file
+        let html = b"<!DOCTYPE html><html>Service Unavailable</html>";
+        let client = StubDownloadClient::ok(html);
+        let (download_path, part_path) = setup_download_dir("invalid_content", "heic");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::InvalidContent { .. }),
+            "expected InvalidContent, got: {err}"
+        );
+        assert!(
+            !part_path.exists(),
+            ".part should be removed on bad content"
+        );
+        assert!(!download_path.exists(), "final path must not exist");
+    }
+
+    #[tokio::test]
+    async fn attempt_download_http_error_returns_http_status() {
+        let client = StubDownloadClient::ok(b"").with_status(503);
+        let (download_path, part_path) = setup_download_dir("http_err", "jpg");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::HttpStatus { status: 503, .. }),
+            "expected HttpStatus 503, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_download_resume_appends_to_existing_part() {
+        let (download_path, part_path) = setup_download_dir("resume", "jpg");
+
+        // Pre-create a partial .part file (first 2 bytes of JPEG header)
+        let first_half = [0xFF, 0xD8];
+        std::fs::write(&part_path, &first_half).unwrap();
+
+        // Stub returns 206 with the remaining bytes
+        let second_half = vec![0xFF, 0xE0, 0x00, 0x10];
+        let client = StubDownloadClient {
+            status: 206,
+            content_length: Some(second_half.len() as u64),
+            body: second_half.clone(),
+        };
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let content = std::fs::read(&download_path).unwrap();
+        assert_eq!(content, [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]);
+        assert!(!part_path.exists(), ".part should be renamed");
+    }
+
+    #[tokio::test]
+    async fn attempt_download_resume_fallback_truncates_and_rewrites() {
+        let (download_path, part_path) = setup_download_dir("resume_fallback", "jpg");
+
+        // Pre-create a .part file with stale data
+        std::fs::write(&part_path, b"stale partial data").unwrap();
+
+        // Server ignores Range and returns 200 with the full body
+        let full_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = StubDownloadClient::ok(&full_body);
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let content = std::fs::read(&download_path).unwrap();
+        assert_eq!(
+            content, full_body,
+            "server returned 200 (full body), so stale .part should be overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_download_expected_size_matches_succeeds() {
+        let body = [0xFF, 0xD8, 0xFF, 0xE0];
+        let client = StubDownloadClient::ok(&body).without_content_length();
+        let (download_path, part_path) = setup_download_dir("size_ok", "jpg");
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            Some(body.len() as u64),
+        )
+        .await
+        .unwrap();
+
+        assert!(download_path.exists());
+    }
+
+    /// Verify that resume_from is correctly forwarded to the client.
+    #[tokio::test]
+    async fn attempt_download_passes_resume_offset_to_client() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct RecordingClient {
+            resume_from: AtomicU64,
+            body: Vec<u8>,
+        }
+
+        #[async_trait::async_trait]
+        impl DownloadClient for RecordingClient {
+            async fn fetch(
+                &self,
+                _url: &str,
+                resume_from: Option<u64>,
+            ) -> Result<DownloadResponse, BoxError> {
+                self.resume_from
+                    .store(resume_from.unwrap_or(0), Ordering::SeqCst);
+                let chunks: Vec<Result<Bytes, BoxError>> = vec![Ok(Bytes::from(self.body.clone()))];
+                Ok(DownloadResponse {
+                    status: if resume_from.is_some() { 206 } else { 200 },
+                    content_length: Some(self.body.len() as u64),
+                    stream: Box::pin(futures_util::stream::iter(chunks)),
+                })
+            }
+        }
+
+        let (download_path, part_path) = setup_download_dir("offset_pass", "bin");
+
+        // Pre-create .part with 100 bytes
+        std::fs::write(&part_path, vec![0xAAu8; 100]).unwrap();
+
+        let remaining = [0xBB, 0xCC, 0xDD];
+        let client = RecordingClient {
+            resume_from: AtomicU64::new(0),
+            body: remaining.to_vec(),
+        };
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            client.resume_from.load(Ordering::SeqCst),
+            100,
+            "client should receive the .part file size as resume offset"
         );
     }
 }

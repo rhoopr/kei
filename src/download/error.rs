@@ -22,7 +22,7 @@ pub(crate) enum DownloadError {
 
     #[error("HTTP error downloading {path} (status={status}, content_length={content_length:?}, bytes_so_far={bytes_written}): {source}")]
     Http {
-        source: Box<reqwest::Error>,
+        source: Box<dyn std::error::Error + Send + Sync>,
         path: String,
         status: u16,
         content_length: Option<u64>,
@@ -43,7 +43,7 @@ impl From<std::io::Error> for DownloadError {
 }
 
 // Verify boxing keeps enum small — guards against regressions from adding unboxed large variants.
-const _: () = assert!(std::mem::size_of::<DownloadError>() <= 80);
+const _: () = assert!(std::mem::size_of::<DownloadError>() <= 88);
 
 impl DownloadError {
     /// Whether this error is transient and worth retrying.
