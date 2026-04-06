@@ -322,8 +322,12 @@ pub async fn authenticate_srp(
     let referer = format!("{}/", endpoints.auth_root);
     let overrides: [(&str, &str); 2] = [("Origin", endpoints.auth_root), ("Referer", &referer)];
 
-    let init_headers =
-        get_auth_headers(domain, client_id, transport.session_data(), Some(&overrides))?;
+    let init_headers = get_auth_headers(
+        domain,
+        client_id,
+        transport.session_data(),
+        Some(&overrides),
+    )?;
 
     tracing::debug!(apple_id = %apple_id, "Initiating SRP authentication");
 
@@ -412,8 +416,12 @@ pub async fn authenticate_srp(
     // Rebuild headers — init response may have rotated scnt/session_id
     let referer = format!("{}/", endpoints.auth_root);
     let overrides: [(&str, &str); 2] = [("Origin", endpoints.auth_root), ("Referer", &referer)];
-    let complete_headers =
-        get_auth_headers(domain, client_id, transport.session_data(), Some(&overrides))?;
+    let complete_headers = get_auth_headers(
+        domain,
+        client_id,
+        transport.session_data(),
+        Some(&overrides),
+    )?;
     let complete_url = format!(
         "{}/signin/complete?isRememberMeEnabled=true",
         endpoints.auth
@@ -445,13 +453,11 @@ pub async fn authenticate_srp(
             .into());
         }
     } else if response.is_client_error() || response.is_server_error() {
-        return Err(
-            AuthError::FailedLogin(format!(
-                "Invalid email/password combination: {}",
-                response.text()
-            ))
-            .into(),
-        );
+        return Err(AuthError::FailedLogin(format!(
+            "Invalid email/password combination: {}",
+            response.text()
+        ))
+        .into());
     }
 
     Ok(())
@@ -614,9 +620,12 @@ mod tests {
 
     #[tokio::test]
     async fn srp_init_401_returns_failed_login() {
-        let err = run_srp(vec![SrpResponse { status: 401, body: vec![] }])
-            .await
-            .unwrap_err();
+        let err = run_srp(vec![SrpResponse {
+            status: 401,
+            body: vec![],
+        }])
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("Failed to initiate SRP"));
     }
 
@@ -640,7 +649,9 @@ mod tests {
         }])
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("Failed to parse SRP init response"));
+        assert!(err
+            .to_string()
+            .contains("Failed to parse SRP init response"));
     }
 
     #[tokio::test]
@@ -658,7 +669,10 @@ mod tests {
     async fn srp_happy_path() {
         run_srp(vec![
             valid_init_response(),
-            SrpResponse { status: 200, body: vec![] },
+            SrpResponse {
+                status: 200,
+                body: vec![],
+            },
         ])
         .await
         .unwrap();
@@ -668,7 +682,10 @@ mod tests {
     async fn srp_complete_409_signals_2fa_required() {
         run_srp(vec![
             valid_init_response(),
-            SrpResponse { status: 409, body: vec![] },
+            SrpResponse {
+                status: 409,
+                body: vec![],
+            },
         ])
         .await
         .unwrap();
@@ -678,8 +695,14 @@ mod tests {
     async fn srp_complete_412_repair_succeeds() {
         run_srp(vec![
             valid_init_response(),
-            SrpResponse { status: 412, body: vec![] },
-            SrpResponse { status: 200, body: vec![] },
+            SrpResponse {
+                status: 412,
+                body: vec![],
+            },
+            SrpResponse {
+                status: 200,
+                body: vec![],
+            },
         ])
         .await
         .unwrap();
@@ -689,8 +712,14 @@ mod tests {
     async fn srp_complete_412_repair_fails() {
         let err = run_srp(vec![
             valid_init_response(),
-            SrpResponse { status: 412, body: vec![] },
-            SrpResponse { status: 500, body: b"repair broken".to_vec() },
+            SrpResponse {
+                status: 412,
+                body: vec![],
+            },
+            SrpResponse {
+                status: 500,
+                body: b"repair broken".to_vec(),
+            },
         ])
         .await
         .unwrap_err();
@@ -702,7 +731,10 @@ mod tests {
     async fn srp_complete_client_error_returns_failed_login() {
         let err = run_srp(vec![
             valid_init_response(),
-            SrpResponse { status: 403, body: b"forbidden".to_vec() },
+            SrpResponse {
+                status: 403,
+                body: b"forbidden".to_vec(),
+            },
         ])
         .await
         .unwrap_err();
@@ -714,7 +746,10 @@ mod tests {
     async fn srp_complete_server_error_returns_failed_login() {
         let err = run_srp(vec![
             valid_init_response(),
-            SrpResponse { status: 502, body: b"bad gateway".to_vec() },
+            SrpResponse {
+                status: 502,
+                body: b"bad gateway".to_vec(),
+            },
         ])
         .await
         .unwrap_err();
