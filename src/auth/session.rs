@@ -98,6 +98,27 @@ fn parse_legacy_cookies(contents: &str) -> Vec<CookieEntry> {
         .collect()
 }
 
+/// Atomically write `data` to `path` via a temp file + rename.
+/// Sets 0o600 permissions on Unix before renaming, so the file is never
+/// world-readable even momentarily.
+async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    fs::write(&tmp, data).await.with_context(|| {
+        format!("Failed to write temp file {}", tmp.display())
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    fs::rename(&tmp, path).await.with_context(|| {
+        format!("Failed to rename {} to {}", tmp.display(), path.display())
+    })?;
+    Ok(())
+}
+
 /// HTTP session wrapper that persists cookies and session data to disk,
 /// allowing authentication to survive across process restarts.
 #[allow(clippy::struct_field_names)]
@@ -370,16 +391,11 @@ impl Session {
         if session_changed {
             let session_path = self.session_path();
             let json = serde_json::to_string_pretty(&self.session_data)?;
-            fs::write(&session_path, &json).await.with_context(|| {
-                format!("Failed to write session data to {}", session_path.display())
-            })?;
-            #[cfg(unix)]
-            {
-                // Session files contain auth tokens — restrict to owner-only
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                fs::set_permissions(&session_path, perms).await?;
-            }
+            atomic_write(&session_path, json.as_bytes())
+                .await
+                .with_context(|| {
+                    format!("Failed to write session data to {}", session_path.display())
+                })?;
             tracing::debug!("Saved session data to file");
         }
 
@@ -461,15 +477,12 @@ impl Session {
             }
         }
 
-        fs::write(&cookiejar_path, serde_json::to_string_pretty(&entries)?)
-            .await
-            .with_context(|| format!("Failed to write cookies to {}", cookiejar_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&cookiejar_path, perms).await?;
-        }
+        atomic_write(
+            &cookiejar_path,
+            serde_json::to_string_pretty(&entries)?.as_bytes(),
+        )
+        .await
+        .with_context(|| format!("Failed to write cookies to {}", cookiejar_path.display()))?;
 
         Ok(())
     }
@@ -818,5 +831,43 @@ mod tests {
             .expect("Should recover from corrupt session file");
 
         assert!(session.session_data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_no_partial_file_on_success() {
+        let dir = test_dir("atomic_write");
+        let path = dir.join("test_file");
+
+        atomic_write(&path, b"hello world").await.unwrap();
+
+        assert!(path.exists());
+        assert!(!dir.join("test_file.tmp").exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_preserves_existing_on_overwrite() {
+        let dir = test_dir("atomic_overwrite");
+        let path = dir.join("data");
+
+        std::fs::write(&path, "original").unwrap();
+        atomic_write(&path, b"updated").await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated");
+        assert!(!dir.join("data.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_atomic_write_sets_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("atomic_perms");
+        let path = dir.join("secret");
+
+        atomic_write(&path, b"sensitive data").await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "File should be owner-only, got {:o}", mode);
     }
 }
