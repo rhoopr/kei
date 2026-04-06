@@ -445,13 +445,7 @@ async fn build_download_tasks(
         let assets = album_result?;
 
         for asset in &assets {
-            let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-            let parent_dir = paths::local_download_dir(
-                &config.directory,
-                &config.folder_structure,
-                &created_local,
-            );
-            dir_cache.ensure_dir_async(&parent_dir).await;
+            pre_ensure_asset_dir(&mut dir_cache, asset, config).await;
             tasks.extend(filter_asset_to_tasks(
                 asset,
                 config,
@@ -592,6 +586,20 @@ fn version_with_fallback<'a>(
         }
         _ => None,
     }
+}
+
+/// Pre-populate the `DirCache` for the asset's date-based parent directory
+/// on the blocking threadpool, so that subsequent sync `DirCache` lookups
+/// inside `filter_asset_to_tasks` are guaranteed cache-hits.
+async fn pre_ensure_asset_dir(
+    dir_cache: &mut paths::DirCache,
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) {
+    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+    let parent =
+        paths::local_download_dir(&config.directory, &config.folder_structure, &created_local);
+    dir_cache.ensure_dir_async(&parent).await;
 }
 
 /// Apply content filters (type, date range) and local existence check,
@@ -1347,10 +1355,7 @@ async fn download_photos_incremental(
             continue;
         }
 
-        let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-        let parent_dir =
-            paths::local_download_dir(&config.directory, &config.folder_structure, &created_local);
-        dir_cache.ensure_dir_async(&parent_dir).await;
+        pre_ensure_asset_dir(&mut dir_cache, asset, config).await;
         tasks.extend(filter_asset_to_tasks(
             asset,
             config,
@@ -1503,13 +1508,7 @@ where
                         continue;
                     }
 
-                    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-                    let parent_dir = paths::local_download_dir(
-                        &config.directory,
-                        &config.folder_structure,
-                        &created_local,
-                    );
-                    dir_cache.ensure_dir_async(&parent_dir).await;
+                    pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
                     for task in &tasks {
@@ -1543,13 +1542,7 @@ where
                 break;
             }
             let asset = result?;
-            let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-            let parent_dir = paths::local_download_dir(
-                &config.directory,
-                &config.folder_structure,
-                &created_local,
-            );
-            dir_cache.ensure_dir_async(&parent_dir).await;
+            pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
             let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
             for task in &tasks {
                 tracing::info!(path = %task.download_path.display(), "[DRY RUN] Would download");
@@ -1726,16 +1719,7 @@ where
                         }
                     }
 
-                    // Pre-populate the DirCache on the blocking threadpool so
-                    // that the sync filter_asset_to_tasks call below never blocks
-                    // the tokio worker with read_dir/stat syscalls.
-                    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-                    let parent_dir = paths::local_download_dir(
-                        &config.directory,
-                        &config.folder_structure,
-                        &created_local,
-                    );
-                    dir_cache.ensure_dir_async(&parent_dir).await;
+                    pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
 
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
