@@ -181,7 +181,7 @@ fn hash_download_config(config: &DownloadConfig) -> String {
     // skipping newly-eligible assets on incremental syncs.
     hasher.update(format!("{:?}", config.skip_created_before).as_bytes());
     hasher.update(format!("{:?}", config.skip_created_after).as_bytes());
-    hasher.update(config.recent.map_or(0u64, u64::from).to_le_bytes());
+    hasher.update(format!("{:?}", config.recent).as_bytes());
     hasher.update([u8::from(config.force_size)]);
     hasher.update([u8::from(config.skip_videos)]);
     hasher.update([u8::from(config.skip_photos)]);
