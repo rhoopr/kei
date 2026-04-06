@@ -174,7 +174,13 @@ fn available_disk_space(_path: &Path) -> Option<u64> {
 /// sources, this re-executes/re-reads each time, supporting password rotation
 /// and keeping no password in memory between auth cycles.
 fn make_password_provider(source: password::PasswordSource) -> impl Fn() -> Option<SecretString> {
-    move || source.resolve().ok().flatten()
+    move || match source.resolve() {
+        Ok(pw) => pw,
+        Err(e) => {
+            tracing::debug!(error = %e, "Password source resolution failed");
+            None
+        }
+    }
 }
 
 /// Build a password provider from CLI auth args and resolved auth fields.
@@ -852,9 +858,21 @@ struct LibraryState {
     albums: Vec<icloud::photos::PhotoAlbum>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
+fn main() -> ExitCode {
+    // Snapshot and scrub the password env var while truly single-threaded,
+    // before the tokio runtime creates worker threads.
+    let env_password = std::env::var("ICLOUD_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    // SAFETY: no other threads exist yet — the tokio runtime has not been built.
+    unsafe { std::env::remove_var("ICLOUD_PASSWORD") };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    match rt.block_on(run(env_password)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // 2FA required is not a failure — kei checked auth, told the user
@@ -879,7 +897,7 @@ async fn main() -> ExitCode {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run() -> anyhow::Result<()> {
+async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
     // Migrate legacy icloudpd-rs paths before loading config, so the
@@ -984,10 +1002,13 @@ async fn run() -> anyhow::Result<()> {
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
+    // Inject the password captured from env before the runtime started,
+    // since we cleared ICLOUD_PASSWORD before Cli::parse() could see it.
+    let mut auth = auth;
+    if auth.password.is_none() {
+        auth.password = env_password;
+    }
     let config = config::Config::build(auth, sync, toml_config)?;
-
-    // Clear password from environment to prevent leakage
-    config::clear_password_env();
 
     // Install password redaction now that we know the password
     if let Some(ref pw) = config.password {

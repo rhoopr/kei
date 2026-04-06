@@ -378,7 +378,7 @@ fn validate_downloaded_content(
         .map_or(header, |pos| &header[pos..]);
 
     if trimmed.starts_with(b"<!")
-        || trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html")
+        || (trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html"))
     {
         return Err(DownloadError::InvalidContent {
             path: download_path.display().to_string(),

@@ -471,7 +471,10 @@ impl DirCache {
             move || read_dir_entries(&d)
         })
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!(dir = %dir_buf.display(), error = %e, "Failed to read directory entries");
+            FxHashMap::default()
+        });
         self.dirs.insert(dir_buf, entries);
     }
 

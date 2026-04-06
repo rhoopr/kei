@@ -52,7 +52,14 @@ pub fn sanitize_username(username: &str) -> String {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
         });
         let prefix_len = MAX_SANITIZED_USERNAME_LEN - 17; // room for "_" + 16 hex digits
-        format!("{}_{:016x}", &sanitized[..prefix_len], hash)
+        // Find the last char boundary at or before prefix_len to avoid
+        // panicking on multi-byte UTF-8 (e.g. CJK usernames).
+        let prefix_end = sanitized[..prefix_len]
+            .char_indices()
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(prefix_len);
+        format!("{}_{:016x}", &sanitized[..prefix_end], hash)
     }
 }
 

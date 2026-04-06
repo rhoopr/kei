@@ -242,11 +242,12 @@ impl CredentialStore {
 
     fn file_delete(&self) -> Result<()> {
         let cred_path = self.credential_file_path();
-        if cred_path.exists() {
-            std::fs::remove_file(&cred_path).with_context(|| {
-                format!("Failed to delete credential file: {}", cred_path.display())
-            })?;
+        if !cred_path.exists() {
+            anyhow::bail!("No credential file found: {}", cred_path.display());
         }
+        std::fs::remove_file(&cred_path).with_context(|| {
+            format!("Failed to delete credential file: {}", cred_path.display())
+        })?;
         // Leave the key file — it may be shared if the user re-stores later
         Ok(())
     }

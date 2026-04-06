@@ -298,14 +298,6 @@ fn resolve_password_command(
         .or_else(|| toml_auth.and_then(|a| a.password_command.clone()))
 }
 
-/// Clear the password environment variable to prevent leakage via
-/// `/proc/[pid]/environ`, `docker inspect`, or child processes.
-pub(crate) fn clear_password_env() {
-    // SAFETY: called during single-threaded init before tokio spawns workers.
-    // `remove_var` is unsafe since Rust 1.66 due to thread-safety concerns,
-    // but we call this before any worker threads exist.
-    unsafe { std::env::remove_var("ICLOUD_PASSWORD") };
-}
 
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
