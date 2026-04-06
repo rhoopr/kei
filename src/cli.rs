@@ -54,15 +54,15 @@ pub struct SyncArgs {
     pub directory: Option<String>,
 
     /// Only authenticate (create/update session tokens)
-    #[arg(long, conflicts_with = "watch_with_interval")]
+    #[arg(long, conflicts_with_all = ["watch_with_interval", "list_albums", "list_libraries"])]
     pub auth_only: bool,
 
     /// List available albums
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long, conflicts_with_all = ["watch_with_interval", "list_libraries"])]
     pub list_albums: bool,
 
     /// List available libraries
-    #[arg(long)]
+    #[arg(long, conflicts_with = "watch_with_interval")]
     pub list_libraries: bool,
 
     /// Album(s) to download
@@ -961,6 +961,41 @@ mod tests {
     fn test_auth_only_conflicts_with_watch() {
         let mut args = base_args();
         args.extend(["--auth-only", "--watch-with-interval", "300"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_auth_only_conflicts_with_list_albums() {
+        let mut args = base_args();
+        args.extend(["--auth-only", "--list-albums"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_auth_only_conflicts_with_list_libraries() {
+        let mut args = base_args();
+        args.extend(["--auth-only", "--list-libraries"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_list_albums_conflicts_with_watch() {
+        let mut args = base_args();
+        args.extend(["--list-albums", "--watch-with-interval", "300"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_list_libraries_conflicts_with_watch() {
+        let mut args = base_args();
+        args.extend(["--list-libraries", "--watch-with-interval", "300"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_list_albums_conflicts_with_list_libraries() {
+        let mut args = base_args();
+        args.extend(["--list-albums", "--list-libraries"]);
         assert!(Cli::try_parse_from(&args).is_err());
     }
 
