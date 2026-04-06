@@ -112,17 +112,17 @@ pub(crate) fn clean_filename(filename: &str) -> String {
         return cleaned;
     }
 
-    // Preserve the extension (e.g. ".jpg") when truncating
-    let (stem, ext) = match cleaned.rfind('.') {
-        Some(dot) => (&cleaned[..dot], &cleaned[dot..]),
-        None => (cleaned.as_str(), ""),
-    };
+    // Preserve the extension (e.g. ".jpg") when truncating, but only if it
+    // leaves room for at least one stem character.
+    if let Some(dot) = cleaned.rfind('.') {
+        let ext = &cleaned[dot..];
+        if ext.len() < MAX_FILENAME_BYTES {
+            let stem_end = cleaned[..dot].floor_char_boundary(MAX_FILENAME_BYTES - ext.len());
+            return format!("{}{ext}", &cleaned[..stem_end]);
+        }
+    }
 
-    let stem_budget = MAX_FILENAME_BYTES.saturating_sub(ext.len());
-    // Truncate stem at a UTF-8 char boundary
-    let truncated_stem = &stem[..stem.floor_char_boundary(stem_budget)];
-
-    format!("{truncated_stem}{ext}")
+    cleaned[..cleaned.floor_char_boundary(MAX_FILENAME_BYTES)].to_string()
 }
 
 /// Sanitize a path component (e.g. album name) to prevent path traversal
@@ -177,11 +177,6 @@ pub(crate) fn sanitize_path_component(name: &str) -> String {
         ) {
             return format!("_{}", trimmed);
         }
-    }
-
-    // Truncate at 255 bytes on a char boundary
-    if trimmed.len() > MAX_FILENAME_BYTES {
-        return trimmed[..trimmed.floor_char_boundary(MAX_FILENAME_BYTES)].to_string();
     }
 
     trimmed.to_string()
@@ -906,6 +901,13 @@ mod tests {
         // Stem should be truncated to a whole number of 3-byte chars
         let stem_part = &result[..result.len() - 4];
         assert_eq!(stem_part.len() % 3, 0);
+    }
+
+    #[test]
+    fn test_clean_filename_truncates_oversized_extension() {
+        let filename = format!("a.{}", "x".repeat(300));
+        let result = clean_filename(&filename);
+        assert_eq!(result.len(), 255);
     }
 
     #[test]
