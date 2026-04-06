@@ -76,6 +76,28 @@ struct CookieEntry {
     cookie: String,
 }
 
+/// Parse legacy tab-separated cookie file format into `CookieEntry` values.
+///
+/// Each line is `URL<TAB>cookie-string`. Comment lines (`#`), blank lines,
+/// and `Set-Cookie3:` headers are skipped. Lines without a tab are ignored.
+fn parse_legacy_cookies(contents: &str) -> Vec<CookieEntry> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("Set-Cookie3:")
+            {
+                return None;
+            }
+            let (url_str, cookie_str) = trimmed.split_once('\t')?;
+            Some(CookieEntry {
+                url: url_str.to_string(),
+                cookie: cookie_str.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// HTTP session wrapper that persists cookies and session data to disk,
 /// allowing authentication to survive across process restarts.
 #[allow(clippy::struct_field_names)]
@@ -160,34 +182,19 @@ impl Session {
                 Ok(contents) => {
                     let now = chrono::Utc::now();
                     // Try JSON format first, fall back to legacy tab-separated format
-                    if let Ok(entries) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
-                        for entry in entries {
-                            if is_cookie_expired(&entry.cookie, &now) {
-                                tracing::debug!(url = %entry.url, "Pruning expired cookie");
-                                continue;
-                            }
-                            if let Ok(url) = entry.url.parse::<url::Url>() {
-                                cookie_jar.add_cookie_str(&entry.cookie, &url);
-                            }
+                    let entries =
+                        if let Ok(entries) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
+                            entries
+                        } else {
+                            parse_legacy_cookies(&contents)
+                        };
+                    for entry in entries {
+                        if is_cookie_expired(&entry.cookie, &now) {
+                            tracing::debug!(url = %entry.url, "Pruning expired cookie");
+                            continue;
                         }
-                    } else {
-                        for line in contents.lines() {
-                            let trimmed = line.trim();
-                            if trimmed.starts_with('#')
-                                || trimmed.is_empty()
-                                || trimmed.starts_with("Set-Cookie3:")
-                            {
-                                continue;
-                            }
-                            if let Some((url_str, cookie_str)) = trimmed.split_once('\t') {
-                                if is_cookie_expired(cookie_str, &now) {
-                                    tracing::debug!(url = %url_str, "Pruning expired cookie");
-                                    continue;
-                                }
-                                if let Ok(url) = url_str.parse::<url::Url>() {
-                                    cookie_jar.add_cookie_str(cookie_str, &url);
-                                }
-                            }
+                        if let Ok(url) = entry.url.parse::<url::Url>() {
+                            cookie_jar.add_cookie_str(&entry.cookie, &url);
                         }
                     }
                     #[cfg(unix)]
@@ -748,5 +755,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(mtime1, mtime2, "File should not have been rewritten");
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_basic() {
+        let input = "https://example.com\tfoo=bar\nhttps://other.com\tbaz=qux";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].url, "https://example.com");
+        assert_eq!(entries[0].cookie, "foo=bar");
+        assert_eq!(entries[1].url, "https://other.com");
+        assert_eq!(entries[1].cookie, "baz=qux");
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_skips_comments_and_blanks() {
+        let input = "# This is a comment\n\nhttps://example.com\tfoo=bar\n  \n# Another comment";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cookie, "foo=bar");
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_skips_set_cookie3_header() {
+        let input = "Set-Cookie3: some header\nhttps://example.com\tfoo=bar";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_skips_malformed_lines() {
+        let input = "no-tab-here\nhttps://example.com\tfoo=bar\nalso no tab";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_empty_input() {
+        assert!(parse_legacy_cookies("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_preserves_cookie_with_tabs() {
+        // Tab in cookie value after the first split
+        let input = "https://example.com\tfoo=bar\textra";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cookie, "foo=bar\textra");
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_session_file_recovers() {
+        let dir = test_dir("corrupt_session");
+        let sanitized = sanitize_username("user@test.com");
+        let session_path = dir.join(format!("{sanitized}.session"));
+
+        std::fs::write(&session_path, "not valid json {{{{").unwrap();
+
+        let session = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .expect("Should recover from corrupt session file");
+
+        assert!(session.session_data.is_empty());
     }
 }
