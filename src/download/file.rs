@@ -373,6 +373,7 @@ fn validate_downloaded_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_base32_encode() {
@@ -459,9 +460,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_sha256_known_content() {
-        let dir = PathBuf::from("/tmp/claude/sha256_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("known.bin");
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("known.bin");
         std::fs::write(&file_path, b"hello world").unwrap();
 
         let hash = compute_sha256(&file_path).await.unwrap();
@@ -473,7 +473,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_sha256_nonexistent_file() {
-        let file_path = PathBuf::from("/tmp/claude/sha256_test/nonexistent_file.bin");
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("nonexistent_file.bin");
         let result = compute_sha256(&file_path).await;
         assert!(result.is_err());
     }
@@ -496,9 +497,8 @@ mod tests {
     #[tokio::test]
     async fn compute_sha256_empty_file_returns_known_hash() {
         // Arrange: create an empty file
-        let dir = PathBuf::from("/tmp/claude/sha256_empty_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("empty.bin");
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("empty.bin");
         std::fs::write(&file_path, b"").unwrap();
 
         // Act
@@ -514,9 +514,8 @@ mod tests {
     #[tokio::test]
     async fn compute_sha256_large_file_streams_without_loading_all_into_memory() {
         // Arrange: write a 2 MiB file (large enough to confirm streaming via io::copy)
-        let dir = PathBuf::from("/tmp/claude/sha256_large_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("large.bin");
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("large.bin");
 
         let chunk = vec![0xABu8; 1024];
         {
@@ -588,21 +587,17 @@ mod tests {
 
     // --- Content validation tests ---
 
-    fn write_temp_file(name: &str, content: &[u8]) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir()
-            .join("claude")
-            .join("validate_content_test")
-            .join(format!("{}_{}", std::process::id(), name));
-        std::fs::create_dir_all(&dir).unwrap();
-        let part_path = dir.join(format!("{name}.part"));
-        let download_path = dir.join(name);
+    fn write_temp_file(name: &str, content: &[u8]) -> (PathBuf, PathBuf, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let part_path = dir.path().join(format!("{name}.part"));
+        let download_path = dir.path().join(name);
         std::fs::write(&part_path, content).unwrap();
-        (part_path, download_path)
+        (part_path, download_path, dir)
     }
 
     #[test]
     fn validate_rejects_html_doctype_as_jpeg() {
-        let (part, dest) = write_temp_file("photo.jpg", b"<!DOCTYPE html><html>");
+        let (part, dest, _dir) = write_temp_file("photo.jpg", b"<!DOCTYPE html><html>");
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
         assert!(matches!(err, DownloadError::InvalidContent { .. }));
         assert!(err.is_retryable());
@@ -610,20 +605,21 @@ mod tests {
 
     #[test]
     fn validate_rejects_html_tag_as_heic() {
-        let (part, dest) = write_temp_file("photo.heic", b"<html><head></head>");
+        let (part, dest, _dir) = write_temp_file("photo.heic", b"<html><head></head>");
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
         assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 
     #[test]
     fn validate_accepts_valid_jpeg() {
-        let (part, dest) = write_temp_file("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]);
+        let (part, dest, _dir) =
+            write_temp_file("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]);
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
     fn validate_accepts_valid_png() {
-        let (part, dest) = write_temp_file(
+        let (part, dest, _dir) = write_temp_file(
             "photo.png",
             &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
         );
@@ -636,7 +632,7 @@ mod tests {
         buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x1C]); // box size
         buf[4..8].copy_from_slice(b"ftyp");
         buf[8..12].copy_from_slice(b"heic");
-        let (part, dest) = write_temp_file("photo.heic", &buf);
+        let (part, dest, _dir) = write_temp_file("photo.heic", &buf);
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
@@ -646,28 +642,28 @@ mod tests {
         buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x14]);
         buf[4..8].copy_from_slice(b"ftyp");
         buf[8..12].copy_from_slice(b"qt  ");
-        let (part, dest) = write_temp_file("clip.mov", &buf);
+        let (part, dest, _dir) = write_temp_file("clip.mov", &buf);
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
     fn validate_rejects_html_error_page_as_mov() {
         let html = b"<!DOCTYPE html>\n<html><body>Service Temporarily Unavailable</body></html>";
-        let (part, dest) = write_temp_file("clip.mov", html);
+        let (part, dest, _dir) = write_temp_file("clip.mov", html);
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
         assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 
     #[test]
     fn validate_rejects_html_for_unknown_extension() {
-        let (part, dest) = write_temp_file("file.xyz", b"<!DOCTYPE html><html>");
+        let (part, dest, _dir) = write_temp_file("file.xyz", b"<!DOCTYPE html><html>");
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
         assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 
     #[test]
     fn validate_rejects_html_with_leading_whitespace() {
-        let (part, dest) = write_temp_file("file.dat", b"  \n<!DOCTYPE html>");
+        let (part, dest, _dir) = write_temp_file("file.dat", b"  \n<!DOCTYPE html>");
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
         assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
@@ -675,39 +671,41 @@ mod tests {
     #[test]
     fn validate_accepts_xml_for_unknown_extension() {
         // AAE files are XML plists — should not be rejected
-        let (part, dest) = write_temp_file("photo.aae", b"<?xml version=\"1.0\"?>");
+        let (part, dest, _dir) = write_temp_file("photo.aae", b"<?xml version=\"1.0\"?>");
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
     fn validate_accepts_empty_file() {
-        let (part, dest) = write_temp_file("empty.jpg", b"");
+        let (part, dest, _dir) = write_temp_file("empty.jpg", b"");
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
     fn validate_rejects_wrong_magic_for_png() {
         // Write JPEG magic but with .png extension
-        let (part, dest) = write_temp_file("photo.png", &[0xFF, 0xD8, 0xFF, 0xE0]);
+        let (part, dest, _dir) = write_temp_file("photo.png", &[0xFF, 0xD8, 0xFF, 0xE0]);
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
         assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 
     #[test]
     fn validate_accepts_gif() {
-        let (part, dest) = write_temp_file("anim.gif", b"GIF89a\x01\x00\x01\x00");
+        let (part, dest, _dir) = write_temp_file("anim.gif", b"GIF89a\x01\x00\x01\x00");
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
     fn validate_accepts_tiff_little_endian() {
-        let (part, dest) = write_temp_file("photo.tiff", &[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00]);
+        let (part, dest, _dir) =
+            write_temp_file("photo.tiff", &[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00]);
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
     fn validate_accepts_tiff_big_endian() {
-        let (part, dest) = write_temp_file("photo.tif", &[0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x08]);
+        let (part, dest, _dir) =
+            write_temp_file("photo.tif", &[0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x08]);
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
@@ -717,20 +715,20 @@ mod tests {
         buf[0..4].copy_from_slice(b"RIFF");
         buf[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]); // file size (irrelevant)
         buf[8..12].copy_from_slice(b"WEBP");
-        let (part, dest) = write_temp_file("photo.webp", &buf);
+        let (part, dest, _dir) = write_temp_file("photo.webp", &buf);
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
     fn validate_accepts_arbitrary_binary_for_unknown_extension() {
         // Random binary data with unknown extension should pass
-        let (part, dest) = write_temp_file("data.bin", &[0x00, 0x01, 0x02, 0xFF, 0xFE]);
+        let (part, dest, _dir) = write_temp_file("data.bin", &[0x00, 0x01, 0x02, 0xFF, 0xFE]);
         assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
     fn validate_html_case_insensitive() {
-        let (part, dest) = write_temp_file("file.dat", b"<HTML><HEAD>");
+        let (part, dest, _dir) = write_temp_file("file.dat", b"<HTML><HEAD>");
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
         assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
@@ -741,7 +739,7 @@ mod tests {
     #[test]
     fn validate_rejects_html_error_page_as_heic_full_flow() {
         let html_body = b"<!DOCTYPE html><html>Service Unavailable</html>";
-        let (part, dest) = write_temp_file("cdn_error.heic", html_body);
+        let (part, dest, _dir) = write_temp_file("cdn_error.heic", html_body);
 
         // Validate rejects — magic bytes don't match ftyp header
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
@@ -835,26 +833,18 @@ mod tests {
     }
 
     /// Helper: set up a temp directory with download and part paths.
-    fn setup_download_dir(name: &str, ext: &str) -> (PathBuf, PathBuf) {
-        let dir = PathBuf::from("/tmp/claude/attempt_download_test").join(format!(
-            "{}_{}",
-            std::process::id(),
-            name
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let download_path = dir.join(format!("{name}.{ext}"));
-        let part_path = dir.join(format!("{name}.part"));
-        // Clean up any leftover files from previous runs
-        let _ = std::fs::remove_file(&download_path);
-        let _ = std::fs::remove_file(&part_path);
-        (download_path, part_path)
+    fn setup_download_dir(name: &str, ext: &str) -> (PathBuf, PathBuf, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let download_path = dir.path().join(format!("{name}.{ext}"));
+        let part_path = dir.path().join(format!("{name}.part"));
+        (download_path, part_path, dir)
     }
 
     #[tokio::test]
     async fn attempt_download_happy_path_writes_and_renames() {
         let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
         let client = StubDownloadClient::ok(&jpeg_body);
-        let (download_path, part_path) = setup_download_dir("happy", "jpg");
+        let (download_path, part_path, _dir) = setup_download_dir("happy", "jpg");
 
         attempt_download(
             &client,
@@ -879,7 +869,7 @@ mod tests {
     async fn attempt_download_skip_rename_leaves_part_file() {
         let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0];
         let client = StubDownloadClient::ok(&jpeg_body);
-        let (download_path, part_path) = setup_download_dir("skip_rename", "jpg");
+        let (download_path, part_path, _dir) = setup_download_dir("skip_rename", "jpg");
 
         attempt_download(
             &client,
@@ -906,7 +896,7 @@ mod tests {
             content_length: Some(100),
             body: body.to_vec(),
         };
-        let (download_path, part_path) = setup_download_dir("cl_mismatch", "jpg");
+        let (download_path, part_path, _dir) = setup_download_dir("cl_mismatch", "jpg");
 
         let err = attempt_download(
             &client,
@@ -932,7 +922,7 @@ mod tests {
         // Body is 8 bytes but caller expects 1024
         let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
         let client = StubDownloadClient::ok(&body).without_content_length();
-        let (download_path, part_path) = setup_download_dir("size_mismatch", "jpg");
+        let (download_path, part_path, _dir) = setup_download_dir("size_mismatch", "jpg");
 
         let err = attempt_download(
             &client,
@@ -957,7 +947,7 @@ mod tests {
         // HTML error page served as a .heic file
         let html = b"<!DOCTYPE html><html>Service Unavailable</html>";
         let client = StubDownloadClient::ok(html);
-        let (download_path, part_path) = setup_download_dir("invalid_content", "heic");
+        let (download_path, part_path, _dir) = setup_download_dir("invalid_content", "heic");
 
         let err = attempt_download(
             &client,
@@ -984,7 +974,7 @@ mod tests {
     #[tokio::test]
     async fn attempt_download_http_error_returns_http_status() {
         let client = StubDownloadClient::ok(b"").with_status(503);
-        let (download_path, part_path) = setup_download_dir("http_err", "jpg");
+        let (download_path, part_path, _dir) = setup_download_dir("http_err", "jpg");
 
         let err = attempt_download(
             &client,
@@ -1005,7 +995,7 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_download_resume_appends_to_existing_part() {
-        let (download_path, part_path) = setup_download_dir("resume", "jpg");
+        let (download_path, part_path, _dir) = setup_download_dir("resume", "jpg");
 
         // Pre-create a partial .part file (first 2 bytes of JPEG header)
         let first_half = [0xFF, 0xD8];
@@ -1037,7 +1027,7 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_download_resume_fallback_truncates_and_rewrites() {
-        let (download_path, part_path) = setup_download_dir("resume_fallback", "jpg");
+        let (download_path, part_path, _dir) = setup_download_dir("resume_fallback", "jpg");
 
         // Pre-create a .part file with stale data
         std::fs::write(&part_path, b"stale partial data").unwrap();
@@ -1068,7 +1058,7 @@ mod tests {
     async fn attempt_download_expected_size_matches_succeeds() {
         let body = [0xFF, 0xD8, 0xFF, 0xE0];
         let client = StubDownloadClient::ok(&body).without_content_length();
-        let (download_path, part_path) = setup_download_dir("size_ok", "jpg");
+        let (download_path, part_path, _dir) = setup_download_dir("size_ok", "jpg");
 
         attempt_download(
             &client,
@@ -1112,7 +1102,7 @@ mod tests {
             }
         }
 
-        let (download_path, part_path) = setup_download_dir("offset_pass", "bin");
+        let (download_path, part_path, _dir) = setup_download_dir("offset_pass", "bin");
 
         // Pre-create .part with 100 bytes
         std::fs::write(&part_path, vec![0xAAu8; 100]).unwrap();
@@ -1174,9 +1164,7 @@ mod tests {
             _url: &str,
             _resume_from: Option<u64>,
         ) -> Result<DownloadResponse, BoxError> {
-            let n = self
-                .calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n < self.fail_count {
                 // Return the error status with an empty body
                 let chunks: Vec<Result<Bytes, BoxError>> = vec![];
@@ -1186,8 +1174,7 @@ mod tests {
                     stream: Box::pin(futures_util::stream::iter(chunks)),
                 })
             } else {
-                let chunks: Vec<Result<Bytes, BoxError>> =
-                    vec![Ok(Bytes::from(self.body.clone()))];
+                let chunks: Vec<Result<Bytes, BoxError>> = vec![Ok(Bytes::from(self.body.clone()))];
                 Ok(DownloadResponse {
                     status: 200,
                     content_length: Some(self.body.len() as u64),
@@ -1200,18 +1187,14 @@ mod tests {
     /// Run download_file with a RetryingStubClient, returning the result and
     /// call count for assertion.
     async fn run_retry_download(
-        name: &str,
         fail_count: u32,
         fail_status: u16,
         max_retries: u32,
-    ) -> (Result<(), DownloadError>, u32, PathBuf) {
+    ) -> (Result<(), DownloadError>, u32, PathBuf, TempDir) {
         let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
         let client = RetryingStubClient::new(fail_count, fail_status, jpeg_body);
-        let dir = PathBuf::from("/tmp/claude/retry_test")
-            .join(format!("{}_{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let download_path = dir.join("photo.jpg");
-        let _ = std::fs::remove_file(&download_path);
+        let dir = TempDir::new().unwrap();
+        let download_path = dir.path().join("photo.jpg");
 
         let config = RetryConfig {
             max_retries,
@@ -1232,12 +1215,12 @@ mod tests {
         )
         .await;
 
-        (result, client.call_count(), download_path)
+        (result, client.call_count(), download_path, dir)
     }
 
     #[tokio::test]
     async fn download_file_retries_on_429_then_succeeds() {
-        let (result, calls, path) = run_retry_download("429_retry", 2, 429, 3).await;
+        let (result, calls, path, _dir) = run_retry_download(2, 429, 3).await;
         result.unwrap();
         assert_eq!(calls, 3, "should have retried twice then succeeded");
         assert!(path.exists(), "file should be downloaded");
@@ -1245,7 +1228,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_file_retries_on_503_then_succeeds() {
-        let (result, calls, path) = run_retry_download("503_retry", 1, 503, 3).await;
+        let (result, calls, path, _dir) = run_retry_download(1, 503, 3).await;
         result.unwrap();
         assert_eq!(calls, 2, "should have retried once then succeeded");
         assert!(path.exists());
@@ -1253,7 +1236,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_file_aborts_on_non_retryable_status() {
-        let (result, calls, _) = run_retry_download("404_abort", 1, 404, 3).await;
+        let (result, calls, _, _dir) = run_retry_download(1, 404, 3).await;
         let err = result.unwrap_err();
         assert_eq!(calls, 1, "should abort immediately on 404");
         assert!(
@@ -1264,7 +1247,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_file_exhausts_retries_on_persistent_429() {
-        let (result, calls, _) = run_retry_download("429_exhaust", 10, 429, 2).await;
+        let (result, calls, _, _dir) = run_retry_download(10, 429, 2).await;
         let err = result.unwrap_err();
         // 1 initial + 2 retries = 3 total attempts
         assert_eq!(calls, 3, "should exhaust all retry attempts");

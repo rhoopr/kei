@@ -726,9 +726,10 @@ mod tests {
 
     #[test]
     fn test_find_ampm_variant_returns_none_for_non_ampm() {
-        let path = Path::new("/tmp/claude/nonexistent/photo.jpg");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
         let mut cache = DirCache::new();
-        assert!(cache.find_ampm_variant(path).is_none());
+        assert!(cache.find_ampm_variant(&path).is_none());
     }
 
     #[test]
@@ -767,12 +768,11 @@ mod tests {
 
     #[test]
     fn test_dir_cache_nonexistent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("no_such_subdir/file.jpg");
         let mut cache = DirCache::new();
-        assert!(!cache.exists(Path::new("/tmp/claude/no_such_dir_xyz/file.jpg")));
-        assert_eq!(
-            cache.file_size(Path::new("/tmp/claude/no_such_dir_xyz/file.jpg")),
-            None
-        );
+        assert!(!cache.exists(&nonexistent));
+        assert_eq!(cache.file_size(&nonexistent), None);
     }
 
     #[test]

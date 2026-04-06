@@ -1028,14 +1028,13 @@ mod tests {
     #[test]
     fn test_build_cookie_directory_under_file_rejected() {
         // Create a regular file, then try to use a path under it as cookie dir
-        let tmp = std::env::temp_dir().join("kei_config_test_cookie_file");
-        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("kei_config_test_cookie_file");
         std::fs::write(&tmp, b"not a dir").unwrap();
         let path = tmp.join("nested").join("cookies");
         let mut auth = default_auth();
         auth.cookie_directory = Some(path.to_string_lossy().to_string());
         let result = Config::build(auth, default_sync(), None);
-        let _ = std::fs::remove_file(&tmp);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("cookie directory"),
@@ -1349,9 +1348,8 @@ mod tests {
 
     #[test]
     fn test_load_toml_config_valid_file() {
-        let dir = PathBuf::from("/tmp/claude/config-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.toml");
         std::fs::write(
             &path,
             r#"
@@ -1366,45 +1364,38 @@ mod tests {
             result.unwrap().auth.unwrap().username.as_deref(),
             Some("disk@example.com")
         );
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_load_toml_config_valid_file_required() {
-        let dir = PathBuf::from("/tmp/claude/config-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test-required.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-required.toml");
         std::fs::write(&path, "log_level = \"warn\"").unwrap();
         let result = load_toml_config(&path, true).unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().log_level, Some(LogLevel::Warn));
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_load_toml_config_invalid_toml_syntax() {
-        let dir = PathBuf::from("/tmp/claude/config-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bad-syntax.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-syntax.toml");
         std::fs::write(&path, "this is not valid toml [[[").unwrap();
         let result = load_toml_config(&path, false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Failed to parse config file"), "got: {err}");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_load_toml_config_empty_file() {
-        let dir = PathBuf::from("/tmp/claude/config-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("empty.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.toml");
         std::fs::write(&path, "").unwrap();
         let result = load_toml_config(&path, false).unwrap();
         let config = result.unwrap();
         assert!(config.auth.is_none());
         assert!(config.download.is_none());
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Config::build: exhaustive field merge tests ────────────────

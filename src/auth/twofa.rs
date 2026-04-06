@@ -381,20 +381,19 @@ pub async fn authenticate_with_token(
 mod tests {
     use super::*;
     use crate::auth::session::Session;
-    use std::path::PathBuf;
+    use tempfile::TempDir;
 
-    async fn test_session(name: &str) -> Session {
-        let dir = PathBuf::from("/tmp/claude/twofa_tests").join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Session::new(&dir, "test@example.com", "https://example.com", None)
+    async fn test_session() -> (TempDir, Session) {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(dir.path(), "test@example.com", "https://example.com", None)
             .await
-            .unwrap()
+            .unwrap();
+        (dir, session)
     }
 
     #[tokio::test]
     async fn submit_2fa_code_rejects_too_short() {
-        let mut session = test_session("short").await;
+        let (_dir, mut session) = test_session().await;
         let endpoints = Endpoints::for_domain("com").unwrap();
         let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "123").await;
         assert!(!result.unwrap());
@@ -402,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_2fa_code_rejects_too_long() {
-        let mut session = test_session("long").await;
+        let (_dir, mut session) = test_session().await;
         let endpoints = Endpoints::for_domain("com").unwrap();
         let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "1234567").await;
         assert!(!result.unwrap());
@@ -410,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_2fa_code_rejects_non_digits() {
-        let mut session = test_session("nondigit").await;
+        let (_dir, mut session) = test_session().await;
         let endpoints = Endpoints::for_domain("com").unwrap();
         let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "12345a").await;
         assert!(!result.unwrap());
@@ -418,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_2fa_code_rejects_empty() {
-        let mut session = test_session("empty").await;
+        let (_dir, mut session) = test_session().await;
         let endpoints = Endpoints::for_domain("com").unwrap();
         let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "").await;
         assert!(!result.unwrap());

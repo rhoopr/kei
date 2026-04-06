@@ -1544,9 +1544,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_local_checksum_match() {
-        let dir = PathBuf::from("/tmp/claude/checksum_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("local_match.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("local_match.bin");
         let content = b"hello world";
         std::fs::write(&file_path, content).unwrap();
 
@@ -1556,9 +1555,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_local_checksum_mismatch() {
-        let dir = PathBuf::from("/tmp/claude/checksum_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("local_mismatch.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("local_mismatch.bin");
         std::fs::write(&file_path, b"hello world").unwrap();
 
         assert!(!verify_local_checksum(
@@ -1571,8 +1569,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_local_checksum_nonexistent_file_errors() {
-        let result =
-            verify_local_checksum(Path::new("/tmp/claude/nonexistent_file_abc.bin"), "abcd").await;
+        let dir = tempfile::tempdir().unwrap();
+        let result = verify_local_checksum(&dir.path().join("nonexistent_file.bin"), "abcd").await;
         assert!(result.is_err());
     }
 

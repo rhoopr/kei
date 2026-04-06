@@ -55,8 +55,6 @@ impl HealthStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     #[test]
@@ -99,26 +97,24 @@ mod tests {
 
     #[test]
     fn write_creates_valid_json() {
-        let dir = PathBuf::from("/tmp/claude/health_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
 
         let mut h = HealthStatus::new();
         h.record_success();
-        h.write(&dir);
+        h.write(dir.path());
 
-        let contents = std::fs::read_to_string(dir.join("health.json")).unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("health.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert!(parsed["last_sync_at"].is_string());
         assert!(parsed["last_success_at"].is_string());
         assert_eq!(parsed["consecutive_failures"], 0);
         assert!(parsed["last_error"].is_null());
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn write_nonexistent_dir_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
         let h = HealthStatus::new();
-        h.write(Path::new("/tmp/claude/nonexistent_health_dir_xyz"));
+        h.write(&dir.path().join("nonexistent_subdir"));
     }
 }

@@ -143,18 +143,10 @@ fn migrate_directory_contents(src_dir: &Path, dst_dir: &Path) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = PathBuf::from("/tmp/claude/migration_tests").join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn migrate_file_copies_to_new_location() {
-        let base = test_dir("migrate_file");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         let src = base.join("old/config.toml");
         let dst = base.join("new/config.toml");
 
@@ -169,7 +161,8 @@ mod tests {
 
     #[test]
     fn migrate_file_skips_existing_destination() {
-        let base = test_dir("migrate_file_skip");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         let src = base.join("old/config.toml");
         let dst = base.join("new/config.toml");
 
@@ -185,7 +178,8 @@ mod tests {
 
     #[test]
     fn migrate_directory_copies_files() {
-        let base = test_dir("migrate_dir");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         let src_dir = base.join("old");
         let dst_dir = base.join("new");
 
@@ -208,7 +202,8 @@ mod tests {
 
     #[test]
     fn migrate_directory_skips_existing_files() {
-        let base = test_dir("migrate_dir_skip");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         let src_dir = base.join("old");
         let dst_dir = base.join("new");
 
@@ -228,7 +223,8 @@ mod tests {
 
     #[test]
     fn migrate_directory_skips_subdirectories() {
-        let base = test_dir("migrate_dir_subdir");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         let src_dir = base.join("old");
         let dst_dir = base.join("new");
 

@@ -712,20 +712,14 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join("claude")
-            .join("state_db_tests")
-            .join(name);
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     #[tokio::test]
     async fn test_open_creates_db() {
-        let dir = test_dir("open_creates");
-        let path = dir.join("test.db");
+        let dir = test_dir();
+        let path = dir.path().join("test.db");
         let db = SqliteStateDb::open(&path).await.unwrap();
         assert!(path.exists());
         assert_eq!(db.path(), path);
@@ -773,8 +767,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_downloaded_then_should_not_download() {
-        let dir = test_dir("mark_downloaded");
-        let file_path = dir.join("photo.jpg");
+        let dir = test_dir();
+        let file_path = dir.path().join("photo.jpg");
         fs::write(&file_path, b"test content").unwrap();
 
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -844,8 +838,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_download_checksum_changed() {
-        let dir = test_dir("checksum_changed");
-        let file_path = dir.join("photo.jpg");
+        let dir = test_dir();
+        let file_path = dir.path().join("photo.jpg");
         fs::write(&file_path, b"test content").unwrap();
 
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -945,7 +939,7 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
         }
 
-        let dir = test_dir("get_summary");
+        let dir = test_dir();
         for i in 0..2 {
             let record = AssetRecord::new_pending(
                 format!("DOWNLOADED_{}", i),
@@ -958,7 +952,7 @@ mod tests {
                 MediaType::Photo,
             );
             db.upsert_seen(&record).await.unwrap();
-            let path = dir.join(format!("dl_photo_{}.jpg", i));
+            let path = dir.path().join(format!("dl_photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
             db.mark_downloaded(
                 &format!("DOWNLOADED_{}", i),
@@ -1016,8 +1010,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_upsert_preserves_status() {
-        let dir = test_dir("upsert_preserves");
-        let file_path = dir.join("photo.jpg");
+        let dir = test_dir();
+        let file_path = dir.path().join("photo.jpg");
         fs::write(&file_path, b"test content").unwrap();
 
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -1051,7 +1045,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_all_downloaded() {
-        let dir = test_dir("get_all_downloaded");
+        let dir = test_dir();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         for i in 0..3 {
@@ -1066,7 +1060,7 @@ mod tests {
                 MediaType::Photo,
             );
             db.upsert_seen(&record).await.unwrap();
-            let path = dir.join(format!("photo_{}.jpg", i));
+            let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
             db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash", None)
                 .await
@@ -1081,7 +1075,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_downloaded_ids() {
-        let dir = test_dir("get_downloaded_ids");
+        let dir = test_dir();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         // Create some assets with different statuses
@@ -1097,7 +1091,7 @@ mod tests {
                 MediaType::Photo,
             );
             db.upsert_seen(&record).await.unwrap();
-            let path = dir.join(format!("photo_{}.jpg", i));
+            let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
             db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash", None)
                 .await
@@ -1127,7 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_downloaded_checksums() {
-        let dir = test_dir("get_downloaded_checksums");
+        let dir = test_dir();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         for i in 0..2 {
@@ -1142,7 +1136,7 @@ mod tests {
                 MediaType::Photo,
             );
             db.upsert_seen(&record).await.unwrap();
-            let path = dir.join(format!("photo_{}.jpg", i));
+            let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
             db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash", None)
                 .await
@@ -1163,7 +1157,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_all_known_ids() {
-        let dir = test_dir("get_all_known_ids");
+        let dir = test_dir();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         // Create downloaded assets
@@ -1179,7 +1173,7 @@ mod tests {
                 MediaType::Photo,
             );
             db.upsert_seen(&record).await.unwrap();
-            let path = dir.join(format!("photo_{}.jpg", i));
+            let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
             db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash", None)
                 .await
@@ -1248,8 +1242,8 @@ mod tests {
             MediaType::Photo,
         );
         db.upsert_seen(&record).await.unwrap();
-        let dir = test_dir("retry_no_failures");
-        let path = dir.join("photo.jpg");
+        let dir = test_dir();
+        let path = dir.path().join("photo.jpg");
         fs::write(&path, b"content").unwrap();
         db.mark_downloaded("DL_1", "original", &path, "hash", None)
             .await
@@ -1262,7 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn test_retry_failed_resets_only_failed() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        let dir = test_dir("retry_resets_failed");
+        let dir = test_dir();
 
         // Add a downloaded asset
         let dl = AssetRecord::new_pending(
@@ -1276,7 +1270,7 @@ mod tests {
             MediaType::Photo,
         );
         db.upsert_seen(&dl).await.unwrap();
-        let path = dir.join("photo1.jpg");
+        let path = dir.path().join("photo1.jpg");
         fs::write(&path, b"content").unwrap();
         db.mark_downloaded("DL_1", "original", &path, "hash", None)
             .await
@@ -1351,7 +1345,16 @@ mod tests {
         );
         db.upsert_seen(&record).await.unwrap();
 
-        // Read the original last_seen_at
+        // Backdate last_seen_at so that touch_last_seen produces a strictly greater timestamp
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE assets SET last_seen_at = last_seen_at - 5 WHERE id = 'TOUCH_1'",
+                [],
+            )
+            .unwrap();
+        }
+
         let original_ts: i64 = {
             let conn = db.conn.lock().unwrap();
             conn.query_row(
@@ -1362,13 +1365,9 @@ mod tests {
             .unwrap()
         };
 
-        // Small delay so timestamps differ
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Touch last_seen_at
+        // Touch last_seen_at — should set it to now(), which is > backdated value
         db.touch_last_seen("TOUCH_1").await.unwrap();
 
-        // Verify the timestamp was actually updated
         let updated_ts: i64 = {
             let conn = db.conn.lock().unwrap();
             conn.query_row(
@@ -1379,8 +1378,8 @@ mod tests {
             .unwrap()
         };
         assert!(
-            updated_ts >= original_ts,
-            "last_seen_at should be updated: {updated_ts} >= {original_ts}"
+            updated_ts > original_ts,
+            "last_seen_at should be updated: {updated_ts} > {original_ts}"
         );
     }
 
@@ -1457,7 +1456,7 @@ mod tests {
     async fn upsert_seen_then_summary_counts_accurate_across_transitions() {
         // Arrange: create assets and move them through pending -> downloaded -> failed transitions
         let db = SqliteStateDb::open_in_memory().unwrap();
-        let dir = test_dir("summary_transitions");
+        let dir = test_dir();
 
         let now = Utc::now();
         let ids = ["AEt9xLq2V0", "AEt9xLq2V1", "AEt9xLq2V2", "AEt9xLq2V3"];
@@ -1486,7 +1485,7 @@ mod tests {
         assert_eq!(s1.failed, 0);
 
         // Act: download two, fail one, leave one pending
-        let path0 = dir.join("IMG_1000.JPG");
+        let path0 = dir.path().join("IMG_1000.JPG");
         fs::write(&path0, b"JPEG data").unwrap();
         db.mark_downloaded(
             ids[0],
@@ -1498,7 +1497,7 @@ mod tests {
         .await
         .unwrap();
 
-        let path1 = dir.join("IMG_1001.JPG");
+        let path1 = dir.path().join("IMG_1001.JPG");
         fs::write(&path1, b"JPEG data 2").unwrap();
         db.mark_downloaded(
             ids[1],
@@ -1603,7 +1602,7 @@ mod tests {
     #[tokio::test]
     async fn test_downloads_reflected_immediately_not_batched() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        let dir = test_dir("immediate_state");
+        let dir = test_dir();
 
         for i in 0..5u32 {
             let id = format!("ASSET_{i}");
@@ -1619,7 +1618,7 @@ mod tests {
             );
             db.upsert_seen(&record).await.unwrap();
 
-            let path = dir.join(format!("photo_{i}.jpg"));
+            let path = dir.path().join(format!("photo_{i}.jpg"));
             fs::write(&path, b"jpeg data").unwrap();
             db.mark_downloaded(&id, "original", &path, &format!("local_ck_{i}"), None)
                 .await
@@ -1682,7 +1681,7 @@ mod tests {
     async fn reset_failed_precise_count_with_mixed_statuses() {
         // Arrange: create assets across all three statuses with multiple failed entries
         let db = SqliteStateDb::open_in_memory().unwrap();
-        let dir = test_dir("reset_mixed");
+        let dir = test_dir();
 
         // 2 downloaded
         for i in 0..2 {
@@ -1701,7 +1700,7 @@ mod tests {
                 MediaType::Photo,
             );
             db.upsert_seen(&record).await.unwrap();
-            let path = dir.join(format!("IMG_{}.HEIC", 2000 + i));
+            let path = dir.path().join(format!("IMG_{}.HEIC", 2000 + i));
             fs::write(&path, b"heic payload").unwrap();
             db.mark_downloaded(&id, "original", &path, &format!("localhash{i}"), None)
                 .await
@@ -1774,8 +1773,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_corrupt_db_returns_error() {
-        let dir = test_dir("corrupt_db");
-        let path = dir.join("corrupt.db");
+        let dir = test_dir();
+        let path = dir.path().join("corrupt.db");
 
         // Write garbage bytes (not a valid SQLite header)
         fs::write(&path, b"this is not a sqlite database at all").unwrap();
@@ -1842,8 +1841,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_truncated_db_returns_error() {
-        let dir = test_dir("truncated_db");
-        let path = dir.join("truncated.db");
+        let dir = test_dir();
+        let path = dir.path().join("truncated.db");
 
         // Write a partial SQLite header (valid magic, but truncated)
         let mut header = b"SQLite format 3\0".to_vec();

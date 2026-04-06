@@ -2450,23 +2450,11 @@ mod tests {
     use crate::icloud::photos::PhotoAsset;
     use serde_json::json;
     use std::fs;
-
-    /// Cross-platform temp directory for tests
-    fn test_tmp_dir(subdir: &str) -> PathBuf {
-        std::env::temp_dir().join("claude").join(subdir)
-    }
-
-    fn tmp_file(name: &str) -> PathBuf {
-        let dir = test_tmp_dir("download_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let p = dir.join(name);
-        fs::write(&p, b"test").unwrap();
-        p
-    }
+    use tempfile::TempDir;
 
     fn test_config() -> DownloadConfig {
         DownloadConfig {
-            directory: test_tmp_dir("download_filter_tests"),
+            directory: PathBuf::from("/nonexistent/download_filter_tests"),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
@@ -2631,11 +2619,10 @@ mod tests {
 
     #[test]
     fn test_filter_skips_existing_file() {
-        let dir = test_tmp_dir("download_filter_tests");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
         let asset = photo_asset_with_version();
         let mut config = test_config();
-        config.directory = dir.clone();
+        config.directory = dir.path().to_path_buf();
 
         // First call should produce a task (file doesn't exist yet)
         let tasks = filter_asset_fresh(&asset, &config);
@@ -2645,20 +2632,15 @@ mod tests {
         fs::create_dir_all(tasks[0].download_path.parent().unwrap()).unwrap();
         fs::write(&tasks[0].download_path, vec![0u8; 1000]).unwrap();
         assert!(filter_asset_fresh(&asset, &config).is_empty());
-
-        // Cleanup
-        let _ = fs::remove_file(&tasks[0].download_path);
     }
 
     #[test]
     fn test_filter_deduplicates_file_with_different_size() {
-        let dir = test_tmp_dir("download_filter_tests_dedup");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
 
         let asset = photo_asset_with_version(); // version.size = 1000
         let mut config = test_config();
-        config.directory = dir.clone();
+        config.directory = dir.path().to_path_buf();
 
         // First call: file doesn't exist yet
         let tasks = filter_asset_fresh(&asset, &config);
@@ -2678,9 +2660,6 @@ mod tests {
             "Expected size suffix '-1000.' in deduped path, got: {}",
             dedup_path,
         );
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&dir);
     }
 
     fn photo_asset_with_live_photo() -> PhotoAsset {
@@ -2748,13 +2727,11 @@ mod tests {
 
     #[test]
     fn test_filter_skips_existing_live_photo_mov() {
-        let dir = test_tmp_dir("download_filter_tests_live");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
 
         let asset = photo_asset_with_live_photo();
         let mut config = test_config();
-        config.directory = dir.clone();
+        config.directory = dir.path().to_path_buf();
 
         // First call: both photo and MOV
         let tasks = filter_asset_fresh(&asset, &config);
@@ -2768,19 +2745,15 @@ mod tests {
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_filter_deduplicates_live_photo_mov_collision() {
-        let dir = test_tmp_dir("download_filter_tests_live_dedup");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
 
         let asset = photo_asset_with_live_photo();
         let mut config = test_config();
-        config.directory = dir.clone();
+        config.directory = dir.path().to_path_buf();
 
         // First call to get the expected MOV path
         let tasks = filter_asset_fresh(&asset, &config);
@@ -2802,8 +2775,6 @@ mod tests {
             "Expected asset ID 'LIVE_1' in deduped path, got: {}",
             dedup_path,
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2811,9 +2782,7 @@ mod tests {
         // Regression test for #102: when two live photos share the same base
         // filename but have different sizes (triggering dedup), the MOV companion
         // must derive from the deduped HEIC name so they remain visually paired.
-        let dir = test_tmp_dir("download_filter_tests_live_dedup_consistency");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
 
         let asset1 = PhotoAsset::new(
             json!({"recordName": "LIVE_A", "fields": {
@@ -2856,7 +2825,7 @@ mod tests {
         );
 
         let mut config = test_config();
-        config.directory = dir.clone();
+        config.directory = dir.path().to_path_buf();
 
         // Process asset1: creates IMG_0001.HEIC (2000 bytes) and its MOV
         let mut claimed_paths = FxHashMap::default();
@@ -2892,8 +2861,6 @@ mod tests {
             "MOV companion should derive from deduped HEIC name (contain '-4000'), got: {}",
             mov2_path,
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2953,7 +2920,9 @@ mod tests {
 
     #[test]
     fn test_set_file_mtime_positive_timestamp() {
-        let p = tmp_file("pos.txt");
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("pos.txt");
+        fs::write(&p, b"test").unwrap();
         set_file_mtime(&p, 1_700_000_000).unwrap();
         let meta = fs::metadata(&p).unwrap();
         let mtime = meta.modified().unwrap();
@@ -2962,7 +2931,9 @@ mod tests {
 
     #[test]
     fn test_set_file_mtime_zero_timestamp() {
-        let p = tmp_file("zero.txt");
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("zero.txt");
+        fs::write(&p, b"test").unwrap();
         set_file_mtime(&p, 0).unwrap();
         let meta = fs::metadata(&p).unwrap();
         let mtime = meta.modified().unwrap();
@@ -2971,15 +2942,17 @@ mod tests {
 
     #[test]
     fn test_set_file_mtime_negative_timestamp() {
-        let p = tmp_file("neg.txt");
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("neg.txt");
+        fs::write(&p, b"test").unwrap();
         // Should not panic — clamps or uses pre-epoch time
         set_file_mtime(&p, -86400).unwrap();
     }
 
     #[test]
     fn test_set_file_mtime_nonexistent_file() {
-        let p = test_tmp_dir("download_tests").join("nonexistent_file.txt");
-        let _ = fs::remove_file(&p); // ensure absent
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("nonexistent_file.txt");
         assert!(set_file_mtime(&p, 0).is_err());
     }
 
@@ -3147,9 +3120,7 @@ mod tests {
     fn test_filter_detects_case_insensitive_collision() {
         // On case-insensitive filesystems (macOS, Windows), IMG_0996.mov and IMG_0996.MOV
         // are the same file. Test that claimed_paths detects this collision.
-        let dir = test_tmp_dir("download_filter_tests_case");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
 
         // First asset: regular video IMG_0996.mov
         let video_asset = PhotoAsset::new(
@@ -3188,7 +3159,7 @@ mod tests {
         );
 
         let mut config = test_config();
-        config.directory = dir.clone();
+        config.directory = dir.path().to_path_buf();
 
         // Process both assets through claimed_paths
         let mut claimed_paths = FxHashMap::default();
@@ -3220,8 +3191,6 @@ mod tests {
             "MOV should be deduped with asset ID suffix due to path collision. Got: {}",
             mov_filename
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3249,88 +3218,112 @@ mod tests {
         assert_eq!(&*tasks[0].checksum, "orig_ck");
     }
 
-    // These tests overflow the stack in debug builds due to large async futures
-    // from reqwest and stream combinators. Run with: cargo test --release
-    #[tokio::test]
-    #[ignore = "stack overflow in debug builds; run with --release"]
-    async fn test_run_download_pass_skips_all_tasks_when_cancelled() {
-        let token = CancellationToken::new();
-        token.cancel();
+    // These tests need a larger stack due to large async futures from reqwest
+    // and stream combinators. We spawn them on a thread with 8 MiB stack.
+    #[test]
+    fn test_run_download_pass_skips_all_tasks_when_cancelled() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let dir = TempDir::new().unwrap();
+                        let token = CancellationToken::new();
+                        token.cancel();
 
-        let tasks = vec![
-            DownloadTask {
-                url: "https://example.com/a".into(),
-                download_path: test_tmp_dir("shutdown_test").join("a.jpg"),
-                checksum: "aaa".into(),
-                created_local: chrono::Local::now(),
-                size: 1000,
-                asset_id: "ASSET_A".into(),
-                version_size: VersionSizeKey::Original,
-            },
-            DownloadTask {
-                url: "https://example.com/b".into(),
-                download_path: test_tmp_dir("shutdown_test").join("b.jpg"),
-                checksum: "bbb".into(),
-                created_local: chrono::Local::now(),
-                size: 2000,
-                asset_id: "ASSET_B".into(),
-                version_size: VersionSizeKey::Original,
-            },
-        ];
+                        let tasks = vec![
+                            DownloadTask {
+                                url: "https://example.com/a".into(),
+                                download_path: dir.path().join("a.jpg"),
+                                checksum: "aaa".into(),
+                                created_local: chrono::Local::now(),
+                                size: 1000,
+                                asset_id: "ASSET_A".into(),
+                                version_size: VersionSizeKey::Original,
+                            },
+                            DownloadTask {
+                                url: "https://example.com/b".into(),
+                                download_path: dir.path().join("b.jpg"),
+                                checksum: "bbb".into(),
+                                created_local: chrono::Local::now(),
+                                size: 2000,
+                                asset_id: "ASSET_B".into(),
+                                version_size: VersionSizeKey::Original,
+                            },
+                        ];
 
-        let client = Client::new();
-        let retry = RetryConfig::default();
+                        let client = Client::new();
+                        let retry = RetryConfig::default();
 
-        // Pre-cancelled token: take_while stops immediately, no downloads attempted.
-        let pass_config = PassConfig {
-            client: &client,
-            retry_config: &retry,
-            set_exif: false,
-            concurrency: 1,
-            no_progress_bar: true,
-            temp_suffix: ".kei-tmp".to_string(),
-            shutdown_token: token,
-            state_db: None,
-        };
-        let result = run_download_pass(pass_config, tasks).await;
-        assert!(result.failed.is_empty());
+                        let pass_config = PassConfig {
+                            client: &client,
+                            retry_config: &retry,
+                            set_exif: false,
+                            concurrency: 1,
+                            no_progress_bar: true,
+                            temp_suffix: ".kei-tmp".to_string(),
+                            shutdown_token: token,
+                            state_db: None,
+                        };
+                        let result = run_download_pass(pass_config, tasks).await;
+                        assert!(result.failed.is_empty());
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
-    #[tokio::test]
-    #[ignore = "stack overflow in debug builds; run with --release"]
-    async fn test_run_download_pass_processes_tasks_when_not_cancelled() {
-        let token = CancellationToken::new();
+    #[test]
+    fn test_run_download_pass_processes_tasks_when_not_cancelled() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let dir = TempDir::new().unwrap();
+                        let token = CancellationToken::new();
 
-        let tasks = vec![DownloadTask {
-            url: "https://0.0.0.0:1/nonexistent".into(),
-            download_path: test_tmp_dir("shutdown_test").join("c.jpg"),
-            checksum: "ccc".into(),
-            created_local: chrono::Local::now(),
-            size: 500,
-            asset_id: "ASSET_C".into(),
-            version_size: VersionSizeKey::Original,
-        }];
+                        let tasks = vec![DownloadTask {
+                            url: "https://0.0.0.0:1/nonexistent".into(),
+                            download_path: dir.path().join("c.jpg"),
+                            checksum: "ccc".into(),
+                            created_local: chrono::Local::now(),
+                            size: 500,
+                            asset_id: "ASSET_C".into(),
+                            version_size: VersionSizeKey::Original,
+                        }];
 
-        let client = Client::new();
-        let retry = RetryConfig {
-            max_retries: 0,
-            base_delay_secs: 0,
-            max_delay_secs: 0,
-        };
+                        let client = Client::new();
+                        let retry = RetryConfig {
+                            max_retries: 0,
+                            base_delay_secs: 0,
+                            max_delay_secs: 0,
+                        };
 
-        // Non-cancelled token: task is attempted (and fails since URL is bogus).
-        let pass_config = PassConfig {
-            client: &client,
-            retry_config: &retry,
-            set_exif: false,
-            concurrency: 1,
-            no_progress_bar: true,
-            temp_suffix: ".kei-tmp".to_string(),
-            shutdown_token: token,
-            state_db: None,
-        };
-        let result = run_download_pass(pass_config, tasks).await;
-        assert_eq!(result.failed.len(), 1);
+                        let pass_config = PassConfig {
+                            client: &client,
+                            retry_config: &retry,
+                            set_exif: false,
+                            concurrency: 1,
+                            no_progress_bar: true,
+                            temp_suffix: ".kei-tmp".to_string(),
+                            shutdown_token: token,
+                            state_db: None,
+                        };
+                        let result = run_download_pass(pass_config, tasks).await;
+                        assert_eq!(result.failed.len(), 1);
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -3712,8 +3705,8 @@ mod tests {
         let asset = photo_asset_with_version();
         let mut config = test_config();
         config.file_match_policy = FileMatchPolicy::NameId7;
-        let dir = test_tmp_dir("name_id7_skip");
-        config.directory = dir.clone();
+        let dir = TempDir::new().unwrap();
+        config.directory = dir.path().to_path_buf();
 
         // First call to get the expected path
         let tasks = filter_asset_fresh(&asset, &config);
@@ -3731,9 +3724,6 @@ mod tests {
             "NameId7 should skip existing file, got {} tasks",
             tasks2.len()
         );
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4700,13 +4690,11 @@ mod tests {
         // With NameId7 policy, the download path includes an ID suffix.
         // Even if a file exists at the *non-suffixed* (original) path,
         // NameId7 should produce a task because its path is different.
-        let dir = test_tmp_dir("download_filter_tests_name_id7_orig");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
 
         let asset = photo_asset_with_version(); // recordName "TEST_1", "photo.jpg"
         let mut config = test_config();
-        config.directory = dir.clone();
+        config.directory = dir.path().to_path_buf();
         config.file_match_policy = FileMatchPolicy::NameId7;
 
         // Get the NameId7 path
@@ -4747,8 +4735,6 @@ mod tests {
             tasks3.is_empty(),
             "NameId7 should skip when ID-suffixed file already exists"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // ── State-write retry tests ──
@@ -5078,12 +5064,10 @@ mod tests {
             Some((Ok(asset) as anyhow::Result<PhotoAsset>, i + 1))
         });
 
-        let dir = test_tmp_dir("shutdown_cancel_test");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
 
         let config = Arc::new(DownloadConfig {
-            directory: dir.clone(),
+            directory: dir.path().to_path_buf(),
             concurrent_downloads: 10,
             retry: crate::retry::RetryConfig {
                 max_retries: 0,
@@ -5119,7 +5103,5 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "should exit promptly after cancellation, took {elapsed:?}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }
