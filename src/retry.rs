@@ -219,6 +219,92 @@ mod tests {
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_retry_logs_structured_fields_on_retryable_error() {
+        let config = RetryConfig {
+            max_retries: 2,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+        let _result: Result<i32, String> = retry_with_backoff(
+            &config,
+            |_| RetryAction::Retry,
+            || {
+                let cc = cc.clone();
+                async move {
+                    let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < 1 {
+                        Err("transient failure".to_string())
+                    } else {
+                        Ok(42)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(logs_contain("Retryable error, retrying"));
+        assert!(logs_contain("attempt=1"));
+        assert!(logs_contain("total_attempts=3"));
+        assert!(logs_contain("transient failure"));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_retry_logs_each_attempt() {
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let _result: Result<i32, String> = retry_with_backoff(
+            &config,
+            |_| RetryAction::Retry,
+            || async { Err::<i32, _>("keep failing".to_string()) },
+        )
+        .await;
+
+        // Should log attempts 1, 2, 3 (but not 4 — last attempt just returns the error)
+        assert!(logs_contain("attempt=1"));
+        assert!(logs_contain("attempt=2"));
+        assert!(logs_contain("attempt=3"));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_retry_no_log_on_success() {
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let result: Result<i32, String> =
+            retry_with_backoff(&config, |_| RetryAction::Retry, || async { Ok(42) }).await;
+        assert_eq!(result.unwrap(), 42);
+        assert!(!logs_contain("Retryable error"));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_retry_no_log_on_abort() {
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let _result: Result<i32, String> = retry_with_backoff(
+            &config,
+            |_| RetryAction::Abort,
+            || async { Err::<i32, _>("fatal".to_string()) },
+        )
+        .await;
+        // Abort returns immediately without logging retry
+        assert!(!logs_contain("Retryable error"));
+    }
+
     #[tokio::test]
     async fn test_retry_exhausted() {
         let config = RetryConfig {

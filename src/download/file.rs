@@ -18,6 +18,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(super) struct DownloadResponse {
     pub status: u16,
     pub content_length: Option<u64>,
+    pub content_type: Option<String>,
     pub stream: Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>,
 }
 
@@ -48,12 +49,18 @@ impl DownloadClient for Client {
         let response = request.send().await?;
         let status = response.status().as_u16();
         let content_length = response.content_length();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let stream = response
             .bytes_stream()
             .map(|r| r.map_err(|e| Box::new(e) as BoxError));
         Ok(DownloadResponse {
             status,
             content_length,
+            content_type,
             stream: Box::pin(stream),
         })
     }
@@ -197,6 +204,18 @@ async fn attempt_download<C: DownloadClient>(
             });
         }
     };
+
+    // Reject HTML content-type before writing to disk. Apple's CDN sometimes
+    // returns HTTP 200 with text/html for rate-limit or error pages.
+    if let Some(ct) = &response.content_type {
+        let ct_lower = ct.to_ascii_lowercase();
+        if ct_lower.starts_with("text/html") {
+            return Err(DownloadError::InvalidContent {
+                path: path_str,
+                reason: format!("server returned content-type: {ct}"),
+            });
+        }
+    }
 
     let content_length = response.content_length;
 
@@ -793,6 +812,7 @@ mod tests {
     struct StubDownloadClient {
         status: u16,
         content_length: Option<u64>,
+        content_type: Option<String>,
         body: Vec<u8>,
     }
 
@@ -801,6 +821,7 @@ mod tests {
             Self {
                 status: 200,
                 content_length: Some(body.len() as u64),
+                content_type: None,
                 body: body.to_vec(),
             }
         }
@@ -812,6 +833,11 @@ mod tests {
 
         fn without_content_length(mut self) -> Self {
             self.content_length = None;
+            self
+        }
+
+        fn with_content_type(mut self, ct: &str) -> Self {
+            self.content_type = Some(ct.to_string());
             self
         }
     }
@@ -827,6 +853,7 @@ mod tests {
             Ok(DownloadResponse {
                 status: self.status,
                 content_length: self.content_length,
+                content_type: self.content_type.clone(),
                 stream: Box::pin(futures_util::stream::iter(chunks)),
             })
         }
@@ -894,6 +921,7 @@ mod tests {
         let client = StubDownloadClient {
             status: 200,
             content_length: Some(100),
+            content_type: None,
             body: body.to_vec(),
         };
         let (download_path, part_path, _dir) = setup_download_dir("cl_mismatch", "jpg");
@@ -1006,6 +1034,7 @@ mod tests {
         let client = StubDownloadClient {
             status: 206,
             content_length: Some(second_half.len() as u64),
+            content_type: None,
             body: second_half.clone(),
         };
 
@@ -1097,6 +1126,7 @@ mod tests {
                 Ok(DownloadResponse {
                     status: if resume_from.is_some() { 206 } else { 200 },
                     content_length: Some(self.body.len() as u64),
+                    content_type: None,
                     stream: Box::pin(futures_util::stream::iter(chunks)),
                 })
             }
@@ -1171,6 +1201,7 @@ mod tests {
                 Ok(DownloadResponse {
                     status: self.fail_status,
                     content_length: None,
+                    content_type: None,
                     stream: Box::pin(futures_util::stream::iter(chunks)),
                 })
             } else {
@@ -1178,6 +1209,7 @@ mod tests {
                 Ok(DownloadResponse {
                     status: 200,
                     content_length: Some(self.body.len() as u64),
+                    content_type: None,
                     stream: Box::pin(futures_util::stream::iter(chunks)),
                 })
             }
@@ -1255,5 +1287,393 @@ mod tests {
             matches!(err, DownloadError::HttpStatus { status: 429, .. }),
             "expected HttpStatus 429, got: {err:?}"
         );
+    }
+
+    // --- Content-type validation tests ---
+
+    #[tokio::test]
+    async fn attempt_download_rejects_text_html_content_type() {
+        let html = b"<!DOCTYPE html><html>Error</html>";
+        let client = StubDownloadClient::ok(html).with_content_type("text/html; charset=utf-8");
+        let (download_path, part_path, _dir) = setup_download_dir("ct_html", "heic");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::InvalidContent { .. }),
+            "expected InvalidContent, got: {err}"
+        );
+        assert!(
+            err.is_retryable(),
+            "content-type rejection should be retryable"
+        );
+        assert!(
+            err.to_string().contains("content-type"),
+            "error message should mention content-type"
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_download_accepts_image_jpeg_content_type() {
+        let body = [0xFF, 0xD8, 0xFF, 0xE0];
+        let client = StubDownloadClient::ok(&body).with_content_type("image/jpeg");
+        let (download_path, part_path, _dir) = setup_download_dir("ct_jpeg", "jpg");
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(download_path.exists());
+    }
+
+    #[tokio::test]
+    async fn attempt_download_accepts_octet_stream_content_type() {
+        let body = [0xFF, 0xD8, 0xFF, 0xE0];
+        let client = StubDownloadClient::ok(&body).with_content_type("application/octet-stream");
+        let (download_path, part_path, _dir) = setup_download_dir("ct_octet", "jpg");
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(download_path.exists());
+    }
+
+    #[tokio::test]
+    async fn attempt_download_accepts_no_content_type() {
+        let body = [0xFF, 0xD8, 0xFF, 0xE0];
+        let client = StubDownloadClient::ok(&body);
+        let (download_path, part_path, _dir) = setup_download_dir("ct_none", "jpg");
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(download_path.exists());
+    }
+
+    #[tokio::test]
+    async fn attempt_download_rejects_text_html_case_insensitive() {
+        let html = b"<html>error</html>";
+        let client = StubDownloadClient::ok(html).with_content_type("Text/HTML");
+        let (download_path, part_path, _dir) = setup_download_dir("ct_html_upper", "jpg");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    // --- wiremock integration tests ---
+
+    /// Test the real reqwest::Client DownloadClient impl against a mock HTTP server.
+    mod wiremock_tests {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn real_client_retries_on_503_then_succeeds() {
+            let server = MockServer::start().await;
+            let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+
+            // First 2 requests return 503, third returns 200 with JPEG
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(2)
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(jpeg_body.clone())
+                        .insert_header("content-type", "image/jpeg"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("photo.jpg");
+            let config = RetryConfig {
+                max_retries: 3,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+
+            download_file(
+                &reqwest::Client::new(),
+                &format!("{}/photo.jpg", server.uri()),
+                &download_path,
+                "AAAA",
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(std::fs::read(&download_path).unwrap(), jpeg_body);
+        }
+
+        #[tokio::test]
+        async fn real_client_retries_on_429_then_succeeds() {
+            let server = MockServer::start().await;
+            let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0];
+
+            Mock::given(method("GET"))
+                .and(path("/rate-limited.jpg"))
+                .respond_with(ResponseTemplate::new(429))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/rate-limited.jpg"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(jpeg_body.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("rate-limited.jpg");
+            let config = RetryConfig {
+                max_retries: 3,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+
+            download_file(
+                &reqwest::Client::new(),
+                &format!("{}/rate-limited.jpg", server.uri()),
+                &download_path,
+                "AAAB",
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(download_path.exists());
+        }
+
+        #[tokio::test]
+        async fn real_client_exhausts_retries_on_persistent_500() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/broken.jpg"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(3)
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("broken.jpg");
+            let config = RetryConfig {
+                max_retries: 2,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+
+            let err = download_file(
+                &reqwest::Client::new(),
+                &format!("{}/broken.jpg", server.uri()),
+                &download_path,
+                "AAAC",
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(err, DownloadError::HttpStatus { status: 500, .. }),
+                "expected HttpStatus 500, got: {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn real_client_aborts_on_404_no_retry() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/missing.jpg"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("missing.jpg");
+            let config = RetryConfig {
+                max_retries: 3,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+
+            let err = download_file(
+                &reqwest::Client::new(),
+                &format!("{}/missing.jpg", server.uri()),
+                &download_path,
+                "AAAD",
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(err, DownloadError::HttpStatus { status: 404, .. }));
+        }
+
+        #[tokio::test]
+        async fn real_client_rejects_html_content_type() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/error-page.heic"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string("<!DOCTYPE html><html>Rate Limited</html>")
+                        .insert_header("content-type", "text/html; charset=utf-8"),
+                )
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("error-page.heic");
+            let config = RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+
+            let err = download_file(
+                &reqwest::Client::new(),
+                &format!("{}/error-page.heic", server.uri()),
+                &download_path,
+                "AAAE",
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(err, DownloadError::InvalidContent { .. }),
+                "expected InvalidContent for HTML content-type, got: {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn real_client_resume_with_range_header() {
+            let server = MockServer::start().await;
+            let full_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+
+            // Respond to Range requests with 206 and the remainder
+            Mock::given(method("GET"))
+                .and(path("/resume.jpg"))
+                .and(wiremock::matchers::header_exists("Range"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .set_body_bytes(full_body[4..].to_vec())
+                        .insert_header("content-length", "4"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("resume.jpg");
+            let part_path = temp_download_path(&download_path, "AAAF", ".kei-tmp").unwrap();
+
+            // Pre-create .part with first 4 bytes
+            std::fs::write(&part_path, &full_body[..4]).unwrap();
+
+            let config = RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+
+            download_file(
+                &reqwest::Client::new(),
+                &format!("{}/resume.jpg", server.uri()),
+                &download_path,
+                "AAAF",
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(std::fs::read(&download_path).unwrap(), full_body);
+        }
     }
 }
