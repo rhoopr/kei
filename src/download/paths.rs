@@ -89,11 +89,15 @@ fn expand_date_format(format_str: &str, date: &DateTime<Local>) -> String {
     result
 }
 
+/// Maximum filename length in bytes for common filesystems (ext4, APFS, NTFS).
+const MAX_FILENAME_BYTES: usize = 255;
+
 /// Clean a filename by replacing characters that are invalid on common
 /// filesystems (`/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`) and control
-/// characters (including NUL) with `_`.
+/// characters (including NUL) with `_`. Truncates filenames exceeding 255
+/// bytes, preserving the file extension.
 pub(crate) fn clean_filename(filename: &str) -> String {
-    filename
+    let cleaned: String = filename
         .chars()
         .map(|c| {
             if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() {
@@ -102,7 +106,23 @@ pub(crate) fn clean_filename(filename: &str) -> String {
                 c
             }
         })
-        .collect()
+        .collect();
+
+    if cleaned.len() <= MAX_FILENAME_BYTES {
+        return cleaned;
+    }
+
+    // Preserve the extension (e.g. ".jpg") when truncating
+    let (stem, ext) = match cleaned.rfind('.') {
+        Some(dot) => (&cleaned[..dot], &cleaned[dot..]),
+        None => (cleaned.as_str(), ""),
+    };
+
+    let stem_budget = MAX_FILENAME_BYTES.saturating_sub(ext.len());
+    // Truncate stem at a UTF-8 char boundary
+    let truncated_stem = &stem[..stem.floor_char_boundary(stem_budget)];
+
+    format!("{truncated_stem}{ext}")
 }
 
 /// Sanitize a path component (e.g. album name) to prevent path traversal
@@ -157,6 +177,11 @@ pub(crate) fn sanitize_path_component(name: &str) -> String {
         ) {
             return format!("_{}", trimmed);
         }
+    }
+
+    // Truncate at 255 bytes on a char boundary
+    if trimmed.len() > MAX_FILENAME_BYTES {
+        return trimmed[..trimmed.floor_char_boundary(MAX_FILENAME_BYTES)].to_string();
     }
 
     trimmed.to_string()
@@ -848,6 +873,42 @@ mod tests {
     }
 
     #[test]
+    fn test_clean_filename_truncates_long_name_with_extension() {
+        let long_stem = "a".repeat(300);
+        let filename = format!("{long_stem}.jpg");
+        let result = clean_filename(&filename);
+        assert!(result.len() <= 255);
+        assert!(result.ends_with(".jpg"));
+    }
+
+    #[test]
+    fn test_clean_filename_truncates_long_name_without_extension() {
+        let filename = "a".repeat(300);
+        let result = clean_filename(&filename);
+        assert_eq!(result.len(), 255);
+    }
+
+    #[test]
+    fn test_clean_filename_no_truncation_at_limit() {
+        let filename = format!("{}.jpg", "a".repeat(251));
+        assert_eq!(filename.len(), 255);
+        assert_eq!(clean_filename(&filename), filename);
+    }
+
+    #[test]
+    fn test_clean_filename_truncates_multibyte_on_char_boundary() {
+        // Each '日' is 3 bytes; ensure we don't split mid-character
+        let stem = "日".repeat(100); // 300 bytes
+        let filename = format!("{stem}.jpg");
+        let result = clean_filename(&filename);
+        assert!(result.len() <= 255);
+        assert!(result.ends_with(".jpg"));
+        // Stem should be truncated to a whole number of 3-byte chars
+        let stem_part = &result[..result.len() - 4];
+        assert_eq!(stem_part.len() % 3, 0);
+    }
+
+    #[test]
     fn test_sanitize_path_component_control_characters() {
         let result = sanitize_path_component("album\ttab\nnewline");
         assert_eq!(result, "album_tab_newline");
@@ -855,10 +916,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_path_component_long_input() {
-        // Very long album names (>255 chars) should not panic
+        // Very long album names (>255 bytes) are truncated
         let long_name = "a".repeat(1000);
         let result = sanitize_path_component(&long_name);
-        assert_eq!(result.len(), 1000);
+        assert_eq!(result.len(), 255);
     }
 
     #[test]
