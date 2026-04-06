@@ -327,19 +327,17 @@ impl PhotoAlbum {
 
             // Always flush unpaired records, even on error
             let flush_events = buffer.flush();
-            if !flush_events.is_empty() {
-                if stream_error.is_some() {
-                    tracing::warn!(
-                        album = %album_name,
-                        orphaned = flush_events.len(),
-                        "flushing unpaired records after stream error"
-                    );
-                }
-                for event in flush_events {
-                    if tx.send(Ok(event)).await.is_err() {
-                        let _ = token_tx.send(current_token);
-                        return;
-                    }
+            if stream_error.is_some() && !flush_events.is_empty() {
+                tracing::warn!(
+                    album = %album_name,
+                    orphaned = flush_events.len(),
+                    "flushing unpaired records after stream error"
+                );
+            }
+            for event in flush_events {
+                if tx.send(Ok(event)).await.is_err() {
+                    let _ = token_tx.send(current_token);
+                    return;
                 }
             }
 
