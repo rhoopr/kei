@@ -1,3 +1,4 @@
+use crate::password::SecretString;
 use crate::types::{
     Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
     RawTreatmentPolicy, VersionSize,
@@ -31,6 +32,8 @@ pub(crate) struct TomlNotifications {
 pub(crate) struct TomlAuth {
     pub username: Option<String>,
     pub password: Option<String>,
+    pub password_file: Option<String>,
+    pub password_command: Option<String>,
     pub domain: Option<Domain>,
     pub cookie_directory: Option<String>,
 }
@@ -154,7 +157,9 @@ impl std::fmt::Display for LibrarySelection {
 pub struct Config {
     // Heap types first
     pub username: String,
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
+    pub password_file: Option<PathBuf>,
+    pub password_command: Option<String>,
     pub directory: PathBuf,
     pub cookie_directory: PathBuf,
     pub folder_structure: String,
@@ -205,6 +210,7 @@ pub struct Config {
     pub no_incremental: bool,
     pub reset_sync_token: bool,
     pub notify_systemd: bool,
+    pub save_password: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -271,6 +277,36 @@ pub(crate) fn resolve_auth(
     (username, password, domain, cookie_directory)
 }
 
+/// Resolve `password_file` from CLI + TOML.
+fn resolve_password_file(
+    auth: &crate::cli::AuthArgs,
+    toml_auth: Option<&TomlAuth>,
+) -> Option<PathBuf> {
+    auth.password_file
+        .as_deref()
+        .or_else(|| toml_auth.and_then(|a| a.password_file.as_deref()))
+        .map(expand_tilde)
+}
+
+/// Resolve `password_command` from CLI + TOML.
+fn resolve_password_command(
+    auth: &crate::cli::AuthArgs,
+    toml_auth: Option<&TomlAuth>,
+) -> Option<String> {
+    auth.password_command
+        .clone()
+        .or_else(|| toml_auth.and_then(|a| a.password_command.clone()))
+}
+
+/// Clear the password environment variable to prevent leakage via
+/// `/proc/[pid]/environ`, `docker inspect`, or child processes.
+pub(crate) fn clear_password_env() {
+    // SAFETY: called during single-threaded init before tokio spawns workers.
+    // `remove_var` is unsafe since Rust 1.66 due to thread-safety concerns,
+    // but we call this before any worker threads exist.
+    unsafe { std::env::remove_var("ICLOUD_PASSWORD") };
+}
+
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
     /// Resolution order: CLI > TOML > hardcoded default.
@@ -280,7 +316,11 @@ impl Config {
         sync: crate::cli::SyncArgs,
         toml: Option<TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let (username, password, domain, cookie_directory) = resolve_auth(&auth, toml.as_ref());
+        let toml_auth = toml.as_ref().and_then(|t| t.auth.as_ref());
+        let (username, password_str, domain, cookie_directory) = resolve_auth(&auth, toml.as_ref());
+        let password_file = resolve_password_file(&auth, toml_auth);
+        let password_command = resolve_password_command(&auth, toml_auth);
+        let save_password = auth.save_password;
 
         // Reject explicitly provided empty username/password (CLI value_parser
         // catches the CLI case; this catches empty strings from TOML).
@@ -292,9 +332,12 @@ impl Config {
         {
             anyhow::ensure!(!username.is_empty(), "username must not be empty");
         }
-        if let Some(ref pw) = password {
+        if let Some(ref pw) = password_str {
             anyhow::ensure!(!pw.is_empty(), "password must not be empty");
         }
+
+        // Convert plain password string to SecretString
+        let password = password_str.map(SecretString::from);
 
         // Validate cookie directory early when explicitly provided: check that
         // the deepest existing ancestor is a directory (not a file), so we fail
@@ -467,6 +510,8 @@ impl Config {
         Ok(Self {
             username,
             password,
+            password_file,
+            password_command,
             directory,
             cookie_directory,
             folder_structure,
@@ -503,6 +548,7 @@ impl Config {
             no_incremental: sync.no_incremental,
             reset_sync_token: sync.reset_sync_token,
             notify_systemd,
+            save_password,
         })
     }
 }
@@ -541,6 +587,7 @@ pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>>
 mod tests {
     use super::*;
     use crate::cli::{AuthArgs, SyncArgs};
+    use secrecy::ExposeSecret;
 
     #[test]
     fn test_expand_tilde_with_home() {
@@ -758,6 +805,9 @@ mod tests {
         AuthArgs {
             username: Some("u@example.com".to_string()),
             password: None,
+            password_file: None,
+            password_command: None,
+            save_password: false,
             domain: None,
             cookie_directory: None,
         }
@@ -1473,7 +1523,10 @@ mod tests {
         let mut auth = default_auth();
         auth.password = Some("cli-pw".to_string());
         let cfg = Config::build(auth, default_sync(), Some(toml)).unwrap();
-        assert_eq!(cfg.password.as_deref(), Some("cli-pw"));
+        assert_eq!(
+            cfg.password.as_ref().map(|s| s.expose_secret()),
+            Some("cli-pw")
+        );
     }
 
     #[test]
@@ -1484,7 +1537,10 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
-        assert_eq!(cfg.password.as_deref(), Some("toml-pw"));
+        assert_eq!(
+            cfg.password.as_ref().map(|s| s.expose_secret()),
+            Some("toml-pw")
+        );
     }
 
     #[test]
@@ -2041,7 +2097,10 @@ mod tests {
         let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         // default_auth username overrides toml
         assert_eq!(cfg.username, "u@example.com");
-        assert_eq!(cfg.password.as_deref(), Some("fullpw"));
+        assert_eq!(
+            cfg.password.as_ref().map(|s| s.expose_secret()),
+            Some("fullpw")
+        );
         assert!(matches!(cfg.domain, Domain::Cn));
         assert_eq!(cfg.cookie_directory, PathBuf::from("/full/cookies"));
         assert_eq!(cfg.directory, PathBuf::from("/full/photos"));
@@ -2090,6 +2149,9 @@ mod tests {
         let auth = AuthArgs {
             username: None,
             password: None,
+            password_file: None,
+            password_command: None,
+            save_password: false,
             domain: None,
             cookie_directory: None,
         };
@@ -2113,6 +2175,9 @@ mod tests {
         let auth = AuthArgs {
             username: Some("cli@example.com".to_string()),
             password: Some("cli-pw".to_string()),
+            password_file: None,
+            password_command: None,
+            save_password: false,
             domain: Some(Domain::Com),
             cookie_directory: Some("/cli/cookies".to_string()),
         };
@@ -2128,6 +2193,9 @@ mod tests {
         let auth = AuthArgs {
             username: None,
             password: None,
+            password_file: None,
+            password_command: None,
+            save_password: false,
             domain: None,
             cookie_directory: None,
         };

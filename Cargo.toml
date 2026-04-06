@@ -35,6 +35,11 @@ num-bigint = "0.4"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 
+# Credential security
+secrecy = "0.10"
+keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
+aes-gcm = "0.10"
+
 # Dates
 chrono = { version = "0.4", features = ["serde"] }
 

@@ -10,11 +10,13 @@
 mod auth;
 mod cli;
 mod config;
+mod credential;
 mod download;
 mod health;
 mod icloud;
 mod migration;
 mod notifications;
+mod password;
 pub mod retry;
 mod setup;
 mod shutdown;
@@ -31,6 +33,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use password::{ExposeSecret, SecretString};
 use tracing_subscriber::EnvFilter;
 
 /// A writer wrapper that redacts a password string from log output.
@@ -39,7 +42,7 @@ use tracing_subscriber::EnvFilter;
 /// configured password with `********` in each `write()` call.
 struct RedactingWriter<W> {
     inner: W,
-    password: Arc<std::sync::Mutex<Option<String>>>,
+    password: Arc<std::sync::Mutex<Option<SecretString>>>,
 }
 
 impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
@@ -48,14 +51,15 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
             .password
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pw) = password.as_deref() {
-            if !pw.is_empty() {
+        if let Some(ref pw) = *password {
+            let pw_str = pw.expose_secret();
+            if !pw_str.is_empty() {
                 // A buffer shorter than the password can't contain it,
                 // avoiding the lossy UTF-8 conversion for short log fragments.
-                if buf.len() >= pw.len() {
+                if buf.len() >= pw_str.len() {
                     let s = String::from_utf8_lossy(buf);
-                    if s.contains(pw) {
-                        let redacted = s.replace(pw, "********");
+                    if s.contains(pw_str) {
+                        let redacted = s.replace(pw_str, "********");
                         self.inner.write_all(redacted.as_bytes())?;
                         return Ok(buf.len());
                     }
@@ -73,7 +77,7 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
 
 /// A `MakeWriter` implementation that produces `RedactingWriter` instances.
 struct RedactingMakeWriter {
-    password: Arc<std::sync::Mutex<Option<String>>>,
+    password: Arc<std::sync::Mutex<Option<SecretString>>>,
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
@@ -95,6 +99,28 @@ use systemd::SystemdNotifier;
 
 /// Maximum number of re-authentication attempts before giving up.
 const MAX_REAUTH_ATTEMPTS: u32 = 3;
+
+/// Prevent core dumps from leaking in-memory credentials.
+/// Best-effort: failures are logged but not fatal (Docker containers may
+/// restrict these syscalls).
+fn harden_process() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            tracing::debug!("prctl(PR_SET_DUMPABLE, 0) failed");
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        let rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::setrlimit(libc::RLIMIT_CORE, &rlim) != 0 {
+            tracing::debug!("setrlimit(RLIMIT_CORE, 0) failed");
+        }
+    }
+}
 
 /// Exit code for partial sync (some downloads failed, but sync was not a total failure).
 const EXIT_PARTIAL: u8 = 2;
@@ -134,14 +160,13 @@ fn available_disk_space(_path: &Path) -> Option<u64> {
     None
 }
 
-/// Build a password provider closure that returns the given password or
-/// falls back to prompting on stdin.
-fn make_password_provider(password: Option<String>) -> impl Fn() -> Option<String> {
-    move || -> Option<String> {
-        password.clone().or_else(|| {
-            tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
-        })
-    }
+/// Build a password provider closure from a [`PasswordSource`].
+///
+/// The source is evaluated lazily on each call — for `Command` and `File`
+/// sources, this re-executes/re-reads each time, supporting password rotation
+/// and keeping no password in memory between auth cycles.
+fn make_password_provider(source: password::PasswordSource) -> impl Fn() -> Option<SecretString> {
+    move || source.resolve().ok().flatten()
 }
 
 /// Attempt to re-authenticate the session.
@@ -165,7 +190,7 @@ async fn attempt_reauth<F>(
     password_provider: &F,
 ) -> anyhow::Result<()>
 where
-    F: Fn() -> Option<String>,
+    F: Fn() -> Option<SecretString>,
 {
     let mut session = shared_session.write().await;
 
@@ -433,6 +458,38 @@ async fn verify_local_checksum(path: &Path, expected_hex: &str) -> anyhow::Resul
 }
 
 /// Run the get-code command: trigger push notification for 2FA.
+/// Run the credential subcommand: set, clear, or show backend.
+async fn run_credential(
+    args: cli::CredentialArgs,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<()> {
+    let (username, _password, _domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
+
+    if username.is_empty() {
+        anyhow::bail!("--username is required for credential management");
+    }
+
+    let store = credential::CredentialStore::new(&username, &cookie_directory);
+
+    match args.action {
+        cli::CredentialAction::Set => {
+            let pw = rpassword::prompt_password("iCloud Password: ")
+                .map_err(|e| anyhow::anyhow!("Failed to read password: {e}"))?;
+            anyhow::ensure!(!pw.is_empty(), "Password must not be empty");
+            store.store(&pw)?;
+            println!("Password stored in {} backend.", store.backend_name());
+        }
+        cli::CredentialAction::Clear => {
+            store.delete()?;
+            println!("Stored credential removed.");
+        }
+        cli::CredentialAction::Backend => {
+            println!("{}", store.backend_name());
+        }
+    }
+    Ok(())
+}
+
 async fn run_get_code(args: cli::GetCodeArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
@@ -440,7 +497,13 @@ async fn run_get_code(args: cli::GetCodeArgs, toml: Option<&TomlConfig>) -> anyh
         anyhow::bail!("--username is required for get-code");
     }
 
-    let password_provider = make_password_provider(password);
+    let source = password::build_password_source(
+        password.map(SecretString::from).as_ref(),
+        args.auth.password_command.as_deref(),
+        args.auth.password_file.as_deref().map(std::path::Path::new),
+        credential::CredentialStore::new(&username, &cookie_directory),
+    );
+    let password_provider = make_password_provider(source);
 
     auth::send_2fa_push(
         &cookie_directory,
@@ -466,7 +529,13 @@ async fn run_submit_code(
         anyhow::bail!("--username is required for submit-code");
     }
 
-    let password_provider = make_password_provider(password);
+    let source = password::build_password_source(
+        password.map(SecretString::from).as_ref(),
+        args.auth.password_command.as_deref(),
+        args.auth.password_file.as_deref().map(std::path::Path::new),
+        credential::CredentialStore::new(&username, &cookie_directory),
+    );
+    let password_provider = make_password_provider(source);
 
     let result = auth::authenticate(
         &cookie_directory,
@@ -544,7 +613,13 @@ async fn run_import_existing(
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
     // Authenticate
-    let password_provider = make_password_provider(password);
+    let source = password::build_password_source(
+        password.map(SecretString::from).as_ref(),
+        args.auth.password_command.as_deref(),
+        args.auth.password_file.as_deref().map(std::path::Path::new),
+        credential::CredentialStore::new(&username, &cookie_directory),
+    );
+    let password_provider = make_password_provider(source);
 
     let auth_result = auth::authenticate(
         &cookie_directory,
@@ -823,7 +898,7 @@ async fn run() -> anyhow::Result<()> {
     // Password redaction: the password is set after config parsing,
     // but tracing must be initialized earlier. Use a shared slot that
     // starts as None and is populated once the password is known.
-    let redact_password: Arc<std::sync::Mutex<Option<String>>> =
+    let redact_password: Arc<std::sync::Mutex<Option<SecretString>>> =
         Arc::new(std::sync::Mutex::new(None));
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -853,6 +928,9 @@ async fn run() -> anyhow::Result<()> {
         }
         Command::GetCode(args) => return run_get_code(args, toml_config.as_ref()).await,
         Command::SubmitCode(args) => return run_submit_code(args, toml_config.as_ref()).await,
+        Command::Credential(args) => {
+            return run_credential(args, toml_config.as_ref()).await;
+        }
         Command::Setup { output } => {
             let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
             match setup::run_setup(&path)? {
@@ -881,6 +959,9 @@ async fn run() -> anyhow::Result<()> {
                     let sync_auth = cli::AuthArgs {
                         username: env_username,
                         password: env_password,
+                        password_file: None,
+                        password_command: None,
+                        save_password: false,
                         domain: None,
                         cookie_directory: None,
                     };
@@ -894,12 +975,18 @@ async fn run() -> anyhow::Result<()> {
     };
     let config = config::Config::build(auth, sync, toml_config)?;
 
+    // Clear password from environment to prevent leakage
+    config::clear_password_env();
+
     // Install password redaction now that we know the password
-    if let Some(pw) = &config.password {
+    if let Some(ref pw) = config.password {
         if let Ok(mut guard) = redact_password.lock() {
-            *guard = Some(pw.clone());
+            *guard = Some(SecretString::from(pw.expose_secret().to_owned()));
         }
     }
+
+    // Prevent core dumps from leaking in-memory credentials
+    harden_process();
 
     // Write PID file if requested (before auth so the PID is visible immediately)
     let _pid_guard = config
@@ -917,7 +1004,14 @@ async fn run() -> anyhow::Result<()> {
         anyhow::bail!("--username is required");
     }
 
-    let password_provider = make_password_provider(config.password);
+    let cred_store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
+    let source = password::build_password_source(
+        config.password.as_ref(),
+        config.password_command.as_deref(),
+        config.password_file.as_deref(),
+        cred_store,
+    );
+    let password_provider = make_password_provider(source);
 
     let auth_result = match auth::authenticate(
         &config.cookie_directory,
@@ -986,6 +1080,22 @@ async fn run() -> anyhow::Result<()> {
         }
         Err(e) => return Err(e),
     };
+
+    // Save password to credential store if requested
+    if config.save_password {
+        if let Some(ref pw) = config.password {
+            let store =
+                credential::CredentialStore::new(&config.username, &config.cookie_directory);
+            if let Err(e) = store.store(pw.expose_secret()) {
+                tracing::warn!(error = %e, "Failed to save password to credential store");
+            } else {
+                tracing::info!(
+                    backend = store.backend_name(),
+                    "Password saved to credential store"
+                );
+            }
+        }
+    }
 
     if config.auth_only {
         tracing::info!("Authentication completed successfully");
@@ -1588,7 +1698,7 @@ mod tests {
     fn redacting_writer_replaces_password() {
         use std::io::Write;
 
-        let password = Arc::new(std::sync::Mutex::new(Some("s3cret".to_string())));
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from("s3cret"))));
         let mut buf = Vec::new();
         {
             let mut writer = RedactingWriter {
@@ -1606,7 +1716,8 @@ mod tests {
     fn redacting_writer_no_password_passthrough() {
         use std::io::Write;
 
-        let password = Arc::new(std::sync::Mutex::new(None));
+        let password: Arc<std::sync::Mutex<Option<SecretString>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let mut buf = Vec::new();
         {
             let mut writer = RedactingWriter {
@@ -1623,7 +1734,9 @@ mod tests {
     fn redacting_writer_empty_password_passthrough() {
         use std::io::Write;
 
-        let password = Arc::new(std::sync::Mutex::new(Some(String::new())));
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from(
+            String::new(),
+        ))));
         let mut buf = Vec::new();
         {
             let mut writer = RedactingWriter {
@@ -1641,7 +1754,9 @@ mod tests {
         use std::io::Write;
 
         // Buffer shorter than the password can't contain it
-        let password = Arc::new(std::sync::Mutex::new(Some("longpassword".to_string())));
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from(
+            "longpassword",
+        ))));
         let mut buf = Vec::new();
         {
             let mut writer = RedactingWriter {
@@ -1658,7 +1773,8 @@ mod tests {
     fn redacting_writer_flush() {
         use std::io::Write;
 
-        let password = Arc::new(std::sync::Mutex::new(None));
+        let password: Arc<std::sync::Mutex<Option<SecretString>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let mut buf = Vec::new();
         let mut writer = RedactingWriter {
             inner: &mut buf,
@@ -1668,11 +1784,22 @@ mod tests {
     }
 
     #[test]
-    fn make_password_provider_with_some() {
-        let provider = make_password_provider(Some("mypass".to_string()));
-        assert_eq!(provider(), Some("mypass".to_string()));
+    fn make_password_provider_with_direct_source() {
+        let source = password::PasswordSource::Direct(Arc::new(SecretString::from("mypass")));
+        let provider = make_password_provider(source);
+        let result = provider().unwrap();
+        assert_eq!(result.expose_secret(), "mypass");
         // Can be called multiple times
-        assert_eq!(provider(), Some("mypass".to_string()));
+        let result2 = provider().unwrap();
+        assert_eq!(result2.expose_secret(), "mypass");
+    }
+
+    #[test]
+    fn make_password_provider_with_command_source() {
+        let source = password::PasswordSource::Command("echo cmd_test".to_string());
+        let provider = make_password_provider(source);
+        let result = provider().unwrap();
+        assert_eq!(result.expose_secret(), "cmd_test");
     }
 
     // ── build_photos_params tests ───────────────────────────────────────

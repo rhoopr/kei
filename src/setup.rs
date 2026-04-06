@@ -25,7 +25,7 @@ pub(crate) enum SetupResult {
 struct SetupAnswers {
     // Account
     username: String,
-    password: String,
+    password: secrecy::SecretString,
     domain: Option<Domain>,
 
     // Destination
@@ -72,7 +72,7 @@ impl Default for SetupAnswers {
     fn default() -> Self {
         Self {
             username: String::new(),
-            password: String::new(),
+            password: secrecy::SecretString::from(String::new()),
             domain: None,
             directory: "~/Photos/iCloud".to_string(),
             folder_structure: None,
@@ -189,7 +189,8 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     let env_path = config_path.parent().unwrap_or(Path::new(".")).join(".env");
     let env_content = format!(
         "ICLOUD_USERNAME={}\nICLOUD_PASSWORD={}\n",
-        answers.username, answers.password
+        answers.username,
+        secrecy::ExposeSecret::expose_secret(&answers.password)
     );
     std::fs::write(&env_path, &env_content)
         .with_context(|| format!("Failed to write {}", env_path.display()))?;
@@ -249,7 +250,8 @@ fn ask_account(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         })
         .interact_text()?;
 
-    answers.password = Password::new().with_prompt("iCloud password").interact()?;
+    answers.password =
+        secrecy::SecretString::from(Password::new().with_prompt("iCloud password").interact()?);
 
     println!();
     let region_items = ["iCloud.com", "iCloud.com.cn (China)"];
@@ -875,7 +877,7 @@ mod tests {
     fn test_generate_toml_defaults_only() {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
-            password: "secret".to_string(),
+            password: secrecy::SecretString::from("secret"),
             directory: "~/Photos/iCloud".to_string(),
             ..Default::default()
         };
@@ -899,7 +901,7 @@ mod tests {
     fn test_generate_toml_roundtrip() {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
-            password: "secret".to_string(),
+            password: secrecy::SecretString::from("secret"),
             directory: "~/Photos/iCloud".to_string(),
             ..Default::default()
         };
@@ -925,7 +927,7 @@ mod tests {
     fn test_generate_toml_full() {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
-            password: "secret".to_string(),
+            password: secrecy::SecretString::from("secret"),
             domain: Some(Domain::Cn),
             directory: "~/photos".to_string(),
             folder_structure: Some("%Y/%m".to_string()),
@@ -983,7 +985,7 @@ mod tests {
     fn test_generate_toml_full_roundtrip_values() {
         let answers = SetupAnswers {
             username: "test@icloud.com".to_string(),
-            password: "pw".to_string(),
+            password: secrecy::SecretString::from("pw"),
             domain: Some(Domain::Cn),
             directory: "/data/photos".to_string(),
             folder_structure: Some("%Y-%m".to_string()),
@@ -1066,7 +1068,7 @@ mod tests {
     fn test_generate_toml_albums_array() {
         let answers = SetupAnswers {
             username: "u@e.com".to_string(),
-            password: "p".to_string(),
+            password: secrecy::SecretString::from("p"),
             directory: "/d".to_string(),
             albums: vec!["My Album".to_string(), "Vacation \"2024\"".to_string()],
             ..Default::default()

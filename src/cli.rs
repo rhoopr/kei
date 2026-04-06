@@ -36,6 +36,23 @@ pub struct AuthArgs {
     #[arg(short = 'p', long, env = "ICLOUD_PASSWORD", value_parser = non_empty_string)]
     pub password: Option<String>,
 
+    /// Read password from a file on each auth attempt.
+    /// Supports Docker secrets (e.g., /run/secrets/icloud_password).
+    /// Trailing newline is stripped.
+    #[arg(long, conflicts_with = "password")]
+    pub password_file: Option<String>,
+
+    /// Execute a shell command to obtain the password on each auth attempt.
+    /// Supports external secret managers (1Password, Vault, pass).
+    /// Example: --password-command "op read 'op://vault/icloud/password'"
+    #[arg(long, conflicts_with_all = ["password", "password_file"])]
+    pub password_command: Option<String>,
+
+    /// After successful auth, persist the password to the credential store
+    /// (OS keyring or encrypted file).
+    #[arg(long)]
+    pub save_password: bool,
+
     /// iCloud domain (com or cn)
     #[arg(long, value_enum)]
     pub domain: Option<Domain>,
@@ -306,12 +323,36 @@ pub enum Command {
     /// Submit a 2FA code non-interactively (for Docker / headless use)
     SubmitCode(SubmitCodeArgs),
 
+    /// Manage stored credentials (OS keyring or encrypted file)
+    Credential(CredentialArgs),
+
     /// Interactively generate a config file
     Setup {
         /// Output path (overrides --config)
         #[arg(short = 'o', long)]
         output: Option<String>,
     },
+}
+
+/// Arguments for the credential subcommand.
+#[derive(Parser, Debug, Clone)]
+pub struct CredentialArgs {
+    #[command(flatten)]
+    pub auth: AuthArgs,
+
+    #[command(subcommand)]
+    pub action: CredentialAction,
+}
+
+/// Credential management actions.
+#[derive(Subcommand, Debug, Clone)]
+pub enum CredentialAction {
+    /// Store a password in the credential store (prompts interactively)
+    Set,
+    /// Remove a stored password
+    Clear,
+    /// Show which credential backend is active (keyring, encrypted-file, none)
+    Backend,
 }
 
 #[derive(Parser, Debug)]
@@ -700,6 +741,98 @@ mod tests {
     fn test_password_none_by_default() {
         let cli = parse(&base_args());
         assert!(cli.auth.password.is_none());
+    }
+
+    #[test]
+    fn test_password_file_flag() {
+        let mut args = base_args();
+        args.extend(["--password-file", "/run/secrets/pw"]);
+        let cli = parse(&args);
+        assert_eq!(cli.auth.password_file.as_deref(), Some("/run/secrets/pw"));
+    }
+
+    #[test]
+    fn test_password_command_flag() {
+        let mut args = base_args();
+        args.extend(["--password-command", "op read 'op://vault/icloud/pw'"]);
+        let cli = parse(&args);
+        assert_eq!(
+            cli.auth.password_command.as_deref(),
+            Some("op read 'op://vault/icloud/pw'")
+        );
+    }
+
+    #[test]
+    fn test_password_conflicts_with_password_file() {
+        let mut args = base_args();
+        args.extend(["--password", "pw", "--password-file", "/tmp/pw.txt"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_password_conflicts_with_password_command() {
+        let mut args = base_args();
+        args.extend(["--password", "pw", "--password-command", "echo pw"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_password_file_conflicts_with_password_command() {
+        let mut args = base_args();
+        args.extend([
+            "--password-file",
+            "/tmp/pw",
+            "--password-command",
+            "echo pw",
+        ]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_save_password_flag() {
+        let mut args = base_args();
+        args.push("--save-password");
+        let cli = parse(&args);
+        assert!(cli.auth.save_password);
+    }
+
+    #[test]
+    fn test_save_password_default_false() {
+        let cli = parse(&base_args());
+        assert!(!cli.auth.save_password);
+    }
+
+    #[test]
+    fn test_credential_set_subcommand() {
+        let cli =
+            Cli::try_parse_from(["kei", "credential", "--username", "test@example.com", "set"])
+                .unwrap();
+        if let Some(Command::Credential(args)) = cli.command {
+            assert!(matches!(args.action, CredentialAction::Set));
+            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
+        } else {
+            panic!("Expected Credential command");
+        }
+    }
+
+    #[test]
+    fn test_credential_clear_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "credential", "clear"]).unwrap();
+        if let Some(Command::Credential(args)) = cli.command {
+            assert!(matches!(args.action, CredentialAction::Clear));
+        } else {
+            panic!("Expected Credential command");
+        }
+    }
+
+    #[test]
+    fn test_credential_backend_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "credential", "backend"]).unwrap();
+        if let Some(Command::Credential(args)) = cli.command {
+            assert!(matches!(args.action, CredentialAction::Backend));
+        } else {
+            panic!("Expected Credential command");
+        }
     }
 
     #[test]

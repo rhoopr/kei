@@ -6,8 +6,40 @@ services:
     stop_grace_period: 30s
     environment:
       - ICLOUD_USERNAME=${ICLOUD_USERNAME}
-      - ICLOUD_PASSWORD=${ICLOUD_PASSWORD}
       - TZ=${TZ:-UTC}
+      # Option 1: Password via environment variable (least secure — visible in
+      # `docker inspect`). Removed by kei from the process environment after
+      # reading.
+      # - ICLOUD_PASSWORD=${ICLOUD_PASSWORD}
     volumes:
       - ./config:/config
       - /path/to/photos:/photos
+
+    # ── Credential options (pick one) ──────────────────────────────
+    #
+    # Option 2 (recommended): Encrypted credential store
+    #   First run:  docker exec -it kei kei credential set --username $ICLOUD_USERNAME
+    #   Subsequent: kei decrypts from /config automatically on each re-auth.
+    #
+    # Option 3: Docker secrets (file-based)
+    #   secrets:
+    #     - icloud_password
+    #   command: >-
+    #     sync
+    #     --config /config/config.toml
+    #     --cookie-directory /config
+    #     --directory /photos
+    #     --password-file /run/secrets/icloud_password
+    #
+    # Option 4: External secret manager (zero password on host)
+    #   command: >-
+    #     sync
+    #     --config /config/config.toml
+    #     --cookie-directory /config
+    #     --directory /photos
+    #     --password-command "cat /run/secrets/icloud_password"
+
+# Uncomment for Docker secrets (Option 3):
+# secrets:
+#   icloud_password:
+#     file: ./icloud_password.txt

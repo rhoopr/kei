@@ -14,6 +14,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
 use self::endpoints::Endpoints;
@@ -60,7 +61,7 @@ impl std::fmt::Debug for AuthResult {
 pub async fn authenticate(
     cookie_dir: &Path,
     apple_id: &str,
-    password_provider: &dyn Fn() -> Option<String>,
+    password_provider: &dyn Fn() -> Option<SecretString>,
     domain: &str,
     client_id: Option<String>,
     timeout_secs: Option<u64>,
@@ -105,11 +106,12 @@ pub async fn authenticate(
             &mut session,
             &endpoints,
             apple_id,
-            &password,
+            password.expose_secret(),
             &client_id,
             domain,
         )
         .await?;
+        // `password` (SecretString) dropped here, zeroing memory
 
         let account_data = twofa::authenticate_with_token(&mut session, &endpoints).await?;
         data = Some(account_data);
@@ -178,7 +180,7 @@ pub async fn authenticate(
 pub async fn send_2fa_push(
     cookie_dir: &Path,
     apple_id: &str,
-    password_provider: &dyn Fn() -> Option<String>,
+    password_provider: &dyn Fn() -> Option<SecretString>,
     domain: &str,
 ) -> Result<()> {
     let endpoints = Endpoints::for_domain(domain)?;
@@ -204,7 +206,7 @@ pub async fn send_2fa_push(
             &mut session,
             &endpoints,
             apple_id,
-            &password,
+            password.expose_secret(),
             &client_id,
             domain,
         )
