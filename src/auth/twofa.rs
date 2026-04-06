@@ -321,7 +321,10 @@ pub async fn validate_token(
     tracing::debug!("Session token is still valid");
     let text = response.text().await.unwrap_or_default();
     let data: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
-        let n = text.len().min(200);
+        let mut n = text.len().min(200);
+        while n > 0 && !text.is_char_boundary(n) {
+            n -= 1;
+        }
         format!("Validate: expected JSON but got: {:?}", &text[..n])
     })?;
     data.check_errors()?;
@@ -361,7 +364,10 @@ pub async fn authenticate_with_token(
 
     let text = response.text().await.unwrap_or_default();
     let body: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
-        let n = text.len().min(200);
+        let mut n = text.len().min(200);
+        while n > 0 && !text.is_char_boundary(n) {
+            n -= 1;
+        }
         format!("Account login: expected JSON but got: {:?}", &text[..n])
     })?;
 
