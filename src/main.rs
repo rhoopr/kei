@@ -22,6 +22,9 @@ mod state;
 mod systemd;
 mod types;
 
+#[cfg(test)]
+mod test_helpers;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;

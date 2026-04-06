@@ -2448,6 +2448,7 @@ mod tests {
     use super::*;
     use crate::icloud::photos::asset::ChangeEvent;
     use crate::icloud::photos::PhotoAsset;
+    use crate::test_helpers::TestPhotoAsset;
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
@@ -2493,25 +2494,9 @@ mod tests {
         filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache)
     }
 
-    fn photo_asset_with_version() -> PhotoAsset {
-        PhotoAsset::new(
-            json!({"recordName": "TEST_1", "fields": {
-                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
-                "itemType": {"value": "public.jpeg"},
-                "resOriginalRes": {"value": {
-                    "size": 1000,
-                    "downloadURL": "https://example.com/orig",
-                    "fileChecksum": "abc123"
-                }},
-                "resOriginalFileType": {"value": "public.jpeg"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        )
-    }
-
     #[test]
     fn test_filter_asset_produces_task() {
-        let asset = photo_asset_with_version();
+        let asset = TestPhotoAsset::new("TEST_1").build();
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
@@ -2522,19 +2507,14 @@ mod tests {
 
     #[test]
     fn test_filter_skips_videos_when_configured() {
-        let asset = PhotoAsset::new(
-            json!({"recordName": "VID_1", "fields": {
-                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
-                "itemType": {"value": "com.apple.quicktime-movie"},
-                "resOriginalRes": {"value": {
-                    "size": 50000,
-                    "downloadURL": "https://example.com/vid",
-                    "fileChecksum": "vid_ck"
-                }},
-                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let asset = TestPhotoAsset::new("VID_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .build();
         let mut config = test_config();
         config.skip_videos = true;
         assert!(filter_asset_fresh(&asset, &config).is_empty());
@@ -2542,19 +2522,14 @@ mod tests {
 
     #[test]
     fn test_filter_video_task_carries_size() {
-        let asset = PhotoAsset::new(
-            json!({"recordName": "VID_2", "fields": {
-                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
-                "itemType": {"value": "com.apple.quicktime-movie"},
-                "resOriginalRes": {"value": {
-                    "size": 500_000_000,
-                    "downloadURL": "https://example.com/big_vid",
-                    "fileChecksum": "big_ck"
-                }},
-                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let asset = TestPhotoAsset::new("VID_2")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(500_000_000)
+            .orig_url("https://example.com/big_vid")
+            .orig_checksum("big_ck")
+            .build();
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
@@ -2563,7 +2538,7 @@ mod tests {
 
     #[test]
     fn test_filter_skips_photos_when_configured() {
-        let asset = photo_asset_with_version();
+        let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         config.skip_photos = true;
         assert!(filter_asset_fresh(&asset, &config).is_empty());
@@ -2620,7 +2595,7 @@ mod tests {
     #[test]
     fn test_filter_skips_existing_file() {
         let dir = TempDir::new().unwrap();
-        let asset = photo_asset_with_version();
+        let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         config.directory = dir.path().to_path_buf();
 
@@ -2638,7 +2613,7 @@ mod tests {
     fn test_filter_deduplicates_file_with_different_size() {
         let dir = TempDir::new().unwrap();
 
-        let asset = photo_asset_with_version(); // version.size = 1000
+        let asset = TestPhotoAsset::new("TEST_1").build(); // version.size = 1000
         let mut config = test_config();
         config.directory = dir.path().to_path_buf();
 
@@ -2662,31 +2637,21 @@ mod tests {
         );
     }
 
-    fn photo_asset_with_live_photo() -> PhotoAsset {
-        PhotoAsset::new(
-            json!({"recordName": "LIVE_1", "fields": {
-                "filenameEnc": {"value": "IMG_0001.HEIC", "type": "STRING"},
-                "itemType": {"value": "public.heic"},
-                "resOriginalRes": {"value": {
-                    "size": 2000,
-                    "downloadURL": "https://example.com/heic_orig",
-                    "fileChecksum": "heic_ck"
-                }},
-                "resOriginalFileType": {"value": "public.heic"},
-                "resOriginalVidComplRes": {"value": {
-                    "size": 3000,
-                    "downloadURL": "https://example.com/live_mov",
-                    "fileChecksum": "mov_ck"
-                }},
-                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        )
+    fn test_live_photo_asset() -> PhotoAsset {
+        TestPhotoAsset::new("LIVE_1")
+            .filename("IMG_0001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(2000)
+            .orig_url("https://example.com/heic_orig")
+            .orig_checksum("heic_ck")
+            .live_photo("https://example.com/live_mov", "mov_ck", 3000)
+            .build()
     }
 
     #[test]
     fn test_filter_produces_live_photo_mov_task() {
-        let asset = photo_asset_with_live_photo();
+        let asset = test_live_photo_asset();
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
@@ -2703,7 +2668,7 @@ mod tests {
 
     #[test]
     fn test_filter_skips_live_photo_when_configured() {
-        let asset = photo_asset_with_live_photo();
+        let asset = test_live_photo_asset();
         let mut config = test_config();
         config.skip_live_photos = true;
         let tasks = filter_asset_fresh(&asset, &config);
@@ -2713,7 +2678,7 @@ mod tests {
 
     #[test]
     fn test_filter_live_photo_original_policy() {
-        let asset = photo_asset_with_live_photo();
+        let asset = test_live_photo_asset();
         let mut config = test_config();
         config.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
         let tasks = filter_asset_fresh(&asset, &config);
@@ -2729,7 +2694,7 @@ mod tests {
     fn test_filter_skips_existing_live_photo_mov() {
         let dir = TempDir::new().unwrap();
 
-        let asset = photo_asset_with_live_photo();
+        let asset = test_live_photo_asset();
         let mut config = test_config();
         config.directory = dir.path().to_path_buf();
 
@@ -2751,7 +2716,7 @@ mod tests {
     fn test_filter_deduplicates_live_photo_mov_collision() {
         let dir = TempDir::new().unwrap();
 
-        let asset = photo_asset_with_live_photo();
+        let asset = test_live_photo_asset();
         let mut config = test_config();
         config.directory = dir.path().to_path_buf();
 
@@ -2784,45 +2749,25 @@ mod tests {
         // must derive from the deduped HEIC name so they remain visually paired.
         let dir = TempDir::new().unwrap();
 
-        let asset1 = PhotoAsset::new(
-            json!({"recordName": "LIVE_A", "fields": {
-                "filenameEnc": {"value": "IMG_0001.HEIC", "type": "STRING"},
-                "itemType": {"value": "public.heic"},
-                "resOriginalRes": {"value": {
-                    "size": 2000,
-                    "downloadURL": "https://example.com/heic_a",
-                    "fileChecksum": "ck_a"
-                }},
-                "resOriginalFileType": {"value": "public.heic"},
-                "resOriginalVidComplRes": {"value": {
-                    "size": 3000,
-                    "downloadURL": "https://example.com/mov_a",
-                    "fileChecksum": "mov_ck_a"
-                }},
-                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let asset1 = TestPhotoAsset::new("LIVE_A")
+            .filename("IMG_0001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(2000)
+            .orig_url("https://example.com/heic_a")
+            .orig_checksum("ck_a")
+            .live_photo("https://example.com/mov_a", "mov_ck_a", 3000)
+            .build();
 
-        let asset2 = PhotoAsset::new(
-            json!({"recordName": "LIVE_B", "fields": {
-                "filenameEnc": {"value": "IMG_0001.HEIC", "type": "STRING"},
-                "itemType": {"value": "public.heic"},
-                "resOriginalRes": {"value": {
-                    "size": 4000,
-                    "downloadURL": "https://example.com/heic_b",
-                    "fileChecksum": "ck_b"
-                }},
-                "resOriginalFileType": {"value": "public.heic"},
-                "resOriginalVidComplRes": {"value": {
-                    "size": 5000,
-                    "downloadURL": "https://example.com/mov_b",
-                    "fileChecksum": "mov_ck_b"
-                }},
-                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let asset2 = TestPhotoAsset::new("LIVE_B")
+            .filename("IMG_0001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(4000)
+            .orig_url("https://example.com/heic_b")
+            .orig_checksum("ck_b")
+            .live_photo("https://example.com/mov_b", "mov_ck_b", 5000)
+            .build();
 
         let mut config = test_config();
         config.directory = dir.path().to_path_buf();
@@ -2893,25 +2838,15 @@ mod tests {
 
     #[test]
     fn test_filter_no_live_photo_for_videos() {
-        let asset = PhotoAsset::new(
-            json!({"recordName": "VID_1", "fields": {
-                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
-                "itemType": {"value": "com.apple.quicktime-movie"},
-                "resOriginalRes": {"value": {
-                    "size": 50000,
-                    "downloadURL": "https://example.com/vid",
-                    "fileChecksum": "vid_ck"
-                }},
-                "resOriginalFileType": {"value": "com.apple.quicktime-movie"},
-                "resOriginalVidComplRes": {"value": {
-                    "size": 3000,
-                    "downloadURL": "https://example.com/live_mov",
-                    "fileChecksum": "mov_ck"
-                }},
-                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let asset = TestPhotoAsset::new("VID_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .live_photo("https://example.com/live_mov", "mov_ck", 3000)
+            .build();
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         // Videos should get 1 task (the video itself), not a live photo MOV
@@ -2957,25 +2892,11 @@ mod tests {
     }
 
     fn photo_asset_with_original_and_alternative(orig_type: &str, alt_type: &str) -> PhotoAsset {
-        PhotoAsset::new(
-            json!({"recordName": "RAW_TEST", "fields": {
-                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
-                "itemType": {"value": "public.jpeg"},
-                "resOriginalRes": {"value": {
-                    "size": 1000,
-                    "downloadURL": "https://example.com/orig",
-                    "fileChecksum": "orig_ck"
-                }},
-                "resOriginalFileType": {"value": orig_type},
-                "resOriginalAltRes": {"value": {
-                    "size": 2000,
-                    "downloadURL": "https://example.com/alt",
-                    "fileChecksum": "alt_ck"
-                }},
-                "resOriginalAltFileType": {"value": alt_type}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        )
+        TestPhotoAsset::new("RAW_TEST")
+            .orig_checksum("orig_ck")
+            .orig_file_type(orig_type)
+            .alt_version("https://example.com/alt", "alt_ck", 2000, alt_type)
+            .build()
     }
 
     /// Helper to get a version from a SmallVec by key
@@ -3060,7 +2981,7 @@ mod tests {
 
     #[test]
     fn test_raw_policy_no_alternative_no_swap() {
-        let asset = photo_asset_with_version(); // only has Original
+        let asset = TestPhotoAsset::new("TEST_1").build(); // only has Original
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
@@ -3123,40 +3044,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // First asset: regular video IMG_0996.mov
-        let video_asset = PhotoAsset::new(
-            json!({"recordName": "VID_0996", "fields": {
-                "filenameEnc": {"value": "IMG_0996.mov", "type": "STRING"},
-                "itemType": {"value": "com.apple.quicktime-movie"},
-                "resOriginalRes": {"value": {
-                    "size": 258592890,
-                    "downloadURL": "https://example.com/vid",
-                    "fileChecksum": "vid_ck"
-                }},
-                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1713657600000.0}}}), // 2025/04/21
-        );
+        let video_asset = TestPhotoAsset::new("VID_0996")
+            .filename("IMG_0996.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(258592890)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .asset_date(1713657600000.0)
+            .build();
 
         // Second asset: live photo IMG_0996.JPG whose MOV companion would be IMG_0996.MOV
-        let photo_asset = PhotoAsset::new(
-            json!({"recordName": "IMG_0996", "fields": {
-                "filenameEnc": {"value": "IMG_0996.JPG", "type": "STRING"},
-                "itemType": {"value": "public.jpeg"},
-                "resOriginalRes": {"value": {
-                    "size": 5000,
-                    "downloadURL": "https://example.com/jpg",
-                    "fileChecksum": "jpg_ck"
-                }},
-                "resOriginalFileType": {"value": "public.jpeg"},
-                "resOriginalVidComplRes": {"value": {
-                    "size": 124037918,
-                    "downloadURL": "https://example.com/live_mov",
-                    "fileChecksum": "mov_ck"
-                }},
-                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1713657600000.0}}}), // Same date
-        );
+        let photo_asset = TestPhotoAsset::new("IMG_0996")
+            .filename("IMG_0996.JPG")
+            .orig_size(5000)
+            .orig_url("https://example.com/jpg")
+            .orig_checksum("jpg_ck")
+            .live_photo("https://example.com/live_mov", "mov_ck", 124037918)
+            .asset_date(1713657600000.0)
+            .build();
 
         let mut config = test_config();
         config.directory = dir.path().to_path_buf();
@@ -3411,7 +3317,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_photo() {
-        let asset = photo_asset_with_version();
+        let asset = TestPhotoAsset::new("TEST_1").build();
         let config = test_config();
         let candidates = extract_skip_candidates(&asset, &config);
         assert_eq!(candidates.len(), 1);
@@ -3421,7 +3327,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_live_photo() {
-        let asset = photo_asset_with_live_photo();
+        let asset = test_live_photo_asset();
         let config = test_config();
         let candidates = extract_skip_candidates(&asset, &config);
         assert_eq!(candidates.len(), 2);
@@ -3433,19 +3339,14 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_skip_videos() {
-        let asset = PhotoAsset::new(
-            json!({"recordName": "VID_1", "fields": {
-                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
-                "itemType": {"value": "com.apple.quicktime-movie"},
-                "resOriginalRes": {"value": {
-                    "size": 50000,
-                    "downloadURL": "https://example.com/vid",
-                    "fileChecksum": "vid_ck"
-                }},
-                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let asset = TestPhotoAsset::new("VID_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .build();
         let mut config = test_config();
         config.skip_videos = true;
         assert!(extract_skip_candidates(&asset, &config).is_empty());
@@ -3453,7 +3354,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_skip_photos() {
-        let asset = photo_asset_with_version();
+        let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         config.skip_photos = true;
         assert!(extract_skip_candidates(&asset, &config).is_empty());
@@ -3461,7 +3362,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_skip_live_photos() {
-        let asset = photo_asset_with_live_photo();
+        let asset = test_live_photo_asset();
         let mut config = test_config();
         config.skip_live_photos = true;
         let candidates = extract_skip_candidates(&asset, &config);
@@ -3472,7 +3373,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_date_before_filter() {
-        let asset = photo_asset_with_version(); // assetDate = 1736899200000 = 2025-01-15
+        let asset = TestPhotoAsset::new("TEST_1").build(); // assetDate = 1736899200000 = 2025-01-15
         let mut config = test_config();
         // Set skip_created_before to a date AFTER the asset's creation
         config.skip_created_before = Some(
@@ -3485,7 +3386,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_date_after_filter() {
-        let asset = photo_asset_with_version(); // assetDate = 1736899200000 = 2025-01-15
+        let asset = TestPhotoAsset::new("TEST_1").build(); // assetDate = 1736899200000 = 2025-01-15
         let mut config = test_config();
         // Set skip_created_after to a date BEFORE the asset's creation
         config.skip_created_after = Some(
@@ -3498,7 +3399,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_size_fallback_to_original() {
-        let asset = photo_asset_with_version(); // only has resOriginalRes
+        let asset = TestPhotoAsset::new("TEST_1").build(); // only has resOriginalRes
         let mut config = test_config();
         config.size = AssetVersionSize::Medium; // not available
         config.force_size = false;
@@ -3510,7 +3411,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_force_size_no_fallback() {
-        let asset = photo_asset_with_version(); // only has resOriginalRes
+        let asset = TestPhotoAsset::new("TEST_1").build(); // only has resOriginalRes
         let mut config = test_config();
         config.size = AssetVersionSize::Medium; // not available
         config.force_size = true;
@@ -3521,7 +3422,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_live_adjusted_falls_back_to_live_original() {
-        let asset = photo_asset_with_live_photo(); // has LiveOriginal, no LiveAdjusted
+        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
         config.live_photo_size = AssetVersionSize::LiveAdjusted;
         config.force_size = false;
@@ -3533,7 +3434,7 @@ mod tests {
 
     #[test]
     fn test_extract_skip_candidates_live_adjusted_force_size_no_fallback() {
-        let asset = photo_asset_with_live_photo(); // has LiveOriginal, no LiveAdjusted
+        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
         config.live_photo_size = AssetVersionSize::LiveAdjusted;
         config.force_size = true;
@@ -3544,7 +3445,7 @@ mod tests {
 
     #[test]
     fn test_filter_live_adjusted_falls_back_to_live_original() {
-        let asset = photo_asset_with_live_photo(); // has LiveOriginal, no LiveAdjusted
+        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
         config.live_photo_size = AssetVersionSize::LiveAdjusted;
         config.force_size = false;
@@ -3557,7 +3458,7 @@ mod tests {
 
     #[test]
     fn test_filter_live_adjusted_force_size_no_fallback() {
-        let asset = photo_asset_with_live_photo(); // has LiveOriginal, no LiveAdjusted
+        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
         config.live_photo_size = AssetVersionSize::LiveAdjusted;
         config.force_size = true;
@@ -3611,7 +3512,7 @@ mod tests {
 
     #[test]
     fn test_determine_media_type_image_no_live_is_photo() {
-        let asset = photo_asset_with_version(); // public.jpeg, no live versions
+        let asset = TestPhotoAsset::new("TEST_1").build(); // public.jpeg, no live versions
         assert_eq!(
             determine_media_type(VersionSizeKey::Original, &asset),
             MediaType::Photo
@@ -3620,7 +3521,7 @@ mod tests {
 
     #[test]
     fn test_determine_media_type_image_with_live_is_live_photo_image() {
-        let asset = photo_asset_with_live_photo(); // public.heic with live versions
+        let asset = test_live_photo_asset(); // public.heic with live versions
         assert_eq!(
             determine_media_type(VersionSizeKey::Original, &asset),
             MediaType::LivePhotoImage
@@ -3629,19 +3530,14 @@ mod tests {
 
     #[test]
     fn test_determine_media_type_movie_original_is_video() {
-        let asset = PhotoAsset::new(
-            json!({"recordName": "MOV_1", "fields": {
-                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
-                "itemType": {"value": "com.apple.quicktime-movie"},
-                "resOriginalRes": {"value": {
-                    "size": 50000,
-                    "downloadURL": "https://example.com/vid",
-                    "fileChecksum": "vid_ck"
-                }},
-                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let asset = TestPhotoAsset::new("MOV_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .build();
         assert_eq!(
             determine_media_type(VersionSizeKey::Original, &asset),
             MediaType::Video
@@ -3650,7 +3546,7 @@ mod tests {
 
     #[test]
     fn test_determine_media_type_live_original_on_image_is_live_photo_video() {
-        let asset = photo_asset_with_live_photo();
+        let asset = test_live_photo_asset();
         assert_eq!(
             determine_media_type(VersionSizeKey::LiveOriginal, &asset),
             MediaType::LivePhotoVideo
@@ -3659,19 +3555,14 @@ mod tests {
 
     #[test]
     fn test_determine_media_type_live_original_on_movie_is_video() {
-        let asset = PhotoAsset::new(
-            json!({"recordName": "MOV_2", "fields": {
-                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
-                "itemType": {"value": "com.apple.quicktime-movie"},
-                "resOriginalRes": {"value": {
-                    "size": 50000,
-                    "downloadURL": "https://example.com/vid",
-                    "fileChecksum": "vid_ck"
-                }},
-                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let asset = TestPhotoAsset::new("MOV_2")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .build();
         assert_eq!(
             determine_media_type(VersionSizeKey::LiveOriginal, &asset),
             MediaType::Video
@@ -3682,7 +3573,7 @@ mod tests {
 
     #[test]
     fn test_name_id7_produces_task_with_id_suffix() {
-        let asset = photo_asset_with_version(); // recordName "TEST_1"
+        let asset = TestPhotoAsset::new("TEST_1").build(); // recordName "TEST_1"
         let mut config = test_config();
         config.file_match_policy = FileMatchPolicy::NameId7;
         let tasks = filter_asset_fresh(&asset, &config);
@@ -3702,7 +3593,7 @@ mod tests {
 
     #[test]
     fn test_name_id7_skips_existing_file() {
-        let asset = photo_asset_with_version();
+        let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         config.file_match_policy = FileMatchPolicy::NameId7;
         let dir = TempDir::new().unwrap();
@@ -3728,7 +3619,7 @@ mod tests {
 
     #[test]
     fn test_name_id7_live_photo_produces_two_tasks_with_id_suffix() {
-        let asset = photo_asset_with_live_photo();
+        let asset = test_live_photo_asset();
         let mut config = test_config();
         config.file_match_policy = FileMatchPolicy::NameId7;
         let tasks = filter_asset_fresh(&asset, &config);
@@ -3750,19 +3641,9 @@ mod tests {
     // ── keep_unicode_in_filenames tests ─────────────────────────────────
 
     fn unicode_photo_asset() -> PhotoAsset {
-        PhotoAsset::new(
-            json!({"recordName": "UNI_1", "fields": {
-                "filenameEnc": {"value": "Café_photo.jpg", "type": "STRING"},
-                "itemType": {"value": "public.jpeg"},
-                "resOriginalRes": {"value": {
-                    "size": 1000,
-                    "downloadURL": "https://example.com/orig",
-                    "fileChecksum": "abc123"
-                }},
-                "resOriginalFileType": {"value": "public.jpeg"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        )
+        TestPhotoAsset::new("UNI_1")
+            .filename("Café_photo.jpg")
+            .build()
     }
 
     #[test]
@@ -3976,7 +3857,7 @@ mod tests {
             record_name: "REC_1".to_string(),
             record_type: Some("CPLAsset".to_string()),
             reason: ChangeReason::Created,
-            asset: Some(photo_asset_with_version()),
+            asset: Some(TestPhotoAsset::new("TEST_1").build()),
         };
         let event_without_asset = ChangeEvent {
             record_name: "REC_2".to_string(),
@@ -4003,7 +3884,7 @@ mod tests {
                 record_name: "REC_1".to_string(),
                 record_type: Some("CPLAsset".to_string()),
                 reason: ChangeReason::Created,
-                asset: Some(photo_asset_with_version()),
+                asset: Some(TestPhotoAsset::new("TEST_1").build()),
             },
             ChangeEvent {
                 record_name: "REC_2".to_string(),
@@ -4041,7 +3922,7 @@ mod tests {
             record_name: "MOD_1".to_string(),
             record_type: Some("CPLAsset".to_string()),
             reason: ChangeReason::Created,
-            asset: Some(photo_asset_with_version()),
+            asset: Some(TestPhotoAsset::new("TEST_1").build()),
         }];
 
         let downloadable: Vec<_> = events
@@ -4318,7 +4199,7 @@ mod tests {
                 record_name: "A".to_string(),
                 record_type: Some("CPLAsset".to_string()),
                 reason: ChangeReason::Created,
-                asset: Some(photo_asset_with_version()),
+                asset: Some(TestPhotoAsset::new("TEST_1").build()),
             },
             ChangeEvent {
                 record_name: "B".to_string(),
@@ -4422,19 +4303,12 @@ mod tests {
     fn filter_asset_path_traversal_filename_is_sanitized() {
         // A filename containing path traversal should NOT escape the download
         // directory. The folder_structure + local_download_path should confine it.
-        let asset = PhotoAsset::new(
-            json!({"recordName": "TRAV_1", "fields": {
-                "filenameEnc": {"value": "../../../etc/passwd", "type": "STRING"},
-                "itemType": {"value": "public.jpeg"},
-                "resOriginalRes": {"value": {
-                    "size": 512,
-                    "downloadURL": "https://cdn.icloud.com/photos/orig/abc",
-                    "fileChecksum": "a1b2c3d4e5f6"
-                }},
-                "resOriginalFileType": {"value": "public.jpeg"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let asset = TestPhotoAsset::new("TRAV_1")
+            .filename("../../../etc/passwd")
+            .orig_size(512)
+            .orig_url("https://cdn.icloud.com/photos/orig/abc")
+            .orig_checksum("a1b2c3d4e5f6")
+            .build();
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
@@ -4539,7 +4413,7 @@ mod tests {
         ctx.known_ids.insert("PREV_SYNCED_001".into());
         ctx.known_ids.insert("PREV_SYNCED_002".into());
 
-        let known_asset = photo_asset_with_version(); // recordName "TEST_1"
+        let known_asset = TestPhotoAsset::new("TEST_1").build(); // recordName "TEST_1"
         let config = test_config();
         let tasks = filter_asset_fresh(&known_asset, &config);
 
@@ -4574,7 +4448,7 @@ mod tests {
     #[test]
     fn filter_asset_narrowing_date_window_includes_asset_inside() {
         // Asset date: 2025-01-15 (epoch ms 1736899200000)
-        let asset = photo_asset_with_version();
+        let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         // Window: 2025-01-01 .. 2025-02-01 — asset at Jan 15 is inside
         config.skip_created_before = Some(
@@ -4598,7 +4472,7 @@ mod tests {
     #[test]
     fn filter_asset_narrowing_date_window_excludes_asset_before() {
         // Asset date: 2025-01-15
-        let asset = photo_asset_with_version();
+        let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         // Window: 2025-01-20 .. 2025-02-01 — asset at Jan 15 is before the window
         config.skip_created_before = Some(
@@ -4620,7 +4494,7 @@ mod tests {
     #[test]
     fn filter_asset_narrowing_date_window_excludes_asset_after() {
         // Asset date: 2025-01-15
-        let asset = photo_asset_with_version();
+        let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         // Window: 2024-12-01 .. 2025-01-10 — asset at Jan 15 is after the window
         config.skip_created_before = Some(
@@ -4647,19 +4521,14 @@ mod tests {
         // ChangeReason::Created (the enum doc says "new or modified").
         // Verify that a "modified" asset with a ChangeReason::Created is
         // picked up by the download filter.
-        let modified_asset = PhotoAsset::new(
-            json!({"recordName": "MODIFIED_ASSET_1", "fields": {
-                "filenameEnc": {"value": "IMG_9876.HEIC", "type": "STRING"},
-                "itemType": {"value": "public.heic"},
-                "resOriginalRes": {"value": {
-                    "size": 4500000,
-                    "downloadURL": "https://cdn.icloud.com/photos/orig/modified",
-                    "fileChecksum": "f0e1d2c3b4a5"
-                }},
-                "resOriginalFileType": {"value": "public.heic"}
-            }}),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
+        let modified_asset = TestPhotoAsset::new("MODIFIED_ASSET_1")
+            .filename("IMG_9876.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(4500000)
+            .orig_url("https://cdn.icloud.com/photos/orig/modified")
+            .orig_checksum("f0e1d2c3b4a5")
+            .build();
 
         let event = ChangeEvent {
             record_name: "MODIFIED_ASSET_1".to_string(),
@@ -4692,7 +4561,7 @@ mod tests {
         // NameId7 should produce a task because its path is different.
         let dir = TempDir::new().unwrap();
 
-        let asset = photo_asset_with_version(); // recordName "TEST_1", "photo.jpg"
+        let asset = TestPhotoAsset::new("TEST_1").build(); // recordName "TEST_1", "photo.jpg"
         let mut config = test_config();
         config.directory = dir.path().to_path_buf();
         config.file_match_policy = FileMatchPolicy::NameId7;
@@ -5048,19 +4917,11 @@ mod tests {
         // Without cancellation this would run forever.
         let asset_stream = stream::unfold(0u32, |i| async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let asset = PhotoAsset::new(
-                json!({"recordName": format!("SHUTDOWN_{i}"), "fields": {
-                    "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
-                    "itemType": {"value": "public.jpeg"},
-                    "resOriginalRes": {"value": {
-                        "size": 100,
-                        "downloadURL": "http://127.0.0.1:1/photo.jpg",
-                        "fileChecksum": format!("ck_{i}")
-                    }},
-                    "resOriginalFileType": {"value": "public.jpeg"}
-                }}),
-                json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-            );
+            let asset = TestPhotoAsset::new(&format!("SHUTDOWN_{i}"))
+                .orig_size(100)
+                .orig_url("http://127.0.0.1:1/photo.jpg")
+                .orig_checksum(&format!("ck_{i}"))
+                .build();
             Some((Ok(asset) as anyhow::Result<PhotoAsset>, i + 1))
         });
 

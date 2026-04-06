@@ -733,6 +733,7 @@ impl std::fmt::Display for PhotoAlbum {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::MockPhotosSession;
     use serde_json::json;
 
     struct StubSession;
@@ -884,51 +885,6 @@ mod tests {
 
     // --- photo_stream_with_token tests ---
 
-    /// A session stub that returns canned QueryResponse JSON. Each call to
-    /// `post()` pops the next response from the front of the queue. If the
-    /// queue is empty, returns an empty records array.
-    struct CannedSession {
-        responses: std::sync::Mutex<std::collections::VecDeque<Value>>,
-    }
-
-    impl CannedSession {
-        fn new(responses: Vec<Value>) -> Self {
-            Self {
-                responses: std::sync::Mutex::new(responses.into()),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl PhotosSession for CannedSession {
-        async fn post(
-            &self,
-            _url: &str,
-            _body: &str,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<Value> {
-            let next = self
-                .responses
-                .lock()
-                .expect("poisoned")
-                .pop_front()
-                .unwrap_or_else(|| json!({"records": []}));
-            Ok(next)
-        }
-        fn clone_box(&self) -> Box<dyn PhotosSession> {
-            // Clone-box snapshots remaining responses so the spawned fetcher
-            // task gets its own copy of the queue.
-            let remaining: Vec<Value> = self
-                .responses
-                .lock()
-                .expect("poisoned")
-                .iter()
-                .cloned()
-                .collect();
-            Box::new(CannedSession::new(remaining))
-        }
-    }
-
     fn make_album_with_session(page_size: usize, session: Box<dyn PhotosSession>) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
@@ -996,12 +952,11 @@ mod tests {
     async fn test_photo_stream_with_token_returns_sync_token() {
         use tokio_stream::StreamExt;
 
-        let session = CannedSession::new(vec![
-            canned_page("master-1", Some("st-zone-abc")),
+        let mock = MockPhotosSession::new()
+            .ok(canned_page("master-1", Some("st-zone-abc")))
             // Second call returns empty records to stop the fetcher
-            json!({"records": [], "syncToken": "st-zone-abc"}),
-        ]);
-        let album = make_album_with_session(100, Box::new(session));
+            .ok(json!({"records": [], "syncToken": "st-zone-abc"}));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
         tokio::pin!(stream);
@@ -1022,9 +977,10 @@ mod tests {
         use tokio_stream::StreamExt;
 
         // Responses without syncToken field
-        let session =
-            CannedSession::new(vec![canned_page("master-1", None), json!({"records": []})]);
-        let album = make_album_with_session(100, Box::new(session));
+        let mock = MockPhotosSession::new()
+            .ok(canned_page("master-1", None))
+            .ok(json!({"records": []}));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
         tokio::pin!(stream);
@@ -1044,12 +1000,11 @@ mod tests {
         // Two pages with different syncTokens — last one should be captured.
         // page_size=1 so each page yields 1 master record and the fetcher
         // advances offset by 1.
-        let session = CannedSession::new(vec![
-            canned_page("master-1", Some("st-first")),
-            canned_page("master-2", Some("st-second")),
-            json!({"records": []}),
-        ]);
-        let album = make_album_with_session(1, Box::new(session));
+        let mock = MockPhotosSession::new()
+            .ok(canned_page("master-1", Some("st-first")))
+            .ok(canned_page("master-2", Some("st-second")))
+            .ok(json!({"records": []}));
+        let album = make_album_with_session(1, Box::new(mock));
 
         let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
         tokio::pin!(stream);
@@ -1070,8 +1025,8 @@ mod tests {
         use tokio_stream::StreamExt;
 
         // Album with no records at all
-        let session = CannedSession::new(vec![json!({"records": []})]);
-        let album = make_album_with_session(100, Box::new(session));
+        let mock = MockPhotosSession::new().ok(json!({"records": []}));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
         tokio::pin!(stream);
@@ -1097,11 +1052,12 @@ mod tests {
     async fn test_photo_stream_limit_zero_yields_nothing() {
         use tokio_stream::StreamExt;
 
-        // --recent 0 should produce 0 items. The CannedSession has a valid
-        // page available, but limit=0 means the fetcher should never send it.
-        let session =
-            CannedSession::new(vec![canned_page("master-1", None), json!({"records": []})]);
-        let album = make_album_with_session(100, Box::new(session));
+        // --recent 0 should produce 0 items. The mock has a valid page
+        // available, but limit=0 means the fetcher should never send it.
+        let mock = MockPhotosSession::new()
+            .ok(canned_page("master-1", None))
+            .ok(json!({"records": []}));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, _handles) = album.photo_stream_inner(Some(0), Some(10), 1, None);
         tokio::pin!(stream);
@@ -1114,12 +1070,11 @@ mod tests {
     async fn test_photo_stream_limit_one_yields_exactly_one() {
         use tokio_stream::StreamExt;
 
-        let session = CannedSession::new(vec![
-            canned_page("master-1", None),
-            canned_page("master-2", None),
-            json!({"records": []}),
-        ]);
-        let album = make_album_with_session(1, Box::new(session));
+        let mock = MockPhotosSession::new()
+            .ok(canned_page("master-1", None))
+            .ok(canned_page("master-2", None))
+            .ok(json!({"records": []}));
+        let album = make_album_with_session(1, Box::new(mock));
 
         let (stream, _handles) = album.photo_stream_inner(Some(1), Some(10), 1, None);
         tokio::pin!(stream);
@@ -1161,8 +1116,11 @@ mod tests {
         let page2 = canned_page("master-ok", None);
 
         // Page 3: Empty → terminates.
-        let session = CannedSession::new(vec![page1, page2, json!({"records": []})]);
-        let album = make_album_with_session(1, Box::new(session));
+        let mock = MockPhotosSession::new()
+            .ok(page1)
+            .ok(page2)
+            .ok(json!({"records": []}));
+        let album = make_album_with_session(1, Box::new(mock));
 
         let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
         tokio::pin!(stream);
@@ -1242,8 +1200,8 @@ mod tests {
             changes_master("master-1"),
             changes_asset("asset-1", "master-1"),
         ];
-        let session = CannedSession::new(vec![canned_changes_page(records, "token-final", false)]);
-        let album = make_album_with_session(100, Box::new(session));
+        let mock = MockPhotosSession::new().ok(canned_changes_page(records, "token-final", false));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
         tokio::pin!(stream);
@@ -1274,11 +1232,10 @@ mod tests {
             changes_master("master-2"),
             changes_asset("asset-2", "master-2"),
         ];
-        let session = CannedSession::new(vec![
-            canned_changes_page(page1_records, "token-page1", true),
-            canned_changes_page(page2_records, "token-page2", false),
-        ]);
-        let album = make_album_with_session(100, Box::new(session));
+        let mock = MockPhotosSession::new()
+            .ok(canned_changes_page(page1_records, "token-page1", true))
+            .ok(canned_changes_page(page2_records, "token-page2", false));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
         tokio::pin!(stream);
@@ -1306,11 +1263,10 @@ mod tests {
             changes_master("master-1"),
             changes_asset("asset-1", "master-1"),
         ];
-        let session = CannedSession::new(vec![
-            canned_changes_page(vec![], "token-empty", true),
-            canned_changes_page(page2_records, "token-final", false),
-        ]);
-        let album = make_album_with_session(100, Box::new(session));
+        let mock = MockPhotosSession::new()
+            .ok(canned_changes_page(vec![], "token-empty", true))
+            .ok(canned_changes_page(page2_records, "token-final", false));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
         tokio::pin!(stream);
@@ -1331,7 +1287,7 @@ mod tests {
     async fn test_changes_stream_zone_error() {
         use tokio_stream::StreamExt;
 
-        let session = CannedSession::new(vec![json!({
+        let mock = MockPhotosSession::new().ok(json!({
             "zones": [{
                 "zoneID": {"zoneName": "PrimarySync"},
                 "syncToken": "",
@@ -1339,8 +1295,8 @@ mod tests {
                 "serverErrorCode": "BAD_REQUEST",
                 "reason": "Unknown sync continuation type"
             }]
-        })]);
-        let album = make_album_with_session(100, Box::new(session));
+        }));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("bad-token");
         tokio::pin!(stream);
@@ -1374,12 +1330,9 @@ mod tests {
             "deleted": true,
             "recordChangeTag": "ct-del"
         })];
-        let session = CannedSession::new(vec![canned_changes_page(
-            records,
-            "token-after-delete",
-            false,
-        )]);
-        let album = make_album_with_session(100, Box::new(session));
+        let mock =
+            MockPhotosSession::new().ok(canned_changes_page(records, "token-after-delete", false));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-before");
         tokio::pin!(stream);
@@ -1407,7 +1360,7 @@ mod tests {
         use crate::icloud::photos::session::SyncTokenError;
         use tokio_stream::StreamExt;
 
-        let session = CannedSession::new(vec![json!({
+        let mock = MockPhotosSession::new().ok(json!({
             "zones": [{
                 "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
                 "syncToken": "",
@@ -1415,8 +1368,8 @@ mod tests {
                 "serverErrorCode": "BAD_REQUEST",
                 "reason": "Unknown sync continuation type"
             }]
-        })]);
-        let album = make_album_with_session(100, Box::new(session));
+        }));
+        let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, _token_rx) = album.changes_stream("old-token");
         tokio::pin!(stream);

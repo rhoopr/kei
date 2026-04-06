@@ -710,6 +710,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::TestAssetRecord;
     use std::fs;
 
     fn test_dir() -> tempfile::TempDir {
@@ -739,16 +740,7 @@ mod tests {
     async fn test_upsert_and_should_download_pending() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let record = AssetRecord::new_pending(
-            "ABC123".to_string(),
-            VersionSizeKey::Original,
-            "checksum123".to_string(),
-            "photo.jpg".to_string(),
-            Utc::now(),
-            None,
-            12345,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
 
@@ -773,16 +765,7 @@ mod tests {
 
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let record = AssetRecord::new_pending(
-            "ABC123".to_string(),
-            VersionSizeKey::Original,
-            "checksum123".to_string(),
-            "photo.jpg".to_string(),
-            Utc::now(),
-            None,
-            12345,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded("ABC123", "original", &file_path, "abc123hash", None)
@@ -801,16 +784,7 @@ mod tests {
     async fn test_should_download_file_missing() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let record = AssetRecord::new_pending(
-            "ABC123".to_string(),
-            VersionSizeKey::Original,
-            "checksum123".to_string(),
-            "photo.jpg".to_string(),
-            Utc::now(),
-            None,
-            12345,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
@@ -844,16 +818,9 @@ mod tests {
 
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let record = AssetRecord::new_pending(
-            "ABC123".to_string(),
-            VersionSizeKey::Original,
-            "old_checksum".to_string(),
-            "photo.jpg".to_string(),
-            Utc::now(),
-            None,
-            12345,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("ABC123")
+            .checksum("old_checksum")
+            .build();
 
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded("ABC123", "original", &file_path, "oldhash", None)
@@ -872,16 +839,7 @@ mod tests {
     async fn test_mark_failed_and_get_failed() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let record = AssetRecord::new_pending(
-            "ABC123".to_string(),
-            VersionSizeKey::Original,
-            "checksum123".to_string(),
-            "photo.jpg".to_string(),
-            Utc::now(),
-            None,
-            12345,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
         db.mark_failed("ABC123", "original", "Connection timeout")
@@ -899,16 +857,7 @@ mod tests {
     async fn test_reset_failed() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let record = AssetRecord::new_pending(
-            "ABC123".to_string(),
-            VersionSizeKey::Original,
-            "checksum123".to_string(),
-            "photo.jpg".to_string(),
-            Utc::now(),
-            None,
-            12345,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
         db.mark_failed("ABC123", "original", "Error").await.unwrap();
@@ -926,31 +875,21 @@ mod tests {
 
         // Add some assets in different states
         for i in 0..3 {
-            let record = AssetRecord::new_pending(
-                format!("PENDING_{}", i),
-                VersionSizeKey::Original,
-                format!("checksum_{}", i),
-                format!("photo_{}.jpg", i),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
+            let record = TestAssetRecord::new(&format!("PENDING_{}", i))
+                .checksum(&format!("checksum_{}", i))
+                .filename(&format!("photo_{}.jpg", i))
+                .size(1000)
+                .build();
             db.upsert_seen(&record).await.unwrap();
         }
 
         let dir = test_dir();
         for i in 0..2 {
-            let record = AssetRecord::new_pending(
-                format!("DOWNLOADED_{}", i),
-                VersionSizeKey::Original,
-                format!("dl_checksum_{}", i),
-                format!("dl_photo_{}.jpg", i),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
+            let record = TestAssetRecord::new(&format!("DOWNLOADED_{}", i))
+                .checksum(&format!("dl_checksum_{}", i))
+                .filename(&format!("dl_photo_{}.jpg", i))
+                .size(1000)
+                .build();
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("dl_photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
@@ -965,16 +904,11 @@ mod tests {
             .unwrap();
         }
 
-        let record = AssetRecord::new_pending(
-            "FAILED_1".to_string(),
-            VersionSizeKey::Original,
-            "fail_checksum".to_string(),
-            "fail_photo.jpg".to_string(),
-            Utc::now(),
-            None,
-            1000,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("FAILED_1")
+            .checksum("fail_checksum")
+            .filename("fail_photo.jpg")
+            .size(1000)
+            .build();
         db.upsert_seen(&record).await.unwrap();
         db.mark_failed("FAILED_1", "original", "Error")
             .await
@@ -1016,16 +950,7 @@ mod tests {
 
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let record = AssetRecord::new_pending(
-            "ABC123".to_string(),
-            VersionSizeKey::Original,
-            "checksum123".to_string(),
-            "photo.jpg".to_string(),
-            Utc::now(),
-            None,
-            12345,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded("ABC123", "original", &file_path, "abc123hash", None)
@@ -1049,16 +974,11 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         for i in 0..3 {
-            let record = AssetRecord::new_pending(
-                format!("DL_{}", i),
-                VersionSizeKey::Original,
-                format!("checksum_{}", i),
-                format!("photo_{}.jpg", i),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
+            let record = TestAssetRecord::new(&format!("DL_{}", i))
+                .checksum(&format!("checksum_{}", i))
+                .filename(&format!("photo_{}.jpg", i))
+                .size(1000)
+                .build();
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
@@ -1080,16 +1000,11 @@ mod tests {
 
         // Create some assets with different statuses
         for i in 0..3 {
-            let record = AssetRecord::new_pending(
-                format!("DL_{}", i),
-                VersionSizeKey::Original,
-                format!("checksum_{}", i),
-                format!("photo_{}.jpg", i),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
+            let record = TestAssetRecord::new(&format!("DL_{}", i))
+                .checksum(&format!("checksum_{}", i))
+                .filename(&format!("photo_{}.jpg", i))
+                .size(1000)
+                .build();
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
@@ -1099,16 +1014,11 @@ mod tests {
         }
 
         // Add a pending asset (should not be in downloaded IDs)
-        let pending = AssetRecord::new_pending(
-            "PENDING_1".to_string(),
-            VersionSizeKey::Original,
-            "pending_ck".to_string(),
-            "pending.jpg".to_string(),
-            Utc::now(),
-            None,
-            1000,
-            MediaType::Photo,
-        );
+        let pending = TestAssetRecord::new("PENDING_1")
+            .checksum("pending_ck")
+            .filename("pending.jpg")
+            .size(1000)
+            .build();
         db.upsert_seen(&pending).await.unwrap();
 
         let ids = db.get_downloaded_ids().await.unwrap();
@@ -1125,16 +1035,11 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         for i in 0..2 {
-            let record = AssetRecord::new_pending(
-                format!("DL_{}", i),
-                VersionSizeKey::Original,
-                format!("checksum_{}", i),
-                format!("photo_{}.jpg", i),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
+            let record = TestAssetRecord::new(&format!("DL_{}", i))
+                .checksum(&format!("checksum_{}", i))
+                .filename(&format!("photo_{}.jpg", i))
+                .size(1000)
+                .build();
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
@@ -1162,16 +1067,11 @@ mod tests {
 
         // Create downloaded assets
         for i in 0..2 {
-            let record = AssetRecord::new_pending(
-                format!("DL_{}", i),
-                VersionSizeKey::Original,
-                format!("checksum_{}", i),
-                format!("photo_{}.jpg", i),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
+            let record = TestAssetRecord::new(&format!("DL_{}", i))
+                .checksum(&format!("checksum_{}", i))
+                .filename(&format!("photo_{}.jpg", i))
+                .size(1000)
+                .build();
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
@@ -1181,29 +1081,19 @@ mod tests {
         }
 
         // Create a pending asset
-        let pending = AssetRecord::new_pending(
-            "PENDING_1".to_string(),
-            VersionSizeKey::Original,
-            "pending_ck".to_string(),
-            "pending.jpg".to_string(),
-            Utc::now(),
-            None,
-            1000,
-            MediaType::Photo,
-        );
+        let pending = TestAssetRecord::new("PENDING_1")
+            .checksum("pending_ck")
+            .filename("pending.jpg")
+            .size(1000)
+            .build();
         db.upsert_seen(&pending).await.unwrap();
 
         // Create a failed asset
-        let failed = AssetRecord::new_pending(
-            "FAILED_1".to_string(),
-            VersionSizeKey::Original,
-            "failed_ck".to_string(),
-            "failed.jpg".to_string(),
-            Utc::now(),
-            None,
-            1000,
-            MediaType::Photo,
-        );
+        let failed = TestAssetRecord::new("FAILED_1")
+            .checksum("failed_ck")
+            .filename("failed.jpg")
+            .size(1000)
+            .build();
         db.upsert_seen(&failed).await.unwrap();
         db.mark_failed("FAILED_1", "original", "test error")
             .await
@@ -1231,16 +1121,10 @@ mod tests {
         assert_eq!(count, 0);
 
         // Add a downloaded asset — still no failures
-        let record = AssetRecord::new_pending(
-            "DL_1".to_string(),
-            VersionSizeKey::Original,
-            "ck".to_string(),
-            "photo.jpg".to_string(),
-            Utc::now(),
-            None,
-            1000,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("DL_1")
+            .checksum("ck")
+            .size(1000)
+            .build();
         db.upsert_seen(&record).await.unwrap();
         let dir = test_dir();
         let path = dir.path().join("photo.jpg");
@@ -1259,16 +1143,11 @@ mod tests {
         let dir = test_dir();
 
         // Add a downloaded asset
-        let dl = AssetRecord::new_pending(
-            "DL_1".to_string(),
-            VersionSizeKey::Original,
-            "ck1".to_string(),
-            "photo1.jpg".to_string(),
-            Utc::now(),
-            None,
-            1000,
-            MediaType::Photo,
-        );
+        let dl = TestAssetRecord::new("DL_1")
+            .checksum("ck1")
+            .filename("photo1.jpg")
+            .size(1000)
+            .build();
         db.upsert_seen(&dl).await.unwrap();
         let path = dir.path().join("photo1.jpg");
         fs::write(&path, b"content").unwrap();
@@ -1277,16 +1156,11 @@ mod tests {
             .unwrap();
 
         // Add a failed asset
-        let failed = AssetRecord::new_pending(
-            "FAIL_1".to_string(),
-            VersionSizeKey::Original,
-            "ck2".to_string(),
-            "photo2.jpg".to_string(),
-            Utc::now(),
-            None,
-            1000,
-            MediaType::Photo,
-        );
+        let failed = TestAssetRecord::new("FAIL_1")
+            .checksum("ck2")
+            .filename("photo2.jpg")
+            .size(1000)
+            .build();
         db.upsert_seen(&failed).await.unwrap();
         db.mark_failed("FAIL_1", "original", "download error")
             .await
@@ -1333,16 +1207,11 @@ mod tests {
     async fn test_touch_last_seen() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let record = AssetRecord::new_pending(
-            "TOUCH_1".to_string(),
-            VersionSizeKey::Original,
-            "ck".to_string(),
-            "photo.jpg".to_string(),
-            Utc::now() - chrono::Duration::hours(1),
-            None,
-            1000,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("TOUCH_1")
+            .checksum("ck")
+            .created_at(Utc::now() - chrono::Duration::hours(1))
+            .size(1000)
+            .build();
         db.upsert_seen(&record).await.unwrap();
 
         // Backdate last_seen_at so that touch_last_seen produces a strictly greater timestamp
@@ -1461,19 +1330,16 @@ mod tests {
         let now = Utc::now();
         let ids = ["AEt9xLq2V0", "AEt9xLq2V1", "AEt9xLq2V2", "AEt9xLq2V3"];
         for (i, id) in ids.iter().enumerate() {
-            let record = AssetRecord::new_pending(
-                id.to_string(),
-                VersionSizeKey::Original,
-                format!(
+            let record = TestAssetRecord::new(id)
+                .checksum(&format!(
                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8{:02x}",
                     i
-                ),
-                format!("IMG_{}.JPG", 1000 + i),
-                now,
-                Some(now - chrono::Duration::days(1)),
-                u64::try_from(4_194_304 + i * 1024).unwrap_or(0),
-                MediaType::Photo,
-            );
+                ))
+                .filename(&format!("IMG_{}.JPG", 1000 + i))
+                .created_at(now)
+                .added_at(now - chrono::Duration::days(1))
+                .size(u64::try_from(4_194_304 + i * 1024).unwrap_or(0))
+                .build();
             db.upsert_seen(&record).await.unwrap();
         }
 
@@ -1606,16 +1472,11 @@ mod tests {
 
         for i in 0..5u32 {
             let id = format!("ASSET_{i}");
-            let record = AssetRecord::new_pending(
-                id.clone(),
-                VersionSizeKey::Original,
-                format!("checksum_{i}"),
-                format!("photo_{i}.jpg"),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
+            let record = TestAssetRecord::new(&id)
+                .checksum(&format!("checksum_{i}"))
+                .filename(&format!("photo_{i}.jpg"))
+                .size(1000)
+                .build();
             db.upsert_seen(&record).await.unwrap();
 
             let path = dir.path().join(format!("photo_{i}.jpg"));
@@ -1686,19 +1547,14 @@ mod tests {
         // 2 downloaded
         for i in 0..2 {
             let id = format!("ADl{}mNp3Q{}", i, i);
-            let record = AssetRecord::new_pending(
-                id.clone(),
-                VersionSizeKey::Original,
-                format!(
+            let record = TestAssetRecord::new(&id)
+                .checksum(&format!(
                     "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48b{}",
                     i
-                ),
-                format!("IMG_{}.HEIC", 2000 + i),
-                Utc::now(),
-                None,
-                5_242_880,
-                MediaType::Photo,
-            );
+                ))
+                .filename(&format!("IMG_{}.HEIC", 2000 + i))
+                .size(5_242_880)
+                .build();
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("IMG_{}.HEIC", 2000 + i));
             fs::write(&path, b"heic payload").unwrap();
@@ -1709,38 +1565,29 @@ mod tests {
 
         // 3 pending (just upserted, never transitioned)
         for i in 0..3 {
-            let record = AssetRecord::new_pending(
-                format!("APn{}rWx5Z{}", i, i),
-                VersionSizeKey::Original,
-                format!(
+            let record = TestAssetRecord::new(&format!("APn{}rWx5Z{}", i, i))
+                .checksum(&format!(
                     "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009{}",
                     i
-                ),
-                format!("IMG_{}.JPG", 3000 + i),
-                Utc::now(),
-                None,
-                3_145_728,
-                MediaType::Photo,
-            );
+                ))
+                .filename(&format!("IMG_{}.JPG", 3000 + i))
+                .size(3_145_728)
+                .build();
             db.upsert_seen(&record).await.unwrap();
         }
 
         // 4 failed
         for i in 0..4 {
             let id = format!("AFl{}kRt7Y{}", i, i);
-            let record = AssetRecord::new_pending(
-                id.clone(),
-                VersionSizeKey::Original,
-                format!(
+            let record = TestAssetRecord::new(&id)
+                .checksum(&format!(
                     "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab3{}",
                     i
-                ),
-                format!("IMG_{}.MOV", 4000 + i),
-                Utc::now(),
-                None,
-                10_485_760,
-                MediaType::Video,
-            );
+                ))
+                .filename(&format!("IMG_{}.MOV", 4000 + i))
+                .size(10_485_760)
+                .media_type(MediaType::Video)
+                .build();
             db.upsert_seen(&record).await.unwrap();
             db.mark_failed(&id, "original", &format!("HTTP 500 attempt {i}"))
                 .await
@@ -1798,16 +1645,11 @@ mod tests {
 
         // Insert 10 pending assets
         for i in 0..10 {
-            let record = AssetRecord::new_pending(
-                format!("CONCURRENT_{i}"),
-                VersionSizeKey::Original,
-                format!("ck_{i}"),
-                format!("photo_{i}.jpg"),
-                Utc::now(),
-                None,
-                1000,
-                MediaType::Photo,
-            );
+            let record = TestAssetRecord::new(&format!("CONCURRENT_{i}"))
+                .checksum(&format!("ck_{i}"))
+                .filename(&format!("photo_{i}.jpg"))
+                .size(1000)
+                .build();
             db.upsert_seen(&record).await.unwrap();
         }
 
