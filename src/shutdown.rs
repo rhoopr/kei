@@ -13,6 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::systemd::SystemdNotifier;
 
+/// How long to wait for graceful shutdown before force-exiting.
+/// Aligned with `stop_grace_period` in docker-compose.yml.
+const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+
 /// Install signal handlers and return a [`CancellationToken`] that is
 /// cancelled on the first SIGINT / SIGTERM / SIGHUP.  A second signal
 /// force-exits the process.
@@ -58,6 +62,18 @@ pub(crate) fn install_signal_handler(
                 tracing::info!("Received shutdown signal, finishing current downloads...");
                 tracing::info!("Press Ctrl+C again to force exit");
                 handler_token.cancel();
+                // Force exit if graceful shutdown hangs (e.g. NFS stall,
+                // dead CDN connection). Matches docker-compose
+                // stop_grace_period so the app exits cleanly before Docker
+                // sends SIGKILL.
+                tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+                    ))
+                    .await;
+                    tracing::warn!("Graceful shutdown timed out, forcing exit");
+                    std::process::exit(130);
+                });
             } else {
                 tracing::warn!("Force exit requested");
                 std::process::exit(130);
