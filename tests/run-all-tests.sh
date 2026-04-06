@@ -108,11 +108,11 @@ fi
 echo ""
 echo "Auth tests: TEST_THROTTLE_SECS=${TEST_THROTTLE_SECS}, INTER_SUITE_DELAY=${INTER_SUITE_DELAY}"
 
-run_or_stop "Sync tests"         cargo test --test sync -- --test-threads=1
+run_or_stop "Sync tests"         cargo test --test sync -- --ignored --test-threads=1
 
 auth_delay
 
-run_or_stop "State tests (auth)" cargo test --test state_auth -- --test-threads=1
+run_or_stop "State tests (auth)" cargo test --test state_auth -- --ignored --test-threads=1
 
 echo ""
 echo "All suites passed. ($(elapsed "$STARTED") total)"

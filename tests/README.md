@@ -18,7 +18,7 @@ env $(grep -v '^#' .env | xargs) cargo run -- sync --auth-only --cookie-director
 ./tests/run-all-tests.sh
 
 # 4. Run a single test
-cargo test --test sync list_albums_prints_album_names -- --test-threads=1
+cargo test --test sync list_albums_prints_album_names -- --ignored --test-threads=1
 ```
 
 ## Setup
@@ -64,9 +64,9 @@ env $(grep -v '^#' .env | xargs) cargo run -- sync --auth-only --cookie-director
 |------|-------|-------------|
 | `cli.rs` | No | CLI argument parsing — no network |
 | `state.rs` | No | State commands against absent DB — no network |
-| `sync.rs` | Yes | Sync, download, filtering — targets `icloudpd-test` album |
-| `state_auth.rs` | Yes | Status, reset-state, verify, import-existing, retry-failed |
-| `setup_auth.rs` | Yes | Verifies pre-auth session is valid (ignored by default) |
+| `sync.rs` | Yes | Sync, download, filtering — targets `icloudpd-test` album (`#[ignore]`) |
+| `state_auth.rs` | Yes | Status, reset-state, verify, import-existing, retry-failed (`#[ignore]`) |
+| `setup_auth.rs` | Yes | Verifies pre-auth session is valid (`#[ignore]`) |
 | `common/mod.rs` | — | Shared helpers |
 
 ## Running Tests
@@ -84,8 +84,8 @@ cargo test --test state                # state commands (no DB)
 Auth tests must run single-threaded to avoid Apple API rate limits (503s).
 
 ```sh
-cargo test --test sync -- --test-threads=1
-cargo test --test state_auth -- --test-threads=1
+cargo test --test sync -- --ignored --test-threads=1
+cargo test --test state_auth -- --ignored --test-threads=1
 ```
 
 ### All tests
@@ -99,7 +99,7 @@ Results are logged to `tests/results.log`.
 ### Single test
 
 ```sh
-cargo test --test sync list_albums_prints_album_names -- --test-threads=1
+cargo test --test sync list_albums_prints_album_names -- --ignored --test-threads=1
 ```
 
 ## Apple API Rate Limits

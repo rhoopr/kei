@@ -7,8 +7,8 @@
 | Unit tests (`src/`) | 541 | No | No |
 | `cli.rs` | 67 | No | No |
 | `state.rs` | 4 | No | No |
-| `state_auth.rs` | 13 | Yes | Yes |
-| `sync.rs` | 27 | Mostly | Yes |
+| `state_auth.rs` | 13 (ignored) | Yes | Yes |
+| `sync.rs` | 27 (ignored) | Yes | Yes |
 | `setup_auth.rs` | 1 (ignored) | Yes | Yes |
 | **Total** | **652** | | |
 
@@ -18,11 +18,14 @@
 # Pre-commit safe (no auth, no network)
 cargo test --bin kei --test cli --test state
 
+# Live iCloud tests (requires pre-auth session + icloudpd-test album)
+cargo test --test sync --test state_auth -- --ignored --test-threads=1
+
 # Full suite (requires pre-auth session + icloudpd-test album)
 ./tests/run-all-tests.sh
 
 # Single test
-cargo test --test sync sync_dry_run_downloads_nothing -- --test-threads=1
+cargo test --test sync sync_dry_run_downloads_nothing -- --ignored --test-threads=1
 ```
 
 See `tests/README.md` for setup instructions.
@@ -178,7 +181,11 @@ absent databases.
 
 ## State Tests — Auth Required (`tests/state_auth.rs`)
 
-13 tests. Require pre-authenticated session. Run with `--test-threads=1`.
+13 tests, all `#[ignore]`. Require pre-authenticated session. Run with:
+
+```sh
+cargo test --test state_auth -- --ignored --test-threads=1
+```
 
 ### Status (1 test)
 
@@ -222,8 +229,12 @@ absent databases.
 
 ## Sync Tests (`tests/sync.rs`)
 
-27 tests. Uses the `icloudpd-test` album for deterministic behavioral assertions.
-Require pre-authenticated session. Run with `--test-threads=1`.
+27 tests, all `#[ignore]`. Uses the `icloudpd-test` album for deterministic behavioral assertions.
+Require pre-authenticated session. Run with:
+
+```sh
+cargo test --test sync -- --ignored --test-threads=1
+```
 
 ### Test Album (`icloudpd-test`)
 

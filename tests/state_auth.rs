@@ -1,8 +1,11 @@
-//! State-management tests that require network credentials.
+//! State-management tests that require network credentials (live iCloud API).
 //!
 //! Exercises status, reset-state, verify, import-existing, and retry-failed
-//! against real iCloud data. Requires pre-authentication via
-//! `cargo test --test setup_auth -- --ignored`.
+//! against real iCloud data. All tests are `#[ignore]` — run with:
+//!
+//! ```sh
+//! cargo test --test state_auth -- --ignored --test-threads=1
+//! ```
 
 mod common;
 
@@ -137,6 +140,7 @@ fn db_file_count(dir: &Path) -> usize {
 // ══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore]
 fn status_after_sync_shows_counts() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -171,6 +175,7 @@ fn status_after_sync_shows_counts() {
 // ══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore]
 fn reset_state_deletes_db_after_sync() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -205,6 +210,7 @@ fn reset_state_deletes_db_after_sync() {
 }
 
 #[test]
+#[ignore]
 fn reset_state_without_yes_does_not_delete() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -242,6 +248,7 @@ fn reset_state_without_yes_does_not_delete() {
 // ══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore]
 fn verify_after_sync_reports_results() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -274,6 +281,7 @@ fn verify_after_sync_reports_results() {
 }
 
 #[test]
+#[ignore]
 fn verify_checksums_after_sync() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -303,6 +311,7 @@ fn verify_checksums_after_sync() {
 }
 
 #[test]
+#[ignore]
 fn verify_detects_missing_files() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -344,6 +353,7 @@ fn verify_detects_missing_files() {
 }
 
 #[test]
+#[ignore]
 fn verify_checksums_detects_corruption() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -384,6 +394,7 @@ fn verify_checksums_detects_corruption() {
 // ══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore]
 fn import_existing_with_nonexistent_directory_fails() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -410,6 +421,7 @@ fn import_existing_with_nonexistent_directory_fails() {
 }
 
 #[test]
+#[ignore]
 fn import_existing_matches_synced_files() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -448,6 +460,7 @@ fn import_existing_matches_synced_files() {
 }
 
 #[test]
+#[ignore]
 fn import_existing_empty_directory_reports_zero_matches() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -471,6 +484,7 @@ fn import_existing_empty_directory_reports_zero_matches() {
 }
 
 #[test]
+#[ignore]
 fn import_existing_custom_folder_structure() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -508,6 +522,7 @@ fn import_existing_custom_folder_structure() {
 // ══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore]
 fn retry_failed_after_successful_sync_is_noop() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -535,6 +550,7 @@ fn retry_failed_after_successful_sync_is_noop() {
 }
 
 #[test]
+#[ignore]
 fn retry_failed_with_no_db_succeeds() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
@@ -566,6 +582,7 @@ fn retry_failed_with_no_db_succeeds() {
 /// This is arguably a bug — dry runs should not have side effects.
 /// If this test starts failing, the bug may have been fixed.
 #[test]
+#[ignore]
 fn dry_run_stores_sync_token_bug() {
     let Some((username, password, cookie_dir)) = common::require_preauth() else {
         return;
