@@ -1318,6 +1318,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_changes_stream_mid_stream_error_preserves_last_good_token() {
+        use tokio_stream::StreamExt;
+
+        let page1_records = vec![
+            changes_master("master-1"),
+            changes_asset("asset-1", "master-1"),
+        ];
+        let page2_records = vec![
+            changes_master("master-2"),
+            changes_asset("asset-2", "master-2"),
+        ];
+        // Pages 1-2 succeed, page 3 returns a zone error
+        let mock = MockPhotosSession::new()
+            .ok(canned_changes_page(page1_records, "token-page1", true))
+            .ok(canned_changes_page(page2_records, "token-page2", true))
+            .ok(json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": "",
+                    "moreComing": false,
+                    "serverErrorCode": "BAD_REQUEST",
+                    "reason": "Unknown sync continuation type"
+                }]
+            }));
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.changes_stream("token-initial");
+        tokio::pin!(stream);
+
+        let mut events = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(event) => events.push(event),
+                Err(e) => errors.push(e),
+            }
+        }
+
+        assert_eq!(events.len(), 2, "should have events from pages 1 and 2");
+        assert_eq!(events[0].record_name, "master-1");
+        assert_eq!(events[1].record_name, "master-2");
+        assert_eq!(errors.len(), 1, "should have exactly one error from page 3");
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(
+            token, "token-page2",
+            "should preserve last-good token from page 2, not initial or error page"
+        );
+    }
+
+    #[tokio::test]
     async fn test_changes_stream_hard_deleted_record() {
         use super::super::types::ChangeReason;
         use tokio_stream::StreamExt;

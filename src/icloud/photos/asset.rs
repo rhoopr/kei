@@ -467,6 +467,10 @@ impl DeltaRecordBuffer {
         }
     }
 
+    fn orphaned_count(&self) -> usize {
+        self.pending_masters.len() + self.pending_assets.len()
+    }
+
     fn emit_paired(
         master_record: Record,
         asset_record: Record,
@@ -481,6 +485,19 @@ impl DeltaRecordBuffer {
             reason,
             asset: Some(asset),
         });
+    }
+}
+
+impl Drop for DeltaRecordBuffer {
+    fn drop(&mut self) {
+        let count = self.orphaned_count();
+        if count > 0 {
+            tracing::warn!(
+                orphaned_masters = self.pending_masters.len(),
+                orphaned_assets = self.pending_assets.len(),
+                "DeltaRecordBuffer dropped with orphaned records"
+            );
+        }
     }
 }
 
@@ -1383,6 +1400,30 @@ mod tests {
             events[0].asset.is_none(),
             "standalone asset should have no PhotoAsset"
         );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_buffer_drop_logs_orphaned_records() {
+        {
+            let mut buffer = DeltaRecordBuffer::new();
+            buffer.process_records(vec![make_master_record("M_ORPHAN")]);
+            // Drop without calling flush()
+        }
+
+        assert!(logs_contain("DeltaRecordBuffer dropped with orphaned records"));
+        assert!(logs_contain("orphaned_masters=1"));
+        assert!(logs_contain("orphaned_assets=0"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_buffer_drop_no_log_when_empty() {
+        {
+            let _buffer = DeltaRecordBuffer::new();
+        }
+
+        assert!(!logs_contain("DeltaRecordBuffer dropped with orphaned records"));
     }
 
     // --- Gap tests: API response handling robustness ---
