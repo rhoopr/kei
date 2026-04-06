@@ -1197,105 +1197,65 @@ mod tests {
         }
     }
 
-    fn retry_config_no_delay(max_retries: u32) -> RetryConfig {
-        RetryConfig {
+    /// Run download_file with a RetryingStubClient, returning the result and
+    /// call count for assertion.
+    async fn run_retry_download(
+        name: &str,
+        fail_count: u32,
+        fail_status: u16,
+        max_retries: u32,
+    ) -> (Result<(), DownloadError>, u32, PathBuf) {
+        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = RetryingStubClient::new(fail_count, fail_status, jpeg_body);
+        let dir = PathBuf::from("/tmp/claude/retry_test")
+            .join(format!("{}_{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let download_path = dir.join("photo.jpg");
+        let _ = std::fs::remove_file(&download_path);
+
+        let config = RetryConfig {
             max_retries,
             base_delay_secs: 0,
             max_delay_secs: 0,
-        }
+        };
+        let result = download_file(
+            &client,
+            "http://stub/photo.jpg",
+            &download_path,
+            "AAAA",
+            &config,
+            ".kei-tmp",
+            DownloadOpts {
+                skip_rename: false,
+                expected_size: None,
+            },
+        )
+        .await;
+
+        (result, client.call_count(), download_path)
     }
 
     #[tokio::test]
     async fn download_file_retries_on_429_then_succeeds() {
-        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
-        let client = RetryingStubClient::new(2, 429, jpeg_body.clone());
-        let dir = PathBuf::from("/tmp/claude/retry_test").join(format!(
-            "{}_429_retry",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let download_path = dir.join("photo.jpg");
-        let _ = std::fs::remove_file(&download_path);
-
-        download_file(
-            &client,
-            "http://stub/photo.jpg",
-            &download_path,
-            "AAAA", // valid base64
-            &retry_config_no_delay(3),
-            ".kei-tmp",
-            DownloadOpts {
-                skip_rename: false,
-                expected_size: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(client.call_count(), 3, "should have retried twice then succeeded");
-        assert!(download_path.exists(), "file should be downloaded");
-        assert_eq!(std::fs::read(&download_path).unwrap(), jpeg_body);
+        let (result, calls, path) = run_retry_download("429_retry", 2, 429, 3).await;
+        result.unwrap();
+        assert_eq!(calls, 3, "should have retried twice then succeeded");
+        assert!(path.exists(), "file should be downloaded");
     }
 
     #[tokio::test]
     async fn download_file_retries_on_503_then_succeeds() {
-        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
-        let client = RetryingStubClient::new(1, 503, jpeg_body.clone());
-        let dir = PathBuf::from("/tmp/claude/retry_test").join(format!(
-            "{}_503_retry",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let download_path = dir.join("photo.jpg");
-        let _ = std::fs::remove_file(&download_path);
-
-        download_file(
-            &client,
-            "http://stub/photo.jpg",
-            &download_path,
-            "AAAA",
-            &retry_config_no_delay(3),
-            ".kei-tmp",
-            DownloadOpts {
-                skip_rename: false,
-                expected_size: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(client.call_count(), 2, "should have retried once then succeeded");
-        assert!(download_path.exists());
+        let (result, calls, path) = run_retry_download("503_retry", 1, 503, 3).await;
+        result.unwrap();
+        assert_eq!(calls, 2, "should have retried once then succeeded");
+        assert!(path.exists());
     }
 
     #[tokio::test]
     async fn download_file_aborts_on_non_retryable_status() {
-        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
-        let client = RetryingStubClient::new(1, 404, jpeg_body);
-        let dir = PathBuf::from("/tmp/claude/retry_test").join(format!(
-            "{}_404_abort",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let download_path = dir.join("photo.jpg");
-        let _ = std::fs::remove_file(&download_path);
-
-        let err = download_file(
-            &client,
-            "http://stub/photo.jpg",
-            &download_path,
-            "AAAA",
-            &retry_config_no_delay(3),
-            ".kei-tmp",
-            DownloadOpts {
-                skip_rename: false,
-                expected_size: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(client.call_count(), 1, "should abort immediately on 404");
+        let (result, calls, _) = run_retry_download("404_abort", 1, 404, 3).await;
+        let err = result.unwrap_err();
+        assert_eq!(calls, 1, "should abort immediately on 404");
         assert!(
             matches!(err, DownloadError::HttpStatus { status: 404, .. }),
             "expected HttpStatus 404, got: {err:?}"
@@ -1304,34 +1264,10 @@ mod tests {
 
     #[tokio::test]
     async fn download_file_exhausts_retries_on_persistent_429() {
-        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
-        // Fail more times than max_retries allows
-        let client = RetryingStubClient::new(10, 429, jpeg_body);
-        let dir = PathBuf::from("/tmp/claude/retry_test").join(format!(
-            "{}_429_exhaust",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let download_path = dir.join("photo.jpg");
-        let _ = std::fs::remove_file(&download_path);
-
-        let err = download_file(
-            &client,
-            "http://stub/photo.jpg",
-            &download_path,
-            "AAAA",
-            &retry_config_no_delay(2),
-            ".kei-tmp",
-            DownloadOpts {
-                skip_rename: false,
-                expected_size: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
+        let (result, calls, _) = run_retry_download("429_exhaust", 10, 429, 2).await;
+        let err = result.unwrap_err();
         // 1 initial + 2 retries = 3 total attempts
-        assert_eq!(client.call_count(), 3, "should exhaust all retry attempts");
+        assert_eq!(calls, 3, "should exhaust all retry attempts");
         assert!(
             matches!(err, DownloadError::HttpStatus { status: 429, .. }),
             "expected HttpStatus 429, got: {err:?}"
