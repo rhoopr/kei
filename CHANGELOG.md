@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] - 2026-04-06
+
+### Added
+
+- **Credential management** - New `credential` subcommand with `set`, `clear`, and `backend` actions. Passwords are stored in the OS keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager) when available, with an AES-256-GCM encrypted file fallback for headless environments like Docker.
+- **`--password-file`** - Read password from a file on each auth attempt. Supports Docker secrets (`/run/secrets/icloud_password`). Trailing newline is stripped. Conflicts with `--password`.
+- **`--password-command`** - Execute a shell command to obtain the password on each auth attempt. Supports external secret managers like 1Password, Vault, and pass. Example: `--password-command "op read 'op://vault/icloud/password'"`. Conflicts with `--password` and `--password-file`.
+- **`--save-password`** - After successful auth, persist the password to the credential store. On subsequent runs (including watch mode re-auth), the stored password is used automatically.
+- **Adjusted video downloads** - `--size adjusted` and `--live-photo-size adjusted` download Apple's edited versions of videos and live photo MOVs. Falls back to original when no adjusted version exists (unless `--force-size` is set). ([#93])
+- **Docker HEALTHCHECK** - The container now writes a `health.json` file to `/config` with `last_sync_at`, `last_success_at`, `consecutive_failures`, and `last_error`. The Dockerfile includes a HEALTHCHECK that marks the container unhealthy after 5 consecutive failures or 2 hours without a sync.
+- **Hard shutdown timeout** - 30 seconds after the first shutdown signal (Ctrl+C, SIGTERM, SIGHUP), in-flight downloads are cancelled and the process exits. A second signal still force-exits immediately.
+- **Low disk space warning** - Logs a warning before downloads if the target filesystem has less than 1 GiB free.
+- **Structured exit codes** - `0` success, `1` failure, `2` partial sync (some downloads failed), `3` auth failure. Useful for scripting and monitoring.
+- **HTTP status validation on CloudKit API responses** - Catches non-2xx responses that were previously ignored.
+- **Config hash includes filter fields** - Changing `--skip-videos`, `--skip-photos`, `--recent`, date ranges, or album filters now automatically clears stored sync tokens, forcing a full re-scan so the filter change takes effect.
+- **Password security** - Passwords use `SecretString` (auto-zeroized on drop, redacted from `Debug`/`Display`). The `ICLOUD_PASSWORD` environment variable is cleared from the process after reading.
+
+### Changed
+
+- **`--watch-with-interval` minimum raised to 60 seconds.** Values below 60 are rejected. Previously accepted down to 1 second. ([#125])
+- **`--max-retries` capped at 100.** Previously unbounded.
+- **`--retry-delay` range restricted to 1-3600 seconds.** Previously unbounded.
+- **Mutually exclusive flags enforced** - `--auth-only` now conflicts with `--watch-with-interval`, `--list-albums`, and `--list-libraries`. `--list-albums` and `--list-libraries` conflict with `--watch-with-interval`.
+- **Empty `--username` and `--password` rejected at parse time.** Passing `--password ""` is now an error instead of silently proceeding with an empty string.
+- **`submit-code` validates 6-digit format.** Non-numeric or wrong-length codes are rejected before any network call.
+- **Invalid filename characters replaced with `_`** instead of silently removed. `photo:/name` becomes `photo__name` rather than `photoname`. Matches Python icloudpd behavior. ([#139])
+- **Cookie and session files written atomically** (write to temp, then rename). Prevents corruption if the process is killed mid-write.
+- **State flushed to SQLite after each download** instead of at the end. Eliminates a crash window where completed downloads weren't recorded.
+- **EXIF writes applied to `.kei-tmp` file** before renaming to the final path. EXIF failures no longer leave a file in the download directory with incorrect metadata.
+- **Content validated before rename** - SHA256 checksum and size are verified while the file is still `.kei-tmp`. Failed verification doesn't pollute the download directory.
+- **`verify` streams results** through paginated queries instead of loading all records into memory.
+- **`docker-compose.yml` updated** with credential options (encrypted store, Docker secrets, password-command) and commented examples. Default `ICLOUD_PASSWORD` env var removed in favor of more secure alternatives.
+- **Docker `stop_grace_period` set to 30 seconds** to allow in-flight downloads to finish before SIGKILL.
+- Config files containing a password now warn if group/world-readable.
+- Shared immutable data (`zone_id`, CloudKit params) uses `Arc<str>` / `Arc<Value>` to reduce cloning.
+- Blocking filesystem I/O (stat calls, directory cache) moved off tokio worker threads.
+- Schema migrations wrapped in SAVEPOINTs to prevent partial application on failure.
+- Four separate COUNT queries in `get_summary` consolidated into a single table scan.
+- Added `secrecy`, `keyring`, `aes-gcm`, `libc`, `bytes`, `http` dependencies. Added `wiremock` and `tracing-test` dev dependencies. Removed unused `uuid` v1 feature.
+
+### Fixed
+
+- **Pagination terminated on zero masters instead of zero records**, causing premature stop when a page contained only companion assets (like MOV files without their parent photo). ([#140])
+- **Apple auth endpoints returning HTTP 200 with error payloads went undetected.** Auth errors embedded in successful HTTP responses are now parsed and surfaced. ([#140])
+- **`--folder-structure` accepted path traversal sequences** like `../../etc`. Traversal components are now stripped. ([#126])
+- **Non-existent `--cookie-directory` silently ignored until deep in auth setup.** The directory is now validated (and created if possible) at config build time. ([#126])
+- **Long usernames caused OS "file name too long" errors** when creating lock/session/DB files. Usernames longer than 64 characters are now truncated with an FNV hash suffix. ([#126])
+- **Filenames exceeding 255-byte filesystem limit** caused write failures. Long filenames are now truncated while preserving the extension.
+- **Filename truncation with oversized extensions** dropped the extension entirely instead of truncating the stem.
+- **Multi-byte UTF-8 in auth response body preview** could panic when truncated mid-character.
+- **SRP PBKDF2 iteration count unbounded** - a malicious server response could request billions of iterations, hanging the client. Now capped.
+- **Sync token not preserved on `changes_stream` error**, forcing a full library re-enumeration on the next run instead of resuming from the last good token.
+- **`DeltaRecordBuffer` not flushed on `changes_stream` error**, losing already-buffered records.
+- **Failed state DB writes silently dropped.** Now retried up to 3 times before reporting failure.
+- **Spawned-task panics silently dropped.** Panics in download and enumeration tasks are now propagated to the parent.
+- **Legacy cookie parser didn't recover from corruption.** Corrupt cookie files are now detected and the session re-authenticates.
+- **Retry attempt counter could overflow** on pathological retry counts. Uses saturating arithmetic.
+
+[#93]: https://github.com/rhoopr/kei/issues/93
+[#125]: https://github.com/rhoopr/kei/issues/125
+[#126]: https://github.com/rhoopr/kei/issues/126
+[#139]: https://github.com/rhoopr/kei/issues/139
+[#140]: https://github.com/rhoopr/kei/issues/140
+
+---
+
 ## [0.5.3] - 2026-04-03
 
 ### Added
@@ -346,7 +412,12 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/rhoopr/kei/compare/v0.5.3...v0.6.0
+[0.5.3]: https://github.com/rhoopr/kei/compare/v0.5.2...v0.5.3
+[0.5.2]: https://github.com/rhoopr/kei/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/rhoopr/kei/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/rhoopr/kei/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.3.0...v0.4.0

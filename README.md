@@ -76,6 +76,8 @@ kei -u you@example.com -d ~/Photos/iCloud
 
 You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after.
 
+For long-running setups (Docker, cron, systemd), use `--password-file`, `--password-command`, or `kei credential set` to avoid storing passwords in environment variables. See the [wiki](https://github.com/rhoopr/kei/wiki/Credentials) for details.
+
 ## Usage
 
 ```sh
@@ -118,6 +120,7 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 | `import-existing` | Import local files into the state DB so they aren't re-downloaded. |
 | `get-code` | Request a 2FA code from Apple. Triggers a push to your trusted devices. |
 | `submit-code` | Submit a 2FA code non-interactively. For Docker and headless setups. |
+| `credential` | Manage stored passwords (OS keyring or encrypted file). `set`, `clear`, `backend`. |
 
 ## Features
 
@@ -127,10 +130,13 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 - SQLite state tracking across runs (downloaded, failed, pending)
 - Watch mode with configurable interval, systemd notify, PID file, graceful shutdown
 - Multi-library sync (`--library all` for personal + shared)
+- Flexible password sources: interactive prompt, env var, `--password-file`, `--password-command`, or OS keyring
 - Date-based folder structure, live photo MOV pairing, EXIF datetime stamping
 - Multi-arch Docker images (amd64/arm64) with headless 2FA via `get-code` + `submit-code`
 - Notification scripts on events: `2fa_required`, `sync_complete`, `sync_failed`, `session_expired`
 - Content filtering: skip videos/photos/live photos, date ranges, `--recent N`
+- Adjusted video and edited live photo MOV downloads (`--size adjusted`)
+- Structured exit codes (0 success, 2 partial, 3 auth) for scripting
 - Exponential backoff retries with transient vs. permanent error classification
 - TOML config file with `setup` wizard, CLI flags override config values
 
