@@ -480,9 +480,14 @@ async fn run_submit_code(
     Ok(())
 }
 
+/// iCloud web-client build identifiers sent with every CloudKit API request.
+/// Apple embeds these in the JS bundle served by `icloud.com`. To find updated
+/// values: open `icloud.com/photos` in a browser, inspect any CloudKit XHR, and
+/// read `clientBuildNumber` / `clientMasteringNumber` from the query string.
+const ICLOUD_CLIENT_BUILD_NUMBER: &str = "2522Project44";
+const ICLOUD_CLIENT_MASTERING_NUMBER: &str = "2522B2";
+
 /// Build the query parameters `HashMap` for the iCloud Photos `CloudKit` API.
-///
-/// Must match Python's `PyiCloudService.params` for API compatibility.
 fn build_photos_params(
     client_id: &str,
     dsid: Option<&str>,
@@ -490,11 +495,11 @@ fn build_photos_params(
     let mut params = std::collections::HashMap::with_capacity(4);
     params.insert(
         "clientBuildNumber".to_string(),
-        serde_json::Value::String("2522Project44".to_string()),
+        serde_json::Value::String(ICLOUD_CLIENT_BUILD_NUMBER.to_string()),
     );
     params.insert(
         "clientMasteringNumber".to_string(),
-        serde_json::Value::String("2522B2".to_string()),
+        serde_json::Value::String(ICLOUD_CLIENT_MASTERING_NUMBER.to_string()),
     );
     params.insert(
         "clientId".to_string(),
@@ -1676,11 +1681,15 @@ mod tests {
 
         assert_eq!(
             params.get("clientBuildNumber"),
-            Some(&serde_json::Value::String("2522Project44".to_string()))
+            Some(&serde_json::Value::String(
+                ICLOUD_CLIENT_BUILD_NUMBER.to_string()
+            ))
         );
         assert_eq!(
             params.get("clientMasteringNumber"),
-            Some(&serde_json::Value::String("2522B2".to_string()))
+            Some(&serde_json::Value::String(
+                ICLOUD_CLIENT_MASTERING_NUMBER.to_string()
+            ))
         );
         assert_eq!(
             params.get("clientId"),

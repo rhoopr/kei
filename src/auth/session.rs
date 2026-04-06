@@ -105,17 +105,17 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);
-    fs::write(&tmp, data).await.with_context(|| {
-        format!("Failed to write temp file {}", tmp.display())
-    })?;
+    fs::write(&tmp, data)
+        .await
+        .with_context(|| format!("Failed to write temp file {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
     }
-    fs::rename(&tmp, path).await.with_context(|| {
-        format!("Failed to rename {} to {}", tmp.display(), path.display())
-    })?;
+    fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("Failed to rename {} to {}", tmp.display(), path.display()))?;
     Ok(())
 }
 

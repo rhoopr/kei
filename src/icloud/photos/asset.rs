@@ -1406,7 +1406,9 @@ mod tests {
             // Drop without calling flush()
         }
 
-        assert!(logs_contain("DeltaRecordBuffer dropped with orphaned records"));
+        assert!(logs_contain(
+            "DeltaRecordBuffer dropped with orphaned records"
+        ));
         assert!(logs_contain("orphaned_masters=1"));
         assert!(logs_contain("orphaned_assets=0"));
     }
@@ -1418,7 +1420,9 @@ mod tests {
             let _buffer = DeltaRecordBuffer::new();
         }
 
-        assert!(!logs_contain("DeltaRecordBuffer dropped with orphaned records"));
+        assert!(!logs_contain(
+            "DeltaRecordBuffer dropped with orphaned records"
+        ));
     }
 
     // --- Gap tests: API response handling robustness ---
