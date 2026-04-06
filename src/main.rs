@@ -492,24 +492,19 @@ fn build_photos_params(
     client_id: &str,
     dsid: Option<&str>,
 ) -> std::collections::HashMap<String, serde_json::Value> {
-    let mut params = std::collections::HashMap::with_capacity(4);
+    let mut params: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::with_capacity(4);
     params.insert(
-        "clientBuildNumber".to_string(),
-        serde_json::Value::String(ICLOUD_CLIENT_BUILD_NUMBER.to_string()),
+        "clientBuildNumber".into(),
+        ICLOUD_CLIENT_BUILD_NUMBER.into(),
     );
     params.insert(
-        "clientMasteringNumber".to_string(),
-        serde_json::Value::String(ICLOUD_CLIENT_MASTERING_NUMBER.to_string()),
+        "clientMasteringNumber".into(),
+        ICLOUD_CLIENT_MASTERING_NUMBER.into(),
     );
-    params.insert(
-        "clientId".to_string(),
-        serde_json::Value::String(client_id.to_string()),
-    );
+    params.insert("clientId".into(), client_id.into());
     if let Some(dsid) = dsid {
-        params.insert(
-            "dsid".to_string(),
-            serde_json::Value::String(dsid.to_string()),
-        );
+        params.insert("dsid".into(), dsid.into());
     }
     params
 }
