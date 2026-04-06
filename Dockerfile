@@ -4,10 +4,13 @@ FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
 # Install cross-compilation toolchains when cross-compiling
 ARG TARGETPLATFORM
 RUN case "$TARGETPLATFORM" in \
+      "linux/amd64") \
+        apt-get update && \
+        apt-get install -y libdbus-1-dev ;; \
       "linux/arm64") \
         dpkg --add-architecture arm64 && \
         apt-get update && \
-        apt-get install -y gcc-aarch64-linux-gnu ;; \
+        apt-get install -y gcc-aarch64-linux-gnu libdbus-1-dev ;; \
     esac
 
 WORKDIR /build
@@ -43,7 +46,7 @@ RUN export TARGET=$(cat /tmp/target) && \
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends bash curl jq ca-certificates && \
+    apt-get install -y --no-install-recommends bash curl jq ca-certificates libdbus-1-3 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /kei /usr/local/bin/kei

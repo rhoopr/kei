@@ -31,6 +31,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       # Caches compiled dependencies to speed up subsequent runs
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features
@@ -47,6 +48,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
 
@@ -60,6 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps --all-features
 
@@ -72,6 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: taiki-e/install-action@cargo-udeps
       - run: cargo +nightly udeps --all-targets
 
@@ -99,6 +105,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
         run: |
@@ -149,6 +156,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
 

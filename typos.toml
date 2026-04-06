@@ -10,3 +10,5 @@ fo = "fo"
 Iz = "Iz"
 # Test data: "Café" stripped to "Caf" by remove_unicode_chars()
 Caf = "Caf"
+# Appears in randomized asset ID test data (e.g. "APn3rWx5Z")
+Pn = "Pn"

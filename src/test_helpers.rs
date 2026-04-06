@@ -246,7 +246,7 @@ impl TestPhotoAsset {
 #[derive(Debug, Clone)]
 pub struct RecordedCall {
     pub url: String,
-    pub body: String,
+    pub _body: String,
 }
 
 /// Response action for a single `post()` call.
@@ -320,7 +320,7 @@ impl PhotosSession for MockPhotosSession {
     ) -> anyhow::Result<Value> {
         self.calls.lock().expect("poisoned").push(RecordedCall {
             url: url.to_string(),
-            body: body.to_string(),
+            _body: body.to_string(),
         });
 
         let response = self.responses.lock().expect("poisoned").pop_front();
