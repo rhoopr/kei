@@ -279,7 +279,7 @@ pub(crate) fn resolve_auth(
 }
 
 /// Resolve `password_file` from CLI + TOML.
-fn resolve_password_file(
+pub(crate) fn resolve_password_file(
     auth: &crate::cli::AuthArgs,
     toml_auth: Option<&TomlAuth>,
 ) -> Option<PathBuf> {
@@ -290,7 +290,7 @@ fn resolve_password_file(
 }
 
 /// Resolve `password_command` from CLI + TOML.
-fn resolve_password_command(
+pub(crate) fn resolve_password_command(
     auth: &crate::cli::AuthArgs,
     toml_auth: Option<&TomlAuth>,
 ) -> Option<String> {

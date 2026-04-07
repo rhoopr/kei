@@ -183,7 +183,7 @@ fn make_password_provider(source: password::PasswordSource) -> impl Fn() -> Opti
     }
 }
 
-/// Build a password provider from CLI auth args and resolved auth fields.
+/// Build a password provider from CLI auth args, TOML config, and resolved auth fields.
 ///
 /// Shared by `run_get_code`, `run_submit_code`, and `run_import_existing`.
 fn make_provider_from_auth(
@@ -191,11 +191,15 @@ fn make_provider_from_auth(
     password: Option<String>,
     username: &str,
     cookie_directory: &Path,
+    toml: Option<&config::TomlConfig>,
 ) -> impl Fn() -> Option<SecretString> {
+    let toml_auth = toml.and_then(|t| t.auth.as_ref());
+    let password_command = config::resolve_password_command(auth, toml_auth);
+    let password_file = config::resolve_password_file(auth, toml_auth);
     let source = password::build_password_source(
         password.map(SecretString::from).as_ref(),
-        auth.password_command.as_deref(),
-        auth.password_file.as_deref().map(Path::new),
+        password_command.as_deref(),
+        password_file.as_deref(),
         credential::CredentialStore::new(username, cookie_directory),
     );
     make_password_provider(source)
@@ -538,7 +542,7 @@ async fn run_get_code(args: cli::GetCodeArgs, toml: Option<&TomlConfig>) -> anyh
     }
 
     let password_provider =
-        make_provider_from_auth(&args.auth, password, &username, &cookie_directory);
+        make_provider_from_auth(&args.auth, password, &username, &cookie_directory, toml);
 
     auth::send_2fa_push(
         &cookie_directory,
@@ -565,7 +569,7 @@ async fn run_submit_code(
     }
 
     let password_provider =
-        make_provider_from_auth(&args.auth, password, &username, &cookie_directory);
+        make_provider_from_auth(&args.auth, password, &username, &cookie_directory, toml);
 
     let result = auth::authenticate(
         &cookie_directory,
@@ -643,7 +647,7 @@ async fn run_import_existing(
 
     // Authenticate
     let password_provider =
-        make_provider_from_auth(&args.auth, password, &username, &cookie_directory);
+        make_provider_from_auth(&args.auth, password, &username, &cookie_directory, toml);
 
     let auth_result = auth::authenticate(
         &cookie_directory,
