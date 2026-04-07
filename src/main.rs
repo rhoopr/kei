@@ -1026,7 +1026,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         .transpose()?;
 
     let sd_notifier = SystemdNotifier::new(config.notify_systemd);
-    let notifier = Notifier::new(config.notification_script);
+    let notifier = Notifier::new(config.notification_script.clone());
 
     tracing::info!(concurrency = config.threads_num, "Starting kei");
 
@@ -1434,6 +1434,33 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             for lib_state in &library_states {
                 if shutdown_token.is_cancelled() {
                     break;
+                }
+
+                // Check if the download config changed since last sync. If so,
+                // clear sync tokens so the subsequent lookup falls back to full
+                // enumeration — the stored incremental token would miss assets
+                // that are newly eligible under the changed config (e.g. a
+                // user switching --size or adding --skip-videos).
+                if let Some(ref db) = state_db {
+                    let config_hash = download::compute_config_hash(&config);
+                    let stored_hash = db.get_metadata("config_hash").await.unwrap_or(None);
+                    if stored_hash.as_deref() != Some(&config_hash) {
+                        if stored_hash.is_some() {
+                            tracing::info!(
+                                "Download config changed since last sync, clearing sync tokens"
+                            );
+                            match db.delete_metadata_by_prefix("sync_token:").await {
+                                Ok(n) if n > 0 => {
+                                    tracing::info!(cleared = n, "Cleared stale sync tokens");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to clear sync tokens");
+                                }
+                                _ => {}
+                            }
+                        }
+                        let _ = db.set_metadata("config_hash", &config_hash).await;
+                    }
                 }
 
                 // Determine sync mode per-library

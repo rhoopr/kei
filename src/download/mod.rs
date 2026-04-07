@@ -160,7 +160,10 @@ pub struct SyncResult {
 /// When this hash changes between runs, we can't trust the state DB's download
 /// records (the resolved paths may differ), so we fall back to the full pipeline
 /// with filesystem existence checks.
-fn hash_download_config(config: &DownloadConfig) -> String {
+///
+/// Also called from `main.rs` (via [`compute_config_hash`]) to clear sync tokens
+/// before the incremental-vs-full decision when the download config changes.
+pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write;
 
@@ -195,6 +198,55 @@ fn hash_download_config(config: &DownloadConfig) -> String {
     let hash = hasher.finalize();
     let mut hex = String::with_capacity(16);
     // First 8 bytes is plenty for collision avoidance in this context
+    for &b in &hash[..8] {
+        let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+    }
+    hex
+}
+
+/// Compute the config hash from the app-level `Config`.
+///
+/// Called from `main.rs` before the sync-mode decision so that stale sync
+/// tokens are cleared when the download config changes. Produces the same
+/// hash as [`hash_download_config`].
+pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let size: AssetVersionSize = config.size.into();
+    let live_photo_size = config.live_photo_size.to_asset_version_size();
+    let skip_created_before = config
+        .skip_created_before
+        .map(|d| d.with_timezone(&chrono::Utc));
+    let skip_created_after = config
+        .skip_created_after
+        .map(|d| d.with_timezone(&chrono::Utc));
+
+    let mut hasher = Sha256::new();
+    hasher.update(config.directory.as_os_str().as_encoded_bytes());
+    hasher.update(b"\0");
+    hasher.update(config.folder_structure.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", size).as_bytes());
+    hasher.update(format!("{:?}", live_photo_size).as_bytes());
+    hasher.update(format!("{:?}", config.file_match_policy).as_bytes());
+    hasher.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
+    hasher.update(format!("{:?}", config.align_raw).as_bytes());
+    hasher.update([u8::from(config.keep_unicode_in_filenames)]);
+    hasher.update(format!("{:?}", skip_created_before).as_bytes());
+    hasher.update(format!("{:?}", skip_created_after).as_bytes());
+    hasher.update(format!("{:?}", config.recent).as_bytes());
+    hasher.update([u8::from(config.force_size)]);
+    hasher.update([u8::from(config.skip_videos)]);
+    hasher.update([u8::from(config.skip_photos)]);
+    hasher.update(
+        chrono::Local::now()
+            .offset()
+            .local_minus_utc()
+            .to_le_bytes(),
+    );
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(16);
     for &b in &hash[..8] {
         let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
     }
