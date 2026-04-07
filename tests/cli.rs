@@ -850,6 +850,110 @@ fn import_existing_accepts_no_progress_bar() {
         .stdout(predicate::str::contains("--no-progress-bar"));
 }
 
+// ── exit codes ────────────────────────────────────────────────────────
+
+/// Exit code 0 for --help.
+#[test]
+fn exit_code_0_on_help() {
+    common::cmd().arg("--help").assert().code(0);
+}
+
+/// Exit code 0 for --version.
+#[test]
+fn exit_code_0_on_version() {
+    common::cmd().arg("--version").assert().code(0);
+}
+
+/// Exit code 1 (generic failure) when --username is missing.
+#[test]
+fn exit_code_1_on_missing_username() {
+    common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args([
+            "sync",
+            "--directory",
+            "/tmp/claude/exit-code-test",
+            "--cookie-directory",
+            "/tmp/claude/exit-code-cookies",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("--username is required"));
+}
+
+/// Exit code 3 (auth failure) when password file is empty.
+///
+/// An empty password file triggers `AuthError::FailedLogin("Password
+/// provider returned no data")`, which maps to EXIT_AUTH (3).
+#[test]
+fn exit_code_3_on_empty_password_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let pw_file = dir.path().join("empty-password");
+    std::fs::write(&pw_file, "").unwrap();
+
+    common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args([
+            "sync",
+            "--username",
+            "exit-code-test@example.com",
+            "--directory",
+            "/tmp/claude/exit-code-test",
+            "--cookie-directory",
+            dir.path().to_str().unwrap(),
+            "--password-file",
+            pw_file.to_str().unwrap(),
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "Password provider returned no data",
+        ));
+}
+
+/// Exit code 3 (auth failure) when password file contains only a newline.
+#[test]
+fn exit_code_3_on_newline_only_password_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let pw_file = dir.path().join("newline-password");
+    std::fs::write(&pw_file, "\n").unwrap();
+
+    common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args([
+            "sync",
+            "--username",
+            "exit-code-test@example.com",
+            "--directory",
+            "/tmp/claude/exit-code-test",
+            "--cookie-directory",
+            dir.path().to_str().unwrap(),
+            "--password-file",
+            pw_file.to_str().unwrap(),
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "Password provider returned no data",
+        ));
+}
+
+/// Exit code 2 (clap validation error) for invalid argument values.
+#[test]
+fn exit_code_2_on_invalid_argument() {
+    common::cmd()
+        .args(["sync", "--username", ""])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("value must not be empty"));
+}
+
 // ── submit-code validation ─────────────────────────────────────────────
 
 #[test]

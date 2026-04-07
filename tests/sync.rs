@@ -72,7 +72,7 @@ fn list_albums_prints_album_names() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_META))
             .assert()
             .success()
-            .stdout(predicate::str::contains("Albums:"));
+            .stdout(predicate::str::contains("Library:"));
     });
 }
 
@@ -471,8 +471,12 @@ fn sync_force_size_succeeds_when_available() {
             "--force-size with available size should download files"
         );
 
-        // With --force-size medium, non-RAW files should be smaller than originals
-        let non_raw_files: Vec<_> = files.iter().filter(|p| !is_raw_ext(p)).collect();
+        // With --force-size medium, non-RAW photo files should be smaller than originals.
+        // Videos don't have meaningful medium alternatives so exclude them too.
+        let non_raw_files: Vec<_> = files
+            .iter()
+            .filter(|p| !is_raw_ext(p) && !is_video_ext(p))
+            .collect();
         for f in &non_raw_files {
             let size = std::fs::metadata(f).unwrap().len();
             assert!(
@@ -838,10 +842,7 @@ fn sync_notification_script_fires_event() {
         let script_path = script_dir.path().join("notify.sh");
         std::fs::write(
             &script_path,
-            format!(
-                "#!/bin/sh\necho \"$ICLOUDPD_EVENT\" > {}\n",
-                marker.display()
-            ),
+            format!("#!/bin/sh\necho \"$KEI_EVENT\" > {}\n", marker.display()),
         )
         .expect("write script");
         #[cfg(unix)]

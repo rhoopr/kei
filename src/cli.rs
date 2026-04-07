@@ -66,7 +66,7 @@ pub struct AuthArgs {
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
     /// Local directory for downloads
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, value_parser = non_empty_string)]
     pub directory: Option<String>,
 
     /// Only authenticate (create/update session tokens)
@@ -82,7 +82,7 @@ pub struct SyncArgs {
     pub list_libraries: bool,
 
     /// Album(s) to download
-    #[arg(short = 'a', long = "album")]
+    #[arg(short = 'a', long = "album", value_parser = non_empty_string)]
     pub albums: Vec<String>,
 
     /// Library to download (default: `PrimarySync`, use "all" for all libraries)
@@ -244,7 +244,7 @@ pub struct ImportArgs {
     pub auth: AuthArgs,
 
     /// Local directory containing existing downloads
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, value_parser = non_empty_string)]
     pub directory: String,
 
     /// Folder structure used for existing downloads
@@ -1414,6 +1414,32 @@ mod tests {
         let mut args = base_args();
         args.extend(["--password", ""]);
         assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_empty_directory_rejected() {
+        let args = ["kei", "--username", "user@example.com", "--directory", ""];
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn test_empty_album_rejected() {
+        let mut args = base_args();
+        args.extend(["--album", ""]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_empty_import_directory_rejected() {
+        let args = [
+            "kei",
+            "import-existing",
+            "--username",
+            "user@example.com",
+            "--directory",
+            "",
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]
