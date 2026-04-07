@@ -891,7 +891,7 @@ fn filter_asset_to_tasks(
                 asset_id: asset.id().into(),
                 size: version.size,
                 created_local,
-                version_size: VersionSizeKey::from(config.size),
+                version_size: VersionSizeKey::from(effective_size),
             });
         }
     }

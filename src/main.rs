@@ -1045,7 +1045,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
-    let config = config::Config::build(auth, sync, toml_config)?;
+    let mut config = config::Config::build(auth, sync, toml_config)?;
+
+    // retry-failed is a one-shot operation — never inherit watch mode from
+    // TOML config, which would cause the process to loop forever instead of
+    // exiting after retrying the failed downloads.
+    if is_retry_failed {
+        config.watch_with_interval = None;
+    }
 
     // Install password redaction now that we know the password
     if let Some(ref pw) = config.password {
