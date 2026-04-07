@@ -1034,6 +1034,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         anyhow::bail!("--username is required");
     }
 
+    // Validate --directory early (before auth) for commands that need it.
+    // This avoids wasting a 2FA code when the user simply forgot --directory.
+    let needs_directory = !config.auth_only && !config.list_albums && !config.list_libraries;
+    if needs_directory && config.directory.as_os_str().is_empty() {
+        anyhow::bail!("--directory is required for downloading");
+    }
+
     let cred_store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
     let source = password::build_password_source(
         config.password.as_ref(),
