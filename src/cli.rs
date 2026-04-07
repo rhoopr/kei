@@ -105,29 +105,29 @@ pub struct SyncArgs {
     #[arg(long = "threads-num", value_parser = clap::value_parser!(u16).range(1..))]
     pub threads_num: Option<u16>,
 
-    /// Don't download videos
-    #[arg(long)]
-    pub skip_videos: bool,
+    /// Don't download videos (pass `false` to override config file)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub skip_videos: Option<bool>,
 
-    /// Don't download photos
-    #[arg(long)]
-    pub skip_photos: bool,
+    /// Don't download photos (pass `false` to override config file)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub skip_photos: Option<bool>,
 
-    /// Don't download live photos
-    #[arg(long)]
-    pub skip_live_photos: bool,
+    /// Don't download live photos (pass `false` to override config file)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub skip_live_photos: Option<bool>,
 
     /// Only download requested size (don't fall back to original)
-    #[arg(long)]
-    pub force_size: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub force_size: Option<bool>,
 
     /// Folder structure for organizing downloads
     #[arg(long)]
     pub folder_structure: Option<String>,
 
     /// Write `DateTimeOriginal` EXIF tag if missing
-    #[arg(long)]
-    pub set_exif_datetime: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub set_exif_datetime: Option<bool>,
 
     /// Do not modify local system or iCloud
     #[arg(long)]
@@ -138,12 +138,12 @@ pub struct SyncArgs {
     pub watch_with_interval: Option<u64>,
 
     /// Disable progress bar
-    #[arg(long)]
-    pub no_progress_bar: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub no_progress_bar: Option<bool>,
 
     /// Keep Unicode in filenames
-    #[arg(long)]
-    pub keep_unicode_in_filenames: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub keep_unicode_in_filenames: Option<bool>,
 
     /// Live photo MOV filename policy
     #[arg(long, value_enum)]
@@ -192,8 +192,8 @@ pub struct SyncArgs {
 
     /// Send systemd `sd_notify` messages (READY, STOPPING, STATUS).
     /// Only effective on Linux with a systemd service unit.
-    #[arg(long)]
-    pub notify_systemd: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub notify_systemd: Option<bool>,
 
     /// Write PID to file (for service managers).
     #[arg(long)]
@@ -382,11 +382,143 @@ pub struct Cli {
     pub sync: SyncArgs,
 }
 
+impl AuthArgs {
+    /// Merge top-level (fallback) auth args into self.
+    /// Subcommand values take precedence; top-level fills in gaps.
+    fn merge_from(&mut self, fallback: &AuthArgs) {
+        if self.username.is_none() {
+            self.username.clone_from(&fallback.username);
+        }
+        if self.password.is_none() {
+            self.password.clone_from(&fallback.password);
+        }
+        if self.password_file.is_none() {
+            self.password_file.clone_from(&fallback.password_file);
+        }
+        if self.password_command.is_none() {
+            self.password_command.clone_from(&fallback.password_command);
+        }
+        self.save_password = self.save_password || fallback.save_password;
+        if self.domain.is_none() {
+            self.domain = fallback.domain;
+        }
+        if self.cookie_directory.is_none() {
+            self.cookie_directory.clone_from(&fallback.cookie_directory);
+        }
+    }
+}
+
+impl SyncArgs {
+    /// Merge top-level (fallback) sync args into self.
+    /// Subcommand values take precedence; top-level fills in gaps.
+    fn merge_from(&mut self, fallback: &SyncArgs) {
+        if self.directory.is_none() {
+            self.directory.clone_from(&fallback.directory);
+        }
+        self.auth_only = self.auth_only || fallback.auth_only;
+        self.list_albums = self.list_albums || fallback.list_albums;
+        self.list_libraries = self.list_libraries || fallback.list_libraries;
+        if self.albums.is_empty() {
+            self.albums.clone_from(&fallback.albums);
+        }
+        if self.library.is_none() {
+            self.library.clone_from(&fallback.library);
+        }
+        if self.size.is_none() {
+            self.size = fallback.size;
+        }
+        if self.live_photo_size.is_none() {
+            self.live_photo_size = fallback.live_photo_size;
+        }
+        if self.recent.is_none() {
+            self.recent = fallback.recent;
+        }
+        if self.threads_num.is_none() {
+            self.threads_num = fallback.threads_num;
+        }
+        if self.skip_videos.is_none() {
+            self.skip_videos = fallback.skip_videos;
+        }
+        if self.skip_photos.is_none() {
+            self.skip_photos = fallback.skip_photos;
+        }
+        if self.skip_live_photos.is_none() {
+            self.skip_live_photos = fallback.skip_live_photos;
+        }
+        if self.force_size.is_none() {
+            self.force_size = fallback.force_size;
+        }
+        if self.folder_structure.is_none() {
+            self.folder_structure.clone_from(&fallback.folder_structure);
+        }
+        if self.set_exif_datetime.is_none() {
+            self.set_exif_datetime = fallback.set_exif_datetime;
+        }
+        self.dry_run = self.dry_run || fallback.dry_run;
+        if self.watch_with_interval.is_none() {
+            self.watch_with_interval = fallback.watch_with_interval;
+        }
+        if self.no_progress_bar.is_none() {
+            self.no_progress_bar = fallback.no_progress_bar;
+        }
+        if self.keep_unicode_in_filenames.is_none() {
+            self.keep_unicode_in_filenames = fallback.keep_unicode_in_filenames;
+        }
+        if self.live_photo_mov_filename_policy.is_none() {
+            self.live_photo_mov_filename_policy = fallback.live_photo_mov_filename_policy;
+        }
+        if self.align_raw.is_none() {
+            self.align_raw = fallback.align_raw;
+        }
+        if self.file_match_policy.is_none() {
+            self.file_match_policy = fallback.file_match_policy;
+        }
+        if self.skip_created_before.is_none() {
+            self.skip_created_before
+                .clone_from(&fallback.skip_created_before);
+        }
+        if self.skip_created_after.is_none() {
+            self.skip_created_after
+                .clone_from(&fallback.skip_created_after);
+        }
+        self.only_print_filenames = self.only_print_filenames || fallback.only_print_filenames;
+        if self.max_retries.is_none() {
+            self.max_retries = fallback.max_retries;
+        }
+        if self.retry_delay.is_none() {
+            self.retry_delay = fallback.retry_delay;
+        }
+        if self.temp_suffix.is_none() {
+            self.temp_suffix.clone_from(&fallback.temp_suffix);
+        }
+        self.no_incremental = self.no_incremental || fallback.no_incremental;
+        self.reset_sync_token = self.reset_sync_token || fallback.reset_sync_token;
+        if self.notify_systemd.is_none() {
+            self.notify_systemd = fallback.notify_systemd;
+        }
+        if self.pid_file.is_none() {
+            self.pid_file.clone_from(&fallback.pid_file);
+        }
+        if self.notification_script.is_none() {
+            self.notification_script
+                .clone_from(&fallback.notification_script);
+        }
+    }
+}
+
 impl Cli {
     /// Get the effective command, treating bare invocation as sync.
+    ///
+    /// When a subcommand is present, top-level auth/sync args are merged
+    /// as fallbacks so `kei --username X sync` works the same as
+    /// `kei sync --username X`.
     pub fn effective_command(&self) -> Command {
         match &self.command {
-            Some(cmd) => cmd.clone(),
+            Some(cmd) => {
+                let mut cmd = cmd.clone();
+                cmd.merge_top_level_args(&self.auth, &self.sync);
+                cmd
+            }
             None => Command::Sync {
                 auth: self.auth.clone(),
                 sync: self.sync.clone(),
@@ -396,6 +528,33 @@ impl Cli {
 }
 
 impl Command {
+    /// Merge top-level CLI auth/sync args as fallbacks into the subcommand's
+    /// own args. This makes `kei --username X sync` equivalent to
+    /// `kei sync --username X`.
+    fn merge_top_level_args(&mut self, top_auth: &AuthArgs, top_sync: &SyncArgs) {
+        match self {
+            Self::Sync {
+                ref mut auth,
+                ref mut sync,
+            } => {
+                auth.merge_from(top_auth);
+                sync.merge_from(top_sync);
+            }
+            Self::RetryFailed(args) => {
+                args.auth.merge_from(top_auth);
+                args.sync.merge_from(top_sync);
+            }
+            Self::Status(args) => args.auth.merge_from(top_auth),
+            Self::ResetState(args) => args.auth.merge_from(top_auth),
+            Self::ImportExisting(args) => args.auth.merge_from(top_auth),
+            Self::Verify(args) => args.auth.merge_from(top_auth),
+            Self::GetCode(args) => args.auth.merge_from(top_auth),
+            Self::SubmitCode(args) => args.auth.merge_from(top_auth),
+            Self::Credential(args) => args.auth.merge_from(top_auth),
+            Self::Setup { .. } => {}
+        }
+    }
+
     /// Inject the `ICLOUD_PASSWORD` value captured before `Cli::parse()`.
     ///
     /// The env var is removed from the process environment for security
@@ -651,9 +810,9 @@ mod tests {
     }
 
     #[test]
-    fn test_notify_systemd_default_false() {
+    fn test_notify_systemd_default_none() {
         let cli = parse(&base_args());
-        assert!(!cli.sync.notify_systemd);
+        assert_eq!(cli.sync.notify_systemd, None);
     }
 
     #[test]
@@ -661,7 +820,7 @@ mod tests {
         let mut args = base_args();
         args.push("--notify-systemd");
         let cli = parse(&args);
-        assert!(cli.sync.notify_systemd);
+        assert_eq!(cli.sync.notify_systemd, Some(true));
     }
 
     #[test]
@@ -929,7 +1088,15 @@ mod tests {
         let mut args = base_args();
         args.push("--skip-videos");
         let cli = parse(&args);
-        assert!(cli.sync.skip_videos);
+        assert_eq!(cli.sync.skip_videos, Some(true));
+    }
+
+    #[test]
+    fn test_skip_videos_explicit_false() {
+        let mut args = base_args();
+        args.extend(["--skip-videos", "false"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.skip_videos, Some(false));
     }
 
     #[test]
@@ -937,7 +1104,7 @@ mod tests {
         let mut args = base_args();
         args.push("--skip-photos");
         let cli = parse(&args);
-        assert!(cli.sync.skip_photos);
+        assert_eq!(cli.sync.skip_photos, Some(true));
     }
 
     #[test]
@@ -945,7 +1112,7 @@ mod tests {
         let mut args = base_args();
         args.push("--skip-live-photos");
         let cli = parse(&args);
-        assert!(cli.sync.skip_live_photos);
+        assert_eq!(cli.sync.skip_live_photos, Some(true));
     }
 
     #[test]
@@ -953,7 +1120,7 @@ mod tests {
         let mut args = base_args();
         args.push("--force-size");
         let cli = parse(&args);
-        assert!(cli.sync.force_size);
+        assert_eq!(cli.sync.force_size, Some(true));
     }
 
     #[test]
@@ -961,7 +1128,7 @@ mod tests {
         let mut args = base_args();
         args.push("--set-exif-datetime");
         let cli = parse(&args);
-        assert!(cli.sync.set_exif_datetime);
+        assert_eq!(cli.sync.set_exif_datetime, Some(true));
     }
 
     #[test]
@@ -969,7 +1136,7 @@ mod tests {
         let mut args = base_args();
         args.push("--no-progress-bar");
         let cli = parse(&args);
-        assert!(cli.sync.no_progress_bar);
+        assert_eq!(cli.sync.no_progress_bar, Some(true));
     }
 
     #[test]
@@ -977,7 +1144,7 @@ mod tests {
         let mut args = base_args();
         args.push("--keep-unicode-in-filenames");
         let cli = parse(&args);
-        assert!(cli.sync.keep_unicode_in_filenames);
+        assert_eq!(cli.sync.keep_unicode_in_filenames, Some(true));
     }
 
     // ── Enum variants ──────────────────────────────────────────────

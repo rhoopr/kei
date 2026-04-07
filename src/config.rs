@@ -240,9 +240,11 @@ fn resolve<T>(cli: Option<T>, toml: Option<T>, default: T) -> T {
     cli.or(toml).unwrap_or(default)
 }
 
-/// For boolean flags: CLI flag present (true) wins, else TOML, else false.
-fn resolve_flag(cli_flag: bool, toml_val: Option<bool>) -> bool {
-    cli_flag || toml_val.unwrap_or(false)
+/// For boolean flags: CLI explicit value wins, then TOML, then false.
+/// `Option<bool>` allows the CLI to explicitly pass `--flag false` to
+/// override a TOML `true`.
+fn resolve_flag(cli_flag: Option<bool>, toml_val: Option<bool>) -> bool {
+    cli_flag.or(toml_val).unwrap_or(false)
 }
 
 /// Resolve auth fields from CLI auth args + optional TOML config.
@@ -921,9 +923,25 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
-        sync.skip_videos = true;
+        sync.skip_videos = Some(true);
         let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(cfg.skip_videos);
+    }
+
+    #[test]
+    fn test_build_cli_false_overrides_toml_true() {
+        let toml_str = r#"
+            [filters]
+            skip_videos = true
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.skip_videos = Some(false);
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
+        assert!(
+            !cfg.skip_videos,
+            "CLI --skip-videos false should override TOML true"
+        );
     }
 
     #[test]
@@ -1864,14 +1882,14 @@ mod tests {
     #[test]
     fn test_build_all_boolean_flags_cli_overrides() {
         let mut sync = default_sync();
-        sync.set_exif_datetime = true;
-        sync.no_progress_bar = true;
-        sync.skip_videos = true;
-        sync.skip_photos = true;
-        sync.skip_live_photos = true;
-        sync.force_size = true;
-        sync.keep_unicode_in_filenames = true;
-        sync.notify_systemd = true;
+        sync.set_exif_datetime = Some(true);
+        sync.no_progress_bar = Some(true);
+        sync.skip_videos = Some(true);
+        sync.skip_photos = Some(true);
+        sync.skip_live_photos = Some(true);
+        sync.force_size = Some(true);
+        sync.keep_unicode_in_filenames = Some(true);
+        sync.notify_systemd = Some(true);
         let cfg = Config::build(default_auth(), sync, None).unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.no_progress_bar);

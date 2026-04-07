@@ -1042,6 +1042,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         anyhow::bail!("--username is required");
     }
 
+    // retry-failed + dry-run is unsupported: dry-run skips the state DB,
+    // but retry-failed needs it to know which assets failed.
+    if is_retry_failed && config.dry_run {
+        anyhow::bail!(
+            "--dry-run cannot be used with retry-failed (retry needs the state database)"
+        );
+    }
+
     // Validate --directory early (before auth) for commands that need it.
     // This avoids wasting a 2FA code when the user simply forgot --directory.
     let needs_directory = !config.auth_only && !config.list_albums && !config.list_libraries;
@@ -1470,8 +1478,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         // the two hashes to overwrite each other every cycle,
                         // permanently preventing incremental sync.
                         let config_hash = download::compute_config_hash(&config);
-                        let stored_hash =
-                            db.get_metadata("enum_config_hash").await.unwrap_or(None);
+                        let stored_hash = db.get_metadata("enum_config_hash").await.unwrap_or(None);
                         if stored_hash.as_deref() != Some(&config_hash) {
                             if stored_hash.is_some() {
                                 tracing::info!(
@@ -1479,10 +1486,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                                 );
                                 match db.delete_metadata_by_prefix("sync_token:").await {
                                     Ok(n) if n > 0 => {
-                                        tracing::info!(
-                                            cleared = n,
-                                            "Cleared stale sync tokens"
-                                        );
+                                        tracing::info!(cleared = n, "Cleared stale sync tokens");
                                     }
                                     Err(e) => {
                                         tracing::warn!(
@@ -1499,9 +1503,15 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 }
 
                 // Determine sync mode per-library
-                let sync_mode = if config.no_incremental {
-                    if library_states.len() == 1 {
+                // retry-failed must always use full enumeration: incremental
+                // sync only returns NEW iCloud changes, missing previously-
+                // failed assets that were already enumerated but not downloaded.
+                let sync_mode = if is_retry_failed || config.no_incremental {
+                    if config.no_incremental && library_states.len() == 1 {
                         tracing::info!("Incremental sync disabled via --no-incremental, performing full enumeration");
+                    }
+                    if is_retry_failed {
+                        tracing::info!("Retry-failed requires full enumeration to find previously-failed assets");
                     }
                     download::SyncMode::Full
                 } else if let Some(ref db) = state_db {
