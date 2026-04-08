@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.1] - 2026-04-08
+
+### Fixed
+
+- **Apple iOS 26.4 2FA push change** - Apple changed the 2FA push mechanism around iOS 26.4. The old `bridge/step/0` endpoint no longer reliably delivers codes to trusted devices. Switched to PUT `/verify/trusteddevice/securitycode`, which works on both old and new iOS versions. ([#164])
+- **Docker first-run crash loop** - When no password was configured and stdin wasn't a terminal (Docker, cron), kei exited with the cryptic "Password provider returned no data". Now shows an actionable error listing all password options. ([#163])
+
+### Added
+
+- **2FA retry loop** - Interactive 2FA prompt now allows up to 3 wrong code attempts instead of exiting on the first failure. Press Enter without a code to request a new push notification.
+- **2FA code normalization** - Codes with spaces or dashes ("123 456", "123-456") are accepted in both the interactive prompt and `submit-code` CLI arg.
+
+[#163]: https://github.com/rhoopr/kei/issues/163
+[#164]: https://github.com/rhoopr/kei/issues/164
+
 ## [0.6.0] - 2026-04-06
 
 ### Added
@@ -423,7 +438,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/rhoopr/kei/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/rhoopr/kei/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/rhoopr/kei/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/rhoopr/kei/compare/v0.5.1...v0.5.2
