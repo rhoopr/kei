@@ -444,7 +444,7 @@ fn import_existing_requires_directory() {
         .args(["import-existing", "--username", "x@x.com"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error"));
+        .stderr(predicate::str::contains("--directory is required"));
 }
 
 // ── Boolean flags are accepted ──────────────────────────────────────────

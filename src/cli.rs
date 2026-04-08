@@ -245,11 +245,15 @@ pub struct ImportArgs {
 
     /// Local directory containing existing downloads
     #[arg(short = 'd', long, value_parser = non_empty_string)]
-    pub directory: String,
+    pub directory: Option<String>,
 
     /// Folder structure used for existing downloads
-    #[arg(long, default_value = "%Y/%m/%d")]
-    pub folder_structure: String,
+    #[arg(long)]
+    pub folder_structure: Option<String>,
+
+    /// Keep Unicode in filenames (must match what was used during sync)
+    #[arg(long)]
+    pub keep_unicode_in_filenames: Option<bool>,
 
     /// Number of recent photos to check
     #[arg(long)]
@@ -1422,8 +1426,8 @@ mod tests {
         .unwrap();
         if let Some(Command::ImportExisting(args)) = cli.command {
             assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
-            assert_eq!(args.directory, "/photos");
-            assert_eq!(args.folder_structure, "%Y/%m/%d");
+            assert_eq!(args.directory.as_deref(), Some("/photos"));
+            assert!(args.folder_structure.is_none());
             assert!(args.recent.is_none());
         } else {
             panic!("Expected ImportExisting command");

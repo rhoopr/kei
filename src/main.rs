@@ -632,7 +632,28 @@ async fn run_import_existing(
     use icloud::photos::AssetVersionSize;
 
     let db_path = get_db_path(&args.auth, toml)?;
-    let directory = config::expand_tilde(&args.directory);
+    let toml_dl = toml.and_then(|t| t.download.as_ref());
+    let toml_photos = toml.and_then(|t| t.photos.as_ref());
+
+    // Resolve directory and path settings from CLI > TOML > default, matching
+    // the sync command's resolution so import-existing looks for files at the
+    // same paths sync would have created.
+    let directory_str = args
+        .directory
+        .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
+        .unwrap_or_default();
+    if directory_str.is_empty() {
+        anyhow::bail!("--directory is required for import-existing");
+    }
+    let directory = config::expand_tilde(&directory_str);
+    let folder_structure = args
+        .folder_structure
+        .or_else(|| toml_dl.and_then(|d| d.folder_structure.clone()))
+        .unwrap_or_else(|| "%Y/%m/%d".to_string());
+    let keep_unicode = args
+        .keep_unicode_in_filenames
+        .or_else(|| toml_photos.and_then(|p| p.keep_unicode_in_filenames))
+        .unwrap_or(false);
 
     if !directory.exists() {
         anyhow::bail!("Directory does not exist: {}", directory.display());
@@ -712,19 +733,28 @@ async fn run_import_existing(
 
         total += 1;
 
-        // Get filename from the asset
-        let filename = if let Some(f) = asset.filename() {
-            f.to_string()
-        } else {
-            tracing::debug!(id = %asset.id(), "Skipping asset with no filename");
-            continue;
-        };
-
         // Get versions
         if asset.versions().is_empty() {
             tracing::debug!(id = %asset.id(), "Skipping asset with no versions");
             continue;
         }
+
+        // Resolve filename using the same logic as the sync download pipeline:
+        // fingerprint fallback → unicode removal → extension mapping.
+        let raw_filename = if let Some(f) = asset.filename() {
+            f.to_string()
+        } else {
+            let asset_type = asset
+                .versions()
+                .first()
+                .map_or("", |(_, v)| v.asset_type.as_ref());
+            download::paths::generate_fingerprint_filename(asset.id(), asset_type)
+        };
+        let base_filename = if keep_unicode {
+            raw_filename
+        } else {
+            download::paths::remove_unicode_chars(&raw_filename)
+        };
 
         // Get the created date in local time for path computation
         let created_local = asset.created().with_timezone(&Local);
@@ -732,9 +762,12 @@ async fn run_import_existing(
         // Check each version (we only check "original" for import since that's
         // what the normal sync would download)
         if let Some(version) = asset.get_version(AssetVersionSize::Original) {
+            // Map extension from UTI type, matching sync pipeline
+            let filename =
+                download::paths::map_filename_extension(&base_filename, &version.asset_type);
             let expected_path = download::paths::local_download_path(
                 &directory,
-                &args.folder_structure,
+                &folder_structure,
                 &created_local,
                 &filename,
             );
