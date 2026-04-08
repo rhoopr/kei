@@ -1204,7 +1204,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // This avoids wasting a 2FA code when the user simply forgot --directory.
     let needs_directory = !config.auth_only && !config.list_albums && !config.list_libraries;
     if needs_directory && config.directory.as_os_str().is_empty() {
-        anyhow::bail!("--directory is required for downloading");
+        anyhow::bail!(
+            "--directory is required for downloading \
+             (pass --directory on the CLI or set [download] directory in the config file)"
+        );
     }
 
     let cred_store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
@@ -1356,7 +1359,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     }
 
     if config.directory.as_os_str().is_empty() {
-        anyhow::bail!("--directory is required for downloading");
+        anyhow::bail!(
+            "--directory is required for downloading \
+             (pass --directory on the CLI or set [download] directory in the config file)"
+        );
     }
 
     // Validate download directory is writable before spending time on enumeration

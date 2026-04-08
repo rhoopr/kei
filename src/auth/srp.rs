@@ -340,9 +340,15 @@ pub async fn authenticate_srp(
         return Err(AuthError::FailedLogin("Failed to initiate SRP authentication".into()).into());
     }
     if !response.is_success() && response.status != 409 {
+        let text = response.text();
+        let message = if text.contains('<') {
+            format!("HTTP {} from Apple auth service", response.status)
+        } else {
+            text
+        };
         return Err(AuthError::ApiError {
             code: response.status,
-            message: response.text(),
+            message,
         }
         .into());
     }
@@ -462,12 +468,30 @@ pub async fn authenticate_srp(
             }
             .into());
         }
-    } else if response.is_client_error() || response.is_server_error() {
+    } else if response.is_server_error() {
+        let status = response.status;
+        let body = response.text();
+        let detail = if body.contains('<') {
+            // HTML error page — show just the status code
+            String::new()
+        } else {
+            format!(": {body}")
+        };
         return Err(AuthError::FailedLogin(format!(
-            "Invalid email/password combination: {}",
-            response.text()
+            "Apple returned HTTP {status}{detail} — this is usually a temporary \
+             Apple server issue, try again in a few minutes"
         ))
         .into());
+    } else if response.is_client_error() {
+        let body = response.text();
+        let detail = if body.contains('<') {
+            String::new()
+        } else {
+            format!(": {body}")
+        };
+        return Err(
+            AuthError::FailedLogin(format!("Invalid email/password combination{detail}")).into(),
+        );
     }
 
     Ok(())

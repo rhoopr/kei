@@ -327,6 +327,21 @@ impl Config {
             anyhow::ensure!(!pw.is_empty(), "password must not be empty");
         }
 
+        // Reject multiple password sources in TOML (CLI enforces this via
+        // conflicts_with, but TOML has no such mechanism).
+        if let Some(toml_a) = toml_auth {
+            let sources = [
+                toml_a.password.is_some(),
+                toml_a.password_file.is_some(),
+                toml_a.password_command.is_some(),
+            ];
+            anyhow::ensure!(
+                sources.iter().filter(|&&s| s).count() <= 1,
+                "config file sets multiple password sources (password, password_file, \
+                 password_command) — pick one"
+            );
+        }
+
         // Convert plain password string to SecretString
         let password = password_str.map(SecretString::from);
 
@@ -437,6 +452,9 @@ impl Config {
             toml_filters.and_then(|f| f.skip_live_photos),
         );
         let recent = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
+        if let Some(0) = recent {
+            anyhow::bail!("recent must be >= 1 (got 0)");
+        }
         let skip_created_before_str = sync
             .skip_created_before
             .or_else(|| toml_filters.and_then(|f| f.skip_created_before.clone()));
