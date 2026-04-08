@@ -74,7 +74,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
         match migrate_to_version(conn, version) {
             Ok(()) => conn.execute_batch("RELEASE migration")?,
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK TO migration");
+                if let Err(rollback_err) = conn.execute_batch("ROLLBACK TO migration") {
+                    tracing::error!(
+                        version,
+                        migration_error = %e,
+                        rollback_error = %rollback_err,
+                        "Migration rollback failed — database may be inconsistent"
+                    );
+                }
                 return Err(e);
             }
         }

@@ -2762,8 +2762,8 @@ mod tests {
 
     #[test]
     fn test_filter_uses_fingerprint_fallback_without_filename() {
-        // Asset ID with special chars proves fingerprint sanitization ran:
-        // "AB/CD+EF==GH" → "AB_CD_EF__GH" (non-alphanumeric replaced with _)
+        // Asset ID with special chars uses SHA-256 hash for collision resistance:
+        // SHA-256("AB/CD+EF==GH") → "c492ec6c51ec..."
         let asset = PhotoAsset::new(
             json!({"recordName": "AB/CD+EF==GH", "fields": {
                 "itemType": {"value": "public.jpeg"},
@@ -2783,8 +2783,8 @@ mod tests {
             tasks[0]
                 .download_path
                 .to_string_lossy()
-                .contains("AB_CD_EF__GH.JPG"),
-            "Expected fingerprint fallback filename, got: {:?}",
+                .contains("c492ec6c51ec.JPG"),
+            "Expected fingerprint hash fallback filename, got: {:?}",
             tasks[0].download_path
         );
     }
@@ -4723,11 +4723,11 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        // Fingerprint path: asset ID chars sanitized, up to 12 chars
-        // "NOFN_ASSET1" → "NOFN_ASSET1" (all valid, 11 chars < 12 limit)
+        // Fingerprint path: SHA-256 hash of asset ID, first 12 hex chars
+        // SHA-256("NOFN_ASSET1") → "aab85e8020e4..."
         assert!(
-            filename.contains("NOFN_ASSET1"),
-            "Missing filename should use fingerprint from asset ID, got: {filename}"
+            filename.contains("aab85e8020e4"),
+            "Missing filename should use fingerprint hash of asset ID, got: {filename}"
         );
         assert!(
             filename.ends_with(".JPG"),

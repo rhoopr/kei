@@ -341,15 +341,14 @@ pub(crate) fn item_type_extension(asset_type: &str) -> &'static str {
 
 /// Generate a fallback filename from the asset ID when `filenameEnc` is absent.
 ///
-/// Replaces non-alphanumeric characters with underscores and truncates to 12 chars,
-/// then appends the extension derived from the asset's UTI type.
-/// Matches Python's `generate_fingerprint_filename()`.
+/// Uses a SHA-256 hash of the full asset ID (first 12 hex chars = 48 bits)
+/// for collision resistance, instead of just taking the first 12 alphanumeric
+/// characters which can collide when IDs differ only in non-alphanumeric
+/// positions.
 pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String {
-    let fingerprint: String = asset_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .take(12)
-        .collect();
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(asset_id.as_bytes());
+    let fingerprint = &format!("{hash:x}")[..12];
     let ext = item_type_extension(asset_type);
     format!("{fingerprint}.{ext}")
 }
@@ -717,18 +716,18 @@ mod tests {
 
     #[test]
     fn test_generate_fingerprint_filename() {
-        // Matches Python: re.sub("[^0-9a-zA-Z]", "_", asset_id)[0:12]
+        // SHA-256 based: first 12 hex chars of hash(asset_id)
         assert_eq!(
             generate_fingerprint_filename("CCPO9c3V/MTwWZJ9bw==", "public.jpeg"),
-            "CCPO9c3V_MTw.JPG"
+            "8b2ee97b47e6.JPG"
         );
         assert_eq!(
             generate_fingerprint_filename("ABC", "public.heic"),
-            "ABC.HEIC"
+            "b5d4045c3f46.HEIC"
         );
         assert_eq!(
             generate_fingerprint_filename("a/b+c=d!e@f#g$h%i", "public.png"),
-            "a_b_c_d_e_f_.PNG"
+            "bed2f1035094.PNG"
         );
     }
 
@@ -895,7 +894,7 @@ mod tests {
     fn test_generate_fingerprint_filename_unknown_type() {
         assert_eq!(
             generate_fingerprint_filename("asset123", "some.unknown.type"),
-            "asset123.unknown"
+            "01d6235dcbf6.unknown"
         );
     }
 
@@ -1061,7 +1060,7 @@ mod tests {
     #[test]
     fn test_generate_fingerprint_filename_empty_id() {
         let result = generate_fingerprint_filename("", "public.jpeg");
-        assert_eq!(result, ".JPG");
+        assert_eq!(result, "e3b0c44298fc.JPG");
     }
 
     #[test]

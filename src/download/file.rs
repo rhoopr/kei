@@ -207,9 +207,12 @@ async fn attempt_download<C: DownloadClient>(
 
     // Reject HTML content-type before writing to disk. Apple's CDN sometimes
     // returns HTTP 200 with text/html for rate-limit or error pages.
+    // Delete any stale .part file so the next successful attempt starts fresh
+    // rather than appending to data from a previous (possibly different) response.
     if let Some(ct) = &response.content_type {
         let ct_lower = ct.to_ascii_lowercase();
         if ct_lower.starts_with("text/html") {
+            let _ = fs::remove_file(part_path).await;
             return Err(DownloadError::InvalidContent {
                 path: path_str,
                 reason: format!("server returned content-type: {ct}"),

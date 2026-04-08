@@ -186,11 +186,14 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
 
     // Write .env file
     let env_path = config_path.parent().unwrap_or(Path::new(".")).join(".env");
-    let env_content = format!(
-        "ICLOUD_USERNAME={}\nICLOUD_PASSWORD={}\n",
-        answers.username,
-        secrecy::ExposeSecret::expose_secret(&answers.password)
-    );
+    // Single-quote values to prevent shell expansion of special characters
+    // ($, `, !, etc.) when the file is sourced. Single quotes inside the
+    // password are escaped as '\'' (end-quote, literal quote, re-open quote).
+    let raw_pass = secrecy::ExposeSecret::expose_secret(&answers.password);
+    let escaped_user = answers.username.replace('\'', "'\\''");
+    let escaped_pass = raw_pass.replace('\'', "'\\''");
+    let env_content =
+        format!("ICLOUD_USERNAME='{escaped_user}'\nICLOUD_PASSWORD='{escaped_pass}'\n",);
     std::fs::write(&env_path, &env_content)
         .with_context(|| format!("Failed to write {}", env_path.display()))?;
     #[cfg(unix)]
