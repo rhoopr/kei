@@ -149,15 +149,76 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-
-      - name: Update Homebrew formula
-        uses: mislav/bump-homebrew-formula-action@v3
+      - name: Checkout tap
+        uses: actions/checkout@v4
         with:
-          formula-name: kei
-          homebrew-tap: rhoopr/homebrew-kei
-          download-url: https://github.com/rhoopr/kei/releases/download/${{ github.ref_name }}/kei-macos-aarch64.tar.gz
-        env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: rhoopr/homebrew-kei
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update formula
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/rhoopr/kei/releases/download/${{ github.ref_name }}"
+
+          declare -A ASSETS=(
+            [macos-aarch64]="kei-macos-aarch64.tar.gz"
+            [macos-x86_64]="kei-macos-x86_64.tar.gz"
+            [linux-aarch64]="kei-linux-aarch64.tar.gz"
+            [linux-x86_64]="kei-linux-x86_64.tar.gz"
+          )
+
+          declare -A SHAS
+          for key in "${!ASSETS[@]}"; do
+            file="${ASSETS[$key]}"
+            curl -sL "$BASE/$file" -o "/tmp/$file"
+            SHAS[$key]=$(sha256sum "/tmp/$file" | cut -d' ' -f1)
+          done
+
+          cat > Formula/kei.rb << FORMULA
+          class Kei < Formula
+            desc "Photo sync engine - compact, efficient, reliable"
+            homepage "https://github.com/rhoopr/kei"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "$BASE/${ASSETS[macos-aarch64]}"
+                sha256 "${SHAS[macos-aarch64]}"
+              else
+                url "$BASE/${ASSETS[macos-x86_64]}"
+                sha256 "${SHAS[macos-x86_64]}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "$BASE/${ASSETS[linux-aarch64]}"
+                sha256 "${SHAS[linux-aarch64]}"
+              else
+                url "$BASE/${ASSETS[linux-x86_64]}"
+                sha256 "${SHAS[linux-x86_64]}"
+              end
+            end
+
+            def install
+              bin.install "kei"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/kei --version")
+              assert_match "kei", shell_output("#{bin}/kei --help")
+            end
+          end
+          FORMULA
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' Formula/kei.rb
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/kei.rb
+          git commit -m "kei ${GITHUB_REF_NAME#v}"
+          git push
