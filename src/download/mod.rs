@@ -233,7 +233,11 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     hasher.update([u8::from(config.keep_unicode_in_filenames)]);
     hasher.update(format!("{:?}", skip_created_before).as_bytes());
     hasher.update(format!("{:?}", skip_created_after).as_bytes());
-    hasher.update(format!("{:?}", config.recent).as_bytes());
+    // Note: `recent` is intentionally excluded from this enum hash.
+    // Changing --recent should not invalidate sync tokens because the
+    // incremental path already applies the recent cap post-fetch.
+    // `recent` IS included in hash_download_config (trust-state) so
+    // changing it still triggers filesystem re-verification.
     hasher.update([u8::from(config.force_size)]);
     hasher.update([u8::from(config.skip_videos)]);
     hasher.update([u8::from(config.skip_photos)]);
@@ -2524,16 +2528,13 @@ async fn download_single_task(
         None
     };
 
-    // Compute checksums of the downloaded content before EXIF modification
-    // so we have hashes that reflect the original download bytes.
-    // Both SHA-256 (for DB storage) and SHA-1 (for API verification) are
-    // computed in a single file read pass.
-    let download_checksums = if let Some(ref path) = part_path {
-        Some(file::compute_file_checksums(path).await?)
+    // Compute SHA-256 of the downloaded content before EXIF modification
+    // so we store a hash that reflects the original download bytes.
+    let download_checksum = if let Some(ref path) = part_path {
+        Some(file::compute_sha256(path).await?)
     } else {
         None
     };
-    let download_checksum = download_checksums.as_ref().map(|c| c.sha256.clone());
 
     let mut exif_ok = true;
     if let Some(part) = &part_path {
@@ -2595,42 +2596,14 @@ async fn download_single_task(
 
     tracing::debug!(path = %task.download_path.display(), "Downloaded");
 
-    // Compute checksums of the final file for local storage and verification.
-    let local_checksums = file::compute_file_checksums(&task.download_path).await?;
-    let local_checksum = local_checksums.sha256;
+    // Compute SHA-256 of the final file for local storage and verification.
+    let local_checksum = file::compute_sha256(&task.download_path).await?;
 
-    // Verify downloaded content matches the API-provided checksum.
-    // Use pre-EXIF checksums when available; for non-EXIF files the
-    // local checksums ARE the unmodified download content.
-    match file::decode_api_checksum(&task.checksum) {
-        Ok(decoded) => {
-            let computed = if decoded.is_sha1 {
-                download_checksums
-                    .as_ref()
-                    .map_or(&local_checksums.sha1, |c| &c.sha1)
-            } else {
-                download_checksum.as_deref().unwrap_or(&local_checksum)
-            };
-            if computed != decoded.hex {
-                tracing::warn!(
-                    path = %task.download_path.display(),
-                    expected = %decoded.hex,
-                    computed = %computed,
-                    algorithm = if decoded.is_sha1 { "SHA-1" } else { "SHA-256" },
-                    "API checksum mismatch (file retained — Apple's fileChecksum \
-                     may be stale)"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %task.download_path.display(),
-                api_checksum = %task.checksum,
-                error = %e,
-                "Could not decode API checksum for verification"
-            );
-        }
-    }
+    // Note: Apple's `fileChecksum` is an MMCS (MobileMe Chunked Storage)
+    // compound signature, not a SHA-1/SHA-256 content hash. It cannot be
+    // compared against a hash of the downloaded bytes.  Content integrity
+    // is verified by size matching (Content-Length + API size field) and
+    // magic-byte validation during download instead.
 
     Ok((exif_ok, local_checksum, download_checksum))
 }

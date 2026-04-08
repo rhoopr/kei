@@ -312,25 +312,16 @@ async fn attempt_download<C: DownloadClient>(
     Ok(())
 }
 
-/// SHA-256 and SHA-1 checksums computed in a single file read.
-pub(crate) struct FileChecksums {
-    pub sha256: String,
-    pub sha1: String,
-}
-
-/// Compute SHA-256 and SHA-1 of a file in a single read pass.
+/// Compute the SHA-256 hash of a file, returning a hex-encoded string.
 ///
-/// SHA-256 is stored as `local_checksum` / `download_checksum` in the DB.
-/// SHA-1 is used for post-download verification when the iCloud API returns
-/// a SHA-1 checksum (21 bytes: 0x01 prefix + 20-byte digest).
-pub(crate) async fn compute_file_checksums(path: &Path) -> anyhow::Result<FileChecksums> {
-    use sha1::Sha1;
+/// Used for `local_checksum` / `download_checksum` in the state DB and
+/// by `verify --checksums` for integrity checks.
+pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut file = std::fs::File::open(&path)?;
         let mut sha256 = Sha256::new();
-        let mut sha1 = Sha1::new();
         let mut buf = [0u8; 8192];
         loop {
             use std::io::Read;
@@ -339,39 +330,26 @@ pub(crate) async fn compute_file_checksums(path: &Path) -> anyhow::Result<FileCh
                 break;
             }
             sha256.update(&buf[..n]);
-            sha1.update(&buf[..n]);
         }
-        Ok(FileChecksums {
-            sha256: format!("{:x}", sha256.finalize()),
-            sha1: format!("{:x}", sha1.finalize()),
-        })
+        Ok(format!("{:x}", sha256.finalize()))
     })
     .await?
 }
 
-/// Compute the SHA-256 hash of a file, returning a hex-encoded string.
-///
-/// Used by `verify --checksums` to verify file integrity against stored
-/// `local_checksum` values (which are always SHA-256).
-pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
-    Ok(compute_file_checksums(path).await?.sha256)
-}
-
 /// Decoded iCloud API checksum with its hash algorithm.
+///
+/// Note: Apple's `fileChecksum` is an MMCS compound signature, not a
+/// content hash. This decoder is retained for test coverage of the
+/// base64/length classification logic.
+#[cfg(test)]
 #[derive(Debug)]
-pub(super) struct DecodedChecksum {
-    pub hex: String,
-    pub is_sha1: bool,
+struct DecodedChecksum {
+    hex: String,
+    is_sha1: bool,
 }
 
-/// Decode an iCloud API checksum (base64) to a lowercase hex string.
-///
-/// Handles four formats based on decoded byte length:
-/// - 20 bytes: raw SHA-1
-/// - 21 bytes: 0x01 prefix + 20-byte SHA-1
-/// - 32 bytes: raw SHA-256
-/// - 33 bytes: 0x01 prefix + 32-byte SHA-256
-pub(super) fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum> {
+#[cfg(test)]
+fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(base64_checksum)
         .context("Failed to decode API checksum from base64")?;
