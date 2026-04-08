@@ -98,7 +98,7 @@ pub struct SyncArgs {
     pub live_photo_size: Option<LivePhotoSize>,
 
     /// Number of recent photos to download
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub recent: Option<u32>,
 
     /// Number of concurrent download threads (default: 10)
@@ -130,7 +130,7 @@ pub struct SyncArgs {
     pub set_exif_datetime: Option<bool>,
 
     /// Do not modify local system or iCloud
-    #[arg(long)]
+    #[arg(long, conflicts_with = "watch_with_interval")]
     pub dry_run: bool,
 
     /// Run continuously, waiting N seconds between runs (minimum: 60)
@@ -166,7 +166,7 @@ pub struct SyncArgs {
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
-    #[arg(long)]
+    #[arg(long, conflicts_with = "watch_with_interval")]
     pub only_print_filenames: bool,
 
     /// Max retries per download (default: 3, 0 = no retries, max: 100)
@@ -256,7 +256,7 @@ pub struct ImportArgs {
     pub keep_unicode_in_filenames: Option<bool>,
 
     /// Number of recent photos to check
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub recent: Option<u32>,
 
     /// Disable progress bar

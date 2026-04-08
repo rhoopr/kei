@@ -518,6 +518,13 @@ impl Config {
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
 
+        if skip_videos && skip_photos && skip_live_photos {
+            tracing::warn!(
+                "All media types are being skipped (--skip-videos, --skip-photos, \
+                 --skip-live-photos) — nothing will be downloaded"
+            );
+        }
+
         Ok(Self {
             username,
             password,
