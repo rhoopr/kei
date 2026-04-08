@@ -1491,12 +1491,39 @@ async fn download_photos_incremental(
         }
 
         pre_ensure_asset_dir(&mut dir_cache, asset, config).await;
-        tasks.extend(filter_asset_to_tasks(
-            asset,
-            config,
-            &mut claimed_paths,
-            &mut dir_cache,
-        ));
+        let asset_tasks = filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache);
+
+        // Upsert state records so mark_downloaded/mark_failed can find them.
+        // Without this, the UPDATE in mark_downloaded matches 0 rows and the
+        // file ends up on disk but untracked in the state DB.
+        if let Some(db) = &config.state_db {
+            for task in &asset_tasks {
+                let media_type = determine_media_type(task.version_size, asset);
+                let record = AssetRecord::new_pending(
+                    task.asset_id.to_string(),
+                    task.version_size,
+                    task.checksum.to_string(),
+                    task.download_path
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    asset.created(),
+                    Some(asset.added_date()),
+                    task.size,
+                    media_type,
+                );
+                if let Err(e) = db.upsert_seen(&record).await {
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        error = %e,
+                        "Failed to record asset in state DB"
+                    );
+                }
+            }
+        }
+
+        tasks.extend(asset_tasks);
     }
 
     if skipped_by_state > 0 {
@@ -1549,10 +1576,11 @@ async fn download_photos_incremental(
     let succeeded = task_count - failed;
 
     tracing::info!("── Incremental Sync Summary ──");
-    if pass_result.exif_failures > 0 {
+    if pass_result.exif_failures > 0 || pass_result.state_write_failures > 0 {
         tracing::info!(
             downloaded = succeeded,
             exif_failures = pass_result.exif_failures,
+            state_write_failures = pass_result.state_write_failures,
             failed,
             total = task_count,
             "  sync results"
@@ -1576,16 +1604,17 @@ async fn download_photos_incremental(
         });
     }
 
-    let outcome = if failed > 0 || pass_result.exif_failures > 0 {
-        for task in &pass_result.failed {
-            tracing::error!(path = %task.download_path.display(), "Download failed");
-        }
-        DownloadOutcome::PartialFailure {
-            failed_count: failed + pass_result.exif_failures,
-        }
-    } else {
-        DownloadOutcome::Success
-    };
+    let outcome =
+        if failed > 0 || pass_result.exif_failures > 0 || pass_result.state_write_failures > 0 {
+            for task in &pass_result.failed {
+                tracing::error!(path = %task.download_path.display(), "Download failed");
+            }
+            DownloadOutcome::PartialFailure {
+                failed_count: failed + pass_result.exif_failures + pass_result.state_write_failures,
+            }
+        } else {
+            DownloadOutcome::Success
+        };
 
     Ok(SyncResult {
         outcome,
