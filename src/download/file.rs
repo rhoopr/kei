@@ -312,41 +312,84 @@ async fn attempt_download<C: DownloadClient>(
     Ok(())
 }
 
-/// Compute the SHA-256 hash of a file, returning a hex-encoded string.
+/// SHA-256 and SHA-1 checksums computed in a single file read.
+pub(crate) struct FileChecksums {
+    pub sha256: String,
+    pub sha1: String,
+}
+
+/// Compute SHA-256 and SHA-1 of a file in a single read pass.
 ///
-/// Used by the download pipeline to store a locally-computed checksum,
-/// and by `verify --checksums` to verify file integrity.
-pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+/// SHA-256 is stored as `local_checksum` / `download_checksum` in the DB.
+/// SHA-1 is used for post-download verification when the iCloud API returns
+/// a SHA-1 checksum (21 bytes: 0x01 prefix + 20-byte digest).
+pub(crate) async fn compute_file_checksums(path: &Path) -> anyhow::Result<FileChecksums> {
+    use sha1::Sha1;
     use sha2::{Digest, Sha256};
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut file = std::fs::File::open(&path)?;
-        let mut hasher = Sha256::new();
-        std::io::copy(&mut file, &mut hasher)?;
-        Ok(format!("{:x}", hasher.finalize()))
+        let mut sha256 = Sha256::new();
+        let mut sha1 = Sha1::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            use std::io::Read;
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            sha256.update(&buf[..n]);
+            sha1.update(&buf[..n]);
+        }
+        Ok(FileChecksums {
+            sha256: format!("{:x}", sha256.finalize()),
+            sha1: format!("{:x}", sha1.finalize()),
+        })
     })
     .await?
 }
 
+/// Compute the SHA-256 hash of a file, returning a hex-encoded string.
+///
+/// Used by `verify --checksums` to verify file integrity against stored
+/// `local_checksum` values (which are always SHA-256).
+pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+    Ok(compute_file_checksums(path).await?.sha256)
+}
+
+/// Decoded iCloud API checksum with its hash algorithm.
+#[derive(Debug)]
+pub(super) struct DecodedChecksum {
+    pub hex: String,
+    pub is_sha1: bool,
+}
+
 /// Decode an iCloud API checksum (base64) to a lowercase hex string.
 ///
-/// Handles both 32-byte raw SHA-256 and Apple's 33-byte prefixed format
-/// (0x01 prefix byte followed by 32 bytes of SHA-256).
-pub(super) fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<String> {
+/// Handles four formats based on decoded byte length:
+/// - 20 bytes: raw SHA-1
+/// - 21 bytes: 0x01 prefix + 20-byte SHA-1
+/// - 32 bytes: raw SHA-256
+/// - 33 bytes: 0x01 prefix + 32-byte SHA-256
+pub(super) fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(base64_checksum)
         .context("Failed to decode API checksum from base64")?;
-    let sha_bytes = match bytes.len() {
-        32 => &bytes[..],
-        33 => &bytes[1..],
-        other => anyhow::bail!("Unexpected API checksum length: {other} bytes (expected 32 or 33)"),
+    let (hash_bytes, is_sha1) = match bytes.len() {
+        20 => (&bytes[..], true),
+        21 => (&bytes[1..], true),
+        32 => (&bytes[..], false),
+        33 => (&bytes[1..], false),
+        other => anyhow::bail!(
+            "Unexpected API checksum length: {other} bytes (expected 20, 21, 32, or 33)"
+        ),
     };
-    let mut hex = String::with_capacity(64);
-    for b in sha_bytes {
+    let mut hex = String::with_capacity(hash_bytes.len() * 2);
+    for b in hash_bytes {
         use std::fmt::Write;
         let _ = write!(hex, "{b:02x}");
     }
-    Ok(hex)
+    Ok(DecodedChecksum { hex, is_sha1 })
 }
 
 /// Validate that downloaded content matches expected format for the file extension.
@@ -1616,21 +1659,39 @@ mod tests {
     // --- decode_api_checksum tests ---
 
     #[test]
+    fn decode_api_checksum_20_byte_raw_sha1() {
+        let base64_input = base64::engine::general_purpose::STANDARD.encode([0u8; 20]);
+        let decoded = decode_api_checksum(&base64_input).unwrap();
+        assert_eq!(decoded.hex, "0".repeat(40));
+        assert!(decoded.is_sha1);
+    }
+
+    #[test]
+    fn decode_api_checksum_21_byte_apple_sha1_prefix() {
+        let mut bytes = vec![0x01u8];
+        bytes.extend_from_slice(&[0xAB; 20]);
+        let base64_input = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let decoded = decode_api_checksum(&base64_input).unwrap();
+        assert_eq!(decoded.hex, "ab".repeat(20));
+        assert!(decoded.is_sha1);
+    }
+
+    #[test]
     fn decode_api_checksum_32_byte_raw() {
-        // 32 zero bytes, base64-encoded
         let base64_input = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
-        let hex = decode_api_checksum(&base64_input).unwrap();
-        assert_eq!(hex, "0".repeat(64));
+        let decoded = decode_api_checksum(&base64_input).unwrap();
+        assert_eq!(decoded.hex, "0".repeat(64));
+        assert!(!decoded.is_sha1);
     }
 
     #[test]
     fn decode_api_checksum_33_byte_apple_prefix() {
-        // 0x01 prefix + 32 bytes of 0xFF
         let mut bytes = vec![0x01u8];
         bytes.extend_from_slice(&[0xFF; 32]);
         let base64_input = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let hex = decode_api_checksum(&base64_input).unwrap();
-        assert_eq!(hex, "f".repeat(64));
+        let decoded = decode_api_checksum(&base64_input).unwrap();
+        assert_eq!(decoded.hex, "f".repeat(64));
+        assert!(!decoded.is_sha1);
     }
 
     #[test]
@@ -1645,7 +1706,7 @@ mod tests {
 
     #[test]
     fn decode_api_checksum_wrong_length() {
-        // 16 bytes — neither 32 nor 33
+        // 16 bytes — none of the expected lengths
         let base64_input = base64::engine::general_purpose::STANDARD.encode([0xABu8; 16]);
         let result = decode_api_checksum(&base64_input);
         assert!(result.is_err());
@@ -1656,23 +1717,48 @@ mod tests {
     }
 
     #[test]
-    fn decode_api_checksum_roundtrip_with_compute_sha256() {
-        // Verify that decode_api_checksum produces the same hex format as compute_sha256
+    fn decode_api_checksum_roundtrip_sha256() {
         use sha2::{Digest, Sha256};
         let data = b"test data for checksum roundtrip";
         let hash = Sha256::digest(data);
         let expected_hex = format!("{:x}", hash);
 
-        // Simulate Apple's base64-encoded checksum (raw 32-byte)
+        // Raw 32-byte SHA-256
         let base64_cksum = base64::engine::general_purpose::STANDARD.encode(hash.as_slice());
-        let decoded_hex = decode_api_checksum(&base64_cksum).unwrap();
-        assert_eq!(decoded_hex, expected_hex);
+        let decoded = decode_api_checksum(&base64_cksum).unwrap();
+        assert_eq!(decoded.hex, expected_hex);
+        assert!(!decoded.is_sha1);
 
-        // Also test with 33-byte Apple prefix
+        // 33-byte Apple prefix + SHA-256
         let mut prefixed = vec![0x01u8];
         prefixed.extend_from_slice(hash.as_slice());
         let base64_prefixed = base64::engine::general_purpose::STANDARD.encode(&prefixed);
-        let decoded_prefixed = decode_api_checksum(&base64_prefixed).unwrap();
-        assert_eq!(decoded_prefixed, expected_hex);
+        let decoded = decode_api_checksum(&base64_prefixed).unwrap();
+        assert_eq!(decoded.hex, expected_hex);
+        assert!(!decoded.is_sha1);
+    }
+
+    #[test]
+    fn decode_api_checksum_roundtrip_sha1() {
+        use sha1::Digest;
+        let data = b"test data for sha1 roundtrip";
+        let hash = sha1::Sha1::digest(data);
+        let expected_hex = format!("{:x}", hash);
+
+        // 21-byte Apple prefix + SHA-1 (the format seen from iCloud)
+        let mut prefixed = vec![0x01u8];
+        prefixed.extend_from_slice(hash.as_slice());
+        let base64_prefixed = base64::engine::general_purpose::STANDARD.encode(&prefixed);
+        let decoded = decode_api_checksum(&base64_prefixed).unwrap();
+        assert_eq!(decoded.hex, expected_hex);
+        assert!(decoded.is_sha1);
+    }
+
+    #[test]
+    fn decode_api_checksum_live_api_value() {
+        // Real value observed from iCloud API during live testing
+        let decoded = decode_api_checksum("AXY53EmM03WU8iZY1QgKZ79gMyMi").unwrap();
+        assert!(decoded.is_sha1);
+        assert_eq!(decoded.hex.len(), 40); // 20 bytes = 40 hex chars
     }
 }

@@ -2520,13 +2520,16 @@ async fn download_single_task(
         None
     };
 
-    // Compute SHA-256 of the downloaded content before EXIF modification
-    // so we have a checksum that reflects the original download bytes.
-    let download_checksum = if let Some(ref path) = part_path {
-        Some(file::compute_sha256(path).await?)
+    // Compute checksums of the downloaded content before EXIF modification
+    // so we have hashes that reflect the original download bytes.
+    // Both SHA-256 (for DB storage) and SHA-1 (for API verification) are
+    // computed in a single file read pass.
+    let download_checksums = if let Some(ref path) = part_path {
+        Some(file::compute_file_checksums(path).await?)
     } else {
         None
     };
+    let download_checksum = download_checksums.as_ref().map(|c| c.sha256.clone());
 
     let mut exif_ok = true;
     if let Some(part) = &part_path {
@@ -2588,21 +2591,28 @@ async fn download_single_task(
 
     tracing::debug!(path = %task.download_path.display(), "Downloaded");
 
-    // Compute SHA-256 of the final file for local verification
-    let local_checksum = file::compute_sha256(&task.download_path).await?;
+    // Compute checksums of the final file for local storage and verification.
+    let local_checksums = file::compute_file_checksums(&task.download_path).await?;
+    let local_checksum = local_checksums.sha256;
 
     // Verify downloaded content matches the API-provided checksum.
-    // Use download_checksum (pre-EXIF) when available; for non-EXIF files
-    // local_checksum IS the unmodified download content.
-    let verification_checksum = download_checksum.as_deref().unwrap_or(&local_checksum);
+    // Use pre-EXIF checksums when available; for non-EXIF files the
+    // local checksums ARE the unmodified download content.
     match file::decode_api_checksum(&task.checksum) {
-        Ok(expected_hex) => {
-            if verification_checksum != expected_hex {
+        Ok(decoded) => {
+            let computed = if decoded.is_sha1 {
+                download_checksums
+                    .as_ref()
+                    .map_or(&local_checksums.sha1, |c| &c.sha1)
+            } else {
+                download_checksum.as_deref().unwrap_or(&local_checksum)
+            };
+            if computed != decoded.hex {
                 let _ = tokio::fs::remove_file(&task.download_path).await;
                 return Err(DownloadError::ChecksumMismatch {
                     path: task.download_path.display().to_string().into(),
-                    expected: expected_hex.into(),
-                    computed: verification_checksum.to_string().into(),
+                    expected: decoded.hex.into(),
+                    computed: computed.to_string().into(),
                 }
                 .into());
             }
