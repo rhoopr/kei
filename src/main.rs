@@ -902,13 +902,11 @@ async fn run_import_existing(
         }
     }
 
-    if !args.no_progress_bar {
-        println!();
-        println!("Import complete:");
-        println!("  Total assets scanned: {total}");
-        println!("  Files matched:        {matched}");
-        println!("  Unmatched versions:   {unmatched}");
-    }
+    println!();
+    println!("Import complete:");
+    println!("  Total assets scanned: {total}");
+    println!("  Files matched:        {matched}");
+    println!("  Unmatched versions:   {unmatched}");
 
     Ok(())
 }

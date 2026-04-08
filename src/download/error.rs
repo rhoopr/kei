@@ -32,13 +32,6 @@ pub(crate) enum DownloadError {
     #[error("Invalid content for {path}: {reason}")]
     InvalidContent { path: String, reason: String },
 
-    #[error("Checksum mismatch for {path}: expected {expected}, computed {computed}")]
-    ChecksumMismatch {
-        path: Box<str>,
-        expected: Box<str>,
-        computed: Box<str>,
-    },
-
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -59,7 +52,6 @@ impl DownloadError {
             DownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
             DownloadError::ContentLengthMismatch { .. }
             | DownloadError::InvalidContent { .. }
-            | DownloadError::ChecksumMismatch { .. }
             | DownloadError::Http { .. } => true,
             DownloadError::Disk(_) | DownloadError::Other(_) => false,
         }
@@ -390,30 +382,6 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("photo.jpg"));
         assert!(msg.contains("does not match"));
-    }
-
-    #[test]
-    fn test_checksum_mismatch_retryable() {
-        let e = DownloadError::ChecksumMismatch {
-            path: "photo.heic".into(),
-            expected: "aabbcc".into(),
-            computed: "ddeeff".into(),
-        };
-        assert!(e.is_retryable());
-        assert!(!e.is_session_expired());
-    }
-
-    #[test]
-    fn display_checksum_mismatch_includes_all_fields() {
-        let e = DownloadError::ChecksumMismatch {
-            path: "photo.jpg".into(),
-            expected: "abc123".into(),
-            computed: "def456".into(),
-        };
-        let msg = e.to_string();
-        assert!(msg.contains("photo.jpg"));
-        assert!(msg.contains("abc123"));
-        assert!(msg.contains("def456"));
     }
 
     #[test]
