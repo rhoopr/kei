@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.2] - 2026-04-08
+
+### Fixed
+
+- **Live photo MOV download failures** - Content validation no longer rejects live photo MOV files served in classic QuickTime format (without `ftyp` box). Magic byte mismatches are now logged as warnings instead of errors. HTML error pages from Apple's CDN remain a hard error. ([#166])
+
+### Changed
+
+- **Credential key file renamed** - The encrypted credential key file is renamed from `.credential-key` to `.session-state`. Existing files are migrated silently.
+
+[#166]: https://github.com/rhoopr/kei/issues/166
+
 ## [0.6.1] - 2026-04-08
 
 ### Fixed
