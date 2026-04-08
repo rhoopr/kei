@@ -10,7 +10,7 @@ RUN case "$TARGETPLATFORM" in \
       "linux/arm64") \
         dpkg --add-architecture arm64 && \
         apt-get update && \
-        apt-get install -y gcc-aarch64-linux-gnu libdbus-1-dev ;; \
+        apt-get install -y gcc-aarch64-linux-gnu libdbus-1-dev:arm64 ;; \
     esac
 
 WORKDIR /build
@@ -31,6 +31,8 @@ RUN case "$TARGETPLATFORM" in \
 COPY Cargo.toml Cargo.lock ./
 RUN export TARGET=$(cat /tmp/target) && \
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
+    export PKG_CONFIG_ALLOW_CROSS=1 && \
+    export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig && \
     mkdir src && echo 'fn main() {}' > src/main.rs && \
     cargo build --release --target $TARGET && \
     rm -rf src target/$TARGET/release/deps/kei*
@@ -39,6 +41,8 @@ COPY src/ src/
 
 RUN export TARGET=$(cat /tmp/target) && \
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
+    export PKG_CONFIG_ALLOW_CROSS=1 && \
+    export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig && \
     cargo build --release --target $TARGET && \
     cp target/$TARGET/release/kei /kei
 
