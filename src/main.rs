@@ -1018,7 +1018,17 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         for line in contents.lines() {
                             if let Some((key, value)) = line.split_once('=') {
                                 let key = key.trim();
+                                // Strip surrounding single or double quotes
+                                // (the setup wizard single-quotes values to
+                                // prevent shell expansion when sourced).
                                 let value = value.trim();
+                                let value = value
+                                    .strip_prefix('\'')
+                                    .and_then(|v| v.strip_suffix('\''))
+                                    .or_else(|| {
+                                        value.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+                                    })
+                                    .unwrap_or(value);
                                 if key == "ICLOUD_USERNAME" {
                                     env_username = Some(value.to_string());
                                 } else if key == "ICLOUD_PASSWORD" {
