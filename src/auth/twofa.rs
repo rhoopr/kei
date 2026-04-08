@@ -1,17 +1,13 @@
-use std::fmt::Write as _;
 use std::io::{self, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rand::Rng;
 use reqwest::header::HeaderMap;
 use reqwest::Response;
 use serde_json::Value;
-use uuid::Uuid;
 
 use super::endpoints::Endpoints;
 use super::session::Session;
-use super::srp::{get_auth_headers, APPLE_WIDGET_KEY};
+use super::srp::get_auth_headers;
 use crate::auth::error::AuthError;
 use crate::auth::responses::AccountLoginResponse;
 
@@ -112,67 +108,51 @@ fn classify_auth_http_error(
 
 /// Trigger a push notification to trusted devices for 2FA code entry.
 ///
-/// Apple requires a POST to `/auth/bridge/step/0` to initiate the push
-/// notification flow. Without this, some accounts receive a "website login"
-/// email instead of a 2FA code on their trusted devices.
+/// Sends a PUT to `/verify/trusteddevice/securitycode` (no body), which
+/// tells Apple to push a 2FA code to the account's trusted devices.
 ///
-/// See: icloud-photos-downloader/icloud_photos_downloader#1327
+/// Apple changed this flow around iOS 26.4 — the older `bridge/step/0`
+/// POST endpoint no longer reliably triggers pushes. The PUT endpoint
+/// works across both old and new Apple auth flows.
+///
+/// See: icloud-photos-downloader/icloud_photos_downloader#1322
 pub async fn trigger_push_notification(
     session: &mut Session,
     endpoints: &Endpoints,
     client_id: &str,
     domain: &str,
 ) -> Result<()> {
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("System clock before UNIX epoch")?
-        .as_millis();
-    let session_uuid = format!("{}-{}", Uuid::new_v4(), timestamp_ms);
+    let accept_override: [(&str, &str); 1] = [("Accept", "application/json")];
+    let headers = get_auth_headers(
+        domain,
+        client_id,
+        &session.session_data,
+        Some(&accept_override),
+    )?;
 
-    let mut ptkn_bytes = [0u8; 64];
-    rand::rng().fill_bytes(&mut ptkn_bytes);
-    let mut ptkn = String::with_capacity(128);
-    for b in &ptkn_bytes {
-        write!(ptkn, "{b:02x}").expect("writing to String cannot fail");
-    }
+    let url = format!("{}/verify/trusteddevice/securitycode", endpoints.auth);
+    tracing::debug!(url = %url, "Requesting 2FA code via PUT");
 
-    let data = serde_json::json!({
-        "sessionUUID": session_uuid,
-        "ptkn": ptkn,
-    });
-
-    let overrides: [(&str, &str); 4] = [
-        ("Accept", "application/json, text/plain, */*"),
-        ("Content-type", "application/json; charset=utf-8"),
-        ("X-Apple-App-Id", APPLE_WIDGET_KEY),
-        ("X-Apple-Domain-Id", "3"),
-    ];
-    let headers = get_auth_headers(domain, client_id, &session.session_data, Some(&overrides))?;
-
-    let url = format!("{}/bridge/step/0", endpoints.auth);
-    tracing::debug!(url = %url, "Triggering push notification to trusted devices");
-
-    let body = data.to_string();
-    let response = session.post(&url, Some(&body), Some(headers)).await?;
+    let response = session.put(&url, Some(headers)).await?;
 
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Push notification failed (HTTP {status}): {text}");
-    }
-
-    // Apple can return HTTP 200 with error indicators in the body
-    let text = response.text().await.unwrap_or_default();
-    if let Ok(body) = serde_json::from_str::<Value>(&text) {
-        check_apple_service_errors(&body)?;
+        anyhow::bail!("2FA code request failed (HTTP {status}): {text}");
     }
 
     Ok(())
 }
 
-/// Check whether a string is a valid 6-digit 2FA code.
-fn is_valid_2fa_code(code: &str) -> bool {
-    code.len() == TWO_FA_CODE_LENGTH && code.chars().all(|c| c.is_ascii_digit())
+/// Strip non-digit characters and check whether the result is a valid 6-digit 2FA code.
+/// Accepts "123456", "123 456", "123-456", etc.
+fn normalize_2fa_code(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == TWO_FA_CODE_LENGTH {
+        Some(digits)
+    } else {
+        None
+    }
 }
 
 /// Submit a 6-digit 2FA code to Apple's verification endpoint.
@@ -186,13 +166,13 @@ pub async fn submit_2fa_code(
     domain: &str,
     code: &str,
 ) -> Result<bool> {
-    if !is_valid_2fa_code(code) {
+    let Some(code) = normalize_2fa_code(code) else {
         tracing::error!(
             expected_length = TWO_FA_CODE_LENGTH,
-            "Invalid 2FA code: must be exactly the specified number of digits"
+            "Invalid 2FA code: must contain exactly {TWO_FA_CODE_LENGTH} digits"
         );
         return Ok(false);
-    }
+    };
 
     let data = serde_json::json!({
         "securityCode": {
@@ -241,26 +221,19 @@ pub async fn submit_2fa_code(
     Ok(true)
 }
 
-/// Prompt the user for a 6-digit 2FA code from a trusted device, then verify it.
+/// Prompt the user for a 2FA code on stdin.
 ///
-/// Interactive wrapper around [`submit_2fa_code`] that reads from stdin.
-/// Returns `true` if verification succeeded.
-pub async fn request_2fa_code(
-    session: &mut Session,
-    endpoints: &Endpoints,
-    client_id: &str,
-    domain: &str,
-) -> Result<bool> {
-    let code = tokio::task::spawn_blocking(|| {
-        print!("Please enter the 2FA code from your trusted device: ");
+/// Returns the trimmed input. An empty string means the user pressed Enter
+/// without typing a code (i.e. they want a new code sent to their device).
+pub async fn prompt_2fa_code() -> Result<String> {
+    Ok(tokio::task::spawn_blocking(|| {
+        print!("Enter 2FA code (or press Enter to request a new code): ");
         io::stdout().flush()?;
         let mut code = String::new();
         io::stdin().read_line(&mut code)?;
         Ok::<String, io::Error>(code.trim().to_string())
     })
-    .await??;
-
-    submit_2fa_code(session, endpoints, client_id, domain, &code).await
+    .await??)
 }
 
 /// Trust the current session so the user is not prompted for 2FA again.
@@ -429,13 +402,38 @@ mod tests {
     }
 
     #[test]
-    fn test_is_valid_2fa_code_accepts_valid() {
-        assert!(is_valid_2fa_code("123456"));
+    fn test_normalize_2fa_code_plain_digits() {
+        assert_eq!(normalize_2fa_code("123456").unwrap(), "123456");
     }
 
     #[test]
-    fn test_is_valid_2fa_code_accepts_leading_zeros() {
-        assert!(is_valid_2fa_code("000000"));
+    fn test_normalize_2fa_code_with_space() {
+        assert_eq!(normalize_2fa_code("123 456").unwrap(), "123456");
+    }
+
+    #[test]
+    fn test_normalize_2fa_code_with_dash() {
+        assert_eq!(normalize_2fa_code("123-456").unwrap(), "123456");
+    }
+
+    #[test]
+    fn test_normalize_2fa_code_leading_zeros() {
+        assert_eq!(normalize_2fa_code("000000").unwrap(), "000000");
+    }
+
+    #[test]
+    fn test_normalize_2fa_code_too_short() {
+        assert!(normalize_2fa_code("12345").is_none());
+    }
+
+    #[test]
+    fn test_normalize_2fa_code_too_long() {
+        assert!(normalize_2fa_code("1234567").is_none());
+    }
+
+    #[test]
+    fn test_normalize_2fa_code_letters_rejected() {
+        assert!(normalize_2fa_code("12345a").is_none());
     }
 
     #[test]

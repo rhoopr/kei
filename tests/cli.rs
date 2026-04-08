@@ -910,9 +910,7 @@ fn exit_code_3_on_empty_password_file() {
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .code(3)
-        .stderr(predicate::str::contains(
-            "Password provider returned no data",
-        ));
+        .stderr(predicate::str::contains("No password available"));
 }
 
 /// Exit code 3 (auth failure) when password file contains only a newline.
@@ -939,9 +937,7 @@ fn exit_code_3_on_newline_only_password_file() {
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .code(3)
-        .stderr(predicate::str::contains(
-            "Password provider returned no data",
-        ));
+        .stderr(predicate::str::contains("No password available"));
 }
 
 /// Exit code 2 (clap validation error) for invalid argument values.

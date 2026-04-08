@@ -363,6 +363,18 @@ impl Session {
         Ok(response)
     }
 
+    pub async fn put(&mut self, url: &str, extra_headers: Option<HeaderMap>) -> Result<Response> {
+        let mut builder = self.client.put(url);
+        if let Some(h) = extra_headers {
+            builder = builder.headers(h);
+        }
+
+        tracing::debug!(url = %url, "PUT");
+        let response = builder.send().await?;
+        self.extract_and_save(&response).await?;
+        Ok(response)
+    }
+
     pub async fn get(&mut self, url: &str, extra_headers: Option<HeaderMap>) -> Result<Response> {
         let mut builder = self.client.get(url);
         if let Some(h) = extra_headers {

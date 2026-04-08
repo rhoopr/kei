@@ -8,6 +8,7 @@
 //! command, credential store, interactive prompt) and evaluates lazily — the
 //! password is only fetched at auth time and released immediately after.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -46,7 +47,20 @@ impl PasswordSource {
             Self::Command(cmd) => run_password_command(cmd).map(Some),
             Self::File(path) => read_password_file(path).map(Some),
             Self::Store(store) => store.retrieve(),
-            Self::Interactive => Ok(prompt_password()),
+            Self::Interactive => {
+                if !std::io::stdin().is_terminal() {
+                    anyhow::bail!(
+                        "No password configured and stdin is not a terminal. \
+                         Set a password with one of:\n  \
+                         - ICLOUD_PASSWORD environment variable\n  \
+                         - kei credential set\n  \
+                         - --password-command (external secret manager)\n  \
+                         - --password-file or Docker secret\n  \
+                         - [auth] password in config.toml"
+                    );
+                }
+                Ok(prompt_password())
+            }
         }
     }
 }

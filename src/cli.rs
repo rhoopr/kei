@@ -13,12 +13,14 @@ fn non_empty_string(s: &str) -> Result<String, String> {
     }
 }
 
-/// Validate that a string is exactly 6 ASCII digits.
+/// Strip non-digit characters and validate that the result is exactly 6 digits.
+/// Accepts "123456", "123 456", "123-456", etc.
 fn parse_2fa_code(s: &str) -> Result<String, String> {
-    if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
-        Ok(s.to_string())
+    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 6 {
+        Ok(digits)
     } else {
-        Err("must be exactly 6 digits".to_string())
+        Err("must contain exactly 6 digits".to_string())
     }
 }
 

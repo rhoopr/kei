@@ -121,8 +121,9 @@ pub async fn authenticate(
     }
 
     if data.is_none() {
-        let password = password_provider()
-            .ok_or_else(|| AuthError::FailedLogin("Password provider returned no data".into()))?;
+        let password = password_provider().ok_or_else(|| {
+            AuthError::FailedLogin("No password available (see error above for details)".into())
+        })?;
 
         tracing::debug!(apple_id = %apple_id, "Authenticating");
 
@@ -153,23 +154,63 @@ pub async fn authenticate(
             return Err(AuthError::TwoFactorRequired.into());
         }
 
-        // Interactive (TTY, no code): trigger push before prompting.
-        // Skip when code is already provided (submit-code) to avoid
-        // sending a new code that invalidates the one being submitted.
-        if code.is_none() {
+        let verified = if let Some(c) = code {
+            // Headless: code provided directly (e.g. submit-code subcommand).
+            // Do NOT trigger a push — it would invalidate the code being submitted.
+            twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, c).await?
+        } else {
+            // Interactive: prompt on stdin (terminal confirmed above).
+            // Always trigger an explicit push before prompting. SRP pushes
+            // a code for some accounts but not all — the explicit push
+            // ensures every account gets one. Apple deduplicates, so
+            // accounts that already got a code from SRP won't see a second.
             if let Err(e) =
                 twofa::trigger_push_notification(&mut session, &endpoints, &client_id, domain).await
             {
                 tracing::warn!(error = %e, "Failed to trigger push notification");
             }
-        }
 
-        let verified = if let Some(c) = code {
-            // Headless: code provided directly (e.g. submit-code subcommand)
-            twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, c).await?
-        } else {
-            // Interactive: prompt on stdin (terminal confirmed above)
-            twofa::request_2fa_code(&mut session, &endpoints, &client_id, domain).await?
+            const MAX_WRONG_CODES: u32 = 3;
+            let mut wrong_codes = 0u32;
+            let mut verified = false;
+            loop {
+                let input = twofa::prompt_2fa_code().await?;
+                if input.is_empty() {
+                    // User didn't receive a code - trigger explicit push.
+                    if let Err(e) = twofa::trigger_push_notification(
+                        &mut session,
+                        &endpoints,
+                        &client_id,
+                        domain,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "Failed to trigger push notification");
+                    }
+                    tracing::info!("Code requested - check your trusted devices");
+                    continue;
+                }
+                match twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, &input)
+                    .await?
+                {
+                    true => {
+                        verified = true;
+                        break;
+                    }
+                    false => {
+                        wrong_codes += 1;
+                        if wrong_codes >= MAX_WRONG_CODES {
+                            break;
+                        }
+                        tracing::warn!(
+                            attempt = wrong_codes,
+                            max = MAX_WRONG_CODES,
+                            "Wrong code, please try again"
+                        );
+                    }
+                }
+            }
+            verified
         };
 
         if !verified {
@@ -224,8 +265,9 @@ pub async fn send_2fa_push(
     }
 
     if data.is_none() {
-        let password = password_provider()
-            .ok_or_else(|| AuthError::FailedLogin("Password provider returned no data".into()))?;
+        let password = password_provider().ok_or_else(|| {
+            AuthError::FailedLogin("No password available (see error above for details)".into())
+        })?;
         srp::authenticate_srp(
             &mut session,
             &endpoints,
