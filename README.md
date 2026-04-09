@@ -6,25 +6,26 @@
 
 <p align="center">
   <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a>
-  <a href="https://github.com/rhoopr/kei/actions"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/ci.yml?label=build" alt="Build"></a>
+  <a href="https://github.com/rhoopr/kei/actions"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/ci.yml?branch=main&label=build" alt="Build"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
   <a href="https://github.com/rhoopr/homebrew-kei"><img src="https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew" alt="Homebrew"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
 </p>
 
----
+Fast, parallel photo sync from the cloud to local storage. Single binary, runs unattended.
 
-> [!IMPORTANT]
-> **`icloudpd-rs` is now `kei`.** We're building a universal photo sync engine. iCloud is just the first source - Google Takeout, Immich, and more are coming. Same fast downloads, same single binary, way bigger ambitions. Upgrading? Your config and cookies migrate automatically on first run.
+- **Parallel downloads** - configurable concurrency, starts downloading before enumeration completes
+- **Incremental sync** - scans large libraries in seconds via CloudKit sync tokens, only fetches what changed
+- **Resumable transfers** - partial downloads resume via HTTP Range, verified by size and content hash
+- **Single binary** - no runtime dependencies, runs on macOS, Linux, and Windows
+- **Unattended operation** - watch mode, systemd integration, headless 2FA, Docker-ready
 
-kei syncs your photos from cloud services to local storage. Single binary, small footprint, runs unattended.
-
-Right now kei supports iCloud Photos. Google Takeout, Immich, and other sources are on the roadmap.
-
-It scans large libraries in seconds using incremental sync, downloads in parallel with resumable transfers, and tracks everything in a local SQLite database so it never re-downloads what it already has.
+iCloud Photos is supported today. Google Takeout and Immich are next.
 
 > [!TIP]
 > Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) maps every flag and shows how to pick up where you left off without re-downloading.
+
+---
 
 ## Install
 
@@ -123,18 +124,15 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 
 ## Features
 
-- Parallel downloads with streaming pipeline - files start downloading before enumeration finishes
-- Incremental sync via CloudKit syncTokens - only fetches what changed
-- Resumable transfers with `.kei-tmp` partial files, size verification, and content validation
-- SQLite state tracking across runs (downloaded, failed, pending)
+- SQLite state tracking across runs - never re-downloads what it already has
 - Watch mode with configurable interval, systemd notify, PID file, graceful shutdown
 - Multi-library sync (`--library all` for personal + shared)
-- Flexible password sources: interactive prompt, env var, `--password-file`, `--password-command`, or OS keyring
+- Flexible password sources: prompt, env var, `--password-file`, `--password-command`, OS keyring
 - Date-based folder structure, live photo MOV pairing, EXIF datetime stamping
-- Multi-arch Docker images (amd64/arm64) with headless 2FA via `get-code` + `submit-code`
-- Notification scripts on events: `2fa_required`, `sync_complete`, `sync_failed`, `session_expired`
+- Multi-arch Docker images (amd64/arm64) with headless 2FA
+- Notification scripts on events (`2fa_required`, `sync_complete`, `sync_failed`, `session_expired`)
 - Content filtering: skip videos/photos/live photos, date ranges, `--recent N`
-- Adjusted video and edited live photo MOV downloads (`--size adjusted`)
+- Adjusted video and edited live photo downloads (`--size adjusted`)
 - Structured exit codes (0 success, 2 partial, 3 auth) for scripting
 - Exponential backoff retries with transient vs. permanent error classification
 - TOML config file with `setup` wizard, CLI flags override config values

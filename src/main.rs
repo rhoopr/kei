@@ -1037,7 +1037,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             (expanded, false)
         }
     };
-    let mut toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
+    // When --config is explicitly set but the file doesn't exist, allow it
+    // if the parent directory exists (auto-config will create the file).
+    // Otherwise require the file to exist so typos in --config paths error.
+    // When --config is explicit but the file doesn't exist and the parent
+    // dir does exist, allow it (auto-config will create the file).
+    let can_auto_create = !config_path.exists() && config_path.parent().is_some_and(|p| p.is_dir());
+    let config_required = config_explicitly_set && !can_auto_create;
+    let mut toml_config = config::load_toml_config(&config_path, config_required)?;
 
     // Resolve log level: CLI > TOML > default (info)
     let effective_log_level = cli
@@ -1156,7 +1163,21 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
+    let toml_existed = toml_config.is_some();
+    let cli_cookie_directory = auth.cookie_directory.clone();
     let mut config = config::Config::build(auth, sync, toml_config)?;
+
+    // On first run (no config file), persist CLI-provided values so
+    // subsequent runs don't need the same flags again. Only when the
+    // user explicitly chose a config path (--config), to avoid surprise
+    // writes at the default location during tests or one-off runs.
+    if !toml_existed && config_explicitly_set {
+        if let Err(e) =
+            config::persist_first_run_config(&config_path, &config, cli_cookie_directory.as_deref())
+        {
+            tracing::warn!(error = %e, "Failed to save first-run config");
+        }
+    }
 
     // One-shot operations — never inherit watch mode from TOML config,
     // which would cause the process to loop forever instead of exiting.

@@ -142,22 +142,31 @@ mod tests {
         notifier.notify(Event::SyncComplete, "test message", "user@example.com");
     }
 
+    /// Write a shell script to a temp dir, avoiding ETXTBSY ("Text file busy")
+    /// races on CI. Writes to a staging file first, then renames so the final
+    /// path was never opened for writing by this process.
+    #[cfg(unix)]
+    fn write_test_script(dir: &std::path::Path, name: &str, body: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staging = dir.join(format!("{name}.tmp"));
+        let final_path = dir.join(name);
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&staging).unwrap();
+            f.write_all(body).unwrap();
+            f.sync_all().unwrap();
+        }
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&staging, &final_path).unwrap();
+        final_path
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn run_script_success() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("success.sh");
-        // Open, write, and close explicitly to avoid "Text file busy" on CI
-        // (the file must be fully closed before exec).
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&script).unwrap();
-            f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
-            f.sync_all().unwrap();
-        }
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = write_test_script(dir.path(), "success.sh", b"#!/bin/sh\nexit 0\n");
 
         let status = run_script(&script, "test_event", "msg", "user")
             .await
@@ -168,17 +177,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_script_nonzero_exit() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fail.sh");
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&script).unwrap();
-            f.write_all(b"#!/bin/sh\nexit 1\n").unwrap();
-            f.sync_all().unwrap();
-        }
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = write_test_script(dir.path(), "fail.sh", b"#!/bin/sh\nexit 1\n");
 
         let status = run_script(&script, "test_event", "msg", "user")
             .await
@@ -189,24 +189,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn notify_runs_script_with_env_vars() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("test_notify.sh");
         let output_path = dir.path().join("test_notify_output.txt");
-
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&script_path).unwrap();
-            write!(
-                f,
-                "#!/bin/sh\necho \"$KEI_EVENT|$KEI_MESSAGE|$KEI_ICLOUD_USERNAME\" > {}\n",
-                output_path.display()
-            )
-            .unwrap();
-            f.sync_all().unwrap();
-        }
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body = format!(
+            "#!/bin/sh\necho \"$KEI_EVENT|$KEI_MESSAGE|$KEI_ICLOUD_USERNAME\" > {}\n",
+            output_path.display()
+        );
+        let script_path = write_test_script(dir.path(), "test_notify.sh", body.as_bytes());
 
         let notifier = Notifier::new(Some(script_path.clone()));
         notifier.notify(Event::TwoFaRequired, "Need 2FA code", "test@example.com");
