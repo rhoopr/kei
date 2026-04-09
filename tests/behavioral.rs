@@ -1740,27 +1740,16 @@ fn verify_detects_missing_file() {
 
 #[test]
 fn verify_checksums_match() {
-    use std::io::Write;
-
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
 
     let file_content = b"known content for checksum";
     let file_path = dir.path().join("checked.jpg");
-    {
-        let mut f = std::fs::File::create(&file_path).unwrap();
-        f.write_all(file_content).unwrap();
-    }
+    std::fs::write(&file_path, file_content).unwrap();
 
-    // Compute the real SHA-256 of the file content
-    use std::process::Command;
-    let sha_output = Command::new("sha256sum")
-        .arg(file_path.to_str().unwrap())
-        .output()
-        .unwrap();
-    let sha_hex = String::from_utf8_lossy(&sha_output.stdout);
-    let checksum = sha_hex.split_whitespace().next().unwrap();
+    // Pre-computed SHA-256 of b"known content for checksum"
+    let checksum = "bce5852bddb57da7abc94da047da866544b87abb1b3c36612ac0e56f5d5bd611";
 
     insert_asset(
         &conn,
