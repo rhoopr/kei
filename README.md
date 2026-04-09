@@ -14,7 +14,7 @@
 
 Fast, parallel photo sync from the cloud to local storage. Single binary, runs unattended.
 
-- **Parallel downloads** - configurable concurrency (default 10), files start downloading before enumeration finishes
+- **Parallel downloads** - configurable concurrency, starts downloading before enumeration completes
 - **Incremental sync** - scans large libraries in seconds via CloudKit sync tokens, only fetches what changed
 - **Resumable transfers** - partial downloads resume via HTTP Range, verified by size and content hash
 - **Single binary** - no runtime dependencies, runs on macOS, Linux, and Windows
