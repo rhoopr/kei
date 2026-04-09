@@ -563,12 +563,17 @@ fn dry_run_does_not_create_state_db() {
     common::with_auth_retry(|| {
         let isolated_cookies = tempfile::tempdir().expect("tempdir for isolated cookies");
 
-        // Copy session cookies from shared cookie dir so we can auth without
-        // contaminating the shared state DB.
+        // Copy session/cookie files from shared cookie dir so we can auth
+        // without contaminating the shared state DB. Skip .db files (state
+        // databases) since we're testing that dry-run doesn't create one.
         for entry in std::fs::read_dir(&cookie_dir).expect("read cookie dir") {
             let entry = entry.expect("dir entry");
             let src = entry.path();
-            if src.is_file() {
+            if src.is_file()
+                && !src
+                    .extension()
+                    .is_some_and(|ext| ext == "db" || ext == "db-wal" || ext == "db-shm")
+            {
                 let dest = isolated_cookies.path().join(entry.file_name());
                 std::fs::copy(&src, &dest).expect("copy cookie file");
             }
