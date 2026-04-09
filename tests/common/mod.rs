@@ -1,3 +1,6 @@
+// Shared test utilities -- not all functions are used by every test file.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;

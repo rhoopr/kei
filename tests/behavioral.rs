@@ -769,12 +769,12 @@ fn legacy_credential_backend_same_as_new() {
 
     let old = clean_cmd()
         .args(["credential", "backend"])
-        .args(&base)
+        .args(base)
         .output()
         .unwrap();
     let new = clean_cmd()
         .args(["password", "backend"])
-        .args(&base)
+        .args(base)
         .output()
         .unwrap();
 
@@ -970,12 +970,12 @@ fn legacy_and_new_credential_backend_same_output() {
 
     let old = clean_cmd()
         .args(["credential", "backend"])
-        .args(&args_base)
+        .args(args_base)
         .output()
         .unwrap();
     let new = clean_cmd()
         .args(["password", "backend"])
-        .args(&args_base)
+        .args(args_base)
         .output()
         .unwrap();
 
