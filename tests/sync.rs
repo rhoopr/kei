@@ -1,13 +1,11 @@
 //! Sync tests with behavioral assertions (live iCloud API).
 //!
 //! Uses the `icloudpd-test` iCloud album with known content:
-//! - GOPR0558.JPG        — regular JPEG photo
-//! - IMG_0962.MOV        — standalone video
-//! - IMG_0212.HEIC       — Live Photo (HEIC + MOV companion)
-//! - IMG_0199.DNG        — Apple ProRAW (RAW + JPEG derivative)
-//! - Café_🧠godzill.jpg  — JPEG with unicode filename
+//! - GOPR0558.JPG        -- regular JPEG photo
+//! - IMG_0962.MOV        -- standalone video
+//! - Cafe_godzill.jpg    -- JPEG with unicode filename
 //!
-//! All tests are `#[ignore]` — they require iCloud credentials and hit the
+//! All tests are `#[ignore]` -- they require iCloud credentials and hit the
 //! live Apple API. Run with:
 //!
 //! ```sh
@@ -17,6 +15,7 @@
 mod common;
 
 use predicates::prelude::*;
+use std::time::Duration;
 use tempfile::tempdir;
 
 const ALBUM: &str = "icloudpd-test";
@@ -39,7 +38,7 @@ fn album_cmd(
         username,
         "--password",
         password,
-        "--cookie-directory",
+        "--data-dir",
         cookie_dir.to_str().unwrap(),
         "--directory",
         download_dir.to_str().unwrap(),
@@ -59,17 +58,16 @@ fn list_albums_prints_album_names() {
     common::with_auth_retry(|| {
         common::cmd()
             .args([
-                "sync",
-                "--list-albums",
+                "list",
+                "albums",
                 "--username",
                 &username,
                 "--password",
                 &password,
-                "--cookie-directory",
+                "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--no-progress-bar",
             ])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_META))
+            .timeout(Duration::from_secs(TIMEOUT_META))
             .assert()
             .success()
             .stdout(predicate::str::contains("Library:"));
@@ -84,17 +82,16 @@ fn list_libraries_prints_output() {
     common::with_auth_retry(|| {
         common::cmd()
             .args([
-                "sync",
-                "--list-libraries",
+                "list",
+                "libraries",
                 "--username",
                 &username,
                 "--password",
                 &password,
-                "--cookie-directory",
+                "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--no-progress-bar",
             ])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_META))
+            .timeout(Duration::from_secs(TIMEOUT_META))
             .assert()
             .success()
             .stdout(predicate::str::contains("libraries:"));
@@ -113,14 +110,14 @@ fn sync_album_downloads_all_asset_types() {
         let download_dir = tempdir().expect("tempdir");
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
         let files = common::walkdir(download_dir.path());
         assert!(
-            files.len() >= 5,
-            "expected at least 5 files from test album, got {}",
+            files.len() >= 3,
+            "expected at least 3 files from test album, got {}",
             files.len()
         );
 
@@ -143,8 +140,6 @@ fn sync_album_downloads_all_asset_types() {
             "expected a JPEG file in: {files:?}"
         );
         assert!(has_ext("mov"), "expected a MOV file in: {files:?}");
-        assert!(has_ext("heic"), "expected a HEIC file in: {files:?}");
-        assert!(has_ext("dng"), "expected a DNG file in: {files:?}");
     });
 }
 
@@ -159,7 +154,7 @@ fn sync_dry_run_downloads_nothing() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--dry-run"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -182,7 +177,7 @@ fn sync_idempotent_second_run_noop() {
 
         // First sync
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -196,7 +191,7 @@ fn sync_idempotent_second_run_noop() {
 
         // Second sync — should be a no-op
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -231,7 +226,7 @@ fn sync_skip_videos_excludes_video_files() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--skip-videos"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -241,21 +236,11 @@ fn sync_skip_videos_excludes_video_files() {
             "should download files when skipping videos"
         );
 
-        // --skip-videos excludes standalone videos, not Live Photo MOV companions
-        let standalone_videos: Vec<_> = files
-            .iter()
-            .filter(|p| is_video_ext(p) && !file_name_contains(p, "0212"))
-            .collect();
+        // No video files should be present (album has no Live Photo MOV companions)
+        let video_files: Vec<_> = files.iter().filter(|p| is_video_ext(p)).collect();
         assert!(
-            standalone_videos.is_empty(),
-            "--skip-videos should exclude standalone video files, found: {standalone_videos:?}"
-        );
-
-        // Live Photo MOV companion (IMG_0212) should still be present
-        let live_movs = live_photo_movs(download_dir.path());
-        assert!(
-            !live_movs.is_empty(),
-            "--skip-videos should keep Live Photo MOV companions, but none found"
+            video_files.is_empty(),
+            "--skip-videos should exclude all video files, found: {video_files:?}"
         );
 
         let image_files: Vec<_> = files.iter().filter(|p| is_image_ext(p)).collect();
@@ -277,7 +262,7 @@ fn sync_skip_photos_excludes_image_files() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--skip-photos"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -296,8 +281,8 @@ fn sync_skip_photos_excludes_image_files() {
     });
 }
 
-/// --skip-live-photos should exclude Live Photo MOV companions but keep
-/// standalone videos and the Live Photo still image.
+/// --skip-live-photos flag should be accepted and sync should succeed.
+/// NOTE: test album has no Live Photos -- this only verifies the flag works.
 #[test]
 #[ignore]
 fn sync_skip_live_photos_excludes_companions() {
@@ -308,7 +293,7 @@ fn sync_skip_live_photos_excludes_companions() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--skip-live-photos"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -319,19 +304,6 @@ fn sync_skip_live_photos_excludes_companions() {
         assert!(
             standalone_video,
             "standalone video (IMG_0962) should still be downloaded"
-        );
-
-        // Live Photo MOV companion should NOT be present
-        let live_photo_mov = files.iter().any(|p| {
-            file_name_contains(p, "0212")
-                && p.extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .eq_ignore_ascii_case("mov")
-        });
-        assert!(
-            !live_photo_mov,
-            "Live Photo MOV companion should be excluded by --skip-live-photos"
         );
     });
 }
@@ -347,7 +319,7 @@ fn sync_skip_all_media_downloads_nothing() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--skip-videos", "--skip-photos", "--skip-live-photos"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -372,7 +344,7 @@ fn sync_date_filters_exclude_by_creation_date() {
             let dir = tempdir().expect("tempdir");
             album_cmd(&username, &password, &cookie_dir, dir.path())
                 .args(["--skip-created-before", "2099-01-01"])
-                .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+                .timeout(Duration::from_secs(TIMEOUT_SECS))
                 .assert()
                 .success();
             let files = common::walkdir(dir.path());
@@ -387,7 +359,7 @@ fn sync_date_filters_exclude_by_creation_date() {
             let dir = tempdir().expect("tempdir");
             album_cmd(&username, &password, &cookie_dir, dir.path())
                 .args(["--skip-created-after", "2000-01-01"])
-                .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+                .timeout(Duration::from_secs(TIMEOUT_SECS))
                 .assert()
                 .success();
             let files = common::walkdir(dir.path());
@@ -402,7 +374,7 @@ fn sync_date_filters_exclude_by_creation_date() {
             let dir = tempdir().expect("tempdir");
             album_cmd(&username, &password, &cookie_dir, dir.path())
                 .args(["--skip-created-before", "1d"])
-                .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+                .timeout(Duration::from_secs(TIMEOUT_SECS))
                 .assert()
                 .success();
         }
@@ -423,7 +395,7 @@ fn sync_size_medium_produces_smaller_files() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--size", "medium", "--skip-videos"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -461,7 +433,7 @@ fn sync_force_size_succeeds_when_available() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--size", "medium", "--force-size"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -500,7 +472,7 @@ fn sync_name_id7_appends_asset_id() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--file-match-policy", "name-id7"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -553,7 +525,7 @@ fn sync_custom_folder_structure() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--folder-structure", "%Y"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -591,7 +563,7 @@ fn sync_keep_unicode_preserves_special_chars() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--keep-unicode-in-filenames"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -626,7 +598,7 @@ fn sync_set_exif_datetime_embeds_date() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--set-exif-datetime", "--skip-videos"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -660,64 +632,28 @@ fn sync_set_exif_datetime_embeds_date() {
 
 // ── RAW alignment ───────────────────────────────────────────────────────
 
-/// --align-raw variants (as-is, original, alternative) should produce different
-/// file naming for the RAW+JPEG pair (IMG_0199.DNG).
+/// --align-raw variants should be accepted and sync should succeed.
+/// NOTE: test album has no RAW files -- this verifies the flag is accepted
+/// without errors rather than testing naming behavior.
 #[test]
 #[ignore]
 fn sync_align_raw_controls_raw_naming() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
-        let mut all_filenames: Vec<Vec<String>> = Vec::new();
-
         for variant in ["as-is", "original", "alternative"] {
             let dir = tempdir().expect("tempdir");
             album_cmd(&username, &password, &cookie_dir, dir.path())
                 .args(["--align-raw", variant])
-                .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+                .timeout(Duration::from_secs(TIMEOUT_SECS))
                 .assert()
                 .success();
 
             let files = common::walkdir(dir.path());
-
-            // DNG should be present in each variant
-            let has_dng = files.iter().any(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .eq_ignore_ascii_case("dng")
-            });
             assert!(
-                has_dng,
-                "DNG file should be present with --align-raw {variant}"
-            );
-
-            // Collect all filenames for comparison
-            let mut names: Vec<String> = files
-                .iter()
-                .map(|p| {
-                    p.strip_prefix(dir.path())
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .to_string()
-                })
-                .collect();
-            names.sort();
-            all_filenames.push(names);
-        }
-
-        // align-raw only changes behavior when the API exposes both RAW and JPEG
-        // versions for the same asset. If the ProRAW only has a DNG version (no
-        // separate JPEG derivative), all three modes produce identical output —
-        // which is correct. Just verify the flag is accepted and DNG is present
-        // (assertions above). If the API does expose both versions, at least one
-        // pair of variants should differ.
-        if all_filenames[0] == all_filenames[1] && all_filenames[1] == all_filenames[2] {
-            // Check that we at least got files (the flag didn't break anything)
-            assert!(
-                !all_filenames[0].is_empty(),
-                "align-raw should download files"
+                files.len() >= 3,
+                "--align-raw {variant} should download files, got {}",
+                files.len()
             );
         }
     });
@@ -725,49 +661,30 @@ fn sync_align_raw_controls_raw_naming() {
 
 // ── Live Photo MOV policy ───────────────────────────────────────────────
 
-/// --live-photo-mov-filename-policy suffix vs original should produce
-/// different MOV companion filenames for Live Photos.
+/// --live-photo-mov-filename-policy flag should be accepted and sync should succeed.
+/// NOTE: test album has no Live Photos -- this only verifies the flag is accepted.
+/// Re-enable naming assertions when the album is repopulated with a Live Photo.
 #[test]
 #[ignore]
 fn sync_live_photo_mov_policy_controls_naming() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
-        // Download with "suffix" policy
-        let dir_suffix = tempdir().expect("tempdir");
-        album_cmd(&username, &password, &cookie_dir, dir_suffix.path())
-            .args(["--live-photo-mov-filename-policy", "suffix"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        for policy in ["suffix", "original"] {
+            let dir = tempdir().expect("tempdir");
+            album_cmd(&username, &password, &cookie_dir, dir.path())
+                .args(["--live-photo-mov-filename-policy", policy])
+                .timeout(Duration::from_secs(TIMEOUT_SECS))
+                .assert()
+                .success();
 
-        // Download with "original" policy
-        let dir_original = tempdir().expect("tempdir");
-        album_cmd(&username, &password, &cookie_dir, dir_original.path())
-            .args(["--live-photo-mov-filename-policy", "original"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
-
-        // Find Live Photo MOV files (containing "0212" — the Live Photo asset)
-        let suffix_movs = live_photo_movs(dir_suffix.path());
-        let original_movs = live_photo_movs(dir_original.path());
-
-        assert!(
-            !suffix_movs.is_empty(),
-            "Live Photo MOV should be present with suffix policy"
-        );
-        assert!(
-            !original_movs.is_empty(),
-            "Live Photo MOV should be present with original policy"
-        );
-
-        // The two policies should produce different MOV filenames
-        assert_ne!(
-            suffix_movs, original_movs,
-            "suffix and original policies should produce different MOV names: \
-             suffix={suffix_movs:?}, original={original_movs:?}"
-        );
+            let files = common::walkdir(dir.path());
+            assert!(
+                files.len() >= 3,
+                "--live-photo-mov-filename-policy {policy} should download files, got {}",
+                files.len()
+            );
+        }
     });
 }
 
@@ -784,7 +701,7 @@ fn sync_temp_suffix_leaves_no_remnants() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--temp-suffix", ".downloading"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -815,7 +732,7 @@ fn sync_threads_num_reflected_in_log() {
 
         let assertion = album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--threads-num", "1"])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -853,7 +770,7 @@ fn sync_notification_script_fires_event() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--notification-script", script_path.to_str().unwrap()])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -883,7 +800,7 @@ fn sync_pid_file_cleaned_up_after_sync() {
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--pid-file", pid_file.to_str().unwrap()])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
@@ -920,20 +837,20 @@ fn sync_bare_invocation_works_like_sync() {
                 &username,
                 "--password",
                 &password,
-                "--cookie-directory",
+                "--data-dir",
                 cookie_dir.to_str().unwrap(),
                 "--directory",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
                 "--no-incremental",
             ])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
         let files = common::walkdir(download_dir.path());
         assert!(
-            files.len() >= 5,
+            files.len() >= 3,
             "bare invocation should download all test album files, got {}",
             files.len()
         );
@@ -958,11 +875,11 @@ fn sync_without_directory_fails() {
             &username,
             "--password",
             &password,
-            "--cookie-directory",
+            "--data-dir",
             cookie_dir.to_str().unwrap(),
             "--no-progress-bar",
         ])
-        .timeout(std::time::Duration::from_secs(TIMEOUT_META))
+        .timeout(Duration::from_secs(TIMEOUT_META))
         .assert()
         .failure()
         .stderr(predicate::str::contains("directory").or(predicate::str::contains("--directory")));
@@ -987,13 +904,13 @@ fn sync_nonexistent_album_fails() {
                 &username,
                 "--password",
                 &password,
-                "--cookie-directory",
+                "--data-dir",
                 cookie_dir.to_str().unwrap(),
                 "--directory",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
             ])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_META))
+            .timeout(Duration::from_secs(TIMEOUT_META))
             .assert()
             .failure()
             .stderr(predicate::str::contains("not found"));
@@ -1017,13 +934,13 @@ fn sync_nonexistent_library_fails() {
                 &username,
                 "--password",
                 &password,
-                "--cookie-directory",
+                "--data-dir",
                 cookie_dir.to_str().unwrap(),
                 "--directory",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
             ])
-            .timeout(std::time::Duration::from_secs(TIMEOUT_META))
+            .timeout(Duration::from_secs(TIMEOUT_META))
             .assert()
             .failure()
             .stderr(
@@ -1034,7 +951,131 @@ fn sync_nonexistent_library_fails() {
     });
 }
 
-// ── Bad credentials (LAST — hits auth from scratch, burns rate limit) ───
+// ── New subcommand tests ───────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn login_authenticates_successfully() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        common::cmd()
+            .args([
+                "login",
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+            ])
+            .timeout(Duration::from_secs(60))
+            .assert()
+            .success();
+    });
+}
+
+#[test]
+#[ignore]
+fn list_albums_new_syntax() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        common::cmd()
+            .args([
+                "list",
+                "albums",
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+            ])
+            .timeout(Duration::from_secs(60))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("icloudpd-test"));
+    });
+}
+
+#[test]
+#[ignore]
+fn sync_retry_failed_flag() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        // sync --retry-failed with no prior failures should succeed (noop)
+        common::cmd()
+            .args([
+                "sync",
+                "--retry-failed",
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+                "--directory",
+                download_dir.path().to_str().unwrap(),
+                "--no-progress-bar",
+            ])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+    });
+}
+
+#[test]
+#[ignore]
+fn sync_incremental_second_run_skips_download() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        // First sync: full enumeration
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let first_count = common::walkdir(download_dir.path()).len();
+        assert!(first_count >= 3, "first sync should download files");
+
+        // Second sync: incremental (no --no-incremental)
+        let output = common::cmd()
+            .args([
+                "sync",
+                "--album",
+                ALBUM,
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+                "--directory",
+                download_dir.path().to_str().unwrap(),
+                "--no-progress-bar",
+            ])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Second run should use incremental sync
+        assert!(
+            stderr.contains("incremental") || stderr.contains("Stored sync token"),
+            "second run should be incremental, stderr: {stderr}"
+        );
+    });
+}
+
+// ── Bad credentials (LAST -- hits auth from scratch, burns rate limit) ──
 
 #[test]
 #[ignore]
@@ -1051,13 +1092,13 @@ fn zz_bad_credentials_fails() {
             "nonexistent-xyz@icloud.com",
             "--password",
             "wrong-password",
-            "--cookie-directory",
+            "--data-dir",
             cookie_dir.path().to_str().unwrap(),
             "--directory",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
         ])
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(Duration::from_secs(60))
         .assert()
         .failure()
         .stderr(
@@ -1122,19 +1163,4 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     result
-}
-
-/// Find Live Photo MOV filenames (files containing "0212" with .mov extension).
-fn live_photo_movs(dir: &std::path::Path) -> Vec<String> {
-    common::walkdir(dir)
-        .iter()
-        .filter(|p| {
-            file_name_contains(p, "0212")
-                && p.extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .eq_ignore_ascii_case("mov")
-        })
-        .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
-        .collect()
 }

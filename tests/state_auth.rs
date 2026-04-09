@@ -1,6 +1,6 @@
 //! State-management tests that require network credentials (live iCloud API).
 //!
-//! Exercises status, reset-state, verify, import-existing, and retry-failed
+//! Exercises status, reset state, verify, import-existing, and retry-failed
 //! against real iCloud data. All tests are `#[ignore]` — run with:
 //!
 //! ```sh
@@ -11,6 +11,8 @@ mod common;
 
 use predicates::prelude::*;
 use std::path::Path;
+use std::time::Duration;
+use tempfile::tempdir;
 
 const TIMEOUT_SYNC: u64 = 180;
 const TIMEOUT_CMD: u64 = 30;
@@ -33,7 +35,7 @@ fn sync_cmd(
         username,
         "--password",
         password,
-        "--cookie-directory",
+        "--data-dir",
         cookie_dir.to_str().unwrap(),
         "--directory",
         dir.to_str().unwrap(),
@@ -49,7 +51,7 @@ fn status_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
         "status",
         "--username",
         username,
-        "--cookie-directory",
+        "--data-dir",
         cookie_dir.to_str().unwrap(),
     ]);
     cmd
@@ -58,10 +60,11 @@ fn status_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
 fn reset_state_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
     let mut cmd = common::cmd();
     cmd.args([
-        "reset-state",
+        "reset",
+        "state",
         "--username",
         username,
-        "--cookie-directory",
+        "--data-dir",
         cookie_dir.to_str().unwrap(),
     ]);
     cmd
@@ -73,7 +76,7 @@ fn verify_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
         "verify",
         "--username",
         username,
-        "--cookie-directory",
+        "--data-dir",
         cookie_dir.to_str().unwrap(),
     ]);
     cmd
@@ -92,7 +95,7 @@ fn import_cmd(
         username,
         "--password",
         password,
-        "--cookie-directory",
+        "--data-dir",
         cookie_dir.to_str().unwrap(),
         "--directory",
         dir.to_str().unwrap(),
@@ -108,12 +111,13 @@ fn retry_failed_cmd(
 ) -> assert_cmd::Command {
     let mut cmd = common::cmd();
     cmd.args([
-        "retry-failed",
+        "sync",
+        "--retry-failed",
         "--username",
         username,
         "--password",
         password,
-        "--cookie-directory",
+        "--data-dir",
         cookie_dir.to_str().unwrap(),
         "--directory",
         dir.to_str().unwrap(),
@@ -169,7 +173,7 @@ fn status_after_sync_shows_counts() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  RESET-STATE
+//  RESET STATE
 // ══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -392,7 +396,7 @@ fn import_existing_with_nonexistent_directory_fails() {
                 &username,
                 "--password",
                 &password,
-                "--cookie-directory",
+                "--data-dir",
                 cookie_dir.to_str().unwrap(),
                 "--directory",
                 "/nonexistent/path/that/does/not/exist",
@@ -611,5 +615,100 @@ fn dry_run_does_not_create_state_db() {
             "--dry-run should not create a state DB, found: {:?}",
             db_files.iter().map(|e| e.path()).collect::<Vec<_>>()
         );
+    });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  RESET SYNC-TOKEN
+// ══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn reset_sync_token_forces_full_enumeration() {
+    let (username, password, cookie_dir) = common::require_preauth();
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+        // First sync to populate sync tokens
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+            .timeout(Duration::from_secs(TIMEOUT_SYNC))
+            .assert()
+            .success();
+
+        // Reset sync tokens
+        common::cmd()
+            .args([
+                "reset",
+                "sync-token",
+                "--username",
+                &username,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+            ])
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Cleared sync tokens"));
+
+        // Second sync should do full enumeration (no stored token)
+        let output = sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+            .timeout(Duration::from_secs(TIMEOUT_SYNC))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("full enumeration") || stderr.contains("No sync token found"),
+            "after reset, sync should do full enumeration, stderr: {stderr}"
+        );
+    });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  CONFIG SHOW
+// ══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn config_show_after_sync() {
+    let (username, _password, cookie_dir) = common::require_preauth();
+    // config show doesn't need auth, just needs username resolution
+    common::cmd()
+        .args([
+            "config",
+            "show",
+            "--username",
+            &username,
+            "--data-dir",
+            cookie_dir.to_str().unwrap(),
+        ])
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&username))
+        .stdout(predicate::str::contains("[auth]"));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  LOGIN
+// ══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn login_with_existing_session() {
+    let (username, password, cookie_dir) = common::require_preauth();
+    common::with_auth_retry(|| {
+        common::cmd()
+            .args([
+                "login",
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+            ])
+            .timeout(Duration::from_secs(60))
+            .assert()
+            .success();
     });
 }
