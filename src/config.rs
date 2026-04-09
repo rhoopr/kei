@@ -310,7 +310,7 @@ pub(crate) fn resolve_data_dir(
         return expand_tilde(d);
     }
     if let Some(d) = cookie_directory_cli {
-        tracing::warn!("--cookie-directory is deprecated, use --data-dir instead");
+        // TODO(PR 2): warn deprecated once --data-dir exists as an alternative
         return expand_tilde(d);
     }
     if let Some(d) = toml.and_then(|t| t.data_dir.as_deref()) {
@@ -320,9 +320,7 @@ pub(crate) fn resolve_data_dir(
         .and_then(|t| t.auth.as_ref())
         .and_then(|a| a.cookie_directory.as_deref())
     {
-        tracing::warn!(
-            "[auth] cookie_directory in config file is deprecated, use top-level data_dir instead"
-        );
+        // TODO(PR 2): warn deprecated once top-level data_dir is documented
         return expand_tilde(d);
     }
     // Default: parent of config file path
