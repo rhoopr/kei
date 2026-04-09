@@ -14,13 +14,15 @@
 
 ---
 
-Fast, parallel photo sync from iCloud to local storage. Single binary, runs unattended. Google Takeout and Immich are next.
+Fast, parallel photo sync from the cloud to local storage. Single binary, runs unattended.
 
 - **Parallel downloads** - configurable concurrency (default 10), files start downloading before enumeration finishes
 - **Incremental sync** - scans large libraries in seconds via CloudKit sync tokens, only fetches what changed
 - **Resumable transfers** - partial downloads resume via HTTP Range, verified by size and content hash
 - **Single binary** - no runtime dependencies, runs on macOS, Linux, and Windows
 - **Unattended operation** - watch mode, systemd integration, headless 2FA, Docker-ready
+
+iCloud Photos is supported today. Google Takeout and Immich are next.
 
 > [!TIP]
 > Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) maps every flag and shows how to pick up where you left off without re-downloading.
