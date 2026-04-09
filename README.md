@@ -59,7 +59,7 @@ cargo build --release
 The setup wizard generates a config file interactively:
 
 ```sh
-kei setup
+kei config setup
 ```
 
 This writes `~/.config/kei/config.toml`. Then just run:
@@ -76,7 +76,7 @@ kei -u you@example.com -d ~/Photos/iCloud
 
 You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after.
 
-For long-running setups (Docker, cron, systemd), use `--password-file`, `--password-command`, or `kei credential set` to avoid storing passwords in environment variables. See the [wiki](https://github.com/rhoopr/kei/wiki/Credentials) for details.
+For long-running setups (Docker, cron, systemd), use `--password-file`, `--password-command`, or `kei password set` to avoid storing passwords in environment variables. See the [wiki](https://github.com/rhoopr/kei/wiki/Credentials) for details.
 
 ## Usage
 
@@ -105,22 +105,28 @@ kei downloads on a streaming pipeline. It starts fetching files as soon as the f
 
 Downloads run with configurable concurrency (default 10). Partial downloads are saved as `.kei-tmp` files and resumed via HTTP Range headers. Every file is verified against its expected size and content-type before being committed to the download directory.
 
-State lives in a SQLite database alongside your session cookies in `~/.config/kei/`. The DB tracks what's been downloaded, what failed, and where files landed on disk. This is what makes `retry-failed`, `verify`, and `import-existing` possible.
+State lives in a SQLite database alongside your session cookies (see `--data-dir`, defaults to `~/.config/kei/`). The DB tracks what's been downloaded, what failed, and where files landed on disk. This is what makes `sync --retry-failed`, `verify`, and `import-existing` possible.
 
 ## Subcommands
 
 | Command | |
 |---|---|
 | `sync` | Download photos. Default when no subcommand is given. |
-| `setup` | Interactive config wizard. |
+| `login` | Authenticate (create/refresh session tokens). |
+| `login get-code` | Request a 2FA code from Apple. |
+| `login submit-code` | Submit a 2FA code non-interactively. |
+| `list albums` | List available albums. |
+| `list libraries` | List available libraries. |
+| `password set` | Store password in keyring or encrypted file. |
+| `password clear` | Remove stored password. |
+| `password backend` | Show which credential backend is active. |
+| `reset state` | Delete the state database and start fresh. |
+| `reset sync-token` | Clear sync tokens for full re-enumeration. |
+| `config show` | Dump resolved config as TOML. |
+| `config setup` | Interactive config wizard. |
 | `status` | Show sync stats and database summary. |
-| `verify` | Check that downloaded files exist. `--checksums` to verify SHA256. |
-| `retry-failed` | Reset failed downloads to pending and re-sync. |
-| `reset-state` | Delete the state database and start fresh. |
-| `import-existing` | Import local files into the state DB so they aren't re-downloaded. |
-| `get-code` | Request a 2FA code from Apple. Triggers a push to your trusted devices. |
-| `submit-code` | Submit a 2FA code non-interactively. For Docker and headless setups. |
-| `credential` | Manage stored passwords (OS keyring or encrypted file). `set`, `clear`, `backend`. |
+| `verify` | Check downloads exist. `--checksums` for SHA256. |
+| `import-existing` | Import local files so they aren't re-downloaded. |
 
 ## Features
 
@@ -135,7 +141,7 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 - Adjusted video and edited live photo downloads (`--size adjusted`)
 - Structured exit codes (0 success, 2 partial, 3 auth) for scripting
 - Exponential backoff retries with transient vs. permanent error classification
-- TOML config file with `setup` wizard, CLI flags override config values
+- TOML config file with `config setup` wizard, `config show` to inspect resolved values
 
 ## Docs
 

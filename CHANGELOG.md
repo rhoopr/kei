@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Subcommand hierarchy** - `login` (get-code, submit-code), `list` (albums, libraries), `password` (set, clear, backend), `reset` (state, sync-token), `config` (show, setup). Cleaner `--help` with grouped commands. ([#170])
+- **`config show`** - Dump resolved configuration as TOML with password redacted. ([#117])
+- **`reset sync-token`** - Clear stored sync tokens so the next sync does a full enumeration. ([#168])
+- **`KEI_*` environment variables** - Every CLI flag has an env var (`KEI_DIRECTORY`, `KEI_DATA_DIR`, `KEI_SIZE`, etc.). Useful for Docker. ([#118])
+- **`--data-dir`** - Global flag replacing `--cookie-directory` for session/state/credential storage.
+- **`sync --retry-failed`** - Flag on sync replacing the `retry-failed` subcommand.
+
+### Changed
+
+- **`--username`, `--domain` are now global** - Accepted on all subcommands, not just sync.
+- **Docker CMD** - Uses `--data-dir` instead of `--cookie-directory`.
+- **`password` replaces `credential`** - `kei password set|clear|backend`. Old `credential` subcommand still works as hidden alias.
+
+### Deprecated
+
+- `--cookie-directory` (use `--data-dir`)
+- `--auth-only` (use `kei login`)
+- `--list-albums` / `--list-libraries` (use `kei list albums` / `kei list libraries`)
+- `--reset-sync-token` flag on sync (use `kei reset sync-token`)
+- `--skip-live-photos` (hidden, still accepted)
+- Top-level `get-code`, `submit-code`, `credential`, `retry-failed`, `reset-state`, `reset-sync-token`, `setup` subcommands (use new grouped equivalents)
+
+All deprecated syntax continues to work and prints a one-line warning to stderr.
+
+[#117]: https://github.com/rhoopr/kei/issues/117
+[#118]: https://github.com/rhoopr/kei/issues/118
+[#168]: https://github.com/rhoopr/kei/issues/168
+[#170]: https://github.com/rhoopr/kei/pull/170
+
 ## [0.6.2] - 2026-04-08
 
 ### Fixed

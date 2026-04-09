@@ -36,13 +36,13 @@ Most flags are the same or very close. Here's the full mapping:
 | `-p, --password` | |
 | `-d, --directory` | |
 | `-a, --album` | Multiple `--album` flags supported, same as Python |
-| `-l, --list-albums` | |
+| `-l, --list-albums` | Deprecated; use `kei list albums` |
 | `--library` | Default: `PrimarySync`. Use `all` to sync every library at once |
-| `--list-libraries` | |
+| `--list-libraries` | Deprecated; use `kei list libraries` |
 | `--recent` | |
 | `--skip-videos` | |
 | `--skip-photos` | |
-| `--skip-live-photos` | |
+| `--skip-live-photos` | Hidden; still accepted |
 | `--skip-created-before` | ISO date (`2024-01-01`) or relative interval (`20d`) |
 | `--skip-created-after` | ISO date (`2024-01-01`) or relative interval (`20d`) |
 | `--set-exif-datetime` | |
@@ -55,7 +55,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--only-print-filenames` | Prints paths that would be downloaded, one per line. Doesn't download or delete. |
 | `--no-progress-bar` | |
 | `--dry-run` | |
-| `--auth-only` | |
+| `--auth-only` | Deprecated; use `kei login` |
 | `--domain` | `com` or `cn` |
 | `--watch-with-interval` | Seconds between cycles |
 | `--log-level` | `debug`, `info`, `warn`, `error` (Python had `debug`, `info`, `error`) |
@@ -66,7 +66,7 @@ Most flags are the same or very close. Here's the full mapping:
 |--------|------|-------------|
 | `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Both Python `{:%Y}` and plain `%Y` strftime syntax accepted. You can keep using the Python format. |
 | `--size original` | `--size original` | Same values, but Python allows multiple `--size` flags (not yet supported in Rust - [#14](https://github.com/rhoopr/kei/issues/14)) |
-| `--cookie-directory ~/.pyicloud` | `--cookie-directory ~/.config/kei/cookies` | Different default path and cookie format (JSON vs LWPCookieJar). Sessions aren't portable between the two. |
+| `--cookie-directory ~/.pyicloud` | `--data-dir ~/.config/kei/` | New flag name and default path. `--cookie-directory` still accepted as hidden alias. |
 | `--threads-num` (deprecated, always 1) | `--threads-num 10` | Actually works in Rust. Default: 10 parallel downloads. |
 | `--notification-script` | `--notification-script` | Same flag name, but kei passes `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars. Python only fired on 2FA expiry; kei also fires on `sync_complete`, `sync_failed`, `session_expired`. |
 
@@ -81,7 +81,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--xmp-sidecar` | Planned | [#19](https://github.com/rhoopr/kei/issues/19) |
 | `--smtp-*` (all SMTP flags) | Planned | [#31](https://github.com/rhoopr/kei/issues/31) |
 | `--use-os-locale` | Not planned | - |
-| `--password-provider` | Replaced by `--password-file`, `--password-command`, or `kei credential set` | - |
+| `--password-provider` | Replaced by `--password-file`, `--password-command`, or `kei password set` | - |
 | `--mfa-provider` | Not applicable - uses trusted device with `get-code` + `submit-code` | - |
 
 ### New in kei (no Python equivalent)
@@ -92,21 +92,25 @@ Most flags are the same or very close. Here's the full mapping:
 | `--password-file <path>` | Read password from a file. Supports Docker secrets (`/run/secrets/icloud_password`). |
 | `--password-command <cmd>` | Obtain password from a shell command (1Password, Vault, pass). |
 | `--save-password` | Persist password to OS keyring or encrypted file after successful auth. |
-| `credential set\|clear\|backend` | Manage stored credentials. See [Credentials](https://github.com/rhoopr/kei/wiki/Credentials). |
+| `password set\|clear\|backend` | Manage stored credentials. `credential` still works as hidden alias. See [Credentials](https://github.com/rhoopr/kei/wiki/Credentials). |
+| `--data-dir` | Session, state, and credential storage directory (replaces `--cookie-directory`). |
 | `--max-retries` | Retry limit per download (Python hardcoded `MAX_RETRIES = 0`) |
 | `--retry-delay` | Base delay for exponential backoff |
 | `--temp-suffix` | Suffix for partial downloads (default: `.kei-tmp`) |
 | `--no-incremental` | Force full library scan instead of syncToken delta sync. Use when you suspect the incremental state is stale, or to verify that incremental results match a full enumeration. |
-| `--reset-sync-token` | Clear stored sync tokens before syncing. Unlike `--no-incremental`, this also stores the fresh token from the full scan, so the next run resumes incremental from that point. Use after recovering from a bad state or after a long gap between syncs. |
+| `reset sync-token` | Clear stored sync tokens so the next sync does a full re-enumeration. Flag `--reset-sync-token` on sync still accepted as hidden alias. |
 | `--notify-systemd` | systemd sd_notify integration |
 | `--pid-file` | PID file for service managers |
-| `get-code` | Trigger Apple to send a 2FA code to trusted devices |
-| `submit-code <code>` | Submit 2FA code non-interactively (for Docker/headless) |
+| `login get-code` | Trigger Apple to send a 2FA code to trusted devices |
+| `login submit-code <code>` | Submit 2FA code non-interactively (for Docker/headless) |
 | `status` | Show sync status and database summary |
-| `retry-failed` | Reset failed downloads and re-sync |
-| `reset-state` | Wipe the state database |
+| `sync --retry-failed` | Reset failed downloads and re-sync |
+| `reset state` | Wipe the state database |
 | `import-existing` | Import local files into state DB |
 | `verify` | Verify downloads exist and optionally check checksums |
+| `config show` | Dump resolved config as TOML |
+| `config setup` | Interactive config wizard (was top-level `setup`) |
+| `KEI_*` env vars | Every CLI flag has an env var (`KEI_DIRECTORY`, `KEI_DATA_DIR`, `KEI_SIZE`, etc.). Useful for Docker. |
 
 ## Docker migration
 
@@ -116,7 +120,7 @@ If you're using a `icloudpd` Docker wrapper (like boredazfcuk's), here are the k
 |---------------|-------------------|
 | Multiple env vars for every setting | `ICLOUD_USERNAME`, `ICLOUD_PASSWORD`, `TZ` + optional `config.toml` |
 | Cron-based scheduling | Built-in `--watch-with-interval` (set `interval` in config) |
-| Interactive 2FA via console | `docker exec kei kei get-code` then `docker exec kei kei submit-code 123456` |
+| Interactive 2FA via console | `docker exec kei kei login get-code` then `docker exec kei kei login submit-code 123456` |
 | Various notification mechanisms | `--notification-script` with env vars |
 
 Minimal `docker-compose.yml`:
@@ -136,7 +140,7 @@ services:
       - /path/to/photos:/photos
 ```
 
-For password management, use `kei credential set` (encrypted store), Docker secrets (`--password-file /run/secrets/icloud_password`), or an external secret manager (`--password-command`). See the [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) wiki page for details. Avoid `ICLOUD_PASSWORD` in environment variables — it's visible in `docker inspect`.
+For password management, use `kei password set` (encrypted store), Docker secrets (`--password-file /run/secrets/icloud_password`), or an external secret manager (`--password-command`). See the [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) wiki page for details. Avoid `ICLOUD_PASSWORD` in environment variables - it's visible in `docker inspect`.
 
 Optional `config/config.toml`:
 
