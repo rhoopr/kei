@@ -12,8 +12,6 @@
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
 </p>
 
----
-
 Fast, parallel photo sync from the cloud to local storage. Single binary, runs unattended.
 
 - **Parallel downloads** - configurable concurrency (default 10), files start downloading before enumeration finishes
@@ -26,6 +24,8 @@ iCloud Photos is supported today. Google Takeout and Immich are next.
 
 > [!TIP]
 > Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) maps every flag and shows how to pick up where you left off without re-downloading.
+
+---
 
 ## Install
 
