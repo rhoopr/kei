@@ -807,10 +807,10 @@ pub(crate) fn persist_first_run_config(
     // This prevents surprise writes during test runs or when the user
     // hasn't established a kei config directory yet. Users who run
     // `kei setup` or manually create the directory opt into auto-config.
-    if config_path
+    let parent_dir_exists = config_path
         .parent()
-        .is_none_or(|p| !p.exists() || !p.is_dir())
-    {
+        .is_some_and(|p| p.exists() && p.is_dir());
+    if !parent_dir_exists {
         return Ok(());
     }
 
