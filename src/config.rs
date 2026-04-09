@@ -269,12 +269,25 @@ pub(crate) fn resolve_auth(
 
     let domain = resolve(auth.domain, toml_auth.and_then(|a| a.domain), Domain::Com);
 
-    let cookie_dir_str = resolve(
-        auth.cookie_directory.clone(),
-        toml_auth.and_then(|a| a.cookie_directory.clone()),
-        "~/.config/kei/cookies".to_string(),
-    );
-    let cookie_directory = expand_tilde(&cookie_dir_str);
+    // Use resolve_data_dir when an explicit source exists, otherwise
+    // preserve the legacy default (~/.config/kei/cookies) for backward
+    // compat. PR 2 will change the default to config-file parent.
+    let has_explicit_data_dir = auth.cookie_directory.is_some()
+        || toml.and_then(|t| t.data_dir.as_ref()).is_some()
+        || toml_auth
+            .and_then(|a| a.cookie_directory.as_ref())
+            .is_some();
+    let cookie_directory = if has_explicit_data_dir {
+        let default_config = expand_tilde("~/.config/kei/config.toml");
+        resolve_data_dir(
+            None,
+            auth.cookie_directory.as_deref(),
+            toml,
+            &default_config,
+        )
+    } else {
+        expand_tilde("~/.config/kei/cookies")
+    };
 
     (username, password, domain, cookie_directory)
 }
@@ -770,14 +783,15 @@ impl Config {
 
 /// Persist a minimal config file on first run.
 ///
-/// Only writes fields that have no sensible defaults and were explicitly
-/// provided on the CLI (username, directory, data-dir, domain, password-file,
-/// password-command). Never writes passwords. No-ops if a config file already
-/// exists or if `KEI_NO_AUTO_CONFIG=1` is set.
+/// Converts the resolved [`Config`] to TOML via [`Config::to_toml()`], then
+/// strips it down to only the essential no-default fields (username, directory,
+/// data-dir, domain, password-file, password-command). Passwords are never
+/// included. No-ops if a config file already exists, the parent directory
+/// doesn't exist, or `KEI_NO_AUTO_CONFIG=1` is set.
 pub(crate) fn persist_first_run_config(
     config_path: &Path,
-    auth: &crate::cli::AuthArgs,
-    sync: &crate::cli::SyncArgs,
+    config: &Config,
+    data_dir_cli: Option<&str>,
 ) -> anyhow::Result<()> {
     // Opt-out via env var
     if std::env::var("KEI_NO_AUTO_CONFIG").is_ok_and(|v| v == "1") {
@@ -800,65 +814,48 @@ pub(crate) fn persist_first_run_config(
         return Ok(());
     }
 
-    // Only write if the user provided at least one meaningful value
-    let has_username = auth.username.is_some();
-    let has_directory = sync.directory.is_some();
-    let has_cookie_dir = auth.cookie_directory.is_some();
-    let has_domain = auth.domain.is_some();
-    let has_password_file = auth.password_file.is_some();
-    let has_password_command = auth.password_command.is_some();
+    // Build a minimal TOML from the resolved config, keeping only
+    // essential fields that have no defaults.
+    let full = config.to_toml();
 
-    if !has_username
-        && !has_directory
-        && !has_cookie_dir
-        && !has_domain
-        && !has_password_file
-        && !has_password_command
-    {
-        return Ok(());
-    }
+    // Resolve which data_dir value to persist (only if explicitly provided)
+    let data_dir = data_dir_cli.map(String::from);
 
-    let toml = TomlConfig {
-        data_dir: auth.cookie_directory.clone(),
+    let minimal = TomlConfig {
+        data_dir,
         log_level: None,
-        auth: if has_username || has_domain || has_password_file || has_password_command {
-            Some(TomlAuth {
-                username: auth.username.clone(),
-                password: None,
-                password_file: auth.password_file.clone(),
-                password_command: auth.password_command.clone(),
-                domain: auth.domain,
-                cookie_directory: None, // use top-level data_dir instead
-            })
-        } else {
-            None
-        },
-        download: if has_directory {
-            Some(TomlDownload {
-                directory: sync.directory.clone(),
-                folder_structure: None,
-                threads_num: None,
-                temp_suffix: None,
-                set_exif_datetime: None,
-                no_progress_bar: None,
-                retry: None,
-            })
-        } else {
-            None
-        },
+        auth: full.auth.map(|a| TomlAuth {
+            username: a.username,
+            password: None, // never persist
+            password_file: a.password_file,
+            password_command: a.password_command,
+            domain: a.domain,
+            cookie_directory: None, // deprecated, use data_dir
+        }),
+        download: full.download.map(|d| TomlDownload {
+            directory: d.directory,
+            folder_structure: None,
+            threads_num: None,
+            temp_suffix: None,
+            set_exif_datetime: None,
+            no_progress_bar: None,
+            retry: None,
+        }),
         filters: None,
         photos: None,
         watch: None,
         notifications: None,
     };
 
-    let content = toml::to_string_pretty(&toml)
-        .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
-
-    // Ensure parent directory exists
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    // Don't write if there's nothing meaningful to persist
+    let has_content =
+        minimal.auth.is_some() || minimal.download.is_some() || minimal.data_dir.is_some();
+    if !has_content {
+        return Ok(());
     }
+
+    let content = toml::to_string_pretty(&minimal)
+        .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
 
     let output = format!("# Generated by kei on first run. Edit freely.\n\n{content}");
     std::fs::write(config_path, &output)?;
@@ -2823,27 +2820,30 @@ mod tests {
         (dir, config_path)
     }
 
-    fn test_auth_with_username(username: &str) -> AuthArgs {
-        AuthArgs {
-            username: Some(username.to_string()),
-            password: None,
-            password_file: None,
-            password_command: None,
-            save_password: false,
-            domain: None,
-            cookie_directory: None,
+    /// Build a Config with the given overrides for persist tests.
+    fn build_config_for_persist(
+        username: &str,
+        directory: Option<&str>,
+        password: Option<&str>,
+    ) -> Config {
+        let mut auth = default_auth();
+        auth.username = Some(username.to_string());
+        if let Some(pw) = password {
+            auth.password = Some(pw.to_string());
         }
+        let mut sync = default_sync();
+        if let Some(d) = directory {
+            sync.directory = Some(d.to_string());
+        }
+        Config::build(auth, sync, None).unwrap()
     }
 
     #[test]
     fn test_persist_first_run_creates_config() {
         let (dir, config_path) = persist_test_dir("creates_6a3b1c2");
+        let config = build_config_for_persist("test@example.com", Some("/photos"), None);
 
-        let auth = test_auth_with_username("test@example.com");
-        let mut sync = SyncArgs::default();
-        sync.directory = Some("/photos".to_string());
-
-        persist_first_run_config(&config_path, &auth, &sync).unwrap();
+        persist_first_run_config(&config_path, &config, None).unwrap();
 
         assert!(config_path.exists());
         let content = std::fs::read_to_string(&config_path).unwrap();
@@ -2857,11 +2857,9 @@ mod tests {
     #[test]
     fn test_persist_first_run_never_writes_password() {
         let (dir, config_path) = persist_test_dir("no_pw_7d4e2f1");
+        let config = build_config_for_persist("test@example.com", None, Some("secret123"));
 
-        let mut auth = test_auth_with_username("test@example.com");
-        auth.password = Some("secret123".to_string());
-
-        persist_first_run_config(&config_path, &auth, &SyncArgs::default()).unwrap();
+        persist_first_run_config(&config_path, &config, None).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(!content.contains("secret123"));
@@ -2872,35 +2870,13 @@ mod tests {
     #[test]
     fn test_persist_first_run_does_not_overwrite_existing() {
         let (dir, config_path) = persist_test_dir("no_overwrite_8e5f3a0");
-
         std::fs::write(&config_path, "# existing config\n").unwrap();
 
-        let auth = test_auth_with_username("new@example.com");
-        persist_first_run_config(&config_path, &auth, &SyncArgs::default()).unwrap();
+        let config = build_config_for_persist("new@example.com", None, None);
+        persist_first_run_config(&config_path, &config, None).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert_eq!(content, "# existing config\n");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_persist_first_run_noop_without_meaningful_values() {
-        let (dir, config_path) = persist_test_dir("noop_9f6a4b1");
-
-        let auth = AuthArgs {
-            username: None,
-            password: None,
-            password_file: None,
-            password_command: None,
-            save_password: false,
-            domain: None,
-            cookie_directory: None,
-        };
-
-        persist_first_run_config(&config_path, &auth, &SyncArgs::default()).unwrap();
-
-        assert!(!config_path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2910,30 +2886,24 @@ mod tests {
         let config_path = PathBuf::from("/tmp/claude/persist_noparent_0a7b5c2/sub/config.toml");
         let _ = std::fs::remove_dir_all("/tmp/claude/persist_noparent_0a7b5c2");
 
-        let auth = test_auth_with_username("test@example.com");
-        persist_first_run_config(&config_path, &auth, &SyncArgs::default()).unwrap();
+        let config = build_config_for_persist("test@example.com", None, None);
+        persist_first_run_config(&config_path, &config, None).unwrap();
 
-        // Parent dir doesn't exist, so should not create the file
         assert!(!config_path.exists());
     }
 
     #[test]
-    fn test_persist_first_run_parseable_output() {
-        let (dir, config_path) = persist_test_dir("parseable_1b8c6d3");
+    fn test_persist_first_run_with_data_dir() {
+        let (dir, config_path) = persist_test_dir("data_dir_2c9d7e4");
 
-        let auth = AuthArgs {
-            username: Some("test@example.com".to_string()),
-            password: None,
-            password_file: Some("/run/secrets/pw".to_string()),
-            password_command: None,
-            save_password: false,
-            domain: Some(crate::types::Domain::Cn),
-            cookie_directory: Some("/data".to_string()),
-        };
-        let mut sync = SyncArgs::default();
+        let mut auth = default_auth();
+        auth.password_file = Some("/run/secrets/pw".to_string());
+        auth.domain = Some(crate::types::Domain::Cn);
+        let mut sync = default_sync();
         sync.directory = Some("/photos".to_string());
+        let config = Config::build(auth, sync, None).unwrap();
 
-        persist_first_run_config(&config_path, &auth, &sync).unwrap();
+        persist_first_run_config(&config_path, &config, Some("/data")).unwrap();
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let toml_content: &str = content
@@ -2942,7 +2912,7 @@ mod tests {
         let parsed: TomlConfig = toml::from_str(toml_content).unwrap();
         assert_eq!(
             parsed.auth.as_ref().unwrap().username.as_deref(),
-            Some("test@example.com")
+            Some("u@example.com")
         );
         assert_eq!(parsed.data_dir.as_deref(), Some("/data"));
         assert_eq!(
