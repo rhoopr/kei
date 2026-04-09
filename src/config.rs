@@ -4,14 +4,15 @@ use crate::types::{
     RawTreatmentPolicy, VersionSize,
 };
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 // ── TOML config structs ─────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlConfig {
+    pub data_dir: Option<String>,
     pub log_level: Option<LogLevel>,
     pub auth: Option<TomlAuth>,
     pub download: Option<TomlDownload>,
@@ -21,13 +22,13 @@ pub(crate) struct TomlConfig {
     pub notifications: Option<TomlNotifications>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlNotifications {
     pub script: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlAuth {
     pub username: Option<String>,
@@ -38,7 +39,7 @@ pub(crate) struct TomlAuth {
     pub cookie_directory: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlDownload {
     pub directory: Option<String>,
@@ -50,14 +51,14 @@ pub(crate) struct TomlDownload {
     pub retry: Option<TomlRetry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlRetry {
     pub max_retries: Option<u32>,
     pub delay: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlFilters {
     pub library: Option<String>,
@@ -70,7 +71,7 @@ pub(crate) struct TomlFilters {
     pub skip_created_after: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlPhotos {
     pub size: Option<VersionSize>,
@@ -82,7 +83,7 @@ pub(crate) struct TomlPhotos {
     pub keep_unicode_in_filenames: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlWatch {
     pub interval: Option<u64>,
@@ -276,6 +277,46 @@ pub(crate) fn resolve_auth(
     let cookie_directory = expand_tilde(&cookie_dir_str);
 
     (username, password, domain, cookie_directory)
+}
+
+/// Resolve the data directory (sessions, state DB, credentials, health).
+///
+/// Resolution order:
+/// 1. Explicit `--data-dir` CLI flag
+/// 2. Legacy `--cookie-directory` CLI flag (deprecated, warns)
+/// 3. TOML top-level `data_dir`
+/// 4. TOML `[auth] cookie_directory` (deprecated, warns)
+/// 5. Default: parent of the resolved config file path
+pub(crate) fn resolve_data_dir(
+    data_dir_cli: Option<&str>,
+    cookie_directory_cli: Option<&str>,
+    toml: Option<&TomlConfig>,
+    config_path: &Path,
+) -> PathBuf {
+    if let Some(d) = data_dir_cli {
+        return expand_tilde(d);
+    }
+    if let Some(d) = cookie_directory_cli {
+        tracing::warn!("--cookie-directory is deprecated, use --data-dir instead");
+        return expand_tilde(d);
+    }
+    if let Some(d) = toml.and_then(|t| t.data_dir.as_deref()) {
+        return expand_tilde(d);
+    }
+    if let Some(d) = toml
+        .and_then(|t| t.auth.as_ref())
+        .and_then(|a| a.cookie_directory.as_deref())
+    {
+        tracing::warn!(
+            "[auth] cookie_directory in config file is deprecated, use top-level data_dir instead"
+        );
+        return expand_tilde(d);
+    }
+    // Default: parent of config file path
+    config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| expand_tilde("~/.config/kei"))
 }
 
 /// Resolve `password_file` from CLI + TOML.
@@ -587,6 +628,250 @@ impl Config {
             save_password,
         })
     }
+
+    /// Convert the resolved config back to a [`TomlConfig`] for serialization.
+    ///
+    /// Only includes static fields suitable for persistence. Passwords are
+    /// never included. Per-run flags (`dry_run`, `recent`, etc.) are omitted.
+    pub(crate) fn to_toml(&self) -> TomlConfig {
+        let library_str = match &self.library {
+            LibrarySelection::Single(name) if name == "PrimarySync" => None,
+            LibrarySelection::Single(name) => Some(name.clone()),
+            LibrarySelection::All => Some("all".to_string()),
+        };
+
+        TomlConfig {
+            data_dir: None,  // derived from config path, not serialized unless explicit
+            log_level: None, // only written if user explicitly set it
+            auth: Some(TomlAuth {
+                username: if self.username.is_empty() {
+                    None
+                } else {
+                    Some(self.username.clone())
+                },
+                password: None, // never persist
+                password_file: self.password_file.as_ref().map(|p| p.display().to_string()),
+                password_command: self.password_command.clone(),
+                domain: if self.domain == Domain::Com {
+                    None
+                } else {
+                    Some(self.domain)
+                },
+                cookie_directory: None, // deprecated, use data_dir
+            }),
+            download: Some(TomlDownload {
+                directory: if self.directory.as_os_str().is_empty() {
+                    None
+                } else {
+                    Some(self.directory.display().to_string())
+                },
+                folder_structure: Some(self.folder_structure.clone()),
+                threads_num: Some(self.threads_num),
+                temp_suffix: if self.temp_suffix == ".kei-tmp" {
+                    None
+                } else {
+                    Some(self.temp_suffix.clone())
+                },
+                set_exif_datetime: if self.set_exif_datetime {
+                    Some(true)
+                } else {
+                    None
+                },
+                no_progress_bar: if self.no_progress_bar {
+                    Some(true)
+                } else {
+                    None
+                },
+                retry: Some(TomlRetry {
+                    max_retries: Some(self.max_retries),
+                    delay: Some(self.retry_delay_secs),
+                }),
+            }),
+            filters: Some(TomlFilters {
+                library: library_str,
+                albums: if self.albums.is_empty() {
+                    None
+                } else {
+                    Some(self.albums.clone())
+                },
+                skip_videos: if self.skip_videos { Some(true) } else { None },
+                skip_photos: if self.skip_photos { Some(true) } else { None },
+                skip_live_photos: if self.skip_live_photos {
+                    Some(true)
+                } else {
+                    None
+                },
+                recent: None,              // per-run
+                skip_created_before: None, // per-run
+                skip_created_after: None,  // per-run
+            }),
+            photos: Some(TomlPhotos {
+                size: if self.size == VersionSize::Original {
+                    None
+                } else {
+                    Some(self.size)
+                },
+                live_photo_size: if self.live_photo_size == LivePhotoSize::Original {
+                    None
+                } else {
+                    Some(self.live_photo_size)
+                },
+                live_photo_mov_filename_policy: if self.live_photo_mov_filename_policy
+                    == LivePhotoMovFilenamePolicy::Suffix
+                {
+                    None
+                } else {
+                    Some(self.live_photo_mov_filename_policy)
+                },
+                align_raw: if self.align_raw == RawTreatmentPolicy::Unchanged {
+                    None
+                } else {
+                    Some(self.align_raw)
+                },
+                file_match_policy: if self.file_match_policy
+                    == FileMatchPolicy::NameSizeDedupWithSuffix
+                {
+                    None
+                } else {
+                    Some(self.file_match_policy)
+                },
+                force_size: if self.force_size { Some(true) } else { None },
+                keep_unicode_in_filenames: if self.keep_unicode_in_filenames {
+                    Some(true)
+                } else {
+                    None
+                },
+            }),
+            watch: if self.watch_with_interval.is_some()
+                || self.notify_systemd
+                || self.pid_file.is_some()
+            {
+                Some(TomlWatch {
+                    interval: self.watch_with_interval,
+                    notify_systemd: if self.notify_systemd {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    pid_file: self.pid_file.as_ref().map(|p| p.display().to_string()),
+                })
+            } else {
+                None
+            },
+            notifications: self
+                .notification_script
+                .as_ref()
+                .map(|s| TomlNotifications {
+                    script: Some(s.display().to_string()),
+                }),
+        }
+    }
+}
+
+/// Persist a minimal config file on first run.
+///
+/// Only writes fields that have no sensible defaults and were explicitly
+/// provided on the CLI (username, directory, data-dir, domain, password-file,
+/// password-command). Never writes passwords. No-ops if a config file already
+/// exists or if `KEI_NO_AUTO_CONFIG=1` is set.
+pub(crate) fn persist_first_run_config(
+    config_path: &Path,
+    auth: &crate::cli::AuthArgs,
+    sync: &crate::cli::SyncArgs,
+) -> anyhow::Result<()> {
+    // Opt-out via env var
+    if std::env::var("KEI_NO_AUTO_CONFIG").is_ok_and(|v| v == "1") {
+        return Ok(());
+    }
+
+    // Never overwrite an existing config
+    if config_path.exists() {
+        return Ok(());
+    }
+
+    // Only write if the config's parent directory already exists.
+    // This prevents surprise writes during test runs or when the user
+    // hasn't established a kei config directory yet. Users who run
+    // `kei setup` or manually create the directory opt into auto-config.
+    if config_path
+        .parent()
+        .is_none_or(|p| !p.exists() || !p.is_dir())
+    {
+        return Ok(());
+    }
+
+    // Only write if the user provided at least one meaningful value
+    let has_username = auth.username.is_some();
+    let has_directory = sync.directory.is_some();
+    let has_cookie_dir = auth.cookie_directory.is_some();
+    let has_domain = auth.domain.is_some();
+    let has_password_file = auth.password_file.is_some();
+    let has_password_command = auth.password_command.is_some();
+
+    if !has_username
+        && !has_directory
+        && !has_cookie_dir
+        && !has_domain
+        && !has_password_file
+        && !has_password_command
+    {
+        return Ok(());
+    }
+
+    let toml = TomlConfig {
+        data_dir: auth.cookie_directory.clone(),
+        log_level: None,
+        auth: if has_username || has_domain || has_password_file || has_password_command {
+            Some(TomlAuth {
+                username: auth.username.clone(),
+                password: None,
+                password_file: auth.password_file.clone(),
+                password_command: auth.password_command.clone(),
+                domain: auth.domain,
+                cookie_directory: None, // use top-level data_dir instead
+            })
+        } else {
+            None
+        },
+        download: if has_directory {
+            Some(TomlDownload {
+                directory: sync.directory.clone(),
+                folder_structure: None,
+                threads_num: None,
+                temp_suffix: None,
+                set_exif_datetime: None,
+                no_progress_bar: None,
+                retry: None,
+            })
+        } else {
+            None
+        },
+        filters: None,
+        photos: None,
+        watch: None,
+        notifications: None,
+    };
+
+    let content = toml::to_string_pretty(&toml)
+        .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
+
+    // Ensure parent directory exists
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let output = format!("# Generated by kei on first run. Edit freely.\n\n{content}");
+    std::fs::write(config_path, &output)?;
+
+    // Restrict permissions on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    tracing::info!(path = %config_path.display(), "Saved configuration for future runs");
+    Ok(())
 }
 
 /// Parse a human-friendly date spec into a concrete timestamp.
@@ -2360,5 +2645,319 @@ mod tests {
         let mut sync = default_sync();
         sync.folder_structure = Some("{:%Y/%m/%d}".to_string());
         assert!(Config::build(default_auth(), sync, None).is_ok());
+    }
+
+    // ── to_toml() tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_to_toml_roundtrip_preserves_username() {
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
+        let toml = cfg.to_toml();
+        assert_eq!(
+            toml.auth.as_ref().unwrap().username.as_deref(),
+            Some("u@example.com")
+        );
+    }
+
+    #[test]
+    fn test_to_toml_never_includes_password() {
+        let mut auth = default_auth();
+        auth.password = Some("secret123".to_string());
+        let cfg = Config::build(auth, default_sync(), None).unwrap();
+        let toml = cfg.to_toml();
+        assert!(toml.auth.as_ref().unwrap().password.is_none());
+    }
+
+    #[test]
+    fn test_to_toml_omits_default_values() {
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
+        let toml = cfg.to_toml();
+        // Default domain (com) should be omitted
+        assert!(toml.auth.as_ref().unwrap().domain.is_none());
+        // Default size (original) should be omitted
+        assert!(toml.photos.as_ref().unwrap().size.is_none());
+        // Default temp_suffix should be omitted
+        assert!(toml.download.as_ref().unwrap().temp_suffix.is_none());
+    }
+
+    #[test]
+    fn test_to_toml_includes_non_default_values() {
+        let mut auth = default_auth();
+        auth.domain = Some(crate::types::Domain::Cn);
+        let mut sync = default_sync();
+        sync.size = Some(crate::types::VersionSize::Medium);
+        let cfg = Config::build(auth, sync, None).unwrap();
+        let toml = cfg.to_toml();
+        assert_eq!(
+            toml.auth.as_ref().unwrap().domain,
+            Some(crate::types::Domain::Cn)
+        );
+        assert_eq!(
+            toml.photos.as_ref().unwrap().size,
+            Some(crate::types::VersionSize::Medium)
+        );
+    }
+
+    #[test]
+    fn test_to_toml_serializes_to_valid_toml() {
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
+        let toml_cfg = cfg.to_toml();
+        let serialized = toml::to_string_pretty(&toml_cfg).unwrap();
+        // Should be parseable back
+        let _parsed: TomlConfig = toml::from_str(&serialized).unwrap();
+    }
+
+    #[test]
+    fn test_to_toml_per_run_fields_omitted() {
+        let mut sync = default_sync();
+        sync.recent = Some(50);
+        sync.skip_created_before = Some("2025-01-01".to_string());
+        sync.skip_created_after = Some("2025-12-31".to_string());
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let filters = toml.filters.as_ref().unwrap();
+        assert!(filters.recent.is_none());
+        assert!(filters.skip_created_before.is_none());
+        assert!(filters.skip_created_after.is_none());
+    }
+
+    // ── resolve_data_dir() tests ────────────────────────────────────
+
+    #[test]
+    fn test_resolve_data_dir_explicit_cli() {
+        let result = resolve_data_dir(
+            Some("/explicit"),
+            None,
+            None,
+            Path::new("/config/config.toml"),
+        );
+        assert_eq!(result, PathBuf::from("/explicit"));
+    }
+
+    #[test]
+    fn test_resolve_data_dir_legacy_cookie_dir() {
+        let result = resolve_data_dir(
+            None,
+            Some("/legacy/cookies"),
+            None,
+            Path::new("/config/config.toml"),
+        );
+        assert_eq!(result, PathBuf::from("/legacy/cookies"));
+    }
+
+    #[test]
+    fn test_resolve_data_dir_toml_data_dir() {
+        let toml = TomlConfig {
+            data_dir: Some("/toml/data".to_string()),
+            log_level: None,
+            auth: None,
+            download: None,
+            filters: None,
+            photos: None,
+            watch: None,
+            notifications: None,
+        };
+        let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
+        assert_eq!(result, PathBuf::from("/toml/data"));
+    }
+
+    #[test]
+    fn test_resolve_data_dir_toml_legacy_cookie_directory() {
+        let toml = TomlConfig {
+            data_dir: None,
+            log_level: None,
+            auth: Some(TomlAuth {
+                username: None,
+                password: None,
+                password_file: None,
+                password_command: None,
+                domain: None,
+                cookie_directory: Some("/toml/cookies".to_string()),
+            }),
+            download: None,
+            filters: None,
+            photos: None,
+            watch: None,
+            notifications: None,
+        };
+        let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
+        assert_eq!(result, PathBuf::from("/toml/cookies"));
+    }
+
+    #[test]
+    fn test_resolve_data_dir_defaults_to_config_parent() {
+        let result = resolve_data_dir(None, None, None, Path::new("/config/config.toml"));
+        assert_eq!(result, PathBuf::from("/config"));
+    }
+
+    #[test]
+    fn test_resolve_data_dir_cli_takes_precedence_over_toml() {
+        let toml = TomlConfig {
+            data_dir: Some("/toml/data".to_string()),
+            log_level: None,
+            auth: None,
+            download: None,
+            filters: None,
+            photos: None,
+            watch: None,
+            notifications: None,
+        };
+        let result = resolve_data_dir(
+            Some("/cli/data"),
+            None,
+            Some(&toml),
+            Path::new("/config/config.toml"),
+        );
+        assert_eq!(result, PathBuf::from("/cli/data"));
+    }
+
+    // ── persist_first_run_config() tests ────────────────────────────
+
+    /// Create a unique temp dir for a test, returning (parent_dir, config_path).
+    /// The parent dir is created so `persist_first_run_config`'s guard passes.
+    fn persist_test_dir(id: &str) -> (PathBuf, PathBuf) {
+        let dir = PathBuf::from(format!("/tmp/claude/persist_{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        (dir, config_path)
+    }
+
+    fn test_auth_with_username(username: &str) -> AuthArgs {
+        AuthArgs {
+            username: Some(username.to_string()),
+            password: None,
+            password_file: None,
+            password_command: None,
+            save_password: false,
+            domain: None,
+            cookie_directory: None,
+        }
+    }
+
+    #[test]
+    fn test_persist_first_run_creates_config() {
+        let (dir, config_path) = persist_test_dir("creates_6a3b1c2");
+
+        let auth = test_auth_with_username("test@example.com");
+        let mut sync = SyncArgs::default();
+        sync.directory = Some("/photos".to_string());
+
+        persist_first_run_config(&config_path, &auth, &sync).unwrap();
+
+        assert!(config_path.exists());
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("test@example.com"));
+        assert!(content.contains("/photos"));
+        assert!(content.contains("Generated by kei"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_persist_first_run_never_writes_password() {
+        let (dir, config_path) = persist_test_dir("no_pw_7d4e2f1");
+
+        let mut auth = test_auth_with_username("test@example.com");
+        auth.password = Some("secret123".to_string());
+
+        persist_first_run_config(&config_path, &auth, &SyncArgs::default()).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!content.contains("secret123"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_persist_first_run_does_not_overwrite_existing() {
+        let (dir, config_path) = persist_test_dir("no_overwrite_8e5f3a0");
+
+        std::fs::write(&config_path, "# existing config\n").unwrap();
+
+        let auth = test_auth_with_username("new@example.com");
+        persist_first_run_config(&config_path, &auth, &SyncArgs::default()).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(content, "# existing config\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_persist_first_run_noop_without_meaningful_values() {
+        let (dir, config_path) = persist_test_dir("noop_9f6a4b1");
+
+        let auth = AuthArgs {
+            username: None,
+            password: None,
+            password_file: None,
+            password_command: None,
+            save_password: false,
+            domain: None,
+            cookie_directory: None,
+        };
+
+        persist_first_run_config(&config_path, &auth, &SyncArgs::default()).unwrap();
+
+        assert!(!config_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_persist_first_run_noop_without_parent_dir() {
+        let config_path = PathBuf::from("/tmp/claude/persist_noparent_0a7b5c2/sub/config.toml");
+        let _ = std::fs::remove_dir_all("/tmp/claude/persist_noparent_0a7b5c2");
+
+        let auth = test_auth_with_username("test@example.com");
+        persist_first_run_config(&config_path, &auth, &SyncArgs::default()).unwrap();
+
+        // Parent dir doesn't exist, so should not create the file
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn test_persist_first_run_parseable_output() {
+        let (dir, config_path) = persist_test_dir("parseable_1b8c6d3");
+
+        let auth = AuthArgs {
+            username: Some("test@example.com".to_string()),
+            password: None,
+            password_file: Some("/run/secrets/pw".to_string()),
+            password_command: None,
+            save_password: false,
+            domain: Some(crate::types::Domain::Cn),
+            cookie_directory: Some("/data".to_string()),
+        };
+        let mut sync = SyncArgs::default();
+        sync.directory = Some("/photos".to_string());
+
+        persist_first_run_config(&config_path, &auth, &sync).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let toml_content: &str = content
+            .strip_prefix("# Generated by kei on first run. Edit freely.\n\n")
+            .unwrap_or(&content);
+        let parsed: TomlConfig = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            parsed.auth.as_ref().unwrap().username.as_deref(),
+            Some("test@example.com")
+        );
+        assert_eq!(parsed.data_dir.as_deref(), Some("/data"));
+        assert_eq!(
+            parsed.download.as_ref().unwrap().directory.as_deref(),
+            Some("/photos")
+        );
+        assert_eq!(
+            parsed.auth.as_ref().unwrap().domain,
+            Some(crate::types::Domain::Cn)
+        );
+        assert_eq!(
+            parsed.auth.as_ref().unwrap().password_file.as_deref(),
+            Some("/run/secrets/pw")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

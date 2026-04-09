@@ -1156,7 +1156,18 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
-    let mut config = config::Config::build(auth, sync, toml_config)?;
+    let toml_existed = toml_config.is_some();
+    let mut config = config::Config::build(auth.clone(), sync.clone(), toml_config)?;
+
+    // On first run (no config file), persist CLI-provided values so
+    // subsequent runs don't need the same flags again. Only when the
+    // user explicitly chose a config path (--config), to avoid surprise
+    // writes at the default location during tests or one-off runs.
+    if !toml_existed && config_explicitly_set {
+        if let Err(e) = config::persist_first_run_config(&config_path, &auth, &sync) {
+            tracing::warn!(error = %e, "Failed to save first-run config");
+        }
+    }
 
     // One-shot operations — never inherit watch mode from TOML config,
     // which would cause the process to loop forever instead of exiting.
