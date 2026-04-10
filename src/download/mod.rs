@@ -1374,6 +1374,7 @@ async fn download_photos_full_with_token(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
+    let uses_album_token = config.folder_structure.contains("{album}");
 
     // Build token-aware streams for each album
     let mut album_counts: Vec<u64> = Vec::with_capacity(albums.len());
@@ -1385,33 +1386,109 @@ async fn download_photos_full_with_token(
         total = total.min(u64::from(recent));
     }
 
-    // Create photo_stream_with_token for each album and collect token receivers
-    let mut token_receivers = Vec::with_capacity(albums.len());
-    let streams: Vec<_> = albums
-        .iter()
-        .zip(&album_counts)
-        .map(|(album, &count)| {
+    // When {album} is in folder_structure, process each album separately so that
+    // the album name can be threaded into path expansion. Otherwise, merge all
+    // album streams for maximum download concurrency across albums.
+    let (streaming_result, token_receivers) = if uses_album_token {
+        let mut combined_result = StreamingResult {
+            downloaded: 0,
+            exif_failures: 0,
+            failed: Vec::new(),
+            auth_errors: 0,
+            state_write_failures: 0,
+            enumeration_errors: 0,
+            assets_seen: 0,
+        };
+        let mut token_receivers = Vec::with_capacity(albums.len());
+
+        for (album, &count) in albums.iter().zip(&album_counts) {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            let album_config = Arc::new(DownloadConfig {
+                album_name: Some(album.name.clone()),
+                directory: config.directory.clone(),
+                folder_structure: config.folder_structure.clone(),
+                size: config.size,
+                skip_videos: config.skip_videos,
+                skip_photos: config.skip_photos,
+                skip_created_before: config.skip_created_before,
+                skip_created_after: config.skip_created_after,
+                set_exif_datetime: config.set_exif_datetime,
+                dry_run: config.dry_run,
+                concurrent_downloads: config.concurrent_downloads,
+                recent: config.recent,
+                retry: config.retry,
+                live_photo_mode: config.live_photo_mode,
+                live_photo_size: config.live_photo_size,
+                live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
+                align_raw: config.align_raw,
+                no_progress_bar: config.no_progress_bar,
+                only_print_filenames: config.only_print_filenames,
+                file_match_policy: config.file_match_policy,
+                force_size: config.force_size,
+                keep_unicode_in_filenames: config.keep_unicode_in_filenames,
+                filename_exclude: config.filename_exclude.clone(),
+                temp_suffix: config.temp_suffix.clone(),
+                state_db: config.state_db.clone(),
+                retry_only: config.retry_only,
+                sync_mode: config.sync_mode.clone(),
+            });
+
             let (stream, token_rx) = album.photo_stream_with_token(
                 config.recent,
                 Some(count),
                 config.concurrent_downloads,
             );
             token_receivers.push(token_rx);
-            stream
-        })
-        .collect();
 
-    let combined = stream::select_all(streams);
+            let result = stream_and_download_from_stream(
+                download_client,
+                stream,
+                &album_config,
+                count,
+                shutdown_token.clone(),
+            )
+            .await?;
 
-    // Run the streaming download pipeline with the combined stream
-    let streaming_result = stream_and_download_from_stream(
-        download_client,
-        combined,
-        config,
-        total,
-        shutdown_token.clone(),
-    )
-    .await?;
+            combined_result.downloaded += result.downloaded;
+            combined_result.exif_failures += result.exif_failures;
+            combined_result.failed.extend(result.failed);
+            combined_result.auth_errors += result.auth_errors;
+            combined_result.state_write_failures += result.state_write_failures;
+            combined_result.enumeration_errors += result.enumeration_errors;
+            combined_result.assets_seen += result.assets_seen;
+        }
+
+        (combined_result, token_receivers)
+    } else {
+        let mut token_receivers = Vec::with_capacity(albums.len());
+        let streams: Vec<_> = albums
+            .iter()
+            .zip(&album_counts)
+            .map(|(album, &count)| {
+                let (stream, token_rx) = album.photo_stream_with_token(
+                    config.recent,
+                    Some(count),
+                    config.concurrent_downloads,
+                );
+                token_receivers.push(token_rx);
+                stream
+            })
+            .collect();
+
+        let combined = stream::select_all(streams);
+        let result = stream_and_download_from_stream(
+            download_client,
+            combined,
+            config,
+            total,
+            shutdown_token.clone(),
+        )
+        .await?;
+
+        (result, token_receivers)
+    };
 
     // Warn if enumeration saw significantly fewer assets than the API reported.
     // This catches silent pagination truncation, dropped pages, or API hiccups
