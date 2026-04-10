@@ -3173,7 +3173,7 @@ mod tests {
 
     #[test]
     fn test_filename_exclude_from_toml() {
-        let toml_str = "[filters]\nfilename_exclude = [\"*.AAE\", \"*.THM\"]\n";
+        let toml_str = "[filters]\nfilename_exclude = [\"*.AAE\", \"*.TMP\"]\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
@@ -3182,7 +3182,7 @@ mod tests {
             Some(toml),
         )
         .unwrap();
-        assert_eq!(cfg.filename_exclude, vec!["*.AAE", "*.THM"]);
+        assert_eq!(cfg.filename_exclude, vec!["*.AAE", "*.TMP"]);
     }
 
     #[test]
