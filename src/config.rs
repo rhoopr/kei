@@ -561,10 +561,9 @@ impl Config {
         if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after) {
             if before >= after {
                 tracing::warn!(
-                    "skip-created-before ({}) >= skip-created-after ({}) -- \
-                     no assets can match this date range",
-                    before.format("%Y-%m-%d"),
-                    after.format("%Y-%m-%d"),
+                    before = %before.format("%Y-%m-%d"),
+                    after = %after.format("%Y-%m-%d"),
+                    "skip-created-before >= skip-created-after, no assets can match",
                 );
             }
         }
@@ -933,7 +932,9 @@ pub(crate) fn persist_first_run_config(
 pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
     if let Some(days_str) = s.strip_suffix('d') {
         if let Ok(days) = days_str.parse::<u64>() {
-            return Ok(Local::now() - chrono::Duration::days(days as i64));
+            let days =
+                i64::try_from(days).map_err(|_| anyhow::anyhow!("interval '{s}' is too large"))?;
+            return Ok(Local::now() - chrono::Duration::days(days));
         }
     }
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
