@@ -70,11 +70,11 @@ pub struct SyncArgs {
     pub albums: Vec<String>,
 
     /// Album(s) to exclude from sync
-    #[arg(long = "exclude-album", env = "KEI_EXCLUDE_ALBUM", value_parser = non_empty_string)]
+    #[arg(long = "exclude-album", env = "KEI_EXCLUDE_ALBUM", value_delimiter = ',', value_parser = non_empty_string)]
     pub exclude_albums: Vec<String>,
 
     /// Exclude files matching glob pattern(s) (e.g. "*.AAE", "Screenshot*")
-    #[arg(long = "filename-exclude", env = "KEI_FILENAME_EXCLUDE", value_parser = non_empty_string)]
+    #[arg(long = "filename-exclude", env = "KEI_FILENAME_EXCLUDE", value_delimiter = ',', value_parser = non_empty_string)]
     pub filename_exclude: Vec<String>,
 
     /// Library to download (default: `PrimarySync`, use "all" for all libraries)
@@ -117,7 +117,7 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub force_size: Option<bool>,
 
-    /// Folder structure for organizing downloads
+    /// Folder structure for organizing downloads (e.g., "%Y/%m/%d", "{album}/%Y/%B", "none")
     #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
 
@@ -157,7 +157,7 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_SKIP_CREATED_BEFORE")]
     pub skip_created_before: Option<String>,
 
-    /// Skip assets created after this ISO date or interval
+    /// Skip assets created after this ISO date or interval (e.g., 2025-01-02 or 20d)
     #[arg(long, env = "KEI_SKIP_CREATED_AFTER")]
     pub skip_created_after: Option<String>,
 

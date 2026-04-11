@@ -558,6 +558,17 @@ impl Config {
             .map(parse_date_or_interval)
             .transpose()?;
 
+        if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after) {
+            if before >= after {
+                tracing::warn!(
+                    "skip-created-before ({}) >= skip-created-after ({}) -- \
+                     no assets can match this date range",
+                    before.format("%Y-%m-%d"),
+                    after.format("%Y-%m-%d"),
+                );
+            }
+        }
+
         // Photos
         let size = resolve(
             sync.size,
