@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Full strftime support in `--folder-structure`** - All standard strftime specifiers now work (`%B`, `%A`, `%j`, etc.), not just the six previously supported.
 - **Auto-config on first run** - When no config file exists, kei creates a minimal `~/.config/kei/config.toml` from CLI arguments. Opt out with `KEI_NO_AUTO_CONFIG=1`.
 
+### Fixed
+
+- **421 Misdirected Request recovery** - When Apple migrates an account to a different CloudKit partition, the cached service URL stops working (HTTP 421). kei now performs a full SRP re-authentication to obtain fresh service URLs, recovering automatically. Previously, recovery attempted token validation which returned the same stale URLs. ([#175], [#177])
+
 ### Changed
 
 - **`--username`, `--domain` are now global** - Accepted on all subcommands, not just sync.
@@ -47,6 +51,8 @@ All deprecated syntax continues to work and prints a one-line warning to stderr.
 [#118]: https://github.com/rhoopr/kei/issues/118
 [#168]: https://github.com/rhoopr/kei/issues/168
 [#170]: https://github.com/rhoopr/kei/pull/170
+[#175]: https://github.com/rhoopr/kei/issues/175
+[#177]: https://github.com/rhoopr/kei/pull/177
 
 ## [0.6.2] - 2026-04-08
 
