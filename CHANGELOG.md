@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.7.0] - 2026-04-11
 
 ### Added
 
@@ -17,12 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`KEI_*` environment variables** - Every CLI flag has an env var (`KEI_DIRECTORY`, `KEI_DATA_DIR`, `KEI_SIZE`, etc.). Useful for Docker. ([#118])
 - **`--data-dir`** - Global flag replacing `--cookie-directory` for session/state/credential storage.
 - **`sync --retry-failed`** - Flag on sync replacing the `retry-failed` subcommand.
+- **`--live-photo-mode`** - Control live photo handling: `both` (default), `image-only`, `video-only`, `skip`. Replaces `--skip-live-photos`.
+- **`--exclude-album`** - Exclude specific albums from sync. Multi-value, comma-separated. [env: `KEI_EXCLUDE_ALBUM`]
+- **`--filename-exclude`** - Exclude files matching glob patterns (e.g., `*.AAE`, `Screenshot*`). Case-insensitive, multi-value. [env: `KEI_FILENAME_EXCLUDE`]
+- **`{album}` token in `--folder-structure`** - Organize downloads by album name (e.g., `{album}/%Y/%m`).
+- **Full strftime support in `--folder-structure`** - All standard strftime specifiers now work (`%B`, `%A`, `%j`, etc.), not just the six previously supported.
+- **Auto-config on first run** - When no config file exists, kei creates a minimal `~/.config/kei/config.toml` from CLI arguments. Opt out with `KEI_NO_AUTO_CONFIG=1`.
 
 ### Changed
 
 - **`--username`, `--domain` are now global** - Accepted on all subcommands, not just sync.
 - **Docker CMD** - Uses `--data-dir` instead of `--cookie-directory`.
 - **`password` replaces `credential`** - `kei password set|clear|backend`. Old `credential` subcommand still works as hidden alias.
+- **Folder structure token expansion** uses `chrono::strftime` instead of manual parsing. Behavior is unchanged for existing templates.
+- **Filename exclude patterns** are compiled once at config build time for performance.
 
 ### Deprecated
 
@@ -30,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--auth-only` (use `kei login`)
 - `--list-albums` / `--list-libraries` (use `kei list albums` / `kei list libraries`)
 - `--reset-sync-token` flag on sync (use `kei reset sync-token`)
-- `--skip-live-photos` (hidden, still accepted)
+- `--skip-live-photos` (use `--live-photo-mode skip`)
 - Top-level `get-code`, `submit-code`, `credential`, `retry-failed`, `reset-state`, `reset-sync-token`, `setup` subcommands (use new grouped equivalents)
 
 All deprecated syntax continues to work and prints a one-line warning to stderr.

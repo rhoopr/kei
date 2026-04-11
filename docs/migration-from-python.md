@@ -22,7 +22,7 @@ The import is idempotent - running it multiple times is safe. It uses `upsert` o
 kei sync --username you@example.com --directory ~/Photos/iCloud
 ```
 
-You'll need to authenticate fresh - kei can't reuse Python's `~/.pyicloud` session cookies (different format). After the first 2FA approval, sessions are persisted to `~/.config/kei/cookies/` and reused on subsequent runs.
+You'll need to authenticate fresh - kei can't reuse Python's `~/.pyicloud` session cookies (different format). After the first 2FA approval, sessions are persisted to `~/.config/kei/` (see `--data-dir`) and reused on subsequent runs.
 
 ## CLI flag mapping
 
@@ -42,7 +42,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--recent` | |
 | `--skip-videos` | |
 | `--skip-photos` | |
-| `--skip-live-photos` | Hidden; still accepted |
+| `--skip-live-photos` | Deprecated; use `--live-photo-mode skip` |
 | `--skip-created-before` | ISO date (`2024-01-01`) or relative interval (`20d`) |
 | `--skip-created-after` | ISO date (`2024-01-01`) or relative interval (`20d`) |
 | `--set-exif-datetime` | |
@@ -110,6 +110,10 @@ Most flags are the same or very close. Here's the full mapping:
 | `verify` | Verify downloads exist and optionally check checksums |
 | `config show` | Dump resolved config as TOML |
 | `config setup` | Interactive config wizard (was top-level `setup`) |
+| `--live-photo-mode` | Control live photo handling: `both`, `image-only`, `video-only`, `skip`. Replaces `--skip-live-photos`. |
+| `--exclude-album` | Exclude specific albums from sync. Multi-value. |
+| `--filename-exclude` | Exclude files by glob pattern (e.g., `*.AAE`, `Screenshot*`). Case-insensitive, multi-value. |
+| `{album}` in `--folder-structure` | Organize by album name: `--folder-structure "{album}/%Y/%m"`. |
 | `KEI_*` env vars | Every CLI flag has an env var (`KEI_DIRECTORY`, `KEI_DATA_DIR`, `KEI_SIZE`, etc.). Useful for Docker. |
 
 ## Docker migration

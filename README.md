@@ -122,8 +122,8 @@ State lives in a SQLite database alongside your session data (see `--data-dir`).
 - Watch mode with systemd notify, PID file, graceful shutdown
 - Multi-library sync (`--library all` for personal + shared)
 - Flexible password sources: prompt, env var, file, shell command, OS keyring
-- Content filtering: skip videos/photos/live photos, date ranges, albums, `--recent N`
-- Date-based folder structure, live photo MOV pairing, EXIF datetime stamping
+- Content filtering: live photo mode, filename globs, album exclusions, date ranges, `--recent N`
+- Flexible folder structure with `{album}` token and full strftime support, EXIF datetime stamping
 - Multi-arch Docker images (amd64/arm64) with headless 2FA
 - Notification scripts on events (2FA required, sync complete, failures)
 - TOML config with env var overrides (`KEI_*`) for every flag
