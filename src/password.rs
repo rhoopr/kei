@@ -53,7 +53,7 @@ impl PasswordSource {
                         "No password configured and stdin is not a terminal. \
                          Set a password with one of:\n  \
                          - ICLOUD_PASSWORD environment variable\n  \
-                         - kei credential set\n  \
+                         - kei password set\n  \
                          - --password-command (external secret manager)\n  \
                          - --password-file or Docker secret\n  \
                          - [auth] password in config.toml"
