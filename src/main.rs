@@ -209,7 +209,8 @@ fn make_provider_from_auth(
 ///
 /// On first attempt, uses the ckdatabasews URL from the auth result. If the
 /// CloudKit service returns 421 Misdirected Request (stale partition), retries
-/// by calling accountLogin to refresh service URLs.
+/// by validating the session token first (which returns fresh service URLs
+/// without needing credentials), then falls back to accountLogin.
 async fn init_photos_service(
     auth_result: auth::AuthResult,
     domain: &str,
@@ -249,12 +250,24 @@ async fn init_photos_service(
             tracing::warn!(
                 url = %ckdatabasews_url,
                 "Service endpoint returned 421 Misdirected Request, \
-                 refreshing service URLs via accountLogin"
+                 refreshing service URLs"
             );
             let endpoints = auth::endpoints::Endpoints::for_domain(domain)?;
             let fresh_data = {
                 let mut session = shared_session.write().await;
-                auth::twofa::authenticate_with_token(&mut session, &endpoints).await?
+                match auth::twofa::validate_token(&mut session, &endpoints).await {
+                    Ok(data) => {
+                        tracing::debug!("Session validated, got fresh service URLs");
+                        data
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "Session validation failed, trying accountLogin"
+                        );
+                        auth::twofa::authenticate_with_token(&mut session, &endpoints).await?
+                    }
+                }
             };
 
             let fresh_url = fresh_data
@@ -292,8 +305,8 @@ async fn init_photos_service(
 /// Check if an iCloud error is a 421 Misdirected Request from the CloudKit service.
 ///
 /// This happens when Apple migrates an account to a different partition but the
-/// cached session still references the old ckdatabasews URL. The fix is to
-/// force a full SRP re-authentication to obtain fresh webservice URLs.
+/// cached session still references the old ckdatabasews URL. Recovery validates
+/// the session token to obtain fresh webservice URLs without re-authenticating.
 fn is_misdirected_request(err: &icloud::error::ICloudError) -> bool {
     matches!(err, icloud::error::ICloudError::Connection(msg) if msg.contains("421"))
 }
