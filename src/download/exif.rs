@@ -62,8 +62,15 @@ pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
         .write_to_vec(&mut buf, FileExtension::JPEG)
         .with_context(|| format!("Writing EXIF metadata for {}", path.display()))?;
 
-    std::fs::write(path, &buf)
-        .with_context(|| format!("Writing EXIF result to {}", path.display()))?;
+    // Write to a sibling temp file and atomically rename to avoid leaving a
+    // truncated file if the process is killed mid-write.
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".exif-tmp");
+    let tmp_path = path.with_file_name(&tmp_name);
+    std::fs::write(&tmp_path, &buf)
+        .with_context(|| format!("Writing EXIF temp file {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
 
     tracing::debug!(
         datetime = %datetime_str,
@@ -218,6 +225,35 @@ mod tests {
 
         let result = get_photo_exif(&path).unwrap();
         assert_eq!(result, Some("2024-12-25 12:00:00".to_string()));
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_exif_tmp_file_not_left_behind() {
+        let dir = test_tmp_dir("exif_atomic");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("atomic_test.jpg");
+        let _ = fs::remove_file(&path);
+
+        // Create a minimal valid JPEG
+        fs::write(&path, minimal_jpeg()).unwrap();
+
+        set_photo_exif(&path, "2025:01:01 00:00:00").unwrap();
+
+        // The .exif-tmp file must not exist after a successful call.
+        let mut tmp_name = path.file_name().unwrap().to_os_string();
+        tmp_name.push(".exif-tmp");
+        let tmp_path = path.with_file_name(&tmp_name);
+        assert!(
+            !tmp_path.exists(),
+            ".exif-tmp should be cleaned up after successful write"
+        );
+
+        // The original file should still exist and have valid EXIF.
+        assert!(path.exists());
+        let result = get_photo_exif(&path).unwrap();
+        assert_eq!(result, Some("2025-01-01 00:00:00".to_string()));
 
         fs::remove_file(&path).ok();
     }

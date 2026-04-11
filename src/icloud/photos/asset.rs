@@ -175,13 +175,17 @@ fn extract_versions(
             continue;
         };
 
-        let asset_type: Box<str> = fields[type_field]["value"]
-            .as_str()
-            .unwrap_or_else(|| {
-                tracing::warn!("Missing expected field: {type_field}");
-                ""
-            })
-            .into();
+        let asset_type: Box<str> = match fields[type_field]["value"].as_str() {
+            Some(s) if !s.is_empty() => s.into(),
+            _ => {
+                tracing::warn!(
+                    asset = %record_name,
+                    field = %type_field,
+                    "Missing or empty asset type, skipping version"
+                );
+                continue;
+            }
+        };
 
         versions.push((
             *key,
@@ -1653,10 +1657,12 @@ mod tests {
                         "size": 2000, "downloadURL": "https://example.com/heic",
                         "fileChecksum": "heic_ck"
                     }},
+                    "resOriginalFileType": {"value": "public.heic"},
                     "resOriginalVidComplRes": {"value": {
                         "size": 3000, "downloadURL": "https://example.com/mov",
                         "fileChecksum": "mov_ck"
-                    }}
+                    }},
+                    "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
                 }
             }),
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
@@ -1704,6 +1710,47 @@ mod tests {
         assert!(
             !asset.is_live_photo(),
             "Movies with video companion are not live photos"
+        );
+    }
+
+    #[test]
+    fn test_versions_skips_empty_asset_type() {
+        // When resOriginalFileType is missing, the version should be excluded.
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "ck_orig"
+                }}
+                // resOriginalFileType intentionally omitted
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "Version with missing asset type should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_versions_skips_null_asset_type() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "ck_orig"
+                }},
+                "resOriginalFileType": {"value": null}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "Version with null asset type should be skipped"
         );
     }
 }

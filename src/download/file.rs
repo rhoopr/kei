@@ -152,7 +152,24 @@ async fn attempt_download<C: DownloadClient>(
     let path_str = download_path.display().to_string();
 
     let resume_offset = match fs::metadata(part_path).await {
-        Ok(meta) if meta.len() > 0 => meta.len(),
+        Ok(meta) if meta.len() > 0 => {
+            // Discard stale .part files from crashed runs to avoid resuming
+            // from potentially corrupt bytes.
+            let stale = meta.modified().ok().is_some_and(|mtime| {
+                mtime.elapsed().unwrap_or(std::time::Duration::ZERO)
+                    > std::time::Duration::from_secs(24 * 3600)
+            });
+            if stale {
+                tracing::warn!(
+                    path = %part_path.display(),
+                    size = meta.len(),
+                    "Stale .part file (>24h old), restarting download"
+                );
+                0
+            } else {
+                meta.len()
+            }
+        }
         _ => 0,
     };
 
