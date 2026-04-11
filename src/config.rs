@@ -921,8 +921,8 @@ pub(crate) fn persist_first_run_config(
 /// - ISO datetime: `"2025-01-02T14:30:00"` (local time)
 pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
     if let Some(days_str) = s.strip_suffix('d') {
-        if let Ok(days) = days_str.parse::<i64>() {
-            return Ok(Local::now() - chrono::Duration::days(days));
+        if let Ok(days) = days_str.parse::<u64>() {
+            return Ok(Local::now() - chrono::Duration::days(days as i64));
         }
     }
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
@@ -1003,6 +1003,12 @@ mod tests {
     fn test_parse_invalid_date() {
         assert!(parse_date_or_interval("not-a-date").is_err());
         assert!(parse_date_or_interval("").is_err());
+    }
+
+    #[test]
+    fn test_parse_negative_interval_rejected() {
+        assert!(parse_date_or_interval("-5d").is_err());
+        assert!(parse_date_or_interval("-1d").is_err());
     }
 
     // ── TOML parsing tests ──────────────────────────────────────────

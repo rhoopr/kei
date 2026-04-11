@@ -30,10 +30,14 @@ pub(crate) fn local_download_dir(
     };
 
     // Expand {album} token before strftime, sanitizing the album name as a
-    // path component to prevent traversal.
+    // path component to prevent traversal. Empty/missing album names produce
+    // an empty replacement so the {album} path component is skipped.
     let expanded;
     let strftime_input = if format_str.contains("{album}") {
-        let safe_name = album_name.map(sanitize_path_component).unwrap_or_default();
+        let safe_name = album_name
+            .filter(|n| !n.is_empty())
+            .map(sanitize_path_component)
+            .unwrap_or_default();
         expanded = format_str.replace("{album}", &safe_name);
         expanded.as_str()
     } else {
@@ -1208,6 +1212,17 @@ mod tests {
             .unwrap();
         let result = local_download_path(dir, "{album}/%Y/%m/%d", &date, "photo.jpg", None);
         // Empty album name means the {album} component is empty, so it's skipped
+        assert_eq!(result, PathBuf::from("/photos/2025/06/15/photo.jpg"));
+    }
+
+    #[test]
+    fn test_album_token_empty_string_skipped() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        // The "All Photos" album has name "" -- should behave like None
+        let result = local_download_path(dir, "{album}/%Y/%m/%d", &date, "photo.jpg", Some(""));
         assert_eq!(result, PathBuf::from("/photos/2025/06/15/photo.jpg"));
     }
 
