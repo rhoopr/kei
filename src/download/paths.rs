@@ -32,11 +32,14 @@ pub(crate) fn local_download_dir(
     // Expand {album} token before strftime, sanitizing the album name as a
     // path component to prevent traversal. Empty/missing album names produce
     // an empty replacement so the {album} path component is skipped.
+    // Percent signs in album names are escaped to %% so chrono's strftime
+    // treats them as literal '%' rather than format specifiers.
     let expanded;
     let strftime_input = if format_str.contains("{album}") {
         let safe_name = album_name
             .filter(|n| !n.is_empty())
             .map(sanitize_path_component)
+            .map(|s| s.replace('%', "%%"))
             .unwrap_or_default();
         expanded = format_str.replace("{album}", &safe_name);
         expanded.as_str()
@@ -1235,6 +1238,38 @@ mod tests {
         let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("../etc"));
         // Path traversal in album name is neutralized
         assert!(!result.to_str().unwrap().contains("../"));
+    }
+
+    #[test]
+    fn test_album_token_percent_escaped() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        // Album name containing % should not be interpreted as strftime
+        let result =
+            local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("My %d Album"));
+        let result_str = result.to_str().unwrap();
+        // %d should be literal, not expanded to "15"
+        assert!(
+            result_str.contains("%d"),
+            "percent in album name should be literal, got: {result_str}"
+        );
+        assert!(
+            !result_str.contains("/15/"),
+            "album %d should not expand to day number, got: {result_str}"
+        );
+    }
+
+    #[test]
+    fn test_album_token_trailing_percent_no_panic() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        // Trailing % in album name must not panic
+        let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("50% Off"));
+        assert!(result.to_str().unwrap().contains("50% Off"));
     }
 
     #[test]

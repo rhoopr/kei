@@ -329,6 +329,26 @@ pub(crate) struct DownloadConfig {
     /// Album name for `{album}` token in folder_structure. Set per-album when
     /// processing albums individually.
     pub(crate) album_name: Option<Arc<str>>,
+    /// Asset IDs to exclude (from `--exclude-album` without `--album`).
+    pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
+}
+
+impl DownloadConfig {
+    /// Clone this config with a different `album_name`, for per-album processing
+    /// when `{album}` is in `folder_structure`.
+    fn with_album_name(&self, name: Arc<str>) -> Self {
+        Self {
+            album_name: Some(name),
+            directory: self.directory.clone(),
+            folder_structure: self.folder_structure.clone(),
+            filename_exclude: self.filename_exclude.clone(),
+            temp_suffix: self.temp_suffix.clone(),
+            state_db: self.state_db.clone(),
+            sync_mode: self.sync_mode.clone(),
+            exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
+            ..*self
+        }
+    }
 }
 
 impl std::fmt::Debug for DownloadConfig {
@@ -364,6 +384,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("retry_only", &self.retry_only)
             .field("sync_mode", &self.sync_mode)
             .field("album_name", &self.album_name)
+            .field("exclude_asset_ids_count", &self.exclude_asset_ids.len())
             .finish()
     }
 }
@@ -608,6 +629,11 @@ fn extract_skip_candidates<'a>(
     asset: &'a crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> SmallVec<[(VersionSizeKey, &'a str); 2]> {
+    // Excluded album assets -- same as filter_asset_to_tasks
+    if config.exclude_asset_ids.contains(asset.id()) {
+        return SmallVec::new();
+    }
+
     // Content type filters -- same as filter_asset_to_tasks
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         return SmallVec::new();
@@ -727,6 +753,10 @@ fn filter_asset_to_tasks(
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
 ) -> SmallVec<[DownloadTask; 2]> {
+    if config.exclude_asset_ids.contains(asset.id()) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
+        return SmallVec::new();
+    }
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         tracing::debug!(asset_id = %asset.id(), "Skipping video (skip_videos enabled)");
         return SmallVec::new();
@@ -1405,35 +1435,7 @@ async fn download_photos_full_with_token(
             if shutdown_token.is_cancelled() {
                 break;
             }
-            let album_config = Arc::new(DownloadConfig {
-                album_name: Some(album.name.clone()),
-                directory: config.directory.clone(),
-                folder_structure: config.folder_structure.clone(),
-                size: config.size,
-                skip_videos: config.skip_videos,
-                skip_photos: config.skip_photos,
-                skip_created_before: config.skip_created_before,
-                skip_created_after: config.skip_created_after,
-                set_exif_datetime: config.set_exif_datetime,
-                dry_run: config.dry_run,
-                concurrent_downloads: config.concurrent_downloads,
-                recent: config.recent,
-                retry: config.retry,
-                live_photo_mode: config.live_photo_mode,
-                live_photo_size: config.live_photo_size,
-                live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
-                align_raw: config.align_raw,
-                no_progress_bar: config.no_progress_bar,
-                only_print_filenames: config.only_print_filenames,
-                file_match_policy: config.file_match_policy,
-                force_size: config.force_size,
-                keep_unicode_in_filenames: config.keep_unicode_in_filenames,
-                filename_exclude: config.filename_exclude.clone(),
-                temp_suffix: config.temp_suffix.clone(),
-                state_db: config.state_db.clone(),
-                retry_only: config.retry_only,
-                sync_mode: config.sync_mode.clone(),
-            });
+            let album_config = Arc::new(config.with_album_name(album.name.clone()));
 
             let (stream, token_rx) = album.photo_stream_with_token(
                 config.recent,
@@ -1446,7 +1448,7 @@ async fn download_photos_full_with_token(
                 download_client,
                 stream,
                 &album_config,
-                count,
+                total,
                 shutdown_token.clone(),
             )
             .await?;
@@ -1547,9 +1549,12 @@ async fn download_photos_incremental(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
+    let uses_album_token = config.folder_structure.contains("{album}");
 
-    // Collect change events from all albums, counting and filtering in a single pass
-    let mut downloadable_assets: Vec<PhotoAsset> = Vec::new();
+    // Collect change events from all albums, counting and filtering in a single pass.
+    // Each asset is paired with its source album name so that {album} token
+    // expansion works correctly in the incremental path.
+    let mut downloadable_assets: Vec<(PhotoAsset, Arc<str>)> = Vec::new();
     let mut sync_token: Option<String> = None;
     let mut created_count = 0u64;
     let mut soft_deleted_count = 0u64;
@@ -1571,7 +1576,7 @@ async fn download_photos_incremental(
                 ChangeReason::Created => {
                     created_count += 1;
                     if let Some(asset) = event.asset {
-                        downloadable_assets.push(asset);
+                        downloadable_assets.push((asset, Arc::clone(&album.name)));
                     }
                 }
                 ChangeReason::SoftDeleted => {
@@ -1637,16 +1642,27 @@ async fn download_photos_incremental(
         DownloadContext::default()
     };
 
-    // Convert assets to download tasks, using state DB fast-skip where possible
+    // Convert assets to download tasks, using state DB fast-skip where possible.
+    // When {album} is in folder_structure, create per-album configs so the album
+    // name is threaded into path expansion (mirrors full sync behaviour).
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
     let mut dir_cache = paths::DirCache::new();
     let mut skipped_by_state = 0usize;
+    let mut album_configs: FxHashMap<Arc<str>, Arc<DownloadConfig>> = FxHashMap::default();
 
-    for asset in &downloadable_assets {
+    for (asset, album_name) in &downloadable_assets {
+        let effective_config: &Arc<DownloadConfig> = if uses_album_token {
+            album_configs
+                .entry(Arc::clone(album_name))
+                .or_insert_with(|| Arc::new(config.with_album_name(Arc::clone(album_name))))
+        } else {
+            config
+        };
+
         // Fast-skip: if state DB confirms all versions are already downloaded
         // with matching checksums, skip the filesystem check entirely.
-        let candidates = extract_skip_candidates(asset, config);
+        let candidates = extract_skip_candidates(asset, effective_config);
         if !candidates.is_empty()
             && candidates.iter().all(|&(vs, cs)| {
                 matches!(
@@ -1659,8 +1675,9 @@ async fn download_photos_incremental(
             continue;
         }
 
-        pre_ensure_asset_dir(&mut dir_cache, asset, config).await;
-        let asset_tasks = filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache);
+        pre_ensure_asset_dir(&mut dir_cache, asset, effective_config).await;
+        let asset_tasks =
+            filter_asset_to_tasks(asset, effective_config, &mut claimed_paths, &mut dir_cache);
 
         // Upsert state records so mark_downloaded/mark_failed can find them.
         // Without this, the UPDATE in mark_downloaded matches 0 rows and the
@@ -2851,6 +2868,7 @@ mod tests {
             retry_only: false,
             sync_mode: SyncMode::Full,
             album_name: None,
+            exclude_asset_ids: Arc::new(FxHashSet::default()),
         }
     }
 
@@ -5683,6 +5701,50 @@ mod tests {
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
         let tasks = filter_asset_fresh(&asset, &config);
         assert!(!tasks.is_empty(), "Non-matching files should pass through");
+    }
+
+    // ── exclude_asset_ids filter tests ─────────────────────────────
+
+    #[test]
+    fn test_filter_exclude_asset_ids_blocks_matching() {
+        let asset = TestPhotoAsset::new("EXCLUDED_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        let mut ids = FxHashSet::default();
+        ids.insert("EXCLUDED_1".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(tasks.is_empty(), "Asset in exclude set should be filtered");
+    }
+
+    #[test]
+    fn test_filter_exclude_asset_ids_passes_non_matching() {
+        let asset = TestPhotoAsset::new("KEEP_1")
+            .filename("IMG_0002.JPG")
+            .build();
+        let mut config = test_config();
+        let mut ids = FxHashSet::default();
+        ids.insert("OTHER_ID".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(!tasks.is_empty(), "Asset not in exclude set should pass");
+    }
+
+    #[test]
+    fn test_skip_candidates_exclude_asset_ids() {
+        let asset = TestPhotoAsset::new("SKIP_EXCL_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        let mut ids = FxHashSet::default();
+        ids.insert("SKIP_EXCL_1".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert!(
+            candidates.is_empty(),
+            "extract_skip_candidates should return empty for excluded assets"
+        );
     }
 
     #[test]

@@ -1041,29 +1041,54 @@ async fn run_import_existing(
     Ok(())
 }
 
-/// Resolve which albums to download from.
+/// Resolve which albums to download from, plus any asset IDs to exclude.
 ///
 /// When no `--album` names are specified, returns `library.all()` (a cheap
 /// in-memory construction, no API call). When names are given, calls
 /// `library.albums().await` to discover user-created albums from iCloud.
+///
+/// The returned `FxHashSet<String>` contains asset IDs from excluded albums
+/// that should be filtered out at download time. This is only populated when
+/// `--exclude-album` is set without `--album`, because the all-photos stream
+/// doesn't carry album membership per asset.
 async fn resolve_albums(
     library: &icloud::photos::PhotoLibrary,
     album_names: &[String],
     exclude_albums: &[String],
-) -> anyhow::Result<Vec<icloud::photos::PhotoAlbum>> {
+) -> anyhow::Result<(
+    Vec<icloud::photos::PhotoAlbum>,
+    rustc_hash::FxHashSet<String>,
+)> {
+    use futures_util::StreamExt;
+
+    let empty_ids = rustc_hash::FxHashSet::default();
+
     if album_names.is_empty() && exclude_albums.is_empty() {
-        return Ok(vec![library.all()]);
+        return Ok((vec![library.all()], empty_ids));
     }
 
     if album_names.is_empty() {
-        // No --album but --exclude-album is set: fetch all albums and filter.
-        let mut album_map = library.albums().await?;
+        // No --album but --exclude-album is set: use library.all() as the
+        // base (all photos) and pre-collect asset IDs from excluded albums
+        // so they can be filtered at download time. This avoids silently
+        // dropping photos that aren't in any named album.
+        let album_map = library.albums().await?;
+        let mut exclude_ids = rustc_hash::FxHashSet::default();
         for name in exclude_albums {
-            if album_map.remove(name.as_str()).is_none() {
+            if let Some(album) = album_map.get(name.as_str()) {
+                let count = album.len().await.unwrap_or(0);
+                tracing::info!(album = name, count, "Pre-fetching excluded album asset IDs");
+                let (stream, _token_rx) = album.photo_stream_with_token(None, Some(count), 1);
+                tokio::pin!(stream);
+                while let Some(Ok(asset)) = stream.next().await {
+                    exclude_ids.insert(asset.id().to_string());
+                }
+            } else {
                 tracing::warn!(album = name, "Excluded album not found, ignoring");
             }
         }
-        return Ok(album_map.into_values().collect());
+        tracing::info!(count = exclude_ids.len(), "Collected excluded asset IDs");
+        return Ok((vec![library.all()], exclude_ids));
     }
 
     // Explicit --album list: resolve and exclude.
@@ -1081,7 +1106,7 @@ async fn resolve_albums(
             anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
         }
     }
-    Ok(matched)
+    Ok((matched, empty_ids))
 }
 
 /// RAII guard that writes the current PID to a file on creation and removes
@@ -1112,6 +1137,9 @@ struct LibraryState {
     zone_name: String,
     sync_token_key: String,
     albums: Vec<icloud::photos::PhotoAlbum>,
+    /// Asset IDs from excluded albums, used to filter out assets when
+    /// `--exclude-album` is set without explicit `--album`.
+    exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
 }
 
 fn main() -> ExitCode {
@@ -1625,7 +1653,9 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         .map(|p| glob::Pattern::new(p).expect("validated in Config::build"))
         .collect();
 
-    let build_download_config = |sync_mode: download::SyncMode| -> Arc<download::DownloadConfig> {
+    let build_download_config = |sync_mode: download::SyncMode,
+                                 exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>|
+     -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
             directory: config.directory.clone(),
             folder_structure: config.folder_structure.clone(),
@@ -1654,6 +1684,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             retry_only: is_retry_failed,
             sync_mode,
             album_name: None,
+            exclude_asset_ids,
         })
     };
 
@@ -1666,12 +1697,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     for library in &libraries {
         let zone_name = library.zone_name().to_string();
         let sync_token_key = format!("sync_token:{zone_name}");
-        let albums = resolve_albums(library, &config.albums, &config.exclude_albums).await?;
+        let (albums, exclude_ids) =
+            resolve_albums(library, &config.albums, &config.exclude_albums).await?;
         library_states.push(LibraryState {
             library: library.clone(),
             zone_name,
             sync_token_key,
             albums,
+            exclude_asset_ids: Arc::new(exclude_ids),
         });
     }
     sd_notifier.notify_ready();
@@ -1837,7 +1870,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 };
                 tracing::debug!(sync_mode = sync_mode_label, zone = %lib_state.zone_name, "Starting sync cycle");
 
-                let download_config = build_download_config(sync_mode);
+                let download_config =
+                    build_download_config(sync_mode, Arc::clone(&lib_state.exclude_asset_ids));
                 let download_client = shared_session.read().await.download_client();
                 let sync_result = download::download_photos_with_sync(
                     &download_client,
@@ -2023,7 +2057,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 match resolve_albums(&lib_state.library, &config.albums, &config.exclude_albums)
                     .await
                 {
-                    Ok(refreshed) => lib_state.albums = refreshed,
+                    Ok((refreshed, exclude_ids)) => {
+                        lib_state.albums = refreshed;
+                        lib_state.exclude_asset_ids = Arc::new(exclude_ids);
+                    }
                     Err(e) => {
                         tracing::warn!(
                             zone = %lib_state.zone_name,
