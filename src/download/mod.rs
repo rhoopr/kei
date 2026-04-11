@@ -664,6 +664,19 @@ fn extract_skip_candidates<'a>(
         }
     }
 
+    // Filename exclusion -- mirrors filter_asset_to_tasks
+    if !config.filename_exclude.is_empty() {
+        if let Some(filename) = asset.filename() {
+            if config
+                .filename_exclude
+                .iter()
+                .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
+            {
+                return SmallVec::new();
+            }
+        }
+    }
+
     let versions = asset.versions();
     let mut result = SmallVec::new();
 
@@ -5836,6 +5849,132 @@ mod tests {
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
+        );
+    }
+
+    // ── with_album_name tests ─────────────────────────────────────
+
+    #[test]
+    fn test_with_album_name_expands_album_token() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y/%m/%d".to_string();
+        let derived = config.with_album_name(Arc::from("Vacation"));
+        assert_eq!(derived.folder_structure, "Vacation/%Y/%m/%d");
+    }
+
+    #[test]
+    fn test_with_album_name_sets_album_name_field() {
+        let config = test_config();
+        assert!(config.album_name.is_none());
+        let derived = config.with_album_name(Arc::from("Favorites"));
+        assert_eq!(derived.album_name.as_deref(), Some("Favorites"));
+    }
+
+    #[test]
+    fn test_with_album_name_preserves_all_fields() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        config.skip_videos = true;
+        config.skip_photos = true;
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+        config.force_size = true;
+        config.keep_unicode_in_filenames = true;
+        config.dry_run = true;
+        config.set_exif_datetime = true;
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config.temp_suffix = ".custom-tmp".to_string();
+        let derived = config.with_album_name(Arc::from("Test"));
+        assert!(derived.skip_videos);
+        assert!(derived.skip_photos);
+        assert_eq!(derived.live_photo_mode, LivePhotoMode::ImageOnly);
+        assert!(derived.force_size);
+        assert!(derived.keep_unicode_in_filenames);
+        assert!(derived.dry_run);
+        assert!(derived.set_exif_datetime);
+        assert_eq!(derived.filename_exclude.len(), 1);
+        assert_eq!(derived.temp_suffix, ".custom-tmp");
+        assert_eq!(derived.directory, config.directory);
+    }
+
+    #[test]
+    fn test_with_album_name_empty_name_leaves_token_stripped() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y/%m/%d".to_string();
+        let derived = config.with_album_name(Arc::from(""));
+        // Empty album name should strip the {album}/ prefix
+        assert!(!derived.folder_structure.contains("{album}"));
+        assert!(derived.album_name.as_deref() == Some(""));
+    }
+
+    #[test]
+    fn test_with_album_name_no_token_in_structure() {
+        let config = test_config(); // folder_structure = "%Y/%m/%d"
+        let derived = config.with_album_name(Arc::from("MyAlbum"));
+        // No {album} token, so structure should be unchanged
+        assert_eq!(derived.folder_structure, "%Y/%m/%d");
+        assert_eq!(derived.album_name.as_deref(), Some("MyAlbum"));
+    }
+
+    #[test]
+    fn test_with_album_name_sanitizes_special_chars() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        let derived = config.with_album_name(Arc::from("My/Album"));
+        // The expand_album_token sanitizes path separators
+        assert!(
+            !derived.folder_structure.contains('/')
+                || !derived.folder_structure.starts_with("My/Album")
+        );
+    }
+
+    // ── extract_skip_candidates: filename_exclude ─────────────────
+
+    #[test]
+    fn test_extract_skip_candidates_filename_exclude_matches() {
+        let asset = TestPhotoAsset::new("TEST_1").filename("photo.AAE").build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert!(
+            extract_skip_candidates(&asset, &config).is_empty(),
+            "filename_exclude should filter in extract_skip_candidates"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_filename_exclude_no_match_passes() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // filename = "test_photo.jpg"
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert!(
+            !extract_skip_candidates(&asset, &config).is_empty(),
+            "non-matching filename should pass through"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_filename_exclude_case_insensitive() {
+        let asset = TestPhotoAsset::new("TEST_1").filename("photo.aae").build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert!(
+            extract_skip_candidates(&asset, &config).is_empty(),
+            "filename_exclude should be case-insensitive"
+        );
+    }
+
+    // ── compute_config_hash: filename_exclude ─────────────────────
+
+    #[test]
+    fn test_compute_config_hash_different_filename_exclude() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.filename_exclude = vec!["*.AAE".to_string()];
+        });
+        assert_ne!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "changing filename_exclude should change the config hash"
         );
     }
 }

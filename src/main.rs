@@ -2548,4 +2548,24 @@ mod tests {
             "should contain the excluded asset ID"
         );
     }
+
+    #[tokio::test]
+    async fn resolve_albums_same_album_in_both_yields_empty() {
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation")
+        ]}));
+        let library = stub_library(mock);
+
+        let (albums, _) = resolve_albums(
+            &library,
+            &["Vacation".to_string()],
+            &["Vacation".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            albums.is_empty(),
+            "album present in both --album and --exclude-album should yield zero albums"
+        );
+    }
 }

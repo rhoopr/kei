@@ -2964,6 +2964,139 @@ mod tests {
         assert!(filters.skip_created_after.is_none());
     }
 
+    #[test]
+    fn test_to_toml_roundtrip_exclude_albums() {
+        let mut sync = default_sync();
+        sync.exclude_albums = vec!["Hidden".to_string(), "Trash".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let filters = toml.filters.as_ref().unwrap();
+        assert_eq!(
+            filters.exclude_albums.as_deref(),
+            Some(&["Hidden".to_string(), "Trash".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn test_to_toml_roundtrip_filename_exclude() {
+        let mut sync = default_sync();
+        sync.filename_exclude = vec!["*.AAE".to_string(), "Screenshot*".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let filters = toml.filters.as_ref().unwrap();
+        assert_eq!(
+            filters.filename_exclude.as_deref(),
+            Some(&["*.AAE".to_string(), "Screenshot*".to_string()][..])
+        );
+        // Round-trip: serialize then deserialize
+        let serialized = ::toml::to_string_pretty(&toml).unwrap();
+        let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            parsed.filters.as_ref().unwrap().filename_exclude.as_deref(),
+            Some(&["*.AAE".to_string(), "Screenshot*".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn test_to_toml_roundtrip_live_photo_mode() {
+        let mut sync = default_sync();
+        sync.live_photo_mode = Some(crate::types::LivePhotoMode::ImageOnly);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        assert_eq!(
+            toml.photos.as_ref().unwrap().live_photo_mode,
+            Some(crate::types::LivePhotoMode::ImageOnly)
+        );
+        // Round-trip
+        let serialized = ::toml::to_string_pretty(&toml).unwrap();
+        let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            parsed.photos.as_ref().unwrap().live_photo_mode,
+            Some(crate::types::LivePhotoMode::ImageOnly)
+        );
+    }
+
+    #[test]
+    fn test_to_toml_empty_exclude_albums_omitted() {
+        let cfg =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let toml = cfg.to_toml();
+        assert!(toml.filters.as_ref().unwrap().exclude_albums.is_none());
+    }
+
+    #[test]
+    fn test_to_toml_default_live_photo_mode_omitted() {
+        let cfg =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let toml = cfg.to_toml();
+        assert!(toml.photos.as_ref().unwrap().live_photo_mode.is_none());
+    }
+
+    // ── TOML-only skip_live_photos legacy path ──────────────────────
+
+    #[test]
+    fn test_toml_skip_live_photos_legacy_maps_to_skip_mode() {
+        let toml_str = r#"
+            [auth]
+            username = "u@example.com"
+
+            [filters]
+            skip_live_photos = true
+        "#;
+        let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Skip);
+    }
+
+    #[test]
+    fn test_toml_skip_live_photos_false_stays_both() {
+        let toml_str = r#"
+            [auth]
+            username = "u@example.com"
+
+            [filters]
+            skip_live_photos = false
+        "#;
+        let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Both);
+    }
+
+    #[test]
+    fn test_toml_photos_live_photo_mode_overrides_filters_skip_live_photos() {
+        let toml_str = r#"
+            [auth]
+            username = "u@example.com"
+
+            [filters]
+            skip_live_photos = true
+
+            [photos]
+            live_photo_mode = "image-only"
+        "#;
+        let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::ImageOnly);
+    }
+
     // ── resolve_data_dir() tests ────────────────────────────────────
 
     #[test]
