@@ -1087,7 +1087,7 @@ async fn run_import_existing(
     Ok(())
 }
 
-/// Resolve a [`LibrarySelection`] into concrete [`PhotoLibrary`] instances.
+/// Resolve a `LibrarySelection` into concrete `PhotoLibrary` instances.
 async fn resolve_libraries(
     selection: &config::LibrarySelection,
     photos_service: &mut icloud::photos::PhotosService,
