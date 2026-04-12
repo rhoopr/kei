@@ -1850,4 +1850,45 @@ mod tests {
         assert!(decoded.is_sha1);
         assert_eq!(decoded.hex.len(), 40); // 20 bytes = 40 hex chars
     }
+
+    #[tokio::test]
+    async fn rename_part_to_final_happy_path() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("photo.part");
+        let final_path = dir.path().join("photo.jpg");
+        tokio::fs::write(&part, b"image data").await.unwrap();
+
+        rename_part_to_final(&part, &final_path).await.unwrap();
+
+        assert!(!part.exists());
+        assert!(final_path.exists());
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"image data");
+    }
+
+    #[tokio::test]
+    async fn rename_part_to_final_destination_already_exists() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("photo.part");
+        let final_path = dir.path().join("photo.jpg");
+        tokio::fs::write(&final_path, b"existing").await.unwrap();
+        tokio::fs::write(&part, b"duplicate").await.unwrap();
+
+        // Should succeed regardless of platform behavior:
+        // - Linux: rename atomically overwrites (Ok path)
+        // - Windows: rename fails, guard detects existing file and cleans .part
+        rename_part_to_final(&part, &final_path).await.unwrap();
+
+        assert!(!part.exists(), ".part should not remain");
+        assert!(final_path.exists(), "final file should exist");
+    }
+
+    #[tokio::test]
+    async fn rename_part_to_final_nonexistent_part_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("missing.part");
+        let final_path = dir.path().join("photo.jpg");
+
+        let result = rename_part_to_final(&part, &final_path).await;
+        assert!(result.is_err(), "should fail when .part doesn't exist");
+    }
 }

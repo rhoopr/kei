@@ -322,6 +322,41 @@ mod tests {
     }
 
     #[test]
+    fn asset_item_type_equality() {
+        assert_eq!(AssetItemType::Image, AssetItemType::Image);
+        assert_eq!(AssetItemType::Movie, AssetItemType::Movie);
+        assert_ne!(AssetItemType::Image, AssetItemType::Movie);
+    }
+
+    #[test]
+    fn asset_item_type_debug() {
+        assert_eq!(format!("{:?}", AssetItemType::Image), "Image");
+        assert_eq!(format!("{:?}", AssetItemType::Movie), "Movie");
+    }
+
+    #[test]
+    fn change_reason_equality() {
+        assert_eq!(ChangeReason::Created, ChangeReason::Created);
+        assert_eq!(ChangeReason::SoftDeleted, ChangeReason::SoftDeleted);
+        assert_eq!(ChangeReason::HardDeleted, ChangeReason::HardDeleted);
+        assert_eq!(ChangeReason::Hidden, ChangeReason::Hidden);
+        assert_ne!(ChangeReason::Created, ChangeReason::SoftDeleted);
+        assert_ne!(ChangeReason::HardDeleted, ChangeReason::Hidden);
+    }
+
+    #[test]
+    fn change_reason_debug() {
+        for (variant, expected) in [
+            (ChangeReason::Created, "Created"),
+            (ChangeReason::SoftDeleted, "SoftDeleted"),
+            (ChangeReason::HardDeleted, "HardDeleted"),
+            (ChangeReason::Hidden, "Hidden"),
+        ] {
+            assert_eq!(format!("{variant:?}"), expected);
+        }
+    }
+
+    #[test]
     fn asset_version_size_variants_have_distinct_repr_values() {
         let variants = [
             AssetVersionSize::Original as u8,
