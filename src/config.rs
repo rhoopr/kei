@@ -383,10 +383,10 @@ pub(crate) fn resolve_data_dir(
         return expand_tilde(d);
     }
     // Default: parent of config file path
-    config_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| expand_tilde("~/.config/kei"))
+    config_path.parent().map_or_else(
+        || expand_tilde("~/.config/kei"),
+        std::path::Path::to_path_buf,
+    )
 }
 
 /// Resolve `password_file` from CLI + TOML.
@@ -436,7 +436,7 @@ impl Config {
         {
             anyhow::ensure!(!username.is_empty(), "username must not be empty");
         }
-        if let Some(ref pw_str) = password_str {
+        if let Some(pw_str) = &password_str {
             anyhow::ensure!(!pw_str.is_empty(), "password must not be empty");
         }
 
@@ -568,7 +568,7 @@ impl Config {
             })
             .collect::<anyhow::Result<_>>()?;
         let recent = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
-        if let Some(0) = recent {
+        if recent == Some(0) {
             anyhow::bail!("recent must be >= 1 (got 0)");
         }
         let skip_created_before_str = sync

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.1] - 2026-04-12
+
+### Fixed
+
+- **Session lock held during watch idle sleep** - The exclusive file lock was held for the entire watch cycle including idle sleep, preventing `login get-code` / `login submit-code` from acquiring the lock for 2FA. Lock is now released before sleep and reacquired after. ([#191], [#192])
+- **`--library` ignored by `import-existing` and `list albums`** - Users with shared libraries couldn't import or list albums for those libraries. ([#190])
+- **Error message referenced deprecated `kei credential set`** - Updated to `kei password set`. ([#190])
+- Replace blocking `std::fs::metadata` with `tokio::fs::metadata` in 2FA polling loop.
+- Log `touch_last_seen` database errors instead of silently discarding them.
+
+### Added
+
+- `Session::reacquire_lock()` for re-locking after release in watch mode. ([#192])
+- `AuthError::LockContention` typed variant, replacing fragile string matching. ([#192])
+- `retry_on_lock_contention()` so `login` subcommands wait briefly instead of failing when sync is mid-auth. ([#192])
+
+### Changed
+
+- Return `Option<&str>` from `Session::client_id` instead of `Option<&String>`.
+- Remove unnecessary `async` from `run_password` and `run_config_show`.
+- Narrow 12 `pub` items to `pub(crate)` for tighter internal visibility.
+- Add `const fn` on 10 predicate/constructor functions.
+- Extract `TWO_FA_POLL_SECS` and `STALE_PART_FILE_SECS` named constants.
+- Apply clippy pedantic/nursery fixes across 30 files (redundant closures, `Self` usage, idiomatic bindings, structured tracing, thiserror on `PartialSyncError`, `let-else`, lazy `or_else`).
+
+[#190]: https://github.com/rhoopr/kei/pull/190
+[#191]: https://github.com/rhoopr/kei/issues/191
+[#192]: https://github.com/rhoopr/kei/pull/192
+
 ## [0.7.0] - 2026-04-11
 
 ### Added

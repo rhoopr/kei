@@ -199,8 +199,11 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     hasher.update([u8::from(config.skip_photos)]);
     hasher.update([config.live_photo_mode as u8]);
     // filename_exclude patterns affect which assets are eligible
-    let mut sorted_excludes: Vec<&str> =
-        config.filename_exclude.iter().map(|p| p.as_str()).collect();
+    let mut sorted_excludes: Vec<&str> = config
+        .filename_exclude
+        .iter()
+        .map(glob::Pattern::as_str)
+        .collect();
     sorted_excludes.sort_unstable();
     for pattern in &sorted_excludes {
         hasher.update(pattern.as_bytes());
@@ -243,8 +246,8 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     hasher.update(b"\0");
     hasher.update(config.folder_structure.as_bytes());
     hasher.update(b"\0");
-    hasher.update(format!("{:?}", size).as_bytes());
-    hasher.update(format!("{:?}", live_photo_size).as_bytes());
+    hasher.update(format!("{size:?}").as_bytes());
+    hasher.update(format!("{live_photo_size:?}").as_bytes());
     hasher.update(format!("{:?}", config.file_match_policy).as_bytes());
     hasher.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
     hasher.update(format!("{:?}", config.align_raw).as_bytes());
@@ -267,15 +270,22 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
         hasher.update(album.as_bytes());
         hasher.update(b"\0");
     }
-    let mut sorted_excludes: Vec<&str> = config.exclude_albums.iter().map(|s| s.as_str()).collect();
+    let mut sorted_excludes: Vec<&str> = config
+        .exclude_albums
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
     sorted_excludes.sort_unstable();
     for name in &sorted_excludes {
         hasher.update(b"exclude:");
         hasher.update(name.as_bytes());
         hasher.update(b"\0");
     }
-    let mut sorted_fn_excludes: Vec<&str> =
-        config.filename_exclude.iter().map(|s| s.as_str()).collect();
+    let mut sorted_fn_excludes: Vec<&str> = config
+        .filename_exclude
+        .iter()
+        .map(glob::Pattern::as_str)
+        .collect();
     sorted_fn_excludes.sort_unstable();
     for pattern in &sorted_fn_excludes {
         hasher.update(b"fnexclude:");
@@ -1046,7 +1056,7 @@ fn filter_asset_to_tasks(
             Some(download_path.clone())
         };
 
-        if let Some(ref path) = final_path {
+        if let Some(path) = &final_path {
             // Record the effective filename used for the primary download so the
             // MOV companion is derived from it, keeping HEIC/MOV paired after dedup.
             if let Some(stem) = path.file_name().and_then(|f| f.to_str()) {
@@ -1244,6 +1254,7 @@ const AUTH_ERROR_THRESHOLD: usize = 3;
 
 /// A successful download whose state write to SQLite failed on first attempt.
 /// Accumulated during the download loop and retried in a final flush.
+#[derive(Debug)]
 struct PendingStateWrite {
     asset_id: Box<str>,
     version_size: VersionSizeKey,
@@ -1343,10 +1354,7 @@ struct StreamingResult {
 /// older than the last completed sync. These are leftovers from interrupted
 /// downloads that will never be resumed (new downloads produce fresh .part files).
 async fn cleanup_orphan_part_files(config: &DownloadConfig) {
-    let db = match &config.state_db {
-        Some(db) => db,
-        None => return,
-    };
+    let Some(db) = &config.state_db else { return };
     let cutoff = match db.get_summary().await {
         Ok(summary) => match summary.last_sync_completed {
             Some(ts) => ts,
@@ -1364,16 +1372,15 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
     }
 
     let suffix = config.temp_suffix.clone();
-    let dir = dir.to_path_buf();
+    let dir = dir.clone();
     let cutoff_secs = cutoff.timestamp();
 
     let cleaned = tokio::task::spawn_blocking(move || {
         let mut cleaned = 0usize;
         let mut stack = vec![dir];
         while let Some(current) = stack.pop() {
-            let entries = match std::fs::read_dir(&current) {
-                Ok(e) => e,
-                Err(_) => continue,
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -2150,7 +2157,9 @@ where
                             })
                         {
                             if let Some(db) = &producer_state_db {
-                                let _ = db.touch_last_seen(asset.id()).await;
+                                if let Err(e) = db.touch_last_seen(asset.id()).await {
+                                    tracing::debug!(error = %e, asset_id = asset.id(), "Failed to update last-seen timestamp");
+                                }
                             }
                             skipped_by_state += 1;
                             producer_pb.inc(1);
@@ -2642,6 +2651,18 @@ struct PassConfig<'a> {
     state_db: Option<Arc<dyn StateDb>>,
 }
 
+impl std::fmt::Debug for PassConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassConfig")
+            .field("set_exif", &self.set_exif)
+            .field("concurrency", &self.concurrency)
+            .field("no_progress_bar", &self.no_progress_bar)
+            .field("temp_suffix", &self.temp_suffix)
+            .field("state_db", &self.state_db.as_ref().map(|_| ".."))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Execute a download pass over the given tasks, returning any that failed.
 async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> PassResult {
     let pb = create_progress_bar(config.no_progress_bar, false, tasks.len() as u64);
@@ -2822,7 +2843,7 @@ async fn download_single_task(
 
     // Compute SHA-256 of the downloaded content before EXIF modification
     // so we store a hash that reflects the original download bytes.
-    let download_checksum = if let Some(ref path) = part_path {
+    let download_checksum = if let Some(path) = &part_path {
         Some(file::compute_sha256(path).await?)
     } else {
         None

@@ -372,7 +372,7 @@ impl PhotoAlbum {
         // Compute effective total, capped by --recent if set.
         let effective_total = total_count
             .map(|tc| limit.map_or(tc, |lim| tc.min(u64::from(lim))))
-            .or(limit.map(u64::from));
+            .or_else(|| limit.map(u64::from));
 
         // Use 2x concurrency for enumeration fetchers — Apple's CloudKit
         // doesn't throttle at these levels and it halves enumeration time.
@@ -535,8 +535,8 @@ impl PhotoAlbum {
                 };
 
                 // Capture the zone-level syncToken from each page response.
-                if let Some(ref shared) = shared_sync_token {
-                    if let Some(ref token) = query.sync_token {
+                if let Some(shared) = &shared_sync_token {
+                    if let Some(token) = &query.sync_token {
                         *shared.lock().await = Some(token.clone());
                     }
                 }

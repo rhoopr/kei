@@ -42,7 +42,7 @@ impl DownloadClient for Client {
         url: &str,
         resume_from: Option<u64>,
     ) -> Result<DownloadResponse, BoxError> {
-        let mut request = Client::get(self, url);
+        let mut request = Self::get(self, url);
         if let Some(offset) = resume_from {
             request = request.header("Range", format!("bytes={offset}-"));
         }
@@ -53,7 +53,7 @@ impl DownloadClient for Client {
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         let stream = response
             .bytes_stream()
             .map(|r| r.map_err(|e| Box::new(e) as BoxError));
@@ -138,6 +138,9 @@ pub(super) async fn download_file<C: DownloadClient>(
 
 /// Single download attempt with resume support.
 ///
+/// .part files older than this are considered stale (crashed runs) and restarted.
+const STALE_PART_FILE_SECS: u64 = 24 * 3600;
+
 /// If a .part file already exists, sends a Range request to resume from where
 /// it left off. Falls back to a fresh download if the server doesn't support
 /// Range or returns an unexpected status.
@@ -157,7 +160,7 @@ async fn attempt_download<C: DownloadClient>(
             // from potentially corrupt bytes.
             let stale = meta.modified().ok().is_some_and(|mtime| {
                 mtime.elapsed().unwrap_or(std::time::Duration::ZERO)
-                    > std::time::Duration::from_secs(24 * 3600)
+                    > std::time::Duration::from_secs(STALE_PART_FILE_SECS)
             });
             if stale {
                 tracing::warn!(

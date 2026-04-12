@@ -56,12 +56,12 @@ const _: () = assert!(std::mem::size_of::<AuthError>() <= 96);
 
 impl AuthError {
     /// Check if this error indicates that 2FA is required but no code was provided.
-    pub fn is_two_factor_required(&self) -> bool {
+    pub const fn is_two_factor_required(&self) -> bool {
         matches!(self, Self::TwoFactorRequired)
     }
 
     /// Check if this error indicates lock contention with another kei instance.
-    pub fn is_lock_contention(&self) -> bool {
+    pub const fn is_lock_contention(&self) -> bool {
         matches!(self, Self::LockContention(_))
     }
 

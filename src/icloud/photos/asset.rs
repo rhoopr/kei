@@ -70,7 +70,7 @@ fn decode_filename(fields: &Value) -> Option<String> {
             String::from_utf8(decoded).ok()
         }
         other => {
-            warn!("Unsupported filenameEnc type: {}", other);
+            warn!(enc_type = %other, "Unsupported filenameEnc type");
             None
         }
     }
@@ -141,16 +141,15 @@ fn extract_versions(
             continue;
         }
 
-        let size = match res_entry["size"].as_u64() {
-            Some(s) => s,
-            None => {
-                warn!(
-                    asset = %record_name,
-                    field = format_args!("{res_field}.size"),
-                    "Missing size, defaulting to 0"
-                );
-                0
-            }
+        let size = if let Some(s) = res_entry["size"].as_u64() {
+            s
+        } else {
+            warn!(
+                asset = %record_name,
+                field = format_args!("{res_field}.size"),
+                "Missing size, defaulting to 0"
+            );
+            0
         };
 
         let url: Box<str> = if let Some(u) = res_entry["downloadURL"].as_str() {
@@ -296,7 +295,7 @@ impl PhotoAsset {
     }
 
     /// Check if a specific version exists.
-    pub fn contains_version(&self, key: AssetVersionSize) -> bool {
+    pub(crate) fn contains_version(&self, key: AssetVersionSize) -> bool {
         self.versions.iter().any(|(k, _)| *k == key)
     }
 
@@ -416,7 +415,7 @@ impl DeltaRecordBuffer {
                     }
                     "CPLAsset" => {
                         let master_ref = extract_master_ref(&record.fields);
-                        if let Some(ref master_name) = master_ref {
+                        if let Some(master_name) = &master_ref {
                             if let Some(master_record) = self.pending_masters.remove(master_name) {
                                 let master_reason = classify_change_reason(&master_record);
                                 let final_reason = Self::reconcile_reasons(master_reason, reason);

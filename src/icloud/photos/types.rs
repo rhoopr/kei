@@ -39,11 +39,11 @@ pub enum AssetVersionSize {
 impl From<VersionSize> for AssetVersionSize {
     fn from(v: VersionSize) -> Self {
         match v {
-            VersionSize::Original => AssetVersionSize::Original,
-            VersionSize::Medium => AssetVersionSize::Medium,
-            VersionSize::Thumb => AssetVersionSize::Thumb,
-            VersionSize::Adjusted => AssetVersionSize::Adjusted,
-            VersionSize::Alternative => AssetVersionSize::Alternative,
+            VersionSize::Original => Self::Original,
+            VersionSize::Medium => Self::Medium,
+            VersionSize::Thumb => Self::Thumb,
+            VersionSize::Adjusted => Self::Adjusted,
+            VersionSize::Alternative => Self::Alternative,
         }
     }
 }

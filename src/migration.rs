@@ -18,7 +18,7 @@ const OLD_COOKIE_DIR: &str = "~/.icloudpd-rs";
 
 /// Summary of what was migrated.
 #[derive(Debug, Default)]
-pub struct MigrationReport {
+pub(crate) struct MigrationReport {
     pub warnings: Vec<String>,
     pub config_migrated: bool,
     pub cookies_migrated: bool,

@@ -16,7 +16,7 @@ fn non_empty_string(s: &str) -> Result<String, String> {
 /// Strip non-digit characters and validate that the result is exactly 6 digits.
 /// Accepts "123456", "123 456", "123-456", etc.
 fn parse_2fa_code(s: &str) -> Result<String, String> {
-    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+    let digits: String = s.chars().filter(char::is_ascii_digit).collect();
     if digits.len() == 6 {
         Ok(digits)
     } else {
@@ -332,7 +332,7 @@ pub enum ConfigAction {
 
 /// Credential management actions (legacy, hidden).
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
-pub enum CredentialAction {
+pub(crate) enum CredentialAction {
     /// Store a password in the credential store (prompts interactively)
     Set,
     /// Remove a stored password
@@ -512,7 +512,7 @@ pub struct Cli {
 impl SyncArgs {
     /// Merge top-level (fallback) sync args into self.
     /// Subcommand values take precedence; top-level fills in gaps.
-    fn merge_from(&mut self, fallback: &SyncArgs) {
+    fn merge_from(&mut self, fallback: &Self) {
         if self.directory.is_none() {
             self.directory.clone_from(&fallback.directory);
         }
@@ -611,7 +611,7 @@ impl SyncArgs {
 
 impl PasswordArgs {
     /// Merge top-level (fallback) password args into self.
-    fn merge_from(&mut self, fallback: &PasswordArgs) {
+    fn merge_from(&mut self, fallback: &Self) {
         if self.password.is_none() {
             self.password.clone_from(&fallback.password);
         }
@@ -634,41 +634,38 @@ impl Cli {
     /// Legacy subcommands and compat flags are mapped to their new equivalents
     /// with deprecation warnings to stderr.
     pub fn effective_command(&self) -> Command {
-        let cmd = match &self.command {
-            Some(cmd) => {
-                let mut cmd = cmd.clone();
-                cmd.merge_top_level_args(&self.password, &self.sync);
-                cmd
-            }
-            None => {
-                // Check hidden compat flags on bare invocation
-                if self.sync.auth_only {
-                    deprecation_warning("--auth-only", "kei login");
-                    return Command::Login {
-                        password: self.password.clone(),
-                        subcommand: None,
-                    };
-                }
-                if self.sync.list_albums {
-                    deprecation_warning("--list-albums", "kei list albums");
-                    return Command::List {
-                        password: self.password.clone(),
-                        library: self.sync.library.clone(),
-                        what: ListCommand::Albums,
-                    };
-                }
-                if self.sync.list_libraries {
-                    deprecation_warning("--list-libraries", "kei list libraries");
-                    return Command::List {
-                        password: self.password.clone(),
-                        library: self.sync.library.clone(),
-                        what: ListCommand::Libraries,
-                    };
-                }
-                Command::Sync {
+        let cmd = if let Some(cmd) = &self.command {
+            let mut cmd = cmd.clone();
+            cmd.merge_top_level_args(&self.password, &self.sync);
+            cmd
+        } else {
+            // Check hidden compat flags on bare invocation
+            if self.sync.auth_only {
+                deprecation_warning("--auth-only", "kei login");
+                return Command::Login {
                     password: self.password.clone(),
-                    sync: self.sync.clone(),
-                }
+                    subcommand: None,
+                };
+            }
+            if self.sync.list_albums {
+                deprecation_warning("--list-albums", "kei list albums");
+                return Command::List {
+                    password: self.password.clone(),
+                    library: self.sync.library.clone(),
+                    what: ListCommand::Albums,
+                };
+            }
+            if self.sync.list_libraries {
+                deprecation_warning("--list-libraries", "kei list libraries");
+                return Command::List {
+                    password: self.password.clone(),
+                    library: self.sync.library.clone(),
+                    what: ListCommand::Libraries,
+                };
+            }
+            Command::Sync {
+                password: self.password.clone(),
+                sync: self.sync.clone(),
             }
         };
 

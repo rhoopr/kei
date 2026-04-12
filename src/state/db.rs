@@ -477,7 +477,7 @@ impl StateDb for SqliteStateDb {
 
         let records = stmt
             .query_map(
-                rusqlite::params![limit as i64, offset as i64],
+                rusqlite::params![i64::from(limit), offset as i64],
                 row_to_asset_record,
             )
             .map_err(|e| StateError::query(&e))?

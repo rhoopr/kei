@@ -20,7 +20,7 @@ pub enum Event {
 }
 
 impl Event {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::TwoFaRequired => "2fa_required",
             Self::SyncComplete => "sync_complete",
@@ -41,7 +41,7 @@ pub struct Notifier {
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Notifier {
-    pub fn new(script: Option<PathBuf>) -> Self {
+    pub const fn new(script: Option<PathBuf>) -> Self {
         Self { script }
     }
 

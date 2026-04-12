@@ -33,7 +33,7 @@ impl RetryConfig {
     ///
     /// Formula: `min(base_delay * 2^retry, max_delay) + random_jitter(0..base_delay)`
     #[must_use]
-    pub fn delay_for_retry(&self, retry: u32) -> std::time::Duration {
+    pub(crate) fn delay_for_retry(&self, retry: u32) -> std::time::Duration {
         let exp_delay = self
             .base_delay_secs
             .saturating_mul(1u64.checked_shl(retry).unwrap_or(u64::MAX));

@@ -27,10 +27,10 @@ pub enum Domain {
 }
 
 impl Domain {
-    pub fn as_str(&self) -> &str {
+    pub const fn as_str(&self) -> &str {
         match self {
-            Domain::Com => "com",
-            Domain::Cn => "cn",
+            Self::Com => "com",
+            Self::Cn => "cn",
         }
     }
 }
@@ -96,10 +96,10 @@ impl LivePhotoSize {
     pub fn to_asset_version_size(self) -> crate::icloud::photos::AssetVersionSize {
         use crate::icloud::photos::AssetVersionSize;
         match self {
-            LivePhotoSize::Original => AssetVersionSize::LiveOriginal,
-            LivePhotoSize::Medium => AssetVersionSize::LiveMedium,
-            LivePhotoSize::Thumb => AssetVersionSize::LiveThumb,
-            LivePhotoSize::Adjusted => AssetVersionSize::LiveAdjusted,
+            Self::Original => AssetVersionSize::LiveOriginal,
+            Self::Medium => AssetVersionSize::LiveMedium,
+            Self::Thumb => AssetVersionSize::LiveThumb,
+            Self::Adjusted => AssetVersionSize::LiveAdjusted,
         }
     }
 }

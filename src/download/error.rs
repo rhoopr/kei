@@ -47,13 +47,13 @@ const _: () = assert!(std::mem::size_of::<DownloadError>() <= 88);
 
 impl DownloadError {
     /// Whether this error is transient and worth retrying.
-    pub fn is_retryable(&self) -> bool {
+    pub const fn is_retryable(&self) -> bool {
         match self {
-            DownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
-            DownloadError::ContentLengthMismatch { .. }
-            | DownloadError::InvalidContent { .. }
-            | DownloadError::Http { .. } => true,
-            DownloadError::Disk(_) | DownloadError::Other(_) => false,
+            Self::HttpStatus { status, .. } => *status == 429 || *status >= 500,
+            Self::ContentLengthMismatch { .. }
+            | Self::InvalidContent { .. }
+            | Self::Http { .. } => true,
+            Self::Disk(_) | Self::Other(_) => false,
         }
     }
 
@@ -62,10 +62,10 @@ impl DownloadError {
     /// HTTP 401 (Unauthorized) and 403 (Forbidden) typically indicate that
     /// the iCloud session token has been invalidated server-side. The caller
     /// should re-authenticate and retry.
-    pub fn is_session_expired(&self) -> bool {
+    pub const fn is_session_expired(&self) -> bool {
         matches!(
             self,
-            DownloadError::HttpStatus {
+            Self::HttpStatus {
                 status: 401 | 403,
                 ..
             }

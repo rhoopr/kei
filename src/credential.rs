@@ -26,6 +26,7 @@ const KEYRING_SERVICE: &str = "kei";
 
 /// Credential store that tries the OS keyring first, falling back to an
 /// AES-256-GCM encrypted file in the config directory.
+#[derive(Debug)]
 pub struct CredentialStore {
     username: String,
     config_dir: PathBuf,

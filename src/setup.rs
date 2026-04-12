@@ -21,6 +21,7 @@ pub(crate) enum SetupResult {
 }
 
 /// Collected answers from the interactive setup wizard.
+#[derive(Debug)]
 struct SetupAnswers {
     // Account
     username: String,
@@ -185,7 +186,10 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     }
 
     // Write .env file
-    let env_path = config_path.parent().unwrap_or(Path::new(".")).join(".env");
+    let env_path = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".env");
     // Single-quote values to prevent shell expansion of special characters
     // ($, `, !, etc.) when the file is sourced. Single quotes inside the
     // password are escaped as '\'' (end-quote, literal quote, re-open quote).

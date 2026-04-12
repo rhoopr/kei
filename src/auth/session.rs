@@ -57,8 +57,7 @@ pub fn sanitize_username(username: &str) -> String {
         let prefix_end = sanitized[..prefix_len]
             .char_indices()
             .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(prefix_len);
+            .map_or(prefix_len, |(i, c)| i + c.len_utf8());
         format!("{}_{:016x}", &sanitized[..prefix_end], hash)
     }
 }
@@ -77,7 +76,7 @@ fn is_cookie_expired(cookie_str: &str, now: &chrono::DateTime<chrono::Utc>) -> b
 }
 
 /// A single persisted cookie entry (URL + Set-Cookie header value).
-#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 struct CookieEntry {
     url: String,
     cookie: String,
@@ -318,7 +317,7 @@ impl Session {
         })
     }
 
-    pub fn cookiejar_path(&self) -> PathBuf {
+    pub(crate) fn cookiejar_path(&self) -> PathBuf {
         self.cookie_dir.join(&self.sanitized_username)
     }
 
@@ -351,8 +350,8 @@ impl Session {
         Ok(())
     }
 
-    pub fn client_id(&self) -> Option<&String> {
-        self.session_data.get("client_id")
+    pub fn client_id(&self) -> Option<&str> {
+        self.session_data.get("client_id").map(String::as_str)
     }
 
     pub fn set_client_id(&mut self, client_id: &str) {

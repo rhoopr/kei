@@ -74,7 +74,7 @@ pub async fn authenticate(
     // Prefer persisted client_id to maintain session continuity across runs
     let client_id = session
         .client_id()
-        .cloned()
+        .map(str::to_owned)
         .or(client_id)
         .unwrap_or_else(|| format!("auth-{}", Uuid::new_v4()));
     session.set_client_id(&client_id);
@@ -190,25 +190,21 @@ pub async fn authenticate(
                     tracing::info!("Code requested - check your trusted devices");
                     continue;
                 }
-                match twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, &input)
+                if twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, &input)
                     .await?
                 {
-                    true => {
-                        verified = true;
-                        break;
-                    }
-                    false => {
-                        wrong_codes += 1;
-                        if wrong_codes >= MAX_WRONG_CODES {
-                            break;
-                        }
-                        tracing::warn!(
-                            attempt = wrong_codes,
-                            max = MAX_WRONG_CODES,
-                            "Wrong code, please try again"
-                        );
-                    }
+                    verified = true;
+                    break;
                 }
+                wrong_codes += 1;
+                if wrong_codes >= MAX_WRONG_CODES {
+                    break;
+                }
+                tracing::warn!(
+                    attempt = wrong_codes,
+                    max = MAX_WRONG_CODES,
+                    "Wrong code, please try again"
+                );
             }
             verified
         };
@@ -253,7 +249,7 @@ pub async fn send_2fa_push(
 
     let client_id = session
         .client_id()
-        .cloned()
+        .map(str::to_owned)
         .unwrap_or_else(|| format!("auth-{}", Uuid::new_v4()));
     session.set_client_id(&client_id);
 
