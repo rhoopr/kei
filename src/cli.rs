@@ -604,6 +604,7 @@ impl SyncArgs {
             self.notification_script
                 .clone_from(&fallback.notification_script);
         }
+        self.save_password = self.save_password || fallback.save_password;
         self.retry_failed = self.retry_failed || fallback.retry_failed;
     }
 }
@@ -1309,6 +1310,16 @@ mod tests {
         args.push("--save-password");
         let cli = parse(&args);
         assert!(cli.sync.save_password);
+    }
+
+    #[test]
+    fn test_save_password_merges_into_subcommand() {
+        let cli = parse(&["kei", "--username", "u@e.com", "--save-password", "sync"]);
+        if let Command::Sync { sync, .. } = cli.effective_command() {
+            assert!(sync.save_password);
+        } else {
+            panic!("expected Sync command");
+        }
     }
 
     // ── Sync args ─────────────────────────────────────────────────
