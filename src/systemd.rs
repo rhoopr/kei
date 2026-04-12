@@ -11,7 +11,7 @@ pub(crate) struct SystemdNotifier {
 
 impl SystemdNotifier {
     /// Create a new notifier. When `enabled` is false, all methods are no-ops.
-    pub(crate) fn new(enabled: bool) -> Self {
+    pub(crate) const fn new(enabled: bool) -> Self {
         Self { enabled }
     }
 

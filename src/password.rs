@@ -21,6 +21,7 @@ use crate::credential::CredentialStore;
 ///
 /// Between auth cycles (e.g., watch mode re-auth), the closure holds only the
 /// source descriptor — no password remains in memory.
+#[derive(Debug)]
 pub enum PasswordSource {
     /// Password already in memory (from `--password` flag, env var, or TOML).
     Direct(Arc<SecretString>),
@@ -91,7 +92,7 @@ pub fn build_password_source(
 ///
 /// Designed for Docker secrets (`/run/secrets/...`) and similar file-based
 /// credential stores. The file is re-read on each call to support rotation.
-pub fn read_password_file(path: &Path) -> anyhow::Result<SecretString> {
+pub(crate) fn read_password_file(path: &Path) -> anyhow::Result<SecretString> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read password file: {}", path.display()))?;
     let trimmed = strip_trailing_newline(&contents);
@@ -108,7 +109,7 @@ pub fn read_password_file(path: &Path) -> anyhow::Result<SecretString> {
 /// The command runs via `sh -c` with stdin as `/dev/null` (prevents hanging)
 /// and stderr inherited (command errors visible to the user). Re-executed on
 /// each auth attempt to support dynamic secret managers (1Password, Vault, etc.).
-pub fn run_password_command(cmd: &str) -> anyhow::Result<SecretString> {
+pub(crate) fn run_password_command(cmd: &str) -> anyhow::Result<SecretString> {
     let output = std::process::Command::new("sh")
         .args(["-c", cmd])
         .stdin(std::process::Stdio::null())

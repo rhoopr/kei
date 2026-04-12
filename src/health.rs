@@ -12,7 +12,7 @@ pub(crate) struct HealthStatus {
 }
 
 impl HealthStatus {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             last_sync_at: None,
             last_success_at: None,

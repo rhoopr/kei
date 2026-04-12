@@ -147,7 +147,7 @@ pub async fn trigger_push_notification(
 /// Strip non-digit characters and check whether the result is a valid 6-digit 2FA code.
 /// Accepts "123456", "123 456", "123-456", etc.
 fn normalize_2fa_code(raw: &str) -> Option<String> {
-    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
     if digits.len() == TWO_FA_CODE_LENGTH {
         Some(digits)
     } else {

@@ -51,7 +51,7 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
             .password
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(ref pw) = *password {
+        if let Some(pw) = &*password {
             let pw_str = pw.expose_secret();
             if !pw_str.is_empty() {
                 // A buffer shorter than the password can't contain it,
@@ -116,7 +116,7 @@ fn harden_process() {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        if libc::setrlimit(libc::RLIMIT_CORE, &rlim) != 0 {
+        if libc::setrlimit(libc::RLIMIT_CORE, &raw const rlim) != 0 {
             tracing::debug!("setrlimit(RLIMIT_CORE, 0) failed");
         }
     }
@@ -128,14 +128,9 @@ const EXIT_PARTIAL: u8 = 2;
 const EXIT_AUTH: u8 = 3;
 
 /// Returned when some (but not all) downloads failed during a sync.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0} downloads failed")]
 struct PartialSyncError(usize);
-impl std::fmt::Display for PartialSyncError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} downloads failed", self.0)
-    }
-}
-impl std::error::Error for PartialSyncError {}
 
 /// Query available disk space on the filesystem containing `path`.
 ///
@@ -156,7 +151,7 @@ fn available_disk_space(path: &Path) -> Option<u64> {
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+        if libc::statvfs(c_path.as_ptr(), &raw mut stat) != 0 {
             return None;
         }
         Some(widen(stat.f_bavail) * widen(stat.f_frsize))
@@ -225,7 +220,11 @@ async fn init_photos_service(
         .map(|ep| ep.url.clone())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
 
-    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
+    let client_id = auth_result
+        .session
+        .client_id()
+        .unwrap_or_default()
+        .to_owned();
     let dsid = auth_result
         .data
         .ds_info
@@ -273,7 +272,7 @@ async fn init_photos_service(
                 let mut session = shared_session.write().await;
                 let client_id = session
                     .client_id()
-                    .cloned()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| format!("auth-{}", uuid::Uuid::new_v4()));
                 auth::srp::authenticate_srp(
                     &mut *session,
@@ -296,7 +295,7 @@ async fn init_photos_service(
 
             let client_id = {
                 let session = shared_session.read().await;
-                session.client_id().cloned().unwrap_or_default()
+                session.client_id().unwrap_or_default().to_owned()
             };
             let dsid = fresh_data.ds_info.as_ref().and_then(|ds| ds.dsid.clone());
             let params = build_photos_params(&client_id, dsid.as_deref());
@@ -387,6 +386,9 @@ where
     Ok(())
 }
 
+/// Interval between polls when waiting for a 2FA code submission.
+const TWO_FA_POLL_SECS: u64 = 5;
+
 /// Wait for `submit-code` to update the session file, with no network traffic.
 ///
 /// Polls the session file's modification time every 5 seconds. When
@@ -394,16 +396,18 @@ where
 /// changing the mtime and breaking the loop.
 async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
     let session_path = auth::session_file_path(cookie_dir, username);
-    let initial_mtime = std::fs::metadata(&session_path)
+    let initial_mtime = tokio::fs::metadata(&session_path)
+        .await
         .and_then(|m| m.modified())
         .ok();
 
     tracing::info!("Waiting for 2FA code submission...");
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(TWO_FA_POLL_SECS)).await;
 
-        let current_mtime = std::fs::metadata(&session_path)
+        let current_mtime = tokio::fs::metadata(&session_path)
+            .await
             .and_then(|m| m.modified())
             .ok();
         if current_mtime != initial_mtime {
@@ -434,7 +438,7 @@ where
 
         for attempt in 0..3 {
             if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(TWO_FA_POLL_SECS)).await;
             }
             match (auth_fn)().await {
                 Ok(result) => return Ok(result),
@@ -704,7 +708,7 @@ async fn verify_local_checksum(path: &Path, expected_hex: &str) -> anyhow::Resul
 }
 
 /// Run the password subcommand: set, clear, or show backend.
-async fn run_password(
+fn run_password(
     action: cli::PasswordAction,
     globals: &config::GlobalArgs,
     pw: &cli::PasswordArgs,
@@ -911,10 +915,7 @@ async fn run_list(
 }
 
 /// Run the config show command: dump resolved config as TOML.
-async fn run_config_show(
-    globals: &config::GlobalArgs,
-    toml: Option<&TomlConfig>,
-) -> anyhow::Result<()> {
+fn run_config_show(globals: &config::GlobalArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let cfg = config::Config::build(
         globals,
         cli::PasswordArgs::default(),
@@ -1370,7 +1371,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // Otherwise require the file to exist so typos in --config paths error.
     // When --config is explicit but the file doesn't exist and the parent
     // dir does exist, allow it (auto-config will create the file).
-    let can_auto_create = !config_path.exists() && config_path.parent().is_some_and(|p| p.is_dir());
+    let can_auto_create =
+        !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
     let mut toml_config = config::load_toml_config(&config_path, config_required)?;
 
@@ -1451,7 +1453,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             return run_login(subcommand, &password, &globals, toml_config.as_ref()).await;
         }
         Command::Password { password, action } => {
-            return run_password(action, &globals, &password, toml_config.as_ref()).await;
+            return run_password(action, &globals, &password, toml_config.as_ref());
         }
         Command::List {
             password,
@@ -1462,7 +1464,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         }
         Command::Config { action } => match action {
             cli::ConfigAction::Show => {
-                return run_config_show(&globals, toml_config.as_ref()).await;
+                return run_config_show(&globals, toml_config.as_ref());
             }
             cli::ConfigAction::Setup { output } => {
                 let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
@@ -1527,7 +1529,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let cli_data_dir = globals
         .data_dir
         .clone()
-        .or(globals.cookie_directory.clone());
+        .or_else(|| globals.cookie_directory.clone());
     let mut config = config::Config::build(&globals, pw, sync, toml_config)?;
 
     // On first run (no config file), persist CLI-provided values so
@@ -1551,7 +1553,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     }
 
     // Install password redaction now that we know the password
-    if let Some(ref pw) = config.password {
+    if let Some(pw) = &config.password {
         if let Ok(mut guard) = redact_password.lock() {
             *guard = Some(SecretString::from(pw.expose_secret().to_owned()));
         }
@@ -1749,7 +1751,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     // Handle --reset-sync-token (hidden compat flag): clear stored tokens before the sync loop
     if reset_sync_token {
-        if let Some(ref db) = state_db {
+        if let Some(db) = &state_db {
             let mut cleared_ok = true;
             if let Err(e) = db.set_metadata("db_sync_token", "").await {
                 tracing::warn!(error = %e, "Failed to clear db_sync_token");
@@ -1849,7 +1851,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         // cheap pre-check to skip cycles when nothing has changed.
         // Only used for single-library mode; multi-library skips this optimization.
         let skip_cycle = if is_watch_mode && !config.no_incremental && library_states.len() == 1 {
-            if let Some(ref db) = state_db {
+            if let Some(db) = &state_db {
                 let has_token = db
                     .get_metadata(&library_states[0].sync_token_key)
                     .await
@@ -1909,7 +1911,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             false
         };
 
-        if !skip_cycle {
+        if skip_cycle {
+            // Skipped cycle (no changes detected) — still update health so
+            // Docker HEALTHCHECK doesn't mark the container unhealthy after
+            // the 2-hour staleness window when no new photos are uploaded.
+            health.record_success();
+            health.write(&config.cookie_directory);
+        } else {
             sd_notifier.notify_status("Syncing...");
             sd_notifier.notify_watchdog();
 
@@ -1927,7 +1935,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 // that are newly eligible under the changed config (e.g. a
                 // user switching --size or adding --skip-videos).
                 if !config.dry_run {
-                    if let Some(ref db) = state_db {
+                    if let Some(db) = &state_db {
                         // Use a separate key from the download-path's "config_hash"
                         // (which tracks path-affecting fields only). This hash is a
                         // superset that also includes enumeration filters (albums,
@@ -1974,7 +1982,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         tracing::info!("Retry-failed requires full enumeration to find previously-failed assets");
                     }
                     download::SyncMode::Full
-                } else if let Some(ref db) = state_db {
+                } else if let Some(db) = &state_db {
                     match db.get_metadata(&lib_state.sync_token_key).await {
                         Ok(Some(ref token)) if !token.is_empty() => {
                             tracing::info!(zone = %lib_state.zone_name, "Stored sync token found, using incremental sync");
@@ -2023,8 +2031,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                     matches!(sync_result.outcome, download::DownloadOutcome::Success)
                         && !config.dry_run;
                 if should_store_token {
-                    if let Some(ref token) = sync_result.sync_token {
-                        if let Some(ref db) = state_db {
+                    if let Some(token) = &sync_result.sync_token {
+                        if let Some(db) = &state_db {
                             if let Err(e) = db.set_metadata(&lib_state.sync_token_key, token).await
                             {
                                 tracing::warn!(error = %e, "Failed to store sync token");
@@ -2161,12 +2169,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                     &config.username,
                 );
             }
-        } else {
-            // Skipped cycle (no changes detected) — still update health so
-            // Docker HEALTHCHECK doesn't mark the container unhealthy after
-            // the 2-hour staleness window when no new photos are uploaded.
-            health.record_success();
-            health.write(&config.cookie_directory);
         }
 
         if let Some(interval) = config.watch_with_interval {

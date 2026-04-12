@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub const SCHEMA_VERSION: i32 = 4;
+pub(crate) const SCHEMA_VERSION: i32 = 4;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -137,7 +137,7 @@ fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError>
                 "No migration defined for version {other}"
             )));
         }
-    };
+    }
     set_schema_version(conn, version)?;
     tracing::info!(version, "Migrated database schema");
     Ok(())

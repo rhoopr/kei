@@ -90,7 +90,7 @@ impl PhotosService {
     }
 
     /// Compute the service endpoint URL for a given library type.
-    pub fn get_service_endpoint(&self, library_type: &str) -> String {
+    pub(crate) fn get_service_endpoint(&self, library_type: &str) -> String {
         Self::build_service_endpoint(&self.service_root, library_type)
     }
 

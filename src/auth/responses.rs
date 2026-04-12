@@ -19,7 +19,7 @@ pub struct SrpInitResponse {
 /// Apple auth APIs sometimes return HTTP 200 with error details in the body
 /// instead of using HTTP status codes.
 #[derive(Debug, Deserialize)]
-pub struct AppleServiceError {
+pub(crate) struct AppleServiceError {
     #[serde(default)]
     pub code: String,
     #[serde(default)]
@@ -61,11 +61,11 @@ impl AccountLoginResponse {
     pub fn check_errors(&self) -> Result<(), AuthError> {
         if let Some(err) = self.service_errors.first() {
             let raw_message = if err.message.is_empty() {
-                err.title.clone().unwrap_or_else(|| "unknown".to_string())
+                err.title.as_deref().unwrap_or("unknown")
             } else {
-                err.message.clone()
+                &err.message
             };
-            return Err(AuthError::service_error(&err.code, &raw_message));
+            return Err(AuthError::service_error(&err.code, raw_message));
         }
         if self.has_error {
             return Err(AuthError::ServiceError {
@@ -89,13 +89,13 @@ pub struct DsInfo {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Webservices {
+pub(crate) struct Webservices {
     #[serde(default)]
     pub ckdatabasews: Option<WebserviceEndpoint>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct WebserviceEndpoint {
+pub(crate) struct WebserviceEndpoint {
     pub url: String,
 }
 

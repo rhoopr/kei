@@ -62,7 +62,7 @@ impl SrpTransport for Session {
         body: Option<&str>,
         headers: Option<HeaderMap>,
     ) -> Result<SrpResponse> {
-        let response = Session::post(self, url, body, headers).await?;
+        let response = Self::post(self, url, body, headers).await?;
         let status = response.status().as_u16();
         let bytes = response.bytes().await?;
         Ok(SrpResponse {

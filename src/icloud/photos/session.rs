@@ -226,10 +226,7 @@ impl SyncTokenError {
     /// Only token/zone-level issues warrant full re-enumeration; transient errors
     /// (THROTTLED, `RETRY_LATER`) should propagate without triggering an expensive fallback.
     pub fn should_fallback_to_full(&self) -> bool {
-        matches!(
-            self,
-            SyncTokenError::InvalidToken { .. } | SyncTokenError::ZoneNotFound { .. }
-        )
+        matches!(self, Self::InvalidToken { .. } | Self::ZoneNotFound { .. })
     }
 }
 
