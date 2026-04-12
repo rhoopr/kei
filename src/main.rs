@@ -1561,7 +1561,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 .is_some_and(auth::error::AuthError::is_two_factor_required) =>
         {
             let msg = format!(
-                "2FA required for {u}. Run: kei get-code",
+                "2FA required for {u}. Run: kei login get-code",
                 u = config.username
             );
             tracing::warn!(message = %msg, "2FA required");
@@ -2044,7 +2044,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         reauth_attempts -= 1;
 
                         let msg = format!(
-                            "2FA required for {u}. Run: kei get-code",
+                            "2FA required for {u}. Run: kei login get-code",
                             u = config.username
                         );
                         tracing::warn!(message = %msg, "2FA required");

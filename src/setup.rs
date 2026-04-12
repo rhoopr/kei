@@ -333,7 +333,7 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             .filter(|s| !s.is_empty())
             .collect();
         if !answers.albums.is_empty() {
-            println!("  Tip: run `kei sync --list-albums` to see available album names.");
+            println!("  Tip: run `kei list albums` to see available album names.");
         }
     }
 

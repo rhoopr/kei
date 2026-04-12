@@ -116,7 +116,9 @@ impl PhotosService {
         if let Some(lib) = self.shared_libraries.as_ref().and_then(|m| m.get(name)) {
             return Ok(lib);
         }
-        anyhow::bail!("Unknown library: '{name}'. Use --list-libraries to see available libraries.")
+        anyhow::bail!(
+            "Unknown library: '{name}'. Run `kei list libraries` to see available libraries."
+        )
     }
 
     /// Return all available libraries: primary + private (non-PrimarySync) + shared.
