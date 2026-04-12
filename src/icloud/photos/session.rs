@@ -62,8 +62,8 @@ const SERVICE_NOT_ACTIVATED_ERRORS: &[&str] = &["ZONE_NOT_FOUND", "AUTHENTICATIO
 #[derive(Debug, thiserror::Error)]
 #[error("CloudKit server error: {code} — {reason}")]
 pub struct CloudKitServerError {
-    pub code: String,
-    pub reason: String,
+    pub code: Box<str>,
+    pub reason: Box<str>,
     pub retryable: bool,
     /// True when the error indicates the iCloud service is not activated
     /// (ADP enabled, incomplete setup, or private db access disabled).
@@ -90,12 +90,11 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
         let reason = response["reason"]
             .as_str()
             .or_else(|| response["serverErrorMessage"].as_str())
-            .unwrap_or("unknown")
-            .to_string();
+            .unwrap_or("unknown");
         let retryable = RETRYABLE_SERVER_ERRORS
             .iter()
             .any(|&s| s.eq_ignore_ascii_case(code));
-        let service_not_activated = is_service_not_activated(code, &reason);
+        let service_not_activated = is_service_not_activated(code, reason);
         tracing::warn!(
             error_code = code,
             retryable,
@@ -103,8 +102,8 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
             "CloudKit server error: {reason}"
         );
         return Err(CloudKitServerError {
-            code: code.to_string(),
-            reason,
+            code: code.into(),
+            reason: reason.into(),
             retryable,
             service_not_activated,
         }
@@ -114,19 +113,28 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
     // Per-record errors: filter out errored records and keep valid ones.
     // Only return Err if ALL records are errored.
     if let Some(records) = response["records"].as_array() {
-        let (errored, valid): (Vec<&Value>, Vec<&Value>) = records
-            .iter()
-            .partition(|r| r["serverErrorCode"].as_str().is_some());
+        // Single pass: separate errored records (by reference) from valid
+        // records (cloned for output). Avoids the double allocation of
+        // partition() followed by cloned().collect().
+        let mut errored: Vec<&Value> = Vec::new();
+        let mut valid_owned: Vec<Value> = Vec::new();
+        for record in records {
+            if record["serverErrorCode"].as_str().is_some() {
+                errored.push(record);
+            } else {
+                valid_owned.push(record.clone());
+            }
+        }
 
         if !errored.is_empty() {
             let mut last_ck_err = None;
             for record in &errored {
                 let code = record["serverErrorCode"].as_str().unwrap_or("unknown");
-                let reason = record["reason"].as_str().unwrap_or("unknown").to_string();
+                let reason = record["reason"].as_str().unwrap_or("unknown");
                 let retryable = RETRYABLE_SERVER_ERRORS
                     .iter()
                     .any(|&s| s.eq_ignore_ascii_case(code));
-                let service_not_activated = is_service_not_activated(code, &reason);
+                let service_not_activated = is_service_not_activated(code, reason);
                 tracing::warn!(
                     error_code = code,
                     retryable,
@@ -134,24 +142,23 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                     "CloudKit per-record error: {reason}"
                 );
                 last_ck_err = Some(CloudKitServerError {
-                    code: code.to_string(),
-                    reason,
+                    code: code.into(),
+                    reason: reason.into(),
                     retryable,
                     service_not_activated,
                 });
             }
 
-            if valid.is_empty() {
+            if valid_owned.is_empty() {
                 return Err(last_ck_err.expect("errored is non-empty").into());
             }
-            let total = errored.len() + valid.len();
+            let total = errored.len() + valid_owned.len();
             tracing::warn!(
                 errored = errored.len(),
-                valid = valid.len(),
+                valid = valid_owned.len(),
                 total,
                 "Filtered errored records from CloudKit response"
             );
-            let valid_owned: Vec<Value> = valid.into_iter().cloned().collect();
             let mut response = response;
             response["records"] = Value::Array(valid_owned);
             return Ok(response);
@@ -307,7 +314,7 @@ mod tests {
         });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
-        assert_eq!(ck_err.code, "TRY_AGAIN_LATER");
+        assert_eq!(&*ck_err.code, "TRY_AGAIN_LATER");
         assert!(ck_err.retryable);
         assert!(!ck_err.service_not_activated);
         assert_eq!(classify_api_error(&err), RetryAction::Retry);
@@ -352,7 +359,7 @@ mod tests {
         });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
-        assert_eq!(ck_err.code, "RETRY_LATER");
+        assert_eq!(&*ck_err.code, "RETRY_LATER");
         assert!(ck_err.retryable);
     }
 
@@ -479,7 +486,7 @@ mod tests {
         });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
-        assert_eq!(ck_err.reason, "fallback message");
+        assert_eq!(&*ck_err.reason, "fallback message");
     }
 
     #[test]
@@ -489,7 +496,7 @@ mod tests {
         });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
-        assert_eq!(ck_err.reason, "unknown");
+        assert_eq!(&*ck_err.reason, "unknown");
     }
 
     #[test]

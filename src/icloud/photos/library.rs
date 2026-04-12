@@ -90,8 +90,8 @@ impl PhotoLibrary {
             if let Some(ck) = e.downcast_ref::<super::session::CloudKitServerError>() {
                 if ck.service_not_activated {
                     return ICloudError::ServiceNotActivated {
-                        code: ck.code.clone(),
-                        reason: ck.reason.clone(),
+                        code: ck.code.to_string(),
+                        reason: ck.reason.to_string(),
                     };
                 }
             }
