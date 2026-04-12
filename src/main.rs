@@ -809,12 +809,7 @@ async fn run_list(
         cli::ListCommand::Albums => {
             let selection =
                 config::resolve_library_selection(library, toml.and_then(|t| t.filters.as_ref()));
-            let libraries = match selection {
-                config::LibrarySelection::All => photos_service.all_libraries().await?,
-                config::LibrarySelection::Single(name) => {
-                    vec![photos_service.get_library(&name).await?.clone()]
-                }
-            };
+            let libraries = resolve_libraries(&selection, &mut photos_service).await?;
             for library in &libraries {
                 println!("Library: {}", library.zone_name());
                 let albums = library.albums().await?;
@@ -950,18 +945,7 @@ async fn run_import_existing(
     // Resolve library selection (CLI > TOML > default PrimarySync)
     let toml_filters = toml.and_then(|t| t.filters.as_ref());
     let selection = config::resolve_library_selection(args.library, toml_filters);
-    let libraries = match selection {
-        config::LibrarySelection::All => {
-            tracing::info!("Importing from all available libraries");
-            photos_service.all_libraries().await?
-        }
-        config::LibrarySelection::Single(name) => {
-            if name != "PrimarySync" {
-                tracing::info!(library = %name, "Importing from non-default library");
-            }
-            vec![photos_service.get_library(&name).await?.clone()]
-        }
-    };
+    let libraries = resolve_libraries(&selection, &mut photos_service).await?;
 
     if !args.no_progress_bar {
         println!("Scanning iCloud assets and matching with local files...");
@@ -1101,6 +1085,25 @@ async fn run_import_existing(
     println!("  Unmatched versions:   {unmatched}");
 
     Ok(())
+}
+
+/// Resolve a [`LibrarySelection`] into concrete [`PhotoLibrary`] instances.
+async fn resolve_libraries(
+    selection: &config::LibrarySelection,
+    photos_service: &mut icloud::photos::PhotosService,
+) -> anyhow::Result<Vec<icloud::photos::PhotoLibrary>> {
+    match selection {
+        config::LibrarySelection::All => {
+            tracing::info!("Using all available libraries");
+            photos_service.all_libraries().await
+        }
+        config::LibrarySelection::Single(name) => {
+            if name != "PrimarySync" {
+                tracing::info!(library = %name, "Using non-default library");
+            }
+            Ok(vec![photos_service.get_library(name).await?.clone()])
+        }
+    }
 }
 
 /// Resolve which albums to download from, plus any asset IDs to exclude.
@@ -1638,18 +1641,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     .await?;
 
     // Resolve the selected library/libraries
-    let libraries: Vec<icloud::photos::PhotoLibrary> = match &config.library {
-        config::LibrarySelection::All => {
-            tracing::info!("Using all available libraries");
-            photos_service.all_libraries().await?
-        }
-        config::LibrarySelection::Single(name) => {
-            if name != "PrimarySync" {
-                tracing::info!(library = %name, "Using non-default library");
-            }
-            vec![photos_service.get_library(name).await?.clone()]
-        }
-    };
+    let libraries = resolve_libraries(&config.library, &mut photos_service).await?;
     tracing::info!(
         count = libraries.len(),
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),

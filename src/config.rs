@@ -58,7 +58,7 @@ pub(crate) struct TomlRetry {
     pub delay: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlFilters {
     pub library: Option<String>,
@@ -3499,15 +3499,7 @@ mod tests {
     fn resolve_library_cli_overrides_toml() {
         let toml_filters = TomlFilters {
             library: Some("SharedSync-FROM-TOML".to_string()),
-            albums: None,
-            exclude_albums: None,
-            filename_exclude: None,
-            skip_videos: None,
-            skip_photos: None,
-            skip_live_photos: None,
-            recent: None,
-            skip_created_before: None,
-            skip_created_after: None,
+            ..Default::default()
         };
         let result =
             resolve_library_selection(Some("SharedSync-FROM-CLI".to_string()), Some(&toml_filters));
@@ -3521,15 +3513,7 @@ mod tests {
     fn resolve_library_falls_back_to_toml() {
         let toml_filters = TomlFilters {
             library: Some("SharedSync-ABCD".to_string()),
-            albums: None,
-            exclude_albums: None,
-            filename_exclude: None,
-            skip_videos: None,
-            skip_photos: None,
-            skip_live_photos: None,
-            recent: None,
-            skip_created_before: None,
-            skip_created_after: None,
+            ..Default::default()
         };
         let result = resolve_library_selection(None, Some(&toml_filters));
         assert_eq!(
