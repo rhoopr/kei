@@ -1,0 +1,71 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill out the sections below so we can reproduce and fix the issue.
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: What actually happened?
+      placeholder: Describe what you saw, including any error messages or unexpected output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Steps, config, or commands to reproduce the issue.
+      placeholder: |
+        ```toml
+        # config.toml (if applicable)
+        ```
+
+        ```sh
+        kei sync --directory /photos ...
+        ```
+      render: markdown
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "Output of `kei --version`, or the Docker image tag."
+      placeholder: "v0.7.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Installation method
+      options:
+        - Docker
+        - Homebrew
+        - GitHub release binary
+        - Built from source
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Logs, screenshots, links to your config, or anything else relevant.
+    validations:
+      required: false
