@@ -21,6 +21,9 @@ pub enum AuthError {
     #[error("Two-factor authentication is required (no code provided)")]
     TwoFactorRequired,
 
+    #[error("Session lock held by another instance: {0}")]
+    LockContention(String),
+
     #[error(transparent)]
     Http(Box<reqwest::Error>),
 
@@ -57,6 +60,11 @@ impl AuthError {
         matches!(self, Self::TwoFactorRequired)
     }
 
+    /// Check if this error indicates lock contention with another kei instance.
+    pub fn is_lock_contention(&self) -> bool {
+        matches!(self, Self::LockContention(_))
+    }
+
     /// Build a `ServiceError` with an enriched message for well-known Apple error codes.
     pub(crate) fn service_error(code: &str, raw_message: &str) -> Self {
         let upper = code.to_ascii_uppercase();
@@ -91,6 +99,7 @@ mod tests {
         assert!(!AuthError::FailedLogin("test".into()).is_two_factor_required());
         assert!(!AuthError::TwoFactorFailed("test".into()).is_two_factor_required());
         assert!(!AuthError::InvalidToken("test".into()).is_two_factor_required());
+        assert!(!AuthError::LockContention("test".into()).is_two_factor_required());
         assert!(!AuthError::ApiError {
             code: 401,
             message: "test".into()
@@ -101,6 +110,23 @@ mod tests {
             message: "test".into()
         }
         .is_two_factor_required());
+    }
+
+    #[test]
+    fn lock_contention_is_detected() {
+        assert!(AuthError::LockContention("test".into()).is_lock_contention());
+    }
+
+    #[test]
+    fn other_variants_are_not_lock_contention() {
+        assert!(!AuthError::FailedLogin("test".into()).is_lock_contention());
+        assert!(!AuthError::TwoFactorRequired.is_lock_contention());
+    }
+
+    #[test]
+    fn lock_contention_display() {
+        let err = AuthError::LockContention("lock path".into());
+        assert!(err.to_string().contains("lock path"));
     }
 
     #[test]

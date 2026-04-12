@@ -413,6 +413,51 @@ async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
     }
 }
 
+/// Wait for a 2FA code submission, then retry authentication with back-off.
+///
+/// Polls `wait_for_2fa_submit` in a loop. After each mtime change, retries
+/// the provided `auth_fn` up to 3 times with 5-second back-off to handle
+/// lock contention (submit-code may still be running when mtime changes).
+/// False wakeups from get-code's SRP writes (which change the mtime before
+/// the session is trusted) are handled by looping back to wait.
+async fn wait_and_retry_2fa<T, F, Fut>(
+    cookie_dir: &Path,
+    username: &str,
+    auth_fn: F,
+) -> anyhow::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    loop {
+        wait_for_2fa_submit(cookie_dir, username).await;
+
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            match (auth_fn)().await {
+                Ok(result) => return Ok(result),
+                Err(e)
+                    if e.downcast_ref::<auth::error::AuthError>()
+                        .is_some_and(auth::error::AuthError::is_two_factor_required) =>
+                {
+                    tracing::info!("Session not yet trusted, continuing to wait...");
+                    break; // Back to outer loop (wait_for_2fa_submit)
+                }
+                Err(e)
+                    if e.downcast_ref::<auth::error::AuthError>()
+                        .is_some_and(auth::error::AuthError::is_lock_contention) =>
+                {
+                    tracing::debug!("Lock held by another process, retrying...");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        tracing::debug!("Lock still held after retries, resuming wait...");
+    }
+}
+
 /// Get the database path for a given auth config, merging with TOML defaults.
 ///
 /// Returns an error if the resolved username is empty, since an empty username
@@ -710,26 +755,30 @@ async fn run_login(
 
     match subcommand {
         Some(cli::LoginCommand::GetCode) => {
-            auth::send_2fa_push(
-                &cookie_directory,
-                &username,
-                &password_provider,
-                domain.as_str(),
-            )
+            retry_on_lock_contention(|| {
+                auth::send_2fa_push(
+                    &cookie_directory,
+                    &username,
+                    &password_provider,
+                    domain.as_str(),
+                )
+            })
             .await?;
             println!("2FA code requested. Check your trusted devices, then run:");
             println!("  kei login submit-code <CODE>");
         }
         Some(cli::LoginCommand::SubmitCode { code }) => {
-            let result = auth::authenticate(
-                &cookie_directory,
-                &username,
-                &password_provider,
-                domain.as_str(),
-                None,
-                None,
-                Some(&code),
-            )
+            let result = retry_on_lock_contention(|| {
+                auth::authenticate(
+                    &cookie_directory,
+                    &username,
+                    &password_provider,
+                    domain.as_str(),
+                    None,
+                    None,
+                    Some(&code),
+                )
+            })
             .await?;
             if result.requires_2fa {
                 println!("2FA code accepted. Session is now authenticated.");
@@ -739,20 +788,57 @@ async fn run_login(
         }
         None => {
             // Bare "kei login" = auth-only
-            auth::authenticate(
-                &cookie_directory,
-                &username,
-                &password_provider,
-                domain.as_str(),
-                None,
-                None,
-                None,
-            )
+            retry_on_lock_contention(|| {
+                auth::authenticate(
+                    &cookie_directory,
+                    &username,
+                    &password_provider,
+                    domain.as_str(),
+                    None,
+                    None,
+                    None,
+                )
+            })
             .await?;
             tracing::info!("Authentication completed successfully");
         }
     }
     Ok(())
+}
+
+/// Retry an auth operation on lock contention, with a brief wait.
+///
+/// Short-lived commands like `login get-code` and `login submit-code` may
+/// collide with a `sync` process that is mid-auth (SRP takes a few seconds).
+/// Instead of failing immediately, wait for the lock to be released.
+async fn retry_on_lock_contention<T, F, Fut>(auth_fn: F) -> anyhow::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    const MAX_ATTEMPTS: u32 = 6;
+    const DELAY_SECS: u64 = 3;
+
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match (auth_fn)().await {
+            Ok(result) => return Ok(result),
+            Err(e)
+                if e.downcast_ref::<auth::error::AuthError>()
+                    .is_some_and(auth::error::AuthError::is_lock_contention) =>
+            {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max_attempts = MAX_ATTEMPTS,
+                    "Another kei process is holding the session lock, retrying..."
+                );
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_secs(DELAY_SECS)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("MAX_ATTEMPTS must be >= 1"))
 }
 
 /// Run the list command: list albums or libraries.
@@ -772,15 +858,17 @@ async fn run_list(
     let password_provider =
         make_provider_from_auth(pw, password, &username, &cookie_directory, toml);
 
-    let auth_result = auth::authenticate(
-        &cookie_directory,
-        &username,
-        &password_provider,
-        domain.as_str(),
-        None,
-        None,
-        None,
-    )
+    let auth_result = retry_on_lock_contention(|| {
+        auth::authenticate(
+            &cookie_directory,
+            &username,
+            &password_provider,
+            domain.as_str(),
+            None,
+            None,
+            None,
+        )
+    })
     .await?;
 
     let api_retry_config = retry::RetryConfig::default();
@@ -1567,47 +1655,18 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             tracing::warn!(message = %msg, "2FA required");
             notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
 
-            // Wait for submit-code to update the session file, then retry
-            // auth. Loop because get-code also writes to the session file
-            // (during SRP), which changes the mtime and wakes us up before
-            // the session is actually trusted.
-            'wait_2fa: loop {
-                wait_for_2fa_submit(&config.cookie_directory, &config.username).await;
-
-                // Retry auth with back-off for lock contention — submit-code
-                // may still be running when we detect the mtime change.
-                for attempt in 0..3 {
-                    if attempt > 0 {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    }
-                    match auth::authenticate(
-                        &config.cookie_directory,
-                        &config.username,
-                        &password_provider,
-                        config.domain.as_str(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(result) => break 'wait_2fa result,
-                        Err(e)
-                            if e.downcast_ref::<auth::error::AuthError>()
-                                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
-                        {
-                            tracing::info!("Session not yet trusted, continuing to wait...");
-                            continue 'wait_2fa;
-                        }
-                        Err(e) if e.to_string().contains("Another kei instance") => {
-                            tracing::debug!("Lock held by another process, retrying...");
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                // Exhausted lock retries — back to waiting for next file change
-                tracing::debug!("Lock still held after retries, resuming wait...");
-            }
+            wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
+                auth::authenticate(
+                    &config.cookie_directory,
+                    &config.username,
+                    &password_provider,
+                    config.domain.as_str(),
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .await?
         }
         Err(e) => return Err(e),
     };
@@ -2056,7 +2115,17 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         if !is_watch_mode {
                             return Err(e);
                         }
-                        wait_for_2fa_submit(&config.cookie_directory, &config.username).await;
+
+                        wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
+                            attempt_reauth(
+                                &shared_session,
+                                &config.cookie_directory,
+                                &config.username,
+                                config.domain.as_str(),
+                                &password_provider,
+                            )
+                        })
+                        .await?;
                         continue;
                     }
                     Err(e) => {
@@ -2105,6 +2174,16 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 tracing::info!("Shutdown requested, exiting...");
                 break;
             }
+
+            // Release the file lock during idle sleep so that docker exec
+            // commands (login get-code, login submit-code) can acquire it.
+            {
+                let session = shared_session.read().await;
+                if let Err(e) = session.release_lock() {
+                    tracing::warn!(error = %e, "Failed to release lock before idle sleep");
+                }
+            }
+
             sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!(interval_secs = interval, "Waiting before next cycle");
             tokio::select! {
@@ -2115,8 +2194,11 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 }
             }
 
-            // Validate session before next cycle; re-authenticate if expired
-            attempt_reauth(
+            // Validate session before next cycle; re-authenticate if expired.
+            // If the session is still valid, attempt_reauth returns without
+            // re-locking, so we re-acquire the lock ourselves. If the session
+            // is invalid, attempt_reauth creates a new Session with its own lock.
+            match attempt_reauth(
                 &shared_session,
                 &config.cookie_directory,
                 &config.username,
@@ -2124,7 +2206,26 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 &password_provider,
             )
             .await
-            .ok(); // Best-effort pre-check; mid-sync re-auth handles failures
+            {
+                Ok(()) => {
+                    // Re-acquire the lock. If attempt_reauth performed a full
+                    // re-auth, the new Session already holds its own lock, so
+                    // LockContention here is expected and harmless.
+                    let session = shared_session.read().await;
+                    if let Err(e) = session.reacquire_lock() {
+                        if e.downcast_ref::<auth::error::AuthError>()
+                            .is_some_and(auth::error::AuthError::is_lock_contention)
+                        {
+                            tracing::debug!("Lock held by new session after reauth");
+                        } else {
+                            tracing::warn!(error = %e, "Failed to reacquire lock after idle");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Pre-cycle reauth failed, will retry mid-sync");
+                }
+            }
 
             // Re-resolve albums per-library to discover newly created iCloud albums.
             // TODO: When --exclude-album is set without --album, this re-fetches the

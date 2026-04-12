@@ -188,12 +188,13 @@ impl Session {
                     .try_lock_exclusive()
                     .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))?;
                 if !acquired {
-                    anyhow::bail!(
+                    return Err(crate::auth::error::AuthError::LockContention(format!(
                         "Another kei instance is running for this account (lock: {}). \
                          If running in Docker, check for orphaned containers with \
                          `docker ps` and stop them with `docker stop <name>`.",
                         lock_path.display()
-                    );
+                    ))
+                    .into());
                 }
                 Ok::<std::fs::File, anyhow::Error>(file)
             }
@@ -330,6 +331,24 @@ impl Session {
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
     pub fn release_lock(&self) -> Result<()> {
         FileExt::unlock(&self.lock_file).context("Failed to release session lock file")
+    }
+
+    /// Re-acquire the exclusive file lock after a prior `release_lock()`.
+    ///
+    /// Returns `Err(AuthError::LockContention)` if another process acquired
+    /// the lock in the interim (e.g. a concurrent `get-code` or `submit-code`).
+    pub fn reacquire_lock(&self) -> Result<()> {
+        let acquired = self
+            .lock_file
+            .try_lock_exclusive()
+            .context("Failed to re-acquire session lock")?;
+        if !acquired {
+            return Err(crate::auth::error::AuthError::LockContention(
+                "Another kei instance acquired the lock while it was released".into(),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     pub fn client_id(&self) -> Option<&String> {
@@ -557,9 +576,9 @@ mod tests {
         match result {
             Ok(_) => panic!("Second session should have failed"),
             Err(e) => assert!(
-                e.to_string().contains("Another kei instance"),
-                "Unexpected error: {}",
-                e
+                e.downcast_ref::<crate::auth::error::AuthError>()
+                    .is_some_and(crate::auth::error::AuthError::is_lock_contention),
+                "Expected LockContention, got: {e}",
             ),
         }
     }
@@ -586,6 +605,54 @@ mod tests {
         let _s2 = Session::new(&dir, "user@test.com", "https://example.com", None)
             .await
             .expect("Lock should be released after drop");
+    }
+
+    #[tokio::test]
+    async fn test_release_and_reacquire_lock() {
+        let (_td, dir) = test_dir("lock_reacquire");
+        let s1 = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .unwrap();
+
+        // Release the lock — another session should now succeed
+        s1.release_lock().unwrap();
+        let s2 = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .expect("Should acquire lock after release");
+        drop(s2);
+
+        // Re-acquire the lock on the original session
+        s1.reacquire_lock()
+            .expect("Should re-acquire after other session dropped");
+
+        // Now a new session should be blocked again
+        let result = Session::new(&dir, "user@test.com", "https://example.com", None).await;
+        match result {
+            Ok(_) => panic!("Lock should be held after reacquire"),
+            Err(e) => assert!(
+                e.downcast_ref::<crate::auth::error::AuthError>()
+                    .is_some_and(crate::auth::error::AuthError::is_lock_contention),
+                "Expected LockContention, got: {e}",
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reacquire_fails_while_held() {
+        let (_td, dir) = test_dir("lock_reacquire_contention");
+        let s1 = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .unwrap();
+        s1.release_lock().unwrap();
+
+        // Another session holds the lock
+        let _s2 = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .unwrap();
+
+        // Reacquire should fail because s2 holds the lock
+        let result = s1.reacquire_lock();
+        assert!(result.is_err(), "Should fail to reacquire while held");
     }
 
     #[tokio::test]
