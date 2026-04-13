@@ -20,6 +20,7 @@ use uuid::Uuid;
 use self::endpoints::Endpoints;
 use self::error::AuthError;
 pub use self::responses::AccountLoginResponse;
+pub(crate) use self::session::strip_session_routing_state;
 use self::session::Session;
 pub use self::session::SharedSession;
 
