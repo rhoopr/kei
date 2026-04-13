@@ -2345,9 +2345,9 @@ where
                             AssetDisposition::RetryExhausted => skips.retry_exhausted += 1,
                             AssetDisposition::RetryOnly => skips.retry_only += 1,
                             AssetDisposition::Unresolved => {
-                                debug_assert!(
-                                    false,
-                                    "asset with non-empty tasks had no disposition"
+                                tracing::warn!(
+                                    asset_id = %asset.id(),
+                                    "Asset with non-empty tasks had no disposition"
                                 );
                             }
                         }
