@@ -13,6 +13,4 @@ pub mod schema;
 pub mod types;
 
 pub use db::{SqliteStateDb, StateDb};
-pub use types::{
-    AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, VersionSizeKey, SOURCE_ICLOUD,
-};
+pub use types::{AssetRecord, AssetStatus, MediaType, SyncRunStats, VersionSizeKey};

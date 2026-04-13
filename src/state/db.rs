@@ -142,6 +142,7 @@ pub trait StateDb: Send + Sync {
     ) -> Result<(), StateError>;
 
     /// Replace people tags for an asset (DELETE + INSERT).
+    #[cfg(test)]
     async fn upsert_asset_people(
         &self,
         asset_id: &str,
@@ -149,9 +150,11 @@ pub trait StateDb: Send + Sync {
     ) -> Result<(), StateError>;
 
     /// Get album names for an asset.
+    #[cfg(test)]
     async fn get_asset_albums(&self, asset_id: &str) -> Result<Vec<String>, StateError>;
 
     /// Get people tagged in an asset.
+    #[cfg(test)]
     async fn get_asset_people(&self, asset_id: &str) -> Result<Vec<String>, StateError>;
 
     /// Mark all versions of an asset as deleted.
@@ -864,6 +867,7 @@ impl StateDb for SqliteStateDb {
         }
     }
 
+    #[cfg(test)]
     async fn upsert_asset_people(
         &self,
         asset_id: &str,
@@ -902,6 +906,7 @@ impl StateDb for SqliteStateDb {
         }
     }
 
+    #[cfg(test)]
     async fn get_asset_albums(&self, asset_id: &str) -> Result<Vec<String>, StateError> {
         let conn = self.acquire_lock("get_asset_albums")?;
 
@@ -920,6 +925,7 @@ impl StateDb for SqliteStateDb {
         Ok(albums)
     }
 
+    #[cfg(test)]
     async fn get_asset_people(&self, asset_id: &str) -> Result<Vec<String>, StateError> {
         let conn = self.acquire_lock("get_asset_people")?;
 
