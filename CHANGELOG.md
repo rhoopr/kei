@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.6] - 2026-04-13
+
+### Added
+
+- **ADP detection** - kei now detects Advanced Data Protection (ADP) on the account at login and bails early with an actionable error message, instead of failing later with a cryptic CloudKit error. ([#203], [#99])
+- ADP incompatibility documented in README and bug report template. ([#202])
+- Bug report issues automatically labeled `user-reported`. ([#202])
+
+[#99]: https://github.com/rhoopr/kei/issues/99
+[#202]: https://github.com/rhoopr/kei/issues/202
+[#203]: https://github.com/rhoopr/kei/issues/203
+
 ## [0.7.5] - 2026-04-13
 
 ### Fixed
