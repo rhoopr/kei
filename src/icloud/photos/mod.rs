@@ -4,6 +4,7 @@
 mod album;
 pub(crate) mod asset;
 pub mod cloudkit;
+pub(crate) mod decode;
 pub mod error;
 mod library;
 pub mod queries;

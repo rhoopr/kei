@@ -1,8 +1,10 @@
 //! Types for the state tracking module.
 
+use std::fmt::Write;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
 use crate::types::AssetVersionSize;
 
@@ -138,6 +140,187 @@ impl MediaType {
     }
 }
 
+/// Provider-agnostic metadata for an asset.
+///
+/// Boxed inside `AssetRecord` (`Option<Box<AssetMetadata>>`) to avoid
+/// inflating the base record on code paths that don't use metadata.
+///
+/// Fields are ordered for optimal memory layout:
+/// - Heap types first (String, `Vec`, `Option<String>`)
+/// - f64 fields
+/// - i32/i64 fields
+/// - bool fields last
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssetMetadata {
+    // Heap types
+    /// Provider that created this record ("icloud", "takeout", etc.).
+    pub source: String,
+    /// Short title / caption (iCloud: `captionEnc`).
+    pub title: Option<String>,
+    /// Longer description / notes (iCloud: `extendedDescEnc`).
+    pub description: Option<String>,
+    /// Keyword tags (stored as JSON array in DB).
+    pub keywords: Vec<String>,
+    /// Groups burst shots.
+    pub burst_id: Option<String>,
+    /// Asset subtype: "screenshot", "panorama", "hdr", "burst", etc.
+    pub media_subtype: Option<String>,
+    /// Opaque JSON blob for provider-specific fields.
+    pub provider_data: Option<String>,
+    /// SHA-256 hash of metadata fields for change detection.
+    pub metadata_hash: Option<String>,
+
+    // f64 fields
+    /// Decimal degrees, WGS84.
+    pub latitude: Option<f64>,
+    /// Decimal degrees, WGS84.
+    pub longitude: Option<f64>,
+    /// Meters above sea level.
+    pub altitude: Option<f64>,
+    /// Duration in seconds (video, live photo).
+    pub duration_secs: Option<f64>,
+
+    // Integer fields
+    /// EXIF orientation (1-8).
+    pub orientation: Option<i32>,
+    /// Seconds from UTC.
+    pub timezone_offset: Option<i32>,
+    /// Pixel width.
+    pub width: Option<i32>,
+    /// Pixel height.
+    pub height: Option<i32>,
+    /// Star rating (1-5).
+    pub rating: Option<i32>,
+    /// When the photo/metadata was last edited at source (unix timestamp).
+    pub modified_at: Option<i64>,
+    /// When asset was deleted/expunged at source (unix timestamp).
+    pub deleted_at: Option<i64>,
+
+    // Booleans
+    /// Provider-native favorite/heart flag.
+    pub is_favorite: bool,
+    /// Hidden from main library view.
+    pub is_hidden: bool,
+    /// Hidden from main timeline but retained.
+    pub is_archived: bool,
+    /// Soft-deleted at source.
+    pub is_deleted: bool,
+}
+
+impl AssetMetadata {
+    /// Compute a deterministic hash of all metadata fields for change detection.
+    ///
+    /// Excludes `source` (immutable) and `metadata_hash` itself. Uses SHA-256
+    /// truncated to 16 hex chars, matching the `hash_download_config()` pattern.
+    pub fn compute_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+
+        // Booleans
+        hasher.update([u8::from(self.is_favorite)]);
+        hasher.update([u8::from(self.is_hidden)]);
+        hasher.update([u8::from(self.is_archived)]);
+        hasher.update([u8::from(self.is_deleted)]);
+
+        // Optional integers
+        hash_opt_i32(&mut hasher, self.orientation);
+        hash_opt_i32(&mut hasher, self.timezone_offset);
+        hash_opt_i32(&mut hasher, self.width);
+        hash_opt_i32(&mut hasher, self.height);
+        hash_opt_i32(&mut hasher, self.rating);
+        hash_opt_i64(&mut hasher, self.modified_at);
+        hash_opt_i64(&mut hasher, self.deleted_at);
+
+        // Optional f64
+        hash_opt_f64(&mut hasher, self.latitude);
+        hash_opt_f64(&mut hasher, self.longitude);
+        hash_opt_f64(&mut hasher, self.altitude);
+        hash_opt_f64(&mut hasher, self.duration_secs);
+
+        // Optional strings
+        hash_opt_str(&mut hasher, self.title.as_deref());
+        hash_opt_str(&mut hasher, self.description.as_deref());
+        hash_opt_str(&mut hasher, self.burst_id.as_deref());
+        hash_opt_str(&mut hasher, self.media_subtype.as_deref());
+
+        // Keywords: sorted for determinism
+        let mut sorted_kw = self.keywords.clone();
+        sorted_kw.sort_unstable();
+        for kw in &sorted_kw {
+            hasher.update(kw.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.update(b"\x01"); // separator after keywords list
+
+        let hash = hasher.finalize();
+        let mut hex = String::with_capacity(16);
+        for &b in &hash[..8] {
+            let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+        }
+        hex
+    }
+}
+
+impl Default for AssetMetadata {
+    fn default() -> Self {
+        Self {
+            source: "icloud".to_string(),
+            title: None,
+            description: None,
+            keywords: Vec::new(),
+            burst_id: None,
+            media_subtype: None,
+            provider_data: None,
+            metadata_hash: None,
+            latitude: None,
+            longitude: None,
+            altitude: None,
+            duration_secs: None,
+            orientation: None,
+            timezone_offset: None,
+            width: None,
+            height: None,
+            rating: None,
+            modified_at: None,
+            deleted_at: None,
+            is_favorite: false,
+            is_hidden: false,
+            is_archived: false,
+            is_deleted: false,
+        }
+    }
+}
+
+fn hash_opt_str(hasher: &mut Sha256, val: Option<&str>) {
+    match val {
+        Some(s) => {
+            hasher.update(s.as_bytes());
+            hasher.update(b"\0");
+        }
+        None => hasher.update(b"\xff"),
+    }
+}
+
+fn hash_opt_i32(hasher: &mut Sha256, val: Option<i32>) {
+    match val {
+        Some(v) => hasher.update(v.to_le_bytes()),
+        None => hasher.update(b"\xff"),
+    }
+}
+
+fn hash_opt_i64(hasher: &mut Sha256, val: Option<i64>) {
+    match val {
+        Some(v) => hasher.update(v.to_le_bytes()),
+        None => hasher.update(b"\xff"),
+    }
+}
+
+fn hash_opt_f64(hasher: &mut Sha256, val: Option<f64>) {
+    match val {
+        Some(v) => hasher.update(v.to_le_bytes()),
+        None => hasher.update(b"\xff"),
+    }
+}
+
 /// A record of an asset's state in the database.
 ///
 /// Fields are ordered for optimal memory layout:
@@ -162,6 +345,9 @@ pub struct AssetRecord {
     /// Locally-computed SHA-256 hash of the downloaded file (hex-encoded).
     /// None for assets downloaded before schema v3.
     pub local_checksum: Option<String>,
+    /// Provider-agnostic metadata. Heap-allocated to keep `AssetRecord` small
+    /// on code paths that don't use metadata (bulk pre-load, skip decisions).
+    pub metadata: Option<Box<AssetMetadata>>,
 
     // 8-byte primitives
     /// File size in bytes.
@@ -209,6 +395,7 @@ impl AssetRecord {
             local_path: None,
             last_error: None,
             local_checksum: None,
+            metadata: None,
             size_bytes,
             created_at,
             added_at,
@@ -435,5 +622,97 @@ mod tests {
         for (avs, expected) in conversions {
             assert_eq!(VersionSizeKey::from(avs), expected, "{:?}", avs);
         }
+    }
+
+    #[test]
+    fn test_asset_metadata_default() {
+        let meta = AssetMetadata::default();
+        assert_eq!(meta.source, "icloud");
+        assert!(!meta.is_favorite);
+        assert!(!meta.is_hidden);
+        assert!(meta.title.is_none());
+        assert!(meta.keywords.is_empty());
+    }
+
+    #[test]
+    fn test_metadata_hash_determinism() {
+        let meta = AssetMetadata {
+            is_favorite: true,
+            latitude: Some(37.7749),
+            longitude: Some(-122.4194),
+            title: Some("Sunset".to_string()),
+            keywords: vec!["beach".to_string(), "sunset".to_string()],
+            ..AssetMetadata::default()
+        };
+        let hash1 = meta.compute_hash();
+        let hash2 = meta.compute_hash();
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 16);
+    }
+
+    #[test]
+    fn test_metadata_hash_sensitivity() {
+        let base = AssetMetadata {
+            is_favorite: true,
+            title: Some("Photo".to_string()),
+            ..AssetMetadata::default()
+        };
+        let changed = AssetMetadata {
+            is_favorite: false,
+            title: Some("Photo".to_string()),
+            ..AssetMetadata::default()
+        };
+        assert_ne!(base.compute_hash(), changed.compute_hash());
+    }
+
+    #[test]
+    fn test_metadata_hash_keyword_order_independent() {
+        let meta1 = AssetMetadata {
+            keywords: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            ..AssetMetadata::default()
+        };
+        let meta2 = AssetMetadata {
+            keywords: vec!["c".to_string(), "a".to_string(), "b".to_string()],
+            ..AssetMetadata::default()
+        };
+        assert_eq!(meta1.compute_hash(), meta2.compute_hash());
+    }
+
+    #[test]
+    fn test_metadata_hash_none_vs_empty_string() {
+        let with_none = AssetMetadata {
+            title: None,
+            ..AssetMetadata::default()
+        };
+        let with_empty = AssetMetadata {
+            title: Some(String::new()),
+            ..AssetMetadata::default()
+        };
+        assert_ne!(with_none.compute_hash(), with_empty.compute_hash());
+    }
+
+    #[test]
+    fn test_asset_record_with_metadata_stays_under_size_limit() {
+        // Box<AssetMetadata> adds only 8 bytes (a pointer)
+        assert!(
+            size_of::<AssetRecord>() <= 288,
+            "AssetRecord size {} exceeds 288 bytes",
+            size_of::<AssetRecord>()
+        );
+    }
+
+    #[test]
+    fn test_new_pending_has_no_metadata() {
+        let record = AssetRecord::new_pending(
+            "test".to_string(),
+            VersionSizeKey::Original,
+            "ck".to_string(),
+            "photo.jpg".to_string(),
+            Utc::now(),
+            None,
+            100,
+            MediaType::Photo,
+        );
+        assert!(record.metadata.is_none());
     }
 }

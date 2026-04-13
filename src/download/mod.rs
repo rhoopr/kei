@@ -1681,15 +1681,32 @@ async fn download_photos_incremental(
                 }
                 ChangeReason::SoftDeleted => {
                     soft_deleted_count += 1;
-                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
+                    if let Some(db) = &config.state_db {
+                        let ts = chrono::Utc::now().timestamp();
+                        if let Err(e) = db.mark_asset_deleted(&event.record_name, Some(ts)).await {
+                            tracing::warn!(asset_id = %event.record_name, error = %e, "Failed to mark asset deleted");
+                        }
+                    }
+                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Marked soft-deleted");
                 }
                 ChangeReason::HardDeleted => {
                     hard_deleted_count += 1;
-                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
+                    if let Some(db) = &config.state_db {
+                        let ts = chrono::Utc::now().timestamp();
+                        if let Err(e) = db.mark_asset_deleted(&event.record_name, Some(ts)).await {
+                            tracing::warn!(asset_id = %event.record_name, error = %e, "Failed to mark asset deleted");
+                        }
+                    }
+                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Marked hard-deleted");
                 }
                 ChangeReason::Hidden => {
                     hidden_count += 1;
-                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
+                    if let Some(db) = &config.state_db {
+                        if let Err(e) = db.mark_asset_hidden(&event.record_name).await {
+                            tracing::warn!(asset_id = %event.record_name, error = %e, "Failed to mark asset hidden");
+                        }
+                    }
+                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Marked hidden");
                 }
             }
         }
@@ -1788,7 +1805,7 @@ async fn download_photos_incremental(
         if let Some(db) = &config.state_db {
             for task in &asset_tasks {
                 let media_type = determine_media_type(task.version_size, asset);
-                let record = AssetRecord::new_pending(
+                let mut record = AssetRecord::new_pending(
                     task.asset_id.to_string(),
                     task.version_size,
                     task.checksum.to_string(),
@@ -1802,11 +1819,24 @@ async fn download_photos_incremental(
                     task.size,
                     media_type,
                 );
+                if let Some(meta) = asset.metadata().cloned() {
+                    record.metadata = Some(Box::new(meta));
+                }
                 if let Err(e) = db.upsert_seen(&record).await {
                     tracing::warn!(
                         asset_id = %task.asset_id,
                         error = %e,
                         "Failed to record asset in state DB"
+                    );
+                }
+
+                // Track album membership
+                let albums = [(album_name.to_string(), "icloud".to_string())];
+                if let Err(e) = db.upsert_asset_albums(&task.asset_id, &albums).await {
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        error = %e,
+                        "Failed to record album membership"
                     );
                 }
             }
@@ -2216,7 +2246,7 @@ where
 
                             if let Some(db) = &producer_state_db {
                                 let media_type = determine_media_type(task.version_size, &asset);
-                                let record = AssetRecord::new_pending(
+                                let mut record = AssetRecord::new_pending(
                                     task.asset_id.to_string(),
                                     task.version_size,
                                     task.checksum.to_string(),
@@ -2230,12 +2260,29 @@ where
                                     task.size,
                                     media_type,
                                 );
+                                if let Some(meta) = asset.metadata().cloned() {
+                                    record.metadata = Some(Box::new(meta));
+                                }
                                 if let Err(e) = db.upsert_seen(&record).await {
                                     tracing::warn!(
                                         asset_id = %task.asset_id,
                                         error = %e,
                                         "Failed to record asset"
                                     );
+                                }
+
+                                // Track album membership
+                                if let Some(album) = config.album_name.as_deref() {
+                                    let albums = [(album.to_string(), "icloud".to_string())];
+                                    if let Err(e) =
+                                        db.upsert_asset_albums(&task.asset_id, &albums).await
+                                    {
+                                        tracing::warn!(
+                                            asset_id = %task.asset_id,
+                                            error = %e,
+                                            "Failed to record album membership"
+                                        );
+                                    }
                                 }
 
                                 match download_ctx.should_download_fast(
@@ -5433,6 +5480,28 @@ mod tests {
             &self,
             _: usize,
         ) -> Result<Vec<std::path::PathBuf>, StateError> {
+            unimplemented!()
+        }
+        async fn upsert_asset_albums(
+            &self,
+            _: &str,
+            _: &[(String, String)],
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn upsert_asset_people(&self, _: &str, _: &[String]) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn get_asset_albums(&self, _: &str) -> Result<Vec<String>, StateError> {
+            unimplemented!()
+        }
+        async fn get_asset_people(&self, _: &str) -> Result<Vec<String>, StateError> {
+            unimplemented!()
+        }
+        async fn mark_asset_deleted(&self, _: &str, _: Option<i64>) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn mark_asset_hidden(&self, _: &str) -> Result<(), StateError> {
             unimplemented!()
         }
     }

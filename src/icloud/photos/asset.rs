@@ -8,6 +8,7 @@ use tracing::warn;
 use super::cloudkit::Record;
 use super::queries::{item_type_from_str, PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
 use super::types::{AssetItemType, AssetVersion, AssetVersionSize, ChangeReason};
+use crate::state::types::AssetMetadata;
 
 /// Type alias for the versions map.
 ///
@@ -44,6 +45,8 @@ pub struct PhotoAsset {
     filename: Option<String>,
     // SmallVec with inline storage
     versions: VersionsMap,
+    // Metadata extracted from CloudKit fields at construction time
+    metadata: Option<Box<AssetMetadata>>,
     // f64 primitives
     asset_date_ms: Option<f64>,
     added_date_ms: Option<f64>,
@@ -214,6 +217,10 @@ impl PhotoAsset {
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
         let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
+        let metadata = Some(Box::new(super::decode::extract_metadata(
+            &master_fields,
+            &asset_fields,
+        )));
         Self {
             record_name,
             filename,
@@ -221,6 +228,7 @@ impl PhotoAsset {
             asset_date_ms,
             added_date_ms,
             versions,
+            metadata,
         }
     }
 
@@ -236,6 +244,10 @@ impl PhotoAsset {
             &asset.fields,
             &master.record_name,
         );
+        let metadata = Some(Box::new(super::decode::extract_metadata(
+            &master.fields,
+            &asset.fields,
+        )));
         Self {
             record_name: master.record_name,
             filename,
@@ -243,6 +255,7 @@ impl PhotoAsset {
             asset_date_ms,
             added_date_ms,
             versions,
+            metadata,
         }
     }
 
@@ -278,6 +291,11 @@ impl PhotoAsset {
 
     pub fn item_type(&self) -> Option<AssetItemType> {
         self.item_type_val
+    }
+
+    /// Extracted metadata (favorites, GPS, keywords, etc.), if available.
+    pub fn metadata(&self) -> Option<&AssetMetadata> {
+        self.metadata.as_deref()
     }
 
     /// Available download versions, as a list of (size, version) pairs.
