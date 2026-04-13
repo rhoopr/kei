@@ -96,4 +96,26 @@ mod tests {
             "expected Json variant, got: {err:?}"
         );
     }
+
+    #[test]
+    fn connection_421_detected_as_misdirected() {
+        // This is how a 421 from reqwest::error_for_status() gets wrapped:
+        // reqwest::Error -> anyhow::Error -> e.to_string() -> ICloudError::Connection
+        let err = ICloudError::Connection(
+            "HTTP status client error (421 Misdirected Request) for url (https://p60-ckdatabasews.icloud.com/...)".into(),
+        );
+        assert!(
+            matches!(&err, ICloudError::Connection(msg) if msg.contains("421")),
+            "421 Connection error should be detectable as misdirected request"
+        );
+    }
+
+    #[test]
+    fn connection_non_421_not_misdirected() {
+        let err = ICloudError::Connection("HTTP status server error (503)".into());
+        assert!(
+            !matches!(&err, ICloudError::Connection(msg) if msg.contains("421")),
+            "503 should not match the misdirected request pattern"
+        );
+    }
 }

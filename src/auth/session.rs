@@ -1003,4 +1003,42 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "File should be owner-only, got {:o}", mode);
     }
+
+    #[tokio::test]
+    async fn test_reset_http_clients_preserves_cookie_jar() {
+        let (_td, dir) = test_dir("reset_cookies");
+        let mut session = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .unwrap();
+
+        // Get a pointer to the cookie jar before reset.
+        let jar_before = Arc::as_ptr(&session.cookie_jar);
+
+        session.reset_http_clients().unwrap();
+
+        // Same Arc, same underlying jar.
+        let jar_after = Arc::as_ptr(&session.cookie_jar);
+        assert_eq!(
+            jar_before, jar_after,
+            "reset_http_clients must reuse the existing cookie jar"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reset_http_clients_preserves_api_timeout() {
+        let (_td, dir) = test_dir("reset_timeout");
+        let custom_timeout = Some(45);
+        let mut session =
+            Session::new(&dir, "user@test.com", "https://example.com", custom_timeout)
+                .await
+                .unwrap();
+
+        assert_eq!(session.api_timeout, Duration::from_secs(45));
+        session.reset_http_clients().unwrap();
+        assert_eq!(
+            session.api_timeout,
+            Duration::from_secs(45),
+            "reset_http_clients must preserve the configured timeout"
+        );
+    }
 }
