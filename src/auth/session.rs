@@ -326,6 +326,38 @@ impl Session {
             .join(format!("{}.session", self.sanitized_username))
     }
 
+    /// Clear persisted session/cookie files so the next `Session::new()` gets
+    /// a clean slate. Prevents stale partition routing during 421 recovery.
+    pub async fn clear_persisted_files(&self) -> Result<()> {
+        let session_path = self.session_path();
+        match fs::remove_file(&session_path).await {
+            Ok(()) => {
+                tracing::debug!(path = %session_path.display(), "Cleared session file for clean re-auth");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "Failed to remove session file: {}",
+                    session_path.display()
+                )));
+            }
+        }
+        let cookie_path = self.cookiejar_path();
+        match fs::remove_file(&cookie_path).await {
+            Ok(()) => {
+                tracing::debug!(path = %cookie_path.display(), "Cleared cookie file for clean re-auth");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "Failed to remove cookie file: {}",
+                    cookie_path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Release the exclusive file lock without dropping the Session.
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
     pub fn release_lock(&self) -> Result<()> {

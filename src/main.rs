@@ -203,10 +203,12 @@ fn make_provider_from_auth(
 /// Initialize the photos service with automatic 421 retry.
 ///
 /// On first attempt, uses the ckdatabasews URL from the auth result. If the
-/// CloudKit service returns 421 Misdirected Request (stale partition), performs
-/// a full SRP re-authentication to obtain fresh service URLs from Apple.
+/// CloudKit service returns 421 Misdirected Request (stale partition), clears
+/// persisted session state, creates a completely fresh session via
+/// `auth::authenticate`, and retries with the new service URL.
 async fn init_photos_service(
     auth_result: auth::AuthResult,
+    cookie_directory: &Path,
     username: &str,
     domain: &str,
     password_provider: &dyn Fn() -> Option<SecretString>,
@@ -250,60 +252,69 @@ async fn init_photos_service(
             tracing::warn!(
                 url = %ckdatabasews_url,
                 "Service endpoint returned 421 Misdirected Request, \
-                 performing full re-authentication for fresh service URLs"
+                 performing full re-authentication with clean session"
             );
 
-            // Full SRP re-auth is required: both /validate and /accountLogin
-            // return the same stale partition URLs. Only a fresh SRP handshake
-            // causes Apple to assign the correct partition.
-            //
-            // We perform SRP + accountLogin directly on the existing session
-            // rather than creating a new Session via auth::authenticate(),
-            // which would conflict with the existing lock and require
-            // destructive session file deletion.
-            let fresh_data = {
-                let password = password_provider().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Password required for re-authentication after 421, \
-                         but no password is available"
-                    )
-                })?;
-                let endpoints = auth::endpoints::Endpoints::for_domain(domain)?;
-                let mut session = shared_session.write().await;
-                let client_id = session
-                    .client_id()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("auth-{}", uuid::Uuid::new_v4()));
-                auth::srp::authenticate_srp(
-                    &mut *session,
-                    &endpoints,
-                    username,
-                    password.expose_secret(),
-                    &client_id,
-                    domain,
-                )
-                .await?;
-                auth::twofa::authenticate_with_token(&mut session, &endpoints).await?
-            };
+            // A 421 means Apple's identity service assigned a CloudKit partition
+            // that CloudKit itself rejects. Recovery requires a completely fresh
+            // session -- new reqwest::Client (clean HTTP/2 connection pool),
+            // new cookie jar, and no stale session headers (scnt, session_id).
+            // Without this, Apple treats the re-auth as session continuity and
+            // returns the same stale partition URL.
+            {
+                let session = shared_session.write().await;
+                session.clear_persisted_files().await?;
+                session.release_lock()?;
+            }
 
-            let fresh_url = fresh_data
+            let new_auth = auth::authenticate(
+                cookie_directory,
+                username,
+                password_provider,
+                domain,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+            let fresh_url = new_auth
+                .data
                 .webservices
                 .as_ref()
                 .and_then(|ws| ws.ckdatabasews.as_ref())
                 .map(|ep| ep.url.clone())
                 .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL after re-authentication"))?;
 
-            let client_id = {
-                let session = shared_session.read().await;
-                session.client_id().unwrap_or_default().to_owned()
-            };
-            let dsid = fresh_data.ds_info.as_ref().and_then(|ds| ds.dsid.clone());
+            if fresh_url == ckdatabasews_url {
+                anyhow::bail!(
+                    "Re-authentication returned the same service URL ({fresh_url}) that \
+                     produced a 421 Misdirected Request. This is likely an Apple-side \
+                     partition inconsistency -- please try again later"
+                );
+            }
+
+            let client_id = new_auth.session.client_id().unwrap_or_default().to_owned();
+            let dsid = new_auth
+                .data
+                .ds_info
+                .as_ref()
+                .and_then(|ds| ds.dsid.clone());
             let params = build_photos_params(&client_id, dsid.as_deref());
+
+            {
+                let mut session = shared_session.write().await;
+                *session = new_auth.session;
+            }
 
             let session_box: Box<dyn icloud::photos::PhotosSession> =
                 Box::new(shared_session.clone());
 
-            tracing::info!(url = %fresh_url, "Retrying with fresh service URL");
+            tracing::info!(
+                old_url = %ckdatabasews_url,
+                new_url = %fresh_url,
+                "Retrying with fresh service URL from clean session"
+            );
             let service = icloud::photos::PhotosService::new(
                 fresh_url,
                 session_box,
@@ -878,6 +889,7 @@ async fn run_list(
     let api_retry_config = retry::RetryConfig::default();
     let (_shared_session, mut photos_service) = init_photos_service(
         auth_result,
+        &cookie_directory,
         &username,
         domain.as_str(),
         &password_provider,
@@ -1024,6 +1036,7 @@ async fn run_import_existing(
 
     let (_shared_session, mut photos_service) = init_photos_service(
         auth_result,
+        &cookie_directory,
         &username,
         domain.as_str(),
         &password_provider,
@@ -1694,6 +1707,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     let (shared_session, mut photos_service) = init_photos_service(
         auth_result,
+        &config.cookie_directory,
         &config.username,
         config.domain.as_str(),
         &password_provider,
