@@ -68,9 +68,28 @@ pub async fn authenticate(
     code: Option<&str>,
 ) -> Result<AuthResult> {
     let endpoints = Endpoints::for_domain(domain)?;
+    let session = Session::new(cookie_dir, apple_id, endpoints.home, timeout_secs).await?;
+    authenticate_inner(
+        session,
+        &endpoints,
+        apple_id,
+        password_provider,
+        domain,
+        client_id,
+        code,
+    )
+    .await
+}
 
-    let mut session = Session::new(cookie_dir, apple_id, endpoints.home, timeout_secs).await?;
-
+async fn authenticate_inner(
+    mut session: Session,
+    endpoints: &Endpoints,
+    apple_id: &str,
+    password_provider: &dyn Fn() -> Option<SecretString>,
+    domain: &str,
+    client_id: Option<String>,
+    code: Option<&str>,
+) -> Result<AuthResult> {
     // Prefer persisted client_id to maintain session continuity across runs
     let client_id = session
         .client_id()
@@ -83,7 +102,7 @@ pub async fn authenticate(
     let has_session_token = session.session_data.contains_key("session_token");
     if has_session_token {
         tracing::debug!("Checking session token validity");
-        match twofa::validate_token(&mut session, &endpoints).await {
+        match twofa::validate_token(&mut session, endpoints).await {
             Ok(d) => {
                 tracing::debug!("Existing session token is valid");
                 data = Some(d);
@@ -106,7 +125,7 @@ pub async fn authenticate(
     // 2FA push from Apple, invalidating the code the user already has).
     if data.is_none() && code.is_some() && has_session_token {
         tracing::debug!("Session token exists with code provided, trying accountLogin before SRP");
-        match twofa::authenticate_with_token(&mut session, &endpoints).await {
+        match twofa::authenticate_with_token(&mut session, endpoints).await {
             Ok(d) => {
                 tracing::debug!("accountLogin succeeded, skipping SRP");
                 data = Some(d);
@@ -129,7 +148,7 @@ pub async fn authenticate(
 
         srp::authenticate_srp(
             &mut session,
-            &endpoints,
+            endpoints,
             apple_id,
             password.expose_secret(),
             &client_id,
@@ -138,7 +157,7 @@ pub async fn authenticate(
         .await?;
         // `password` (SecretString) dropped here, zeroing memory
 
-        let account_data = twofa::authenticate_with_token(&mut session, &endpoints).await?;
+        let account_data = twofa::authenticate_with_token(&mut session, endpoints).await?;
         data = Some(account_data);
     }
 
@@ -157,7 +176,7 @@ pub async fn authenticate(
         let verified = if let Some(c) = code {
             // Headless: code provided directly (e.g. submit-code subcommand).
             // Do NOT trigger a push — it would invalidate the code being submitted.
-            twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, c).await?
+            twofa::submit_2fa_code(&mut session, endpoints, &client_id, domain, c).await?
         } else {
             // Interactive: prompt on stdin (terminal confirmed above).
             // Always trigger an explicit push before prompting. SRP pushes
@@ -165,7 +184,7 @@ pub async fn authenticate(
             // ensures every account gets one. Apple deduplicates, so
             // accounts that already got a code from SRP won't see a second.
             if let Err(e) =
-                twofa::trigger_push_notification(&mut session, &endpoints, &client_id, domain).await
+                twofa::trigger_push_notification(&mut session, endpoints, &client_id, domain).await
             {
                 tracing::warn!(error = %e, "Failed to trigger push notification");
             }
@@ -179,7 +198,7 @@ pub async fn authenticate(
                     // User didn't receive a code - trigger explicit push.
                     if let Err(e) = twofa::trigger_push_notification(
                         &mut session,
-                        &endpoints,
+                        endpoints,
                         &client_id,
                         domain,
                     )
@@ -190,7 +209,7 @@ pub async fn authenticate(
                     tracing::info!("Code requested - check your trusted devices");
                     continue;
                 }
-                if twofa::submit_2fa_code(&mut session, &endpoints, &client_id, domain, &input)
+                if twofa::submit_2fa_code(&mut session, endpoints, &client_id, domain, &input)
                     .await?
                 {
                     verified = true;
@@ -213,9 +232,9 @@ pub async fn authenticate(
             return Err(AuthError::TwoFactorFailed("2FA verification failed".into()).into());
         }
 
-        twofa::trust_session(&mut session, &endpoints, &client_id, domain).await?;
+        twofa::trust_session(&mut session, endpoints, &client_id, domain).await?;
         // Re-authenticate to get fresh account data with 2FA-elevated privileges
-        let account_data = twofa::authenticate_with_token(&mut session, &endpoints).await?;
+        let account_data = twofa::authenticate_with_token(&mut session, endpoints).await?;
 
         tracing::info!("Authentication completed successfully");
         return Ok(AuthResult {

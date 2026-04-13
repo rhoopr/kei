@@ -1263,13 +1263,15 @@ struct PendingStateWrite {
 
 /// Maximum retry attempts for deferred state writes.
 const STATE_WRITE_MAX_RETRIES: u32 = 6;
+const _: () = assert!(STATE_WRITE_MAX_RETRIES <= 32, "shift overflow in backoff");
 
 /// Retry all pending state writes that failed during the download loop.
 ///
 /// Each write is attempted up to [`STATE_WRITE_MAX_RETRIES`] times with
-/// exponential backoff (200ms, 400ms, 800ms, 1.6s, 3.2s). SQLite lock
-/// contention is transient, so generous retries prevent files from ending
-/// up on disk but untracked in the state DB.
+/// exponential backoff (200ms, 400ms, 800ms, 1.6s, 3.2s between attempts
+/// 1–5; attempt 6 fails immediately). SQLite lock contention is transient,
+/// so generous retries prevent files from ending up on disk but untracked
+/// in the state DB.
 /// Returns the number of writes that still failed after all retries.
 async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWrite]) -> usize {
     if pending.is_empty() {

@@ -207,12 +207,20 @@ fn make_provider_from_auth(
     make_password_provider(source)
 }
 
-/// Initialize the photos service with automatic 421 retry.
+/// Initialize the photos service with automatic 421 recovery.
 ///
-/// On first attempt, uses the ckdatabasews URL from the auth result. If the
-/// CloudKit service returns 421 Misdirected Request (stale partition), clears
-/// persisted session state, creates a completely fresh session via
-/// `auth::authenticate`, and retries with the new service URL.
+/// On 421 Misdirected Request, tries two recovery strategies in order:
+///
+/// 1. **Reset HTTP clients** (cheap): drops the connection pool and retries
+///    with fresh TCP/HTTP2 connections. Fixes cases where HTTP/2 connection
+///    routing directed the request to the wrong CloudKit partition server.
+///
+/// 2. **Full re-authentication** (expensive): clears session state and
+///    performs a fresh SRP login. Fixes cases where stale session headers
+///    (scnt, session_id) cause CloudKit to route to the wrong partition.
+///    May require password + 2FA from the user.
+///
+/// If both strategies fail, the error from the second attempt is returned.
 async fn init_photos_service(
     auth_result: auth::AuthResult,
     cookie_directory: &Path,
@@ -254,93 +262,101 @@ async fn init_photos_service(
     )
     .await
     {
-        Ok(service) => Ok((shared_session, service)),
-        Err(e) if is_misdirected_request(&e) => {
-            tracing::warn!(
-                url = %ckdatabasews_url,
-                "Service endpoint returned 421 Misdirected Request, \
-                 performing full re-authentication with clean session"
-            );
-
-            // A 421 means Apple's identity service assigned a CloudKit partition
-            // that CloudKit itself rejects. Recovery requires a completely fresh
-            // session -- new reqwest::Client (clean HTTP/2 connection pool),
-            // new cookie jar, and no stale session headers (scnt, session_id).
-            // Without this, Apple treats the re-auth as session continuity and
-            // returns the same stale partition URL.
-            {
-                let session = shared_session.write().await;
-                session.clear_persisted_files().await?;
-                session.release_lock()?;
-            }
-
-            let new_auth = auth::authenticate(
-                cookie_directory,
-                username,
-                password_provider,
-                domain,
-                None,
-                None,
-                None,
-            )
-            .await?;
-
-            let fresh_url = new_auth
-                .data
-                .webservices
-                .as_ref()
-                .and_then(|ws| ws.ckdatabasews.as_ref())
-                .map(|ep| ep.url.clone())
-                .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL after re-authentication"))?;
-
-            if fresh_url == ckdatabasews_url {
-                anyhow::bail!(
-                    "Re-authentication returned the same service URL ({fresh_url}) that \
-                     produced a 421 Misdirected Request. This is likely an Apple-side \
-                     partition inconsistency -- please try again later"
-                );
-            }
-
-            let client_id = new_auth.session.client_id().unwrap_or_default().to_owned();
-            let dsid = new_auth
-                .data
-                .ds_info
-                .as_ref()
-                .and_then(|ds| ds.dsid.clone());
-            let params = build_photos_params(&client_id, dsid.as_deref());
-
-            {
-                let mut session = shared_session.write().await;
-                *session = new_auth.session;
-            }
-
-            let session_box: Box<dyn icloud::photos::PhotosSession> =
-                Box::new(shared_session.clone());
-
-            tracing::info!(
-                old_url = %ckdatabasews_url,
-                new_url = %fresh_url,
-                "Retrying with fresh service URL from clean session"
-            );
-            let service = icloud::photos::PhotosService::new(
-                fresh_url,
-                session_box,
-                params,
-                api_retry_config,
-            )
-            .await?;
-
-            Ok((shared_session, service))
-        }
-        Err(e) => Err(e.into()),
+        Ok(service) => return Ok((shared_session, service)),
+        Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
+        Err(_) => {}
     }
+
+    // ── Recovery strategy 1: fresh HTTP/2 connection pool ──────────────
+    // Cheap fix: drop old connections, keep auth state. Handles cases where
+    // the TCP connection was routed to the wrong CloudKit partition server.
+    tracing::warn!(
+        url = %ckdatabasews_url,
+        "Service returned 421 Misdirected Request, retrying with fresh connection pool"
+    );
+    {
+        let mut session = shared_session.write().await;
+        session.reset_http_clients()?;
+    }
+
+    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
+    match icloud::photos::PhotosService::new(
+        ckdatabasews_url.clone(),
+        session_box,
+        params.clone(),
+        api_retry_config,
+    )
+    .await
+    {
+        Ok(service) => return Ok((shared_session, service)),
+        Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
+        Err(_) => {}
+    }
+
+    // ── Recovery strategy 2: full re-authentication ────────────────────
+    // Expensive fix: clear session state, perform fresh SRP + 2FA login.
+    // Handles cases where stale session headers cause wrong partition routing.
+    tracing::warn!(
+        url = %ckdatabasews_url,
+        "Fresh connection pool did not resolve 421, performing full re-authentication"
+    );
+    {
+        let session = shared_session.read().await;
+        session.release_lock()?;
+    }
+    let new_auth = auth::authenticate(
+        cookie_directory,
+        username,
+        password_provider,
+        domain,
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    let fresh_url = new_auth
+        .data
+        .webservices
+        .as_ref()
+        .and_then(|ws| ws.ckdatabasews.as_ref())
+        .map(|ep| ep.url.clone())
+        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL after re-authentication"))?;
+
+    if fresh_url != ckdatabasews_url {
+        tracing::info!(
+            old_url = %ckdatabasews_url,
+            new_url = %fresh_url,
+            "Re-authentication returned a different service URL"
+        );
+    }
+
+    let new_client_id = new_auth.session.client_id().unwrap_or_default().to_owned();
+    let new_dsid = new_auth
+        .data
+        .ds_info
+        .as_ref()
+        .and_then(|ds| ds.dsid.clone());
+    let new_params = build_photos_params(&new_client_id, new_dsid.as_deref());
+
+    {
+        let mut session = shared_session.write().await;
+        *session = new_auth.session;
+    }
+
+    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
+    let service =
+        icloud::photos::PhotosService::new(fresh_url, session_box, new_params, api_retry_config)
+            .await?;
+
+    Ok((shared_session, service))
 }
 
 /// Check if an iCloud error is a 421 Misdirected Request from the CloudKit service.
 ///
-/// This happens when Apple migrates an account to a different partition but the
-/// cached session still references the old ckdatabasews URL. Recovery requires
-/// a full SRP re-authentication to obtain fresh service URLs from Apple.
+/// This happens when the HTTP/2 connection is routed to a CloudKit partition
+/// server that cannot serve the user's data. Root cause may be stale
+/// connection routing or stale session state; see `init_photos_service`.
 fn is_misdirected_request(err: &icloud::error::ICloudError) -> bool {
     matches!(err, icloud::error::ICloudError::Connection(msg) if msg.contains("421"))
 }

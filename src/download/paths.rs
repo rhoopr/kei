@@ -516,7 +516,10 @@ impl DirCache {
     /// In async contexts, prefer `ensure_dir_async()` to avoid blocking the
     /// tokio worker thread — especially on slow or network-attached storage.
     fn ensure_dir(&mut self, dir: &Path) -> &FxHashMap<String, u64> {
-        // Fast path: avoid PathBuf allocation when directory is already cached.
+        // Fast path: two lookups but zero allocation on cache hit.
+        // get() would be one lookup, but its returned reference borrows
+        // self.dirs immutably, which the borrow checker cannot release
+        // before the mutable entry() call below.
         if self.dirs.contains_key(dir) {
             return &self.dirs[dir];
         }

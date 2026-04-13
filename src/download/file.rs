@@ -352,10 +352,11 @@ pub(super) async fn rename_part_to_final(
 ) -> anyhow::Result<()> {
     match fs::rename(part_path, final_path).await {
         Ok(()) => Ok(()),
-        Err(_) if fs::try_exists(final_path).await.unwrap_or(false) => {
+        Err(rename_err) if fs::try_exists(final_path).await.unwrap_or(false) => {
             // Another task won the race — clean up our .part file.
             tracing::debug!(
                 path = %final_path.display(),
+                error = %rename_err,
                 "Destination already exists, removing redundant .part file"
             );
             if let Err(rm_err) = fs::remove_file(part_path).await {

@@ -125,6 +125,42 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Build the API and download HTTP clients for a session.
+///
+/// Both share the same cookie jar. The API client uses a total-request timeout;
+/// the download client uses connect + read timeouts without a total cap so
+/// large file transfers aren't killed mid-stream.
+fn build_clients(
+    cookie_jar: &Arc<reqwest::cookie::Jar>,
+    home_endpoint: &str,
+    api_timeout: Duration,
+) -> Result<(Client, Client)> {
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(ORIGIN, HeaderValue::from_str(home_endpoint)?);
+    default_headers.insert(
+        REFERER,
+        HeaderValue::from_str(&format!("{home_endpoint}/"))?,
+    );
+    default_headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+
+    let client = Client::builder()
+        .cookie_provider(cookie_jar.clone())
+        .default_headers(default_headers.clone())
+        .timeout(api_timeout)
+        .build()?;
+
+    let download_client = Client::builder()
+        .cookie_provider(cookie_jar.clone())
+        .default_headers(default_headers)
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(120))
+        .pool_max_idle_per_host(20)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()?;
+
+    Ok((client, download_client))
+}
+
 /// HTTP session wrapper that persists cookies and session data to disk,
 /// allowing authentication to survive across process restarts.
 pub struct Session {
@@ -138,6 +174,8 @@ pub struct Session {
     cookie_dir: PathBuf,
     sanitized_username: String,
     home_endpoint: String,
+    /// API client timeout (preserved for `reset_http_clients`).
+    api_timeout: Duration,
     /// Exclusive file lock preventing concurrent instances for the same account.
     /// The advisory lock is held for the lifetime of the Session via the open
     /// file descriptor; released automatically when the File is dropped.
@@ -165,7 +203,6 @@ impl Session {
     ) -> Result<Self> {
         let sanitized = sanitize_username(username);
         let cookie_dir = cookie_dir.to_path_buf();
-        let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
 
         fs::create_dir_all(&cookie_dir).await.with_context(|| {
             format!(
@@ -200,9 +237,29 @@ impl Session {
         })
         .await??;
 
+        Self::build(
+            cookie_dir,
+            &sanitized,
+            home_endpoint,
+            timeout_secs,
+            lock_file,
+        )
+        .await
+    }
+
+    /// Shared constructor body: loads cookies/session from disk, builds HTTP
+    /// clients, and assembles the `Session`. Callers provide the lock file.
+    async fn build(
+        cookie_dir: PathBuf,
+        sanitized: &str,
+        home_endpoint: &str,
+        timeout_secs: Option<u64>,
+        lock_file: std::fs::File,
+    ) -> Result<Self> {
+        let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
 
-        let cookiejar_path = cookie_dir.join(&sanitized);
+        let cookiejar_path = cookie_dir.join(sanitized);
         if cookiejar_path.is_file() {
             match fs::read_to_string(&cookiejar_path).await {
                 Ok(contents) => {
@@ -247,33 +304,7 @@ impl Session {
             }
         }
 
-        // Origin/Referer headers are required by Apple's CORS checks
-        let mut default_headers = HeaderMap::new();
-        default_headers.insert(ORIGIN, HeaderValue::from_str(home_endpoint)?);
-        default_headers.insert(
-            REFERER,
-            HeaderValue::from_str(&format!("{home_endpoint}/"))?,
-        );
-        default_headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
-
-        let client = Client::builder()
-            .cookie_provider(cookie_jar.clone())
-            .default_headers(default_headers.clone())
-            .timeout(timeout)
-            .build()?;
-
-        // Separate client for file downloads: no total timeout so large files
-        // aren't killed mid-transfer. connect_timeout catches unreachable hosts;
-        // read_timeout detects stalled connections (no bytes for 120s).
-        // Pool settings tuned for high-concurrency downloads to Apple's CDN.
-        let download_client = Client::builder()
-            .cookie_provider(cookie_jar.clone())
-            .default_headers(default_headers)
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(120))
-            .pool_max_idle_per_host(20)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()?;
+        let (client, download_client) = build_clients(&cookie_jar, home_endpoint, timeout)?;
 
         let session_path = cookie_dir.join(format!("{sanitized}.session"));
         let session_data = if session_path.exists() {
@@ -311,8 +342,9 @@ impl Session {
             cookie_jar,
             session_data,
             cookie_dir,
-            sanitized_username: sanitized,
+            sanitized_username: sanitized.to_owned(),
             home_endpoint: home_endpoint.to_string(),
+            api_timeout: timeout,
             lock_file,
         })
     }
@@ -326,35 +358,15 @@ impl Session {
             .join(format!("{}.session", self.sanitized_username))
     }
 
-    /// Clear persisted session/cookie files so the next `Session::new()` gets
-    /// a clean slate. Prevents stale partition routing during 421 recovery.
-    pub async fn clear_persisted_files(&self) -> Result<()> {
-        let session_path = self.session_path();
-        match fs::remove_file(&session_path).await {
-            Ok(()) => {
-                tracing::debug!(path = %session_path.display(), "Cleared session file for clean re-auth");
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "Failed to remove session file: {}",
-                    session_path.display()
-                )));
-            }
-        }
-        let cookie_path = self.cookiejar_path();
-        match fs::remove_file(&cookie_path).await {
-            Ok(()) => {
-                tracing::debug!(path = %cookie_path.display(), "Cleared cookie file for clean re-auth");
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "Failed to remove cookie file: {}",
-                    cookie_path.display()
-                )));
-            }
-        }
+    /// Replace both HTTP clients with fresh ones, dropping the old connection
+    /// pools. The existing cookie jar and session data are preserved so no
+    /// re-authentication is needed. Used for 421 recovery where the issue is
+    /// stale HTTP/2 connection routing, not invalid auth state.
+    pub fn reset_http_clients(&mut self) -> Result<()> {
+        let (client, download_client) =
+            build_clients(&self.cookie_jar, &self.home_endpoint, self.api_timeout)?;
+        self.client = client;
+        self.download_client = download_client;
         Ok(())
     }
 

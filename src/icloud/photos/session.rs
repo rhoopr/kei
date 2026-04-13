@@ -62,12 +62,12 @@ const SERVICE_NOT_ACTIVATED_ERRORS: &[&str] = &["ZONE_NOT_FOUND", "AUTHENTICATIO
 #[derive(Debug, thiserror::Error)]
 #[error("CloudKit server error: {code} — {reason}")]
 pub struct CloudKitServerError {
-    pub code: Box<str>,
-    pub reason: Box<str>,
-    pub retryable: bool,
+    pub(crate) code: Box<str>,
+    pub(crate) reason: Box<str>,
+    pub(crate) retryable: bool,
     /// True when the error indicates the iCloud service is not activated
     /// (ADP enabled, incomplete setup, or private db access disabled).
-    pub service_not_activated: bool,
+    pub(crate) service_not_activated: bool,
 }
 
 /// Check whether an error code or reason indicates the iCloud service is not
@@ -113,18 +113,9 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
     // Per-record errors: filter out errored records and keep valid ones.
     // Only return Err if ALL records are errored.
     if let Some(records) = response["records"].as_array() {
-        // Single pass: separate errored records (by reference) from valid
-        // records (cloned for output). Avoids the double allocation of
-        // partition() followed by cloned().collect().
-        let mut errored: Vec<&Value> = Vec::new();
-        let mut valid_owned: Vec<Value> = Vec::new();
-        for record in records {
-            if record["serverErrorCode"].as_str().is_some() {
-                errored.push(record);
-            } else {
-                valid_owned.push(record.clone());
-            }
-        }
+        let (errored, valid): (Vec<&Value>, Vec<&Value>) = records
+            .iter()
+            .partition(|r| r["serverErrorCode"].as_str().is_some());
 
         if !errored.is_empty() {
             let mut last_ck_err = None;
@@ -149,16 +140,17 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                 });
             }
 
-            if valid_owned.is_empty() {
+            if valid.is_empty() {
                 return Err(last_ck_err.expect("errored is non-empty").into());
             }
-            let total = errored.len() + valid_owned.len();
+            let total = errored.len() + valid.len();
             tracing::warn!(
                 errored = errored.len(),
-                valid = valid_owned.len(),
+                valid = valid.len(),
                 total,
                 "Filtered errored records from CloudKit response"
             );
+            let valid_owned: Vec<Value> = valid.into_iter().cloned().collect();
             let mut response = response;
             response["records"] = Value::Array(valid_owned);
             return Ok(response);
