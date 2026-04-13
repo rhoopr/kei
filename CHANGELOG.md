@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.3] - 2026-04-13
+
+### Fixed
+
+- **421 Misdirected Request recovery** - v0.7.2's fix forced full SRP re-auth on every 421, then bailed if Apple returned the same partition URL. Now tries two strategies in order: reset the HTTP connection pool first (no password or 2FA prompt needed), then fall back to full re-auth only if the 421 persists. ([#199], [#201])
+
+### Changed
+
+- Move `AssetItemType`, `AssetVersionSize`, `ChangeReason` from `icloud/photos/types.rs` to `types.rs` (provider-agnostic).
+- Extract `build_clients()` to deduplicate HTTP client construction between `Session::build()` and `reset_http_clients()`.
+- `acquire_lock()` helper replacing repeated lock patterns in state DB.
+- Pre-allocate bulk DB loads with `COUNT(*)` + `with_capacity`.
+- `rename_part_to_final()` for handling concurrent download rename races.
+- Increase state-write retry from 3 to 6 attempts with exponential backoff.
+- `Box<str>` for CloudKit error fields, deferred clone in record filtering.
+- Tighten `pub` to `pub(crate)` on internal types.
+- Add `// SAFETY:` comments on all unsafe blocks.
+- Const assertion guarding shift overflow in retry backoff.
+
+[#201]: https://github.com/rhoopr/kei/pull/201
+
 ## [0.7.2] - 2026-04-13
 
 ### Fixed
