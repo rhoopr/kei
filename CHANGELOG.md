@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.8] - 2026-04-13
+
+### Fixed
+
+- **HTTP 403 on CloudKit now shows ADP guidance** - a 403 Forbidden after successful authentication was reported as a generic "Connection error" with no hint about ADP. Now detected and surfaced with the same actionable message as other service-not-activated errors. ([#199])
+
+### Changed
+
+- **ADP detection restored to hard stop** - v0.7.7 softened the `iCDPEnabled` check to a warning, but testing confirms ADP must be off for web API access to work. Restored to an immediate bail with a clear message. ([#199])
+- **ADP messaging requires both settings** - all error messages now tell users to disable ADP *and* enable "Access iCloud Data on the Web". Previous wording implied either alone was enough. ([#199])
+
+[#199]: https://github.com/rhoopr/kei/issues/199
+
 ## [0.7.7] - 2026-04-13
 
 ### Changed

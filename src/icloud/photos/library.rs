@@ -95,7 +95,17 @@ impl PhotoLibrary {
                     };
                 }
             }
-            ICloudError::Connection(e.to_string())
+            // HTTP 403 on the CloudKit query endpoint after successful
+            // authentication is the classic ADP signature: the account
+            // authenticated fine but iCloud data access is blocked.
+            let msg = e.to_string();
+            if msg.contains("403 Forbidden") {
+                return ICloudError::ServiceNotActivated {
+                    code: "HTTP_403".into(),
+                    reason: "Forbidden — iCloud data access denied".into(),
+                };
+            }
+            ICloudError::Connection(msg)
         })?;
 
         let query: super::cloudkit::QueryResponse =
@@ -362,5 +372,53 @@ mod tests {
         let cloned = lib.clone();
         drop(lib);
         assert_eq!(cloned.zone_name(), "PrimarySync");
+    }
+
+    /// Stub that returns an HTTP 403 error (the format produced by `PhotosSession::post`).
+    struct Forbidden403Session;
+
+    #[async_trait::async_trait]
+    impl PhotosSession for Forbidden403Session {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!(
+                "HTTP status client error (403 Forbidden) for url (https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query)"
+            )
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(Forbidden403Session)
+        }
+    }
+
+    #[tokio::test]
+    async fn http_403_maps_to_service_not_activated() {
+        let err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(Forbidden403Session),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ICloudError::ServiceNotActivated { .. }),
+            "expected ServiceNotActivated, got: {err:?}"
+        );
+        let display = err.to_string();
+        assert!(
+            display.contains("Advanced Data Protection"),
+            "expected ADP guidance in message, got: {display}"
+        );
     }
 }

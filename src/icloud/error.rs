@@ -8,8 +8,9 @@ pub enum ICloudError {
         "iCloud service not activated ({code}): {reason}\n\n\
          This usually means one of:\n  \
          1. Advanced Data Protection (ADP) is enabled, which blocks third-party iCloud access.\n     \
-            → Disable ADP in Settings > Apple Account > iCloud > Advanced Data Protection,\n     \
-            or enable \"Access iCloud Data on the Web\" (Settings > Apple Account > iCloud).\n  \
+            To fix, change both settings on your iPhone/iPad:\n     \
+            - Disable ADP: Settings > Apple ID > iCloud > Advanced Data Protection\n     \
+            - Enable web access: Settings > Apple ID > iCloud > Access iCloud Data on the Web\n  \
          2. iCloud setup is incomplete.\n     \
             → Log into https://icloud.com/ and finish setting up your iCloud service."
     )]

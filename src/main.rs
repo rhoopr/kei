@@ -232,10 +232,12 @@ async fn init_photos_service(
     api_retry_config: retry::RetryConfig,
 ) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
     if auth_result.data.i_cdp_enabled {
-        tracing::warn!(
-            "Advanced Data Protection (ADP) is enabled on this account. \
-             If you experience errors, ensure web access is allowed for iCloud data in: \
-             Settings > Apple ID > iCloud > Advanced Data Protection"
+        anyhow::bail!(
+            "Advanced Data Protection (ADP) is enabled on this account.\n\n\
+             ADP blocks the web API that kei uses to access photos.\n\
+             To use kei, change both settings on your iPhone/iPad:\n  \
+             1. Disable ADP: Settings > Apple ID > iCloud > Advanced Data Protection\n  \
+             2. Enable web access: Settings > Apple ID > iCloud > Access iCloud Data on the Web"
         );
     }
 
@@ -351,10 +353,12 @@ async fn init_photos_service(
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL after re-authentication"))?;
 
     if new_auth.data.i_cdp_enabled {
-        tracing::warn!(
-            "Advanced Data Protection (ADP) is enabled on this account. \
-             If you experience errors, ensure web access is allowed for iCloud data in: \
-             Settings > Apple ID > iCloud > Advanced Data Protection"
+        anyhow::bail!(
+            "Advanced Data Protection (ADP) is enabled on this account.\n\n\
+             ADP blocks the web API that kei uses to access photos.\n\
+             To use kei, change both settings on your iPhone/iPad:\n  \
+             1. Disable ADP: Settings > Apple ID > iCloud > Advanced Data Protection\n  \
+             2. Enable web access: Settings > Apple ID > iCloud > Access iCloud Data on the Web"
         );
     }
 
@@ -432,8 +436,10 @@ async fn init_photos_service(
         "421 Misdirected Request persists on {} after re-authentication and {} \
          backoff retries.\n\n\
          If Advanced Data Protection (ADP) is enabled on this account, that's the\n\
-         cause -- ADP blocks the web API that kei uses. Disable ADP or enable web\n\
-         access in: Settings > Apple ID > iCloud > Advanced Data Protection\n\n\
+         cause -- ADP blocks the web API that kei uses. To fix, change both settings\n\
+         on your iPhone/iPad:\n  \
+         1. Disable ADP: Settings > Apple ID > iCloud > Advanced Data Protection\n  \
+         2. Enable web access: Settings > Apple ID > iCloud > Access iCloud Data on the Web\n\n\
          Otherwise, this is likely a transient Apple-side routing issue. Try again later.",
         fresh_url,
         BACKOFF_SECS.len()

@@ -58,7 +58,7 @@ cargo build --release
 ```
 
 > [!IMPORTANT]
-> If you have Advanced Data Protection (ADP) enabled on your iCloud account, kei can't access your photos. ADP encrypts data end-to-end, which blocks the web API. Either disable ADP or turn on web access for iCloud data in Settings > Apple ID > iCloud > Advanced Data Protection. See the [Authentication wiki](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp) for details.
+> If you have Advanced Data Protection (ADP) enabled on your iCloud account, kei can't access your photos. ADP blocks the web API that kei uses. To fix this, you need to change both settings on your iPhone/iPad: disable ADP (Settings > Apple ID > iCloud > Advanced Data Protection) and enable "Access iCloud Data on the Web" (Settings > Apple ID > iCloud). See the [Authentication wiki](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp) for details.
 
 ## Quick start
 
