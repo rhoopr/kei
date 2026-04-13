@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.2] - 2026-04-13
+
+### Fixed
+
+- **421 Misdirected Request recovery** - The recovery path reused the existing session (same HTTP/2 connection pool, cookie jar, and session headers), so Apple returned the same stale partition URL on re-auth. Now tears down the session completely, clears persisted session/cookie files, and creates a fresh session via `auth::authenticate()`. Also adds a same-URL guard to bail early if Apple returns the same partition after clean re-auth. ([#199], [#200])
+
+[#199]: https://github.com/rhoopr/kei/issues/199
+[#200]: https://github.com/rhoopr/kei/pull/200
+
 ## [0.7.1] - 2026-04-12
 
 ### Fixed
