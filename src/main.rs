@@ -27,7 +27,6 @@ mod types;
 #[cfg(test)]
 mod test_helpers;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -323,7 +322,7 @@ async fn init_photos_service(
         session.release_lock()?;
     }
     let session_file = auth::session_file_path(cookie_directory, username);
-    strip_session_routing_state(&session_file).await;
+    auth::strip_session_routing_state(&session_file).await;
     let new_auth = auth::authenticate(
         cookie_directory,
         username,
@@ -435,38 +434,6 @@ async fn init_photos_service(
         fresh_url,
         BACKOFF_SECS.len()
     )
-}
-
-/// Strip routing state from a session file, keeping only `trust_token` and `client_id`.
-///
-/// Clearing `session_token` forces `authenticate()` through the SRP path instead of the
-/// validate shortcut. Preserving `trust_token` lets SRP send it in `trustTokens`, so
-/// Apple can recognise a trusted device and skip 2FA.
-///
-/// Deletes the file if it's corrupt or unreadable (fallback to old behavior).
-async fn strip_session_routing_state(session_file: &Path) {
-    match tokio::fs::read_to_string(session_file).await {
-        Ok(contents) => {
-            match serde_json::from_str::<HashMap<String, serde_json::Value>>(&contents) {
-                Ok(mut map) => {
-                    map.retain(|k, _| k == "trust_token" || k == "client_id");
-                    if let Ok(json) = serde_json::to_string_pretty(&map) {
-                        if let Err(e) = tokio::fs::write(session_file, json.as_bytes()).await {
-                            tracing::warn!(error = %e, "Could not rewrite session file, removing");
-                            let _ = tokio::fs::remove_file(session_file).await;
-                        }
-                    }
-                }
-                Err(_) => {
-                    let _ = tokio::fs::remove_file(session_file).await;
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {
-            let _ = tokio::fs::remove_file(session_file).await;
-        }
-    }
 }
 
 /// Check if an iCloud error is a 421 Misdirected Request from the CloudKit service.
@@ -2431,71 +2398,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn strip_session_preserves_trust_token_and_client_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.session");
-        let data = serde_json::json!({
-            "session_token": "tok_abc",
-            "session_id": "sid_123",
-            "scnt": "scnt_val",
-            "trust_token": "trust_xyz",
-            "client_id": "auth-1234",
-            "account_country": "USA"
-        });
-        std::fs::write(&path, data.to_string()).unwrap();
-
-        strip_session_routing_state(&path).await;
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let map: HashMap<String, serde_json::Value> = serde_json::from_str(&contents).unwrap();
-        assert_eq!(map.len(), 2);
-        assert_eq!(map["trust_token"], "trust_xyz");
-        assert_eq!(map["client_id"], "auth-1234");
-        assert!(!map.contains_key("session_token"));
-        assert!(!map.contains_key("session_id"));
-        assert!(!map.contains_key("scnt"));
-    }
-
-    #[tokio::test]
-    async fn strip_session_corrupt_file_gets_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("corrupt.session");
-        std::fs::write(&path, "not valid json {{{").unwrap();
-
-        strip_session_routing_state(&path).await;
-
-        assert!(!path.exists());
-    }
-
-    #[tokio::test]
-    async fn strip_session_missing_file_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nonexistent.session");
-
-        strip_session_routing_state(&path).await;
-
-        assert!(!path.exists());
-    }
-
-    #[tokio::test]
-    async fn strip_session_no_trust_token_leaves_empty_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("no_trust.session");
-        let data = serde_json::json!({
-            "session_token": "tok_abc",
-            "session_id": "sid_123",
-            "scnt": "scnt_val"
-        });
-        std::fs::write(&path, data.to_string()).unwrap();
-
-        strip_session_routing_state(&path).await;
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let map: HashMap<String, serde_json::Value> = serde_json::from_str(&contents).unwrap();
-        assert!(map.is_empty());
-    }
 
     #[test]
     fn pid_file_guard_creates_and_removes() {
