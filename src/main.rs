@@ -131,6 +131,13 @@ const EXIT_PARTIAL: u8 = 2;
 /// Exit code for authentication failures.
 const EXIT_AUTH: u8 = 3;
 
+const ADP_ENABLED_ERROR: &str = "\
+    Advanced Data Protection (ADP) is enabled on this account.\n\n\
+    ADP encrypts iCloud data end-to-end, which blocks the web API that\n\
+    kei uses to access photos. To use kei, either disable ADP or enable\n\
+    web access for iCloud data in:\n  \
+    Settings > Apple ID > iCloud > Advanced Data Protection";
+
 /// Returned when some (but not all) downloads failed during a sync.
 #[derive(Debug, thiserror::Error)]
 #[error("{0} downloads failed")]
@@ -232,13 +239,7 @@ async fn init_photos_service(
     api_retry_config: retry::RetryConfig,
 ) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
     if auth_result.data.i_cdp_enabled {
-        anyhow::bail!(
-            "Advanced Data Protection (ADP) is enabled on this account.\n\n\
-             ADP encrypts iCloud data end-to-end, which blocks the web API that\n\
-             kei uses to access photos. To use kei, either disable ADP or enable\n\
-             web access for iCloud data in:\n  \
-             Settings > Apple ID > iCloud > Advanced Data Protection"
-        );
+        anyhow::bail!(ADP_ENABLED_ERROR);
     }
 
     let ckdatabasews_url = auth_result
@@ -353,13 +354,7 @@ async fn init_photos_service(
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL after re-authentication"))?;
 
     if new_auth.data.i_cdp_enabled {
-        anyhow::bail!(
-            "Advanced Data Protection (ADP) is enabled on this account.\n\n\
-             ADP encrypts iCloud data end-to-end, which blocks the web API that\n\
-             kei uses to access photos. To use kei, either disable ADP or enable\n\
-             web access for iCloud data in:\n  \
-             Settings > Apple ID > iCloud > Advanced Data Protection"
-        );
+        anyhow::bail!(ADP_ENABLED_ERROR);
     }
 
     if fresh_url != ckdatabasews_url {
