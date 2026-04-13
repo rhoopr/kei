@@ -1337,6 +1337,46 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
     failures
 }
 
+/// Breakdown of assets skipped during the producer phase.
+///
+/// Every asset from the API stream must be accounted for: either it ends up
+/// in one of these skip buckets, gets sent for download (showing up in
+/// `downloaded` / `failed`), or was an enumeration error.
+#[derive(Debug, Default, Clone)]
+struct ProducerSkipSummary {
+    by_state: usize,
+    on_disk: usize,
+    ampm_variant: usize,
+    by_filter: usize,
+    duplicates: usize,
+    retry_exhausted: usize,
+    retry_only: usize,
+}
+
+impl ProducerSkipSummary {
+    fn total(&self) -> usize {
+        self.by_state
+            + self.on_disk
+            + self.ampm_variant
+            + self.by_filter
+            + self.duplicates
+            + self.retry_exhausted
+            + self.retry_only
+    }
+}
+
+impl std::ops::AddAssign for ProducerSkipSummary {
+    fn add_assign(&mut self, rhs: Self) {
+        self.by_state += rhs.by_state;
+        self.on_disk += rhs.on_disk;
+        self.ampm_variant += rhs.ampm_variant;
+        self.by_filter += rhs.by_filter;
+        self.duplicates += rhs.duplicates;
+        self.retry_exhausted += rhs.retry_exhausted;
+        self.retry_only += rhs.retry_only;
+    }
+}
+
 /// Result of the streaming download phase.
 #[derive(Debug)]
 struct StreamingResult {
@@ -1347,6 +1387,7 @@ struct StreamingResult {
     state_write_failures: usize,
     enumeration_errors: usize,
     assets_seen: u64,
+    skip_summary: ProducerSkipSummary,
 }
 
 /// Download photos with syncToken support.
@@ -1523,6 +1564,7 @@ async fn download_photos_full_with_token(
             state_write_failures: 0,
             enumeration_errors: 0,
             assets_seen: 0,
+            skip_summary: ProducerSkipSummary::default(),
         };
         let mut token_receivers = Vec::with_capacity(albums.len());
 
@@ -1560,6 +1602,7 @@ async fn download_photos_full_with_token(
             combined_result.state_write_failures += result.state_write_failures;
             combined_result.enumeration_errors += result.enumeration_errors;
             combined_result.assets_seen += result.assets_seen;
+            combined_result.skip_summary += result.skip_summary;
         }
 
         (combined_result, token_receivers)
@@ -1982,6 +2025,7 @@ where
             state_write_failures: 0,
             enumeration_errors: 0,
             assets_seen: 0,
+            skip_summary: ProducerSkipSummary::default(),
         });
     }
 
@@ -2011,6 +2055,7 @@ where
             state_write_failures: 0,
             enumeration_errors: 0,
             assets_seen: 0,
+            skip_summary: ProducerSkipSummary::default(),
         });
     }
 
@@ -2135,10 +2180,7 @@ where
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
         let mut seen_ids: FxHashSet<Box<str>> = FxHashSet::default();
-        let mut skipped_by_state = 0usize;
-        let mut skipped_on_disk = 0usize;
-        let mut skipped_ampm = 0usize;
-        let mut skipped_by_filter = 0usize;
+        let mut skips = ProducerSkipSummary::default();
         tokio::pin!(combined);
         while let Some(result) = combined.next().await {
             if producer_shutdown.is_cancelled() {
@@ -2151,7 +2193,7 @@ where
                             asset_id = %asset.id(),
                             "Duplicate asset ID from API, skipping"
                         );
-                        producer_pb.inc(1);
+                        skips.duplicates += 1;
                         continue;
                     }
 
@@ -2172,7 +2214,7 @@ where
                                     tracing::debug!(error = %e, asset_id = asset.id(), "Failed to update last-seen timestamp");
                                 }
                             }
-                            skipped_by_state += 1;
+                            skips.by_state += 1;
                             producer_pb.inc(1);
                             continue;
                         }
@@ -2183,9 +2225,13 @@ where
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
                     if tasks.is_empty() {
-                        skipped_by_filter += 1;
+                        skips.by_filter += 1;
                         producer_pb.inc(1);
                     } else {
+                        let mut any_task_reached_checks = false;
+                        let mut had_retry_exhausted = false;
+                        let mut had_retry_only = false;
+
                         for task in tasks {
                             // Skip assets that have exceeded the retry limit.
                             if let Some(&attempts) =
@@ -2200,6 +2246,7 @@ where
                                         max = config.max_download_attempts,
                                         "Skipping asset: exceeded max download attempts"
                                     );
+                                    had_retry_exhausted = true;
                                     continue;
                                 }
                             }
@@ -2211,8 +2258,11 @@ where
                                     asset_id = %task.asset_id,
                                     "Skipping new asset in retry-only mode"
                                 );
+                                had_retry_only = true;
                                 continue;
                             }
+
+                            any_task_reached_checks = true;
 
                             if let Some(db) = &producer_state_db {
                                 let media_type = determine_media_type(task.version_size, &asset);
@@ -2246,11 +2296,11 @@ where
                                 ) {
                                     Some(true) => {
                                         if task_tx.send(task).await.is_err() {
-                                            return;
+                                            return skips;
                                         }
                                     }
                                     Some(false) => {
-                                        skipped_by_state += 1;
+                                        skips.by_state += 1;
                                         tracing::debug!(
                                             asset_id = %task.asset_id,
                                             "Skipping (state confirms no download needed)"
@@ -2258,9 +2308,9 @@ where
                                     }
                                     None => {
                                         // Directory was pre-populated above, so these
-                                        // are cache-hits — no blocking I/O.
+                                        // are cache-hits -- no blocking I/O.
                                         if dir_cache.exists(&task.download_path) {
-                                            skipped_on_disk += 1;
+                                            skips.on_disk += 1;
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
@@ -2270,7 +2320,7 @@ where
                                             .find_ampm_variant(&task.download_path)
                                             .is_some()
                                         {
-                                            skipped_ampm += 1;
+                                            skips.ampm_variant += 1;
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
@@ -2283,15 +2333,26 @@ where
                                                 "File missing, will re-download"
                                             );
                                             if task_tx.send(task).await.is_err() {
-                                                return;
+                                                return skips;
                                             }
                                         }
                                     }
                                 }
                             } else if task_tx.send(task).await.is_err() {
-                                return;
+                                return skips;
                             }
                         }
+
+                        // If no task made it past the retry gates, count
+                        // the asset in the appropriate skip bucket.
+                        if !any_task_reached_checks {
+                            if had_retry_exhausted {
+                                skips.retry_exhausted += 1;
+                            } else if had_retry_only {
+                                skips.retry_only += 1;
+                            }
+                        }
+
                         producer_pb.inc(1);
                     }
                 }
@@ -2302,19 +2363,24 @@ where
             }
         }
 
-        let total_skipped = skipped_by_state + skipped_on_disk + skipped_ampm + skipped_by_filter;
+        let total_skipped = skips.total();
         if total_skipped > 0 {
             producer_pb.suspend(|| {
                 tracing::info!(
-                    state = skipped_by_state,
-                    on_disk = skipped_on_disk,
-                    ampm_variant = skipped_ampm,
-                    filtered = skipped_by_filter,
+                    state = skips.by_state,
+                    on_disk = skips.on_disk,
+                    ampm_variant = skips.ampm_variant,
+                    filtered = skips.by_filter,
+                    duplicates = skips.duplicates,
+                    retry_exhausted = skips.retry_exhausted,
+                    retry_only = skips.retry_only,
                     total = total_skipped,
                     "Skipped assets"
                 );
             });
         }
+
+        skips
     });
 
     // Convert channel receiver to stream and feed into buffer_unordered
@@ -2433,12 +2499,13 @@ where
         }
     }
 
-    let producer_panicked = match producer.await {
+    let (producer_panicked, producer_skips) = match producer.await {
+        Ok(skips) => (false, skips),
         Err(e) if e.is_panic() => {
             tracing::error!(error = ?e, "Asset producer task panicked");
-            true
+            (true, ProducerSkipSummary::default())
         }
-        _ => false,
+        Err(_) => (false, ProducerSkipSummary::default()),
     };
 
     let assets_seen_count = assets_seen.load(std::sync::atomic::Ordering::Relaxed);
@@ -2488,6 +2555,7 @@ where
         state_write_failures,
         enumeration_errors: enum_errors.load(std::sync::atomic::Ordering::Relaxed),
         assets_seen: assets_seen_count,
+        skip_summary: producer_skips,
     })
 }
 
@@ -2508,6 +2576,7 @@ async fn build_download_outcome(
     let auth_errors = streaming_result.auth_errors;
     let mut state_write_failures = streaming_result.state_write_failures;
     let enumeration_errors = streaming_result.enumeration_errors;
+    let skipped = streaming_result.skip_summary.total();
 
     if auth_errors >= AUTH_ERROR_THRESHOLD {
         return Ok(DownloadOutcome::SessionExpired {
@@ -2545,15 +2614,22 @@ async fn build_download_outcome(
         if exif_failures > 0 || state_write_failures > 0 || enumeration_errors > 0 {
             tracing::info!(
                 downloaded = total,
+                skipped,
                 exif_failures,
                 state_write_failures,
                 enumeration_errors,
                 failed = 0,
-                total,
+                total = total + skipped,
                 "  sync results"
             );
         } else {
-            tracing::info!(downloaded = total, failed = 0, total, "  sync results");
+            tracing::info!(
+                downloaded = total,
+                skipped,
+                failed = 0,
+                total = total + skipped,
+                "  sync results"
+            );
         }
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
         if state_write_failures > 0 || enumeration_errors > 0 || exif_failures > 0 {
@@ -2612,17 +2688,19 @@ async fn build_download_outcome(
     if exif_failures > 0 || state_write_failures > 0 {
         tracing::info!(
             downloaded = succeeded,
+            skipped,
             exif_failures,
             state_write_failures,
             failed,
-            total = final_total,
+            total = final_total + skipped,
             "  sync results"
         );
     } else {
         tracing::info!(
             downloaded = succeeded,
+            skipped,
             failed,
-            total = final_total,
+            total = final_total + skipped,
             "  sync results"
         );
     }
@@ -5576,6 +5654,57 @@ mod tests {
         );
 
         assert_eq!(seen_ids.len(), 2, "only 2 unique IDs should be tracked");
+    }
+
+    #[test]
+    fn test_producer_skip_summary_total() {
+        let skips = ProducerSkipSummary {
+            by_state: 10,
+            on_disk: 5,
+            ampm_variant: 2,
+            by_filter: 1,
+            duplicates: 3,
+            retry_exhausted: 4,
+            retry_only: 0,
+        };
+        assert_eq!(skips.total(), 25);
+    }
+
+    #[test]
+    fn test_producer_skip_summary_add_assign() {
+        let mut a = ProducerSkipSummary {
+            by_state: 10,
+            on_disk: 5,
+            ampm_variant: 2,
+            by_filter: 1,
+            duplicates: 3,
+            retry_exhausted: 4,
+            retry_only: 0,
+        };
+        let b = ProducerSkipSummary {
+            by_state: 1,
+            on_disk: 2,
+            ampm_variant: 3,
+            by_filter: 4,
+            duplicates: 5,
+            retry_exhausted: 6,
+            retry_only: 7,
+        };
+        a += b;
+        assert_eq!(a.by_state, 11);
+        assert_eq!(a.on_disk, 7);
+        assert_eq!(a.ampm_variant, 5);
+        assert_eq!(a.by_filter, 5);
+        assert_eq!(a.duplicates, 8);
+        assert_eq!(a.retry_exhausted, 10);
+        assert_eq!(a.retry_only, 7);
+        assert_eq!(a.total(), 53);
+    }
+
+    #[test]
+    fn test_producer_skip_summary_default_is_zero() {
+        let skips = ProducerSkipSummary::default();
+        assert_eq!(skips.total(), 0);
     }
 
     /// NB-1: When a CancellationToken fires during a download pass with
