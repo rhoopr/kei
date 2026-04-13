@@ -1392,7 +1392,7 @@ impl std::ops::AddAssign for ProducerSkipSummary {
 }
 
 /// Result of the streaming download phase.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct StreamingResult {
     downloaded: usize,
     exif_failures: usize,
@@ -1570,16 +1570,7 @@ async fn download_photos_full_with_token(
     // the album name can be threaded into path expansion. Otherwise, merge all
     // album streams for maximum download concurrency across albums.
     let (streaming_result, token_receivers) = if uses_album_token {
-        let mut combined_result = StreamingResult {
-            downloaded: 0,
-            exif_failures: 0,
-            failed: Vec::new(),
-            auth_errors: 0,
-            state_write_failures: 0,
-            enumeration_errors: 0,
-            assets_seen: 0,
-            skip_summary: ProducerSkipSummary::default(),
-        };
+        let mut combined_result = StreamingResult::default();
         let mut token_receivers = Vec::with_capacity(albums.len());
 
         // When {album} is in folder_structure, albums are processed sequentially
@@ -2031,16 +2022,7 @@ where
                 }
             }
         }
-        return Ok(StreamingResult {
-            downloaded: 0,
-            exif_failures: 0,
-            failed: Vec::new(),
-            auth_errors: 0,
-            state_write_failures: 0,
-            enumeration_errors: 0,
-            assets_seen: 0,
-            skip_summary: ProducerSkipSummary::default(),
-        });
+        return Ok(StreamingResult::default());
     }
 
     if config.dry_run {
@@ -2063,13 +2045,7 @@ where
         }
         return Ok(StreamingResult {
             downloaded: count,
-            exif_failures: 0,
-            failed: Vec::new(),
-            auth_errors: 0,
-            state_write_failures: 0,
-            enumeration_errors: 0,
-            assets_seen: 0,
-            skip_summary: ProducerSkipSummary::default(),
+            ..StreamingResult::default()
         });
     }
 
@@ -2306,7 +2282,7 @@ where
                                     false,
                                 ) {
                                     Some(true) => {
-                                        disposition = AssetDisposition::Forwarded;
+                                        disposition = disposition.max(AssetDisposition::Forwarded);
                                         if task_tx.send(task).await.is_err() {
                                             return skips;
                                         }
@@ -2345,7 +2321,8 @@ where
                                                 path = %task.download_path.display(),
                                                 "File missing, will re-download"
                                             );
-                                            disposition = AssetDisposition::Forwarded;
+                                            disposition =
+                                                disposition.max(AssetDisposition::Forwarded);
                                             if task_tx.send(task).await.is_err() {
                                                 return skips;
                                             }
@@ -2353,7 +2330,7 @@ where
                                     }
                                 }
                             } else {
-                                disposition = AssetDisposition::Forwarded;
+                                disposition = disposition.max(AssetDisposition::Forwarded);
                                 if task_tx.send(task).await.is_err() {
                                     return skips;
                                 }
@@ -2367,7 +2344,12 @@ where
                             AssetDisposition::StateSkip => skips.by_state += 1,
                             AssetDisposition::RetryExhausted => skips.retry_exhausted += 1,
                             AssetDisposition::RetryOnly => skips.retry_only += 1,
-                            AssetDisposition::Unresolved => {}
+                            AssetDisposition::Unresolved => {
+                                debug_assert!(
+                                    false,
+                                    "asset with non-empty tasks had no disposition"
+                                );
+                            }
                         }
 
                         producer_pb.inc(1);
@@ -2611,7 +2593,9 @@ async fn build_download_outcome(
     let auth_errors = streaming_result.auth_errors;
     let mut state_write_failures = streaming_result.state_write_failures;
     let enumeration_errors = streaming_result.enumeration_errors;
-    let skipped = streaming_result.skip_summary.total();
+    // Exclude duplicates: they're outside the API's unique-asset count
+    // and would inflate the user-facing total beyond what the API reported.
+    let skipped = streaming_result.skip_summary.total() - streaming_result.skip_summary.duplicates;
 
     if auth_errors >= AUTH_ERROR_THRESHOLD {
         return Ok(DownloadOutcome::SessionExpired {
