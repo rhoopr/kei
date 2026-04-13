@@ -352,7 +352,7 @@ pub(super) async fn rename_part_to_final(
 ) -> anyhow::Result<()> {
     match fs::rename(part_path, final_path).await {
         Ok(()) => Ok(()),
-        Err(_) if final_path.is_file() => {
+        Err(_) if fs::try_exists(final_path).await.unwrap_or(false) => {
             // Another task won the race — clean up our .part file.
             tracing::debug!(
                 path = %final_path.display(),

@@ -1,6 +1,3 @@
-// Re-export provider-agnostic types from the core module so that existing
-// iCloud-internal imports (`super::types::AssetVersionSize`, etc.) continue
-// to resolve without changing every file in `icloud/photos/`.
 pub use crate::types::{AssetItemType, AssetVersionSize, ChangeReason};
 
 /// Information about a downloadable asset version.
