@@ -1432,8 +1432,44 @@ pub async fn download_photos_with_sync(
 ) -> Result<SyncResult> {
     cleanup_orphan_part_files(&config).await;
 
+    // Give every non-downloaded asset a fresh start this sync:
+    // failed -> pending (with attempts reset), and stale attempt counts on
+    // pending assets cleared so the per-sync cap starts from zero.
+    let total_pending = if let Some(db) = &config.state_db {
+        match db.prepare_for_retry().await {
+            Ok((failed, stale, total_pending)) => {
+                if failed > 0 {
+                    tracing::info!(count = failed, "Reset failed assets for retry");
+                }
+                if stale > 0 {
+                    tracing::info!(
+                        count = stale,
+                        "Cleared stale attempt counts on pending assets"
+                    );
+                }
+                total_pending
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to reset assets for retry");
+                0
+            }
+        }
+    } else {
+        0
+    };
+
     match &config.sync_mode {
         SyncMode::Full => {
+            download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
+        }
+        // Incremental sync only returns new changes — it won't re-enumerate
+        // pending assets from previous syncs. Fall back to full so they get
+        // retried. Once everything is downloaded, incremental resumes.
+        SyncMode::Incremental { .. } if total_pending > 0 => {
+            tracing::info!(
+                pending = total_pending,
+                "Pending assets require full enumeration, skipping incremental sync"
+            );
             download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
         }
         SyncMode::Incremental { zone_sync_token } => {
@@ -2187,7 +2223,7 @@ where
                         producer_pb.inc(1);
                     } else {
                         for task in tasks {
-                            // Skip assets that have exceeded the retry limit.
+                            // Mark assets that have exceeded the retry limit as failed.
                             if let Some(&attempts) =
                                 download_ctx.attempt_counts.get(task.asset_id.as_ref())
                             {
@@ -2198,8 +2234,28 @@ where
                                         asset_id = %task.asset_id,
                                         attempts,
                                         max = config.max_download_attempts,
-                                        "Skipping asset: exceeded max download attempts"
+                                        "Asset exceeded max download attempts, marking as failed"
                                     );
+                                    if let Some(db) = &producer_state_db {
+                                        let error = format!(
+                                            "Exceeded max download attempts ({attempts}/{})",
+                                            config.max_download_attempts
+                                        );
+                                        if let Err(e) = db
+                                            .mark_failed(
+                                                &task.asset_id,
+                                                task.version_size.as_str(),
+                                                &error,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                asset_id = %task.asset_id,
+                                                error = %e,
+                                                "Failed to mark asset as failed"
+                                            );
+                                        }
+                                    }
                                     continue;
                                 }
                             }
@@ -5401,7 +5457,10 @@ mod tests {
             unimplemented!()
         }
         async fn reset_failed(&self) -> Result<u64, StateError> {
-            unimplemented!()
+            Ok(0)
+        }
+        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+            Ok((0, 0, 0))
         }
         async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
             unimplemented!()
