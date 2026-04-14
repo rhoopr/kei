@@ -1860,6 +1860,41 @@ mod tests {
         );
     }
 
+    // ── Gap coverage: should_download_fast with no checksum in DB ────────
+
+    #[test]
+    fn should_download_fast_no_checksum_trust_true_returns_false() {
+        // Asset is in downloaded_ids but has no entry in downloaded_checksums.
+        // With trust_state=true the method should hard-skip (Some(false))
+        // because the absence of a stored checksum means "nothing to compare".
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("asset_no_ck".into())
+            .or_default()
+            .insert("original".into());
+        // No entry in downloaded_checksums
+
+        assert_eq!(
+            ctx.should_download_fast("asset_no_ck", VersionSizeKey::Original, "any", true),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn should_download_fast_no_checksum_trust_false_returns_none() {
+        // Same scenario but trust_state=false: needs filesystem check (None).
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("asset_no_ck".into())
+            .or_default()
+            .insert("original".into());
+
+        assert_eq!(
+            ctx.should_download_fast("asset_no_ck", VersionSizeKey::Original, "any", false),
+            None
+        );
+    }
+
     // ── Gap coverage: retry_only known_ids filtering ────────────────────
 
     // ── Gap coverage: skip_created_before AND skip_created_after ────────
@@ -1960,6 +1995,20 @@ mod tests {
             s.live_photo_mode = Some(LivePhotoMode::Skip);
         });
         assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_library() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.library = Some("all".to_string());
+        });
+        assert_ne!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "changing library selection should change the config hash"
+        );
     }
 
     #[test]
