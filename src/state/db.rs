@@ -90,6 +90,13 @@ pub trait StateDb: Send + Sync {
     /// Returns the number of assets reset.
     async fn reset_failed(&self) -> Result<u64, StateError>;
 
+    /// Reset all non-downloaded assets for a fresh sync attempt.
+    ///
+    /// Moves failed -> pending and clears stale attempt counts on pending
+    /// assets, all in one lock acquisition. Returns
+    /// (failed_reset, pending_reset, total_pending).
+    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
+
     // ── Bulk read operations ──
 
     /// Get all downloaded asset IDs as (id, `version_size`) pairs.
@@ -510,16 +517,39 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn reset_failed(&self) -> Result<u64, StateError> {
-        let conn = self.acquire_lock("reset_failed")?;
+        let (failed, _, _) = self.prepare_for_retry().await?;
+        Ok(failed)
+    }
 
-        let rows = conn
+    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+        let conn = self.acquire_lock("prepare_for_retry")?;
+
+        let failed = conn
             .execute(
-                "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL WHERE status = 'failed'",
+                "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
+                 WHERE status = 'failed'",
                 [],
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query(&e))? as u64;
 
-        Ok(rows as u64) // usize -> u64 is lossless on 64-bit
+        let pending = conn
+            .execute(
+                "UPDATE assets SET download_attempts = 0, last_error = NULL \
+                 WHERE status = 'pending' AND download_attempts > 0",
+                [],
+            )
+            .map_err(|e| StateError::query(&e))? as u64;
+
+        let total_pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM assets WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StateError::query(&e))?;
+        let total_pending = total_pending as u64;
+
+        Ok((failed, pending, total_pending))
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
@@ -1705,6 +1735,87 @@ mod tests {
         // Verify the formerly-failed assets have cleared error and zero attempts
         let failed_after = db.get_failed().await.unwrap();
         assert!(failed_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_for_retry_resets_failed_and_stuck_pending() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let dir = test_dir();
+
+        // 1 downloaded (should be untouched)
+        let record = TestAssetRecord::new("ADwnloaded1")
+            .checksum("aaaa")
+            .filename("IMG_1000.HEIC")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let path = dir.path().join("IMG_1000.HEIC");
+        fs::write(&path, b"payload").unwrap();
+        db.mark_downloaded("ADwnloaded1", "original", &path, "localhash1", None)
+            .await
+            .unwrap();
+
+        // 1 normal pending (attempts = 0, should be untouched)
+        let record = TestAssetRecord::new("APending1")
+            .checksum("bbbb")
+            .filename("IMG_2000.JPG")
+            .size(2000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+
+        // 1 stuck pending (attempts > 0, should get attempts cleared)
+        let record = TestAssetRecord::new("AStuck1")
+            .checksum("cccc")
+            .filename("IMG_3000.JPG")
+            .size(3000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        // Simulate accumulated attempts by marking failed then resetting status to pending
+        // but keeping attempts high (as the old bug would produce)
+        db.mark_failed("AStuck1", "original", "transient error")
+            .await
+            .unwrap();
+        // Manually set back to pending with attempts preserved (simulating the old bug)
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE assets SET status = 'pending' WHERE id = 'AStuck1'",
+                [],
+            )
+            .unwrap();
+
+        // 2 failed (should transition to pending)
+        for i in 0..2 {
+            let id = format!("AFailed{i}");
+            let record = TestAssetRecord::new(&id)
+                .checksum(&format!("dddd{i}"))
+                .filename(&format!("IMG_400{i}.MOV"))
+                .size(5000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_failed(&id, "original", "HTTP 500").await.unwrap();
+        }
+
+        let before = db.get_summary().await.unwrap();
+        assert_eq!(before.downloaded, 1);
+        assert_eq!(before.pending, 2); // normal + stuck
+        assert_eq!(before.failed, 2);
+
+        let (failed_reset, pending_reset, total_pending) = db.prepare_for_retry().await.unwrap();
+
+        assert_eq!(failed_reset, 2);
+        assert_eq!(pending_reset, 1); // only the stuck one
+        assert_eq!(total_pending, 4); // 2 original pending + 2 reset from failed
+
+        let after = db.get_summary().await.unwrap();
+        assert_eq!(after.downloaded, 1);
+        assert_eq!(after.pending, 4);
+        assert_eq!(after.failed, 0);
+
+        // Verify attempt counts are all zero now
+        let attempts = db.get_attempt_counts().await.unwrap();
+        assert!(attempts.is_empty(), "all attempt counts should be zero");
     }
 
     #[tokio::test]

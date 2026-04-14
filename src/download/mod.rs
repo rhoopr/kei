@@ -663,8 +663,44 @@ pub async fn download_photos_with_sync(
 ) -> Result<SyncResult> {
     cleanup_orphan_part_files(&config).await;
 
+    // Give every non-downloaded asset a fresh start this sync:
+    // failed -> pending (with attempts reset), and stale attempt counts on
+    // pending assets cleared so the per-sync cap starts from zero.
+    let total_pending = if let Some(db) = &config.state_db {
+        match db.prepare_for_retry().await {
+            Ok((failed, stale, total_pending)) => {
+                if failed > 0 {
+                    tracing::info!(count = failed, "Reset failed assets for retry");
+                }
+                if stale > 0 {
+                    tracing::info!(
+                        count = stale,
+                        "Cleared stale attempt counts on pending assets"
+                    );
+                }
+                total_pending
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to reset assets for retry");
+                0
+            }
+        }
+    } else {
+        0
+    };
+
     match &config.sync_mode {
         SyncMode::Full => {
+            download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
+        }
+        // Incremental sync only returns new changes — it won't re-enumerate
+        // pending assets from previous syncs. Fall back to full so they get
+        // retried. Once everything is downloaded, incremental resumes.
+        SyncMode::Incremental { .. } if total_pending > 0 => {
+            tracing::info!(
+                pending = total_pending,
+                "Pending assets require full enumeration, skipping incremental sync"
+            );
             download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
         }
         SyncMode::Incremental { zone_sync_token } => {

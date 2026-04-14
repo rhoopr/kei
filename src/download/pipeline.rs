@@ -503,7 +503,7 @@ where
                         let mut disposition = AssetDisposition::Unresolved;
 
                         for task in tasks {
-                            // Skip assets that have exceeded the retry limit.
+                            // Mark assets that have exceeded the retry limit as failed.
                             if let Some(&attempts) =
                                 download_ctx.attempt_counts.get(task.asset_id.as_ref())
                             {
@@ -514,8 +514,28 @@ where
                                         asset_id = %task.asset_id,
                                         attempts,
                                         max = config.max_download_attempts,
-                                        "Skipping asset: exceeded max download attempts"
+                                        "Asset exceeded max download attempts, marking as failed"
                                     );
+                                    if let Some(db) = &producer_state_db {
+                                        let error = format!(
+                                            "Exceeded max download attempts ({attempts}/{})",
+                                            config.max_download_attempts
+                                        );
+                                        if let Err(e) = db
+                                            .mark_failed(
+                                                &task.asset_id,
+                                                task.version_size.as_str(),
+                                                &error,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                asset_id = %task.asset_id,
+                                                error = %e,
+                                                "Failed to mark asset as failed"
+                                            );
+                                        }
+                                    }
                                     disposition = disposition.max(AssetDisposition::RetryExhausted);
                                     continue;
                                 }
@@ -1690,6 +1710,9 @@ mod tests {
         }
         async fn reset_failed(&self) -> Result<u64, StateError> {
             unimplemented!()
+        }
+        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+            Ok((0, 0, 0))
         }
         async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
             unimplemented!()
