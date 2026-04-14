@@ -694,7 +694,6 @@ pub(super) fn filter_asset_to_tasks(
             };
 
             if let Some(path) = final_mov_path {
-                // Clone for the normalized key, move original into DownloadTask
                 claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
                 tasks.push(DownloadTask {
                     url: live_version.url.clone(),

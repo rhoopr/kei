@@ -713,7 +713,6 @@ where
         skips
     });
 
-    // Convert channel receiver to stream and feed into buffer_unordered
     let temp_suffix: Arc<str> = config.temp_suffix.clone().into();
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
