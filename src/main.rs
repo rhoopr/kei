@@ -1496,11 +1496,11 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let config_required = config_explicitly_set && !can_auto_create;
     let mut toml_config = config::load_toml_config(&config_path, config_required)?;
 
-    // Resolve log level: CLI > TOML > default (info)
+    // Resolve log level: CLI > TOML > default (warn)
     let effective_log_level = cli
         .log_level
         .or_else(|| toml_config.as_ref().and_then(|t| t.log_level))
-        .unwrap_or(types::LogLevel::Info);
+        .unwrap_or(types::LogLevel::Warn);
 
     // Scope debug/info to the app crate so dependency crates stay quieter.
     // Users can override with RUST_LOG env var for full control.

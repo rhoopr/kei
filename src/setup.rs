@@ -660,7 +660,7 @@ fn generate_toml(answers: &SetupAnswers) -> String {
     // Log level
     match answers.log_level {
         Some(level) => writeln!(out, "log_level = \"{}\"", log_level_str(level)).ok(),
-        None => writeln!(out, "# log_level = \"info\"").ok(),
+        None => writeln!(out, "# log_level = \"warn\"").ok(),
     };
 
     // [auth]
@@ -899,7 +899,7 @@ mod tests {
         // Defaults should be commented out
         assert!(toml.contains("# size = \"original\""));
         assert!(toml.contains("# threads_num = 10"));
-        assert!(toml.contains("# log_level = \"info\""));
+        assert!(toml.contains("# log_level = \"warn\""));
     }
 
     #[test]
