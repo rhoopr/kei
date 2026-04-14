@@ -165,6 +165,56 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
     Cow::Owned(swapped)
 }
 
+/// Returns `true` if this asset should be skipped by all filter paths.
+/// Shared predicate used by both `extract_skip_candidates` (lightweight
+/// pre-check) and `filter_asset_to_tasks` (full path resolution).
+fn is_asset_filtered(asset: &crate::icloud::photos::PhotoAsset, config: &DownloadConfig) -> bool {
+    if config.exclude_asset_ids.contains(asset.id()) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
+        return true;
+    }
+    if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping video (skip_videos enabled)");
+        return true;
+    }
+    if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping photo (skip_photos enabled)");
+        return true;
+    }
+    if config.live_photo_mode == LivePhotoMode::Skip && asset.is_live_photo() {
+        tracing::debug!(asset_id = %asset.id(), "Skipping live photo (live_photo_mode=skip)");
+        return true;
+    }
+    let created_utc = asset.created();
+    if let Some(before) = &config.skip_created_before {
+        if created_utc < *before {
+            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (before date range)");
+            return true;
+        }
+    }
+    if let Some(after) = &config.skip_created_after {
+        if created_utc > *after {
+            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (after date range)");
+            return true;
+        }
+    }
+    // Only check filename exclusion when the asset has a real filename.
+    // filter_asset_to_tasks separately handles fallback fingerprint filenames.
+    if !config.filename_exclude.is_empty() {
+        if let Some(filename) = asset.filename() {
+            if config
+                .filename_exclude
+                .iter()
+                .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
+            {
+                tracing::debug!(asset_id = %asset.id(), filename, "Skipping (filename_exclude match)");
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Lightweight pre-check: extract (`version_size`, checksum) pairs for an asset
 /// after applying content/date filters but WITHOUT path resolution or disk I/O.
 ///
@@ -174,50 +224,11 @@ pub(super) fn extract_skip_candidates<'a>(
     asset: &'a crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> SmallVec<[(VersionSizeKey, &'a str); 2]> {
-    // Excluded album assets -- same as filter_asset_to_tasks
-    if config.exclude_asset_ids.contains(asset.id()) {
-        return SmallVec::new();
-    }
-
-    // Content type filters -- same as filter_asset_to_tasks
-    if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
-        return SmallVec::new();
-    }
-    if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
+    if is_asset_filtered(asset, config) {
         return SmallVec::new();
     }
 
     let is_live_photo = asset.is_live_photo();
-    if config.live_photo_mode == LivePhotoMode::Skip && is_live_photo {
-        return SmallVec::new();
-    }
-
-    // Date filters
-    let created_utc = asset.created();
-    if let Some(before) = &config.skip_created_before {
-        if created_utc < *before {
-            return SmallVec::new();
-        }
-    }
-    if let Some(after) = &config.skip_created_after {
-        if created_utc > *after {
-            return SmallVec::new();
-        }
-    }
-
-    // Filename exclusion -- mirrors filter_asset_to_tasks
-    if !config.filename_exclude.is_empty() {
-        if let Some(filename) = asset.filename() {
-            if config
-                .filename_exclude
-                .iter()
-                .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
-            {
-                return SmallVec::new();
-            }
-        }
-    }
-
     let versions = asset.versions();
     let mut result = SmallVec::new();
 
@@ -311,39 +322,11 @@ pub(super) fn filter_asset_to_tasks(
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
 ) -> SmallVec<[DownloadTask; 2]> {
-    if config.exclude_asset_ids.contains(asset.id()) {
-        tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
-        return SmallVec::new();
-    }
-    if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
-        tracing::debug!(asset_id = %asset.id(), "Skipping video (skip_videos enabled)");
-        return SmallVec::new();
-    }
-    if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
-        tracing::debug!(asset_id = %asset.id(), "Skipping photo (skip_photos enabled)");
+    if is_asset_filtered(asset, config) {
         return SmallVec::new();
     }
 
-    // LivePhotoMode::Skip: skip live photo assets entirely (both image and MOV)
     let is_live_photo = asset.is_live_photo();
-    if config.live_photo_mode == LivePhotoMode::Skip && is_live_photo {
-        tracing::debug!(asset_id = %asset.id(), "Skipping live photo (live_photo_mode=skip)");
-        return SmallVec::new();
-    }
-
-    let created_utc = asset.created();
-    if let Some(before) = &config.skip_created_before {
-        if created_utc < *before {
-            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (before date range)");
-            return SmallVec::new();
-        }
-    }
-    if let Some(after) = &config.skip_created_after {
-        if created_utc > *after {
-            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (after date range)");
-            return SmallVec::new();
-        }
-    }
 
     let fallback_filename;
     let raw_filename = if let Some(f) = asset.filename() {
@@ -360,19 +343,22 @@ pub(super) fn filter_asset_to_tasks(
             filename = %fallback_filename,
             "Using fingerprint fallback filename"
         );
+        // is_asset_filtered only checks real filenames; check fallback against
+        // exclusion patterns here so fingerprint names are also filtered.
+        if config
+            .filename_exclude
+            .iter()
+            .any(|p| p.matches_with(&fallback_filename, GLOB_CASE_INSENSITIVE))
+        {
+            tracing::debug!(
+                asset_id = %asset.id(),
+                filename = %fallback_filename,
+                "Skipping (filename_exclude match on fallback)"
+            );
+            return SmallVec::new();
+        }
         &fallback_filename
     };
-
-    // Filename exclusion: match raw filename against glob patterns before any
-    // cleaning or unicode stripping, so patterns match the original iCloud name.
-    if config
-        .filename_exclude
-        .iter()
-        .any(|p| p.matches_with(raw_filename, GLOB_CASE_INSENSITIVE))
-    {
-        tracing::debug!(asset_id = %asset.id(), filename = raw_filename, "Skipping (filename_exclude match)");
-        return SmallVec::new();
-    }
 
     // Strip non-ASCII characters unless --keep-unicode-in-filenames is set.
     // Matches Python's default behavior of calling remove_unicode_chars() on filenames.
@@ -382,7 +368,7 @@ pub(super) fn filter_asset_to_tasks(
         paths::remove_unicode_chars(raw_filename)
     };
 
-    let created_local: DateTime<Local> = created_utc.with_timezone(&Local);
+    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
     let versions = apply_raw_policy(asset.versions(), config.align_raw);
     let mut tasks = SmallVec::new();
     // Track the effective primary filename (including any dedup suffix) so the
