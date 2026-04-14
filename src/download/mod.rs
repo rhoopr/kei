@@ -404,6 +404,45 @@ impl std::fmt::Debug for DownloadConfig {
     }
 }
 
+#[cfg(test)]
+impl DownloadConfig {
+    /// Default test config shared across download submodule tests.
+    pub(super) fn test_default() -> Self {
+        use rustc_hash::FxHashSet;
+        Self {
+            directory: std::path::PathBuf::from("/nonexistent/download_filter_tests"),
+            folder_structure: "{:%Y/%m/%d}".to_string(),
+            size: AssetVersionSize::Original,
+            skip_videos: false,
+            skip_photos: false,
+            skip_created_before: None,
+            skip_created_after: None,
+            set_exif_datetime: false,
+            dry_run: false,
+            concurrent_downloads: 1,
+            recent: None,
+            retry: crate::retry::RetryConfig::default(),
+            live_photo_mode: LivePhotoMode::Both,
+            live_photo_size: AssetVersionSize::LiveOriginal,
+            live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
+            align_raw: RawTreatmentPolicy::Unchanged,
+            no_progress_bar: true,
+            only_print_filenames: false,
+            file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
+            force_size: false,
+            keep_unicode_in_filenames: false,
+            filename_exclude: Vec::new(),
+            temp_suffix: ".kei-tmp".to_string(),
+            state_db: None,
+            retry_only: false,
+            max_download_attempts: 10,
+            sync_mode: SyncMode::Full,
+            album_name: None,
+            exclude_asset_ids: std::sync::Arc::new(FxHashSet::default()),
+        }
+    }
+}
+
 /// Pre-loaded download state for O(1) skip decisions.
 ///
 /// Loaded once at sync start from the state database, this enables fast
@@ -1182,37 +1221,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_config() -> DownloadConfig {
-        DownloadConfig {
-            directory: PathBuf::from("/nonexistent/download_filter_tests"),
-            folder_structure: "{:%Y/%m/%d}".to_string(),
-            size: AssetVersionSize::Original,
-            skip_videos: false,
-            skip_photos: false,
-            skip_created_before: None,
-            skip_created_after: None,
-            set_exif_datetime: false,
-            dry_run: false,
-            concurrent_downloads: 1,
-            recent: None,
-            retry: RetryConfig::default(),
-            live_photo_mode: LivePhotoMode::Both,
-            live_photo_size: AssetVersionSize::LiveOriginal,
-            live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
-            align_raw: RawTreatmentPolicy::Unchanged,
-            no_progress_bar: true,
-            only_print_filenames: false,
-            file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-            force_size: false,
-            keep_unicode_in_filenames: false,
-            filename_exclude: Vec::new(),
-            temp_suffix: ".kei-tmp".to_string(),
-            state_db: None,
-            retry_only: false,
-            max_download_attempts: 10,
-            sync_mode: SyncMode::Full,
-            album_name: None,
-            exclude_asset_ids: Arc::new(FxHashSet::default()),
-        }
+        DownloadConfig::test_default()
     }
 
     #[test]

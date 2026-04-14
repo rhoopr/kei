@@ -618,7 +618,6 @@ pub(super) fn filter_asset_to_tasks(
             }
         }
         if let Some(path) = final_path {
-            // Clone for the normalized key, move original into DownloadTask
             claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
             tasks.push(DownloadTask {
                 url: version.url.clone(),
@@ -733,37 +732,7 @@ mod tests {
     use super::super::SyncMode;
 
     fn test_config() -> DownloadConfig {
-        DownloadConfig {
-            directory: PathBuf::from("/nonexistent/download_filter_tests"),
-            folder_structure: "{:%Y/%m/%d}".to_string(),
-            size: AssetVersionSize::Original,
-            skip_videos: false,
-            skip_photos: false,
-            skip_created_before: None,
-            skip_created_after: None,
-            set_exif_datetime: false,
-            dry_run: false,
-            concurrent_downloads: 1,
-            recent: None,
-            retry: RetryConfig::default(),
-            live_photo_mode: LivePhotoMode::Both,
-            live_photo_size: AssetVersionSize::LiveOriginal,
-            live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
-            align_raw: RawTreatmentPolicy::Unchanged,
-            no_progress_bar: true,
-            only_print_filenames: false,
-            file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-            force_size: false,
-            keep_unicode_in_filenames: false,
-            filename_exclude: Vec::new(),
-            temp_suffix: ".kei-tmp".to_string(),
-            state_db: None,
-            retry_only: false,
-            max_download_attempts: 10,
-            sync_mode: SyncMode::Full,
-            album_name: None,
-            exclude_asset_ids: Arc::new(FxHashSet::default()),
-        }
+        DownloadConfig::test_default()
     }
 
     /// Helper that calls filter_asset_to_tasks with a fresh claimed_paths map.
