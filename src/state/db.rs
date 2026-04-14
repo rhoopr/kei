@@ -97,6 +97,14 @@ pub trait StateDb: Send + Sync {
     /// (failed_reset, pending_reset, total_pending).
     async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
 
+    /// Promote all remaining pending assets to failed.
+    ///
+    /// Called at the end of a non-interrupted sync run. Pending is a transient
+    /// state that should only exist during a sync — anything still pending
+    /// when the run finishes either wasn't enumerated by the API or failed
+    /// silently. Returns the number of assets promoted.
+    async fn promote_pending_to_failed(&self) -> Result<u64, StateError>;
+
     // ── Bulk read operations ──
 
     /// Get all downloaded asset IDs as (id, `version_size`) pairs.
@@ -550,6 +558,20 @@ impl StateDb for SqliteStateDb {
         let total_pending = total_pending as u64;
 
         Ok((failed, pending, total_pending))
+    }
+
+    async fn promote_pending_to_failed(&self) -> Result<u64, StateError> {
+        let conn = self.acquire_lock("promote_pending_to_failed")?;
+
+        let promoted = conn
+            .execute(
+                "UPDATE assets SET status = 'failed', last_error = 'Not resolved during sync' \
+                 WHERE status = 'pending'",
+                [],
+            )
+            .map_err(|e| StateError::query(&e))? as u64;
+
+        Ok(promoted)
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
@@ -1816,6 +1838,72 @@ mod tests {
         // Verify attempt counts are all zero now
         let attempts = db.get_attempt_counts().await.unwrap();
         assert!(attempts.is_empty(), "all attempt counts should be zero");
+    }
+
+    #[tokio::test]
+    async fn promote_pending_to_failed_only_affects_pending() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let dir = test_dir();
+
+        // 1 downloaded (should be untouched)
+        let record = TestAssetRecord::new("ADownloaded")
+            .checksum("aaaa")
+            .filename("IMG_1000.HEIC")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let path = dir.path().join("IMG_1000.HEIC");
+        fs::write(&path, b"payload").unwrap();
+        db.mark_downloaded("ADownloaded", "original", &path, "localhash", None)
+            .await
+            .unwrap();
+
+        // 2 pending (should be promoted to failed)
+        for i in 0..2 {
+            let id = format!("APending{i}");
+            let record = TestAssetRecord::new(&id)
+                .checksum(&format!("bbbb{i}"))
+                .filename(&format!("IMG_200{i}.JPG"))
+                .size(2000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        // 1 already failed (should be untouched)
+        let record = TestAssetRecord::new("AFailed")
+            .checksum("cccc")
+            .filename("IMG_3000.MOV")
+            .size(3000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_failed("AFailed", "original", "HTTP 500")
+            .await
+            .unwrap();
+
+        let before = db.get_summary().await.unwrap();
+        assert_eq!(before.downloaded, 1);
+        assert_eq!(before.pending, 2);
+        assert_eq!(before.failed, 1);
+
+        let promoted = db.promote_pending_to_failed().await.unwrap();
+        assert_eq!(promoted, 2);
+
+        let after = db.get_summary().await.unwrap();
+        assert_eq!(after.downloaded, 1);
+        assert_eq!(after.pending, 0);
+        assert_eq!(after.failed, 3);
+
+        // Verify the promoted assets have the right error message
+        let failed = db.get_failed().await.unwrap();
+        let promoted_errors: Vec<_> = failed
+            .iter()
+            .filter(|a| a.id.starts_with("APending"))
+            .map(|a| a.last_error.as_deref())
+            .collect();
+        assert_eq!(promoted_errors.len(), 2);
+        for error in &promoted_errors {
+            assert_eq!(*error, Some("Not resolved during sync"));
+        }
     }
 
     #[tokio::test]

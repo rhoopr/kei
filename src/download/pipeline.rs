@@ -1726,6 +1726,9 @@ mod tests {
         async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
             Ok((0, 0, 0))
         }
+        async fn promote_pending_to_failed(&self) -> Result<u64, StateError> {
+            Ok(0)
+        }
         async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
             unimplemented!()
         }

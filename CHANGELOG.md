@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.11] - 2026-04-14
+
+### Fixed
+
+- **Pending assets promoted to failed at end of sync** - assets still pending when a sync run finishes (not re-enumerated by the API or silently failed) are now promoted to `failed` with a descriptive error. Makes stuck assets visible in `kei status --failed` and unblocks incremental sync from being forced into full enumeration indefinitely. ([#208])
+
+### Changed
+
+- **Default log level changed from `info` to `warn`** - reduces output noise for typical usage. Set `log_level = "info"` in config or pass `--log-level info` for verbose output. ([#208])
+
+[#208]: https://github.com/rhoopr/kei/pull/208
+
 ## [0.7.10] - 2026-04-14
 
 ### Fixed
