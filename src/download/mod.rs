@@ -1433,27 +1433,24 @@ pub async fn download_photos_with_sync(
     cleanup_orphan_part_files(&config).await;
 
     // Give every non-downloaded asset a fresh start this sync:
-    // 1. Failed -> pending (with attempts reset) so they re-enter the pipeline.
-    // 2. Pending with stale attempt counts -> attempts cleared, covering legacy
-    //    assets that were silently skipped before this fix.
+    // failed -> pending (with attempts reset), and stale attempt counts on
+    // pending assets cleared so the per-sync cap starts from zero.
     if let Some(db) = &config.state_db {
-        match db.reset_failed().await {
-            Ok(n) if n > 0 => {
-                tracing::info!(count = n, "Reset failed assets for retry");
+        match db.prepare_for_retry().await {
+            Ok((failed, pending)) => {
+                if failed > 0 {
+                    tracing::info!(count = failed, "Reset failed assets for retry");
+                }
+                if pending > 0 {
+                    tracing::info!(
+                        count = pending,
+                        "Cleared stale attempt counts on pending assets"
+                    );
+                }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to reset failed assets");
+                tracing::warn!(error = %e, "Failed to reset assets for retry");
             }
-            _ => {}
-        }
-        match db.reset_pending_attempts().await {
-            Ok(n) if n > 0 => {
-                tracing::info!(count = n, "Cleared stale attempt counts on pending assets");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to reset pending attempt counts");
-            }
-            _ => {}
         }
     }
 
@@ -5448,8 +5445,8 @@ mod tests {
         async fn reset_failed(&self) -> Result<u64, StateError> {
             Ok(0)
         }
-        async fn reset_pending_attempts(&self) -> Result<u64, StateError> {
-            Ok(0)
+        async fn prepare_for_retry(&self) -> Result<(u64, u64), StateError> {
+            Ok((0, 0))
         }
         async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
             unimplemented!()
