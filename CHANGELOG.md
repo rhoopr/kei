@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.10] - 2026-04-14
+
+### Fixed
+
+- **Assets stuck in pending after exceeding retry limit** - assets that hit `max_download_attempts` were silently skipped in the producer loop, stuck as "pending" forever. They didn't appear in `kei status --failed` and `kei reset failed` couldn't touch them. Now marked as `failed` with a descriptive error so they're visible and recoverable. ([#207])
+
+### Changed
+
+- **Failed assets auto-retry on sync start** - all previously failed assets are reset to pending and have their attempt counts cleared before each sync via `prepare_for_retry()`. No need to manually `--retry-failed`. ([#207])
+- **Incremental sync falls back to full when pending assets exist** - the `changes/zone` API only returns new modifications and can't re-enumerate pending assets from prior syncs. kei now detects leftover pending assets and falls back to full enumeration until everything is downloaded, then resumes incremental. ([#207])
+
+[#207]: https://github.com/rhoopr/kei/pull/207
+
 ## [0.7.9] - 2026-04-13
 
 ### Fixed
