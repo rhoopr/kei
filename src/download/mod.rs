@@ -1458,9 +1458,15 @@ pub async fn download_photos_with_sync(
         0
     };
 
-    match &config.sync_mode {
+    let result = match &config.sync_mode {
         SyncMode::Full => {
-            download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
+            download_photos_full_with_token(
+                download_client,
+                albums,
+                &config,
+                shutdown_token.clone(),
+            )
+            .await
         }
         // Incremental sync only returns new changes — it won't re-enumerate
         // pending assets from previous syncs. Fall back to full so they get
@@ -1470,7 +1476,13 @@ pub async fn download_photos_with_sync(
                 pending = total_pending,
                 "Pending assets require full enumeration, skipping incremental sync"
             );
-            download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
+            download_photos_full_with_token(
+                download_client,
+                albums,
+                &config,
+                shutdown_token.clone(),
+            )
+            .await
         }
         SyncMode::Incremental { zone_sync_token } => {
             let token = zone_sync_token.clone();
@@ -1511,7 +1523,7 @@ pub async fn download_photos_with_sync(
                             download_client,
                             albums,
                             &config,
-                            shutdown_token,
+                            shutdown_token.clone(),
                         )
                         .await
                     } else {
@@ -1520,7 +1532,28 @@ pub async fn download_photos_with_sync(
                 }
             }
         }
+    };
+
+    // Pending is transient — anything still pending after a complete sync either
+    // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
+    if let Some(db) = &config.state_db {
+        if !shutdown_token.is_cancelled() {
+            match db.promote_pending_to_failed().await {
+                Ok(promoted) if promoted > 0 => {
+                    tracing::warn!(
+                        count = promoted,
+                        "Promoted unresolved pending assets to failed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to promote pending assets");
+                }
+                _ => {}
+            }
+        }
     }
+
+    result
 }
 
 /// Full enumeration with syncToken capture.
@@ -5461,6 +5494,9 @@ mod tests {
         }
         async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
             Ok((0, 0, 0))
+        }
+        async fn promote_pending_to_failed(&self) -> Result<u64, StateError> {
+            Ok(0)
         }
         async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
             unimplemented!()
