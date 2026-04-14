@@ -93,8 +93,9 @@ pub trait StateDb: Send + Sync {
     /// Reset all non-downloaded assets for a fresh sync attempt.
     ///
     /// Moves failed -> pending and clears stale attempt counts on pending
-    /// assets, all in one lock acquisition. Returns (failed_reset, pending_reset).
-    async fn prepare_for_retry(&self) -> Result<(u64, u64), StateError>;
+    /// assets, all in one lock acquisition. Returns
+    /// (failed_reset, pending_reset, total_pending).
+    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
 
     // ── Bulk read operations ──
 
@@ -516,19 +517,11 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn reset_failed(&self) -> Result<u64, StateError> {
-        let conn = self.acquire_lock("reset_failed")?;
-
-        let rows = conn
-            .execute(
-                "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL WHERE status = 'failed'",
-                [],
-            )
-            .map_err(|e| StateError::query(&e))?;
-
-        Ok(rows as u64) // usize -> u64 is lossless on 64-bit
+        let (failed, _, _) = self.prepare_for_retry().await?;
+        Ok(failed)
     }
 
-    async fn prepare_for_retry(&self) -> Result<(u64, u64), StateError> {
+    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
         let conn = self.acquire_lock("prepare_for_retry")?;
 
         let failed = conn
@@ -547,7 +540,16 @@ impl StateDb for SqliteStateDb {
             )
             .map_err(|e| StateError::query(&e))? as u64;
 
-        Ok((failed, pending))
+        let total_pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM assets WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StateError::query(&e))?;
+        let total_pending = total_pending as u64;
+
+        Ok((failed, pending, total_pending))
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
@@ -1800,14 +1802,15 @@ mod tests {
         assert_eq!(before.pending, 2); // normal + stuck
         assert_eq!(before.failed, 2);
 
-        let (failed_reset, pending_reset) = db.prepare_for_retry().await.unwrap();
+        let (failed_reset, pending_reset, total_pending) = db.prepare_for_retry().await.unwrap();
 
         assert_eq!(failed_reset, 2);
         assert_eq!(pending_reset, 1); // only the stuck one
+        assert_eq!(total_pending, 4); // 2 original pending + 2 reset from failed
 
         let after = db.get_summary().await.unwrap();
         assert_eq!(after.downloaded, 1);
-        assert_eq!(after.pending, 4); // 2 original pending + 2 reset from failed
+        assert_eq!(after.pending, 4);
         assert_eq!(after.failed, 0);
 
         // Verify attempt counts are all zero now
