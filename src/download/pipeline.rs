@@ -1152,17 +1152,14 @@ pub(super) async fn run_download_pass(
                 }
             }
             Err(e) => {
-                if let Some(download_err) = e.downcast_ref::<DownloadError>() {
-                    if download_err.is_session_expired() {
-                        auth_errors += 1;
-                        pb.suspend(|| {
-                            tracing::warn!(path = %task.download_path.display(), error = %e, "Auth error");
-                        });
-                    } else {
-                        pb.suspend(|| {
-                            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
-                        });
-                    }
+                let is_auth = e
+                    .downcast_ref::<DownloadError>()
+                    .is_some_and(DownloadError::is_session_expired);
+                if is_auth {
+                    auth_errors += 1;
+                    pb.suspend(|| {
+                        tracing::warn!(path = %task.download_path.display(), error = %e, "Auth error");
+                    });
                 } else {
                     pb.suspend(|| {
                         tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
