@@ -53,7 +53,7 @@ fn album_cmd(
 #[test]
 #[ignore]
 fn list_albums_prints_album_names() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let (username, _password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         common::cmd()
@@ -62,8 +62,6 @@ fn list_albums_prints_album_names() {
                 "albums",
                 "--username",
                 &username,
-                "--password",
-                &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
             ])
@@ -77,7 +75,7 @@ fn list_albums_prints_album_names() {
 #[test]
 #[ignore]
 fn list_libraries_prints_output() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let (username, _password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         common::cmd()
@@ -86,8 +84,6 @@ fn list_libraries_prints_output() {
                 "libraries",
                 "--username",
                 &username,
-                "--password",
-                &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
             ])
@@ -731,7 +727,7 @@ fn sync_threads_num_reflected_in_log() {
         let download_dir = tempdir().expect("tempdir");
 
         let assertion = album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--threads-num", "1"])
+            .args(["--threads-num", "1", "--log-level", "info"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
@@ -978,7 +974,7 @@ fn login_authenticates_successfully() {
 #[test]
 #[ignore]
 fn list_albums_new_syntax() {
-    let (username, password, cookie_dir) = common::require_preauth();
+    let (username, _password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         common::cmd()
@@ -987,8 +983,6 @@ fn list_albums_new_syntax() {
                 "albums",
                 "--username",
                 &username,
-                "--password",
-                &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
             ])
@@ -1060,6 +1054,8 @@ fn sync_incremental_second_run_skips_download() {
                 "--directory",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
+                "--log-level",
+                "info",
             ])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .output()

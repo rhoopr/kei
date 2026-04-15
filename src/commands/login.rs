@@ -67,7 +67,7 @@ pub(crate) async fn run_login(
                 )
             })
             .await?;
-            tracing::info!("Authentication completed successfully");
+            println!("Authentication completed successfully.");
         }
     }
     Ok(())

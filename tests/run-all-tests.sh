@@ -7,10 +7,10 @@
 # Order: no-auth tests first, then auth tests. Bad-credentials test runs
 # last (sorts as zz_*) since it hits Apple's auth endpoint from scratch.
 #
-# Auth throttling: session reuse is broken (validate_token always fails),
-# so every binary invocation does a fresh SRP handshake. Apple rate-limits
-# after ~10 rapid SRP auths. TEST_THROTTLE_SECS (default 8) spaces out
-# test functions. A 15s inter-suite delay separates cargo test binaries.
+# Auth throttling: session reuse via accountLogin avoids repeated SRP
+# handshakes (only 1 SRP per run). TEST_THROTTLE_SECS (default 2) spaces
+# out test functions for API politeness. A short inter-suite delay
+# separates cargo test binaries.
 #
 # Auth test suites fail-fast: if one suite fails (likely 503 rate limit),
 # remaining auth suites are skipped to avoid piling on.
@@ -26,11 +26,11 @@ FAILED=0
 STARTED=""
 
 # Auth throttle: seconds between individual test functions (Rust-side).
-# Override with TEST_THROTTLE_SECS env var. Default: 8.
-export TEST_THROTTLE_SECS="${TEST_THROTTLE_SECS:-8}"
+# Override with TEST_THROTTLE_SECS env var. Default: 2.
+export TEST_THROTTLE_SECS="${TEST_THROTTLE_SECS:-2}"
 
 # Inter-suite delay: seconds to wait between auth test suites.
-INTER_SUITE_DELAY="${INTER_SUITE_DELAY:-15}"
+INTER_SUITE_DELAY="${INTER_SUITE_DELAY:-3}"
 
 elapsed() {
     local start="$1"
@@ -81,11 +81,11 @@ run_or_stop() {
     echo "  passed ($(elapsed "$t0"))"
 }
 
-# Delay between auth test suites to avoid SRP rate limiting.
+# Delay between auth test suites to avoid API rate limiting.
 auth_delay() {
     if [ "$INTER_SUITE_DELAY" -gt 0 ]; then
         echo ""
-        echo "--- Waiting ${INTER_SUITE_DELAY}s between auth suites (SRP rate-limit avoidance) ---"
+        echo "--- Waiting ${INTER_SUITE_DELAY}s between auth suites (API rate-limit avoidance) ---"
         sleep "$INTER_SUITE_DELAY"
     fi
 }
@@ -95,7 +95,7 @@ STARTED=$(date +%s)
 # ── No-auth tests (always run all) ──────────────────────────────────────
 run "Unit tests"              cargo test --bin kei
 run "CLI integration tests"   cargo test --test cli
-run "State tests (no-auth)"   cargo test --test state
+run "Behavioral tests"        cargo test --test behavioral
 
 if [ "$FAILED" -ne 0 ]; then
     echo ""
@@ -115,5 +115,10 @@ auth_delay
 run_or_stop "State tests (auth)" cargo test --test state_auth -- --ignored --test-threads=1
 
 echo ""
+if [ "$FAILED" -ne 0 ]; then
+    echo "Some suites FAILED. ($(elapsed "$STARTED") total)"
+    echo "See $LOG"
+    exit 1
+fi
 echo "All suites passed. ($(elapsed "$STARTED") total)"
 exit 0

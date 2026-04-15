@@ -122,6 +122,8 @@ fn retry_failed_cmd(
         "--directory",
         dir.to_str().unwrap(),
         "--no-progress-bar",
+        "--log-level",
+        "info",
     ]);
     cmd
 }
@@ -651,6 +653,7 @@ fn reset_sync_token_forces_full_enumeration() {
 
         // Second sync should do full enumeration (no stored token)
         let output = sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+            .args(["--log-level", "info"])
             .timeout(Duration::from_secs(TIMEOUT_SYNC))
             .output()
             .unwrap();

@@ -154,15 +154,15 @@ async fn authenticate_inner(
         }
     }
 
-    // When submit-code provides a code and a session_token already exists
-    // (from a prior SRP by --auth-only or get-code), try /accountLogin
-    // before falling back to SRP. The /validate endpoint above is stricter
-    // and rejects pre-2FA sessions, but /accountLogin works — it returns
-    // account data showing 2FA is required, letting us skip straight to
-    // code submission without re-initiating SRP (which triggers a new
-    // 2FA push from Apple, invalidating the code the user already has).
-    if data.is_none() && code.is_some() && has_session_token {
-        tracing::debug!("Session token exists with code provided, trying accountLogin before SRP");
+    // Try /accountLogin as a fallback before SRP. The /validate endpoint
+    // above is strict and often rejects sessions that /accountLogin accepts
+    // (e.g. post-2FA trusted sessions loaded from disk). /accountLogin
+    // sends dsWebAuthToken + trustToken and is more lenient -- it succeeds
+    // for most persisted sessions, avoiding unnecessary SRP handshakes.
+    // This is critical because Apple rate-limits SRP to ~10 auths per
+    // rolling window.
+    if data.is_none() && has_session_token {
+        tracing::debug!("Session token exists, trying accountLogin before SRP");
         match twofa::authenticate_with_token(&mut session, endpoints).await {
             Ok(d) => {
                 tracing::debug!("accountLogin succeeded, skipping SRP");
@@ -370,6 +370,14 @@ pub async fn send_2fa_push(
         }
     }
 
+    // Try accountLogin before SRP (same rationale as authenticate_inner:
+    // validate_token is strict, accountLogin is lenient).
+    if data.is_none() && has_session_token {
+        if let Ok(d) = twofa::authenticate_with_token(&mut session, &endpoints).await {
+            data = Some(d);
+        }
+    }
+
     if data.is_none() {
         let password = password_provider().ok_or_else(|| {
             AuthError::FailedLogin("No password available (see error above for details)".into())
@@ -402,7 +410,40 @@ pub async fn validate_session(session: &mut Session, domain: &str) -> Result<boo
     let endpoints = Endpoints::for_domain(domain)?;
     match twofa::validate_token(session, &endpoints).await {
         Ok(_) => Ok(true),
-        Err(_) => Ok(false),
+        Err(_) => {
+            // /validate is strict; try /accountLogin as a lenient fallback.
+            // A session is valid if accountLogin succeeds and 2FA is not required
+            // (i.e. the trust token is still accepted).
+            match twofa::authenticate_with_token(session, &endpoints).await {
+                Ok(d) => {
+                    if check_requires_2fa(&d) {
+                        return Ok(false);
+                    }
+                    // If Apple rerouted the account to a different CloudKit
+                    // partition, the stored ckdatabasews URL is stale. Return
+                    // false to force full re-auth, which rebuilds PhotosService
+                    // with the new URL.
+                    let fresh_url = d
+                        .webservices
+                        .as_ref()
+                        .and_then(|ws| ws.ckdatabasews.as_ref())
+                        .map(|ep| ep.url.as_str());
+                    let stored_url = session.session_data.get("ckdatabasews_url");
+                    if let (Some(fresh), Some(stored)) = (fresh_url, stored_url) {
+                        if fresh != stored {
+                            tracing::info!(
+                                old_url = %stored,
+                                new_url = %fresh,
+                                "CloudKit partition changed, forcing full re-auth"
+                            );
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                Err(_) => Ok(false),
+            }
+        }
     }
 }
 

@@ -119,7 +119,3 @@ path = "tests/sync.rs"
 [[test]]
 name = "state_auth"
 path = "tests/state_auth.rs"
-
-[[test]]
-name = "setup_auth"
-path = "tests/setup_auth.rs"

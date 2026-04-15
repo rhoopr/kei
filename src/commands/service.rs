@@ -33,7 +33,7 @@ const ICLOUD_CLIENT_MASTERING_NUMBER: &str = "2522B2";
 ///    backoff (10s, 30s, 60s) with fresh connection pools. Handles transient
 ///    Apple-side partition routing issues that resolve on their own.
 pub(crate) async fn init_photos_service(
-    auth_result: auth::AuthResult,
+    mut auth_result: auth::AuthResult,
     cookie_directory: &Path,
     username: &str,
     domain: &str,
@@ -57,6 +57,13 @@ pub(crate) async fn init_photos_service(
         .and_then(|ws| ws.ckdatabasews.as_ref())
         .map(|ep| ep.url.clone())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
+
+    // Persist the active ckdatabasews URL so validate_session can detect
+    // partition changes during watch-mode revalidation.
+    auth_result
+        .session
+        .session_data
+        .insert("ckdatabasews_url".to_owned(), ckdatabasews_url.clone());
 
     let client_id = auth_result
         .session

@@ -52,10 +52,9 @@ fn install_rate_limit_hook() {
 
 /// Sleep between auth tests to reduce Apple API rate-limit risk.
 ///
-/// Session reuse is currently broken (validate_token always fails), so every
-/// binary invocation does a fresh SRP handshake. Apple rate-limits after ~10
-/// rapid SRP auths. Default: 8 seconds. Override with `TEST_THROTTLE_SECS`
-/// env var (0 to disable).
+/// With session reuse (accountLogin fallback), most invocations avoid SRP,
+/// but spacing API calls is still polite. Default: 2 seconds. Override with
+/// `TEST_THROTTLE_SECS` env var (0 to disable).
 fn throttle() {
     static FIRST: AtomicBool = AtomicBool::new(true);
     if FIRST.swap(false, Ordering::SeqCst) {
@@ -64,7 +63,7 @@ fn throttle() {
     let secs: u64 = std::env::var("TEST_THROTTLE_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
+        .unwrap_or(2);
     if secs > 0 {
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }

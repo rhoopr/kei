@@ -6,13 +6,13 @@
 # 1. Pre-commit (runs automatically on git commit)
 cargo fmt -- --check
 cargo clippy -- -D warnings
-cargo test --bin kei --test cli --test state
+cargo test --bin kei --test cli --test behavioral
 
 # 2. One-time auth setup (interactive, prompts for 2FA)
 # fish:
-env (cat .env | grep -v '^#') cargo run -- sync --auth-only --cookie-directory .test-cookies
+env (cat .env | grep -v '^#') cargo run -- login --data-dir .test-cookies
 # bash/zsh:
-env $(grep -v '^#' .env | xargs) cargo run -- sync --auth-only --cookie-directory .test-cookies
+env $(grep -v '^#' .env | xargs) cargo run -- login --data-dir .test-cookies
 
 # 3. Run all tests
 ./tests/run-all-tests.sh
@@ -35,18 +35,13 @@ cargo test --test sync list_albums_prints_album_names -- --ignored --test-thread
 2. Authenticate (creates `.test-cookies/` with session files):
    ```sh
    # fish:
-env (cat .env | grep -v '^#') cargo run -- sync --auth-only --cookie-directory .test-cookies
-# bash/zsh:
-env $(grep -v '^#' .env | xargs) cargo run -- sync --auth-only --cookie-directory .test-cookies
+   env (cat .env | grep -v '^#') cargo run -- login --data-dir .test-cookies
+   # bash/zsh:
+   env $(grep -v '^#' .env | xargs) cargo run -- login --data-dir .test-cookies
    ```
    This prompts for a 2FA code. You only need to redo this when the session expires.
 
-3. Verify the session works:
-   ```sh
-   cargo test --test setup_auth -- --ignored
-   ```
-
-4. Create an `icloudpd-test` album in iCloud Photos with these assets:
+3. Create an `icloudpd-test` album in iCloud Photos with these assets:
 
    | Asset | Purpose |
    |-------|---------|
@@ -62,21 +57,20 @@ env $(grep -v '^#' .env | xargs) cargo run -- sync --auth-only --cookie-director
 
 | File | Auth? | Description |
 |------|-------|-------------|
-| `cli.rs` | No | CLI argument parsing — no network |
-| `state.rs` | No | State commands against absent DB — no network |
-| `sync.rs` | Yes | Sync, download, filtering — targets `icloudpd-test` album (`#[ignore]`) |
+| `cli.rs` | No | CLI argument parsing -- no network |
+| `behavioral.rs` | No | Wiremock-based e2e, state commands -- no network |
+| `sync.rs` | Yes | Sync, download, filtering -- targets `icloudpd-test` album (`#[ignore]`) |
 | `state_auth.rs` | Yes | Status, reset-state, verify, import-existing, retry-failed (`#[ignore]`) |
-| `setup_auth.rs` | Yes | Verifies pre-auth session is valid (`#[ignore]`) |
-| `common/mod.rs` | — | Shared helpers |
+| `common/mod.rs` | -- | Shared helpers |
 
 ## Running Tests
 
 ### No-auth tests (no setup needed)
 
 ```sh
-cargo test --bin kei          # unit tests
+cargo test --bin kei                   # unit tests
 cargo test --test cli                  # CLI parsing
-cargo test --test state                # state commands (no DB)
+cargo test --test behavioral           # wiremock e2e + state commands
 ```
 
 ### Auth-required tests (need .test-cookies/)
@@ -118,5 +112,5 @@ Apple returns HTTP 503 if you hit their API too fast. If you get 503s:
 | `.env.example` | No | Template for `.env` |
 | `.test-cookies/` | Yes | Pre-auth session files |
 | `tests/results.log` | Yes | Test run output |
-| `tests/run-all-tests.sh` | No | Runs all tests sequentially |
+| `tests/run-all-tests.sh` | No | Orchestrator for all test suites |
 | `tests/TESTS.md` | No | Detailed test reference |

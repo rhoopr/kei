@@ -4,13 +4,12 @@
 
 | File | Tests | Auth Required | Network |
 |------|------:|:---:|:---:|
-| Unit tests (`src/`) | 1018 | No | No |
+| Unit tests (`src/`) | 1122+ | No | No |
 | `behavioral.rs` | 101 | No | No |
 | `cli.rs` | 93 | No | No |
 | `state_auth.rs` | 17 (ignored) | Yes | Yes |
 | `sync.rs` | 31 (ignored) | Yes | Yes |
-| `setup_auth.rs` | 1 (ignored) | Yes | Yes |
-| **Total** | **1261** | | |
+| **Total** | **1364+** | | |
 
 ## Running Tests
 
@@ -96,12 +95,3 @@ policy, misc flags (temp suffix, threads, notification script, PID file), bare
 invocation, error paths (missing directory, nonexistent album/library, bad
 credentials).
 
----
-
-## Setup Auth (`tests/setup_auth.rs`)
-
-1 test, `#[ignore]` by default. Verifies a pre-auth session is still valid.
-
-```sh
-cargo test --test setup_auth -- --ignored --test-threads=1
-```
