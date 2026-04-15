@@ -20,9 +20,9 @@ pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
 #[derive(Debug)]
 pub struct ChangeEvent {
     /// The record name (`CloudKit` record ID)
-    pub record_name: String,
+    pub record_name: Box<str>,
     /// The record type, if known (None for hard-deletes)
-    pub record_type: Option<String>,
+    pub record_type: Option<Box<str>>,
     /// Why this record changed
     pub reason: ChangeReason,
     /// The photo asset, if this is a CPLMaster+CPLAsset pair that was successfully paired.
@@ -33,15 +33,15 @@ pub struct ChangeEvent {
 /// A photo or video asset from iCloud.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (String, `Option<String>`)
+/// - Heap types first (Box<str>, `Option<Box<str>>`)
 /// - `VersionsMap` (`SmallVec` inline storage)
 /// - f64 primitives
 /// - Small enums last
 #[derive(Debug, Clone)]
 pub struct PhotoAsset {
     // Heap types first
-    record_name: String,
-    filename: Option<String>,
+    record_name: Box<str>,
+    filename: Option<Box<str>>,
     // SmallVec with inline storage
     versions: VersionsMap,
     // f64 primitives
@@ -203,13 +203,10 @@ impl PhotoAsset {
     /// Construct from raw JSON values (used by tests).
     #[cfg(test)]
     pub fn new(master_record: Value, asset_record: Value) -> Self {
-        let record_name = master_record["recordName"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let record_name: Box<str> = master_record["recordName"].as_str().unwrap_or("").into();
         let master_fields = master_record.get("fields").cloned().unwrap_or(Value::Null);
         let asset_fields = asset_record.get("fields").cloned().unwrap_or(Value::Null);
-        let filename = decode_filename(&master_fields);
+        let filename = decode_filename(&master_fields).map(String::into_boxed_str);
         let item_type_val = Some(resolve_item_type(&master_fields, filename.as_deref()));
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
@@ -226,7 +223,7 @@ impl PhotoAsset {
 
     /// Construct from typed `Record` structs (used by album pagination).
     pub fn from_records(master: super::cloudkit::Record, asset: super::cloudkit::Record) -> Self {
-        let filename = decode_filename(&master.fields);
+        let filename = decode_filename(&master.fields).map(String::into_boxed_str);
         let item_type_val = Some(resolve_item_type(&master.fields, filename.as_deref()));
         let asset_date_ms = asset.fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset.fields["addedDate"]["value"].as_f64();
@@ -237,7 +234,7 @@ impl PhotoAsset {
             &master.record_name,
         );
         Self {
-            record_name: master.record_name,
+            record_name: master.record_name.into_boxed_str(),
             filename,
             item_type_val,
             asset_date_ms,
@@ -396,7 +393,7 @@ impl DeltaRecordBuffer {
                     // Hard-deleted: no fields, can't tell if master or asset.
                     // Emit immediately as-is.
                     events.push(ChangeEvent {
-                        record_name: record.record_name,
+                        record_name: record.record_name.into_boxed_str(),
                         record_type: None,
                         reason,
                         asset: None,
@@ -426,8 +423,8 @@ impl DeltaRecordBuffer {
                         } else {
                             // CPLAsset with no masterRef -- metadata-only change
                             events.push(ChangeEvent {
-                                record_name: record.record_name,
-                                record_type: Some("CPLAsset".to_string()),
+                                record_name: record.record_name.into_boxed_str(),
+                                record_type: Some("CPLAsset".into()),
                                 reason,
                                 asset: None,
                             });
@@ -452,8 +449,8 @@ impl DeltaRecordBuffer {
         for (name, record) in self.pending_masters.drain() {
             let reason = classify_change_reason(&record);
             events.push(ChangeEvent {
-                record_name: name,
-                record_type: Some("CPLMaster".to_string()),
+                record_name: name.into_boxed_str(),
+                record_type: Some("CPLMaster".into()),
                 reason,
                 asset: None,
             });
@@ -462,8 +459,8 @@ impl DeltaRecordBuffer {
         for (_master_ref, record) in self.pending_assets.drain() {
             let reason = classify_change_reason(&record);
             events.push(ChangeEvent {
-                record_name: record.record_name,
-                record_type: Some("CPLAsset".to_string()),
+                record_name: record.record_name.into_boxed_str(),
+                record_type: Some("CPLAsset".into()),
                 reason,
                 asset: None,
             });
@@ -500,11 +497,11 @@ impl DeltaRecordBuffer {
         reason: ChangeReason,
         events: &mut Vec<ChangeEvent>,
     ) {
-        let master_name = master_record.record_name.clone();
+        let master_name: Box<str> = master_record.record_name.clone().into_boxed_str();
         let asset = PhotoAsset::from_records(master_record, asset_record);
         events.push(ChangeEvent {
             record_name: master_name,
-            record_type: Some("CPLMaster".to_string()),
+            record_type: Some("CPLMaster".into()),
             reason,
             asset: Some(asset),
         });
@@ -865,7 +862,7 @@ mod tests {
             "AssetVersion size {} exceeds 64 bytes",
             size_of::<AssetVersion>()
         );
-        // PhotoAsset with SmallVec<[...; 4]> inline storage is ~360 bytes.
+        // PhotoAsset with SmallVec<[...; 4]> inline storage and Box<str> fields is ~344 bytes.
         // This is larger than HashMap but avoids heap allocation for common case (<=4 versions).
         // The trade-off is acceptable since we process assets in streams, not all at once.
         assert!(
@@ -1037,7 +1034,7 @@ mod tests {
         // Page 2: asset arrives, referencing M1
         let events = buffer.process_records(vec![make_asset_record("A1", "M1")]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert_eq!(events[0].record_type.as_deref(), Some("CPLMaster"));
         assert_eq!(events[0].reason, ChangeReason::Created);
         assert!(events[0].asset.is_some());
@@ -1055,7 +1052,7 @@ mod tests {
         // Page 2: master arrives
         let events = buffer.process_records(vec![make_master_record("M1")]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert!(events[0].asset.is_some());
     }
 
@@ -1069,7 +1066,7 @@ mod tests {
             make_asset_record("A1", "M1"),
         ]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert!(events[0].asset.is_some());
     }
 
@@ -1083,7 +1080,7 @@ mod tests {
             make_master_record("M1"),
         ]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert!(events[0].asset.is_some());
     }
 
@@ -1100,7 +1097,7 @@ mod tests {
 
         let events = buffer.process_records(vec![hard_deleted]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "DELETED_1");
+        assert_eq!(&*events[0].record_name, "DELETED_1");
         assert_eq!(events[0].record_type, None);
         assert_eq!(events[0].reason, ChangeReason::HardDeleted);
         assert!(events[0].asset.is_none());
@@ -1146,14 +1143,14 @@ mod tests {
         assert_eq!(flushed.len(), 2);
 
         // Check that both orphans appear (order not guaranteed due to HashMap)
-        let names: Vec<&str> = flushed.iter().map(|e| e.record_name.as_str()).collect();
+        let names: Vec<&str> = flushed.iter().map(|e| &*e.record_name).collect();
         assert!(names.contains(&"M_ORPHAN"));
         assert!(names.contains(&"A_ORPHAN"));
 
         // Verify record types
         for event in &flushed {
             assert!(event.asset.is_none());
-            match event.record_name.as_str() {
+            match &*event.record_name {
                 "M_ORPHAN" => {
                     assert_eq!(event.record_type.as_deref(), Some("CPLMaster"));
                 }
@@ -1180,7 +1177,7 @@ mod tests {
             make_master_record("M3"),
         ]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M2");
+        assert_eq!(&*events[0].record_name, "M2");
 
         // Page 3: assets for M1 and M3
         let events = buffer.process_records(vec![
@@ -1188,7 +1185,7 @@ mod tests {
             make_asset_record("A3", "M3"),
         ]);
         assert_eq!(events.len(), 2);
-        let names: Vec<&str> = events.iter().map(|e| e.record_name.as_str()).collect();
+        let names: Vec<&str> = events.iter().map(|e| &*e.record_name).collect();
         assert!(names.contains(&"M1"));
         assert!(names.contains(&"M3"));
 
@@ -1211,7 +1208,7 @@ mod tests {
 
         let events = buffer.process_records(vec![asset_no_ref]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "A_NO_REF");
+        assert_eq!(&*events[0].record_name, "A_NO_REF");
         assert_eq!(events[0].record_type.as_deref(), Some("CPLAsset"));
         assert!(events[0].asset.is_none());
     }
@@ -1267,13 +1264,13 @@ mod tests {
             make_asset_record("A1", "M1"),
         ]);
         assert_eq!(events.len(), 1, "page 2 should pair M1+A1");
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert!(events[0].asset.is_some());
 
         // Page 3: asset A2 referencing M2
         let events = buffer.process_records(vec![make_asset_record("A2", "M2")]);
         assert_eq!(events.len(), 1, "page 3 should pair M2+A2");
-        assert_eq!(events[0].record_name, "M2");
+        assert_eq!(&*events[0].record_name, "M2");
         assert!(events[0].asset.is_some());
 
         // Everything paired, flush empty
@@ -1304,7 +1301,7 @@ mod tests {
 
         let events = buffer.process_records(vec![master, soft_deleted_asset]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M_DEL");
+        assert_eq!(&*events[0].record_name, "M_DEL");
         assert_eq!(events[0].reason, ChangeReason::SoftDeleted);
         assert!(events[0].asset.is_some());
     }
@@ -1415,7 +1412,7 @@ mod tests {
 
         let events = buffer.process_records(vec![asset_no_ref]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "A_STANDALONE");
+        assert_eq!(&*events[0].record_name, "A_STANDALONE");
         assert_eq!(events[0].record_type.as_deref(), Some("CPLAsset"));
         assert_eq!(events[0].reason, ChangeReason::Created);
         assert!(
@@ -1625,7 +1622,7 @@ mod tests {
             deleted: None,
         }]);
         assert_eq!(events.len(), 1, "page 2 should pair M_SPLIT + A_SPLIT");
-        assert_eq!(events[0].record_name, "M_SPLIT");
+        assert_eq!(&*events[0].record_name, "M_SPLIT");
         assert_eq!(events[0].reason, ChangeReason::Created);
 
         let asset = events[0]

@@ -305,7 +305,7 @@ mod tests {
         async fn post(
             &self,
             _url: &str,
-            _body: &str,
+            _body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             panic!("StubSession::post should not be called in zone_name tests");
@@ -383,7 +383,7 @@ mod tests {
         async fn post(
             &self,
             _url: &str,
-            _body: &str,
+            _body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             Err(crate::icloud::photos::session::HttpStatusError {

@@ -1451,14 +1451,14 @@ mod tests {
     fn test_change_event_asset_extraction() {
         // Verify that events with None assets are filtered out
         let event_with_asset = ChangeEvent {
-            record_name: "REC_1".to_string(),
-            record_type: Some("CPLAsset".to_string()),
+            record_name: "REC_1".into(),
+            record_type: Some("CPLAsset".into()),
             reason: ChangeReason::Created,
             asset: Some(TestPhotoAsset::new("TEST_1").build()),
         };
         let event_without_asset = ChangeEvent {
-            record_name: "REC_2".to_string(),
-            record_type: Some("CPLAsset".to_string()),
+            record_name: "REC_2".into(),
+            record_type: Some("CPLAsset".into()),
             reason: ChangeReason::Created,
             asset: None,
         };
@@ -1478,26 +1478,26 @@ mod tests {
     fn test_incremental_filters_skip_deletions() {
         let events = vec![
             ChangeEvent {
-                record_name: "REC_1".to_string(),
-                record_type: Some("CPLAsset".to_string()),
+                record_name: "REC_1".into(),
+                record_type: Some("CPLAsset".into()),
                 reason: ChangeReason::Created,
                 asset: Some(TestPhotoAsset::new("TEST_1").build()),
             },
             ChangeEvent {
-                record_name: "REC_2".to_string(),
+                record_name: "REC_2".into(),
                 record_type: None,
                 reason: ChangeReason::HardDeleted,
                 asset: None,
             },
             ChangeEvent {
-                record_name: "REC_3".to_string(),
-                record_type: Some("CPLAsset".to_string()),
+                record_name: "REC_3".into(),
+                record_type: Some("CPLAsset".into()),
                 reason: ChangeReason::SoftDeleted,
                 asset: None,
             },
             ChangeEvent {
-                record_name: "REC_4".to_string(),
-                record_type: Some("CPLAsset".to_string()),
+                record_name: "REC_4".into(),
+                record_type: Some("CPLAsset".into()),
                 reason: ChangeReason::Hidden,
                 asset: None,
             },
@@ -1516,8 +1516,8 @@ mod tests {
     #[test]
     fn test_incremental_modified_events_are_downloadable() {
         let events = vec![ChangeEvent {
-            record_name: "MOD_1".to_string(),
-            record_type: Some("CPLAsset".to_string()),
+            record_name: "MOD_1".into(),
+            record_type: Some("CPLAsset".into()),
             reason: ChangeReason::Created,
             asset: Some(TestPhotoAsset::new("TEST_1").build()),
         }];
@@ -1847,32 +1847,32 @@ mod tests {
         // Simulate the inline filtering loop from download_photos_incremental
         let events = vec![
             ChangeEvent {
-                record_name: "A".to_string(),
-                record_type: Some("CPLAsset".to_string()),
+                record_name: "A".into(),
+                record_type: Some("CPLAsset".into()),
                 reason: ChangeReason::Created,
                 asset: Some(TestPhotoAsset::new("TEST_1").build()),
             },
             ChangeEvent {
-                record_name: "B".to_string(),
-                record_type: Some("CPLAsset".to_string()),
+                record_name: "B".into(),
+                record_type: Some("CPLAsset".into()),
                 reason: ChangeReason::Created,
                 asset: None, // Unpaired record
             },
             ChangeEvent {
-                record_name: "C".to_string(),
+                record_name: "C".into(),
                 record_type: None,
                 reason: ChangeReason::HardDeleted,
                 asset: None,
             },
             ChangeEvent {
-                record_name: "D".to_string(),
-                record_type: Some("CPLAsset".to_string()),
+                record_name: "D".into(),
+                record_type: Some("CPLAsset".into()),
                 reason: ChangeReason::SoftDeleted,
                 asset: None,
             },
             ChangeEvent {
-                record_name: "E".to_string(),
-                record_type: Some("CPLAsset".to_string()),
+                record_name: "E".into(),
+                record_type: Some("CPLAsset".into()),
                 reason: ChangeReason::Hidden,
                 asset: None,
             },

@@ -315,12 +315,12 @@ impl PhotosSession for MockPhotosSession {
     async fn post(
         &self,
         url: &str,
-        body: &str,
+        body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         self.calls.lock().expect("poisoned").push(RecordedCall {
             url: url.to_string(),
-            _body: body.to_string(),
+            _body: body,
         });
 
         let response = self.responses.lock().expect("poisoned").pop_front();
@@ -361,16 +361,22 @@ mod tests {
 
         assert_eq!(mock.call_count(), 0);
 
-        let r1 = mock.post("https://example.com/query", "{}", &[]).await;
+        let r1 = mock
+            .post("https://example.com/query", "{}".to_owned(), &[])
+            .await;
         assert!(r1.is_ok());
         assert_eq!(mock.call_count(), 1);
 
-        let r2 = mock.post("https://example.com/changes", "{}", &[]).await;
+        let r2 = mock
+            .post("https://example.com/changes", "{}".to_owned(), &[])
+            .await;
         assert!(r2.is_err());
         assert_eq!(mock.call_count(), 2);
 
         // Exhausted queue falls back to empty records
-        let r3 = mock.post("https://example.com/extra", "{}", &[]).await;
+        let r3 = mock
+            .post("https://example.com/extra", "{}".to_owned(), &[])
+            .await;
         assert_eq!(r3.unwrap(), json!({"records": []}));
 
         let calls = mock.recorded_calls();

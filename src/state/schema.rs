@@ -108,10 +108,10 @@ const SCHEMA_V4: &str = "ALTER TABLE assets ADD COLUMN download_checksum TEXT;";
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StateError> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("column_exists", e))?;
     let exists = stmt
         .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|e| StateError::query(&e))?
+        .map_err(|e| StateError::query("column_exists", e))?
         .any(|name| name.is_ok_and(|n| n == column));
     Ok(exists)
 }
@@ -133,9 +133,10 @@ fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError>
             }
         }
         other => {
-            return Err(StateError::Query(format!(
-                "No migration defined for version {other}"
-            )));
+            return Err(StateError::UnsupportedSchemaVersion {
+                found: other,
+                expected: SCHEMA_VERSION,
+            });
         }
     }
     set_schema_version(conn, version)?;

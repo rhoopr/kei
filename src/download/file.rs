@@ -203,7 +203,7 @@ async fn attempt_download<C: DownloadClient>(
         .await
         .map_err(|e| DownloadError::Http {
             source: e,
-            path: path_str.clone(),
+            path: path_str.clone().into(),
             status: 0,
             content_length: None,
             bytes_written: 0,
@@ -231,7 +231,7 @@ async fn attempt_download<C: DownloadClient>(
         _ => {
             return Err(DownloadError::HttpStatus {
                 status,
-                path: path_str,
+                path: path_str.into(),
             });
         }
     };
@@ -245,8 +245,8 @@ async fn attempt_download<C: DownloadClient>(
         if ct_lower.starts_with("text/html") {
             let _ = fs::remove_file(part_path).await;
             return Err(DownloadError::InvalidContent {
-                path: path_str,
-                reason: format!("server returned content-type: {ct}"),
+                path: path_str.into(),
+                reason: format!("server returned content-type: {ct}").into(),
             });
         }
     }
@@ -269,7 +269,7 @@ async fn attempt_download<C: DownloadClient>(
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| DownloadError::Http {
                 source: e,
-                path: path_str.clone(),
+                path: path_str.clone().into(),
                 status,
                 content_length,
                 bytes_written,
@@ -297,7 +297,7 @@ async fn attempt_download<C: DownloadClient>(
         if total_bytes != expected_len {
             let _ = fs::remove_file(&part_path).await;
             return Err(DownloadError::ContentLengthMismatch {
-                path: path_str,
+                path: path_str.into(),
                 expected: expected_len,
                 received: total_bytes,
             });
@@ -310,7 +310,7 @@ async fn attempt_download<C: DownloadClient>(
         if bytes_written != expected {
             let _ = fs::remove_file(&part_path).await;
             return Err(DownloadError::ContentLengthMismatch {
-                path: path_str,
+                path: path_str.into(),
                 expected,
                 received: bytes_written,
             });
@@ -472,7 +472,7 @@ fn validate_downloaded_content(
         || (trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html"))
     {
         return Err(DownloadError::InvalidContent {
-            path: download_path.display().to_string(),
+            path: download_path.display().to_string().into(),
             reason: "file contains HTML (likely a CDN error page)".into(),
         });
     }

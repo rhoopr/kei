@@ -8,7 +8,12 @@ use crate::retry::{self, RetryAction, RetryConfig};
 /// without hitting the real iCloud API.
 #[async_trait::async_trait]
 pub trait PhotosSession: Send + Sync {
-    async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value>;
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value>;
 
     /// Clone this session into a new boxed trait object.
     fn clone_box(&self) -> Box<dyn PhotosSession>;
@@ -18,8 +23,13 @@ pub trait PhotosSession: Send + Sync {
 // `PhotosSession` without an adapter, since Client is Arc-backed and cheap to clone.
 #[async_trait::async_trait]
 impl PhotosSession for reqwest::Client {
-    async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value> {
-        let mut builder = self.post(url).body(body.to_owned());
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let mut builder = self.post(url).body(body);
         for &(k, v) in headers {
             builder = builder.header(k, v);
         }
@@ -58,7 +68,12 @@ impl PhotosSession for reqwest::Client {
 // the actual HTTP call so other tasks can read concurrently.
 #[async_trait::async_trait]
 impl PhotosSession for crate::auth::SharedSession {
-    async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value> {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
         let client = self.read().await.http_client();
         PhotosSession::post(&client, url, body, headers).await
     }
@@ -142,46 +157,52 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
     // Per-record errors: filter out errored records and keep valid ones.
     // Only return Err if ALL records are errored.
     if let Some(records) = response["records"].as_array() {
-        let (errored, valid): (Vec<&Value>, Vec<&Value>) = records
+        // Check if any records have errors before taking the mutable path
+        let has_errors = records
             .iter()
-            .partition(|r| r["serverErrorCode"].as_str().is_some());
+            .any(|r| r["serverErrorCode"].as_str().is_some());
 
-        if !errored.is_empty() {
+        if has_errors {
+            // Log each errored record and capture the last error
             let mut last_ck_err = None;
-            for record in &errored {
-                let code = record["serverErrorCode"].as_str().unwrap_or("unknown");
-                let reason = record["reason"].as_str().unwrap_or("unknown");
-                let retryable = RETRYABLE_SERVER_ERRORS
-                    .iter()
-                    .any(|&s| s.eq_ignore_ascii_case(code));
-                let service_not_activated = is_service_not_activated(code, reason);
-                tracing::warn!(
-                    error_code = code,
-                    retryable,
-                    service_not_activated,
-                    "CloudKit per-record error: {reason}"
-                );
-                last_ck_err = Some(CloudKitServerError {
-                    code: code.into(),
-                    reason: reason.into(),
-                    retryable,
-                    service_not_activated,
-                });
+            for record in records {
+                if let Some(code) = record["serverErrorCode"].as_str() {
+                    let reason = record["reason"].as_str().unwrap_or("unknown");
+                    let retryable = RETRYABLE_SERVER_ERRORS
+                        .iter()
+                        .any(|&s| s.eq_ignore_ascii_case(code));
+                    let service_not_activated = is_service_not_activated(code, reason);
+                    tracing::warn!(
+                        error_code = code,
+                        retryable,
+                        service_not_activated,
+                        "CloudKit per-record error: {reason}"
+                    );
+                    last_ck_err = Some(CloudKitServerError {
+                        code: code.into(),
+                        reason: reason.into(),
+                        retryable,
+                        service_not_activated,
+                    });
+                }
             }
 
-            if valid.is_empty() {
-                return Err(last_ck_err.expect("errored is non-empty").into());
-            }
-            let total = errored.len() + valid.len();
-            tracing::warn!(
-                errored = errored.len(),
-                valid = valid.len(),
-                total,
-                "Filtered errored records from CloudKit response"
-            );
-            let valid_owned: Vec<Value> = valid.into_iter().cloned().collect();
+            // Now mutate in-place: retain only valid records
             let mut response = response;
-            response["records"] = Value::Array(valid_owned);
+            let total = response["records"].as_array().map_or(0, Vec::len);
+            if let Some(records) = response["records"].as_array_mut() {
+                records.retain(|r| r["serverErrorCode"].as_str().is_none());
+                let valid_count = records.len();
+                if valid_count == 0 {
+                    return Err(last_ck_err.expect("errored is non-empty").into());
+                }
+                tracing::warn!(
+                    errored = total - valid_count,
+                    valid = valid_count,
+                    total,
+                    "Filtered errored records from CloudKit response"
+                );
+            }
             return Ok(response);
         }
     }
@@ -225,7 +246,7 @@ pub async fn retry_post(
     retry_config: &RetryConfig,
 ) -> anyhow::Result<Value> {
     retry::retry_with_backoff(retry_config, classify_api_error, || async {
-        let response = session.post(url, body, headers).await?;
+        let response = session.post(url, body.to_owned(), headers).await?;
         check_cloudkit_errors(response)
     })
     .await
@@ -236,16 +257,16 @@ pub async fn retry_post(
 pub enum SyncTokenError {
     /// Token is invalid/corrupted — fall back to full enumeration
     #[error("Invalid sync token: {reason}")]
-    InvalidToken { reason: String },
+    InvalidToken { reason: Box<str> },
     /// Zone no longer exists — stop syncing this zone
     #[error("Zone not found: {zone_name}")]
-    ZoneNotFound { zone_name: String },
+    ZoneNotFound { zone_name: Box<str> },
     /// Unexpected zone-level error (e.g. `RETRY_LATER`, THROTTLED) —
     /// treat as transient; do NOT advance the sync token.
     #[error("Unexpected zone error in {zone_name}: {error_code}")]
     UnexpectedZoneError {
-        zone_name: String,
-        error_code: String,
+        zone_name: Box<str>,
+        error_code: Box<str>,
     },
 }
 
@@ -267,16 +288,14 @@ pub fn check_changes_zone_error(
 ) -> Result<(), SyncTokenError> {
     match server_error_code {
         Some("BAD_REQUEST") => Err(SyncTokenError::InvalidToken {
-            reason: reason
-                .unwrap_or("Unknown sync continuation type")
-                .to_string(),
+            reason: reason.unwrap_or("Unknown sync continuation type").into(),
         }),
         Some("ZONE_NOT_FOUND") => Err(SyncTokenError::ZoneNotFound {
-            zone_name: zone_name.to_string(),
+            zone_name: zone_name.into(),
         }),
         Some(code) => Err(SyncTokenError::UnexpectedZoneError {
-            zone_name: zone_name.to_string(),
-            error_code: code.to_string(),
+            zone_name: zone_name.into(),
+            error_code: code.into(),
         }),
         None => Ok(()),
     }
@@ -554,8 +573,8 @@ mod tests {
                 zone_name,
                 error_code,
             } => {
-                assert_eq!(zone_name, "PrimarySync");
-                assert_eq!(error_code, "SOME_OTHER_CODE");
+                assert_eq!(&*zone_name, "PrimarySync");
+                assert_eq!(&*error_code, "SOME_OTHER_CODE");
             }
             other => panic!("Expected UnexpectedZoneError, got {other:?}"),
         }
@@ -571,7 +590,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             SyncTokenError::InvalidToken { reason } => {
-                assert_eq!(reason, "Unknown sync continuation type");
+                assert_eq!(&*reason, "Unknown sync continuation type");
             }
             other => panic!("Expected InvalidToken, got {other:?}"),
         }
@@ -582,7 +601,7 @@ mod tests {
         let result = check_changes_zone_error(Some("BAD_REQUEST"), None, "PrimarySync");
         match result.unwrap_err() {
             SyncTokenError::InvalidToken { reason } => {
-                assert_eq!(reason, "Unknown sync continuation type");
+                assert_eq!(&*reason, "Unknown sync continuation type");
             }
             other => panic!("Expected InvalidToken, got {other:?}"),
         }
@@ -594,7 +613,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             SyncTokenError::ZoneNotFound { zone_name } => {
-                assert_eq!(zone_name, "SharedSync-123");
+                assert_eq!(&*zone_name, "SharedSync-123");
             }
             other => panic!("Expected ZoneNotFound, got {other:?}"),
         }
@@ -632,9 +651,7 @@ mod tests {
 
     #[test]
     fn test_sync_token_error_display_empty_reason() {
-        let err = SyncTokenError::InvalidToken {
-            reason: String::new(),
-        };
+        let err = SyncTokenError::InvalidToken { reason: "".into() };
         assert_eq!(err.to_string(), "Invalid sync token: ");
     }
 
@@ -651,7 +668,7 @@ mod tests {
             async fn post(
                 &self,
                 _url: &str,
-                _body: &str,
+                _body: String,
                 _headers: &[(&str, &str)],
             ) -> anyhow::Result<Value> {
                 let n = self

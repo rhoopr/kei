@@ -8,11 +8,11 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub(crate) enum DownloadError {
     #[error("HTTP error {status} downloading {path}")]
-    HttpStatus { status: u16, path: String },
+    HttpStatus { status: u16, path: Box<str> },
 
     #[error("Content-length mismatch for {path}: expected {expected} bytes, received {received}")]
     ContentLengthMismatch {
-        path: String,
+        path: Box<str>,
         expected: u64,
         received: u64,
     },
@@ -23,14 +23,14 @@ pub(crate) enum DownloadError {
     #[error("HTTP error downloading {path} (status={status}, content_length={content_length:?}, bytes_so_far={bytes_written}): {source}")]
     Http {
         source: Box<dyn std::error::Error + Send + Sync>,
-        path: String,
+        path: Box<str>,
         status: u16,
         content_length: Option<u64>,
         bytes_written: u64,
     },
 
     #[error("Invalid content for {path}: {reason}")]
-    InvalidContent { path: String, reason: String },
+    InvalidContent { path: Box<str>, reason: Box<str> },
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),

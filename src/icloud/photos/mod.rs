@@ -275,12 +275,12 @@ mod tests {
         async fn post(
             &self,
             url: &str,
-            body: &str,
+            body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             *self.captured.lock().unwrap() = Some(CapturedRequest {
                 url: url.to_string(),
-                body: body.to_string(),
+                body,
             });
             Ok(self.response.clone())
         }
@@ -316,7 +316,7 @@ mod tests {
         async fn post(
             &self,
             _url: &str,
-            _body: &str,
+            _body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             panic!("PanicSession::post should not be called");

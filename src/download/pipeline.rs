@@ -1698,7 +1698,7 @@ mod tests {
         ) -> Result<(), StateError> {
             let prev = self.remaining_failures.fetch_sub(1, Ordering::Relaxed);
             if prev > 0 {
-                Err(StateError::Query("simulated failure".into()))
+                Err(StateError::LockPoisoned("simulated failure".into()))
             } else {
                 self.remaining_failures.store(0, Ordering::Relaxed);
                 self.successes.fetch_add(1, Ordering::Relaxed);

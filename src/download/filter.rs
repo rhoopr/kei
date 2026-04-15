@@ -2119,8 +2119,8 @@ mod tests {
             .build();
 
         let event = ChangeEvent {
-            record_name: "MODIFIED_ASSET_1".to_string(),
-            record_type: Some("CPLAsset".to_string()),
+            record_name: "MODIFIED_ASSET_1".into(),
+            record_type: Some("CPLAsset".into()),
             reason: ChangeReason::Created,
             asset: Some(modified_asset),
         };

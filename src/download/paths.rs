@@ -275,7 +275,7 @@ pub(crate) fn map_filename_extension(filename: &str, asset_type: &str) -> String
 /// Used by the `name-id7` file match policy to create unique filenames.
 fn base64_id7(id: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(id.as_bytes());
-    encoded.chars().take(7).collect()
+    encoded[..encoded.len().min(7)].to_string()
 }
 
 /// Apply the `name-id7` policy: insert the first 7 chars of the base64-encoded
@@ -331,10 +331,16 @@ pub(crate) fn item_type_extension(asset_type: &str) -> &'static str {
 /// positions.
 pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write;
     let hash = Sha256::digest(asset_id.as_bytes());
-    let fingerprint = &format!("{hash:x}")[..12];
     let ext = item_type_extension(asset_type);
-    format!("{fingerprint}.{ext}")
+    let mut result = String::with_capacity(12 + 1 + ext.len());
+    for &b in &hash[..6] {
+        let _ = Write::write_fmt(&mut result, format_args!("{b:02x}"));
+    }
+    result.push('.');
+    result.push_str(ext);
+    result
 }
 
 /// Normalize AM/PM whitespace variants to a canonical no-space form.
@@ -426,13 +432,13 @@ fn read_dir_entries(dir: &Path) -> FxHashMap<String, u64> {
 /// entering tight sync loops (e.g. `filter_asset_to_tasks`), so that the sync
 /// lookup methods (`exists`, `file_size`, `find_ampm_variant`) never hit disk.
 pub(crate) struct DirCache {
-    dirs: std::collections::HashMap<PathBuf, FxHashMap<String, u64>>,
+    dirs: FxHashMap<PathBuf, FxHashMap<String, u64>>,
 }
 
 impl DirCache {
     pub fn new() -> Self {
         Self {
-            dirs: std::collections::HashMap::new(),
+            dirs: FxHashMap::default(),
         }
     }
 

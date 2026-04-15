@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use anyhow::Context;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -473,7 +475,8 @@ impl PhotoAlbum {
         tokio::spawn(async move {
             let mut offset = start_offset;
             let mut total_sent: u64 = 0;
-            let mut pending_masters: HashMap<String, super::cloudkit::Record> = HashMap::new();
+            let mut pending_masters: FxHashMap<String, super::cloudkit::Record> =
+                FxHashMap::default();
             let url = format!(
                 "{}/records/query?{}",
                 service_endpoint,
@@ -558,7 +561,8 @@ impl PhotoAlbum {
 
                 // Collect current page's records, trying to pair with
                 // buffered unpaired records from previous pages.
-                let mut page_assets: HashMap<String, super::cloudkit::Record> = HashMap::new();
+                let mut page_assets: FxHashMap<String, super::cloudkit::Record> =
+                    FxHashMap::default();
                 let mut page_masters: Vec<super::cloudkit::Record> = Vec::new();
 
                 for rec in records {
@@ -735,7 +739,7 @@ mod tests {
         async fn post(
             &self,
             _url: &str,
-            _body: &str,
+            _body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             unimplemented!("stub")
@@ -1204,7 +1208,7 @@ mod tests {
         }
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "master-1");
+        assert_eq!(&*events[0].record_name, "master-1");
         assert!(events[0].asset.is_some());
         assert_eq!(events[0].record_type.as_deref(), Some("CPLMaster"));
 
@@ -1238,8 +1242,8 @@ mod tests {
         }
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].record_name, "master-1");
-        assert_eq!(events[1].record_name, "master-2");
+        assert_eq!(&*events[0].record_name, "master-1");
+        assert_eq!(&*events[1].record_name, "master-2");
 
         let token = token_rx.await.expect("oneshot should not be dropped");
         assert_eq!(token, "token-page2");
@@ -1269,7 +1273,7 @@ mod tests {
         }
 
         assert_eq!(events.len(), 1, "should yield the event from page 2");
-        assert_eq!(events[0].record_name, "master-1");
+        assert_eq!(&*events[0].record_name, "master-1");
 
         let token = token_rx.await.expect("oneshot should not be dropped");
         assert_eq!(token, "token-final");
@@ -1354,8 +1358,8 @@ mod tests {
         }
 
         assert_eq!(events.len(), 2, "should have events from pages 1 and 2");
-        assert_eq!(events[0].record_name, "master-1");
-        assert_eq!(events[1].record_name, "master-2");
+        assert_eq!(&*events[0].record_name, "master-1");
+        assert_eq!(&*events[1].record_name, "master-2");
         assert_eq!(errors.len(), 1, "should have exactly one error from page 3");
 
         let token = token_rx.await.expect("oneshot should not be dropped");
@@ -1389,7 +1393,7 @@ mod tests {
         }
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "deleted-record-1");
+        assert_eq!(&*events[0].record_name, "deleted-record-1");
         assert_eq!(events[0].reason, ChangeReason::HardDeleted);
         assert!(events[0].asset.is_none(), "hard-deleted has no asset");
         assert!(
@@ -1438,7 +1442,7 @@ mod tests {
 
         match sync_err {
             SyncTokenError::InvalidToken { reason } => {
-                assert_eq!(reason, "Unknown sync continuation type");
+                assert_eq!(&**reason, "Unknown sync continuation type");
             }
             other => panic!("expected InvalidToken variant, got: {other:?}"),
         }

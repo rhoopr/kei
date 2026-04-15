@@ -19,8 +19,16 @@ pub enum StateError {
     Migration(#[from] rusqlite::Error),
 
     /// A query failed.
-    #[error("Database query failed: {0}")]
-    Query(String),
+    #[error("Database query failed ({operation}): {source}")]
+    Query {
+        operation: &'static str,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// Failed to acquire the database lock (mutex poisoned).
+    #[error("Database lock acquisition failed ({0})")]
+    LockPoisoned(String),
 
     /// Failed to spawn a blocking task.
     #[error("Failed to spawn blocking task: {0}")]
@@ -33,8 +41,8 @@ pub enum StateError {
 
 impl StateError {
     /// Create a Query error from a rusqlite error.
-    pub fn query(source: &rusqlite::Error) -> Self {
-        Self::Query(source.to_string())
+    pub fn query(operation: &'static str, source: rusqlite::Error) -> Self {
+        Self::Query { operation, source }
     }
 }
 
@@ -50,19 +58,39 @@ mod tests {
 
     #[test]
     fn query_display_format() {
-        let err = StateError::Query("something broke".to_string());
-        assert_eq!(err.to_string(), "Database query failed: something broke");
+        let err = StateError::Query {
+            operation: "test_op",
+            source: make_rusqlite_error(),
+        };
+        let display = err.to_string();
+        assert!(
+            display.starts_with("Database query failed (test_op): "),
+            "unexpected display: {display}"
+        );
     }
 
     #[test]
     fn query_helper_creates_correct_variant() {
         let rusqlite_err = make_rusqlite_error();
-        let msg = rusqlite_err.to_string();
-        let err = StateError::query(&rusqlite_err);
+        let err = StateError::query("some_operation", rusqlite_err);
         match &err {
-            StateError::Query(s) => assert_eq!(s, &msg),
+            StateError::Query {
+                operation,
+                source: _,
+            } => {
+                assert_eq!(*operation, "some_operation");
+            }
             other => panic!("expected Query variant, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn lock_poisoned_display_format() {
+        let err = StateError::LockPoisoned("get_metadata: poisoned".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Database lock acquisition failed (get_metadata: poisoned)"
+        );
     }
 
     #[test]

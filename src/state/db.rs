@@ -229,7 +229,7 @@ impl SqliteStateDb {
     ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, StateError> {
         self.conn
             .lock()
-            .map_err(|e| StateError::Query(format!("{operation}: {e}")))
+            .map_err(|e| StateError::LockPoisoned(format!("{operation}: {e}")))
     }
 }
 
@@ -253,7 +253,7 @@ impl StateDb for SqliteStateDb {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("should_download", e))?
         };
 
         match result {
@@ -338,7 +338,7 @@ impl StateDb for SqliteStateDb {
                 last_seen_at,
             ],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("upsert_seen", e))?;
 
         Ok(())
     }
@@ -368,7 +368,7 @@ impl StateDb for SqliteStateDb {
                 version_size
             ],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("mark_downloaded", e))?;
 
         Ok(())
     }
@@ -385,7 +385,7 @@ impl StateDb for SqliteStateDb {
             "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, last_error = ?1 WHERE id = ?2 AND version_size = ?3",
             rusqlite::params![error, id, version_size],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("mark_failed", e))?;
 
         Ok(())
     }
@@ -397,13 +397,13 @@ impl StateDb for SqliteStateDb {
             .prepare(
                 "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'failed'",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_failed", e))?;
 
         let records = stmt
             .query_map([], row_to_asset_record)
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("get_failed", e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_failed", e))?;
 
         Ok(records)
     }
@@ -437,7 +437,7 @@ impl StateDb for SqliteStateDb {
                     u64::try_from(f).unwrap_or(0),
                 )
             })
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_summary", e))?;
 
         let last_sync: Option<(Option<i64>, Option<i64>)> = conn
             .query_row(
@@ -446,7 +446,7 @@ impl StateDb for SqliteStateDb {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_summary", e))?;
 
         let (last_sync_started, last_sync_completed) = match last_sync {
             Some((started, completed)) => (
@@ -477,16 +477,16 @@ impl StateDb for SqliteStateDb {
             .prepare(
                 "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'downloaded' ORDER BY rowid LIMIT ?1 OFFSET ?2",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_page", e))?;
 
         let records = stmt
             .query_map(
                 rusqlite::params![i64::from(limit), offset as i64],
                 row_to_asset_record,
             )
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("get_downloaded_page", e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_page", e))?;
 
         Ok(records)
     }
@@ -500,7 +500,7 @@ impl StateDb for SqliteStateDb {
             "INSERT INTO sync_runs (started_at) VALUES (?1)",
             [started_at],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("start_sync_run", e))?;
 
         let id = conn.last_insert_rowid();
         Ok(id)
@@ -519,7 +519,7 @@ impl StateDb for SqliteStateDb {
             "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, assets_failed = ?4, interrupted = ?5 WHERE id = ?6",
             rusqlite::params![completed_at, assets_seen, assets_downloaded, assets_failed, interrupted, run_id],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("complete_sync_run", e))?;
 
         Ok(())
     }
@@ -538,7 +538,7 @@ impl StateDb for SqliteStateDb {
                  WHERE status = 'failed'",
                 [],
             )
-            .map_err(|e| StateError::query(&e))? as u64;
+            .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
 
         let pending = conn
             .execute(
@@ -546,7 +546,7 @@ impl StateDb for SqliteStateDb {
                  WHERE status = 'pending' AND download_attempts > 0",
                 [],
             )
-            .map_err(|e| StateError::query(&e))? as u64;
+            .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
 
         let total_pending: i64 = conn
             .query_row(
@@ -554,7 +554,7 @@ impl StateDb for SqliteStateDb {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("prepare_for_retry", e))?;
         let total_pending = total_pending as u64;
 
         Ok((failed, pending, total_pending))
@@ -563,13 +563,13 @@ impl StateDb for SqliteStateDb {
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
         let conn = self.acquire_lock("promote_pending_to_failed")?;
 
-        let promoted = conn
-            .execute(
+        let promoted =
+            conn.execute(
                 "UPDATE assets SET status = 'failed', last_error = 'Not resolved during sync' \
                  WHERE status = 'pending' AND (last_seen_at IS NULL OR last_seen_at < ?1)",
                 rusqlite::params![seen_since],
             )
-            .map_err(|e| StateError::query(&e))? as u64;
+            .map_err(|e| StateError::query("promote_pending_to_failed", e))? as u64;
 
         Ok(promoted)
     }
@@ -583,21 +583,21 @@ impl StateDb for SqliteStateDb {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_ids", e))?;
         let count = usize::try_from(count).unwrap_or(0);
 
         let mut stmt = conn
             .prepare_cached("SELECT id, version_size FROM assets WHERE status = 'downloaded'")
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_ids", e))?;
 
         let mut ids = HashSet::with_capacity(count);
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_ids", e))?;
         for row in rows {
-            ids.insert(row.map_err(|e| StateError::query(&e))?);
+            ids.insert(row.map_err(|e| StateError::query("get_downloaded_ids", e))?);
         }
 
         Ok(ids)
@@ -608,13 +608,13 @@ impl StateDb for SqliteStateDb {
 
         let mut stmt = conn
             .prepare_cached("SELECT DISTINCT id FROM assets")
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_all_known_ids", e))?;
 
         let ids = stmt
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("get_all_known_ids", e))?
             .collect::<Result<HashSet<_>, _>>()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_all_known_ids", e))?;
 
         Ok(ids)
     }
@@ -630,14 +630,14 @@ impl StateDb for SqliteStateDb {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
         let count = usize::try_from(count).unwrap_or(0);
 
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, version_size, checksum FROM assets WHERE status = 'downloaded'",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
 
         let mut checksums = HashMap::with_capacity(count);
         let rows = stmt
@@ -647,9 +647,9 @@ impl StateDb for SqliteStateDb {
                     row.get::<_, String>(2)?,
                 ))
             })
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
         for row in rows {
-            let (key, val) = row.map_err(|e| StateError::query(&e))?;
+            let (key, val) = row.map_err(|e| StateError::query("get_downloaded_checksums", e))?;
             checksums.insert(key, val);
         }
 
@@ -664,7 +664,7 @@ impl StateDb for SqliteStateDb {
                 "SELECT id, MAX(download_attempts) FROM assets \
                  WHERE download_attempts > 0 GROUP BY id",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_attempt_counts", e))?;
 
         let counts = stmt
             .query_map([], |row| {
@@ -672,9 +672,9 @@ impl StateDb for SqliteStateDb {
                 let count: i64 = row.get(1)?;
                 Ok((id, u32::try_from(count).unwrap_or(u32::MAX)))
             })
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("get_attempt_counts", e))?
             .collect::<Result<HashMap<_, _>, _>>()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_attempt_counts", e))?;
 
         Ok(counts)
     }
@@ -687,7 +687,7 @@ impl StateDb for SqliteStateDb {
                 row.get::<_, String>(0)
             })
             .optional()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_metadata", e))?;
 
         Ok(value)
     }
@@ -699,7 +699,7 @@ impl StateDb for SqliteStateDb {
             "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             rusqlite::params![key, value],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("set_metadata", e))?;
 
         Ok(())
     }
@@ -712,7 +712,7 @@ impl StateDb for SqliteStateDb {
                 "DELETE FROM metadata WHERE key LIKE ?1",
                 [format!("{prefix}%")],
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("delete_metadata_by_prefix", e))?;
 
         Ok(deleted as u64)
     }
@@ -725,7 +725,7 @@ impl StateDb for SqliteStateDb {
             "UPDATE assets SET last_seen_at = ?1 WHERE id = ?2",
             rusqlite::params![now, asset_id],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("touch_last_seen", e))?;
 
         Ok(())
     }
@@ -738,14 +738,14 @@ impl StateDb for SqliteStateDb {
                 "SELECT local_path FROM assets WHERE status = 'downloaded' \
                  AND local_path IS NOT NULL ORDER BY RANDOM() LIMIT ?1",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
 
         let paths = stmt
             .query_map(rusqlite::params![limit as i64], |row| {
                 let p: String = row.get(0)?;
                 Ok(PathBuf::from(p))
             })
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("sample_downloaded_paths", e))?
             .filter_map(Result::ok)
             .collect();
 
