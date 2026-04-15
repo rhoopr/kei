@@ -194,6 +194,7 @@ pub struct Config {
     // Optional paths
     pub pid_file: Option<PathBuf>,
     pub notification_script: Option<PathBuf>,
+    pub report_json: Option<PathBuf>,
 
     // 8-byte primitives
     pub watch_with_interval: Option<u64>,
@@ -662,6 +663,9 @@ impl Config {
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
 
+        // JSON report
+        let report_json = sync.report_json;
+
         if skip_videos && skip_photos && live_photo_mode == LivePhotoMode::Skip {
             tracing::warn!(
                 "All media types are being skipped (--skip-videos, --skip-photos, \
@@ -686,6 +690,7 @@ impl Config {
             skip_created_after,
             pid_file,
             notification_script,
+            report_json,
             watch_with_interval,
             retry_delay_secs,
             recent,

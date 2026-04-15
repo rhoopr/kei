@@ -20,6 +20,16 @@ use crate::types::{
 use super::paths;
 use super::DownloadConfig;
 
+/// Reason an asset was filtered out during content/metadata filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FilterReason {
+    ExcludedAlbum,
+    MediaType,
+    LivePhoto,
+    DateRange,
+    Filename,
+}
+
 /// Case-insensitive glob matching options for filename exclusion patterns.
 const GLOB_CASE_INSENSITIVE: glob::MatchOptions = glob::MatchOptions {
     case_sensitive: false,
@@ -165,41 +175,42 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
     Cow::Owned(swapped)
 }
 
-/// Returns `true` if this asset should be skipped by content/metadata filters.
+/// Returns the reason this asset should be skipped by content/metadata
+/// filters, or `None` if the asset passes all filters.
 ///
 /// Callers must invoke this before `extract_skip_candidates` or
 /// `filter_asset_to_tasks` to avoid redundant evaluation.
 pub(super) fn is_asset_filtered(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
-) -> bool {
+) -> Option<FilterReason> {
     if config.exclude_asset_ids.contains(asset.id()) {
         tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
-        return true;
+        return Some(FilterReason::ExcludedAlbum);
     }
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         tracing::debug!(asset_id = %asset.id(), "Skipping video (skip_videos enabled)");
-        return true;
+        return Some(FilterReason::MediaType);
     }
     if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
         tracing::debug!(asset_id = %asset.id(), "Skipping photo (skip_photos enabled)");
-        return true;
+        return Some(FilterReason::MediaType);
     }
     if config.live_photo_mode == LivePhotoMode::Skip && asset.is_live_photo() {
         tracing::debug!(asset_id = %asset.id(), "Skipping live photo (live_photo_mode=skip)");
-        return true;
+        return Some(FilterReason::LivePhoto);
     }
     let created_utc = asset.created();
     if let Some(before) = &config.skip_created_before {
         if created_utc < *before {
             tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (before date range)");
-            return true;
+            return Some(FilterReason::DateRange);
         }
     }
     if let Some(after) = &config.skip_created_after {
         if created_utc > *after {
             tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (after date range)");
-            return true;
+            return Some(FilterReason::DateRange);
         }
     }
     // Only check filename exclusion when the asset has a real filename.
@@ -212,11 +223,11 @@ pub(super) fn is_asset_filtered(
                 .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
             {
                 tracing::debug!(asset_id = %asset.id(), filename, "Skipping (filename_exclude match)");
-                return true;
+                return Some(FilterReason::Filename);
             }
         }
     }
-    false
+    None
 }
 
 /// Lightweight pre-check: extract (`version_size`, checksum) pairs for an asset
@@ -763,7 +774,10 @@ mod tests {
             .build();
         let mut config = test_config();
         config.skip_videos = true;
-        assert!(is_asset_filtered(&asset, &config));
+        assert_eq!(
+            is_asset_filtered(&asset, &config),
+            Some(FilterReason::MediaType)
+        );
     }
 
     #[test]
@@ -787,7 +801,10 @@ mod tests {
         let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         config.skip_photos = true;
-        assert!(is_asset_filtered(&asset, &config));
+        assert_eq!(
+            is_asset_filtered(&asset, &config),
+            Some(FilterReason::MediaType)
+        );
     }
 
     #[test]
@@ -1329,7 +1346,10 @@ mod tests {
             .build();
         let mut config = test_config();
         config.skip_videos = true;
-        assert!(is_asset_filtered(&asset, &config));
+        assert_eq!(
+            is_asset_filtered(&asset, &config),
+            Some(FilterReason::MediaType)
+        );
     }
 
     #[test]
@@ -1337,7 +1357,10 @@ mod tests {
         let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         config.skip_photos = true;
-        assert!(is_asset_filtered(&asset, &config));
+        assert_eq!(
+            is_asset_filtered(&asset, &config),
+            Some(FilterReason::MediaType)
+        );
     }
 
     #[test]
@@ -1356,8 +1379,9 @@ mod tests {
         let asset = test_live_photo_asset();
         let mut config = test_config();
         config.live_photo_mode = LivePhotoMode::Skip;
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::LivePhoto),
             "Skip mode should exclude live photos entirely"
         );
     }
@@ -1396,7 +1420,10 @@ mod tests {
                 .unwrap()
                 .into(),
         );
-        assert!(is_asset_filtered(&asset, &config));
+        assert_eq!(
+            is_asset_filtered(&asset, &config),
+            Some(FilterReason::DateRange)
+        );
     }
 
     #[test]
@@ -1409,7 +1436,10 @@ mod tests {
                 .unwrap()
                 .into(),
         );
-        assert!(is_asset_filtered(&asset, &config));
+        assert_eq!(
+            is_asset_filtered(&asset, &config),
+            Some(FilterReason::DateRange)
+        );
     }
 
     #[test]
@@ -1975,8 +2005,9 @@ mod tests {
                 .unwrap()
                 .into(),
         );
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::DateRange),
             "Asset before the date window should be skipped"
         );
     }
@@ -1997,8 +2028,9 @@ mod tests {
                 .unwrap()
                 .into(),
         );
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::DateRange),
             "Asset after the date window should be skipped"
         );
     }
@@ -2173,8 +2205,9 @@ mod tests {
                 .unwrap()
                 .and_utc(),
         );
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::DateRange),
             "Asset created in 2020 should be excluded by skip_created_before=2024"
         );
     }
@@ -2194,8 +2227,9 @@ mod tests {
                 .unwrap()
                 .and_utc(),
         );
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::DateRange),
             "Asset created in 2025 should be excluded by skip_created_after=2023"
         );
     }
@@ -2220,8 +2254,9 @@ mod tests {
         let asset = test_live_photo_asset();
         let mut config = test_config();
         config.live_photo_mode = LivePhotoMode::Skip;
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::LivePhoto),
             "Skip mode should produce no tasks for live photos"
         );
     }
@@ -2244,8 +2279,9 @@ mod tests {
             .build();
         let mut config = test_config();
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::Filename),
             "*.AAE pattern should exclude AAE files"
         );
     }
@@ -2255,8 +2291,9 @@ mod tests {
         let asset = TestPhotoAsset::new("EXCL_2").filename("Photo.aae").build();
         let mut config = test_config();
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::Filename),
             "Pattern matching should be case-insensitive"
         );
     }
@@ -2283,8 +2320,9 @@ mod tests {
         let mut ids = FxHashSet::default();
         ids.insert("EXCLUDED_1".to_string());
         config.exclude_asset_ids = Arc::new(ids);
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::ExcludedAlbum),
             "Asset in exclude set should be filtered"
         );
     }
@@ -2311,8 +2349,9 @@ mod tests {
         let mut ids = FxHashSet::default();
         ids.insert("SKIP_EXCL_1".to_string());
         config.exclude_asset_ids = Arc::new(ids);
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::ExcludedAlbum),
             "is_asset_filtered should return true for excluded assets"
         );
     }
@@ -2324,8 +2363,9 @@ mod tests {
         let asset = TestPhotoAsset::new("TEST_1").filename("photo.AAE").build();
         let mut config = test_config();
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::Filename),
             "filename_exclude should filter via is_asset_filtered"
         );
     }
@@ -2346,8 +2386,9 @@ mod tests {
         let asset = TestPhotoAsset::new("TEST_1").filename("photo.aae").build();
         let mut config = test_config();
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::Filename),
             "filename_exclude should be case-insensitive"
         );
     }
@@ -2530,8 +2571,9 @@ mod tests {
         excluded.insert("EXCLUDED_1".to_string());
         config.exclude_asset_ids = Arc::new(excluded);
 
-        assert!(
+        assert_eq!(
             is_asset_filtered(&asset, &config),
+            Some(FilterReason::ExcludedAlbum),
             "asset in exclude_asset_ids should be filtered"
         );
     }

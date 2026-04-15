@@ -30,6 +30,63 @@ impl Event {
     }
 }
 
+/// Sync statistics passed to notification scripts as environment variables.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SyncNotificationData {
+    pub assets_seen: u64,
+    pub downloaded: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub bytes_downloaded: u64,
+    pub disk_bytes_written: u64,
+    pub elapsed_secs: f64,
+    pub interrupted: bool,
+    pub exif_failures: usize,
+    pub state_write_failures: usize,
+    pub enumeration_errors: usize,
+    // Skip breakdown
+    pub skipped_by_state: usize,
+    pub skipped_on_disk: usize,
+    pub skipped_by_media_type: usize,
+    pub skipped_by_date_range: usize,
+    pub skipped_by_live_photo: usize,
+    pub skipped_by_filename: usize,
+    pub skipped_by_excluded_album: usize,
+    pub skipped_live_photo_variant: usize,
+    pub skipped_duplicates: usize,
+    pub skipped_retry_exhausted: usize,
+    pub skipped_retry_only: usize,
+}
+
+impl From<&crate::download::SyncStats> for SyncNotificationData {
+    fn from(s: &crate::download::SyncStats) -> Self {
+        Self {
+            assets_seen: s.assets_seen,
+            downloaded: s.downloaded,
+            failed: s.failed,
+            skipped: s.skipped.total(),
+            bytes_downloaded: s.bytes_downloaded,
+            disk_bytes_written: s.disk_bytes_written,
+            elapsed_secs: s.elapsed_secs,
+            interrupted: s.interrupted,
+            exif_failures: s.exif_failures,
+            state_write_failures: s.state_write_failures,
+            enumeration_errors: s.enumeration_errors,
+            skipped_by_state: s.skipped.by_state,
+            skipped_on_disk: s.skipped.on_disk,
+            skipped_by_media_type: s.skipped.by_media_type,
+            skipped_by_date_range: s.skipped.by_date_range,
+            skipped_by_live_photo: s.skipped.by_live_photo,
+            skipped_by_filename: s.skipped.by_filename,
+            skipped_by_excluded_album: s.skipped.by_excluded_album,
+            skipped_live_photo_variant: s.skipped.ampm_variant,
+            skipped_duplicates: s.skipped.duplicates,
+            skipped_retry_exhausted: s.skipped.retry_exhausted,
+            skipped_retry_only: s.skipped.retry_only,
+        }
+    }
+}
+
 /// Notification dispatcher. Holds an optional script path.
 /// When no script is configured, all methods are no-ops.
 #[derive(Debug, Clone)]
@@ -47,7 +104,13 @@ impl Notifier {
 
     /// Fire the notification script with the given event.
     /// Fire-and-forget: spawns the script in a background task so it never blocks sync.
-    pub fn notify(&self, event: Event, message: &str, username: &str) {
+    pub fn notify(
+        &self,
+        event: Event,
+        message: &str,
+        username: &str,
+        data: Option<&SyncNotificationData>,
+    ) {
         let Some(script) = self.script.clone() else {
             return;
         };
@@ -63,11 +126,12 @@ impl Notifier {
         let event_str = event.as_str();
         let message = message.to_owned();
         let username = username.to_owned();
+        let data = data.cloned();
 
         tracing::debug!(event = event_str, "Firing notification script");
 
         tokio::spawn(async move {
-            match run_script(&script, event_str, &message, &username).await {
+            match run_script(&script, event_str, &message, &username, data.as_ref()).await {
                 Ok(status) if status.success() => {
                     tracing::debug!(event = event_str, "Notification script completed");
                 }
@@ -95,19 +159,67 @@ async fn run_script(
     event: &str,
     message: &str,
     username: &str,
+    data: Option<&SyncNotificationData>,
 ) -> anyhow::Result<std::process::ExitStatus> {
     // Execute via /bin/sh to avoid ETXTBSY ("Text file busy") races when
     // the script file was recently written or replaced (e.g. config reload,
     // `kei setup`, parallel tests). Scripts with shebangs work fine via sh.
-    let mut child = tokio::process::Command::new("/bin/sh")
-        .arg(script)
+    let mut cmd = tokio::process::Command::new("/bin/sh");
+    cmd.arg(script)
         .env("KEI_EVENT", event)
         .env("KEI_MESSAGE", message)
         .env("KEI_ICLOUD_USERNAME", username)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()?;
+        .stderr(std::process::Stdio::inherit());
+
+    if let Some(d) = data {
+        cmd.env("KEI_ASSETS_SEEN", d.assets_seen.to_string())
+            .env("KEI_DOWNLOADED", d.downloaded.to_string())
+            .env("KEI_FAILED", d.failed.to_string())
+            .env("KEI_SKIPPED", d.skipped.to_string())
+            .env("KEI_INTERRUPTED", d.interrupted.to_string())
+            .env("KEI_BYTES_DOWNLOADED", d.bytes_downloaded.to_string())
+            .env("KEI_DISK_BYTES", d.disk_bytes_written.to_string())
+            .env("KEI_ELAPSED_SECS", format!("{:.1}", d.elapsed_secs))
+            .env("KEI_EXIF_FAILURES", d.exif_failures.to_string())
+            .env(
+                "KEI_STATE_WRITE_FAILURES",
+                d.state_write_failures.to_string(),
+            )
+            .env("KEI_ENUMERATION_ERRORS", d.enumeration_errors.to_string())
+            .env("KEI_SKIPPED_BY_STATE", d.skipped_by_state.to_string())
+            .env("KEI_SKIPPED_ON_DISK", d.skipped_on_disk.to_string())
+            .env(
+                "KEI_SKIPPED_BY_MEDIA_TYPE",
+                d.skipped_by_media_type.to_string(),
+            )
+            .env(
+                "KEI_SKIPPED_BY_DATE_RANGE",
+                d.skipped_by_date_range.to_string(),
+            )
+            .env(
+                "KEI_SKIPPED_BY_LIVE_PHOTO",
+                d.skipped_by_live_photo.to_string(),
+            )
+            .env("KEI_SKIPPED_BY_FILENAME", d.skipped_by_filename.to_string())
+            .env(
+                "KEI_SKIPPED_BY_EXCLUDED_ALBUM",
+                d.skipped_by_excluded_album.to_string(),
+            )
+            .env(
+                "KEI_SKIPPED_LIVE_PHOTO_VARIANT",
+                d.skipped_live_photo_variant.to_string(),
+            )
+            .env("KEI_SKIPPED_DUPLICATES", d.skipped_duplicates.to_string())
+            .env(
+                "KEI_SKIPPED_RETRY_EXHAUSTED",
+                d.skipped_retry_exhausted.to_string(),
+            )
+            .env("KEI_SKIPPED_RETRY_ONLY", d.skipped_retry_only.to_string());
+    }
+
+    let mut child = cmd.spawn()?;
 
     if let Ok(result) = tokio::time::timeout(SCRIPT_TIMEOUT, child.wait()).await {
         Ok(result?)
@@ -143,7 +255,12 @@ mod tests {
     fn notify_with_nonexistent_script() {
         let notifier = Notifier::new(Some(PathBuf::from("/tmp/claude/nonexistent_notify.sh")));
         // Should not panic, just log a warning (script existence checked synchronously)
-        notifier.notify(Event::SyncComplete, "test message", "user@example.com");
+        notifier.notify(
+            Event::SyncComplete,
+            "test message",
+            "user@example.com",
+            None,
+        );
     }
 
     /// Write a shell script to a temp dir. No executable permission needed
@@ -161,7 +278,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script = write_test_script(dir.path(), "success.sh", b"#!/bin/sh\nexit 0\n");
 
-        let status = run_script(&script, "test_event", "msg", "user")
+        let status = run_script(&script, "test_event", "msg", "user", None)
             .await
             .unwrap();
         assert!(status.success());
@@ -173,7 +290,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script = write_test_script(dir.path(), "fail.sh", b"#!/bin/sh\nexit 1\n");
 
-        let status = run_script(&script, "test_event", "msg", "user")
+        let status = run_script(&script, "test_event", "msg", "user", None)
             .await
             .unwrap();
         assert!(!status.success());
@@ -191,7 +308,12 @@ mod tests {
         let script_path = write_test_script(dir.path(), "test_notify.sh", body.as_bytes());
 
         let notifier = Notifier::new(Some(script_path.clone()));
-        notifier.notify(Event::TwoFaRequired, "Need 2FA code", "test@example.com");
+        notifier.notify(
+            Event::TwoFaRequired,
+            "Need 2FA code",
+            "test@example.com",
+            None,
+        );
 
         // Wait for the spawned background task to complete (poll instead of fixed sleep)
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -208,5 +330,74 @@ mod tests {
 
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert_eq!(output.trim(), "2fa_required|Need 2FA code|test@example.com");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notify_with_sync_data_sets_extended_env_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("test_data_output.txt");
+        let body = format!(
+            "#!/bin/sh\necho \"$KEI_DOWNLOADED|$KEI_FAILED|$KEI_SKIPPED|$KEI_BYTES_DOWNLOADED|$KEI_SKIPPED_BY_STATE\" > {}\n",
+            output_path.display()
+        );
+        let script_path = write_test_script(dir.path(), "test_data.sh", body.as_bytes());
+
+        let data = SyncNotificationData {
+            downloaded: 42,
+            failed: 3,
+            skipped: 100,
+            bytes_downloaded: 1_500_000,
+            skipped_by_state: 80,
+            ..SyncNotificationData::default()
+        };
+
+        let notifier = Notifier::new(Some(script_path));
+        notifier.notify(Event::SyncComplete, "test", "user@example.com", Some(&data));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if output_path.exists() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "notification script did not produce output"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let output = std::fs::read_to_string(&output_path).unwrap();
+        assert_eq!(output.trim(), "42|3|100|1500000|80");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notify_without_data_omits_extended_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("test_no_data.txt");
+        let body = format!(
+            "#!/bin/sh\necho \"${{KEI_DOWNLOADED:-unset}}|${{KEI_FAILED:-unset}}\" > {}\n",
+            output_path.display()
+        );
+        let script_path = write_test_script(dir.path(), "test_no_data.sh", body.as_bytes());
+
+        let notifier = Notifier::new(Some(script_path));
+        notifier.notify(Event::SyncComplete, "test", "user@example.com", None);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if output_path.exists() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "notification script did not produce output"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let output = std::fs::read_to_string(&output_path).unwrap();
+        assert_eq!(output.trim(), "unset|unset");
     }
 }

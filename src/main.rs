@@ -18,6 +18,7 @@ mod icloud;
 mod migration;
 mod notifications;
 mod password;
+mod report;
 mod retry;
 mod setup;
 mod shutdown;

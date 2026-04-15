@@ -1160,3 +1160,22 @@ fn submit_code_fails_without_username() {
         .failure()
         .stderr(predicate::str::contains("error").or(predicate::str::contains("required")));
 }
+
+// ── --report-json ────────────────────────────────────────────────────
+
+#[test]
+fn report_json_flag_accepted() {
+    common::cmd()
+        .args(["sync", "--report-json", "/tmp/report.json", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn report_json_visible_in_help() {
+    common::cmd()
+        .args(["sync", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--report-json"));
+}

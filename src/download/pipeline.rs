@@ -24,7 +24,7 @@ use crate::state::{AssetRecord, StateDb, SyncRunStats};
 use super::error::DownloadError;
 use super::filter::{
     determine_media_type, extract_skip_candidates, filter_asset_to_tasks, is_asset_filtered,
-    pre_ensure_asset_dir, DownloadTask, NormalizedPath,
+    pre_ensure_asset_dir, DownloadTask, FilterReason, NormalizedPath,
 };
 use super::{paths, DownloadConfig, DownloadContext, DownloadOutcome};
 
@@ -52,7 +52,11 @@ pub(super) struct ProducerSkipSummary {
     pub(super) by_state: usize,
     pub(super) on_disk: usize,
     pub(super) ampm_variant: usize,
-    pub(super) by_filter: usize,
+    pub(super) by_media_type: usize,
+    pub(super) by_date_range: usize,
+    pub(super) by_live_photo: usize,
+    pub(super) by_filename: usize,
+    pub(super) by_excluded_album: usize,
     pub(super) duplicates: usize,
     pub(super) retry_exhausted: usize,
     pub(super) retry_only: usize,
@@ -63,7 +67,11 @@ impl ProducerSkipSummary {
         self.by_state
             + self.on_disk
             + self.ampm_variant
-            + self.by_filter
+            + self.by_media_type
+            + self.by_date_range
+            + self.by_live_photo
+            + self.by_filename
+            + self.by_excluded_album
             + self.duplicates
             + self.retry_exhausted
             + self.retry_only
@@ -75,10 +83,32 @@ impl std::ops::AddAssign for ProducerSkipSummary {
         self.by_state += rhs.by_state;
         self.on_disk += rhs.on_disk;
         self.ampm_variant += rhs.ampm_variant;
-        self.by_filter += rhs.by_filter;
+        self.by_media_type += rhs.by_media_type;
+        self.by_date_range += rhs.by_date_range;
+        self.by_live_photo += rhs.by_live_photo;
+        self.by_filename += rhs.by_filename;
+        self.by_excluded_album += rhs.by_excluded_album;
         self.duplicates += rhs.duplicates;
         self.retry_exhausted += rhs.retry_exhausted;
         self.retry_only += rhs.retry_only;
+    }
+}
+
+impl From<ProducerSkipSummary> for super::SkipBreakdown {
+    fn from(s: ProducerSkipSummary) -> Self {
+        Self {
+            by_state: s.by_state,
+            on_disk: s.on_disk,
+            by_media_type: s.by_media_type,
+            by_date_range: s.by_date_range,
+            by_live_photo: s.by_live_photo,
+            by_filename: s.by_filename,
+            by_excluded_album: s.by_excluded_album,
+            ampm_variant: s.ampm_variant,
+            duplicates: s.duplicates,
+            retry_exhausted: s.retry_exhausted,
+            retry_only: s.retry_only,
+        }
     }
 }
 
@@ -93,6 +123,8 @@ pub(super) struct StreamingResult {
     pub(super) enumeration_errors: usize,
     pub(super) assets_seen: u64,
     pub(super) skip_summary: ProducerSkipSummary,
+    pub(super) bytes_downloaded: u64,
+    pub(super) disk_bytes_written: u64,
 }
 
 /// Threshold of auth errors before aborting the download pass for re-authentication.
@@ -240,6 +272,8 @@ pub(super) struct PassResult {
     pub(super) failed: Vec<DownloadTask>,
     pub(super) auth_errors: usize,
     pub(super) state_write_failures: usize,
+    pub(super) bytes_downloaded: u64,
+    pub(super) disk_bytes_written: u64,
 }
 
 /// Streaming download pipeline that consumes a pre-built combined stream.
@@ -280,7 +314,7 @@ where
             }
             match result {
                 Ok(asset) => {
-                    if is_asset_filtered(&asset, config) {
+                    if is_asset_filtered(&asset, config).is_some() {
                         continue;
                     }
                     let candidates = extract_skip_candidates(&asset, config);
@@ -327,7 +361,7 @@ where
             }
             match result {
                 Ok(asset) => {
-                    if is_asset_filtered(&asset, config) {
+                    if is_asset_filtered(&asset, config).is_some() {
                         continue;
                     }
                     pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
@@ -455,6 +489,8 @@ where
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
+    let mut bytes_downloaded_total: u64 = 0;
+    let mut disk_bytes_total: u64 = 0;
 
     let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
 
@@ -492,8 +528,14 @@ where
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                    if is_asset_filtered(&asset, config) {
-                        skips.by_filter += 1;
+                    if let Some(reason) = is_asset_filtered(&asset, config) {
+                        match reason {
+                            FilterReason::ExcludedAlbum => skips.by_excluded_album += 1,
+                            FilterReason::MediaType => skips.by_media_type += 1,
+                            FilterReason::LivePhoto => skips.by_live_photo += 1,
+                            FilterReason::DateRange => skips.by_date_range += 1,
+                            FilterReason::Filename => skips.by_filename += 1,
+                        }
                         producer_pb.inc(1);
                         continue;
                     }
@@ -532,7 +574,7 @@ where
                                 tracing::debug!(error = %e, asset_id = asset.id(), "Failed to touch last_seen for on-disk asset");
                             }
                         }
-                        skips.by_filter += 1;
+                        skips.on_disk += 1;
                         producer_pb.inc(1);
                     } else {
                         let mut disposition = AssetDisposition::Unresolved;
@@ -705,7 +747,11 @@ where
                     state = skips.by_state,
                     on_disk = skips.on_disk,
                     ampm_variant = skips.ampm_variant,
-                    filtered = skips.by_filter,
+                    media_type = skips.by_media_type,
+                    date_range = skips.by_date_range,
+                    live_photo = skips.by_live_photo,
+                    filename = skips.by_filename,
+                    excluded_album = skips.by_excluded_album,
                     duplicates = skips.duplicates,
                     retry_exhausted = skips.retry_exhausted,
                     retry_only = skips.retry_only,
@@ -770,8 +816,10 @@ where
             .to_string();
         pb.set_message(filename);
         match result {
-            Ok((exif_ok, local_checksum, download_checksum)) => {
+            Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
                 downloaded += 1;
+                bytes_downloaded_total += bytes_dl;
+                disk_bytes_total += disk_bytes;
                 if !exif_ok {
                     exif_failures += 1;
                 }
@@ -911,6 +959,8 @@ where
         enumeration_errors: enum_errors.load(std::sync::atomic::Ordering::Relaxed),
         assets_seen: assets_seen_count,
         skip_summary: producer_skips,
+        bytes_downloaded: bytes_downloaded_total,
+        disk_bytes_written: disk_bytes_total,
     })
 }
 
@@ -924,24 +974,45 @@ pub(super) async fn build_download_outcome(
     streaming_result: StreamingResult,
     started: Instant,
     shutdown_token: CancellationToken,
-) -> Result<DownloadOutcome> {
+) -> Result<(DownloadOutcome, super::SyncStats)> {
     let downloaded = streaming_result.downloaded;
     let mut exif_failures = streaming_result.exif_failures;
     let failed_tasks = streaming_result.failed;
     let auth_errors = streaming_result.auth_errors;
     let mut state_write_failures = streaming_result.state_write_failures;
     let enumeration_errors = streaming_result.enumeration_errors;
-    // Exclude duplicates: they're outside the API's unique-asset count
-    // and would inflate the user-facing total beyond what the API reported.
-    let skipped = streaming_result.skip_summary.total() - streaming_result.skip_summary.duplicates;
+    let skip_breakdown: super::SkipBreakdown = streaming_result.skip_summary.into();
 
     if auth_errors >= AUTH_ERROR_THRESHOLD {
-        return Ok(DownloadOutcome::SessionExpired {
-            auth_error_count: auth_errors,
-        });
+        let stats = super::SyncStats {
+            assets_seen: streaming_result.assets_seen,
+            downloaded,
+            failed: failed_tasks.len(),
+            skipped: skip_breakdown,
+            bytes_downloaded: streaming_result.bytes_downloaded,
+            disk_bytes_written: streaming_result.disk_bytes_written,
+            exif_failures,
+            state_write_failures,
+            enumeration_errors,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            interrupted: true,
+        };
+        return Ok((
+            DownloadOutcome::SessionExpired {
+                auth_error_count: auth_errors,
+            },
+            stats,
+        ));
     }
 
     if downloaded == 0 && failed_tasks.is_empty() {
+        let stats = super::SyncStats {
+            assets_seen: streaming_result.assets_seen,
+            skipped: skip_breakdown,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            interrupted: shutdown_token.is_cancelled(),
+            ..super::SyncStats::default()
+        };
         if config.dry_run {
             tracing::info!("── Dry Run Summary ──");
             tracing::info!("  0 files would be downloaded");
@@ -949,10 +1020,18 @@ pub(super) async fn build_download_outcome(
         } else {
             tracing::info!("No new photos to download");
         }
-        return Ok(DownloadOutcome::Success);
+        return Ok((DownloadOutcome::Success, stats));
     }
 
     if config.dry_run {
+        let stats = super::SyncStats {
+            assets_seen: streaming_result.assets_seen,
+            downloaded,
+            skipped: skip_breakdown,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            interrupted: shutdown_token.is_cancelled(),
+            ..super::SyncStats::default()
+        };
         tracing::info!("── Dry Run Summary ──");
         if shutdown_token.is_cancelled() {
             tracing::info!(scanned = downloaded, "  Interrupted before shutdown");
@@ -961,40 +1040,33 @@ pub(super) async fn build_download_outcome(
         }
         tracing::info!(destination = %config.directory.display(), "  destination");
         tracing::info!(concurrency = config.concurrent_downloads, "  concurrency");
-        return Ok(DownloadOutcome::Success);
+        return Ok((DownloadOutcome::Success, stats));
     }
 
-    let total = downloaded + failed_tasks.len();
-
     if failed_tasks.is_empty() {
-        tracing::info!("── Summary ──");
-        if exif_failures > 0 || state_write_failures > 0 || enumeration_errors > 0 {
-            tracing::info!(
-                downloaded = total,
-                skipped,
-                exif_failures,
-                state_write_failures,
-                enumeration_errors,
-                failed = 0,
-                total = total + skipped,
-                "  sync results"
-            );
-        } else {
-            tracing::info!(
-                downloaded = total,
-                skipped,
-                failed = 0,
-                total = total + skipped,
-                "  sync results"
-            );
-        }
-        tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
+        let stats = super::SyncStats {
+            assets_seen: streaming_result.assets_seen,
+            downloaded,
+            failed: 0,
+            skipped: skip_breakdown,
+            bytes_downloaded: streaming_result.bytes_downloaded,
+            disk_bytes_written: streaming_result.disk_bytes_written,
+            exif_failures,
+            state_write_failures,
+            enumeration_errors,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            interrupted: shutdown_token.is_cancelled(),
+        };
+        log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
         if state_write_failures > 0 || enumeration_errors > 0 || exif_failures > 0 {
-            return Ok(DownloadOutcome::PartialFailure {
-                failed_count: state_write_failures + enumeration_errors + exif_failures,
-            });
+            return Ok((
+                DownloadOutcome::PartialFailure {
+                    failed_count: state_write_failures + enumeration_errors + exif_failures,
+                },
+                stats,
+            ));
         }
-        return Ok(DownloadOutcome::Success);
+        return Ok((DownloadOutcome::Success, stats));
     }
 
     // Phase 2: cleanup pass with fresh CDN URLs
@@ -1020,7 +1092,7 @@ pub(super) async fn build_download_outcome(
         concurrency: cleanup_concurrency,
         no_progress_bar: config.no_progress_bar,
         temp_suffix: config.temp_suffix.clone(),
-        shutdown_token,
+        shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
     };
     let pass_result = run_download_pass(pass_config, fresh_tasks).await;
@@ -1032,48 +1104,65 @@ pub(super) async fn build_download_outcome(
     let total_auth_errors = auth_errors + phase2_auth_errors;
 
     if total_auth_errors >= AUTH_ERROR_THRESHOLD {
-        return Ok(DownloadOutcome::SessionExpired {
-            auth_error_count: total_auth_errors,
-        });
+        let stats = super::SyncStats {
+            assets_seen: streaming_result.assets_seen,
+            downloaded,
+            failed: remaining_failed.len(),
+            skipped: skip_breakdown,
+            bytes_downloaded: streaming_result.bytes_downloaded + pass_result.bytes_downloaded,
+            disk_bytes_written: streaming_result.disk_bytes_written
+                + pass_result.disk_bytes_written,
+            exif_failures,
+            state_write_failures,
+            enumeration_errors,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            interrupted: true,
+        };
+        return Ok((
+            DownloadOutcome::SessionExpired {
+                auth_error_count: total_auth_errors,
+            },
+            stats,
+        ));
     }
 
     let failed = remaining_failed.len();
     let phase2_succeeded = phase2_task_count - failed;
     let succeeded = downloaded + phase2_succeeded;
-    let final_total = succeeded + failed;
-    tracing::info!("── Summary ──");
-    if exif_failures > 0 || state_write_failures > 0 {
-        tracing::info!(
-            downloaded = succeeded,
-            skipped,
-            exif_failures,
-            state_write_failures,
-            failed,
-            total = final_total + skipped,
-            "  sync results"
-        );
-    } else {
-        tracing::info!(
-            downloaded = succeeded,
-            skipped,
-            failed,
-            total = final_total + skipped,
-            "  sync results"
-        );
-    }
-    tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
 
+    // Log failed downloads before the summary
     let total_failures = failed + state_write_failures + exif_failures;
     if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
         }
-        return Ok(DownloadOutcome::PartialFailure {
-            failed_count: total_failures,
-        });
     }
 
-    Ok(DownloadOutcome::Success)
+    let stats = super::SyncStats {
+        assets_seen: streaming_result.assets_seen,
+        downloaded: succeeded,
+        failed,
+        skipped: skip_breakdown,
+        bytes_downloaded: streaming_result.bytes_downloaded + pass_result.bytes_downloaded,
+        disk_bytes_written: streaming_result.disk_bytes_written + pass_result.disk_bytes_written,
+        exif_failures,
+        state_write_failures,
+        enumeration_errors,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+        interrupted: shutdown_token.is_cancelled(),
+    };
+    log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
+
+    if total_failures > 0 {
+        return Ok((
+            DownloadOutcome::PartialFailure {
+                failed_count: total_failures,
+            },
+            stats,
+        ));
+    }
+
+    Ok((DownloadOutcome::Success, stats))
 }
 
 /// Execute a download pass over the given tasks, returning any that failed.
@@ -1090,7 +1179,10 @@ pub(super) async fn run_download_pass(
     let concurrency = config.concurrency;
     let temp_suffix: Arc<str> = config.temp_suffix.into();
 
-    type DownloadResult = (DownloadTask, Result<(bool, String, Option<String>)>);
+    type DownloadResult = (
+        DownloadTask,
+        Result<(bool, String, Option<String>, u64, u64)>,
+    );
     let results: Vec<DownloadResult> = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
@@ -1116,10 +1208,14 @@ pub(super) async fn run_download_pass(
     let mut auth_errors = 0usize;
     let mut exif_failures = 0usize;
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
+    let mut bytes_downloaded_total: u64 = 0;
+    let mut disk_bytes_total: u64 = 0;
 
     for (task, result) in results {
         match &result {
-            Ok((exif_ok, local_checksum, download_checksum)) => {
+            Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
+                bytes_downloaded_total += bytes_dl;
+                disk_bytes_total += disk_bytes;
                 if !*exif_ok {
                     exif_failures += 1;
                 }
@@ -1196,6 +1292,8 @@ pub(super) async fn run_download_pass(
         failed,
         auth_errors,
         state_write_failures,
+        bytes_downloaded: bytes_downloaded_total,
+        disk_bytes_written: disk_bytes_total,
     }
 }
 
@@ -1209,7 +1307,7 @@ async fn download_single_task(
     retry_config: &RetryConfig,
     set_exif: bool,
     temp_suffix: &str,
-) -> Result<(bool, String, Option<String>)> {
+) -> Result<(bool, String, Option<String>, u64, u64)> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -1233,7 +1331,7 @@ async fn download_single_task(
         matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg")
     };
 
-    Box::pin(super::file::download_file(
+    let bytes_downloaded = Box::pin(super::file::download_file(
         client,
         &task.url,
         &task.download_path,
@@ -1316,6 +1414,14 @@ async fn download_single_task(
         super::file::rename_part_to_final(part, &task.download_path).await?;
     }
 
+    let disk_bytes = match tokio::fs::metadata(&task.download_path).await {
+        Ok(meta) => meta.len(),
+        Err(e) => {
+            tracing::warn!(path = %task.download_path.display(), error = %e, "Could not stat downloaded file for size tracking");
+            0
+        }
+    };
+
     tracing::debug!(path = %task.download_path.display(), "Downloaded");
 
     // Compute SHA-256 of the final file for local storage and verification.
@@ -1327,7 +1433,13 @@ async fn download_single_task(
     // is verified by size matching (Content-Length + API size field) and
     // magic-byte validation during download instead.
 
-    Ok((exif_ok, local_checksum, download_checksum))
+    Ok((
+        exif_ok,
+        local_checksum,
+        download_checksum,
+        bytes_downloaded,
+        disk_bytes,
+    ))
 }
 
 pub(super) fn format_duration(d: Duration) -> String {
@@ -1343,6 +1455,130 @@ pub(super) fn format_duration(d: Duration) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Log a formatted summary of sync statistics.
+pub(super) fn log_sync_summary(title: &str, stats: &super::SyncStats) {
+    tracing::info!("{title}");
+
+    // Line 1: core counts
+    let skipped = stats.skipped.total() - stats.skipped.duplicates;
+    let total = stats.downloaded + stats.failed + skipped;
+    if skipped > 0 {
+        tracing::info!(
+            "  {downloaded} downloaded, {skipped} skipped, {failed} failed ({total} total)",
+            downloaded = stats.downloaded,
+            failed = stats.failed
+        );
+    } else {
+        tracing::info!(
+            "  {downloaded} downloaded, {failed} failed ({total} total)",
+            downloaded = stats.downloaded,
+            failed = stats.failed
+        );
+    }
+
+    // Line 2: error details (only if any)
+    if stats.exif_failures > 0 || stats.state_write_failures > 0 {
+        tracing::info!(
+            "  {} EXIF write failure(s), {} state write failure(s)",
+            stats.exif_failures,
+            stats.state_write_failures
+        );
+    }
+
+    // Line 3: skip breakdown (only if skips > 0)
+    if skipped > 0 {
+        let mut reasons = Vec::new();
+        if stats.skipped.by_state > 0 {
+            reasons.push(format!("{} already downloaded", stats.skipped.by_state));
+        }
+        if stats.skipped.on_disk > 0 {
+            reasons.push(format!("{} on disk", stats.skipped.on_disk));
+        }
+        if stats.skipped.by_media_type > 0 {
+            reasons.push(format!(
+                "{} filtered by media type",
+                stats.skipped.by_media_type
+            ));
+        }
+        if stats.skipped.by_date_range > 0 {
+            reasons.push(format!(
+                "{} filtered by date range",
+                stats.skipped.by_date_range
+            ));
+        }
+        if stats.skipped.by_live_photo > 0 {
+            reasons.push(format!(
+                "{} filtered (live photo)",
+                stats.skipped.by_live_photo
+            ));
+        }
+        if stats.skipped.by_filename > 0 {
+            reasons.push(format!(
+                "{} filtered by filename",
+                stats.skipped.by_filename
+            ));
+        }
+        if stats.skipped.by_excluded_album > 0 {
+            reasons.push(format!(
+                "{} excluded by album",
+                stats.skipped.by_excluded_album
+            ));
+        }
+        if stats.skipped.ampm_variant > 0 {
+            reasons.push(format!(
+                "{} live photo variants",
+                stats.skipped.ampm_variant
+            ));
+        }
+        if stats.skipped.retry_exhausted > 0 {
+            reasons.push(format!(
+                "{} retries exhausted",
+                stats.skipped.retry_exhausted
+            ));
+        }
+        if stats.skipped.retry_only > 0 {
+            reasons.push(format!(
+                "{} not failed (retry mode)",
+                stats.skipped.retry_only
+            ));
+        }
+        if !reasons.is_empty() {
+            tracing::info!("  Skipped: {}", reasons.join(", "));
+        }
+    }
+
+    // Line 4: transfer stats (only if bytes downloaded)
+    if stats.bytes_downloaded > 0 {
+        if stats.bytes_downloaded == stats.disk_bytes_written {
+            tracing::info!("  Transferred {}", format_bytes(stats.bytes_downloaded));
+        } else {
+            tracing::info!(
+                "  Transferred {}, {} written to disk",
+                format_bytes(stats.bytes_downloaded),
+                format_bytes(stats.disk_bytes_written)
+            );
+        }
+    }
+
+    // Line 5: elapsed
+    tracing::info!(
+        "  Completed in {}",
+        format_duration(Duration::from_secs_f64(stats.elapsed_secs))
+    );
 }
 
 /// Set the modification and access times of a file to the given Unix
@@ -1602,7 +1838,11 @@ mod tests {
             by_state: 10,
             on_disk: 5,
             ampm_variant: 2,
-            by_filter: 1,
+            by_media_type: 1,
+            by_date_range: 0,
+            by_live_photo: 0,
+            by_filename: 0,
+            by_excluded_album: 0,
             duplicates: 3,
             retry_exhausted: 4,
             retry_only: 0,
@@ -1616,7 +1856,11 @@ mod tests {
             by_state: 10,
             on_disk: 5,
             ampm_variant: 2,
-            by_filter: 1,
+            by_media_type: 1,
+            by_date_range: 0,
+            by_live_photo: 0,
+            by_filename: 0,
+            by_excluded_album: 0,
             duplicates: 3,
             retry_exhausted: 4,
             retry_only: 0,
@@ -1625,7 +1869,11 @@ mod tests {
             by_state: 1,
             on_disk: 2,
             ampm_variant: 3,
-            by_filter: 4,
+            by_media_type: 2,
+            by_date_range: 1,
+            by_live_photo: 1,
+            by_filename: 0,
+            by_excluded_album: 0,
             duplicates: 5,
             retry_exhausted: 6,
             retry_only: 7,
@@ -1634,7 +1882,11 @@ mod tests {
         assert_eq!(a.by_state, 11);
         assert_eq!(a.on_disk, 7);
         assert_eq!(a.ampm_variant, 5);
-        assert_eq!(a.by_filter, 5);
+        assert_eq!(a.by_media_type, 3);
+        assert_eq!(a.by_date_range, 1);
+        assert_eq!(a.by_live_photo, 1);
+        assert_eq!(a.by_filename, 0);
+        assert_eq!(a.by_excluded_album, 0);
         assert_eq!(a.duplicates, 8);
         assert_eq!(a.retry_exhausted, 10);
         assert_eq!(a.retry_only, 7);

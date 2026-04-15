@@ -11,8 +11,8 @@ pub mod paths;
 pub(crate) mod pipeline;
 
 use pipeline::{
-    build_download_outcome, format_duration, run_download_pass, stream_and_download_from_stream,
-    PassConfig, StreamingResult, AUTH_ERROR_THRESHOLD,
+    build_download_outcome, format_duration, log_sync_summary, run_download_pass,
+    stream_and_download_from_stream, PassConfig, StreamingResult, AUTH_ERROR_THRESHOLD,
 };
 
 pub(crate) use filter::determine_media_type;
@@ -73,6 +73,56 @@ pub struct SyncResult {
     /// The new zone-level syncToken, if one was captured during this sync.
     /// Store this for the next incremental sync.
     pub sync_token: Option<String>,
+    /// Accumulated statistics from this sync run.
+    pub stats: SyncStats,
+}
+
+/// Accumulated statistics from a sync run, used for JSON reports and notifications.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SyncStats {
+    pub assets_seen: u64,
+    pub downloaded: usize,
+    pub failed: usize,
+    pub skipped: SkipBreakdown,
+    pub bytes_downloaded: u64,
+    pub disk_bytes_written: u64,
+    pub exif_failures: usize,
+    pub state_write_failures: usize,
+    pub enumeration_errors: usize,
+    pub elapsed_secs: f64,
+    pub interrupted: bool,
+}
+
+/// Per-reason breakdown of skipped assets.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SkipBreakdown {
+    pub by_state: usize,
+    pub on_disk: usize,
+    pub by_media_type: usize,
+    pub by_date_range: usize,
+    pub by_live_photo: usize,
+    pub by_filename: usize,
+    pub by_excluded_album: usize,
+    pub ampm_variant: usize,
+    pub duplicates: usize,
+    pub retry_exhausted: usize,
+    pub retry_only: usize,
+}
+
+impl SkipBreakdown {
+    pub fn total(&self) -> usize {
+        self.by_state
+            + self.on_disk
+            + self.by_media_type
+            + self.by_date_range
+            + self.by_live_photo
+            + self.by_filename
+            + self.by_excluded_album
+            + self.ampm_variant
+            + self.duplicates
+            + self.retry_exhausted
+            + self.retry_only
+    }
 }
 
 /// Truncate a `DateTime<Utc>` to midnight so that relative date intervals
@@ -606,7 +656,7 @@ async fn build_download_tasks(
         let assets = album_result?;
 
         for asset in &assets {
-            if filter::is_asset_filtered(asset, config) {
+            if filter::is_asset_filtered(asset, config).is_some() {
                 continue;
             }
             pre_ensure_asset_dir(&mut dir_cache, asset, config).await;
@@ -964,7 +1014,7 @@ async fn download_photos_full_with_token(
     }
 
     // Build the outcome using the same logic as download_photos
-    let outcome = build_download_outcome(
+    let (outcome, stats) = build_download_outcome(
         download_client,
         albums,
         config,
@@ -977,6 +1027,7 @@ async fn download_photos_full_with_token(
     Ok(SyncResult {
         outcome,
         sync_token,
+        stats,
     })
 }
 
@@ -1052,11 +1103,16 @@ async fn download_photos_incremental(
     );
 
     if downloadable_assets.is_empty() {
+        let stats = SyncStats {
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            ..SyncStats::default()
+        };
         tracing::info!("No new photos to download from incremental sync");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
         return Ok(SyncResult {
             outcome: DownloadOutcome::Success,
             sync_token,
+            stats,
         });
     }
 
@@ -1091,7 +1147,7 @@ async fn download_photos_incremental(
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
     let mut dir_cache = paths::DirCache::new();
-    let mut skipped_by_state = 0usize;
+    let mut skip_breakdown = SkipBreakdown::default();
     let mut album_configs: FxHashMap<Arc<str>, Arc<DownloadConfig>> = FxHashMap::default();
 
     // In {album} mode, assets in multiple albums are processed once per album,
@@ -1106,7 +1162,14 @@ async fn download_photos_incremental(
             config
         };
 
-        if filter::is_asset_filtered(asset, effective_config) {
+        if let Some(reason) = filter::is_asset_filtered(asset, effective_config) {
+            match reason {
+                filter::FilterReason::ExcludedAlbum => skip_breakdown.by_excluded_album += 1,
+                filter::FilterReason::MediaType => skip_breakdown.by_media_type += 1,
+                filter::FilterReason::LivePhoto => skip_breakdown.by_live_photo += 1,
+                filter::FilterReason::DateRange => skip_breakdown.by_date_range += 1,
+                filter::FilterReason::Filename => skip_breakdown.by_filename += 1,
+            }
             continue;
         }
 
@@ -1121,7 +1184,7 @@ async fn download_photos_incremental(
                 )
             })
         {
-            skipped_by_state += 1;
+            skip_breakdown.by_state += 1;
             continue;
         }
 
@@ -1159,22 +1222,31 @@ async fn download_photos_incremental(
             }
         }
 
+        if asset_tasks.is_empty() {
+            skip_breakdown.on_disk += 1;
+        }
         tasks.extend(asset_tasks);
     }
 
-    if skipped_by_state > 0 {
+    if skip_breakdown.by_state > 0 {
         tracing::info!(
-            skipped = skipped_by_state,
+            skipped = skip_breakdown.by_state,
             "Skipped already-downloaded assets (state DB)"
         );
     }
 
     if tasks.is_empty() {
+        let stats = SyncStats {
+            skipped: skip_breakdown,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            ..SyncStats::default()
+        };
         tracing::info!("All incremental assets already downloaded or filtered");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
         return Ok(SyncResult {
             outcome: DownloadOutcome::Success,
             sync_token,
+            stats,
         });
     }
 
@@ -1182,10 +1254,16 @@ async fn download_photos_incremental(
         for task in &tasks {
             println!("{}", task.download_path.display());
         }
+        let stats = SyncStats {
+            skipped: skip_breakdown,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            ..SyncStats::default()
+        };
         // Don't advance the sync token — this is a read-only operation.
         return Ok(SyncResult {
             outcome: DownloadOutcome::Success,
             sync_token: None,
+            stats,
         });
     }
 
@@ -1211,25 +1289,30 @@ async fn download_photos_incremental(
     let failed = pass_result.failed.len();
     let succeeded = task_count - failed;
 
-    tracing::info!("── Incremental Sync Summary ──");
-    if pass_result.exif_failures > 0 || pass_result.state_write_failures > 0 {
-        tracing::info!(
-            downloaded = succeeded,
-            exif_failures = pass_result.exif_failures,
-            state_write_failures = pass_result.state_write_failures,
-            failed,
-            total = task_count,
-            "  sync results"
-        );
-    } else {
-        tracing::info!(
-            downloaded = succeeded,
-            failed,
-            total = task_count,
-            "  sync results"
-        );
+    // Log failed downloads before the summary
+    if failed > 0 {
+        for task in &pass_result.failed {
+            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
+        }
     }
-    tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
+
+    let stats = SyncStats {
+        assets_seen: 0, // incremental doesn't have total library count
+        downloaded: succeeded,
+        failed,
+        skipped: skip_breakdown,
+        bytes_downloaded: pass_result.bytes_downloaded,
+        disk_bytes_written: pass_result.disk_bytes_written,
+        exif_failures: pass_result.exif_failures,
+        state_write_failures: pass_result.state_write_failures,
+        enumeration_errors: 0,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+        interrupted: pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
+    };
+    log_sync_summary(
+        "\u{2500}\u{2500} Incremental Sync Summary \u{2500}\u{2500}",
+        &stats,
+    );
 
     if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
         return Ok(SyncResult {
@@ -1237,26 +1320,23 @@ async fn download_photos_incremental(
                 auth_error_count: pass_result.auth_errors,
             },
             sync_token,
+            stats,
         });
     }
 
-    let outcome = if failed > 0
-        || pass_result.exif_failures > 0
-        || pass_result.state_write_failures > 0
-    {
-        for task in &pass_result.failed {
-            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
-        }
-        DownloadOutcome::PartialFailure {
-            failed_count: failed + pass_result.exif_failures + pass_result.state_write_failures,
-        }
-    } else {
-        DownloadOutcome::Success
-    };
+    let outcome =
+        if failed > 0 || pass_result.exif_failures > 0 || pass_result.state_write_failures > 0 {
+            DownloadOutcome::PartialFailure {
+                failed_count: failed + pass_result.exif_failures + pass_result.state_write_failures,
+            }
+        } else {
+            DownloadOutcome::Success
+        };
 
     Ok(SyncResult {
         outcome,
         sync_token,
+        stats,
     })
 }
 
@@ -1402,6 +1482,7 @@ mod tests {
         let result = SyncResult {
             outcome: DownloadOutcome::PartialFailure { failed_count: 3 },
             sync_token: Some("tok".to_string()),
+            stats: SyncStats::default(),
         };
         match result.outcome {
             DownloadOutcome::PartialFailure { failed_count } => {
@@ -1418,6 +1499,7 @@ mod tests {
                 auth_error_count: 5,
             },
             sync_token: None,
+            stats: SyncStats::default(),
         };
         match result.outcome {
             DownloadOutcome::SessionExpired { auth_error_count } => {
@@ -1713,6 +1795,7 @@ mod tests {
             skip_created_after: None,
             pid_file: None,
             notification_script: None,
+            report_json: None,
             watch_with_interval: None,
             retry_delay_secs: 5,
             recent: dl_config.recent,
