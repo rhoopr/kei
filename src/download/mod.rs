@@ -2349,13 +2349,13 @@ mod tests {
             "asset_high should exceed max_download_attempts"
         );
         assert!(
-            !ctx.attempt_counts
+            ctx.attempt_counts
                 .get("asset_low")
-                .is_some_and(|&c| c >= max_attempts),
+                .is_none_or(|&c| c < max_attempts),
             "asset_low should not exceed max_download_attempts"
         );
         assert!(
-            ctx.attempt_counts.get("asset_never_failed").is_none(),
+            !ctx.attempt_counts.contains_key("asset_never_failed"),
             "unknown asset should not be in attempt_counts"
         );
     }
