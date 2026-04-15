@@ -2033,4 +2033,262 @@ mod tests {
         let counts = db.get_attempt_counts().await.unwrap();
         assert!(counts.is_empty());
     }
+
+    // ── Gap: mark_downloaded on non-existent record (no upsert_seen) ──
+
+    #[tokio::test]
+    async fn mark_downloaded_without_upsert_seen_succeeds_with_zero_rows() {
+        // mark_downloaded does an UPDATE, not an UPSERT. If the asset was
+        // never recorded via upsert_seen, it updates 0 rows and logs a
+        // warning. This should NOT return an error -- it's a graceful no-op.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let result = db
+            .mark_downloaded(
+                "NEVER_SEEN",
+                "original",
+                Path::new("/tmp/never.jpg"),
+                "abc123",
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "mark_downloaded on unknown asset should succeed (0-row update)"
+        );
+
+        // Verify: the asset is NOT in the DB (it was never inserted)
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 0);
+        assert_eq!(summary.total_assets, 0);
+    }
+
+    // ── Gap: mark_failed increments download_attempts cumulatively ────
+
+    #[tokio::test]
+    async fn mark_failed_increments_attempts_cumulatively() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("RETRY_ME")
+            .checksum("ck_retry")
+            .filename("photo.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+
+        // Fail three times
+        for i in 1..=3 {
+            db.mark_failed("RETRY_ME", "original", &format!("error {i}"))
+                .await
+                .unwrap();
+        }
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].download_attempts, 3,
+            "download_attempts should be 3 after three failures"
+        );
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some("error 3"),
+            "last_error should be the most recent failure"
+        );
+    }
+
+    // ── Gap: promote_pending_to_failed boundary -- seen assets preserved ──
+
+    #[tokio::test]
+    async fn promote_pending_to_failed_preserves_recently_seen() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Insert an "old" asset with last_seen_at far in the past
+        let old_record = TestAssetRecord::new("OLD_ASSET")
+            .checksum("ck_old")
+            .filename("old.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&old_record).await.unwrap();
+
+        // Manually backdate OLD_ASSET's last_seen_at to 1 hour ago
+        {
+            let conn = db.acquire_lock("test_setup").unwrap();
+            let old_ts = chrono::Utc::now().timestamp() - 3600;
+            conn.execute(
+                "UPDATE assets SET last_seen_at = ?1 WHERE id = 'OLD_ASSET'",
+                rusqlite::params![old_ts],
+            )
+            .unwrap();
+        }
+
+        // Insert a "new" asset -- its last_seen_at will be now()
+        let new_record = TestAssetRecord::new("NEW_ASSET")
+            .checksum("ck_new")
+            .filename("new.jpg")
+            .size(2000)
+            .build();
+        db.upsert_seen(&new_record).await.unwrap();
+
+        // Boundary: 30 minutes ago -- OLD_ASSET (1h ago) is before,
+        // NEW_ASSET (now) is after
+        let boundary = chrono::Utc::now().timestamp() - 1800;
+        let promoted = db.promote_pending_to_failed(boundary).await.unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(
+            promoted, 1,
+            "only OLD_ASSET (seen before boundary) should be promoted"
+        );
+        assert_eq!(summary.pending, 1, "NEW_ASSET should remain pending");
+        assert_eq!(summary.failed, 1, "OLD_ASSET should be failed");
+    }
+
+    // ── Gap: promote_pending_to_failed with very old last_seen_at ────
+
+    #[tokio::test]
+    async fn promote_pending_to_failed_promotes_stale_last_seen() {
+        // Assets with last_seen_at from a previous sync cycle (e.g., epoch)
+        // should be promoted when the boundary is recent.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("STALE_ASSET")
+            .checksum("ck_stale")
+            .filename("stale.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+
+        // Backdate to epoch
+        {
+            let conn = db.acquire_lock("test_setup").unwrap();
+            conn.execute(
+                "UPDATE assets SET last_seen_at = 0 WHERE id = 'STALE_ASSET'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let promoted = db.promote_pending_to_failed(now).await.unwrap();
+        assert_eq!(
+            promoted, 1,
+            "asset with epoch last_seen_at should be promoted"
+        );
+    }
+
+    // ── Gap: upsert_seen preserves downloaded status across updates ───
+
+    #[tokio::test]
+    async fn upsert_seen_preserves_downloaded_status_and_path() {
+        let dir = test_dir();
+        let file_path = dir.path().join("keep_me.jpg");
+        fs::write(&file_path, b"content").unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Insert and mark downloaded
+        let record = TestAssetRecord::new("PRESERVE")
+            .checksum("ck_v1")
+            .filename("keep_me.jpg")
+            .size(7)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("PRESERVE", "original", &file_path, "hash_v1", None)
+            .await
+            .unwrap();
+
+        // Re-upsert with updated metadata (e.g., checksum changed in iCloud)
+        let updated = TestAssetRecord::new("PRESERVE")
+            .checksum("ck_v2")
+            .filename("keep_me.jpg")
+            .size(7)
+            .build();
+        db.upsert_seen(&updated).await.unwrap();
+
+        // Status should still be "downloaded", not reset to "pending"
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(
+            summary.downloaded, 1,
+            "upsert_seen should preserve downloaded status"
+        );
+        assert_eq!(
+            summary.pending, 0,
+            "upsert_seen should NOT reset to pending"
+        );
+    }
+
+    // ── Gap: mark_downloaded with download_checksum ───────────────────
+
+    #[tokio::test]
+    async fn mark_downloaded_stores_download_checksum() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("DL_CK")
+            .checksum("api_ck")
+            .filename("photo.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "DL_CK",
+            "original",
+            Path::new("/photos/photo.jpg"),
+            "local_sha256",
+            Some("pre_exif_sha256"),
+        )
+        .await
+        .unwrap();
+
+        // Verify via get_downloaded_page that the asset is downloaded
+        let page = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "DL_CK");
+        assert_eq!(
+            page[0].local_checksum.as_deref(),
+            Some("local_sha256"),
+            "local_checksum should be stored"
+        );
+    }
+
+    // ── Gap: sample_downloaded_paths returns actual paths ─────────────
+
+    #[tokio::test]
+    async fn sample_downloaded_paths_returns_stored_paths() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for i in 0..5 {
+            let record = TestAssetRecord::new(&format!("SAMPLE_{i}"))
+                .checksum(&format!("ck_{i}"))
+                .filename(&format!("photo_{i}.jpg"))
+                .size(1000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                &format!("SAMPLE_{i}"),
+                "original",
+                Path::new(&format!("/photos/photo_{i}.jpg")),
+                &format!("hash_{i}"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let paths = db.sample_downloaded_paths(10).await.unwrap();
+        assert!(
+            !paths.is_empty(),
+            "should return at least some downloaded paths"
+        );
+        assert!(
+            paths.len() <= 5,
+            "should not return more than the number of downloaded assets"
+        );
+        for p in &paths {
+            assert!(
+                p.to_str().unwrap().starts_with("/photos/"),
+                "path should match what was stored: {:?}",
+                p
+            );
+        }
+    }
 }

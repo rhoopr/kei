@@ -1749,4 +1749,213 @@ mod tests {
             "Version with null asset type should be skipped"
         );
     }
+
+    // ── Gap: asset with completely empty fields produces no versions ──
+
+    #[test]
+    fn extract_versions_empty_fields_produces_empty_map() {
+        let asset = make_asset(
+            json!({"recordName": "EMPTY_FIELDS", "fields": {}}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "asset with no version fields should have empty versions"
+        );
+    }
+
+    // ── Gap: asset with null resOriginalRes value ────────────────────
+
+    #[test]
+    fn extract_versions_null_res_value_produces_empty_map() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": null},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "null resOriginalRes value should produce empty versions"
+        );
+    }
+
+    // ── Gap: asset with missing size defaults to 0 ───────────────────
+
+    #[test]
+    fn extract_versions_missing_size_defaults_to_zero() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        // Missing size should default to 0, not skip the version entirely
+        assert_eq!(
+            asset.versions().len(),
+            1,
+            "version with missing size should still be extracted"
+        );
+        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
+        assert_eq!(orig.size, 0, "missing size should default to 0");
+    }
+
+    // ── Gap: asset with empty string downloadURL ─────────────────────
+
+    #[test]
+    fn extract_versions_empty_download_url_is_preserved() {
+        // An empty-but-present URL is technically valid JSON -- verify it's
+        // not confused with null/missing.
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "",
+                    "fileChecksum": "ck_empty_url"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert_eq!(
+            asset.versions().len(),
+            1,
+            "empty string URL should not be treated as missing"
+        );
+        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
+        assert_eq!(&*orig.url, "", "empty URL should be stored as empty");
+    }
+
+    // ── Gap: multiple versions with partial failures ─────────────────
+
+    #[test]
+    fn extract_versions_partial_valid_versions() {
+        // Original is valid, Thumb has missing checksum -- only Original
+        // should appear in versions.
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "ck_orig"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "https://example.com/thumb"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert_eq!(
+            asset.versions().len(),
+            1,
+            "only the valid Original version should be extracted"
+        );
+        assert!(asset.contains_version(AssetVersionSize::Original));
+        assert!(
+            !asset.contains_version(AssetVersionSize::Thumb),
+            "Thumb with missing checksum should be skipped"
+        );
+    }
+
+    // ── Gap: is_live_photo false for video with LiveOriginal ─────────
+
+    #[test]
+    fn is_live_photo_false_for_video_with_live_version() {
+        // A Movie-type asset with LiveOriginal should NOT be considered a
+        // live photo (live photo = Image + companion video).
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000,
+                    "downloadURL": "https://example.com/live",
+                    "fileChecksum": "live_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            !asset.is_live_photo(),
+            "Movie with LiveOriginal should NOT be is_live_photo"
+        );
+    }
+
+    // ── Gap: asset_date falls back to epoch for missing field ────────
+
+    #[test]
+    fn asset_date_missing_returns_epoch() {
+        let asset = make_asset(json!({"recordName": "NO_DATE"}), json!({"fields": {}}));
+        let dt = asset.asset_date();
+        assert_eq!(dt, DateTime::UNIX_EPOCH);
+    }
+
+    // ── Gap: classify_change_reason for various field combinations ───
+
+    #[test]
+    fn classify_change_reason_soft_deleted() {
+        use super::super::cloudkit::Record;
+        let record = Record {
+            record_name: "DEL".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({"isDeleted": {"value": 1}}),
+            deleted: None,
+        };
+        assert_eq!(classify_change_reason(&record), ChangeReason::SoftDeleted);
+    }
+
+    #[test]
+    fn classify_change_reason_hidden() {
+        use super::super::cloudkit::Record;
+        let record = Record {
+            record_name: "HID".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({"isHidden": {"value": 1}}),
+            deleted: None,
+        };
+        assert_eq!(classify_change_reason(&record), ChangeReason::Hidden);
+    }
+
+    #[test]
+    fn classify_change_reason_hard_deleted_overrides_fields() {
+        // record.deleted == true should take precedence over fields
+        use super::super::cloudkit::Record;
+        let record = Record {
+            record_name: "HARD".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({"isDeleted": {"value": 0}, "isHidden": {"value": 0}}),
+            deleted: Some(true),
+        };
+        assert_eq!(classify_change_reason(&record), ChangeReason::HardDeleted);
+    }
+
+    #[test]
+    fn classify_change_reason_default_is_created() {
+        use super::super::cloudkit::Record;
+        let record = Record {
+            record_name: "NEW".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({}),
+            deleted: None,
+        };
+        assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
 }

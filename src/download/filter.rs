@@ -2351,4 +2351,188 @@ mod tests {
             "filename_exclude should be case-insensitive"
         );
     }
+
+    // ── Gap: two assets with same filename, same date, same size ──────
+    //
+    // When two distinct iCloud assets resolve to the same local path AND have
+    // the same file size, the NameSizeDedupWithSuffix policy treats the second
+    // as "already present" and silently skips it. This is by design -- but
+    // there was no test verifying this exact scenario.
+
+    #[test]
+    fn filter_two_assets_same_path_same_size_second_skipped() {
+        // Arrange: two assets with identical filename, date, and size but
+        // different checksums (different photos that happen to share a name).
+        let asset_a = TestPhotoAsset::new("ASSET_A")
+            .filename("IMG_0001.JPG")
+            .orig_size(5000)
+            .orig_url("https://example.com/a")
+            .orig_checksum("ck_a")
+            .build();
+        let asset_b = TestPhotoAsset::new("ASSET_B")
+            .filename("IMG_0001.JPG")
+            .orig_size(5000)
+            .orig_url("https://example.com/b")
+            .orig_checksum("ck_b")
+            .build();
+
+        let config = test_config();
+        let mut claimed_paths = FxHashMap::default();
+        let mut dir_cache = paths::DirCache::new();
+
+        // Act
+        let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
+
+        // Assert: first asset gets a task, second is skipped (same size = "match")
+        assert_eq!(tasks_a.len(), 1, "first asset should produce a task");
+        assert!(
+            tasks_b.is_empty(),
+            "second asset with same path and same size should be skipped, but got {} tasks",
+            tasks_b.len()
+        );
+    }
+
+    #[test]
+    fn filter_two_assets_same_path_different_size_second_deduped() {
+        // Arrange: two assets with identical filename and date but different sizes.
+        // The second should get a dedup suffix, not be silently skipped.
+        let asset_a = TestPhotoAsset::new("ASSET_A")
+            .filename("IMG_0001.JPG")
+            .orig_size(5000)
+            .orig_url("https://example.com/a")
+            .orig_checksum("ck_a")
+            .build();
+        let asset_b = TestPhotoAsset::new("ASSET_B")
+            .filename("IMG_0001.JPG")
+            .orig_size(7000)
+            .orig_url("https://example.com/b")
+            .orig_checksum("ck_b")
+            .build();
+
+        let config = test_config();
+        let mut claimed_paths = FxHashMap::default();
+        let mut dir_cache = paths::DirCache::new();
+
+        // Act
+        let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
+
+        // Assert: both get tasks, second has dedup suffix
+        assert_eq!(tasks_a.len(), 1);
+        assert_eq!(tasks_b.len(), 1);
+        let path_b = tasks_b[0].download_path.to_str().unwrap();
+        assert!(
+            path_b.contains("-7000."),
+            "second asset should have size dedup suffix, got: {}",
+            path_b,
+        );
+    }
+
+    // ── Gap: zero-size version triggers dedup, never matches ──────────
+
+    #[test]
+    fn filter_zero_size_version_never_matches_existing_file() {
+        // When the API reports size=0, the SizeDedup policy with
+        // skip_zero_size=true should treat it as "unknown" and never
+        // match an existing file -- always produce a dedup path.
+        let dir = TempDir::new().unwrap();
+
+        let asset = TestPhotoAsset::new("ZERO_SIZE")
+            .filename("IMG_0001.JPG")
+            .orig_size(0) // size unknown/zero
+            .orig_url("https://example.com/zero")
+            .orig_checksum("zero_ck")
+            .build();
+
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+
+        // Create an existing file with some content (non-zero size)
+        let tasks_first = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks_first.len(), 1);
+        fs::create_dir_all(tasks_first[0].download_path.parent().unwrap()).unwrap();
+        fs::write(&tasks_first[0].download_path, vec![0u8; 500]).unwrap();
+
+        // Second call: zero-size should NOT match the 500-byte file,
+        // should produce a dedup path instead of being silently skipped.
+        let tasks_second = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks_second.len(),
+            1,
+            "zero-size asset should produce a dedup task, not be skipped"
+        );
+        let path = tasks_second[0].download_path.to_str().unwrap();
+        assert!(
+            path.contains("-0."),
+            "zero-size asset should have dedup suffix, got: {}",
+            path,
+        );
+    }
+
+    // ── Gap: NameId7 policy skips regardless of size ──────────────────
+
+    #[test]
+    fn filter_name_id7_skips_when_file_exists_regardless_of_size() {
+        let dir = TempDir::new().unwrap();
+
+        let asset = TestPhotoAsset::new("ASSET_X")
+            .filename("IMG_0001.JPG")
+            .orig_size(5000)
+            .orig_url("https://example.com/x")
+            .orig_checksum("ck_x")
+            .build();
+
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+
+        // First call: no file on disk
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let path = &tasks[0].download_path;
+
+        // Create the file with a DIFFERENT size (NameId7 doesn't check size)
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, vec![0u8; 1]).unwrap();
+
+        // Second call: file exists, NameId7 should skip regardless of size
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks.is_empty(),
+            "NameId7 should skip when file exists, regardless of size"
+        );
+    }
+
+    // ── Gap: VideoOnly mode emits only MOV, no primary image ─────────
+
+    #[test]
+    fn filter_video_only_mode_emits_only_mov_companion() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1, "VideoOnly should emit exactly one task");
+        assert!(
+            tasks[0].download_path.to_str().unwrap().contains("MOV"),
+            "VideoOnly task should be the MOV companion, got: {:?}",
+            tasks[0].download_path,
+        );
+    }
+
+    // ── Gap: exclude_asset_ids prevents download ─────────────────────
+
+    #[test]
+    fn filter_excluded_asset_id_is_filtered() {
+        let asset = TestPhotoAsset::new("EXCLUDED_1").build();
+        let mut config = test_config();
+        let mut excluded = FxHashSet::default();
+        excluded.insert("EXCLUDED_1".to_string());
+        config.exclude_asset_ids = Arc::new(excluded);
+
+        assert!(
+            is_asset_filtered(&asset, &config),
+            "asset in exclude_asset_ids should be filtered"
+        );
+    }
 }

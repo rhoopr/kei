@@ -2331,4 +2331,123 @@ mod tests {
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
+
+    // ── Gap: DownloadContext attempt_counts used by producer ──────────
+
+    #[test]
+    fn download_context_attempt_counts_track_per_asset() {
+        let mut ctx = DownloadContext::default();
+        ctx.attempt_counts.insert("asset_high".into(), 15);
+        ctx.attempt_counts.insert("asset_low".into(), 2);
+
+        // Simulate the producer's retry-exhaustion check
+        let max_attempts = 10u32;
+        assert!(
+            ctx.attempt_counts
+                .get("asset_high")
+                .is_some_and(|&c| c >= max_attempts),
+            "asset_high should exceed max_download_attempts"
+        );
+        assert!(
+            !ctx.attempt_counts
+                .get("asset_low")
+                .is_some_and(|&c| c >= max_attempts),
+            "asset_low should not exceed max_download_attempts"
+        );
+        assert!(
+            ctx.attempt_counts.get("asset_never_failed").is_none(),
+            "unknown asset should not be in attempt_counts"
+        );
+    }
+
+    // ── Gap: should_download_fast with downloaded but different version ──
+
+    #[test]
+    fn should_download_fast_downloaded_original_but_medium_requested() {
+        // Asset is downloaded as Original, but now we ask about Medium.
+        // should_download_fast should return Some(true) because Medium
+        // was never downloaded.
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("asset_multi".into())
+            .or_default()
+            .insert("original".into());
+        ctx.downloaded_checksums
+            .entry("asset_multi".into())
+            .or_default()
+            .insert("original".into(), "ck_orig".into());
+
+        assert_eq!(
+            ctx.should_download_fast("asset_multi", VersionSizeKey::Medium, "ck_med", true),
+            Some(true),
+            "Medium version not in downloaded set should need download"
+        );
+    }
+
+    // ── Gap: should_download_fast with multiple version sizes ─────────
+
+    #[test]
+    fn should_download_fast_multiple_versions_independent() {
+        // Both Original and LiveOriginal downloaded, each with own checksum.
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("live_asset".into())
+            .or_default()
+            .insert("original".into());
+        ctx.downloaded_ids
+            .entry("live_asset".into())
+            .or_default()
+            .insert("live_original".into());
+        ctx.downloaded_checksums
+            .entry("live_asset".into())
+            .or_default()
+            .insert("original".into(), "ck_img".into());
+        ctx.downloaded_checksums
+            .entry("live_asset".into())
+            .or_default()
+            .insert("live_original".into(), "ck_mov".into());
+
+        // Image: matching checksum, trusted
+        assert_eq!(
+            ctx.should_download_fast("live_asset", VersionSizeKey::Original, "ck_img", true),
+            Some(false)
+        );
+        // MOV: matching checksum, trusted
+        assert_eq!(
+            ctx.should_download_fast("live_asset", VersionSizeKey::LiveOriginal, "ck_mov", true),
+            Some(false)
+        );
+        // MOV: changed checksum -- re-download even though image is fine
+        assert_eq!(
+            ctx.should_download_fast(
+                "live_asset",
+                VersionSizeKey::LiveOriginal,
+                "ck_mov_v2",
+                true
+            ),
+            Some(true),
+            "changed MOV checksum should trigger re-download"
+        );
+    }
+
+    // ── Gap: retry_only mode filters new assets ──────────────────────
+
+    #[test]
+    fn download_context_retry_only_known_ids_filtering() {
+        let mut ctx = DownloadContext::default();
+        ctx.known_ids.insert("previously_synced".into());
+
+        // Known asset: should_download_fast returns Some(true) (it needs
+        // download because it's not in downloaded_ids)
+        assert_eq!(
+            ctx.should_download_fast("previously_synced", VersionSizeKey::Original, "ck", true),
+            Some(true)
+        );
+        // The producer checks known_ids separately before forwarding:
+        assert!(ctx.known_ids.contains("previously_synced"));
+        assert!(
+            !ctx.known_ids.contains("brand_new_asset"),
+            "new asset should not be in known_ids in retry_only mode"
+        );
+    }
 }

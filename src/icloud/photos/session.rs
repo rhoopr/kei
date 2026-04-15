@@ -747,4 +747,77 @@ mod tests {
         let err = reqwest_status_error(421);
         assert_eq!(classify_api_error(&err), RetryAction::Abort);
     }
+
+    // ── Gap: empty records array passes through cleanly ──────────────
+
+    #[test]
+    fn test_check_cloudkit_errors_empty_records_array() {
+        let response = serde_json::json!({"records": []});
+        let result = check_cloudkit_errors(response.clone());
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["records"].as_array().unwrap().len(), 0);
+    }
+
+    // ── Gap: response without records key passes through ─────────────
+
+    #[test]
+    fn test_check_cloudkit_errors_no_records_key() {
+        // Some CloudKit endpoints return data without a "records" key
+        // (e.g., zones/list). Should pass through unmodified.
+        let response = serde_json::json!({"zones": [{"zoneID": {"zoneName": "PrimarySync"}}]});
+        let result = check_cloudkit_errors(response.clone());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), response);
+    }
+
+    // ── Gap: per-record mixed with non-retryable error ───────────────
+
+    #[test]
+    fn test_check_cloudkit_errors_per_record_non_retryable_still_filters() {
+        // When a per-record error is non-retryable (e.g., ZONE_NOT_FOUND),
+        // but there are still valid records, the valid ones should be kept.
+        let response = serde_json::json!({
+            "records": [
+                {"recordName": "VALID_1"},
+                {"serverErrorCode": "ZONE_NOT_FOUND", "reason": "not found"},
+                {"recordName": "VALID_2"}
+            ]
+        });
+        let result = check_cloudkit_errors(response).unwrap();
+        let records = result["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2, "two valid records should be preserved");
+        assert_eq!(records[0]["recordName"], "VALID_1");
+        assert_eq!(records[1]["recordName"], "VALID_2");
+    }
+
+    // ── Gap: SyncTokenError::should_fallback_to_full classification ──
+
+    #[test]
+    fn test_sync_token_error_fallback_classification() {
+        let invalid = SyncTokenError::InvalidToken {
+            reason: "bad token".into(),
+        };
+        assert!(
+            invalid.should_fallback_to_full(),
+            "InvalidToken should trigger full fallback"
+        );
+
+        let zone_gone = SyncTokenError::ZoneNotFound {
+            zone_name: "Primary".into(),
+        };
+        assert!(
+            zone_gone.should_fallback_to_full(),
+            "ZoneNotFound should trigger full fallback"
+        );
+
+        let transient = SyncTokenError::UnexpectedZoneError {
+            zone_name: "Primary".into(),
+            error_code: "RETRY_LATER".into(),
+        };
+        assert!(
+            !transient.should_fallback_to_full(),
+            "UnexpectedZoneError should NOT trigger full fallback"
+        );
+    }
 }
