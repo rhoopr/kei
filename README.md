@@ -79,8 +79,24 @@ For Docker, cron, and systemd setups, `--password-file` and `--password-command`
 ## Usage
 
 ```sh
+# --- Filtering ---
+
 # Specific albums, skip videos, last 100 photos only
 kei sync --album "Favorites" --recent 100 --skip-videos
+
+# Everything except screenshots and AAE sidecars
+kei sync --exclude-album "Screenshots" --filename-exclude "*.AAE"
+
+# Only photos from 2024
+kei sync --skip-created-before "2024-01-01" --skip-created-after "2025-01-01"
+
+# Just the MOV clips from live photos, no stills
+kei sync --skip-photos --live-photo-mode video-only
+
+# --- Output control ---
+
+# Smaller files, organized by album and month, with EXIF dates stamped
+kei sync --size medium --folder-structure "{album}/%Y/%m" --set-exif-datetime
 
 # All libraries (personal + shared) in one run
 kei sync --library all
@@ -88,7 +104,9 @@ kei sync --library all
 # Keep syncing every hour
 kei sync --watch-with-interval 3600
 
-# Preview what would download
+# --- Inspection ---
+
+# Print filenames to stdout (useful for piping)
 kei sync --only-print-filenames
 
 # Dry run (no writes to disk)
