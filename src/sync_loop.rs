@@ -275,7 +275,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 if is_retry_failed {
                     match db.reset_failed().await {
                         Ok(0) => {
-                            tracing::debug!("No failed assets to retry");
+                            tracing::info!("No failed assets to retry");
                             return Ok(());
                         }
                         Ok(count) => {
