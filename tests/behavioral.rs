@@ -2159,7 +2159,7 @@ fn exit_1_for_missing_username_on_sync() {
 #[test]
 fn log_level_default_info() {
     let dir = tempfile::tempdir().unwrap();
-    // sync with username + directory will fail at auth. Check stderr for WARN.
+    // sync with username + directory will fail at auth. Check stderr for INFO.
     let out = clean_cmd()
         .args([
             "sync",
@@ -2175,10 +2175,18 @@ fn log_level_default_info() {
         .get_output()
         .clone();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // Default level is WARN; INFO-level messages like "Starting kei" should not appear.
+    // Default level is INFO; "Starting kei" should appear but DEBUG should not.
     assert!(
-        !stderr.contains("INFO") && !stderr.contains("info"),
-        "default log level should suppress INFO-level messages, stderr: {stderr}"
+        stderr.contains("Starting kei"),
+        "default log level should show INFO-level messages like 'Starting kei', stderr: {stderr}"
+    );
+    let has_debug = stderr.lines().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains(" debug ") && !line.starts_with("Error:")
+    });
+    assert!(
+        !has_debug,
+        "default log level should suppress DEBUG-level messages, stderr: {stderr}"
     );
 }
 

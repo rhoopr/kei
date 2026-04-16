@@ -53,7 +53,7 @@ pub(crate) async fn run_import_existing(
 
     // Create or open the state database
     let db = Arc::new(state::SqliteStateDb::open(&db_path).await?);
-    tracing::info!(path = %db_path.display(), "State database opened");
+    tracing::debug!(path = %db_path.display(), "State database opened");
 
     // Resolve auth from globals + TOML
     let (username, password, domain, cookie_directory) =
@@ -103,7 +103,7 @@ pub(crate) async fn run_import_existing(
     let mut total = 0u64;
 
     for library in &libraries {
-        tracing::info!(zone = %library.zone_name(), "Scanning library");
+        tracing::debug!(zone = %library.zone_name(), "Scanning library");
         let all_album = library.all();
         let stream = all_album.photo_stream(args.recent, None, 1);
         tokio::pin!(stream);

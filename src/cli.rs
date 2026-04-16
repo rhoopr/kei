@@ -191,6 +191,10 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_NOTIFICATION_SCRIPT")]
     pub notification_script: Option<String>,
 
+    /// Write a JSON run report to this path after each sync cycle.
+    #[arg(long, env = "KEI_REPORT_JSON")]
+    pub report_json: Option<std::path::PathBuf>,
+
     /// After successful auth, persist the password to the credential store
     /// (OS keyring or encrypted file).
     #[arg(long)]
@@ -603,6 +607,9 @@ impl SyncArgs {
         if self.notification_script.is_none() {
             self.notification_script
                 .clone_from(&fallback.notification_script);
+        }
+        if self.report_json.is_none() {
+            self.report_json.clone_from(&fallback.report_json);
         }
         self.save_password = self.save_password || fallback.save_password;
         self.retry_failed = self.retry_failed || fallback.retry_failed;
@@ -1467,6 +1474,17 @@ mod tests {
         assert_eq!(
             cli.sync.notification_script.as_deref(),
             Some("/path/to/notify.sh")
+        );
+    }
+
+    #[test]
+    fn test_report_json_flag() {
+        let mut args = base_args();
+        args.extend(["--report-json", "/tmp/report.json"]);
+        let cli = parse(&args);
+        assert_eq!(
+            cli.sync.report_json.as_deref(),
+            Some(std::path::Path::new("/tmp/report.json"))
         );
     }
 

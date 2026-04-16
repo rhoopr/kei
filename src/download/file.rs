@@ -109,7 +109,7 @@ pub(super) async fn download_file<C: DownloadClient>(
     retry_config: &RetryConfig,
     temp_suffix: &str,
     opts: DownloadOpts,
-) -> Result<(), DownloadError> {
+) -> Result<u64, DownloadError> {
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
 
@@ -152,7 +152,7 @@ async fn attempt_download<C: DownloadClient>(
     part_path: &Path,
     skip_rename: bool,
     expected_size: Option<u64>,
-) -> Result<(), DownloadError> {
+) -> Result<u64, DownloadError> {
     let path_str = download_path.display().to_string();
 
     let resume_offset = match fs::metadata(part_path).await {
@@ -340,7 +340,7 @@ async fn attempt_download<C: DownloadClient>(
         rename_part_to_final(part_path, download_path).await?;
     }
 
-    Ok(())
+    Ok(bytes_written)
 }
 
 /// Rename a `.part` file to its final destination, handling the case where
@@ -1394,7 +1394,7 @@ mod tests {
         fail_count: u32,
         fail_status: u16,
         max_retries: u32,
-    ) -> (Result<(), DownloadError>, u32, PathBuf, TempDir) {
+    ) -> (Result<u64, DownloadError>, u32, PathBuf, TempDir) {
         let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
         let client = RetryingStubClient::new(fail_count, fail_status, jpeg_body);
         let dir = TempDir::new().unwrap();
@@ -1569,7 +1569,7 @@ mod tests {
             filename: &str,
             checksum: &str,
             max_retries: u32,
-        ) -> (Result<(), DownloadError>, PathBuf, TempDir) {
+        ) -> (Result<u64, DownloadError>, PathBuf, TempDir) {
             let dir = TempDir::new().unwrap();
             let download_path = dir.path().join(filename);
             let config = RetryConfig {

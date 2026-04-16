@@ -195,7 +195,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 u = config.username
             );
             tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
+            notifier.notify(
+                notifications::Event::TwoFaRequired,
+                &msg,
+                &config.username,
+                None,
+            );
 
             wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
                 auth::authenticate(
@@ -244,7 +249,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Resolve the selected library/libraries
     let libraries = resolve_libraries(&config.library, &mut photos_service).await?;
-    tracing::info!(
+    tracing::debug!(
         count = libraries.len(),
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
         "Resolved libraries"
@@ -274,7 +279,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             return Ok(());
                         }
                         Ok(count) => {
-                            tracing::info!(count, "Reset failed assets to pending");
+                            tracing::debug!(count, "Reset failed assets to pending");
                         }
                         Err(e) => {
                             tracing::warn!("Failed to reset failed assets: {e}");
@@ -306,7 +311,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             }
             if cleared_ok {
-                tracing::info!("Cleared stored sync tokens");
+                tracing::debug!("Cleared stored sync tokens");
             }
         }
     }
@@ -428,6 +433,28 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
             health.write(&config.cookie_directory);
 
+            // Write JSON report if configured
+            if let Some(report_path) = &config.report_json {
+                let status = if cycle_result.session_expired {
+                    "session_expired"
+                } else if cycle_result.failed_count > 0 {
+                    "partial_failure"
+                } else {
+                    "success"
+                };
+                let report = crate::report::SyncReport {
+                    version: "1",
+                    kei_version: env!("CARGO_PKG_VERSION"),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    status: status.to_string(),
+                    options: crate::report::RunOptions::from_config(&config),
+                    stats: cycle_result.stats.clone(),
+                };
+                if let Err(e) = crate::report::write_report(report_path, &report) {
+                    tracing::warn!(error = %e, path = %report_path.display(), "Failed to write JSON report");
+                }
+            }
+
             // Handle aggregate outcome across all libraries
             if cycle_result.session_expired {
                 reauth_attempts += 1;
@@ -472,6 +499,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             notifications::Event::TwoFaRequired,
                             &msg,
                             &config.username,
+                            None,
                         );
                         if !is_watch_mode {
                             return Err(e);
@@ -494,15 +522,18 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             notifications::Event::SessionExpired,
                             &format!("Re-authentication failed: {e}"),
                             &config.username,
+                            None,
                         );
                         return Err(e);
                     }
                 }
             } else if cycle_result.failed_count > 0 {
+                let data = notifications::SyncNotificationData::from(&cycle_result.stats);
                 notifier.notify(
                     notifications::Event::SyncFailed,
                     &format!("{} downloads failed", cycle_result.failed_count),
                     &config.username,
+                    Some(&data),
                 );
                 if is_watch_mode {
                     tracing::warn!(
@@ -516,10 +547,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             } else {
                 reauth_attempts = 0;
                 last_cycle_failed_count = 0;
+                let data = notifications::SyncNotificationData::from(&cycle_result.stats);
                 notifier.notify(
                     notifications::Event::SyncComplete,
                     "Sync completed successfully",
                     &config.username,
+                    Some(&data),
                 );
             }
         }
@@ -601,6 +634,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 struct CycleResult {
     failed_count: usize,
     session_expired: bool,
+    stats: download::SyncStats,
 }
 
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
@@ -618,6 +652,7 @@ async fn run_cycle(
 ) -> anyhow::Result<CycleResult> {
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
+    let mut cycle_stats = download::SyncStats::default();
 
     for lib_state in library_states {
         if shutdown_token.is_cancelled() {
@@ -646,7 +681,7 @@ async fn run_cycle(
                         );
                         match db.delete_metadata_by_prefix("sync_token:").await {
                             Ok(n) if n > 0 => {
-                                tracing::info!(cleared = n, "Cleared stale sync tokens");
+                                tracing::debug!(cleared = n, "Cleared stale sync tokens");
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -710,7 +745,7 @@ async fn run_cycle(
                     if let Err(e) = db.set_metadata(&lib_state.sync_token_key, token).await {
                         tracing::warn!(error = %e, "Failed to store sync token");
                     } else {
-                        tracing::info!(zone = %lib_state.zone_name, "Stored sync token for next incremental sync");
+                        tracing::debug!(zone = %lib_state.zone_name, "Stored sync token for next incremental sync");
                     }
                 }
             }
@@ -720,6 +755,29 @@ async fn run_cycle(
                 "Sync token NOT advanced (incomplete sync -- will replay changes next cycle)"
             );
         }
+
+        // Accumulate stats across libraries
+        cycle_stats.assets_seen += sync_result.stats.assets_seen;
+        cycle_stats.downloaded += sync_result.stats.downloaded;
+        cycle_stats.failed += sync_result.stats.failed;
+        cycle_stats.bytes_downloaded += sync_result.stats.bytes_downloaded;
+        cycle_stats.disk_bytes_written += sync_result.stats.disk_bytes_written;
+        cycle_stats.exif_failures += sync_result.stats.exif_failures;
+        cycle_stats.state_write_failures += sync_result.stats.state_write_failures;
+        cycle_stats.enumeration_errors += sync_result.stats.enumeration_errors;
+        cycle_stats.elapsed_secs += sync_result.stats.elapsed_secs;
+        cycle_stats.interrupted = cycle_stats.interrupted || sync_result.stats.interrupted;
+        cycle_stats.skipped.by_state += sync_result.stats.skipped.by_state;
+        cycle_stats.skipped.on_disk += sync_result.stats.skipped.on_disk;
+        cycle_stats.skipped.by_media_type += sync_result.stats.skipped.by_media_type;
+        cycle_stats.skipped.by_date_range += sync_result.stats.skipped.by_date_range;
+        cycle_stats.skipped.by_live_photo += sync_result.stats.skipped.by_live_photo;
+        cycle_stats.skipped.by_filename += sync_result.stats.skipped.by_filename;
+        cycle_stats.skipped.by_excluded_album += sync_result.stats.skipped.by_excluded_album;
+        cycle_stats.skipped.ampm_variant += sync_result.stats.skipped.ampm_variant;
+        cycle_stats.skipped.duplicates += sync_result.stats.skipped.duplicates;
+        cycle_stats.skipped.retry_exhausted += sync_result.stats.skipped.retry_exhausted;
+        cycle_stats.skipped.retry_only += sync_result.stats.skipped.retry_only;
 
         match sync_result.outcome {
             download::DownloadOutcome::Success => {}
@@ -741,6 +799,7 @@ async fn run_cycle(
     Ok(CycleResult {
         failed_count: cycle_failed_count,
         session_expired: cycle_session_expired,
+        stats: cycle_stats,
     })
 }
 
@@ -813,12 +872,12 @@ async fn determine_sync_mode(
 ) -> download::SyncMode {
     if is_retry_failed || no_incremental {
         if no_incremental && library_count == 1 {
-            tracing::info!(
+            tracing::debug!(
                 "Incremental sync disabled via --no-incremental, performing full enumeration"
             );
         }
         if is_retry_failed {
-            tracing::info!(
+            tracing::debug!(
                 "Retry-failed requires full enumeration to find previously-failed assets"
             );
         }
@@ -826,13 +885,13 @@ async fn determine_sync_mode(
     } else if let Some(db) = state_db {
         match db.get_metadata(sync_token_key).await {
             Ok(Some(ref token)) if !token.is_empty() => {
-                tracing::info!(zone = %zone_name, "Stored sync token found, using incremental sync");
+                tracing::debug!(zone = %zone_name, "Stored sync token found, using incremental sync");
                 download::SyncMode::Incremental {
                     zone_sync_token: token.clone(),
                 }
             }
             Ok(_) => {
-                tracing::info!(zone = %zone_name, "No sync token found, performing full enumeration");
+                tracing::debug!(zone = %zone_name, "No sync token found, performing full enumeration");
                 download::SyncMode::Full
             }
             Err(e) => {

@@ -221,6 +221,13 @@ fn classify_api_error(e: &anyhow::Error) -> RetryAction {
             RetryAction::Abort
         };
     }
+    if let Some(http_err) = e.downcast_ref::<HttpStatusError>() {
+        return if http_err.status == 429 || http_err.status >= 500 {
+            RetryAction::Retry
+        } else {
+            RetryAction::Abort
+        };
+    }
     if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
         if let Some(status) = reqwest_err.status() {
             if status.as_u16() == 429 || status.as_u16() >= 500 {
@@ -819,5 +826,41 @@ mod tests {
             !transient.should_fallback_to_full(),
             "UnexpectedZoneError should NOT trigger full fallback"
         );
+    }
+
+    #[test]
+    fn classify_http_status_error_retries_5xx() {
+        let err = anyhow::Error::new(HttpStatusError {
+            status: 503,
+            url: "https://example.com".to_string(),
+        });
+        assert!(matches!(classify_api_error(&err), RetryAction::Retry));
+    }
+
+    #[test]
+    fn classify_http_status_error_retries_429() {
+        let err = anyhow::Error::new(HttpStatusError {
+            status: 429,
+            url: "https://example.com".to_string(),
+        });
+        assert!(matches!(classify_api_error(&err), RetryAction::Retry));
+    }
+
+    #[test]
+    fn classify_http_status_error_aborts_4xx() {
+        let err = anyhow::Error::new(HttpStatusError {
+            status: 401,
+            url: "https://example.com".to_string(),
+        });
+        assert!(matches!(classify_api_error(&err), RetryAction::Abort));
+    }
+
+    #[test]
+    fn classify_http_status_error_aborts_403() {
+        let err = anyhow::Error::new(HttpStatusError {
+            status: 403,
+            url: "https://example.com".to_string(),
+        });
+        assert!(matches!(classify_api_error(&err), RetryAction::Abort));
     }
 }

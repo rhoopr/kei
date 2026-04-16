@@ -399,7 +399,7 @@ impl PhotoAlbum {
                 raw.div_ceil(ps) * ps
             };
 
-            tracing::info!(
+            tracing::debug!(
                 fetchers = num_fetchers,
                 chunk_size = chunk_size_items,
                 total = total,

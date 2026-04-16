@@ -1055,7 +1055,7 @@ fn sync_incremental_second_run_skips_download() {
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
                 "--log-level",
-                "info",
+                "debug",
             ])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .output()

@@ -18,6 +18,7 @@ mod icloud;
 mod migration;
 mod notifications;
 mod password;
+mod report;
 mod retry;
 mod setup;
 mod shutdown;
@@ -327,17 +328,17 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let config_required = config_explicitly_set && !can_auto_create;
     let mut toml_config = config::load_toml_config(&config_path, config_required)?;
 
-    // Resolve log level: CLI > TOML > default (warn)
+    // Resolve log level: CLI > TOML > default (info)
     let effective_log_level = cli
         .log_level
         .or_else(|| toml_config.as_ref().and_then(|t| t.log_level))
-        .unwrap_or(types::LogLevel::Warn);
+        .unwrap_or(types::LogLevel::Info);
 
     // Scope debug/info to the app crate so dependency crates stay quieter.
     // Users can override with RUST_LOG env var for full control.
     let filter = match effective_log_level {
         types::LogLevel::Debug => "kei=debug,info",
-        types::LogLevel::Info => "info",
+        types::LogLevel::Info => "kei=info",
         types::LogLevel::Warn => "warn",
         types::LogLevel::Error => "error",
     };

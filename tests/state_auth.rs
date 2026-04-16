@@ -129,8 +129,10 @@ fn retry_failed_cmd(
 }
 
 fn db_file_count(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .expect("read dir")
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.path()
@@ -653,7 +655,7 @@ fn reset_sync_token_forces_full_enumeration() {
 
         // Second sync should do full enumeration (no stored token)
         let output = sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
-            .args(["--log-level", "info"])
+            .args(["--log-level", "debug"])
             .timeout(Duration::from_secs(TIMEOUT_SYNC))
             .output()
             .unwrap();

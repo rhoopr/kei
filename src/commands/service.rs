@@ -81,7 +81,7 @@ pub(crate) async fn init_photos_service(
         std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
     let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
 
-    tracing::info!("Initializing photos service...");
+    tracing::debug!("Initializing photos service...");
     match icloud::photos::PhotosService::new(
         ckdatabasews_url.clone(),
         session_box,
@@ -95,9 +95,21 @@ pub(crate) async fn init_photos_service(
         Err(_) => {}
     }
 
-    // ── Recovery strategy 1: fresh HTTP/2 connection pool ──────────────
-    // Cheap fix: drop old connections, keep auth state. Handles cases where
-    // the TCP connection was routed to the wrong CloudKit partition server.
+    // ── 421 recovery ─────────────────────────────────────────────────────
+    //
+    // A 421 Misdirected Request means Apple's CDN routed our HTTP/2
+    // connection to the wrong CloudKit partition server. Per RFC 9110,
+    // the correct client response is to retry on a new connection - NOT
+    // to re-authenticate. The session credentials are almost certainly
+    // fine; it's the TCP/TLS routing that's wrong.
+    //
+    // Strategy order:
+    //   1. Fresh connection pool (instant, free)
+    //   2. Backoff + fresh pools (handles transient CDN routing issues)
+    //   3. Full re-auth (last resort - only if the URL actually changed,
+    //      meaning Apple migrated the account to a different partition)
+
+    // ── Strategy 1: fresh HTTP/2 connection pool ─────────────────────
     tracing::warn!(
         url = %ckdatabasews_url,
         "Service returned 421 Misdirected Request, retrying with fresh connection pool"
@@ -121,17 +133,53 @@ pub(crate) async fn init_photos_service(
         Err(_) => {}
     }
 
-    // ── Recovery strategy 2: full re-authentication ────────────────────
-    // Expensive fix: clear session state, perform fresh SRP + 2FA login.
-    // Handles cases where stale session headers cause wrong partition routing.
+    // ── Strategy 2: exponential backoff with fresh pools ─────────────
+    // The routing issue may be transient (CDN propagation, partition
+    // migration in progress). Retry with fresh connections on each
+    // attempt, giving Apple's infrastructure time to settle.
+    const BACKOFF_SECS: &[u64] = &[10, 30, 60];
+    for (i, &delay) in BACKOFF_SECS.iter().enumerate() {
+        tracing::warn!(
+            attempt = i + 1,
+            max_attempts = BACKOFF_SECS.len(),
+            delay_secs = delay,
+            url = %ckdatabasews_url,
+            "421 persists, retrying after backoff with fresh connection pool"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+
+        {
+            let mut session = shared_session.write().await;
+            session.reset_http_clients()?;
+        }
+
+        let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
+        match icloud::photos::PhotosService::new(
+            ckdatabasews_url.clone(),
+            session_box,
+            params.clone(),
+            api_retry_config,
+        )
+        .await
+        {
+            Ok(service) => return Ok((shared_session, service)),
+            Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
+            Err(_) => {}
+        }
+    }
+
+    // ── Strategy 3: re-authenticate (last resort) ────────────────────
+    // All pool resets and backoff failed. The most likely cause is that
+    // Apple migrated the account to a different CloudKit partition, so
+    // the ckdatabasews URL itself is stale. Re-authenticate to get a
+    // fresh URL.
     //
-    // Clear routing-related session state (session_token, session_id, scnt)
-    // so `authenticate()` falls through to fresh SRP instead of the validate
-    // shortcut. We preserve trust_token so SRP can include it in `trustTokens`,
+    // We preserve trust_token so SRP can include it in `trustTokens`,
     // letting Apple recognise this as a trusted device and skip 2FA.
     tracing::warn!(
         url = %ckdatabasews_url,
-        "Fresh connection pool did not resolve 421, performing full re-authentication"
+        "421 persists after {} backoff retries, performing full re-authentication",
+        BACKOFF_SECS.len()
     );
     {
         let session = shared_session.read().await;
@@ -203,46 +251,11 @@ pub(crate) async fn init_photos_service(
         Err(_) => {}
     }
 
-    // ── Recovery strategy 3: retry with exponential backoff ───────────
-    // Both strategies failed. Apple's partition routing may be transiently
-    // broken (account migration, infrastructure issue). Wait and retry
-    // with fresh connection pools on each attempt.
-    const BACKOFF_SECS: &[u64] = &[10, 30, 60];
-    for (i, &delay) in BACKOFF_SECS.iter().enumerate() {
-        tracing::warn!(
-            attempt = i + 1,
-            max_attempts = BACKOFF_SECS.len(),
-            delay_secs = delay,
-            url = %fresh_url,
-            "All recovery strategies failed, retrying after backoff"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-
-        {
-            let mut session = shared_session.write().await;
-            session.reset_http_clients()?;
-        }
-
-        let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-        match icloud::photos::PhotosService::new(
-            fresh_url.clone(),
-            session_box,
-            new_params.clone(),
-            api_retry_config,
-        )
-        .await
-        {
-            Ok(service) => return Ok((shared_session, service)),
-            Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
-            Err(_) => {}
-        }
-    }
-
     anyhow::bail!(
-        "421 Misdirected Request persists on {} after re-authentication and {} \
-         backoff retries.\n\n\
+        "421 Misdirected Request persists on {} after {} backoff retries and \
+         re-authentication.\n\n\
          If Advanced Data Protection (ADP) is enabled on this account, that's the\n\
-         cause -- ADP blocks the web API that kei uses. To fix, change both settings\n\
+         cause - ADP blocks the web API that kei uses. To fix, change both settings\n\
          on your iPhone/iPad:\n  \
          1. Disable ADP: Settings > Apple ID > iCloud > Advanced Data Protection\n  \
          2. Enable web access: Settings > Apple ID > iCloud > Access iCloud Data on the Web\n\n\
@@ -345,7 +358,7 @@ async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
             .and_then(|m| m.modified())
             .ok();
         if current_mtime != initial_mtime {
-            tracing::info!("Session file updated, retrying authentication");
+            tracing::debug!("Session file updated, retrying authentication");
             break;
         }
     }
@@ -370,6 +383,19 @@ where
     loop {
         wait_for_2fa_submit(cookie_dir, username).await;
 
+        // Invalidate the validation cache so authenticate() actually checks
+        // with Apple instead of returning stale cached data from before 2FA.
+        let sanitized: String = username
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let cache_path = cookie_dir.join(format!("{sanitized}.cache"));
+        if cache_path.exists() {
+            if let Err(e) = tokio::fs::remove_file(&cache_path).await {
+                tracing::debug!(error = %e, "Could not remove validation cache");
+            }
+        }
+
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(TWO_FA_POLL_SECS)).await;
@@ -380,7 +406,7 @@ where
                     if e.downcast_ref::<auth::error::AuthError>()
                         .is_some_and(auth::error::AuthError::is_two_factor_required) =>
                 {
-                    tracing::info!("Session not yet trusted, continuing to wait...");
+                    tracing::debug!("Session not yet trusted, continuing to wait...");
                     break; // Back to outer loop (wait_for_2fa_submit)
                 }
                 Err(e)
@@ -460,12 +486,12 @@ pub(crate) async fn resolve_libraries(
 ) -> anyhow::Result<Vec<icloud::photos::PhotoLibrary>> {
     match selection {
         config::LibrarySelection::All => {
-            tracing::info!("Using all available libraries");
+            tracing::debug!("Using all available libraries");
             photos_service.all_libraries().await
         }
         config::LibrarySelection::Single(name) => {
             if name != "PrimarySync" {
-                tracing::info!(library = %name, "Using non-default library");
+                tracing::debug!(library = %name, "Using non-default library");
             }
             Ok(vec![photos_service.get_library(name).await?.clone()])
         }
@@ -508,7 +534,7 @@ pub(crate) async fn resolve_albums(
         for name in exclude_albums {
             if let Some(album) = album_map.get(name.as_str()) {
                 let count = album.len().await.unwrap_or(0);
-                tracing::info!(album = name, count, "Pre-fetching excluded album asset IDs");
+                tracing::debug!(album = name, count, "Pre-fetching excluded album asset IDs");
                 let (stream, _token_rx) = album.photo_stream_with_token(None, Some(count), 1);
                 tokio::pin!(stream);
                 while let Some(Ok(asset)) = stream.next().await {
@@ -518,7 +544,7 @@ pub(crate) async fn resolve_albums(
                 tracing::warn!(album = name, "Excluded album not found, ignoring");
             }
         }
-        tracing::info!(count = exclude_ids.len(), "Collected excluded asset IDs");
+        tracing::debug!(count = exclude_ids.len(), "Collected excluded asset IDs");
         return Ok((vec![library.all()], exclude_ids));
     }
 
@@ -527,7 +553,7 @@ pub(crate) async fn resolve_albums(
     let mut matched = Vec::new();
     for name in album_names {
         if exclude_albums.iter().any(|e| e == name) {
-            tracing::info!(album = name, "Album excluded by --exclude-album");
+            tracing::debug!(album = name, "Album excluded by --exclude-album");
             continue;
         }
         if let Some(album) = album_map.remove(name.as_str()) {
@@ -767,6 +793,33 @@ mod tests {
             exclude_ids.contains("MASTER_1"),
             "should contain the excluded asset ID"
         );
+    }
+
+    // ── is_misdirected_request tests ──────────────────────────────────
+
+    #[test]
+    fn misdirected_request_detected_from_connection_error() {
+        let err = icloud::error::ICloudError::Connection(
+            "HTTP 421 for https://p60-ckdatabasews.icloud.com/...".to_string(),
+        );
+        assert!(is_misdirected_request(&err));
+    }
+
+    #[test]
+    fn non_421_connection_error_not_misdirected() {
+        let err = icloud::error::ICloudError::Connection(
+            "HTTP 500 for https://p60-ckdatabasews.icloud.com/...".to_string(),
+        );
+        assert!(!is_misdirected_request(&err));
+    }
+
+    #[test]
+    fn service_not_activated_not_misdirected() {
+        let err = icloud::error::ICloudError::ServiceNotActivated {
+            code: "ZONE_NOT_FOUND".to_string(),
+            reason: "zone not found".to_string(),
+        };
+        assert!(!is_misdirected_request(&err));
     }
 
     #[tokio::test]

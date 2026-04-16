@@ -141,8 +141,7 @@ async fn authenticate_inner(
                 {
                     tracing::warn!(
                         error = %e,
-                        "Misdirected request persists after connection pool reset, \
-                         falling back to SRP"
+                        "validate returned persistent 421 Misdirected Request"
                     );
                 } else {
                     tracing::debug!(
@@ -182,8 +181,7 @@ async fn authenticate_inner(
                 {
                     tracing::warn!(
                         error = %e,
-                        "accountLogin misdirected after connection pool reset, \
-                         falling back to SRP"
+                        "accountLogin also returned 421 Misdirected Request"
                     );
                 } else {
                     tracing::debug!(
@@ -192,6 +190,21 @@ async fn authenticate_inner(
                     );
                 }
             }
+        }
+    }
+
+    // 421 fallback: if both /validate and /accountLogin returned 421,
+    // the auth endpoints have a routing issue but the session is likely
+    // still valid. Use cached auth data (no time limit) and let the
+    // CloudKit layer discover any real auth failures downstream. This
+    // avoids an unnecessary SRP handshake that would trigger 2FA.
+    if data.is_none() && has_session_token {
+        if let Some(cached) = session.load_validation_cache(i64::MAX).await {
+            tracing::info!(
+                "Auth endpoints returned 421, using cached session data \
+                 (CloudKit will re-auth if needed)"
+            );
+            data = Some(cached);
         }
     }
 

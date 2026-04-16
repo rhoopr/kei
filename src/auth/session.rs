@@ -62,6 +62,28 @@ pub fn sanitize_username(username: &str) -> String {
     }
 }
 
+/// Derive the broad cookie domain from a hostname.
+///
+/// Apple sets auth cookies with `Domain=.icloud.com` (or `.apple.com`),
+/// making them available to all subdomains. `reqwest::Jar::cookies()` strips
+/// the `Domain` attribute when serializing, so on reload we need to restore
+/// it. Without this, cookies scoped to `setup.icloud.com` won't be sent to
+/// `ckdatabasews.icloud.com`, causing 401 errors after container restarts.
+fn broad_cookie_domain(host: Option<&str>) -> Option<&str> {
+    let host = host?;
+    if host.ends_with(".icloud.com.cn") || host == "icloud.com.cn" {
+        Some("icloud.com.cn")
+    } else if host.ends_with(".apple.com.cn") || host == "apple.com.cn" {
+        Some("apple.com.cn")
+    } else if host.ends_with(".icloud.com") || host == "icloud.com" {
+        Some("icloud.com")
+    } else if host.ends_with(".apple.com") || host == "apple.com" {
+        Some("apple.com")
+    } else {
+        None
+    }
+}
+
 /// Check if a Set-Cookie header string represents an expired cookie.
 /// Parses the `cookie` crate's `Cookie::parse()` to extract `Expires`.
 fn is_cookie_expired(cookie_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
@@ -324,7 +346,13 @@ impl Session {
                             continue;
                         }
                         if let Ok(url) = entry.url.parse::<url::Url>() {
-                            cookie_jar.add_cookie_str(&entry.cookie, &url);
+                            let cookie_with_domain =
+                                if let Some(domain) = broad_cookie_domain(url.host_str()) {
+                                    format!("{}; Domain={domain}", entry.cookie)
+                                } else {
+                                    entry.cookie.clone()
+                                };
+                            cookie_jar.add_cookie_str(&cookie_with_domain, &url);
                         }
                     }
                     #[cfg(unix)]
@@ -367,17 +395,17 @@ impl Session {
                             .collect()
                     }
                     Err(e) => {
-                        tracing::info!(path = %session_path.display(), error = %e, "Session file corrupt, starting fresh");
+                        tracing::warn!(path = %session_path.display(), error = %e, "Session file corrupt, starting fresh");
                         HashMap::new()
                     }
                 },
                 Err(e) => {
-                    tracing::info!(path = %session_path.display(), error = %e, "Could not read session file, starting fresh");
+                    tracing::warn!(path = %session_path.display(), error = %e, "Could not read session file, starting fresh");
                     HashMap::new()
                 }
             }
         } else {
-            tracing::info!("Session file does not exist");
+            tracing::debug!("Session file does not exist");
             HashMap::new()
         };
 
@@ -1292,6 +1320,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_cache_no_time_limit_returns_stale_data() {
+        // When 421 fallback uses i64::MAX, even very old cached data should load
+        let (_td, dir) = test_dir("cache_no_limit");
+        let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        // Write a cache with a very old timestamp (1 week ago)
+        let cache = responses::ValidationCache {
+            validated_at: chrono::Utc::now().timestamp() - 604_800,
+            account_data: responses::AccountLoginResponse {
+                ds_info: None,
+                webservices: Some(responses::Webservices {
+                    ckdatabasews: Some(responses::WebserviceEndpoint {
+                        url: "https://p60-ckdatabasews.icloud.com".to_string(),
+                    }),
+                }),
+                hsa_challenge_required: false,
+                hsa_trusted_browser: true,
+                domain_to_use: None,
+                has_error: false,
+                service_errors: vec![],
+                i_cdp_enabled: false,
+            },
+        };
+        let json = serde_json::to_string_pretty(&cache).unwrap();
+        std::fs::write(session.cache_path(), json).unwrap();
+
+        // With normal grace (600s), should be expired
+        let loaded = session.load_validation_cache(600).await;
+        assert!(loaded.is_none(), "Should be expired with 600s grace");
+
+        // With i64::MAX grace (421 fallback), should load
+        let loaded = session.load_validation_cache(i64::MAX).await;
+        assert!(
+            loaded.is_some(),
+            "Should load with i64::MAX grace (421 fallback)"
+        );
+        let loaded = loaded.unwrap();
+        assert!(loaded.hsa_trusted_browser);
+        let ws = loaded.webservices.unwrap();
+        assert_eq!(
+            ws.ckdatabasews.unwrap().url,
+            "https://p60-ckdatabasews.icloud.com"
+        );
+    }
+
+    #[tokio::test]
     async fn strip_session_invalidates_cache() {
         let dir = tempfile::tempdir().unwrap();
         let session_path = dir.path().join("test.session");
@@ -1311,6 +1387,90 @@ mod tests {
         assert!(
             !cache_path.exists(),
             "Cache should be deleted on session strip"
+        );
+    }
+
+    #[test]
+    fn broad_cookie_domain_icloud() {
+        assert_eq!(
+            broad_cookie_domain(Some("setup.icloud.com")),
+            Some("icloud.com")
+        );
+        assert_eq!(
+            broad_cookie_domain(Some("www.icloud.com")),
+            Some("icloud.com")
+        );
+        assert_eq!(
+            broad_cookie_domain(Some("p150-ckdatabasews.icloud.com")),
+            Some("icloud.com")
+        );
+        assert_eq!(broad_cookie_domain(Some("icloud.com")), Some("icloud.com"));
+    }
+
+    #[test]
+    fn broad_cookie_domain_apple() {
+        assert_eq!(
+            broad_cookie_domain(Some("idmsa.apple.com")),
+            Some("apple.com")
+        );
+        assert_eq!(broad_cookie_domain(Some("apple.com")), Some("apple.com"));
+    }
+
+    #[test]
+    fn broad_cookie_domain_cn() {
+        assert_eq!(
+            broad_cookie_domain(Some("setup.icloud.com.cn")),
+            Some("icloud.com.cn")
+        );
+        assert_eq!(
+            broad_cookie_domain(Some("idmsa.apple.com.cn")),
+            Some("apple.com.cn")
+        );
+    }
+
+    #[test]
+    fn broad_cookie_domain_unknown() {
+        assert_eq!(broad_cookie_domain(Some("example.com")), None);
+        assert_eq!(broad_cookie_domain(None), None);
+    }
+
+    #[tokio::test]
+    async fn cookies_reload_with_broad_domain_scope() {
+        let (_td, dir) = test_dir("broad_domain");
+        let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        // Simulate cookies set by Apple's auth (scoped to setup.icloud.com)
+        let setup_url: url::Url = "https://setup.icloud.com/".parse().unwrap();
+        session.cookie_jar.add_cookie_str(
+            "X-APPLE-WEBAUTH-TOKEN=test123; Domain=icloud.com",
+            &setup_url,
+        );
+
+        // Persist and reload
+        session.persist_jar_cookies().await.unwrap();
+        drop(session);
+
+        let session2 = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        // After reload, cookies should be available for ckdatabasews.icloud.com too
+        let ck_url: url::Url = "https://p150-ckdatabasews.icloud.com/".parse().unwrap();
+        let cookies = session2.cookie_jar.cookies(&ck_url);
+        assert!(
+            cookies.is_some(),
+            "Cookies should be available for ckdatabasews.icloud.com after reload"
+        );
+        let cookie_str = cookies.unwrap();
+        assert!(
+            cookie_str
+                .to_str()
+                .unwrap()
+                .contains("X-APPLE-WEBAUTH-TOKEN=test123"),
+            "Expected WEBAUTH cookie for ckdatabasews, got: {}",
+            cookie_str.to_str().unwrap()
         );
     }
 }
