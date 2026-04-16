@@ -41,7 +41,7 @@ cargo test --test sync list_albums_prints_album_names -- --ignored --test-thread
    ```
    This prompts for a 2FA code. You only need to redo this when the session expires.
 
-3. Create a test album in iCloud Photos (default name: `icloudpd-test`) with these assets:
+3. Create a test album in iCloud Photos (default name: `kei-test`) with these assets:
 
    | Asset | Purpose |
    |-------|---------|
@@ -62,7 +62,7 @@ Nothing account-specific is baked into the test code. Override these env vars to
 | `ICLOUD_USERNAME` | (required) | Apple ID email |
 | `ICLOUD_PASSWORD` | (required) | Apple ID password |
 | `ICLOUD_TEST_COOKIE_DIR` | `./.test-cookies` | Pre-authenticated session directory |
-| `KEI_TEST_ALBUM` | `icloudpd-test` | Name of the test album in iCloud |
+| `KEI_TEST_ALBUM` | `kei-test` | Name of the test album in iCloud |
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image used by `run-docker-live.sh` |
 
 The shell scripts read these via `tests/lib.sh`. Rust tests read them via `tests/common/mod.rs` and (for the album name) `tests/sync.rs::album()`.

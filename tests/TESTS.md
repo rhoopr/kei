@@ -17,10 +17,10 @@
 # Pre-commit safe (no auth, no network)
 cargo test --bin kei --test cli --test behavioral
 
-# Live iCloud tests (requires pre-auth session + icloudpd-test album)
+# Live iCloud tests (requires pre-auth session + kei-test album)
 cargo test --test sync --test state_auth -- --ignored --test-threads=1
 
-# Full suite (requires pre-auth session + icloudpd-test album)
+# Full suite (requires pre-auth session + kei-test album)
 ./tests/run-all-tests.sh
 
 # Single test
@@ -80,7 +80,7 @@ dir, matched files, empty dir, custom folder structure), retry-failed
 
 ## Sync Tests (`tests/sync.rs`)
 
-31 tests, all `#[ignore]`. Uses the `icloudpd-test` album for deterministic
+31 tests, all `#[ignore]`. Uses the `kei-test` album for deterministic
 behavioral assertions. Require pre-authenticated session. Run with:
 
 ```sh

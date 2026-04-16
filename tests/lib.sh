@@ -8,7 +8,7 @@
 #   ICLOUD_USERNAME             (required) Apple ID email
 #   ICLOUD_PASSWORD             (required) Apple ID password
 #   ICLOUD_TEST_COOKIE_DIR      path to pre-authenticated session (default: $PROJECT_DIR/.test-cookies)
-#   KEI_TEST_ALBUM              name of the test album in iCloud (default: icloudpd-test)
+#   KEI_TEST_ALBUM              name of the test album in iCloud (default: kei-test)
 #   KEI_DOCKER_IMAGE            docker image to test (default: kei:latest)
 
 : "${PROJECT_DIR:?PROJECT_DIR must be set by the caller}"
@@ -48,7 +48,7 @@ kei_db_path() {
 }
 
 kei_album() {
-    printf '%s' "${KEI_TEST_ALBUM:-icloudpd-test}"
+    printf '%s' "${KEI_TEST_ALBUM:-kei-test}"
 }
 
 kei_docker_image() {

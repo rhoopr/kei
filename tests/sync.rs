@@ -1,6 +1,6 @@
 //! Sync tests with behavioral assertions (live iCloud API).
 //!
-//! Uses a test album in iCloud (default `icloudpd-test`, override with
+//! Uses a test album in iCloud (default `kei-test`, override with
 //! `KEI_TEST_ALBUM`) that must contain at least:
 //! - one regular JPEG
 //! - one standalone video (.MOV or .MP4)
@@ -22,14 +22,12 @@ use tempfile::tempdir;
 const TIMEOUT_SECS: u64 = 180;
 const TIMEOUT_META: u64 = 90;
 
-/// Name of the iCloud album used for live tests. Defaults to `icloudpd-test`
-/// (the album shared with the upstream icloudpd project). Override with
-/// `KEI_TEST_ALBUM=<name>` so a different account can run the suite.
+/// Name of the iCloud album used for live tests. Defaults to `kei-test`.
+/// Override with `KEI_TEST_ALBUM=<name>` so a different account can run
+/// the suite.
 fn album() -> &'static str {
     static A: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    A.get_or_init(|| {
-        std::env::var("KEI_TEST_ALBUM").unwrap_or_else(|_| "icloudpd-test".to_string())
-    })
+    A.get_or_init(|| std::env::var("KEI_TEST_ALBUM").unwrap_or_else(|_| "kei-test".to_string()))
 }
 
 /// Build a sync command targeting the test album.
@@ -999,7 +997,7 @@ fn list_albums_new_syntax() {
             .timeout(Duration::from_secs(60))
             .assert()
             .success()
-            .stdout(predicate::str::contains("icloudpd-test"));
+            .stdout(predicate::str::contains(album()));
     });
 }
 
@@ -1179,7 +1177,7 @@ fn sync_report_json_writes_valid_schema() {
 /// Verify passing the same album twice still downloads exactly once (dedup).
 ///
 /// Exercises the multi-`--album` code path end-to-end. A richer test would
-/// use two distinct small albums, but only `icloudpd-test` exists in the
+/// use two distinct small albums, but only `kei-test` exists in the
 /// test account, so we assert dedup as the minimal multi-filter invariant.
 #[test]
 #[ignore]
