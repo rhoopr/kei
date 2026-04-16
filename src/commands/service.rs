@@ -95,9 +95,21 @@ pub(crate) async fn init_photos_service(
         Err(_) => {}
     }
 
-    // ── Recovery strategy 1: fresh HTTP/2 connection pool ──────────────
-    // Cheap fix: drop old connections, keep auth state. Handles cases where
-    // the TCP connection was routed to the wrong CloudKit partition server.
+    // ── 421 recovery ─────────────────────────────────────────────────────
+    //
+    // A 421 Misdirected Request means Apple's CDN routed our HTTP/2
+    // connection to the wrong CloudKit partition server. Per RFC 9110,
+    // the correct client response is to retry on a new connection - NOT
+    // to re-authenticate. The session credentials are almost certainly
+    // fine; it's the TCP/TLS routing that's wrong.
+    //
+    // Strategy order:
+    //   1. Fresh connection pool (instant, free)
+    //   2. Backoff + fresh pools (handles transient CDN routing issues)
+    //   3. Full re-auth (last resort - only if the URL actually changed,
+    //      meaning Apple migrated the account to a different partition)
+
+    // ── Strategy 1: fresh HTTP/2 connection pool ─────────────────────
     tracing::warn!(
         url = %ckdatabasews_url,
         "Service returned 421 Misdirected Request, retrying with fresh connection pool"
@@ -121,17 +133,53 @@ pub(crate) async fn init_photos_service(
         Err(_) => {}
     }
 
-    // ── Recovery strategy 2: full re-authentication ────────────────────
-    // Expensive fix: clear session state, perform fresh SRP + 2FA login.
-    // Handles cases where stale session headers cause wrong partition routing.
+    // ── Strategy 2: exponential backoff with fresh pools ─────────────
+    // The routing issue may be transient (CDN propagation, partition
+    // migration in progress). Retry with fresh connections on each
+    // attempt, giving Apple's infrastructure time to settle.
+    const BACKOFF_SECS: &[u64] = &[10, 30, 60];
+    for (i, &delay) in BACKOFF_SECS.iter().enumerate() {
+        tracing::warn!(
+            attempt = i + 1,
+            max_attempts = BACKOFF_SECS.len(),
+            delay_secs = delay,
+            url = %ckdatabasews_url,
+            "421 persists, retrying after backoff with fresh connection pool"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+
+        {
+            let mut session = shared_session.write().await;
+            session.reset_http_clients()?;
+        }
+
+        let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
+        match icloud::photos::PhotosService::new(
+            ckdatabasews_url.clone(),
+            session_box,
+            params.clone(),
+            api_retry_config,
+        )
+        .await
+        {
+            Ok(service) => return Ok((shared_session, service)),
+            Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
+            Err(_) => {}
+        }
+    }
+
+    // ── Strategy 3: re-authenticate (last resort) ────────────────────
+    // All pool resets and backoff failed. The most likely cause is that
+    // Apple migrated the account to a different CloudKit partition, so
+    // the ckdatabasews URL itself is stale. Re-authenticate to get a
+    // fresh URL.
     //
-    // Clear routing-related session state (session_token, session_id, scnt)
-    // so `authenticate()` falls through to fresh SRP instead of the validate
-    // shortcut. We preserve trust_token so SRP can include it in `trustTokens`,
+    // We preserve trust_token so SRP can include it in `trustTokens`,
     // letting Apple recognise this as a trusted device and skip 2FA.
     tracing::warn!(
         url = %ckdatabasews_url,
-        "Fresh connection pool did not resolve 421, performing full re-authentication"
+        "421 persists after {} backoff retries, performing full re-authentication",
+        BACKOFF_SECS.len()
     );
     {
         let session = shared_session.read().await;
@@ -203,46 +251,11 @@ pub(crate) async fn init_photos_service(
         Err(_) => {}
     }
 
-    // ── Recovery strategy 3: retry with exponential backoff ───────────
-    // Both strategies failed. Apple's partition routing may be transiently
-    // broken (account migration, infrastructure issue). Wait and retry
-    // with fresh connection pools on each attempt.
-    const BACKOFF_SECS: &[u64] = &[10, 30, 60];
-    for (i, &delay) in BACKOFF_SECS.iter().enumerate() {
-        tracing::warn!(
-            attempt = i + 1,
-            max_attempts = BACKOFF_SECS.len(),
-            delay_secs = delay,
-            url = %fresh_url,
-            "All recovery strategies failed, retrying after backoff"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-
-        {
-            let mut session = shared_session.write().await;
-            session.reset_http_clients()?;
-        }
-
-        let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-        match icloud::photos::PhotosService::new(
-            fresh_url.clone(),
-            session_box,
-            new_params.clone(),
-            api_retry_config,
-        )
-        .await
-        {
-            Ok(service) => return Ok((shared_session, service)),
-            Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
-            Err(_) => {}
-        }
-    }
-
     anyhow::bail!(
-        "421 Misdirected Request persists on {} after re-authentication and {} \
-         backoff retries.\n\n\
+        "421 Misdirected Request persists on {} after {} backoff retries and \
+         re-authentication.\n\n\
          If Advanced Data Protection (ADP) is enabled on this account, that's the\n\
-         cause -- ADP blocks the web API that kei uses. To fix, change both settings\n\
+         cause - ADP blocks the web API that kei uses. To fix, change both settings\n\
          on your iPhone/iPad:\n  \
          1. Disable ADP: Settings > Apple ID > iCloud > Advanced Data Protection\n  \
          2. Enable web access: Settings > Apple ID > iCloud > Access iCloud Data on the Web\n\n\
