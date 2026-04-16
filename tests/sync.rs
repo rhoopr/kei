@@ -1212,6 +1212,115 @@ fn sync_multi_album_dedups() {
     });
 }
 
+// ── Download integrity ──────────────────────────────────────────────────
+
+/// Data-sacred invariant: if the user (or `rm -rf` accident) deletes a synced
+/// file, the next sync must restore it. A silent skip here would mean kei
+/// "loses" the file permanently.
+#[test]
+#[ignore]
+fn sync_recovers_deleted_file() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let before = common::walkdir(download_dir.path());
+        assert!(before.len() >= 3, "expected >=3 files after first sync");
+
+        // Pick a JPEG (stable size/content), record its checksum, delete it.
+        let victim = before
+            .iter()
+            .find(|p| is_image_ext(p) && !is_video_ext(p))
+            .expect("at least one image file")
+            .clone();
+        let expected_size = std::fs::metadata(&victim).unwrap().len();
+        std::fs::remove_file(&victim).expect("delete victim");
+        assert!(!victim.exists(), "victim deleted");
+
+        // Re-sync: full enumeration so the filter can notice the missing file.
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        assert!(
+            victim.exists(),
+            "deleted file should be re-downloaded: {}",
+            victim.display()
+        );
+        let after_size = std::fs::metadata(&victim).unwrap().len();
+        assert_eq!(
+            after_size, expected_size,
+            "recovered file should match original size"
+        );
+    });
+}
+
+/// Data-sacred invariant: a truncated file left on disk (e.g. from a crashed
+/// write) must not mask the real photo. The default `name-size-dedup-with-suffix`
+/// policy preserves the existing file untouched and downloads the real photo
+/// alongside with a size suffix in the filename. Either way, the correctly-sized
+/// photo bytes must end up on disk.
+#[test]
+#[ignore]
+fn sync_truncated_file_does_not_cause_data_loss() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let files = common::walkdir(download_dir.path());
+        let victim = files
+            .iter()
+            .find(|p| is_image_ext(p) && !is_video_ext(p))
+            .expect("image file")
+            .clone();
+        let expected_size = std::fs::metadata(&victim).unwrap().len();
+        let original_bytes = std::fs::read(&victim).unwrap();
+        let parent = victim.parent().unwrap().to_path_buf();
+
+        // Truncate to zero bytes -- simulates a crashed write leaving an empty file.
+        std::fs::File::create(&victim)
+            .expect("truncate")
+            .set_len(0)
+            .expect("set_len 0");
+        assert_eq!(std::fs::metadata(&victim).unwrap().len(), 0);
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        // The correctly-sized photo must exist somewhere under the same folder
+        // (either overwriting the zero-byte file or as a size-suffixed sibling).
+        let candidates: Vec<_> = common::walkdir(&parent)
+            .into_iter()
+            .filter(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) == expected_size)
+            .collect();
+        assert!(
+            !candidates.is_empty(),
+            "after re-sync, the correctly-sized photo must be on disk somewhere in {:?}",
+            parent
+        );
+        let recovered = std::fs::read(&candidates[0]).unwrap();
+        assert_eq!(
+            recovered, original_bytes,
+            "recovered photo content must match the original"
+        );
+    });
+}
+
 // ── Bad credentials (LAST -- hits auth from scratch, burns rate limit) ──
 
 #[test]
