@@ -41,7 +41,7 @@ cargo test --test sync list_albums_prints_album_names -- --ignored --test-thread
    ```
    This prompts for a 2FA code. You only need to redo this when the session expires.
 
-3. Create an `icloudpd-test` album in iCloud Photos with these assets:
+3. Create a test album in iCloud Photos (default name: `kei-test`) with these assets:
 
    | Asset | Purpose |
    |-------|---------|
@@ -51,17 +51,32 @@ cargo test --test sync list_albums_prints_album_names -- --ignored --test-thread
    | Apple ProRAW (.DNG) | RAW+JPEG pair for align-raw tests |
    | Photo with unicode filename | keep-unicode-in-filenames test |
 
-   The sync tests target this album for deterministic, behavioral assertions.
+   If your album has a different name, set `KEI_TEST_ALBUM=<name>` in your environment.
+
+## Portability
+
+Nothing account-specific is baked into the test code. Override these env vars to point the suite at your own account:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ICLOUD_USERNAME` | (required) | Apple ID email |
+| `ICLOUD_PASSWORD` | (required) | Apple ID password |
+| `ICLOUD_TEST_COOKIE_DIR` | `./.test-cookies` | Pre-authenticated session directory |
+| `KEI_TEST_ALBUM` | `kei-test` | Name of the test album in iCloud |
+| `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image used by `run-docker-live.sh` |
+
+The shell scripts read these via `tests/lib.sh`. Rust tests read them via `tests/common/mod.rs` and (for the album name) `tests/sync.rs::album()`.
 
 ## Test Structure
 
 | File | Auth? | Description |
 |------|-------|-------------|
-| `cli.rs` | No | CLI argument parsing -- no network |
-| `behavioral.rs` | No | Wiremock-based e2e, state commands -- no network |
-| `sync.rs` | Yes | Sync, download, filtering -- targets `icloudpd-test` album (`#[ignore]`) |
+| `cli.rs` | No | CLI argument parsing |
+| `behavioral.rs` | No | CLI behavior, state commands, config resolution |
+| `sync.rs` | Yes | Sync, download, filtering against the test album (`#[ignore]`) |
 | `state_auth.rs` | Yes | Status, reset-state, verify, import-existing, retry-failed (`#[ignore]`) |
-| `common/mod.rs` | -- | Shared helpers |
+| `common/mod.rs` | -- | Shared Rust helpers (`require_preauth`, `cookie_dir`, `walkdir`) |
+| `lib.sh` | -- | Shared bash helpers for the run-*.sh scripts |
 
 ## Running Tests
 
@@ -70,10 +85,10 @@ cargo test --test sync list_albums_prints_album_names -- --ignored --test-thread
 ```sh
 cargo test --bin kei                   # unit tests
 cargo test --test cli                  # CLI parsing
-cargo test --test behavioral           # wiremock e2e + state commands
+cargo test --test behavioral           # CLI behavior + state commands
 ```
 
-### Auth-required tests (need .test-cookies/)
+### Auth-required tests (need cookie dir with trusted session)
 
 Auth tests must run single-threaded to avoid Apple API rate limits (503s).
 
@@ -82,13 +97,23 @@ cargo test --test sync -- --ignored --test-threads=1
 cargo test --test state_auth -- --ignored --test-threads=1
 ```
 
-### All tests
+### All Rust suites
 
 ```sh
 ./tests/run-all-tests.sh
 ```
 
 Results are logged to `tests/results.log`.
+
+### Live shell-script suites
+
+```sh
+./tests/run-gap-tests.sh           # Concurrent downloads, resume, partial-failure exit codes
+./tests/run-deep-validation.sh     # Sync token + config hash invariants
+./tests/run-docker-live.sh         # Docker container integration (13 checks)
+```
+
+Each sources `tests/lib.sh` to resolve cookie dir, DB path, and album name from the environment.
 
 ### Single test
 
@@ -110,7 +135,11 @@ Apple returns HTTP 503 if you hit their API too fast. If you get 503s:
 |------|------------|---------|
 | `.env` | Yes | Credentials |
 | `.env.example` | No | Template for `.env` |
-| `.test-cookies/` | Yes | Pre-auth session files |
+| `.test-cookies/` | Yes | Pre-auth session files (default location) |
 | `tests/results.log` | Yes | Test run output |
-| `tests/run-all-tests.sh` | No | Orchestrator for all test suites |
+| `tests/lib.sh` | No | Shared bash helpers |
+| `tests/run-all-tests.sh` | No | Orchestrator for all Rust suites |
+| `tests/run-gap-tests.sh` | No | Regression coverage for known gaps |
+| `tests/run-deep-validation.sh` | No | Sync-token/config-hash invariants |
+| `tests/run-docker-live.sh` | No | Docker integration tests |
 | `tests/TESTS.md` | No | Detailed test reference |

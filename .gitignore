@@ -20,5 +20,6 @@ CLAUDE.md
 # Test logs
 tests/results.log
 
-# Local test scripts
-tests/run-*.sh
+# Transient test artifacts created by tests/run-*.sh
+.deep-test/
+.gap*/

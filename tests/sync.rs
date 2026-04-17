@@ -1,9 +1,10 @@
 //! Sync tests with behavioral assertions (live iCloud API).
 //!
-//! Uses the `icloudpd-test` iCloud album with known content:
-//! - GOPR0558.JPG        -- regular JPEG photo
-//! - IMG_0962.MOV        -- standalone video
-//! - Cafe_godzill.jpg    -- JPEG with unicode filename
+//! Uses a test album in iCloud (default `kei-test`, override with
+//! `KEI_TEST_ALBUM`) that must contain at least:
+//! - one regular JPEG
+//! - one standalone video (.MOV or .MP4)
+//! - one JPEG with a non-ASCII filename
 //!
 //! All tests are `#[ignore]` -- they require iCloud credentials and hit the
 //! live Apple API. Run with:
@@ -18,9 +19,16 @@ use predicates::prelude::*;
 use std::time::Duration;
 use tempfile::tempdir;
 
-const ALBUM: &str = "icloudpd-test";
 const TIMEOUT_SECS: u64 = 180;
 const TIMEOUT_META: u64 = 90;
+
+/// Name of the iCloud album used for live tests. Defaults to `kei-test`.
+/// Override with `KEI_TEST_ALBUM=<name>` so a different account can run
+/// the suite.
+fn album() -> &'static str {
+    static A: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    A.get_or_init(|| std::env::var("KEI_TEST_ALBUM").unwrap_or_else(|_| "kei-test".to_string()))
+}
 
 /// Build a sync command targeting the test album.
 fn album_cmd(
@@ -33,7 +41,7 @@ fn album_cmd(
     cmd.args([
         "sync",
         "--album",
-        ALBUM,
+        album(),
         "--username",
         username,
         "--password",
@@ -828,7 +836,7 @@ fn sync_bare_invocation_works_like_sync() {
         common::cmd()
             .args([
                 "--album",
-                ALBUM,
+                album(),
                 "--username",
                 &username,
                 "--password",
@@ -989,7 +997,7 @@ fn list_albums_new_syntax() {
             .timeout(Duration::from_secs(60))
             .assert()
             .success()
-            .stdout(predicate::str::contains("icloudpd-test"));
+            .stdout(predicate::str::contains(album()));
     });
 }
 
@@ -1044,7 +1052,7 @@ fn sync_incremental_second_run_skips_download() {
             .args([
                 "sync",
                 "--album",
-                ALBUM,
+                album(),
                 "--username",
                 &username,
                 "--password",
@@ -1092,7 +1100,7 @@ fn sync_watch_runs_multiple_cycles() {
             .args([
                 "sync",
                 "--album",
-                ALBUM,
+                album(),
                 "--username",
                 &username,
                 "--password",
@@ -1169,7 +1177,7 @@ fn sync_report_json_writes_valid_schema() {
 /// Verify passing the same album twice still downloads exactly once (dedup).
 ///
 /// Exercises the multi-`--album` code path end-to-end. A richer test would
-/// use two distinct small albums, but only `icloudpd-test` exists in the
+/// use two distinct small albums, but only `kei-test` exists in the
 /// test account, so we assert dedup as the minimal multi-filter invariant.
 #[test]
 #[ignore]
@@ -1183,9 +1191,9 @@ fn sync_multi_album_dedups() {
             .args([
                 "sync",
                 "--album",
-                ALBUM,
+                album(),
                 "--album",
-                ALBUM,
+                album(),
                 "--username",
                 &username,
                 "--password",
