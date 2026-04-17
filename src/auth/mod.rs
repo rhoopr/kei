@@ -119,6 +119,10 @@ async fn authenticate_inner(
         }
     }
 
+    // Track whether we've already reset the HTTP pool so a persistent 421
+    // doesn't reset it twice (no upside) and so subsequent calls benefit
+    // from the fresh connection.
+    let mut pool_reset = false;
     if has_session_token {
         tracing::debug!("Checking session token validity");
         match twofa::validate_token(&mut session, endpoints).await {
@@ -141,8 +145,11 @@ async fn authenticate_inner(
                 {
                     tracing::warn!(
                         error = %e,
-                        "validate returned persistent 421 Misdirected Request"
+                        "validate returned 421 Misdirected Request; resetting HTTP pool \
+                         before accountLogin/SRP"
                     );
+                    session.reset_http_clients()?;
+                    pool_reset = true;
                 } else {
                     tracing::debug!(
                         error = %e,
@@ -179,10 +186,19 @@ async fn authenticate_inner(
                 if e.downcast_ref::<AuthError>()
                     .is_some_and(|ae| ae.is_misdirected_request())
                 {
-                    tracing::warn!(
-                        error = %e,
-                        "accountLogin also returned 421 Misdirected Request"
-                    );
+                    if pool_reset {
+                        tracing::warn!(
+                            error = %e,
+                            "accountLogin also returned 421 Misdirected Request after pool reset"
+                        );
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            "accountLogin returned 421 Misdirected Request; resetting HTTP pool \
+                             before SRP"
+                        );
+                        session.reset_http_clients()?;
+                    }
                 } else {
                     tracing::debug!(
                         error = %e,
@@ -193,21 +209,10 @@ async fn authenticate_inner(
         }
     }
 
-    // 421 fallback: if both /validate and /accountLogin returned 421,
-    // the auth endpoints have a routing issue but the session is likely
-    // still valid. Use cached auth data (no time limit) and let the
-    // CloudKit layer discover any real auth failures downstream. This
-    // avoids an unnecessary SRP handshake that would trigger 2FA.
-    if data.is_none() && has_session_token {
-        if let Some(cached) = session.load_validation_cache(i64::MAX).await {
-            tracing::info!(
-                "Auth endpoints returned 421, using cached session data \
-                 (CloudKit will re-auth if needed)"
-            );
-            data = Some(cached);
-        }
-    }
-
+    // If validate and accountLogin both failed (including persistent 421),
+    // fall through to SRP. SRP is the canonical path for re-minting session
+    // cookies, and trust_token is preserved across the session (via
+    // `strip_session_routing_state`) so 2FA is skipped in the common case.
     if data.is_none() {
         let password = password_provider().ok_or_else(|| {
             AuthError::FailedLogin("No password available (see error above for details)".into())
@@ -226,7 +231,26 @@ async fn authenticate_inner(
         .await?;
         // `password` (SecretString) dropped here, zeroing memory
 
-        let account_data = twofa::authenticate_with_token(&mut session, endpoints).await?;
+        // Post-SRP cookies are fresh, so a 421 here is narrow (HTTP/2 pool
+        // still pinned to the wrong partition). Reset the pool once and retry
+        // so the caller doesn't see an AuthError::ServiceError that the
+        // sync_loop init-retry (which matches on ICloudError) would miss.
+        let account_data = match twofa::authenticate_with_token(&mut session, endpoints).await {
+            Ok(d) => d,
+            Err(e)
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_misdirected_request()) =>
+            {
+                tracing::warn!(
+                    error = %e,
+                    "accountLogin returned 421 Misdirected Request after SRP; \
+                     resetting HTTP pool and retrying once"
+                );
+                session.reset_http_clients()?;
+                twofa::authenticate_with_token(&mut session, endpoints).await?
+            }
+            Err(e) => return Err(e),
+        };
         data = Some(account_data);
     }
 
@@ -355,6 +379,7 @@ pub async fn send_2fa_push(
         }
     }
 
+    let mut pool_reset = false;
     if data.is_none() && has_session_token {
         match twofa::validate_token(&mut session, &endpoints).await {
             Ok(d) => {
@@ -375,9 +400,11 @@ pub async fn send_2fa_push(
                 {
                     tracing::warn!(
                         error = %e,
-                        "Misdirected request persists after connection pool reset, \
-                         falling back to SRP"
+                        "validate returned 421 Misdirected Request; resetting HTTP pool \
+                         before accountLogin/SRP"
                     );
+                    session.reset_http_clients()?;
+                    pool_reset = true;
                 }
             }
         }
@@ -386,8 +413,23 @@ pub async fn send_2fa_push(
     // Try accountLogin before SRP (same rationale as authenticate_inner:
     // validate_token is strict, accountLogin is lenient).
     if data.is_none() && has_session_token {
-        if let Ok(d) = twofa::authenticate_with_token(&mut session, &endpoints).await {
-            data = Some(d);
+        match twofa::authenticate_with_token(&mut session, &endpoints).await {
+            Ok(d) => {
+                data = Some(d);
+            }
+            Err(e)
+                if !pool_reset
+                    && e.downcast_ref::<AuthError>()
+                        .is_some_and(|ae| ae.is_misdirected_request()) =>
+            {
+                tracing::warn!(
+                    error = %e,
+                    "accountLogin returned 421 Misdirected Request; resetting HTTP pool \
+                     before SRP"
+                );
+                session.reset_http_clients()?;
+            }
+            Err(_) => {}
         }
     }
 
@@ -404,7 +446,22 @@ pub async fn send_2fa_push(
             domain,
         )
         .await?;
-        let account_data = twofa::authenticate_with_token(&mut session, &endpoints).await?;
+        let account_data = match twofa::authenticate_with_token(&mut session, &endpoints).await {
+            Ok(d) => d,
+            Err(e)
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_misdirected_request()) =>
+            {
+                tracing::warn!(
+                    error = %e,
+                    "accountLogin returned 421 Misdirected Request after SRP; \
+                     resetting HTTP pool and retrying once"
+                );
+                session.reset_http_clients()?;
+                twofa::authenticate_with_token(&mut session, &endpoints).await?
+            }
+            Err(e) => return Err(e),
+        };
         data = Some(account_data);
     }
 

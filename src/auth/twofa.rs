@@ -15,14 +15,14 @@ const TWO_FA_CODE_LENGTH: usize = 6;
 
 /// Check if the `X-Apple-I-Rscd` response header indicates an authentication
 /// failure. Apple sometimes returns HTTP 200 but sets this header to the "real"
-/// status code (e.g. 401, 403, 421).
+/// status code (e.g. 401, 403).
 fn check_apple_rscd(response: &Response) -> Option<u16> {
     response
         .headers()
         .get("X-Apple-I-Rscd")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u16>().ok())
-        .filter(|&code| code == 401 || code == 403 || code == 421)
+        .filter(|&code| code == 401 || code == 403)
 }
 
 /// If `X-Apple-I-Rscd` indicates an auth failure, consume the response body
@@ -269,29 +269,9 @@ pub async fn trust_session(
 /// POST `{setup_endpoint}/validate` with body "null".
 /// Returns the parsed JSON response body on success.
 ///
-/// On 421 Misdirected Request, resets the HTTP connection pool and retries
-/// once. 421 is an HTTP/2 routing issue (connection went to the wrong
-/// partition server), not an authentication failure.
+/// 421 Misdirected Request surfaces as-is; the caller (`auth::authenticate`)
+/// resets the HTTP connection pool once before trying `accountLogin`/SRP.
 pub async fn validate_token(
-    session: &mut Session,
-    endpoints: &Endpoints,
-) -> Result<AccountLoginResponse> {
-    match validate_token_once(session, endpoints).await {
-        Err(e)
-            if e.downcast_ref::<AuthError>()
-                .is_some_and(|ae| ae.is_misdirected_request()) =>
-        {
-            tracing::warn!(
-                "validate returned 421 Misdirected Request, retrying with fresh connection pool"
-            );
-            session.reset_http_clients()?;
-            validate_token_once(session, endpoints).await
-        }
-        other => other,
-    }
-}
-
-async fn validate_token_once(
     session: &mut Session,
     endpoints: &Endpoints,
 ) -> Result<AccountLoginResponse> {
@@ -336,28 +316,9 @@ async fn validate_token_once(
 /// POST `{setup_endpoint}/accountLogin` with the token and trust token.
 /// Returns the parsed JSON response containing account data.
 ///
-/// On 421 Misdirected Request, resets the HTTP connection pool and retries
-/// once before returning the error.
+/// 421 Misdirected Request surfaces as-is; pool resets happen at the
+/// `auth::authenticate` level so the reset amortizes across callers.
 pub async fn authenticate_with_token(
-    session: &mut Session,
-    endpoints: &Endpoints,
-) -> Result<AccountLoginResponse> {
-    match authenticate_with_token_once(session, endpoints).await {
-        Err(e)
-            if e.downcast_ref::<AuthError>()
-                .is_some_and(|ae| ae.is_misdirected_request()) =>
-        {
-            tracing::warn!(
-                "accountLogin returned 421 Misdirected Request, retrying with fresh connection pool"
-            );
-            session.reset_http_clients()?;
-            authenticate_with_token_once(session, endpoints).await
-        }
-        other => other,
-    }
-}
-
-async fn authenticate_with_token_once(
     session: &mut Session,
     endpoints: &Endpoints,
 ) -> Result<AccountLoginResponse> {
@@ -597,14 +558,16 @@ mod tests {
     }
 
     #[test]
-    fn test_check_apple_rscd_421() {
+    fn test_check_apple_rscd_421_ignored() {
+        // 200 + rscd=421 has not been observed in the wild; only rscd=401/403
+        // indicates an auth rejection kei needs to act on.
         let response = http::Response::builder()
             .status(200)
             .header("X-Apple-I-Rscd", "421")
             .body("")
             .unwrap();
         let resp = Response::from(response);
-        assert_eq!(check_apple_rscd(&resp), Some(421));
+        assert!(check_apple_rscd(&resp).is_none());
     }
 
     #[test]

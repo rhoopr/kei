@@ -237,18 +237,50 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         max_delay_secs: 60,
     };
 
-    let (shared_session, mut photos_service) = init_photos_service(
-        auth_result,
-        &config.cookie_directory,
-        &config.username,
-        config.domain.as_str(),
-        &password_provider,
-        api_retry_config,
-    )
-    .await?;
-
-    // Resolve the selected library/libraries
-    let libraries = resolve_libraries(&config.library, &mut photos_service).await?;
+    // CloudKit session/routing recovery: if init or the first CloudKit query
+    // surfaces a session-error signature (401 stale session, or 421 persisting
+    // after a pool reset), strip routing state and force SRP re-auth. A second
+    // failure bails cleanly instead of looping under Docker's restart policy.
+    let mut pending_auth = Some(auth_result);
+    let mut retried_after_session_error = false;
+    let is_session_error = |e: &anyhow::Error| {
+        e.downcast_ref::<crate::icloud::error::ICloudError>()
+            .is_some_and(crate::icloud::error::ICloudError::is_session_error)
+    };
+    let (shared_session, mut photos_service, libraries) = loop {
+        let this_auth = pending_auth
+            .take()
+            .expect("auth_result present at start of attempt");
+        let init_result = init_photos_service(this_auth, api_retry_config).await;
+        let (ss, mut ps) = match init_result {
+            Ok(pair) => pair,
+            Err(e) if !retried_after_session_error && is_session_error(&e) => {
+                tracing::warn!(
+                    error = %e,
+                    "CloudKit init failed with stale-session signature; forcing SRP re-authentication"
+                );
+                retried_after_session_error = true;
+                pending_auth =
+                    Some(reauth_with_srp(&config, &password_provider, &notifier, None).await?);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match resolve_libraries(&config.library, &mut ps).await {
+            Ok(libs) => break (ss, ps, libs),
+            Err(e) if !retried_after_session_error && is_session_error(&e) => {
+                tracing::warn!(
+                    error = %e,
+                    "CloudKit returned stale-session signature; forcing SRP re-authentication"
+                );
+                retried_after_session_error = true;
+                pending_auth = Some(
+                    reauth_with_srp(&config, &password_provider, &notifier, Some((ss, ps))).await?,
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    };
     tracing::debug!(
         count = libraries.len(),
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
@@ -635,6 +667,70 @@ struct CycleResult {
     failed_count: usize,
     session_expired: bool,
     stats: download::SyncStats,
+}
+
+/// Re-authenticate via SRP after a session-error signature from CloudKit.
+///
+/// Drops any live session + service (releasing the file lock), strips routing
+/// state from the session file so `auth::authenticate` is forced onto SRP,
+/// then runs authentication — handling the 2FA-required case by notifying and
+/// waiting for `kei login submit-code`.
+async fn reauth_with_srp(
+    config: &config::Config,
+    password_provider: &dyn Fn() -> Option<SecretString>,
+    notifier: &Notifier,
+    live: Option<(auth::SharedSession, crate::icloud::photos::PhotosService)>,
+) -> anyhow::Result<auth::AuthResult> {
+    if let Some((ss, ps)) = live {
+        ss.read().await.release_lock()?;
+        drop(ps);
+        drop(ss);
+    }
+    let session_file = auth::session_file_path(&config.cookie_directory, &config.username);
+    auth::strip_session_routing_state(&session_file).await;
+
+    match auth::authenticate(
+        &config.cookie_directory,
+        &config.username,
+        password_provider,
+        config.domain.as_str(),
+        None,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(e)
+            if e.downcast_ref::<auth::error::AuthError>()
+                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
+        {
+            let msg = format!(
+                "2FA required for {u}. Run: kei login get-code",
+                u = config.username
+            );
+            tracing::warn!(message = %msg, "2FA required");
+            notifier.notify(
+                notifications::Event::TwoFaRequired,
+                &msg,
+                &config.username,
+                None,
+            );
+            wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
+                auth::authenticate(
+                    &config.cookie_directory,
+                    &config.username,
+                    password_provider,
+                    config.domain.as_str(),
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.

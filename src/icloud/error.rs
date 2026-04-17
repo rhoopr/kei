@@ -15,12 +15,32 @@ pub enum ICloudError {
             → Log into https://icloud.com/ and finish setting up your iCloud service."
     )]
     ServiceNotActivated { code: String, reason: String },
+    /// CloudKit rejected the request with HTTP 401. The caller should
+    /// invalidate any cached session/validation data and re-authenticate
+    /// with SRP before retrying.
+    #[error("Session expired (HTTP 401 from CloudKit)")]
+    SessionExpired,
+    /// CloudKit returned HTTP 421 Misdirected Request. The HTTP/2 connection
+    /// was routed to the wrong CloudKit partition; the caller should reset
+    /// the connection pool and retry on a fresh connection.
+    #[error("Misdirected Request (HTTP 421 from CloudKit)")]
+    MisdirectedRequest,
     #[error(transparent)]
     Http(Box<reqwest::Error>),
     #[error(transparent)]
     Io(Box<std::io::Error>),
     #[error(transparent)]
     Json(Box<serde_json::Error>),
+}
+
+impl ICloudError {
+    /// True if the error means kei should invalidate the session cache, force
+    /// SRP re-authentication, and retry. Both `SessionExpired` (CloudKit 401)
+    /// and `MisdirectedRequest` (persistent CloudKit 421) typically indicate
+    /// stale session routing state that only SRP can re-mint.
+    pub fn is_session_error(&self) -> bool {
+        matches!(self, Self::SessionExpired | Self::MisdirectedRequest)
+    }
 }
 
 impl From<reqwest::Error> for ICloudError {
@@ -99,23 +119,40 @@ mod tests {
     }
 
     #[test]
-    fn connection_421_detected_as_misdirected() {
-        // HttpStatusError Display format: "HTTP {status} for {url}"
-        // This gets wrapped as ICloudError::Connection(e.to_string())
-        let err =
-            ICloudError::Connection("HTTP 421 for https://p60-ckdatabasews.icloud.com/...".into());
+    fn misdirected_request_is_distinct_variant() {
+        let err = ICloudError::MisdirectedRequest;
         assert!(
-            matches!(&err, ICloudError::Connection(msg) if msg.contains("421")),
-            "421 Connection error should be detectable as misdirected request"
+            matches!(err, ICloudError::MisdirectedRequest),
+            "dedicated variant so callers can reset pool and retry"
         );
+        let display = err.to_string();
+        assert!(display.contains("421"), "display mentions 421: {display}");
     }
 
     #[test]
-    fn connection_non_421_not_misdirected() {
-        let err = ICloudError::Connection("HTTP status server error (503)".into());
+    fn session_expired_is_distinct_variant() {
+        let err = ICloudError::SessionExpired;
         assert!(
-            !matches!(&err, ICloudError::Connection(msg) if msg.contains("421")),
-            "503 should not match the misdirected request pattern"
+            matches!(err, ICloudError::SessionExpired),
+            "dedicated variant so callers can trigger SRP re-auth"
         );
+        let display = err.to_string();
+        assert!(display.contains("401"), "display mentions 401: {display}");
+    }
+
+    #[test]
+    fn is_session_error_true_for_session_expired_and_misdirected() {
+        assert!(ICloudError::SessionExpired.is_session_error());
+        assert!(ICloudError::MisdirectedRequest.is_session_error());
+    }
+
+    #[test]
+    fn is_session_error_false_for_other_variants() {
+        assert!(!ICloudError::Connection("x".into()).is_session_error());
+        assert!(!ICloudError::ServiceNotActivated {
+            code: "ADP".into(),
+            reason: "y".into()
+        }
+        .is_session_error());
     }
 }

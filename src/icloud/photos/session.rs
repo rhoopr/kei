@@ -40,12 +40,25 @@ impl PhotosSession for reqwest::Client {
             let url = resp.url().to_string();
             let resp_body = resp.text().await.unwrap_or_default();
             if !resp_body.is_empty() {
-                tracing::debug!(
-                    status = %status,
-                    url = %url,
-                    body = %resp_body,
-                    "CloudKit error response body"
-                );
+                // 421 bodies are the most diagnostic signal for distinguishing
+                // ADP-class from session-class misdirected requests (e.g. the
+                // "Missing X-APPLE-WEBAUTH-USER cookie" string from issue
+                // #199). Surface at WARN so reporters don't need RUST_LOG=debug.
+                if status.as_u16() == 421 {
+                    tracing::warn!(
+                        status = %status,
+                        url = %url,
+                        body = %resp_body,
+                        "CloudKit 421 Misdirected Request response body"
+                    );
+                } else {
+                    tracing::debug!(
+                        status = %status,
+                        url = %url,
+                        body = %resp_body,
+                        "CloudKit error response body"
+                    );
+                }
             }
             return Err(HttpStatusError {
                 status: status.as_u16(),

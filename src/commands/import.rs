@@ -79,15 +79,8 @@ pub(crate) async fn run_import_existing(
     )
     .await?;
 
-    let (_shared_session, mut photos_service) = init_photos_service(
-        auth_result,
-        &cookie_directory,
-        &username,
-        domain.as_str(),
-        &password_provider,
-        retry::RetryConfig::default(),
-    )
-    .await?;
+    let (_shared_session, mut photos_service) =
+        init_photos_service(auth_result, retry::RetryConfig::default()).await?;
 
     // Resolve library selection (CLI > TOML > default PrimarySync)
     let toml_filters = toml.and_then(|t| t.filters.as_ref());

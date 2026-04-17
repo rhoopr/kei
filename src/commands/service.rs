@@ -16,28 +16,15 @@ pub(crate) const MAX_REAUTH_ATTEMPTS: u32 = 3;
 const ICLOUD_CLIENT_BUILD_NUMBER: &str = "2522Project44";
 const ICLOUD_CLIENT_MASTERING_NUMBER: &str = "2522B2";
 
-/// Initialize the photos service with automatic 421 recovery.
+/// Initialize the photos service with one 421 recovery attempt.
 ///
-/// On 421 Misdirected Request, tries three recovery strategies in order:
-///
-/// 1. **Reset HTTP clients** (cheap): drops the connection pool and retries
-///    with fresh TCP/HTTP2 connections. Fixes cases where HTTP/2 connection
-///    routing directed the request to the wrong CloudKit partition server.
-///
-/// 2. **Full re-authentication** (expensive): deletes the persisted session
-///    file and performs a fresh SRP login. Fixes cases where stale session
-///    headers (scnt, session_id) cause CloudKit to route to the wrong
-///    partition. May require password + 2FA from the user.
-///
-/// 3. **Backoff retries**: if both strategies fail, retries with exponential
-///    backoff (10s, 30s, 60s) with fresh connection pools. Handles transient
-///    Apple-side partition routing issues that resolve on their own.
+/// On 421 Misdirected Request, resets the HTTP/2 connection pool and retries
+/// once. A second 421 surfaces `ICloudError::MisdirectedRequest` to the
+/// caller; `sync_loop` routes both 421 and 401 through the same SRP re-auth
+/// path (covering the case where stale session routing headers are pinning
+/// the request to the wrong partition).
 pub(crate) async fn init_photos_service(
     mut auth_result: auth::AuthResult,
-    cookie_directory: &Path,
-    username: &str,
-    domain: &str,
-    password_provider: &dyn Fn() -> Option<SecretString>,
     api_retry_config: retry::RetryConfig,
 ) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
     if auth_result.data.i_cdp_enabled {
@@ -95,21 +82,12 @@ pub(crate) async fn init_photos_service(
         Err(_) => {}
     }
 
-    // ── 421 recovery ─────────────────────────────────────────────────────
-    //
-    // A 421 Misdirected Request means Apple's CDN routed our HTTP/2
-    // connection to the wrong CloudKit partition server. Per RFC 9110,
-    // the correct client response is to retry on a new connection - NOT
-    // to re-authenticate. The session credentials are almost certainly
-    // fine; it's the TCP/TLS routing that's wrong.
-    //
-    // Strategy order:
-    //   1. Fresh connection pool (instant, free)
-    //   2. Backoff + fresh pools (handles transient CDN routing issues)
-    //   3. Full re-auth (last resort - only if the URL actually changed,
-    //      meaning Apple migrated the account to a different partition)
-
-    // ── Strategy 1: fresh HTTP/2 connection pool ─────────────────────
+    // 421 Misdirected Request: Apple's CDN routed our HTTP/2 connection to
+    // the wrong CloudKit partition. Per RFC 9110, the correct response is a
+    // fresh connection — not re-auth. Try that once; if the second attempt
+    // also 421s, surface `MisdirectedRequest` so `sync_loop` can invalidate
+    // the cache and force SRP (where stale routing headers are the likely
+    // cause).
     tracing::warn!(
         url = %ckdatabasews_url,
         "Service returned 421 Misdirected Request, retrying with fresh connection pool"
@@ -120,149 +98,14 @@ pub(crate) async fn init_photos_service(
     }
 
     let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-    match icloud::photos::PhotosService::new(
+    let service = icloud::photos::PhotosService::new(
         ckdatabasews_url.clone(),
         session_box,
-        params.clone(),
+        params,
         api_retry_config,
-    )
-    .await
-    {
-        Ok(service) => return Ok((shared_session, service)),
-        Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
-        Err(_) => {}
-    }
-
-    // ── Strategy 2: exponential backoff with fresh pools ─────────────
-    // The routing issue may be transient (CDN propagation, partition
-    // migration in progress). Retry with fresh connections on each
-    // attempt, giving Apple's infrastructure time to settle.
-    const BACKOFF_SECS: &[u64] = &[10, 30, 60];
-    for (i, &delay) in BACKOFF_SECS.iter().enumerate() {
-        tracing::warn!(
-            attempt = i + 1,
-            max_attempts = BACKOFF_SECS.len(),
-            delay_secs = delay,
-            url = %ckdatabasews_url,
-            "421 persists, retrying after backoff with fresh connection pool"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-
-        {
-            let mut session = shared_session.write().await;
-            session.reset_http_clients()?;
-        }
-
-        let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-        match icloud::photos::PhotosService::new(
-            ckdatabasews_url.clone(),
-            session_box,
-            params.clone(),
-            api_retry_config,
-        )
-        .await
-        {
-            Ok(service) => return Ok((shared_session, service)),
-            Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
-            Err(_) => {}
-        }
-    }
-
-    // ── Strategy 3: re-authenticate (last resort) ────────────────────
-    // All pool resets and backoff failed. The most likely cause is that
-    // Apple migrated the account to a different CloudKit partition, so
-    // the ckdatabasews URL itself is stale. Re-authenticate to get a
-    // fresh URL.
-    //
-    // We preserve trust_token so SRP can include it in `trustTokens`,
-    // letting Apple recognise this as a trusted device and skip 2FA.
-    tracing::warn!(
-        url = %ckdatabasews_url,
-        "421 persists after {} backoff retries, performing full re-authentication",
-        BACKOFF_SECS.len()
-    );
-    {
-        let session = shared_session.read().await;
-        session.release_lock()?;
-    }
-    let session_file = auth::session_file_path(cookie_directory, username);
-    auth::strip_session_routing_state(&session_file).await;
-    let new_auth = auth::authenticate(
-        cookie_directory,
-        username,
-        password_provider,
-        domain,
-        None,
-        None,
-        None,
     )
     .await?;
-
-    let fresh_url = new_auth
-        .data
-        .webservices
-        .as_ref()
-        .and_then(|ws| ws.ckdatabasews.as_ref())
-        .map(|ep| ep.url.clone())
-        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL after re-authentication"))?;
-
-    if new_auth.data.i_cdp_enabled {
-        anyhow::bail!(
-            "Advanced Data Protection (ADP) is enabled on this account.\n\n\
-             ADP blocks the web API that kei uses to access photos.\n\
-             To use kei, change both settings on your iPhone/iPad:\n  \
-             1. Disable ADP: Settings > Apple ID > iCloud > Advanced Data Protection\n  \
-             2. Enable web access: Settings > Apple ID > iCloud > Access iCloud Data on the Web"
-        );
-    }
-
-    if fresh_url != ckdatabasews_url {
-        tracing::info!(
-            old_url = %ckdatabasews_url,
-            new_url = %fresh_url,
-            "Re-authentication returned a different service URL"
-        );
-    }
-
-    let new_client_id = new_auth.session.client_id().unwrap_or_default().to_owned();
-    let new_dsid = new_auth
-        .data
-        .ds_info
-        .as_ref()
-        .and_then(|ds| ds.dsid.clone());
-    let new_params = build_photos_params(&new_client_id, new_dsid.as_deref());
-
-    {
-        let mut session = shared_session.write().await;
-        *session = new_auth.session;
-    }
-
-    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-    match icloud::photos::PhotosService::new(
-        fresh_url.clone(),
-        session_box,
-        new_params.clone(),
-        api_retry_config,
-    )
-    .await
-    {
-        Ok(service) => return Ok((shared_session, service)),
-        Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
-        Err(_) => {}
-    }
-
-    anyhow::bail!(
-        "421 Misdirected Request persists on {} after {} backoff retries and \
-         re-authentication.\n\n\
-         If Advanced Data Protection (ADP) is enabled on this account, that's the\n\
-         cause - ADP blocks the web API that kei uses. To fix, change both settings\n\
-         on your iPhone/iPad:\n  \
-         1. Disable ADP: Settings > Apple ID > iCloud > Advanced Data Protection\n  \
-         2. Enable web access: Settings > Apple ID > iCloud > Access iCloud Data on the Web\n\n\
-         Otherwise, this is likely a transient Apple-side routing issue. Try again later.",
-        fresh_url,
-        BACKOFF_SECS.len()
-    )
+    Ok((shared_session, service))
 }
 
 /// Check if an iCloud error is a 421 Misdirected Request from the CloudKit service.
@@ -271,7 +114,7 @@ pub(crate) async fn init_photos_service(
 /// server that cannot serve the user's data. Root cause may be stale
 /// connection routing or stale session state; see `init_photos_service`.
 fn is_misdirected_request(err: &icloud::error::ICloudError) -> bool {
-    matches!(err, icloud::error::ICloudError::Connection(msg) if msg.contains("421"))
+    matches!(err, icloud::error::ICloudError::MisdirectedRequest)
 }
 
 /// Attempt to re-authenticate the session.
@@ -822,18 +665,20 @@ mod tests {
     // ── is_misdirected_request tests ──────────────────────────────────
 
     #[test]
-    fn misdirected_request_detected_from_connection_error() {
-        let err = icloud::error::ICloudError::Connection(
-            "HTTP 421 for https://p60-ckdatabasews.icloud.com/...".to_string(),
-        );
+    fn misdirected_request_variant_detected() {
+        let err = icloud::error::ICloudError::MisdirectedRequest;
         assert!(is_misdirected_request(&err));
     }
 
     #[test]
     fn non_421_connection_error_not_misdirected() {
-        let err = icloud::error::ICloudError::Connection(
-            "HTTP 500 for https://p60-ckdatabasews.icloud.com/...".to_string(),
-        );
+        let err = icloud::error::ICloudError::Connection("HTTP 500 ...".to_string());
+        assert!(!is_misdirected_request(&err));
+    }
+
+    #[test]
+    fn session_expired_not_misdirected() {
+        let err = icloud::error::ICloudError::SessionExpired;
         assert!(!is_misdirected_request(&err));
     }
 

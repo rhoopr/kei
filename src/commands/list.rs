@@ -36,15 +36,8 @@ pub(crate) async fn run_list(
     .await?;
 
     let api_retry_config = retry::RetryConfig::default();
-    let (_shared_session, mut photos_service) = init_photos_service(
-        auth_result,
-        &cookie_directory,
-        &username,
-        domain.as_str(),
-        &password_provider,
-        api_retry_config,
-    )
-    .await?;
+    let (_shared_session, mut photos_service) =
+        init_photos_service(auth_result, api_retry_config).await?;
 
     match what {
         cli::ListCommand::Libraries => {

@@ -81,12 +81,11 @@ impl AuthError {
     ///
     /// HTTP 421 is an HTTP/2 routing issue where the connection was routed to
     /// the wrong partition server. The fix is to reset the connection pool and
-    /// retry, NOT to re-authenticate. Apple can return 421 as an HTTP status
-    /// or via the `X-Apple-I-Rscd` response header (rscd_421).
+    /// retry, NOT to re-authenticate.
     pub fn is_misdirected_request(&self) -> bool {
         match self {
             Self::ApiError { code, .. } => *code == 421,
-            Self::ServiceError { code, .. } => code == "http_421" || code == "rscd_421",
+            Self::ServiceError { code, .. } => code == "http_421",
             _ => false,
         }
     }
@@ -315,15 +314,6 @@ mod tests {
     }
 
     #[test]
-    fn service_error_rscd_421_is_misdirected() {
-        let err = AuthError::ServiceError {
-            code: "rscd_421".into(),
-            message: "Apple rejected the session (response code 421)".into(),
-        };
-        assert!(err.is_misdirected_request());
-    }
-
-    #[test]
     fn api_error_other_codes_not_misdirected() {
         for code in [401, 403, 450, 500, 502, 503, 504] {
             let err = AuthError::ApiError {
@@ -340,7 +330,7 @@ mod tests {
     #[test]
     fn service_error_other_codes_not_misdirected() {
         for code in [
-            "http_450", "http_500", "http_503", "rscd_401", "rscd_403", "AUTH-421",
+            "http_450", "http_500", "http_503", "rscd_401", "rscd_403", "rscd_421", "AUTH-421",
         ] {
             let err = AuthError::ServiceError {
                 code: code.into(),

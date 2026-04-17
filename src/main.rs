@@ -273,6 +273,12 @@ fn main() -> ExitCode {
             {
                 ExitCode::SUCCESS
             } else {
+                // Route the final error through tracing so it carries the same
+                // timestamp + level prefix as the rest of the logs; makes
+                // `docker logs` / `journalctl` output correlate cleanly.
+                // Also echo to stderr unconditionally as a fallback for early
+                // failures before `tracing_subscriber::fmt().init()` runs.
+                tracing::error!(error = format!("{e:#}"), "kei exited with error");
                 eprintln!("Error: {e:#}");
                 if e.downcast_ref::<PartialSyncError>().is_some() {
                     ExitCode::from(EXIT_PARTIAL)

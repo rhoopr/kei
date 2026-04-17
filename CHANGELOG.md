@@ -11,7 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CloudKit 401 / persistent 421 no longer loops under Docker restart.** Removed the 0.8.0 cache-fallback that accepted cached session data when `/validate` and `/accountLogin` both returned 421 — stale cached tokens would then produce a CloudKit 401, the process exited, and Docker restarted with the same cache forever. Auth now falls through to SRP in every stale-session case (trust_token is preserved, so 2FA is skipped in the common path). CloudKit 401 maps to `ICloudError::SessionExpired` and CloudKit 421 (after one pool reset) maps to `ICloudError::MisdirectedRequest`; the sync loop handles both by invalidating the validation cache, forcing SRP, and retrying init. A second failure surfaces cleanly. ([#217], [#199])
+- **Final error output carries a timestamp.** The top-level `anyhow::Error` is now routed through `tracing::error!` in addition to stderr, so crash messages in `docker logs` / `journalctl` carry the same `YYYY-MM-DDTHH:MM:SS INFO kei::...` prefix as the rest of the output. Makes the log timeline correlate cleanly instead of jumping from "kei::sync_loop: ..." lines to an unprefixed "Error: ..." line.
 - **Duplicate `--album` names no longer error** - `sync --album X --album X` previously failed with "Album 'X' not found" because the album map was drained on first match. Duplicate names are now deduplicated before resolution.
+
+### Changed
+
+- **Simplified 421 recovery.** `init_photos_service` no longer ladders through pool reset → 10/30/60s backoff → full re-auth (~150 lines). It resets the HTTP pool once and, on a second 421, surfaces the typed error through the same SRP re-auth path that handles 401. Per-endpoint pool-reset retries in `validate_token` / `authenticate_with_token` were hoisted to a single reset at `auth::authenticate` level, removing duplication.
+- **Typed `ICloudError::MisdirectedRequest`.** Replaces the `Connection(String).contains("421")` stringly-typed check in `is_misdirected_request`. `check_apple_rscd` no longer treats `X-Apple-I-Rscd: 421` as an auth failure (never observed in the wild; only fed the removed cache-fallback).
+- **CloudKit 421 response body logged at WARN.** Issue #199's breakthrough was seeing `Missing X-APPLE-WEBAUTH-USER cookie` in the 421 body — the single most useful signal for distinguishing ADP-class 421 from session-class 421. Surfaced by default so the next reporter doesn't need `RUST_LOG=debug`.
+
+[#199]: https://github.com/rhoopr/kei/issues/199
+[#217]: https://github.com/rhoopr/kei/issues/217
 
 ---
 
