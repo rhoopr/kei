@@ -480,25 +480,6 @@ impl Session {
         }
     }
 
-    /// Remove the validation cache file. Called when CloudKit rejects the
-    /// cached tokens with 401, so the next auth attempt is forced onto SRP
-    /// instead of reusing stale data.
-    pub(crate) async fn invalidate_validation_cache(&self) {
-        let path = self.cache_path();
-        match fs::remove_file(&path).await {
-            Ok(()) => tracing::info!(
-                path = %path.display(),
-                "Validation cache invalidated"
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "Failed to remove validation cache"
-            ),
-        }
-    }
-
     /// Replace both HTTP clients with fresh ones, dropping the old connection
     /// pools. The existing cookie jar and session data are preserved so no
     /// re-authentication is needed. Used for 421 recovery where the issue is
@@ -855,30 +836,6 @@ mod tests {
             .await
             .unwrap();
         assert!(session.cookiejar_path().is_dir());
-    }
-
-    #[tokio::test]
-    async fn invalidate_validation_cache_removes_file() {
-        let (_td, dir) = test_dir("cache_invalidate");
-        let session = Session::new(&dir, "user@test.com", "https://example.com", None)
-            .await
-            .unwrap();
-
-        // Seed the cache with a minimal valid ValidationCache payload.
-        let sanitized = sanitize_username("user@test.com");
-        let cache_path = dir.join(format!("{sanitized}.cache"));
-        std::fs::write(
-            &cache_path,
-            r#"{"validated_at": 0, "account_data": {"dsInfo": null, "webservices": null, "iCDPEnabled": false}}"#,
-        )
-        .unwrap();
-        assert!(cache_path.exists());
-
-        session.invalidate_validation_cache().await;
-        assert!(!cache_path.exists(), "cache file should be removed");
-
-        // Idempotent: second call on already-removed file is a no-op.
-        session.invalidate_validation_cache().await;
     }
 
     #[tokio::test]

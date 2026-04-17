@@ -305,12 +305,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             {
                 tracing::warn!(
                     error = %e,
-                    "CloudKit returned stale-session signature; invalidating cache and \
-                     forcing SRP re-authentication"
+                    "CloudKit returned stale-session signature; forcing SRP re-authentication"
                 );
-                ss.read().await.invalidate_validation_cache().await;
+                // Release the file lock, drop the live session, then strip
+                // routing state from the session file so auth::authenticate is
+                // forced onto the SRP path. Matches the init-retry prep.
+                ss.read().await.release_lock()?;
                 drop(ps);
                 drop(ss);
+                let session_file =
+                    auth::session_file_path(&config.cookie_directory, &config.username);
+                auth::strip_session_routing_state(&session_file).await;
                 retried_after_session_error = true;
                 pending_auth = Some(
                     match auth::authenticate(
