@@ -833,6 +833,50 @@ mod tests {
         vec!["kei", "--username", "test@example.com"]
     }
 
+    /// Scrub auth-related env vars for the duration of the returned guard so
+    /// tests that exercise clap's flag parsing don't get contaminated when the
+    /// developer has `ICLOUD_USERNAME` / `ICLOUD_PASSWORD` exported (via
+    /// `.env` sourcing for live tests). The process-wide mutex serializes
+    /// mutations so parallel test threads don't race.
+    fn scrub_auth_env() -> AuthEnvGuard {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_user = std::env::var("ICLOUD_USERNAME").ok();
+        let prev_pw = std::env::var("ICLOUD_PASSWORD").ok();
+        // SAFETY: mutations happen only inside the static mutex, so no other
+        // thread in this process observes env state mid-swap.
+        unsafe {
+            std::env::remove_var("ICLOUD_USERNAME");
+            std::env::remove_var("ICLOUD_PASSWORD");
+        }
+        AuthEnvGuard {
+            _lock: guard,
+            prev_user,
+            prev_pw,
+        }
+    }
+
+    struct AuthEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_user: Option<String>,
+        prev_pw: Option<String>,
+    }
+
+    impl Drop for AuthEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still holding the static mutex, so restoration is exclusive.
+            unsafe {
+                if let Some(v) = self.prev_user.take() {
+                    std::env::set_var("ICLOUD_USERNAME", v);
+                }
+                if let Some(v) = self.prev_pw.take() {
+                    std::env::set_var("ICLOUD_PASSWORD", v);
+                }
+            }
+        }
+    }
+
     // ── Global args ───────────────────────────────────────────────
 
     #[test]
@@ -877,6 +921,7 @@ mod tests {
 
     #[test]
     fn test_bare_invocation_without_username() {
+        let _guard = scrub_auth_env();
         let cli = Cli::try_parse_from(["kei"]).unwrap();
         assert!(cli.username.is_none());
         assert!(cli.command.is_none());
@@ -1262,6 +1307,7 @@ mod tests {
 
     #[test]
     fn test_password_file_flag() {
+        let _guard = scrub_auth_env();
         let mut args = base_args();
         args.extend(["--password-file", "/run/secrets/pw"]);
         let cli = parse(&args);
@@ -1273,6 +1319,7 @@ mod tests {
 
     #[test]
     fn test_password_command_flag() {
+        let _guard = scrub_auth_env();
         let mut args = base_args();
         args.extend(["--password-command", "op read 'op://vault/icloud/pw'"]);
         let cli = parse(&args);

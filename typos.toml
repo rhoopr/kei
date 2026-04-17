@@ -14,3 +14,8 @@ Caf = "Caf"
 Pn = "Pn"
 # THM = camera thumbnail file extension (e.g. Canon .THM files)
 THM = "THM"
+
+[default]
+# The `mis-` prefix (mis-routing, mis-attributed, mis-directed) is grammatical
+# English; typos wants to "fix" it to `miss`/`mist`. Suppress those matches.
+extend-ignore-re = ["\\bmis-\\w+"]

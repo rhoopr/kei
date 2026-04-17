@@ -4,7 +4,7 @@ use std::time::Duration;
 use rand::RngExt;
 
 /// Parse the `Retry-After` response header as delta-seconds, capped at `max`.
-/// Returns `None` for absent, zero, or unparseable values. The HTTP-date form
+/// Returns `None` for absent, zero, or unparsable values. The HTTP-date form
 /// is not accepted (Apple/CloudKit always emit delta-seconds).
 pub fn parse_retry_after_header(
     headers: &reqwest::header::HeaderMap,
