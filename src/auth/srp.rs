@@ -7,16 +7,29 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::endpoints::Endpoints;
 use super::session::Session;
+use super::twofa::{check_rscd_from_headers, rscd_service_error};
 use crate::auth::error::AuthError;
+use crate::retry::{RetryAction, RetryConfig};
+
+/// Bounded retry budget for transient failures on Apple's auth endpoints
+/// (5xx, 429, network flaps). The auth flow is user-blocking, so we keep
+/// this short: three tries with short-ish backoffs, capped by Retry-After.
+const SRP_RETRY_CONFIG: RetryConfig = RetryConfig {
+    max_retries: 2,
+    base_delay_secs: 2,
+    max_delay_secs: 30,
+};
 
 /// Buffered HTTP response for SRP authentication steps.
 /// Decouples the SRP flow from `reqwest::Response` for testability.
 pub(crate) struct SrpResponse {
     pub(crate) status: u16,
     body: Vec<u8>,
+    pub(crate) headers: HeaderMap,
 }
 
 impl SrpResponse {
@@ -39,6 +52,42 @@ impl SrpResponse {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+
+    /// Parse `Retry-After` (delta-seconds only) from the response headers.
+    fn retry_after(&self) -> Option<Duration> {
+        self.headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .map(Duration::from_secs)
+    }
+}
+
+/// Typed error for transient SRP HTTP failures that should retry.
+/// Distinct from `AuthError` so the retry classifier can match on it.
+#[derive(Debug, thiserror::Error)]
+#[error("SRP transport error ({status}) at {step}")]
+struct SrpTransientError {
+    status: u16,
+    step: &'static str,
+    retry_after: Option<Duration>,
+}
+
+fn classify_srp_error(e: &anyhow::Error) -> RetryAction {
+    if let Some(t) = e.downcast_ref::<SrpTransientError>() {
+        return match t.retry_after {
+            Some(d) => RetryAction::RetryAfter(d),
+            None => RetryAction::Retry,
+        };
+    }
+    // reqwest network failures (no status) are transient; retry.
+    if let Some(rq) = e.downcast_ref::<reqwest::Error>() {
+        if rq.status().is_none() {
+            return RetryAction::Retry;
+        }
+    }
+    RetryAction::Abort
 }
 
 /// Abstracts the HTTP transport used by SRP authentication.
@@ -64,10 +113,12 @@ impl SrpTransport for Session {
     ) -> Result<SrpResponse> {
         let response = Self::post(self, url, body, headers).await?;
         let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let bytes = response.bytes().await?;
         Ok(SrpResponse {
             status,
             body: bytes.to_vec(),
+            headers,
         })
     }
 
@@ -332,12 +383,37 @@ pub async fn authenticate_srp(
 
     let init_url = format!("{}/signin/init", endpoints.auth);
     let init_body = init_body.to_string();
-    let response = transport
-        .post(&init_url, Some(&init_body), Some(init_headers))
-        .await?;
+    // First attempt reuses the pre-computed headers (they include the
+    // current scnt/session_id). Retries rebuild headers so any rotated
+    // values from a 5xx response are picked up.
+    let mut init_attempt_headers = Some(init_headers);
+    let response = srp_post(
+        transport,
+        "init",
+        &init_url,
+        &init_body,
+        &mut init_attempt_headers,
+        |sd| get_auth_headers(domain, client_id, sd, Some(&overrides)),
+    )
+    .await?;
 
+    if let Some(rscd) = check_rscd_from_headers(&response.headers) {
+        return Err(rscd_service_error(rscd, &response.text()).into());
+    }
+
+    // A 401 at /signin/init means Apple rejected the *session context*
+    // (stale scnt/cookies/client-id), not the password — SRP hasn't yet
+    // sent the M1 proof. Surface as a typed API error instead of
+    // FailedLogin so the caller doesn't tell the user their password is
+    // wrong when the real cause is a transient auth-CDN issue.
     if response.status == 401 {
-        return Err(AuthError::FailedLogin("Failed to initiate SRP authentication".into()).into());
+        return Err(AuthError::ApiError {
+            code: 401,
+            message:
+                "SRP init rejected (HTTP 401). Apple's auth session context is stale; retry shortly."
+                    .into(),
+        }
+        .into());
     }
     if !response.is_success() && response.status != 409 {
         let text = response.text();
@@ -446,15 +522,29 @@ pub async fn authenticate_srp(
         endpoints.auth
     );
     let complete_body = complete_body.to_string();
-    let response = transport
-        .post(&complete_url, Some(&complete_body), Some(complete_headers))
-        .await?;
+    let mut complete_attempt_headers = Some(complete_headers);
+    let response = srp_post(
+        transport,
+        "complete",
+        &complete_url,
+        &complete_body,
+        &mut complete_attempt_headers,
+        |sd| get_auth_headers(domain, client_id, sd, Some(&overrides)),
+    )
+    .await?;
+
+    if let Some(rscd) = check_rscd_from_headers(&response.headers) {
+        return Err(rscd_service_error(rscd, &response.text()).into());
+    }
 
     if response.status == 409 {
         // 409 is Apple's signal that credentials are valid but 2FA is needed
         tracing::debug!("SRP complete returned 409: two-factor authentication required");
         return Ok(());
     } else if response.status == 412 {
+        // /repair/complete uses the same session context; `transport.post`
+        // calls `extract_and_save` on every response, so session_data here
+        // reflects any scnt/session_id rotated by the failing complete call.
         tracing::debug!("SRP complete returned 412: attempting repair");
         let repair_headers = get_auth_headers(domain, client_id, transport.session_data(), None)?;
         let repair_url = format!("{}/repair/complete", endpoints.auth);
@@ -469,6 +559,7 @@ pub async fn authenticate_srp(
             .into());
         }
     } else if response.is_server_error() {
+        // Retries already exhausted by srp_post; this is a persistent 5xx.
         let status = response.status;
         let body = response.text();
         let detail = if body.contains('<') {
@@ -477,12 +568,36 @@ pub async fn authenticate_srp(
         } else {
             format!(": {body}")
         };
-        return Err(AuthError::FailedLogin(format!(
-            "Apple returned HTTP {status}{detail} — this is usually a temporary \
-             Apple server issue, try again in a few minutes"
-        ))
+        return Err(AuthError::ApiError {
+            code: status,
+            message: format!(
+                "Apple returned HTTP {status}{detail} — this is usually a temporary \
+                 Apple server issue, try again in a few minutes"
+            ),
+        }
         .into());
-    } else if response.is_client_error() {
+    } else if response.status == 400 {
+        // 400 means Apple rejected the SRP payload as malformed. That is
+        // either a kei bug or a protocol change on Apple's side — never a
+        // wrong password. Surface verbatim so we don't mislead the user.
+        let body = response.text();
+        let detail = if body.contains('<') {
+            String::new()
+        } else {
+            format!(": {body}")
+        };
+        return Err(AuthError::ApiError {
+            code: 400,
+            message: format!(
+                "Apple rejected the SRP payload as malformed (HTTP 400){detail}. \
+                 This usually indicates a kei bug or an Apple auth protocol change."
+            ),
+        }
+        .into());
+    } else if response.status == 401 {
+        // 401 at /signin/complete means Apple's SRP M1 verification failed —
+        // the password does not match. This is the one branch that can
+        // confidently blame the credentials.
         let body = response.text();
         let detail = if body.contains('<') {
             String::new()
@@ -492,9 +607,121 @@ pub async fn authenticate_srp(
         return Err(
             AuthError::FailedLogin(format!("Invalid email/password combination{detail}")).into(),
         );
+    } else if response.status == 429 {
+        // srp_post only retries up to max_retries; after that, 429 lands
+        // here. Map to ApiError so `is_rate_limited()` detects it via the
+        // HTTP-503 path? No -- 429 is rate-limited too but the existing
+        // helper keys on 503. Surface with an actionable message.
+        return Err(AuthError::ApiError {
+            code: 429,
+            message:
+                "Apple is rate limiting authentication (HTTP 429). Wait a few minutes and retry."
+                    .into(),
+        }
+        .into());
+    } else if response.is_client_error() {
+        // Any other 4xx (403, 412 already handled, etc) — surface the raw
+        // status rather than attributing it to bad credentials. Apple's
+        // auth surface has historically returned 403 for rate limits,
+        // rotated routing cookies, and rarely even bad passwords; without
+        // a discriminating body we cannot tell which.
+        let status = response.status;
+        let body = response.text();
+        let detail = if body.contains('<') {
+            String::new()
+        } else {
+            format!(": {body}")
+        };
+        return Err(AuthError::ApiError {
+            code: status,
+            message: format!("SRP complete rejected by Apple (HTTP {status}){detail}"),
+        }
+        .into());
     }
 
     Ok(())
+}
+
+/// POST to an Apple SRP endpoint, retrying on transient 429/5xx responses.
+///
+/// The first call uses `prebuilt_headers` so the caller's carefully-ordered
+/// header map (with Origin/Referer overrides) is preserved. Retries call
+/// `rebuild_headers` against the latest `session_data`, since Apple rotates
+/// `scnt`/`session_id` on many responses and the retry would otherwise carry
+/// stale values.
+///
+/// After the retry budget is exhausted, the last response is returned as
+/// `Ok`; the caller's status-match sees the lingering 429/5xx and produces
+/// the user-facing `AuthError`.
+async fn srp_post<F>(
+    transport: &mut impl SrpTransport,
+    step: &'static str,
+    url: &str,
+    body: &str,
+    prebuilt_headers: &mut Option<HeaderMap>,
+    rebuild_headers: F,
+) -> Result<SrpResponse>
+where
+    F: Fn(&HashMap<String, String>) -> Result<HeaderMap>,
+{
+    let total_attempts = SRP_RETRY_CONFIG.max_retries.saturating_add(1);
+    let mut last_transient: Option<SrpResponse> = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..total_attempts {
+        let headers = if let Some(h) = prebuilt_headers.take() {
+            h
+        } else {
+            rebuild_headers(transport.session_data())?
+        };
+        match transport.post(url, Some(body), Some(headers)).await {
+            Ok(resp) => {
+                let status = resp.status;
+                let is_transient = status == 429 || resp.is_server_error();
+                if !is_transient {
+                    return Ok(resp);
+                }
+                let is_last = attempt + 1 >= total_attempts;
+                if is_last {
+                    // Surface the actual response so the caller's existing
+                    // status-match produces the end-user error message.
+                    return Ok(resp);
+                }
+                let delay = match resp.retry_after() {
+                    Some(d) => d.min(Duration::from_secs(SRP_RETRY_CONFIG.max_delay_secs)),
+                    None => SRP_RETRY_CONFIG.delay_for_retry(attempt),
+                };
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    total_attempts,
+                    status,
+                    retry_delay_secs = delay.as_secs(),
+                    "SRP {step}: transient HTTP failure, retrying"
+                );
+                last_transient = Some(resp);
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => {
+                let is_last = attempt + 1 >= total_attempts;
+                if is_last || classify_srp_error(&e) == RetryAction::Abort {
+                    return Err(e);
+                }
+                let delay = SRP_RETRY_CONFIG.delay_for_retry(attempt);
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    total_attempts,
+                    error = %e,
+                    retry_delay_secs = delay.as_secs(),
+                    "SRP {step}: network error, retrying"
+                );
+                last_err = Some(e);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    if let Some(resp) = last_transient {
+        return Ok(resp);
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("SRP {step}: retry loop exhausted")))
 }
 
 #[cfg(test)]
@@ -607,12 +834,25 @@ mod tests {
         .unwrap()
     }
 
+    fn response(status: u16, body: Vec<u8>) -> SrpResponse {
+        SrpResponse {
+            status,
+            body,
+            headers: HeaderMap::new(),
+        }
+    }
+
+    fn response_with_headers(status: u16, body: Vec<u8>, headers: HeaderMap) -> SrpResponse {
+        SrpResponse {
+            status,
+            body,
+            headers,
+        }
+    }
+
     /// A valid SRP init response with B = 2 (non-zero mod N).
     fn valid_init_response() -> SrpResponse {
-        SrpResponse {
-            status: 200,
-            body: srp_init_body(&BASE64.encode([2u8])),
-        }
+        response(200, srp_init_body(&BASE64.encode([2u8])))
     }
 
     struct StubSrpTransport {
@@ -652,106 +892,138 @@ mod tests {
         authenticate_srp(&mut t, &ep, "u@test.com", "p", "c", "com").await
     }
 
+    /// 401 at /signin/init is not a bad-password signal — Apple hasn't yet
+    /// verified the M1 proof. Expect a typed `ApiError` so the caller doesn't
+    /// tell the user their password is wrong for a transient auth-CDN issue.
     #[tokio::test]
-    async fn srp_init_401_returns_failed_login() {
-        let err = run_srp(vec![SrpResponse {
-            status: 401,
-            body: vec![],
-        }])
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("Failed to initiate SRP"));
+    async fn srp_init_401_returns_api_error_not_failed_login() {
+        let err = run_srp(vec![response(401, vec![])]).await.unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        assert!(
+            matches!(auth_err, AuthError::ApiError { code: 401, .. }),
+            "expected ApiError {{ code: 401 }}, got: {auth_err:?}"
+        );
+        assert!(
+            !matches!(auth_err, AuthError::FailedLogin(_)),
+            "401 on init must NOT be FailedLogin (would blame password)"
+        );
     }
 
-    #[tokio::test]
-    async fn srp_init_500_returns_api_error() {
-        let err = run_srp(vec![SrpResponse {
-            status: 500,
-            body: b"server error".to_vec(),
-        }])
+    /// srp_post retries transient 5xx until the budget is exhausted, then
+    /// surfaces an ApiError carrying the final status.
+    #[tokio::test(start_paused = true)]
+    async fn srp_init_500_retries_then_returns_api_error() {
+        let err = run_srp(vec![
+            response(500, b"server error".to_vec()),
+            response(500, b"server error".to_vec()),
+            response(500, b"server error".to_vec()),
+        ])
         .await
         .unwrap_err();
         let auth_err = err.downcast_ref::<AuthError>().unwrap();
         assert!(matches!(auth_err, AuthError::ApiError { code: 500, .. }));
     }
 
+    /// A 503 that recovers on retry should succeed, proving the retry budget
+    /// is actually being used.
+    #[tokio::test(start_paused = true)]
+    async fn srp_init_503_retries_then_succeeds() {
+        run_srp(vec![
+            response(503, b"unavailable".to_vec()),
+            valid_init_response(),
+            response(200, vec![]),
+        ])
+        .await
+        .unwrap();
+    }
+
+    /// Apple's `X-Apple-I-Rscd: 401/403` header means "session rejected" even
+    /// when the HTTP status is 200. SRP must detect this so a hidden rejection
+    /// surfaces as a ServiceError rather than being treated as a valid handshake.
     #[tokio::test]
-    async fn srp_init_invalid_json_returns_parse_error() {
-        let err = run_srp(vec![SrpResponse {
-            status: 200,
-            body: b"not json".to_vec(),
-        }])
+    async fn srp_init_rscd_401_on_http_200_is_service_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Apple-I-Rscd", HeaderValue::from_static("401"));
+        let err = run_srp(vec![response_with_headers(
+            200,
+            srp_init_body(&BASE64.encode([2u8])),
+            headers,
+        )])
         .await
         .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        match auth_err {
+            AuthError::ServiceError { code, .. } => assert_eq!(code, "rscd_401"),
+            other => panic!("expected rscd ServiceError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srp_complete_rscd_403_on_http_200_is_service_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Apple-I-Rscd", HeaderValue::from_static("403"));
+        let err = run_srp(vec![
+            valid_init_response(),
+            response_with_headers(200, vec![], headers),
+        ])
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        match auth_err {
+            AuthError::ServiceError { code, .. } => assert_eq!(code, "rscd_403"),
+            other => panic!("expected rscd ServiceError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srp_init_invalid_json_returns_parse_error() {
+        let err = run_srp(vec![response(200, b"not json".to_vec())])
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("SRP init: expected JSON"));
     }
 
     #[tokio::test]
     async fn srp_b_mod_n_zero_returns_error() {
-        let err = run_srp(vec![SrpResponse {
-            status: 200,
-            body: srp_init_body(&BASE64.encode([0u8])),
-        }])
-        .await
-        .unwrap_err();
+        let err = run_srp(vec![response(200, srp_init_body(&BASE64.encode([0u8])))])
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("B mod N is zero"));
     }
 
     #[tokio::test]
     async fn srp_happy_path() {
-        run_srp(vec![
-            valid_init_response(),
-            SrpResponse {
-                status: 200,
-                body: vec![],
-            },
-        ])
-        .await
-        .unwrap();
+        run_srp(vec![valid_init_response(), response(200, vec![])])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn srp_complete_409_signals_2fa_required() {
-        run_srp(vec![
-            valid_init_response(),
-            SrpResponse {
-                status: 409,
-                body: vec![],
-            },
-        ])
-        .await
-        .unwrap();
+        run_srp(vec![valid_init_response(), response(409, vec![])])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn srp_complete_412_repair_succeeds() {
         run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 412,
-                body: vec![],
-            },
-            SrpResponse {
-                status: 200,
-                body: vec![],
-            },
+            response(412, vec![]),
+            response(200, vec![]),
         ])
         .await
         .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn srp_complete_412_repair_fails() {
+        // Repair itself gets the retry budget (3 attempts) since it goes
+        // through srp_post-style transport.post; here all three return 500.
         let err = run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 412,
-                body: vec![],
-            },
-            SrpResponse {
-                status: 500,
-                body: b"repair broken".to_vec(),
-            },
+            response(412, vec![]),
+            response(500, b"repair broken".to_vec()),
         ])
         .await
         .unwrap_err();
@@ -759,33 +1031,112 @@ mod tests {
         assert!(matches!(auth_err, AuthError::ApiError { code: 412, .. }));
     }
 
+    /// 401 at /signin/complete IS a password rejection (SRP's M1 verification
+    /// failed). This is the one branch that may legitimately say "wrong password".
     #[tokio::test]
-    async fn srp_complete_client_error_returns_failed_login() {
+    async fn srp_complete_401_is_failed_login() {
         let err = run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 403,
-                body: b"forbidden".to_vec(),
-            },
+            response(401, b"wrong".to_vec()),
         ])
         .await
         .unwrap_err();
         let auth_err = err.downcast_ref::<AuthError>().unwrap();
-        assert!(matches!(auth_err, AuthError::FailedLogin(_)));
+        assert!(
+            matches!(auth_err, AuthError::FailedLogin(_)),
+            "401 on complete should be FailedLogin, got: {auth_err:?}"
+        );
     }
 
+    /// 403 at /signin/complete should NOT be mis-attributed to bad password.
+    /// Apple returns 403 for rate limits, rotated routing cookies, and more.
     #[tokio::test]
-    async fn srp_complete_server_error_returns_failed_login() {
+    async fn srp_complete_403_is_api_error_not_failed_login() {
         let err = run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 502,
-                body: b"bad gateway".to_vec(),
-            },
+            response(403, b"forbidden".to_vec()),
         ])
         .await
         .unwrap_err();
         let auth_err = err.downcast_ref::<AuthError>().unwrap();
-        assert!(matches!(auth_err, AuthError::FailedLogin(_)));
+        assert!(
+            matches!(auth_err, AuthError::ApiError { code: 403, .. }),
+            "403 on complete must be ApiError, not FailedLogin, got: {auth_err:?}"
+        );
+    }
+
+    /// 429 at /signin/complete must be reported as rate-limited, not as a
+    /// password failure. Retries inside srp_post handle transient cases; this
+    /// path covers exhaustion.
+    #[tokio::test(start_paused = true)]
+    async fn srp_complete_429_is_rate_limited_api_error() {
+        let err = run_srp(vec![
+            valid_init_response(),
+            response(429, b"too many".to_vec()),
+            response(429, b"too many".to_vec()),
+            response(429, b"too many".to_vec()),
+        ])
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        assert!(
+            matches!(auth_err, AuthError::ApiError { code: 429, .. }),
+            "429 on complete must be ApiError(429), got: {auth_err:?}"
+        );
+    }
+
+    /// 400 at /signin/complete signals a malformed payload — kei bug or
+    /// Apple protocol change. Never a wrong password.
+    #[tokio::test]
+    async fn srp_complete_400_is_api_error() {
+        let err = run_srp(vec![
+            valid_init_response(),
+            response(400, b"bad request".to_vec()),
+        ])
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        match auth_err {
+            AuthError::ApiError { code: 400, message } => {
+                assert!(
+                    message.to_lowercase().contains("malformed")
+                        || message.to_lowercase().contains("400"),
+                    "expected explanatory 400 message, got: {message}"
+                );
+            }
+            other => panic!("expected ApiError(400), got: {other:?}"),
+        }
+    }
+
+    /// Persistent 5xx after retry exhaustion is surfaced as ApiError (not
+    /// FailedLogin, which is the bug this PR fixes).
+    #[tokio::test(start_paused = true)]
+    async fn srp_complete_server_error_returns_api_error() {
+        let err = run_srp(vec![
+            valid_init_response(),
+            response(502, b"bad gateway".to_vec()),
+            response(502, b"bad gateway".to_vec()),
+            response(502, b"bad gateway".to_vec()),
+        ])
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        assert!(
+            matches!(auth_err, AuthError::ApiError { code: 502, .. }),
+            "5xx after retries must be ApiError, got: {auth_err:?}"
+        );
+    }
+
+    /// Transient 503 on complete that recovers within the retry budget
+    /// should succeed rather than surfacing an error.
+    #[tokio::test(start_paused = true)]
+    async fn srp_complete_503_retries_then_succeeds() {
+        run_srp(vec![
+            valid_init_response(),
+            response(503, b"unavailable".to_vec()),
+            response(200, vec![]),
+        ])
+        .await
+        .unwrap();
     }
 }

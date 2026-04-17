@@ -106,13 +106,19 @@ impl PhotoLibrary {
                 if http_err.status == 421 {
                     return ICloudError::MisdirectedRequest;
                 }
-                // HTTP 403 is the classic ADP signature: account authenticated
-                // fine but iCloud data access is blocked.
+                // HTTP 403 has many causes: rate limits, stale sessions, rotated
+                // routing cookies, and - in some cases - ADP. Genuine ADP is
+                // already surfaced earlier via (a) `i_cdp_enabled` in the auth
+                // response, which bails before we ever reach CloudKit, and
+                // (b) CloudKit body errors ZONE_NOT_FOUND / ACCESS_DENIED /
+                // AUTHENTICATION_FAILED, which classify_api_error maps to
+                // ServiceNotActivated above. Anything left is most often a
+                // session-state problem, so route it to SessionExpired and let
+                // the sync loop re-auth. If the 403 truly is ADP and persists,
+                // the AUTH_ERROR_THRESHOLD break in the download pipeline stops
+                // the sync instead of spamming retries.
                 if http_err.status == 403 {
-                    return ICloudError::ServiceNotActivated {
-                        code: "HTTP_403".into(),
-                        reason: "Forbidden — iCloud data access denied".into(),
-                    };
+                    return ICloudError::SessionExpired;
                 }
             }
             ICloudError::Connection(e.to_string())
@@ -398,6 +404,7 @@ mod tests {
             Err(crate::icloud::photos::session::HttpStatusError {
                 status: 403,
                 url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+                retry_after: None,
             }.into())
         }
 
@@ -407,7 +414,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_403_maps_to_service_not_activated() {
+    async fn http_403_maps_to_session_expired() {
+        // Bare HTTP 403 (without a CloudKit body error) has too many causes
+        // to assume ADP. Route it through SessionExpired so the sync loop
+        // re-authenticates once; genuine ADP is surfaced via `i_cdp_enabled`
+        // before we reach CloudKit, and CloudKit-body errors (ZONE_NOT_FOUND,
+        // ACCESS_DENIED) still map to ServiceNotActivated via `service_not_activated`.
         let err = PhotoLibrary::new(
             "https://example.com".into(),
             Arc::new(HashMap::new()),
@@ -423,13 +435,59 @@ mod tests {
         .unwrap_err();
 
         assert!(
+            matches!(err, ICloudError::SessionExpired),
+            "expected SessionExpired so sync_loop can re-auth, got: {err:?}"
+        );
+    }
+
+    /// Stub whose CloudKit body reports an `ACCESS_DENIED` service error.
+    /// These are the ADP-class signals; they should still produce a clear
+    /// `ServiceNotActivated` error with the ADP guidance message.
+    struct AccessDeniedBodySession;
+
+    #[async_trait::async_trait]
+    impl PhotosSession for AccessDeniedBodySession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            Ok(json!({
+                "serverErrorCode": "ACCESS_DENIED",
+                "reason": "private db access disabled for this account",
+            }))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(AccessDeniedBodySession)
+        }
+    }
+
+    #[tokio::test]
+    async fn cloudkit_access_denied_still_maps_to_service_not_activated() {
+        let err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(AccessDeniedBodySession),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
             matches!(err, ICloudError::ServiceNotActivated { .. }),
-            "expected ServiceNotActivated, got: {err:?}"
+            "ADP body signal must still surface ServiceNotActivated, got: {err:?}"
         );
         let display = err.to_string();
         assert!(
             display.contains("Advanced Data Protection"),
-            "expected ADP guidance in message, got: {display}"
+            "expected ADP guidance, got: {display}"
         );
     }
 
@@ -448,6 +506,7 @@ mod tests {
             Err(crate::icloud::photos::session::HttpStatusError {
                 status: 401,
                 url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+                retry_after: None,
             }.into())
         }
 
@@ -494,6 +553,7 @@ mod tests {
             Err(crate::icloud::photos::session::HttpStatusError {
                 status: 421,
                 url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+                retry_after: None,
             }.into())
         }
 

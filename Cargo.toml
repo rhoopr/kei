@@ -107,6 +107,9 @@ http = "1"
 wiremock = "0.6"
 tracing-test = "0.2"
 sha1 = "0.10"
+# test-util enables `tokio::test(start_paused = true)` so retry/backoff
+# tests in the auth layer don't sleep through real wall-clock delays.
+tokio = { version = "1", features = ["test-util"] }
 
 [[test]]
 name = "cli"
