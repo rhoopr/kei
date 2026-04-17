@@ -20,6 +20,7 @@ pub(crate) struct TomlConfig {
     pub photos: Option<TomlPhotos>,
     pub watch: Option<TomlWatch>,
     pub notifications: Option<TomlNotifications>,
+    pub metrics: Option<TomlMetrics>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -92,6 +93,12 @@ pub(crate) struct TomlWatch {
     pub interval: Option<u64>,
     pub notify_systemd: Option<bool>,
     pub pid_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TomlMetrics {
+    pub port: Option<u16>,
 }
 
 /// Load a TOML config file. Returns `Ok(None)` if the file doesn't exist
@@ -206,6 +213,7 @@ pub struct Config {
 
     // 2-byte primitives
     pub threads_num: u16,
+    pub metrics_port: Option<u16>,
 
     // 1-byte enums
     pub size: VersionSize,
@@ -481,6 +489,7 @@ impl Config {
         let toml_filters = toml.as_ref().and_then(|t| t.filters.as_ref());
         let toml_photos = toml.as_ref().and_then(|t| t.photos.as_ref());
         let toml_watch = toml.as_ref().and_then(|t| t.watch.as_ref());
+        let toml_metrics = toml.as_ref().and_then(|t| t.metrics.as_ref());
 
         // Download
         let directory = sync
@@ -666,6 +675,11 @@ impl Config {
         // JSON report
         let report_json = sync.report_json;
 
+        // Prometheus metrics port — CLI takes precedence over TOML.
+        let metrics_port = sync
+            .metrics_port
+            .or_else(|| toml_metrics.and_then(|m| m.port));
+
         if skip_videos && skip_photos && live_photo_mode == LivePhotoMode::Skip {
             tracing::warn!(
                 "All media types are being skipped (--skip-videos, --skip-photos, \
@@ -691,6 +705,7 @@ impl Config {
             pid_file,
             notification_script,
             report_json,
+            metrics_port,
             watch_with_interval,
             retry_delay_secs,
             recent,
@@ -868,6 +883,9 @@ impl Config {
                 .map(|s| TomlNotifications {
                     script: Some(s.display().to_string()),
                 }),
+            metrics: self
+                .metrics_port
+                .map(|port| TomlMetrics { port: Some(port) }),
         }
     }
 }
@@ -936,6 +954,7 @@ pub(crate) fn persist_first_run_config(
         photos: None,
         watch: None,
         notifications: None,
+        metrics: None,
     };
 
     // Don't write if there's nothing meaningful to persist
@@ -1909,6 +1928,69 @@ mod tests {
         assert_eq!(w.interval, Some(1800));
         assert_eq!(w.notify_systemd, Some(true));
         assert_eq!(w.pid_file.as_deref(), Some("/run/test.pid"));
+    }
+
+    #[test]
+    fn test_toml_metrics_port_parsed() {
+        let toml_str = r#"
+            [metrics]
+            port = 9090
+        "#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.metrics.unwrap().port, Some(9090));
+    }
+
+    #[test]
+    fn test_toml_metrics_port_resolves_in_config() {
+        let toml_str = r#"
+            [auth]
+            username = "user@example.com"
+            [download]
+            directory = "/photos"
+            [metrics]
+            port = 9090
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(config.metrics_port, Some(9090));
+    }
+
+    #[test]
+    fn test_cli_metrics_port_overrides_toml() {
+        let toml_str = r#"
+            [auth]
+            username = "user@example.com"
+            [download]
+            directory = "/photos"
+            [metrics]
+            port = 9090
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.metrics_port = Some(8080);
+        let config =
+            Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(config.metrics_port, Some(8080));
+    }
+
+    #[test]
+    fn test_toml_metrics_unknown_field_rejected() {
+        let toml_str = r#"
+            [metrics]
+            port = 9090
+            unknown_field = true
+        "#;
+        let result: Result<TomlConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "unknown fields in [metrics] should be rejected"
+        );
     }
 
     // ── TOML file loading from disk ────────────────────────────────
@@ -3164,6 +3246,7 @@ mod tests {
             photos: None,
             watch: None,
             notifications: None,
+            metrics: None,
         };
         let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/data"));
@@ -3187,6 +3270,7 @@ mod tests {
             photos: None,
             watch: None,
             notifications: None,
+            metrics: None,
         };
         let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/cookies"));
@@ -3209,6 +3293,7 @@ mod tests {
             photos: None,
             watch: None,
             notifications: None,
+            metrics: None,
         };
         let result = resolve_data_dir(
             Some("/cli/data"),

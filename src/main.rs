@@ -15,6 +15,7 @@ mod credential;
 mod download;
 mod health;
 mod icloud;
+mod metrics;
 mod migration;
 mod notifications;
 mod password;
