@@ -446,7 +446,22 @@ pub async fn send_2fa_push(
             domain,
         )
         .await?;
-        let account_data = twofa::authenticate_with_token(&mut session, &endpoints).await?;
+        let account_data = match twofa::authenticate_with_token(&mut session, &endpoints).await {
+            Ok(d) => d,
+            Err(e)
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_misdirected_request()) =>
+            {
+                tracing::warn!(
+                    error = %e,
+                    "accountLogin returned 421 Misdirected Request after SRP; \
+                     resetting HTTP pool and retrying once"
+                );
+                session.reset_http_clients()?;
+                twofa::authenticate_with_token(&mut session, &endpoints).await?
+            }
+            Err(e) => return Err(e),
+        };
         data = Some(account_data);
     }
 
