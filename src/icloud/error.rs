@@ -33,6 +33,16 @@ pub enum ICloudError {
     Json(Box<serde_json::Error>),
 }
 
+impl ICloudError {
+    /// True if the error means kei should invalidate the session cache, force
+    /// SRP re-authentication, and retry. Both `SessionExpired` (CloudKit 401)
+    /// and `MisdirectedRequest` (persistent CloudKit 421) typically indicate
+    /// stale session routing state that only SRP can re-mint.
+    pub fn is_session_error(&self) -> bool {
+        matches!(self, Self::SessionExpired | Self::MisdirectedRequest)
+    }
+}
+
 impl From<reqwest::Error> for ICloudError {
     fn from(e: reqwest::Error) -> Self {
         Self::Http(Box::new(e))
@@ -128,5 +138,21 @@ mod tests {
         );
         let display = err.to_string();
         assert!(display.contains("401"), "display mentions 401: {display}");
+    }
+
+    #[test]
+    fn is_session_error_true_for_session_expired_and_misdirected() {
+        assert!(ICloudError::SessionExpired.is_session_error());
+        assert!(ICloudError::MisdirectedRequest.is_session_error());
+    }
+
+    #[test]
+    fn is_session_error_false_for_other_variants() {
+        assert!(!ICloudError::Connection("x".into()).is_session_error());
+        assert!(!ICloudError::ServiceNotActivated {
+            code: "ADP".into(),
+            reason: "y".into()
+        }
+        .is_session_error());
     }
 }
