@@ -31,6 +31,37 @@ pub struct SrpInitResponse {
     pub protocol: String,
 }
 
+/// Subset of Apple's `/signin/complete` 409 body used to detect FIDO/WebAuthn
+/// security-key requirements. When `fsa_challenge` is present or `key_names`
+/// is non-empty, the account requires a security-key tap that kei can't
+/// perform headless. Sessions minted through this flow get rejected by
+/// CloudKit with "no auth method found" (issue #221), so we bail early.
+///
+/// Other 2FA-challenge fields (`trustedDevices`, `trustedPhoneNumbers`,
+/// `securityCode`) are ignored here — they're handled further down the
+/// existing 2FA prompt path.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TwoFactorChallenge {
+    /// Present iff Apple is asking for a FIDO/WebAuthn assertion.
+    /// The object's internals (challenge, keyHandles, rpId) are not
+    /// inspected — presence alone is the signal.
+    #[serde(default)]
+    pub fsa_challenge: Option<Value>,
+    /// Human-readable names of registered security keys, e.g.
+    /// `["YubiKey 5C"]`. Surfaced verbatim so the user can identify
+    /// which keys to remove.
+    #[serde(default)]
+    pub key_names: Vec<String>,
+}
+
+impl TwoFactorChallenge {
+    /// True if Apple's 2FA challenge includes a FIDO/WebAuthn assertion.
+    pub(crate) fn requires_fido(&self) -> bool {
+        self.fsa_challenge.is_some() || !self.key_names.is_empty()
+    }
+}
+
 /// An error entry from Apple's `service_errors` array.
 /// Apple auth APIs sometimes return HTTP 200 with error details in the body
 /// instead of using HTTP status codes.
@@ -123,6 +154,65 @@ pub(crate) struct WebserviceEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_factor_challenge_detects_fsa_challenge() {
+        let json = r#"{
+            "trustedDevices": [],
+            "authType": "hsa2",
+            "fsaChallenge": {
+                "challenge": "abc123",
+                "keyHandles": ["handle-1"],
+                "rpId": "apple.com"
+            },
+            "keyNames": ["YubiKey 5C"]
+        }"#;
+        let parsed: TwoFactorChallenge = serde_json::from_str(json).unwrap();
+        assert!(parsed.requires_fido());
+        assert_eq!(parsed.key_names, vec!["YubiKey 5C".to_string()]);
+    }
+
+    #[test]
+    fn two_factor_challenge_detects_key_names_without_fsa_challenge() {
+        // Defensive: Apple could send keyNames without fsaChallenge in some
+        // flow we haven't seen; still treat as FIDO.
+        let json = r#"{"keyNames": ["YubiKey 5C", "Passkey-Home"]}"#;
+        let parsed: TwoFactorChallenge = serde_json::from_str(json).unwrap();
+        assert!(parsed.requires_fido());
+        assert_eq!(parsed.key_names.len(), 2);
+    }
+
+    #[test]
+    fn two_factor_challenge_ignores_device_only_2fa() {
+        // A normal HSA2 challenge (no security keys) must NOT match.
+        let json = r#"{
+            "trustedDevices": [{"id": "d1"}],
+            "trustedPhoneNumbers": [{"id": 1, "numberWithDialCode": "+1 •••-•••-1234"}],
+            "authType": "hsa2",
+            "securityCode": {"length": 6}
+        }"#;
+        let parsed: TwoFactorChallenge = serde_json::from_str(json).unwrap();
+        assert!(!parsed.requires_fido());
+        assert!(parsed.key_names.is_empty());
+    }
+
+    #[test]
+    fn two_factor_challenge_defaults_on_missing_fields() {
+        // Minimal body must deserialize cleanly and report no FIDO.
+        let parsed: TwoFactorChallenge = serde_json::from_str("{}").unwrap();
+        assert!(!parsed.requires_fido());
+    }
+
+    #[test]
+    fn two_factor_challenge_handles_empty_body_via_default() {
+        // The SRP handler calls `.unwrap_or_default()` when the 409 body
+        // isn't valid JSON. The default must report no FIDO so a transient
+        // parse miss doesn't incorrectly bail a legitimate device-push
+        // 2FA flow.
+        let parsed = TwoFactorChallenge::default();
+        assert!(!parsed.requires_fido());
+        assert!(parsed.key_names.is_empty());
+    }
 
     #[test]
     fn test_srp_init_response_deserialize() {

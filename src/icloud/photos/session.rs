@@ -67,10 +67,16 @@ impl PhotosSession for reqwest::Client {
                     );
                 }
             }
+            let preserved = if resp_body.is_empty() {
+                None
+            } else {
+                Some(truncate_body(&resp_body))
+            };
             return Err(HttpStatusError {
                 status: status.as_u16(),
                 url,
                 retry_after,
+                body: preserved,
             }
             .into());
         }
@@ -110,12 +116,38 @@ impl PhotosSession for crate::auth::SharedSession {
 /// `retry_after` is populated from the `Retry-After` response header when
 /// present, so callers can honor the server-provided delay on 429/503
 /// instead of falling back to exponential backoff alone.
+///
+/// `body` carries a truncated copy of the response body so downstream
+/// error mapping (e.g. detecting "no auth method found" in a CloudKit 401
+/// that typically indicates FIDO/security keys on the account) can read
+/// the payload without re-requesting. Truncated to keep memory bounded
+/// when CloudKit occasionally returns large HTML error pages.
 #[derive(Debug, thiserror::Error)]
 #[error("HTTP {status} for {url}")]
 pub(crate) struct HttpStatusError {
     pub status: u16,
     pub url: String,
     pub retry_after: Option<Duration>,
+    pub body: Option<String>,
+}
+
+/// Maximum number of bytes preserved from an HTTP error body. Apple's
+/// CloudKit error JSON is typically a few hundred bytes; HTML error pages
+/// and stack traces are occasionally much larger. Cap it so a degenerate
+/// response can't bloat the error path.
+const MAX_PRESERVED_BODY: usize = 1024;
+
+/// Shorten `body` to at most `MAX_PRESERVED_BODY` bytes without splitting
+/// a multi-byte UTF-8 character.
+fn truncate_body(body: &str) -> String {
+    if body.len() <= MAX_PRESERVED_BODY {
+        return body.to_string();
+    }
+    let mut end = MAX_PRESERVED_BODY;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &body[..end])
 }
 
 /// `CloudKit` server error codes that indicate a transient condition.
@@ -862,6 +894,7 @@ mod tests {
             status: 503,
             url: "https://example.com".to_string(),
             retry_after: None,
+            body: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Retry));
     }
@@ -872,6 +905,7 @@ mod tests {
             status: 429,
             url: "https://example.com".to_string(),
             retry_after: None,
+            body: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Retry));
     }
@@ -882,6 +916,7 @@ mod tests {
             status: 429,
             url: "https://example.com".to_string(),
             retry_after: Some(Duration::from_secs(7)),
+            body: None,
         });
         match classify_api_error(&err) {
             RetryAction::RetryAfter(d) => assert_eq!(d, Duration::from_secs(7)),
@@ -895,6 +930,7 @@ mod tests {
             status: 503,
             url: "https://example.com".to_string(),
             retry_after: Some(Duration::from_secs(2)),
+            body: None,
         });
         match classify_api_error(&err) {
             RetryAction::RetryAfter(d) => assert_eq!(d, Duration::from_secs(2)),
@@ -908,6 +944,7 @@ mod tests {
             status: 401,
             url: "https://example.com".to_string(),
             retry_after: None,
+            body: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Abort));
     }
@@ -918,7 +955,180 @@ mod tests {
             status: 403,
             url: "https://example.com".to_string(),
             retry_after: None,
+            body: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Abort));
+    }
+
+    #[test]
+    fn truncate_body_leaves_short_bodies_unchanged() {
+        let body = r#"{"serverErrorCode":"AUTHENTICATION_FAILED","reason":"no auth method found"}"#;
+        assert_eq!(truncate_body(body), body);
+    }
+
+    #[test]
+    fn truncate_body_clips_oversized_bodies() {
+        let body = "x".repeat(MAX_PRESERVED_BODY * 2);
+        let out = truncate_body(&body);
+        assert!(
+            out.len() <= MAX_PRESERVED_BODY + 4,
+            "truncated body must stay under the cap plus the marker, got len {}",
+            out.len()
+        );
+        assert!(
+            out.ends_with('…'),
+            "truncation marker must be appended to signal the clip"
+        );
+    }
+
+    #[test]
+    fn truncate_body_respects_utf8_boundaries() {
+        // Multi-byte chars must not be split — pad with a 3-byte char so
+        // the naive byte-slice would land in the middle.
+        let mut body = "a".repeat(MAX_PRESERVED_BODY - 1);
+        body.push('€'); // 3 bytes: 0xE2 0x82 0xAC
+        body.push_str(&"b".repeat(MAX_PRESERVED_BODY));
+        let out = truncate_body(&body);
+        // Must be valid UTF-8 (the format! call would panic otherwise).
+        assert!(out.is_char_boundary(out.len() - '…'.len_utf8()));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // wiremock-based tests: exercise the real reqwest path through
+    // `PhotosSession::post` to prove that CloudKit error bodies
+    // actually end up on `HttpStatusError.body`. The unit-level tests
+    // above only cover `truncate_body`; these tests close the loop
+    // between "server returned a body" and "caller can read it".
+    // ────────────────────────────────────────────────────────────────
+
+    use wiremock::matchers::method as wm_method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The FIDO failure mode from issue #221: CloudKit returns 401 with
+    /// `"no auth method found"` in the JSON body. A real reqwest client
+    /// posting to a wiremock endpoint must surface that body on the
+    /// resulting `HttpStatusError` so the library.rs mapping can log
+    /// the security-key hint.
+    #[tokio::test]
+    async fn wiremock_401_preserves_body_in_http_status_error() {
+        let server = MockServer::start().await;
+        let body = r#"{"serverErrorCode":"AUTHENTICATION_FAILED","reason":"no auth method found"}"#;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await
+        .expect_err("401 must propagate as an error");
+        let http_err = err
+            .downcast_ref::<HttpStatusError>()
+            .expect("expected HttpStatusError");
+        assert_eq!(http_err.status, 401);
+        let preserved = http_err
+            .body
+            .as_deref()
+            .expect("401 body must be preserved for downstream FIDO/auth diagnostics");
+        assert!(
+            preserved.contains("no auth method found"),
+            "preserved body must include the FIDO-indicating signal, got: {preserved}"
+        );
+    }
+
+    /// A 503 body (transient error) is preserved too, so the retry
+    /// path's warnings can include server-provided detail. Guards
+    /// against a refactor that accidentally scopes body preservation
+    /// to 401 only.
+    #[tokio::test]
+    async fn wiremock_5xx_preserves_body_in_http_status_error() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("service unavailable"))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await
+        .expect_err("503 must propagate as an error");
+        let http_err = err.downcast_ref::<HttpStatusError>().unwrap();
+        assert_eq!(http_err.status, 503);
+        assert_eq!(http_err.body.as_deref(), Some("service unavailable"));
+    }
+
+    /// An empty error body yields `body: None`, not `Some("")`. Guards
+    /// the downstream check `http_err.body.as_deref()` from having to
+    /// special-case "" vs absent.
+    #[tokio::test]
+    async fn wiremock_empty_body_stays_none() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(403)) // no body
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await
+        .expect_err("403 must propagate");
+        let http_err = err.downcast_ref::<HttpStatusError>().unwrap();
+        assert_eq!(http_err.status, 403);
+        assert!(
+            http_err.body.is_none(),
+            "empty response body must be None, not Some(\"\"), got: {:?}",
+            http_err.body
+        );
+    }
+
+    /// An oversized body is truncated with the `…` marker so a
+    /// pathological CloudKit response (HTML error page, stack trace)
+    /// can't blow up the error path.
+    #[tokio::test]
+    async fn wiremock_oversized_body_is_truncated() {
+        let server = MockServer::start().await;
+        let huge = "x".repeat(MAX_PRESERVED_BODY * 3);
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await
+        .expect_err("500 must propagate");
+        let http_err = err.downcast_ref::<HttpStatusError>().unwrap();
+        let preserved = http_err.body.as_deref().unwrap();
+        assert!(
+            preserved.ends_with('…'),
+            "oversized body must be clipped with the truncation marker, got (len {}): {}",
+            preserved.len(),
+            preserved
+        );
+        assert!(
+            preserved.len() <= MAX_PRESERVED_BODY + '…'.len_utf8(),
+            "truncated body must stay under the cap plus the marker, got len {}",
+            preserved.len()
+        );
     }
 }

@@ -1,5 +1,16 @@
 use thiserror::Error;
 
+/// Format an optional list of security-key names for display.
+/// Returns " (YubiKey 5C, Passkey-1)" when names are known, or an empty
+/// string when Apple did not disclose them.
+fn format_fido_keys(keys: &[String]) -> String {
+    if keys.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", keys.join(", "))
+    }
+}
+
 /// Custom error types for iCloud authentication.
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -20,6 +31,20 @@ pub enum AuthError {
 
     #[error("Two-factor authentication is required (no code provided)")]
     TwoFactorRequired,
+
+    /// The Apple ID has FIDO/WebAuthn hardware security keys registered.
+    /// Apple signals this via `fsaChallenge` / `keyNames` in the 2FA
+    /// challenge body. CloudKit rejects sessions minted through this path
+    /// with "no auth method found", so kei bails early rather than let the
+    /// user hit that downstream failure and loop through re-auth.
+    #[error(
+        "This Apple ID has FIDO/WebAuthn hardware security keys registered{}. \
+         kei does not yet support this authentication method (see issue #221).\n\n\
+         To use kei with this account, remove the security keys at:\n  \
+         Settings > Apple ID & iCloud > Sign-In & Security > Security Keys",
+        format_fido_keys(key_names)
+    )]
+    FidoNotSupported { key_names: Vec<String> },
 
     #[error("Session lock held by another instance: {0}")]
     LockContention(String),
@@ -387,6 +412,61 @@ mod tests {
         };
         assert!(err_503.is_transient_apple_failure());
         assert!(!err_503.is_misdirected_request());
+    }
+
+    #[test]
+    fn fido_not_supported_display_with_key_names() {
+        let err = AuthError::FidoNotSupported {
+            key_names: vec!["YubiKey 5C".into(), "Passkey-Home".into()],
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("YubiKey 5C"),
+            "display should name the registered key, got: {msg}"
+        );
+        assert!(
+            msg.contains("Passkey-Home"),
+            "display should list all keys, got: {msg}"
+        );
+        assert!(
+            msg.contains("#221"),
+            "display should reference the tracking issue, got: {msg}"
+        );
+        assert!(
+            msg.contains("Sign-In & Security"),
+            "display should point to the settings path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fido_not_supported_display_without_key_names() {
+        // Apple's response may omit keyNames (empty array) while still
+        // signaling FIDO via fsaChallenge. The message must still render
+        // cleanly without a trailing empty parenthesis.
+        let err = AuthError::FidoNotSupported { key_names: vec![] };
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("()"),
+            "empty key list should not render empty parens, got: {msg}"
+        );
+        assert!(
+            msg.contains("security keys registered"),
+            "base message must still be present, got: {msg}"
+        );
+        assert!(msg.contains("#221"), "issue link required, got: {msg}");
+    }
+
+    #[test]
+    fn fido_not_supported_is_not_transient() {
+        // FIDO detection is a terminal error: no amount of retry will help
+        // until the user removes the keys from their account.
+        let err = AuthError::FidoNotSupported {
+            key_names: vec!["YubiKey".into()],
+        };
+        assert!(!err.is_transient_apple_failure());
+        assert!(!err.is_misdirected_request());
+        assert!(!err.is_two_factor_required());
+        assert!(!err.is_lock_contention());
     }
 
     #[test]

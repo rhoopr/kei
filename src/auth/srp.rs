@@ -494,6 +494,23 @@ pub async fn authenticate_srp(
     }
 
     if response.status == 409 {
+        // The 409 body carries the 2FA challenge metadata. When the account
+        // has FIDO/WebAuthn security keys registered, Apple includes an
+        // `fsaChallenge` object (and usually a `keyNames` array). CloudKit
+        // rejects sessions minted through this flow with "no auth method
+        // found" (issue #221), so bail before prompting for a 2FA code the
+        // user can't complete headless.
+        let challenge: super::responses::TwoFactorChallenge = response.json().unwrap_or_default();
+        if challenge.requires_fido() {
+            tracing::debug!(
+                key_count = challenge.key_names.len(),
+                "SRP complete returned 409 with FIDO/WebAuthn challenge; unsupported"
+            );
+            return Err(AuthError::FidoNotSupported {
+                key_names: challenge.key_names,
+            }
+            .into());
+        }
         tracing::debug!("SRP complete returned 409: two-factor authentication required");
         return Ok(());
     } else if response.status == 412 {
@@ -975,6 +992,76 @@ mod tests {
             .unwrap();
     }
 
+    /// 409 with an `fsaChallenge` field means the account has a FIDO/WebAuthn
+    /// security key registered. kei can't complete that challenge, so the
+    /// caller must see a typed `FidoNotSupported` error rather than
+    /// proceeding to prompt for a 2FA code (which would hang or fail
+    /// silently downstream at the CloudKit handshake).
+    #[tokio::test]
+    async fn srp_complete_409_with_fsa_challenge_returns_fido_not_supported() {
+        let body = br#"{
+            "fsaChallenge": {"challenge": "abc", "keyHandles": ["h1"], "rpId": "apple.com"},
+            "keyNames": ["YubiKey 5C"],
+            "authType": "hsa2"
+        }"#;
+        let err = run_srp(vec![valid_init_response(), response(409, body.to_vec())])
+            .await
+            .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        match auth_err {
+            AuthError::FidoNotSupported { key_names } => {
+                assert_eq!(key_names, &vec!["YubiKey 5C".to_string()]);
+            }
+            other => panic!("expected FidoNotSupported, got: {other:?}"),
+        }
+    }
+
+    /// Defensive: Apple could send `keyNames` without `fsaChallenge` in a
+    /// flow we haven't observed. Treat the presence of any named security
+    /// keys as a FIDO signal.
+    #[tokio::test]
+    async fn srp_complete_409_with_only_key_names_returns_fido_not_supported() {
+        let body = br#"{"keyNames": ["Passkey-Home"]}"#;
+        let err = run_srp(vec![valid_init_response(), response(409, body.to_vec())])
+            .await
+            .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        assert!(
+            matches!(auth_err, AuthError::FidoNotSupported { .. }),
+            "expected FidoNotSupported, got: {auth_err:?}"
+        );
+    }
+
+    /// A normal HSA2 challenge (push to trusted device, SMS to trusted
+    /// phone) must continue through the existing 2FA flow — the FIDO
+    /// detection must not false-positive on the usual 409 shape.
+    #[tokio::test]
+    async fn srp_complete_409_without_fido_fields_passes_through() {
+        let body = br#"{
+            "trustedDevices": [{"id": "d1"}],
+            "trustedPhoneNumbers": [{"id": 1}],
+            "authType": "hsa2",
+            "securityCode": {"length": 6}
+        }"#;
+        run_srp(vec![valid_init_response(), response(409, body.to_vec())])
+            .await
+            .unwrap();
+    }
+
+    /// If Apple returns a 409 with an unparsable body (rare but possible on
+    /// upstream errors or protocol drift), the default-derived
+    /// `TwoFactorChallenge` reports no FIDO, and SRP falls through to the
+    /// normal 2FA path rather than incorrectly bailing.
+    #[tokio::test]
+    async fn srp_complete_409_with_unparsable_body_falls_through_to_2fa() {
+        run_srp(vec![
+            valid_init_response(),
+            response(409, b"not json".to_vec()),
+        ])
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn srp_complete_412_repair_succeeds() {
         run_srp(vec![
@@ -1126,5 +1213,205 @@ mod tests {
         ])
         .await
         .unwrap();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // wiremock-based tests: exercise the FIDO detection path through a
+    // real HTTP client and SRP math, not the StubSrpTransport. Guards
+    // against regressions where the 409 body parsing works in isolation
+    // but the reqwest buffering, status-code branch, or JSON decode
+    // path drops the signal before `authenticate_srp` sees it.
+    // ────────────────────────────────────────────────────────────────
+
+    use crate::auth::session::Session;
+    use tempfile::TempDir;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn wm_session(server: &MockServer) -> (TempDir, Session) {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(dir.path(), "test@example.com", &server.uri(), Some(5))
+            .await
+            .unwrap();
+        (dir, session)
+    }
+
+    /// Minimal SRP init body that produces tractable math in tests:
+    /// `B = 2`, `iteration = 1`. Apple's real responses have iteration
+    /// counts in the tens of thousands; 1 is fine because the point of
+    /// this test isn't to exercise PBKDF2, it's to drive the request
+    /// through the HTTP layer to the 409 branch.
+    fn wm_srp_init_body() -> String {
+        serde_json::json!({
+            "salt": BASE64.encode(b"salt1234"),
+            "b": BASE64.encode([2u8]),
+            "c": "challenge-token",
+            "iteration": 1,
+            "protocol": "s2k"
+        })
+        .to_string()
+    }
+
+    /// End-to-end: real SRP handshake against a wiremock server that
+    /// returns 409 with an `fsaChallenge`. The test proves the FIDO
+    /// signal survives the full HTTP round-trip (reqwest buffering,
+    /// status check, JSON parse) and surfaces as the typed
+    /// `FidoNotSupported` error with the key names Apple disclosed.
+    #[tokio::test]
+    async fn srp_wiremock_fsa_challenge_returns_fido_not_supported() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/appleauth/auth/signin/init"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/appleauth/auth/signin/complete"))
+            .respond_with(ResponseTemplate::new(409).set_body_string(
+                r#"{
+                    "fsaChallenge": {"challenge": "abc", "keyHandles": ["h1"], "rpId": "apple.com"},
+                    "keyNames": ["YubiKey 5C", "Passkey-Home"],
+                    "authType": "hsa2",
+                    "trustedDevices": []
+                }"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, mut session) = wm_session(&server).await;
+        let endpoints = Endpoints::for_test_base(&server.uri());
+        let err = authenticate_srp(
+            &mut session,
+            &endpoints,
+            "test@example.com",
+            "hunter2",
+            "client-id",
+            "com",
+        )
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().expect("typed AuthError");
+        match auth_err {
+            AuthError::FidoNotSupported { key_names } => {
+                assert_eq!(
+                    key_names,
+                    &vec!["YubiKey 5C".to_string(), "Passkey-Home".to_string()],
+                    "key_names must round-trip verbatim so the error message can name the keys"
+                );
+            }
+            other => panic!("expected FidoNotSupported, got: {other:?}"),
+        }
+    }
+
+    /// End-to-end control: an ordinary device-push 2FA 409 (no security
+    /// keys) must NOT trigger FIDO detection. `authenticate_srp` returns
+    /// `Ok(())` so the caller can prompt for the code. Guards against a
+    /// future refactor that over-broadens the detection check.
+    #[tokio::test]
+    async fn srp_wiremock_ordinary_2fa_passes_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/appleauth/auth/signin/init"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/appleauth/auth/signin/complete"))
+            .respond_with(ResponseTemplate::new(409).set_body_string(
+                r#"{
+                    "trustedDevices": [{"id": "d1"}],
+                    "trustedPhoneNumbers": [{"id": 1, "numberWithDialCode": "+1 •••-•••-1234"}],
+                    "authType": "hsa2",
+                    "securityCode": {"length": 6}
+                }"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let (_dir, mut session) = wm_session(&server).await;
+        let endpoints = Endpoints::for_test_base(&server.uri());
+        authenticate_srp(
+            &mut session,
+            &endpoints,
+            "test@example.com",
+            "hunter2",
+            "client-id",
+            "com",
+        )
+        .await
+        .expect("ordinary 2FA 409 must not be mis-classified as FIDO");
+    }
+
+    /// A 409 with `keyNames` but no `fsaChallenge` must still bail as
+    /// FIDO. Defensive against Apple flow variants we haven't directly
+    /// observed.
+    #[tokio::test]
+    async fn srp_wiremock_key_names_only_returns_fido_not_supported() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/appleauth/auth/signin/init"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/appleauth/auth/signin/complete"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_string(r#"{"keyNames": ["Solo V2"], "authType": "hsa2"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let (_dir, mut session) = wm_session(&server).await;
+        let endpoints = Endpoints::for_test_base(&server.uri());
+        let err = authenticate_srp(
+            &mut session,
+            &endpoints,
+            "test@example.com",
+            "hunter2",
+            "client-id",
+            "com",
+        )
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().expect("typed AuthError");
+        assert!(
+            matches!(auth_err, AuthError::FidoNotSupported { .. }),
+            "keyNames alone must still trigger FIDO bail, got: {auth_err:?}"
+        );
+    }
+
+    /// A 409 with a malformed body must fall through to the normal 2FA
+    /// path (returning `Ok(())`), not spuriously bail as FIDO. Guards
+    /// against a future parser change that would treat a parse error as
+    /// "FIDO present".
+    #[tokio::test]
+    async fn srp_wiremock_unparsable_409_falls_through_to_2fa() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/appleauth/auth/signin/init"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/appleauth/auth/signin/complete"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("<html>oops</html>"))
+            .mount(&server)
+            .await;
+
+        let (_dir, mut session) = wm_session(&server).await;
+        let endpoints = Endpoints::for_test_base(&server.uri());
+        authenticate_srp(
+            &mut session,
+            &endpoints,
+            "test@example.com",
+            "hunter2",
+            "client-id",
+            "com",
+        )
+        .await
+        .expect("unparsable 409 must fall through to the 2FA path, not bail as FIDO");
     }
 }

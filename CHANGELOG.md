@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Apple IDs with FIDO/WebAuthn security keys fail fast with a clear error.** Accounts with a YubiKey or other hardware security key registered could sign in through SRP + 2FA, then hit an opaque CloudKit `HTTP 401 AUTHENTICATION_FAILED "no auth method found"` on the first API call and loop through re-auth until `AUTH_ERROR_THRESHOLD` stopped the sync. SRP now inspects the `/signin/complete` 409 body for `fsaChallenge` / `keyNames` and bails with `AuthError::FidoNotSupported { key_names }` before prompting for a 2FA code. The message names the registered keys and points to Settings > Apple ID & iCloud > Sign-In & Security > Security Keys. As a defense-in-depth, `HttpStatusError` now preserves a truncated copy of the CloudKit error body, and a 401 carrying "no auth method found" logs a WARN with the security-key hint and a link to the tracking issue. ([#221])
+
+[#221]: https://github.com/rhoopr/kei/issues/221
+
+---
+
 ## [0.9.0] - 2026-04-18
 
 ### Added

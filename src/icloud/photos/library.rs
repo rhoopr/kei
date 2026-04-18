@@ -109,6 +109,28 @@ impl PhotoLibrary {
                 // persistent ADP, AUTH_ERROR_THRESHOLD in the download
                 // pipeline stops the sync rather than spamming retries.
                 if http_err.status == 401 || http_err.status == 403 {
+                    // Defense-in-depth for FIDO/security-key accounts: the
+                    // SRP path detects `fsaChallenge` / `keyNames` up front
+                    // and bails with `AuthError::FidoNotSupported`, but if
+                    // Apple drops those fields in some future flow, the
+                    // failure mode is a CloudKit 401 with "no auth method
+                    // found" in the body. Log the hint so a reporter sees
+                    // it even when kei falls into the re-auth loop. See
+                    // issue #221.
+                    if http_err.status == 401 {
+                        if let Some(body) = http_err.body.as_deref() {
+                            if body.contains("no auth method found") {
+                                tracing::warn!(
+                                    url = %http_err.url,
+                                    body = %body,
+                                    "CloudKit 401 'no auth method found' — usually means \
+                                     FIDO/WebAuthn security keys are on the account (issue \
+                                     #221). Remove them at Settings > Apple ID & iCloud > \
+                                     Sign-In & Security > Security Keys."
+                                );
+                            }
+                        }
+                    }
                     return ICloudError::SessionExpired {
                         status: http_err.status,
                     };
@@ -398,6 +420,7 @@ mod tests {
                 status: 403,
                 url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
                 retry_after: None,
+                body: None,
             }.into())
         }
 
@@ -504,6 +527,7 @@ mod tests {
                 status: 401,
                 url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
                 retry_after: None,
+                body: None,
             }.into())
         }
 
@@ -535,6 +559,134 @@ mod tests {
         );
     }
 
+    /// Stub that returns HTTP 401 with a CloudKit "no auth method found" body.
+    /// This is the FIDO-account failure mode from issue #221 when the SRP-side
+    /// up-front detection has been bypassed (e.g. Apple drops the
+    /// `fsaChallenge` field in a future flow).
+    struct NoAuthMethodFoundSession;
+
+    #[async_trait::async_trait]
+    impl PhotosSession for NoAuthMethodFoundSession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            Err(crate::icloud::photos::session::HttpStatusError {
+                status: 401,
+                url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+                retry_after: None,
+                body: Some(
+                    r#"{"serverErrorCode":"AUTHENTICATION_FAILED","reason":"no auth method found"}"#
+                        .into(),
+                ),
+            }.into())
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(NoAuthMethodFoundSession)
+        }
+    }
+
+    /// Even when the CloudKit 401 body identifies a FIDO-class failure, the
+    /// mapping still routes to `SessionExpired` so the existing `sync_loop`
+    /// re-auth path runs (capped by `AUTH_ERROR_THRESHOLD`). The up-front
+    /// detection in `auth/srp.rs` is the primary fix; this test pins the
+    /// belt-and-suspenders behavior so a future refactor doesn't silently
+    /// stop producing the warning or change the retry contract.
+    #[tokio::test]
+    async fn http_401_no_auth_method_found_still_maps_to_session_expired() {
+        let err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(NoAuthMethodFoundSession),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ICloudError::SessionExpired { status: 401 }),
+            "FIDO-class 401 bodies must still route to SessionExpired so \
+             AUTH_ERROR_THRESHOLD in sync_loop bounds the re-auth loop, got: {err:?}"
+        );
+    }
+
+    /// When the 401 body contains "no auth method found", the mapping must
+    /// emit a WARN naming security keys as the likely cause and pointing
+    /// at issue #221. This is the defense-in-depth hint that fires if a
+    /// future Apple flow change bypasses the SRP-level FIDO detection.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn http_401_no_auth_method_found_logs_security_key_hint() {
+        let _err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(NoAuthMethodFoundSession),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            logs_contain("no auth method found"),
+            "WARN must quote the CloudKit signal so reporters can grep for it"
+        );
+        assert!(
+            logs_contain("FIDO/WebAuthn security keys"),
+            "WARN must name FIDO/WebAuthn as the likely cause"
+        );
+        assert!(
+            logs_contain("#221"),
+            "WARN must link to the tracking issue so the user can find context"
+        );
+        assert!(
+            logs_contain("Sign-In & Security"),
+            "WARN must include the settings path to remove the keys"
+        );
+    }
+
+    /// A plain 401 without the "no auth method found" signal must NOT
+    /// emit the FIDO hint — that would confuse users whose session is
+    /// stale for ordinary reasons (expired trust token, rotated cookies).
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn http_401_without_fido_body_does_not_log_security_key_hint() {
+        let _err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(Unauthorized401Session),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            !logs_contain("FIDO/WebAuthn security keys"),
+            "ordinary stale-session 401 must not trigger the FIDO hint"
+        );
+        assert!(
+            !logs_contain("Sign-In & Security"),
+            "only 'no auth method found' bodies should produce the settings hint"
+        );
+    }
+
     /// Stub that returns HTTP 421, the signature of a misdirected CloudKit
     /// connection that survived the `init_photos_service` pool-reset retry.
     struct Misdirected421Session;
@@ -551,6 +703,7 @@ mod tests {
                 status: 421,
                 url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
                 retry_after: None,
+                body: None,
             }.into())
         }
 
