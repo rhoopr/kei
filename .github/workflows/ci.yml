@@ -3,6 +3,9 @@ name: Rust CI
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Treat any compiler warning as an error to keep the codebase warning-free
@@ -117,13 +120,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Extract stats from coverage output
-          TOTAL=$(grep "^TOTAL" coverage.txt | awk '{print $10}')
-          TESTS=$(grep -E "^test result:" coverage.txt | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
+          # Disable strict mode for parsing: greps with no matches and head's
+          # SIGPIPE to upstream are expected and must not abort the script.
+          set +e +o pipefail
 
-          # Find files with 0% and 100% coverage
-          ZERO_COV=$(grep "0.00%" coverage.txt | grep -v "^TOTAL" | awk '{print $1}' | head -5 | tr '\n' ', ' | sed 's/,$//')
-          FULL_COV=$(grep "100.00%" coverage.txt | awk '{print $1}' | tr '\n' ', ' | sed 's/,$//')
+          # Line coverage % from the TOTAL summary row (column 10 in
+          # cargo-llvm-cov's table: regions/functions/lines/branches).
+          TOTAL=$(awk '/^TOTAL/ {print $10; exit}' coverage.txt)
+
+          # Sum "N passed" across every test binary's result line.
+          TESTS=$(awk '/^test result:/ {for (i=1; i<=NF; i++) if ($i == "passed;") s += $(i-1)} END {print s+0}' coverage.txt)
+
+          # Files with 0% and 100% coverage (excluding the TOTAL row).
+          ZERO_COV=$(awk '/0\.00%/ && !/^TOTAL/ {print $1; if (++n >= 5) exit}' coverage.txt | tr '\n' ', ' | sed 's/, $//')
+          FULL_COV=$(awk '/100\.00%/ && !/^TOTAL/ {print $1}' coverage.txt | tr '\n' ', ' | sed 's/, $//')
+
+          set -e -o pipefail
+
+          : "${TOTAL:=N/A}"
+          : "${TESTS:=0}"
 
           {
             echo "## Coverage Report"
