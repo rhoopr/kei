@@ -5,7 +5,7 @@
 ```sh
 # 1. Pre-commit (runs automatically on git commit)
 cargo fmt -- --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --bin kei --test cli --test behavioral
 
 # 2. One-time auth setup (interactive, prompts for 2FA)

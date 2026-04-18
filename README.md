@@ -162,7 +162,7 @@ State lives in a SQLite database alongside your session data (see `--data-dir`).
 Contributions welcome. Open an issue first if you're planning something big.
 
 ```sh
-cargo fmt -- --check && cargo clippy && cargo test
+cargo fmt -- --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test
 ```
 
 ## License

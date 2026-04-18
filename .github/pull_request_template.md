@@ -9,5 +9,5 @@
 ## Checklist
 
 - [ ] `cargo fmt -- --check` passes
-- [ ] `cargo clippy -- -D warnings` passes
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes
 - [ ] `cargo test --bin kei --test cli --test behavioral` passes

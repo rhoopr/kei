@@ -9,7 +9,7 @@ Contributions are welcome. For anything beyond a small fix, open an issue first 
 3. Run the checks:
    ```sh
    cargo fmt -- --check
-   cargo clippy -- -D warnings
+   cargo clippy --all-targets --all-features -- -D warnings
    cargo test --bin kei --test cli --test behavioral
    ```
 4. Open a pull request against `main`.
