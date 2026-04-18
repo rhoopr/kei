@@ -1,6 +1,12 @@
+use std::time::Duration;
+
 use serde_json::Value;
 
-use crate::retry::{self, RetryAction, RetryConfig};
+use crate::retry::{self, parse_retry_after_header, RetryAction, RetryConfig};
+
+/// Upper bound on any `Retry-After` hint from CloudKit, chosen so a
+/// pathological server value can't stall the retry loop.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(120);
 
 /// Async HTTP session trait for the photos service.
 ///
@@ -38,6 +44,7 @@ impl PhotosSession for reqwest::Client {
 
         if status.is_client_error() || status.is_server_error() {
             let url = resp.url().to_string();
+            let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
             let resp_body = resp.text().await.unwrap_or_default();
             if !resp_body.is_empty() {
                 // 421 bodies are the most diagnostic signal for distinguishing
@@ -63,6 +70,7 @@ impl PhotosSession for reqwest::Client {
             return Err(HttpStatusError {
                 status: status.as_u16(),
                 url,
+                retry_after,
             }
             .into());
         }
@@ -98,11 +106,16 @@ impl PhotosSession for crate::auth::SharedSession {
 
 /// HTTP error with structured status code for typed error handling.
 /// Wraps non-success HTTP responses from CloudKit endpoints.
+///
+/// `retry_after` is populated from the `Retry-After` response header when
+/// present, so callers can honor the server-provided delay on 429/503
+/// instead of falling back to exponential backoff alone.
 #[derive(Debug, thiserror::Error)]
 #[error("HTTP {status} for {url}")]
 pub(crate) struct HttpStatusError {
     pub status: u16,
     pub url: String,
+    pub retry_after: Option<Duration>,
 }
 
 /// `CloudKit` server error codes that indicate a transient condition.
@@ -235,11 +248,13 @@ fn classify_api_error(e: &anyhow::Error) -> RetryAction {
         };
     }
     if let Some(http_err) = e.downcast_ref::<HttpStatusError>() {
-        return if http_err.status == 429 || http_err.status >= 500 {
-            RetryAction::Retry
-        } else {
-            RetryAction::Abort
-        };
+        if http_err.status == 429 || http_err.status >= 500 {
+            return match http_err.retry_after {
+                Some(d) => RetryAction::RetryAfter(d),
+                None => RetryAction::Retry,
+            };
+        }
+        return RetryAction::Abort;
     }
     if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
         if let Some(status) = reqwest_err.status() {
@@ -846,6 +861,7 @@ mod tests {
         let err = anyhow::Error::new(HttpStatusError {
             status: 503,
             url: "https://example.com".to_string(),
+            retry_after: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Retry));
     }
@@ -855,8 +871,35 @@ mod tests {
         let err = anyhow::Error::new(HttpStatusError {
             status: 429,
             url: "https://example.com".to_string(),
+            retry_after: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Retry));
+    }
+
+    #[test]
+    fn classify_http_status_error_honors_retry_after() {
+        let err = anyhow::Error::new(HttpStatusError {
+            status: 429,
+            url: "https://example.com".to_string(),
+            retry_after: Some(Duration::from_secs(7)),
+        });
+        match classify_api_error(&err) {
+            RetryAction::RetryAfter(d) => assert_eq!(d, Duration::from_secs(7)),
+            other => panic!("expected RetryAfter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_status_error_503_with_retry_after() {
+        let err = anyhow::Error::new(HttpStatusError {
+            status: 503,
+            url: "https://example.com".to_string(),
+            retry_after: Some(Duration::from_secs(2)),
+        });
+        match classify_api_error(&err) {
+            RetryAction::RetryAfter(d) => assert_eq!(d, Duration::from_secs(2)),
+            other => panic!("expected RetryAfter, got {other:?}"),
+        }
     }
 
     #[test]
@@ -864,6 +907,7 @@ mod tests {
         let err = anyhow::Error::new(HttpStatusError {
             status: 401,
             url: "https://example.com".to_string(),
+            retry_after: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Abort));
     }
@@ -873,6 +917,7 @@ mod tests {
         let err = anyhow::Error::new(HttpStatusError {
             status: 403,
             url: "https://example.com".to_string(),
+            retry_after: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Abort));
     }

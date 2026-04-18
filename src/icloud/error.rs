@@ -15,11 +15,13 @@ pub enum ICloudError {
             → Log into https://icloud.com/ and finish setting up your iCloud service."
     )]
     ServiceNotActivated { code: String, reason: String },
-    /// CloudKit rejected the request with HTTP 401. The caller should
-    /// invalidate any cached session/validation data and re-authenticate
-    /// with SRP before retrying.
-    #[error("Session expired (HTTP 401 from CloudKit)")]
-    SessionExpired,
+    /// CloudKit rejected the request with an auth-class HTTP status. Typically
+    /// 401 (stale session), 403 (rotated routing cookie or an ADP edge case
+    /// not caught earlier), or - rarely - another 4xx that maps to the same
+    /// recovery path. The caller should invalidate any cached session data
+    /// and re-authenticate with SRP before retrying.
+    #[error("Session expired (HTTP {status} from CloudKit)")]
+    SessionExpired { status: u16 },
     /// CloudKit returned HTTP 421 Misdirected Request. The HTTP/2 connection
     /// was routed to the wrong CloudKit partition; the caller should reset
     /// the connection pool and retry on a fresh connection.
@@ -35,11 +37,11 @@ pub enum ICloudError {
 
 impl ICloudError {
     /// True if the error means kei should invalidate the session cache, force
-    /// SRP re-authentication, and retry. Both `SessionExpired` (CloudKit 401)
-    /// and `MisdirectedRequest` (persistent CloudKit 421) typically indicate
-    /// stale session routing state that only SRP can re-mint.
+    /// SRP re-authentication, and retry. Both `SessionExpired` (CloudKit
+    /// 401/403) and `MisdirectedRequest` (persistent CloudKit 421) typically
+    /// indicate stale session routing state that only SRP can re-mint.
     pub fn is_session_error(&self) -> bool {
-        matches!(self, Self::SessionExpired | Self::MisdirectedRequest)
+        matches!(self, Self::SessionExpired { .. } | Self::MisdirectedRequest)
     }
 }
 
@@ -131,9 +133,9 @@ mod tests {
 
     #[test]
     fn session_expired_is_distinct_variant() {
-        let err = ICloudError::SessionExpired;
+        let err = ICloudError::SessionExpired { status: 401 };
         assert!(
-            matches!(err, ICloudError::SessionExpired),
+            matches!(err, ICloudError::SessionExpired { .. }),
             "dedicated variant so callers can trigger SRP re-auth"
         );
         let display = err.to_string();
@@ -141,8 +143,20 @@ mod tests {
     }
 
     #[test]
+    fn session_expired_display_renders_actual_status() {
+        // A 403 that maps to SessionExpired (e.g. bare CloudKit 403) must
+        // surface as "HTTP 403" so the diagnostic matches the on-wire status.
+        let err = ICloudError::SessionExpired { status: 403 };
+        assert!(
+            err.to_string().contains("HTTP 403"),
+            "403 must render as HTTP 403, not HTTP 401: {err}"
+        );
+    }
+
+    #[test]
     fn is_session_error_true_for_session_expired_and_misdirected() {
-        assert!(ICloudError::SessionExpired.is_session_error());
+        assert!(ICloudError::SessionExpired { status: 401 }.is_session_error());
+        assert!(ICloudError::SessionExpired { status: 403 }.is_session_error());
         assert!(ICloudError::MisdirectedRequest.is_session_error());
     }
 

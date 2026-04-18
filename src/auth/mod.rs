@@ -10,6 +10,17 @@ pub mod session;
 pub mod srp;
 pub mod twofa;
 
+use crate::retry::RetryConfig;
+
+/// Retry budget for Apple's auth endpoints (SRP init/complete, 2FA push,
+/// 2FA submit). The flow is user-blocking, so we keep this short: three
+/// tries total, short backoffs, capped by `Retry-After`.
+pub(crate) const AUTH_RETRY_CONFIG: RetryConfig = RetryConfig {
+    max_retries: 2,
+    base_delay_secs: 2,
+    max_delay_secs: 30,
+};
+
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -133,15 +144,15 @@ async fn authenticate_inner(
             }
             Err(e) => {
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_rate_limited())
+                    .is_some_and(AuthError::is_transient_apple_failure)
                 {
                     return Err(e.context(
-                        "Apple is rate limiting authentication requests. \
-                         Wait a few minutes before trying again",
+                        "Apple's auth service is returning transient errors (HTTP 429/5xx). \
+                         Wait a few minutes and retry",
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request())
+                    .is_some_and(AuthError::is_misdirected_request)
                 {
                     tracing::warn!(
                         error = %e,
@@ -176,15 +187,15 @@ async fn authenticate_inner(
             }
             Err(e) => {
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_rate_limited())
+                    .is_some_and(AuthError::is_transient_apple_failure)
                 {
                     return Err(e.context(
-                        "Apple is rate limiting authentication requests. \
-                         Wait a few minutes before trying again",
+                        "Apple's auth service is returning transient errors (HTTP 429/5xx). \
+                         Wait a few minutes and retry",
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request())
+                    .is_some_and(AuthError::is_misdirected_request)
                 {
                     if pool_reset {
                         tracing::warn!(
@@ -239,7 +250,7 @@ async fn authenticate_inner(
             Ok(d) => d,
             Err(e)
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request()) =>
+                    .is_some_and(AuthError::is_misdirected_request) =>
             {
                 tracing::warn!(
                     error = %e,
@@ -388,15 +399,15 @@ pub async fn send_2fa_push(
             }
             Err(e) => {
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_rate_limited())
+                    .is_some_and(AuthError::is_transient_apple_failure)
                 {
                     return Err(e.context(
-                        "Apple is rate limiting authentication requests. \
-                         Wait a few minutes before trying again",
+                        "Apple's auth service is returning transient errors (HTTP 429/5xx). \
+                         Wait a few minutes and retry",
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request())
+                    .is_some_and(AuthError::is_misdirected_request)
                 {
                     tracing::warn!(
                         error = %e,
@@ -420,7 +431,7 @@ pub async fn send_2fa_push(
             Err(e)
                 if !pool_reset
                     && e.downcast_ref::<AuthError>()
-                        .is_some_and(|ae| ae.is_misdirected_request()) =>
+                        .is_some_and(AuthError::is_misdirected_request) =>
             {
                 tracing::warn!(
                     error = %e,
@@ -429,7 +440,12 @@ pub async fn send_2fa_push(
                 );
                 session.reset_http_clients()?;
             }
-            Err(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "accountLogin failed during send_2fa_push, falling back to SRP"
+                );
+            }
         }
     }
 
@@ -450,7 +466,7 @@ pub async fn send_2fa_push(
             Ok(d) => d,
             Err(e)
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request()) =>
+                    .is_some_and(AuthError::is_misdirected_request) =>
             {
                 tracing::warn!(
                     error = %e,

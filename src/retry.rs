@@ -1,11 +1,35 @@
 use std::future::Future;
+use std::time::Duration;
 
 use rand::RngExt;
+
+/// Parse the `Retry-After` response header as delta-seconds, capped at `max`.
+/// Returns `None` for absent, zero, or unparsable values. The HTTP-date form
+/// is not accepted (Apple/CloudKit always emit delta-seconds).
+pub fn parse_retry_after_header(
+    headers: &reqwest::header::HeaderMap,
+    max: Duration,
+) -> Option<Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(secs).min(max))
+}
 
 /// Retry decision returned by the error classifier callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryAction {
     Retry,
+    /// Retry after an explicit delay (e.g. honoring a `Retry-After` header).
+    /// Overrides the exponential-backoff schedule for this attempt only.
+    RetryAfter(std::time::Duration),
     Abort,
 }
 
@@ -76,14 +100,21 @@ where
         match operation().await {
             Ok(val) => return Ok(val),
             Err(e) => {
-                if classifier(&e) == RetryAction::Abort {
+                let action = classifier(&e);
+                if action == RetryAction::Abort {
                     return Err(e);
                 }
                 let is_last = attempt + 1 >= total_attempts;
                 if is_last {
                     return Err(e);
                 }
-                let delay = config.delay_for_retry(attempt);
+                let delay = match action {
+                    RetryAction::RetryAfter(d) => {
+                        let max = std::time::Duration::from_secs(config.max_delay_secs);
+                        d.min(max)
+                    }
+                    _ => config.delay_for_retry(attempt),
+                };
                 tracing::warn!(
                     attempt = attempt + 1,
                     total_attempts,
@@ -306,6 +337,135 @@ mod tests {
         .await;
         // Abort returns immediately without logging retry
         assert!(!logs_contain("Retryable error"));
+    }
+
+    fn headers_with_retry_after(value: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn parse_retry_after_delta_seconds() {
+        let h = headers_with_retry_after("5");
+        assert_eq!(
+            parse_retry_after_header(&h, Duration::from_secs(60)),
+            Some(Duration::from_secs(5))
+        );
+        let h = headers_with_retry_after(" 12 ");
+        assert_eq!(
+            parse_retry_after_header(&h, Duration::from_secs(60)),
+            Some(Duration::from_secs(12))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_zero_treated_as_absent() {
+        let h = headers_with_retry_after("0");
+        assert_eq!(parse_retry_after_header(&h, Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn parse_retry_after_caps_at_max() {
+        let h = headers_with_retry_after("999999");
+        assert_eq!(
+            parse_retry_after_header(&h, Duration::from_secs(120)),
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_http_date() {
+        let h = headers_with_retry_after("Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(parse_retry_after_header(&h, Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_junk() {
+        let h = headers_with_retry_after("not-a-number");
+        assert_eq!(parse_retry_after_header(&h, Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn parse_retry_after_missing_header() {
+        let h = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after_header(&h, Duration::from_secs(60)), None);
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_overrides_exponential_delay() {
+        // RetryAction::RetryAfter(d) uses the server-provided delay instead
+        // of the configured exponential backoff for that attempt.
+        let config = RetryConfig {
+            max_retries: 2,
+            base_delay_secs: 5, // would normally sleep 5..10s on first retry
+            max_delay_secs: 60,
+        };
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+        let started = std::time::Instant::now();
+        let result: Result<i32, String> = retry_with_backoff(
+            &config,
+            |_| RetryAction::RetryAfter(std::time::Duration::from_millis(50)),
+            || {
+                let cc = cc.clone();
+                async move {
+                    let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < 1 {
+                        Err("transient".to_string())
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(result.unwrap(), 7);
+        // Server-provided 50ms should dominate over the configured 5s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "expected RetryAfter to shorten delay, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_capped_at_max_delay() {
+        // A Retry-After larger than max_delay_secs is clamped so a pathological
+        // server response cannot stall the retry loop indefinitely.
+        let config = RetryConfig {
+            max_retries: 1,
+            base_delay_secs: 0,
+            max_delay_secs: 0, // forces the clamp to zero
+        };
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+        let started = std::time::Instant::now();
+        let result: Result<i32, String> = retry_with_backoff(
+            &config,
+            |_| RetryAction::RetryAfter(std::time::Duration::from_secs(3600)),
+            || {
+                let cc = cc.clone();
+                async move {
+                    let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < 1 {
+                        Err("rate limited".to_string())
+                    } else {
+                        Ok(1)
+                    }
+                }
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(result.unwrap(), 1);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "expected max_delay_secs clamp, took {elapsed:?}"
+        );
     }
 
     #[tokio::test]

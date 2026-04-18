@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn session_expired_not_misdirected() {
-        let err = icloud::error::ICloudError::SessionExpired;
+        let err = icloud::error::ICloudError::SessionExpired { status: 401 };
         assert!(!is_misdirected_request(&err));
     }
 

@@ -65,14 +65,21 @@ impl AuthError {
         matches!(self, Self::LockContention(_))
     }
 
-    /// Check if this error indicates Apple is rate limiting requests (HTTP 503).
+    /// True when Apple's auth surface is returning a transient failure
+    /// class: explicit rate limiting (HTTP 429, 503) or any other 5xx
+    /// ("Apple is having trouble" from the caller's perspective).
     ///
-    /// When rate limited, callers should back off rather than escalating to
-    /// heavier auth flows (e.g. SRP) which would worsen the rate limit.
-    pub fn is_rate_limited(&self) -> bool {
+    /// Callers use this to decide between "wait a few minutes, do not
+    /// escalate to SRP" and a hard failure. The SRP retry loop already
+    /// absorbs short blips; this predicate fires after retries are
+    /// exhausted to add back-off guidance to the surfaced error.
+    pub fn is_transient_apple_failure(&self) -> bool {
         match self {
-            Self::ApiError { code, .. } => *code == 503,
-            Self::ServiceError { code, .. } => code == "http_503",
+            Self::ApiError { code, .. } => *code == 429 || (500..600).contains(code),
+            Self::ServiceError { code, .. } => code
+                .strip_prefix("http_")
+                .and_then(|s| s.parse::<u16>().ok())
+                .is_some_and(|c| c == 429 || (500..600).contains(&c)),
             _ => false,
         }
     }
@@ -241,58 +248,68 @@ mod tests {
     }
 
     #[test]
-    fn api_error_503_is_rate_limited() {
-        let err = AuthError::ApiError {
-            code: 503,
-            message: "HTTP 503 from Apple auth service".into(),
-        };
-        assert!(err.is_rate_limited());
-    }
-
-    #[test]
-    fn service_error_http_503_is_rate_limited() {
-        let err = AuthError::ServiceError {
-            code: "http_503".into(),
-            message: "Apple server error during validation (HTTP 503)".into(),
-        };
-        assert!(err.is_rate_limited());
-    }
-
-    #[test]
-    fn api_error_other_codes_not_rate_limited() {
-        for code in [401, 403, 421, 500, 502, 504] {
+    fn api_error_429_and_5xx_are_transient() {
+        for code in [429, 500, 502, 503, 504] {
             let err = AuthError::ApiError {
                 code,
                 message: "test".into(),
             };
             assert!(
-                !err.is_rate_limited(),
-                "code {code} should not be rate limited"
+                err.is_transient_apple_failure(),
+                "code {code} should be transient"
             );
         }
     }
 
     #[test]
-    fn service_error_other_codes_not_rate_limited() {
-        for code in ["http_500", "http_502", "AUTH-401", "test"] {
+    fn service_error_http_429_and_5xx_are_transient() {
+        for code in ["http_429", "http_500", "http_502", "http_503", "http_504"] {
             let err = AuthError::ServiceError {
                 code: code.into(),
                 message: "test".into(),
             };
             assert!(
-                !err.is_rate_limited(),
-                "code {code} should not be rate limited"
+                err.is_transient_apple_failure(),
+                "code {code} should be transient"
             );
         }
     }
 
     #[test]
-    fn non_api_variants_not_rate_limited() {
-        assert!(!AuthError::FailedLogin("test".into()).is_rate_limited());
-        assert!(!AuthError::InvalidToken("test".into()).is_rate_limited());
-        assert!(!AuthError::TwoFactorFailed("test".into()).is_rate_limited());
-        assert!(!AuthError::TwoFactorRequired.is_rate_limited());
-        assert!(!AuthError::LockContention("test".into()).is_rate_limited());
+    fn api_error_non_transient_codes_are_not_transient() {
+        for code in [400, 401, 403, 409, 412, 421, 450] {
+            let err = AuthError::ApiError {
+                code,
+                message: "test".into(),
+            };
+            assert!(
+                !err.is_transient_apple_failure(),
+                "code {code} should not be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn service_error_non_http_code_is_not_transient() {
+        for code in ["AUTH-401", "rscd_401", "rscd_403", "ZONE_NOT_FOUND"] {
+            let err = AuthError::ServiceError {
+                code: code.into(),
+                message: "test".into(),
+            };
+            assert!(
+                !err.is_transient_apple_failure(),
+                "code {code} should not be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn non_api_variants_are_not_transient() {
+        assert!(!AuthError::FailedLogin("test".into()).is_transient_apple_failure());
+        assert!(!AuthError::InvalidToken("test".into()).is_transient_apple_failure());
+        assert!(!AuthError::TwoFactorFailed("test".into()).is_transient_apple_failure());
+        assert!(!AuthError::TwoFactorRequired.is_transient_apple_failure());
+        assert!(!AuthError::LockContention("test".into()).is_transient_apple_failure());
     }
 
     #[test]
@@ -353,21 +370,22 @@ mod tests {
     }
 
     #[test]
-    fn misdirected_and_rate_limited_are_exclusive() {
-        // 421 is misdirected, not rate limited
+    fn misdirected_and_transient_are_exclusive() {
+        // 421 is misdirected, not a transient-failure (it has a dedicated
+        // recovery path: reset the HTTP/2 pool, do not retry as-is).
         let err_421 = AuthError::ApiError {
             code: 421,
             message: "test".into(),
         };
         assert!(err_421.is_misdirected_request());
-        assert!(!err_421.is_rate_limited());
+        assert!(!err_421.is_transient_apple_failure());
 
-        // 503 is rate limited, not misdirected
+        // 503 is transient, not misdirected
         let err_503 = AuthError::ApiError {
             code: 503,
             message: "test".into(),
         };
-        assert!(err_503.is_rate_limited());
+        assert!(err_503.is_transient_apple_failure());
         assert!(!err_503.is_misdirected_request());
     }
 

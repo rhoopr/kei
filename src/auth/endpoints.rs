@@ -10,6 +10,24 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
+    /// Test-only constructor that builds an `Endpoints` pointing at a
+    /// user-supplied base URL (e.g. a wiremock server). All four fields
+    /// are rooted at `base`, which is leaked to satisfy the `'static str`
+    /// contract; this is acceptable only in tests.
+    #[cfg(test)]
+    pub(crate) fn for_test_base(base: &str) -> Self {
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        let base_static = leak(base.to_string());
+        let auth = leak(format!("{base}/appleauth/auth"));
+        let setup = leak(format!("{base}/setup/ws/1"));
+        Self {
+            auth_root: base_static,
+            auth,
+            home: base_static,
+            setup,
+        }
+    }
+
     /// Returns the correct endpoints for the given domain.
     ///
     /// Supported domains: "com" (international), "cn" (China mainland).

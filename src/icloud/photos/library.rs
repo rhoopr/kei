@@ -96,22 +96,21 @@ impl PhotoLibrary {
                 }
             }
             if let Some(http_err) = e.downcast_ref::<super::session::HttpStatusError>() {
-                // HTTP 401: stale cached session tokens. Caller invalidates
-                // the validation cache and retries with fresh SRP.
-                if http_err.status == 401 {
-                    return ICloudError::SessionExpired;
-                }
                 // HTTP 421: HTTP/2 connection routed to the wrong CloudKit
                 // partition. Caller resets the pool and retries.
                 if http_err.status == 421 {
                     return ICloudError::MisdirectedRequest;
                 }
-                // HTTP 403 is the classic ADP signature: account authenticated
-                // fine but iCloud data access is blocked.
-                if http_err.status == 403 {
-                    return ICloudError::ServiceNotActivated {
-                        code: "HTTP_403".into(),
-                        reason: "Forbidden — iCloud data access denied".into(),
+                // HTTP 401 / 403 both route through SessionExpired so the sync
+                // loop re-auths. 401 is the classic stale-session signal; 403
+                // has many causes (rate limits, rotated routing cookies, and
+                // ADP edge cases not caught by `i_cdp_enabled` or by the
+                // CloudKit body errors handled above). If the 403 truly is
+                // persistent ADP, AUTH_ERROR_THRESHOLD in the download
+                // pipeline stops the sync rather than spamming retries.
+                if http_err.status == 401 || http_err.status == 403 {
+                    return ICloudError::SessionExpired {
+                        status: http_err.status,
                     };
                 }
             }
@@ -398,6 +397,7 @@ mod tests {
             Err(crate::icloud::photos::session::HttpStatusError {
                 status: 403,
                 url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+                retry_after: None,
             }.into())
         }
 
@@ -407,7 +407,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_403_maps_to_service_not_activated() {
+    async fn http_403_maps_to_session_expired() {
+        // Bare HTTP 403 (without a CloudKit body error) has too many causes
+        // to assume ADP. Route it through SessionExpired so the sync loop
+        // re-authenticates once; genuine ADP is surfaced via `i_cdp_enabled`
+        // before we reach CloudKit, and CloudKit-body errors (ZONE_NOT_FOUND,
+        // ACCESS_DENIED) still map to ServiceNotActivated via `service_not_activated`.
         let err = PhotoLibrary::new(
             "https://example.com".into(),
             Arc::new(HashMap::new()),
@@ -423,13 +428,63 @@ mod tests {
         .unwrap_err();
 
         assert!(
+            matches!(err, ICloudError::SessionExpired { status: 403 }),
+            "expected SessionExpired {{ 403 }} so the message tracks the actual status, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("HTTP 403"),
+            "display must mention HTTP 403, got: {err}"
+        );
+    }
+
+    /// Stub whose CloudKit body reports an `ACCESS_DENIED` service error.
+    /// These are the ADP-class signals; they should still produce a clear
+    /// `ServiceNotActivated` error with the ADP guidance message.
+    struct AccessDeniedBodySession;
+
+    #[async_trait::async_trait]
+    impl PhotosSession for AccessDeniedBodySession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            Ok(json!({
+                "serverErrorCode": "ACCESS_DENIED",
+                "reason": "private db access disabled for this account",
+            }))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(AccessDeniedBodySession)
+        }
+    }
+
+    #[tokio::test]
+    async fn cloudkit_access_denied_still_maps_to_service_not_activated() {
+        let err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(AccessDeniedBodySession),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
             matches!(err, ICloudError::ServiceNotActivated { .. }),
-            "expected ServiceNotActivated, got: {err:?}"
+            "ADP body signal must still surface ServiceNotActivated, got: {err:?}"
         );
         let display = err.to_string();
         assert!(
             display.contains("Advanced Data Protection"),
-            "expected ADP guidance in message, got: {display}"
+            "expected ADP guidance, got: {display}"
         );
     }
 
@@ -448,6 +503,7 @@ mod tests {
             Err(crate::icloud::photos::session::HttpStatusError {
                 status: 401,
                 url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+                retry_after: None,
             }.into())
         }
 
@@ -473,8 +529,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, ICloudError::SessionExpired),
-            "expected SessionExpired so sync_loop can invalidate cache and \
+            matches!(err, ICloudError::SessionExpired { status: 401 }),
+            "expected SessionExpired {{ 401 }} so sync_loop can invalidate cache and \
              re-authenticate, got: {err:?}"
         );
     }
@@ -494,6 +550,7 @@ mod tests {
             Err(crate::icloud::photos::session::HttpStatusError {
                 status: 421,
                 url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+                retry_after: None,
             }.into())
         }
 

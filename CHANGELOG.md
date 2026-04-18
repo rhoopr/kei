@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.2] - 2026-04-17
+
+### Fixed
+
+- **Apple rate limits and auth-CDN flakes no longer surface as "wrong password".** SRP `/signin/complete` had a catch-all 4xx branch that mapped every non-409/412 status to `FailedLogin("Invalid email/password combination")`. Transient 429 rate limits and 403s from rotated routing cookies looked identical to a credential failure. Complete now distinguishes 401 (the real M1 rejection, the one code that actually means wrong password), 429 (`ApiError` with "Apple is rate limiting authentication"), 400 (`ApiError` with a kei-bug-or-protocol-change message), and other 4xx (`ApiError` with the raw status). `/signin/init` 401 is also no longer `FailedLogin` - init runs before the M1 proof is sent, so a 401 there is a stale auth context (cookies/scnt), not a bad password. ([#226])
+- **Bare CloudKit 403 re-authenticates instead of falsely claiming ADP.** HTTP 403 at library init unconditionally mapped to `ServiceNotActivated` with Advanced Data Protection guidance. Real ADP is already caught upstream by `i_cdp_enabled` in the auth response and by CloudKit body errors (ZONE_NOT_FOUND, ACCESS_DENIED, AUTHENTICATION_FAILED); bare 403 has other causes (rate limits, rotated routing cookies, stale sessions). It now maps to `ICloudError::SessionExpired { status: 403 }` so the sync loop re-auths once, and `AUTH_ERROR_THRESHOLD = 3` in the download pipeline stops the loop if the 403 really is persistent ADP. `SessionExpired` now carries the actual HTTP status, so its Display renders "HTTP 403 from CloudKit" instead of always hardcoding "HTTP 401". ([#226])
+- **Transient 5xx/429 on SRP and 2FA endpoints retry instead of failing hard.** `/signin/init`, `/signin/complete`, `/repair/complete`, `trigger_push_notification`, and `submit_2fa_code` all retry transient responses up to a shared `AUTH_RETRY_CONFIG` (2 retries, 2s base, 30s max) and honor `Retry-After` when Apple supplies one. Persistent 5xx after the budget is exhausted surfaces as `ApiError` with the actual status, not `FailedLogin`. ([#226])
+- **SRP now detects `X-Apple-I-Rscd` session rejections.** Apple sometimes returns HTTP 200 with this header set to 401 or 403 to signal a hidden session rejection. The check was already wired into `/validate` and `/accountLogin`, but SRP init and complete used to treat the 200 as a valid handshake. Both now surface `AuthError::ServiceError` with code `rscd_401` / `rscd_403`. ([#226])
+- **CloudKit retry loop honors `Retry-After`.** `HttpStatusError` captures the header (delta-seconds only, capped at 120s), `classify_api_error` returns a new `RetryAfter(Duration)` action on 429/5xx, and `retry_with_backoff` uses the server-provided delay in place of the exponential schedule for that attempt. ([#226])
+
+### Changed
+
+- **`AuthError::is_rate_limited` renamed to `is_transient_apple_failure`** and broadened from HTTP 503 only to 429 + all 5xx. After retries exhaust, the auth layer surfaces "Apple's auth service is returning transient errors (HTTP 429/5xx). Wait a few minutes and retry" context; previously only 503 got the back-off hint. Internal to the binary, no external API impact. ([#226])
+
+[#226]: https://github.com/rhoopr/kei/pull/226
+
+---
+
 ## [0.8.1] - 2026-04-17
 
 ### Fixed

@@ -839,6 +839,62 @@ mod tests {
         vec!["kei", "--username", "test@example.com"]
     }
 
+    /// Scrub auth-related env vars for the duration of the returned guard so
+    /// tests that exercise clap's flag parsing don't get contaminated when the
+    /// developer has `ICLOUD_USERNAME` / `ICLOUD_PASSWORD` exported (via
+    /// `.env` sourcing for live tests). A process-wide mutex serializes
+    /// concurrent calls to this helper.
+    ///
+    /// Note that this only protects against other callers of `scrub_auth_env`.
+    /// `setenv`/`getenv` on POSIX aren't thread-safe against each other, so an
+    /// unrelated test reading an env var while the guard is mutating could
+    /// theoretically race. The CLI unit tests only touch these two vars via
+    /// clap's `env = "..."` attributes during `try_parse_from`, which happens
+    /// synchronously on one thread per test — so in practice the guard is
+    /// sufficient for this suite. If a future test reads env from another
+    /// thread, it needs to coordinate through the same mutex.
+    fn scrub_auth_env() -> AuthEnvGuard {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_user = std::env::var("ICLOUD_USERNAME").ok();
+        let prev_pw = std::env::var("ICLOUD_PASSWORD").ok();
+        // SAFETY: the enclosing MutexGuard serializes every other caller of
+        // scrub_auth_env, and the test suite does not read these env vars
+        // from separate threads.
+        unsafe {
+            std::env::remove_var("ICLOUD_USERNAME");
+            std::env::remove_var("ICLOUD_PASSWORD");
+        }
+        AuthEnvGuard {
+            _lock: guard,
+            prev_user,
+            prev_pw,
+        }
+    }
+
+    struct AuthEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_user: Option<String>,
+        prev_pw: Option<String>,
+    }
+
+    impl Drop for AuthEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still holding the static mutex, so restoration is
+            // exclusive under the same "no cross-thread readers" condition
+            // described on scrub_auth_env.
+            unsafe {
+                if let Some(v) = self.prev_user.take() {
+                    std::env::set_var("ICLOUD_USERNAME", v);
+                }
+                if let Some(v) = self.prev_pw.take() {
+                    std::env::set_var("ICLOUD_PASSWORD", v);
+                }
+            }
+        }
+    }
+
     // ── Global args ───────────────────────────────────────────────
 
     #[test]
@@ -883,6 +939,7 @@ mod tests {
 
     #[test]
     fn test_bare_invocation_without_username() {
+        let _guard = scrub_auth_env();
         let cli = Cli::try_parse_from(["kei"]).unwrap();
         assert!(cli.username.is_none());
         assert!(cli.command.is_none());
@@ -1268,6 +1325,7 @@ mod tests {
 
     #[test]
     fn test_password_file_flag() {
+        let _guard = scrub_auth_env();
         let mut args = base_args();
         args.extend(["--password-file", "/run/secrets/pw"]);
         let cli = parse(&args);
@@ -1279,6 +1337,7 @@ mod tests {
 
     #[test]
     fn test_password_command_flag() {
+        let _guard = scrub_auth_env();
         let mut args = base_args();
         args.extend(["--password-command", "op read 'op://vault/icloud/pw'"]);
         let cli = parse(&args);
