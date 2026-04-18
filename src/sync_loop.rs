@@ -482,6 +482,18 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     handle.record_session_expiration();
                 }
                 handle.update(&cycle_result.stats, &health).await;
+
+                // Update DB-backed gauges from the state database.
+                if let Some(ref db) = state_db {
+                    match db.get_summary().await {
+                        Ok(summary) => {
+                            handle.update_db_stats(&summary, cycle_result.stats.assets_seen);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to fetch DB summary for metrics; skipping DB gauge update");
+                        }
+                    }
+                }
             }
 
             // Write JSON report if configured
