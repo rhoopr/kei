@@ -566,15 +566,10 @@ where
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
                     if tasks.is_empty() {
-                        // Asset enumerated but produced no tasks (on-disk
-                        // dedup, claimed-path collision, etc). Rows reached
-                        // here are almost always status='downloaded', where
-                        // touching last_seen_at is a no-op for the promote
-                        // gate. A row left status='pending' by a prior
+                        // No-op for status='downloaded' rows (the common
+                        // case). A row left status='pending' by a prior
                         // interrupted sync will be promoted to failed at
-                        // sync end (see upsert_seen / touch_last_seen /
-                        // promote_pending_to_failed docs and issue #211) -
-                        // that's the intended stuck-pipeline recovery.
+                        // sync end as stuck-pipeline recovery.
                         if let Some(db) = &producer_state_db {
                             if let Err(e) = db.touch_last_seen(asset.id()).await {
                                 tracing::debug!(error = %e, asset_id = asset.id(), "Failed to touch last_seen for on-disk asset");

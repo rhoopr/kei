@@ -431,10 +431,8 @@ impl StateDb for SqliteStateDb {
             tracing::warn!(
                 id,
                 version_size,
-                "mark_failed matched 0 rows: caller violated the producer-dispatch \
-                 invariant (see upsert_seen docs). The asset was never recorded, so \
-                 the failure is not persisted. Find the mark_failed call path that \
-                 didn't run upsert_seen first"
+                "mark_failed matched 0 rows; caller must upsert_seen before mark_failed \
+                 (producer-dispatch invariant). Failure not persisted"
             );
         }
 
