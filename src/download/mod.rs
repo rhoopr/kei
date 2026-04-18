@@ -1796,6 +1796,7 @@ mod tests {
             pid_file: None,
             notification_script: None,
             report_json: None,
+            metrics_port: None,
             watch_with_interval: None,
             retry_delay_secs: 5,
             recent: dl_config.recent,

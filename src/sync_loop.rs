@@ -416,6 +416,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
     sd_notifier.notify_ready();
 
+    // Spawn the Prometheus metrics + /healthz server if --metrics-port is set.
+    // Binds synchronously so a bad port fails at startup rather than silently.
+    let metrics_handle = config
+        .metrics_port
+        .map(|port| crate::metrics::spawn_server(port, shutdown_token.clone()))
+        .transpose()?;
+
     let mut health = health::HealthStatus::new();
     let mut consecutive_album_refresh_failures = 0u32;
 
@@ -440,6 +447,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             // the 2-hour staleness window when no new photos are uploaded.
             health.record_success();
             health.write(&config.cookie_directory);
+            // Refresh health gauges only -- do not reset cycle_duration_seconds.
+            if let Some(ref handle) = metrics_handle {
+                handle.update_health_only(&health).await;
+            }
         } else {
             sd_notifier.notify_status("Syncing...");
             sd_notifier.notify_watchdog();
@@ -464,6 +475,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 health.record_success();
             }
             health.write(&config.cookie_directory);
+
+            // Update Prometheus metrics if the server is running.
+            if let Some(ref handle) = metrics_handle {
+                if cycle_result.session_expired {
+                    handle.record_session_expiration();
+                }
+                handle.update(&cycle_result.stats, &health).await;
+            }
 
             // Write JSON report if configured
             if let Some(report_path) = &config.report_json {

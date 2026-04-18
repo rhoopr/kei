@@ -46,6 +46,10 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Metrics / observability
+prometheus-client = "0.22"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+
 # Progress / UI
 indicatif = "0.18"
 rpassword = "7"
