@@ -94,33 +94,102 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fetch --locked
 
-  # Measures what percentage of code is exercised by tests
-  # Posts coverage summary as PR comment
-  coverage:
-    name: Coverage
+  # PR head coverage. Runs in parallel with coverage-base.
+  # Output artifact feeds into the Coverage aggregator job.
+  coverage-head:
+    name: Coverage (head)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage-head
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate coverage
+      - name: Run coverage
         run: |
-          # Run tests with coverage, defer report generation
           cargo llvm-cov --all-features --no-report
           # Human-readable report for the Actions log
           cargo llvm-cov report
           # Structured data for parsing - cargo-llvm-cov's text format is
           # column-position-fragile and the test summary goes to stderr.
           cargo llvm-cov report --json --output-path coverage.json
+          # Per-line hit counts for patch coverage computation.
+          cargo llvm-cov report --lcov --output-path coverage.lcov
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-head
+          path: |
+            coverage.json
+            coverage.lcov
+          retention-days: 1
+
+  # Base-branch coverage for the delta. Runs in parallel with coverage-head
+  # on a separate runner. continue-on-error so a broken main only suppresses
+  # the delta - it doesn't block the PR.
+  coverage-base:
+    name: Coverage (base)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage-base
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run coverage
+        run: |
+          cargo llvm-cov --all-features --no-report
+          cargo llvm-cov report --json --output-path base_coverage.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-base
+          path: base_coverage.json
+          retention-days: 1
+
+  # Aggregates head + base, computes patch coverage, posts the PR comment.
+  # This is the required check; it runs as long as head succeeded.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: [coverage-head, coverage-base]
+    if: always() && needs.coverage-head.result == 'success'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history for git diff against base in patch_coverage.py.
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-head
+      - name: Download base coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-base
+        continue-on-error: true
+      - name: Compute patch coverage
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 .github/scripts/patch_coverage.py \
+            --base "$BASE_SHA" \
+            --lcov coverage.lcov \
+            --workspace . \
+            > patch_coverage.json
+          cat patch_coverage.json
       - name: Post coverage comment
-        if: github.event_name == 'pull_request'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -133,17 +202,50 @@ jobs:
           # Strip absolute workspace prefix from filenames in JSON.
           WORKSPACE="$(pwd)/"
 
-          # Build the comment.
+          # Reusable jq function defining 2-decimal percent formatting.
+          PCT_DEF='def pct: (. * 100 | round) as $x | "\($x / 100 | floor).\($x % 100 | tostring | if length == 1 then "0\(.)" else . end)";'
+
+          # --- Build headline (line coverage % + delta + patch coverage) ---
+          HEAD_PCT=$(jq -r '.data[0].totals.lines.percent' coverage.json)
+          HEADLINE="**Line coverage:** $(printf '%.2f' "$HEAD_PCT")%"
+
+          if [ -f base_coverage.json ]; then
+            BASE_PCT=$(jq -r '.data[0].totals.lines.percent' base_coverage.json)
+            DELTA=$(awk "BEGIN { printf \"%+.2f\", ${HEAD_PCT} - ${BASE_PCT} }")
+            HEADLINE="${HEADLINE} (${DELTA}% from main)"
+          fi
+
+          PATCH_TOTAL=$(jq -r '.total_eligible' patch_coverage.json)
+          if [ "$PATCH_TOTAL" -gt 0 ]; then
+            PATCH_PCT=$(jq -r '.percent' patch_coverage.json)
+            PATCH_COVERED=$(jq -r '.total_covered' patch_coverage.json)
+            HEADLINE="${HEADLINE} · **Patch coverage:** $(printf '%.2f' "$PATCH_PCT")% (${PATCH_COVERED} / ${PATCH_TOTAL} changed lines)"
+          fi
+
+          # --- Build the comment ---
           {
             echo "$MARKER"
             echo "## Coverage Report"
             echo ""
+            echo "$HEADLINE"
+            echo ""
+
+            # Per-file patch coverage, if the PR touched any covered .rs lines.
+            if [ "$PATCH_TOTAL" -gt 0 ]; then
+              echo "| File | Patch Coverage | Covered / Changed |"
+              echo "|------|----------------|-------------------|"
+              jq -r "${PCT_DEF}"'
+                .files | sort_by(.percent) | .[]
+                | "| \(.file) | \(.percent | pct)% | \(.covered) / \(.total) |"
+              ' patch_coverage.json
+              echo ""
+            fi
+
+            echo "### Project totals"
+            echo ""
             echo "| Metric | Coverage | Covered / Total |"
             echo "|--------|----------|-----------------|"
-            jq -r '
-              # Format a percentage as XX.YY (always 2 decimals).
-              def pct: (. * 100 | round) as $x
-                | "\($x / 100 | floor).\($x % 100 | tostring | if length == 1 then "0\(.)" else . end)";
+            jq -r "${PCT_DEF}"'
               .data[0].totals as $t |
               [
                 ["Lines", $t.lines],
@@ -158,9 +260,7 @@ jobs:
             echo ""
 
             # Lowest-covered files (line coverage ascending), excluding 100%.
-            LOWEST=$(jq -r --arg ws "$WORKSPACE" '
-              def pct: (. * 100 | round) as $x
-                | "\($x / 100 | floor).\($x % 100 | tostring | if length == 1 then "0\(.)" else . end)";
+            LOWEST=$(jq -r --arg ws "$WORKSPACE" "${PCT_DEF}"'
               .data[0].files
               | map(select(.summary.lines.percent < 100))
               | sort_by(.summary.lines.percent)
@@ -170,7 +270,7 @@ jobs:
             ' coverage.json)
             if [ -n "$LOWEST" ]; then
               N=$(printf '%s\n' "$LOWEST" | wc -l)
-              echo "<details><summary>${N} lowest-covered files (line coverage)</summary>"
+              echo "<details><summary>${N} lowest-covered files (line coverage, project-wide)</summary>"
               echo ""
               echo "| File | Lines | Covered / Total |"
               echo "|------|-------|-----------------|"
