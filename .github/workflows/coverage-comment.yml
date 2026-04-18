@@ -1,0 +1,104 @@
+name: Coverage Comment
+
+# Runs after "Rust CI" finishes and posts the sticky coverage comment on
+# the PR. This workflow exists because pull_request events from forks run
+# with a read-only GITHUB_TOKEN, which cannot post comments. workflow_run
+# runs in the context of the base repository on the default branch, so its
+# token can be granted pull-requests: write safely.
+#
+# Security: this workflow must NOT execute or trust any content from the
+# triggering (fork) run. It only consumes the comment body and PR metadata
+# as text, and passes the body through the GitHub API. See:
+# https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+
+on:
+  workflow_run:
+    workflows: ["Rust CI"]
+    types: [completed]
+
+# Serialize runs for the same head SHA so a CI re-run cancels the
+# in-flight comment from the prior run. Fork PRs don't expose PR number
+# on workflow_run reliably, so head_sha is the stable key.
+concurrency:
+  group: coverage-comment-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  post-coverage-comment:
+    name: Post coverage comment
+    runs-on: ubuntu-latest
+    # Only act on PR-triggered CI runs. We don't gate on the workflow's
+    # overall conclusion because we want a coverage comment even when
+    # unrelated jobs (docs, clippy, etc.) fail. Absence of the
+    # coverage-comment artifact is the real signal to skip.
+    if: github.event.workflow_run.event == 'pull_request'
+    steps:
+      - name: Download coverage comment artifact
+        id: comment_artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-comment
+          path: comment
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
+      - name: Download PR metadata artifact
+        id: meta_artifact
+        if: steps.comment_artifact.outcome == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-comment-meta
+          path: meta
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Post or update sticky comment
+        if: steps.comment_artifact.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MARKER: "<!-- coverage-comment -->"
+          EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER="$(tr -d '[:space:]' < meta/pr_number.txt)"
+          ARTIFACT_HEAD_SHA="$(tr -d '[:space:]' < meta/pr_head_sha.txt)"
+
+          # Defensive validation: PR number must be a positive integer, and
+          # the artifact's recorded head SHA must match the workflow_run
+          # head SHA. This keeps a malicious fork from redirecting the
+          # comment at an unrelated PR.
+          if ! printf '%s' "$PR_NUMBER" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "::error::Invalid PR number in artifact: $PR_NUMBER"
+            exit 1
+          fi
+          if [ "$ARTIFACT_HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::Artifact head SHA ($ARTIFACT_HEAD_SHA) does not match workflow_run head SHA ($EXPECTED_HEAD_SHA)"
+            exit 1
+          fi
+
+          # Confirm the PR exists and its head SHA matches.
+          PR_HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')
+          if [ "$PR_HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "PR #${PR_NUMBER} head has moved (${PR_HEAD_SHA} != ${EXPECTED_HEAD_SHA}); skipping stale comment."
+            exit 0
+          fi
+
+          # Sticky comment: edit the existing one if our marker is present,
+          # otherwise post a new one. Avoids spamming the PR on each push.
+          EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" \
+            | head -n 1)
+
+          if [ -n "$EXISTING" ]; then
+            jq -Rs '{body: .}' < comment/comment.md \
+              | gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" --input -
+          else
+            jq -Rs '{body: .}' < comment/comment.md \
+              | gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" --input -
+          fi

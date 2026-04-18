@@ -232,8 +232,10 @@ jobs:
             base_coverage.lcov
           retention-days: 1
 
-  # Aggregates head + base, computes patch coverage, posts the PR comment.
-  # This is the required check; it runs as long as head succeeded.
+  # Aggregates head + base, computes patch coverage, and builds the sticky
+  # comment body. The comment is posted by a separate workflow triggered via
+  # workflow_run so cross-fork PRs (which run with a read-only GITHUB_TOKEN)
+  # can still get comments - this job only builds the artifact.
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -241,7 +243,6 @@ jobs:
     if: always() && needs.coverage-head.result == 'success'
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -265,12 +266,8 @@ jobs:
           fi
           python3 .github/scripts/patch_coverage.py "${args[@]}" > patch_coverage.json
           cat patch_coverage.json
-      - name: Post coverage comment
-        continue-on-error: true
+      - name: Build coverage comment
         env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
           MARKER: "<!-- coverage-comment -->"
         run: |
           set -euo pipefail
@@ -385,19 +382,30 @@ jobs:
 
           # Mirror to the Actions step summary so the report is visible in the run UI.
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
-
-          # Sticky comment: edit the existing one if our marker is present,
-          # otherwise post a new one. Avoids spamming the PR on each push.
-          EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" \
-            | head -n 1)
-
-          if [ -n "$EXISTING" ]; then
-            jq -Rs '{body: .}' < comment.md \
-              | gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" --input -
-          else
-            gh pr comment "$PR_NUMBER" --body-file comment.md
-          fi
+      - name: Upload coverage comment
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-comment
+          path: comment.md
+          retention-days: 1
+      # PR metadata for the coverage-comment workflow. workflow_run events
+      # don't carry PR context, and looking it up from the head SHA is
+      # unreliable for fork PRs, so we pass it via artifact.
+      - name: Record PR metadata
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s\n' "$PR_NUMBER" > pr_number.txt
+          printf '%s\n' "$PR_HEAD_SHA" > pr_head_sha.txt
+      - name: Upload PR metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-comment-meta
+          path: |
+            pr_number.txt
+            pr_head_sha.txt
+          retention-days: 1
 
   # Compiles release builds on all platforms to catch platform-specific compile errors
   # Release mode can surface different issues than debug mode (e.g., optimization bugs)
