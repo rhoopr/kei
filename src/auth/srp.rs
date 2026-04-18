@@ -1388,7 +1388,7 @@ mod tests {
     /// against a future parser change that would treat a parse error as
     /// "FIDO present".
     #[tokio::test]
-    async fn srp_wiremock_unparseable_409_falls_through_to_2fa() {
+    async fn srp_wiremock_unparsable_409_falls_through_to_2fa() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(wm_path("/appleauth/auth/signin/init"))
@@ -1412,6 +1412,6 @@ mod tests {
             "com",
         )
         .await
-        .expect("unparseable 409 must fall through to the 2FA path, not bail as FIDO");
+        .expect("unparsable 409 must fall through to the 2FA path, not bail as FIDO");
     }
 }
