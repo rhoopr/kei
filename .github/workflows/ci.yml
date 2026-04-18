@@ -3,6 +3,12 @@ name: Rust CI
 on:
   pull_request:
 
+# Cancel an in-flight CI run when a new push lands on the same PR.
+# Only the latest commit matters; older runs would just burn minutes.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
