@@ -238,6 +238,16 @@ pub struct StatusArgs {
     /// Show failed assets with error messages
     #[arg(long)]
     pub failed: bool,
+
+    /// Show pending assets (known to the DB, not yet finalized this sync).
+    /// Includes assets the current sync scope excludes via filters or album
+    /// selection.
+    #[arg(long)]
+    pub pending: bool,
+
+    /// Show downloaded assets
+    #[arg(long)]
+    pub downloaded: bool,
 }
 
 /// Arguments for the import-existing command.
@@ -1885,6 +1895,45 @@ mod tests {
         let cli = Cli::try_parse_from(["kei", "status", "--failed"]).unwrap();
         if let Some(Command::Status(args)) = cli.command {
             assert!(args.failed);
+            assert!(!args.pending);
+            assert!(!args.downloaded);
+        } else {
+            panic!("Expected Status command");
+        }
+    }
+
+    #[test]
+    fn test_status_with_pending_flag() {
+        let cli = Cli::try_parse_from(["kei", "status", "--pending"]).unwrap();
+        if let Some(Command::Status(args)) = cli.command {
+            assert!(!args.failed);
+            assert!(args.pending);
+            assert!(!args.downloaded);
+        } else {
+            panic!("Expected Status command");
+        }
+    }
+
+    #[test]
+    fn test_status_with_downloaded_flag() {
+        let cli = Cli::try_parse_from(["kei", "status", "--downloaded"]).unwrap();
+        if let Some(Command::Status(args)) = cli.command {
+            assert!(!args.failed);
+            assert!(!args.pending);
+            assert!(args.downloaded);
+        } else {
+            panic!("Expected Status command");
+        }
+    }
+
+    #[test]
+    fn test_status_flags_combine() {
+        let cli = Cli::try_parse_from(["kei", "status", "--failed", "--pending", "--downloaded"])
+            .unwrap();
+        if let Some(Command::Status(args)) = cli.command {
+            assert!(args.failed);
+            assert!(args.pending);
+            assert!(args.downloaded);
         } else {
             panic!("Expected Status command");
         }

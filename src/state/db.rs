@@ -40,9 +40,21 @@ pub trait StateDb: Send + Sync {
         local_path: &Path,
     ) -> Result<bool, StateError>;
 
-    /// Insert or update an asset record after seeing it during sync.
+    /// Insert or update an asset record after the producer commits it for
+    /// download.
     ///
     /// Updates `last_seen_at` and preserves existing download status.
+    ///
+    /// **Invariant (see issue #211):** Call only from the producer dispatch
+    /// path, after an asset has passed every filter and skip check and a
+    /// download task has been created. `promote_pending_to_failed` treats
+    /// `last_seen_at >= sync_started_at` as "the producer handed this off to
+    /// the consumer this sync", so any call that bumps `last_seen_at` without
+    /// a matching consumer finalization (`mark_downloaded` / `mark_failed`)
+    /// will cause the asset to be promoted to `failed`. If you need to touch
+    /// `last_seen_at` for an asset the consumer will not finalize (trust-state
+    /// fast-skip, on-disk dedup, filtered-out, etc.), use `touch_last_seen`
+    /// on rows that already have a terminal status, not `upsert_seen`.
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError>;
 
     /// Mark an asset as successfully downloaded.
@@ -65,6 +77,9 @@ pub trait StateDb: Send + Sync {
 
     /// Get all failed assets.
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError>;
+
+    /// Get all pending assets.
+    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
 
     /// Get a summary of the database state.
     async fn get_summary(&self) -> Result<SyncSummary, StateError>;
@@ -97,11 +112,19 @@ pub trait StateDb: Send + Sync {
     /// (failed_reset, pending_reset, total_pending).
     async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
 
-    /// Promote stale pending assets to failed.
+    /// Promote stuck pending assets to failed.
     ///
-    /// Called at the end of a non-interrupted sync run. Only promotes pending
-    /// assets whose `last_seen_at` is before `seen_since` - assets seen
-    /// during this sync (including on-disk skips) are left alone.
+    /// Called at the end of a non-interrupted sync run. Promotes pending
+    /// assets that the producer dispatched this sync (`last_seen_at >=
+    /// seen_since`) but that the consumer never finalized via
+    /// `mark_downloaded` or `mark_failed`. These are stuck-pipeline cases,
+    /// not filter or album-scope exclusions.
+    ///
+    /// Assets whose `last_seen_at` predates this sync (filtered out, album
+    /// scope changed, remotely deleted, or otherwise not re-enumerated) are
+    /// left alone - they are not failures, and promoting them causes the
+    /// pending -> failed -> pending ghost loop documented in issue #211.
+    ///
     /// Returns the number of assets promoted.
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError>;
 
@@ -143,6 +166,12 @@ pub trait StateDb: Send + Sync {
 
     /// Update `last_seen_at` for all versions of an asset without requiring
     /// full metadata. Used by the early skip path to avoid path resolution.
+    ///
+    /// Safe to call for assets the consumer will not finalize (trust-state
+    /// fast-skip, on-disk dedup, etc.) only when the row already has a
+    /// terminal status (`downloaded` or `failed`). Touching a `pending` row
+    /// will cause `promote_pending_to_failed` to promote it to `failed` at
+    /// sync end - see `upsert_seen` docs and issue #211.
     async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError>;
 
     /// Sample up to `limit` local paths of downloaded assets.
@@ -402,7 +431,8 @@ impl StateDb for SqliteStateDb {
             tracing::warn!(
                 id,
                 version_size,
-                "mark_failed matched 0 rows — asset may not have been recorded via upsert_seen"
+                "mark_failed matched 0 rows; caller must upsert_seen before mark_failed \
+                 (producer-dispatch invariant). Failure not persisted"
             );
         }
 
@@ -412,10 +442,12 @@ impl StateDb for SqliteStateDb {
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
         let conn = self.acquire_lock("get_failed")?;
 
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+             ORDER BY last_seen_at DESC",
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'failed'",
-            )
+            .prepare(&sql)
             .map_err(|e| StateError::query("get_failed", e))?;
 
         let records = stmt
@@ -423,6 +455,26 @@ impl StateDb for SqliteStateDb {
             .map_err(|e| StateError::query("get_failed", e))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| StateError::query("get_failed", e))?;
+
+        Ok(records)
+    }
+
+    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+        let conn = self.acquire_lock("get_pending")?;
+
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' \
+             ORDER BY last_seen_at DESC",
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StateError::query("get_pending", e))?;
+
+        let records = stmt
+            .query_map([], row_to_asset_record)
+            .map_err(|e| StateError::query("get_pending", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StateError::query("get_pending", e))?;
 
         Ok(records)
     }
@@ -492,10 +544,12 @@ impl StateDb for SqliteStateDb {
     ) -> Result<Vec<AssetRecord>, StateError> {
         let conn = self.acquire_lock("get_downloaded_page")?;
 
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'downloaded' \
+             ORDER BY rowid LIMIT ?1 OFFSET ?2",
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'downloaded' ORDER BY rowid LIMIT ?1 OFFSET ?2",
-            )
+            .prepare(&sql)
             .map_err(|e| StateError::query("get_downloaded_page", e))?;
 
         let records = stmt
@@ -582,10 +636,14 @@ impl StateDb for SqliteStateDb {
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
         let conn = self.acquire_lock("promote_pending_to_failed")?;
 
+        // Only promote assets the producer dispatched this sync (last_seen_at
+        // was bumped by upsert_seen at or after sync_started_at) that never
+        // reached mark_downloaded or mark_failed. See the trait doc comment
+        // and issue #211 for the rationale.
         let promoted =
             conn.execute(
                 "UPDATE assets SET status = 'failed', last_error = 'Not resolved during sync' \
-                 WHERE status = 'pending' AND (last_seen_at IS NULL OR last_seen_at < ?1)",
+                 WHERE status = 'pending' AND last_seen_at >= ?1",
                 rusqlite::params![seen_since],
             )
             .map_err(|e| StateError::query("promote_pending_to_failed", e))? as u64;
@@ -771,6 +829,29 @@ impl StateDb for SqliteStateDb {
         Ok(paths)
     }
 }
+
+#[cfg(test)]
+impl SqliteStateDb {
+    /// Overwrite `last_seen_at` for a specific asset. Used by tests that need
+    /// to simulate a pending row carried over from a prior sync. Callable
+    /// from any test module in the crate so cross-module state tests (e.g.
+    /// pipeline-level ghost-loop regression) don't have to reach for raw
+    /// `rusqlite::Connection` plumbing.
+    pub(crate) fn backdate_last_seen(&self, asset_id: &str, ts: i64) {
+        let conn = self.acquire_lock("test_backdate_last_seen").unwrap();
+        conn.execute(
+            "UPDATE assets SET last_seen_at = ?1 WHERE id = ?2",
+            rusqlite::params![ts, asset_id],
+        )
+        .unwrap();
+    }
+}
+
+/// Column list for every `SELECT ... FROM assets` that feeds `row_to_asset_record`.
+/// Keep this in sync with the indices read in `row_to_asset_record`.
+const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
+     added_at, size_bytes, media_type, status, downloaded_at, local_path, \
+     last_seen_at, download_attempts, last_error, local_checksum";
 
 /// Convert a database row to an `AssetRecord`.
 ///
@@ -963,6 +1044,60 @@ mod tests {
         assert_eq!(failed[0].id, "ABC123");
         assert_eq!(failed[0].last_error.as_deref(), Some("Connection timeout"));
         assert_eq!(failed[0].download_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn get_failed_orders_by_last_seen_desc() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for id in &["OLDEST", "MIDDLE", "NEWEST"] {
+            let record = TestAssetRecord::new(id)
+                .checksum(&format!("ck_{id}"))
+                .filename(&format!("{}.jpg", id.to_lowercase()))
+                .size(100)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_failed(id, "original", "boom").await.unwrap();
+        }
+
+        // Force a deterministic order by backdating.
+        db.backdate_last_seen("OLDEST", 1_000);
+        db.backdate_last_seen("MIDDLE", 2_000);
+        db.backdate_last_seen("NEWEST", 3_000);
+
+        let failed = db.get_failed().await.unwrap();
+        let ids: Vec<&str> = failed.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["NEWEST", "MIDDLE", "OLDEST"],
+            "get_failed must sort last_seen_at DESC"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_pending_orders_by_last_seen_desc() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for id in &["OLD", "MID", "NEW"] {
+            let record = TestAssetRecord::new(id)
+                .checksum(&format!("ck_{id}"))
+                .filename(&format!("{}.jpg", id.to_lowercase()))
+                .size(100)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        db.backdate_last_seen("OLD", 1_000);
+        db.backdate_last_seen("MID", 2_000);
+        db.backdate_last_seen("NEW", 3_000);
+
+        let pending = db.get_pending().await.unwrap();
+        let ids: Vec<&str> = pending.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["NEW", "MID", "OLD"],
+            "get_pending must sort last_seen_at DESC"
+        );
     }
 
     #[tokio::test]
@@ -1877,7 +2012,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 2 pending (should be promoted to failed)
+        // 2 pending dispatched this sync (should be promoted to failed)
         for i in 0..2 {
             let id = format!("APending{i}");
             let record = TestAssetRecord::new(&id)
@@ -1904,9 +2039,11 @@ mod tests {
         assert_eq!(before.pending, 2);
         assert_eq!(before.failed, 1);
 
-        // Use a future timestamp so all pending assets are considered stale
-        let future = chrono::Utc::now().timestamp() + 3600;
-        let promoted = db.promote_pending_to_failed(future).await.unwrap();
+        // Gate is `last_seen_at >= seen_since`. Use a timestamp in the past
+        // so every pending asset seen in this test counts as "dispatched
+        // this sync" and gets promoted.
+        let past = chrono::Utc::now().timestamp() - 3600;
+        let promoted = db.promote_pending_to_failed(past).await.unwrap();
         assert_eq!(promoted, 2);
 
         let after = db.get_summary().await.unwrap();
@@ -2096,32 +2233,28 @@ mod tests {
         );
     }
 
-    // ── Gap: promote_pending_to_failed boundary -- seen assets preserved ──
+    // Promote: only the asset the producer touched this sync is a candidate.
+    // Anything with a stale last_seen_at is filtered / out of scope and must
+    // stay pending. See issue #211.
 
     #[tokio::test]
-    async fn promote_pending_to_failed_preserves_recently_seen() {
+    async fn promote_pending_to_failed_skips_stale_last_seen() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        // Insert an "old" asset with last_seen_at far in the past
+        // OLD_ASSET: upserted before this sync (last_seen_at 1 hour ago).
+        // Stands in for filtered-out / out-of-scope / remotely deleted assets
+        // whose last_seen_at didn't get refreshed this sync.
         let old_record = TestAssetRecord::new("OLD_ASSET")
             .checksum("ck_old")
             .filename("old.jpg")
             .size(1000)
             .build();
         db.upsert_seen(&old_record).await.unwrap();
+        db.backdate_last_seen("OLD_ASSET", chrono::Utc::now().timestamp() - 3600);
 
-        // Manually backdate OLD_ASSET's last_seen_at to 1 hour ago
-        {
-            let conn = db.acquire_lock("test_setup").unwrap();
-            let old_ts = chrono::Utc::now().timestamp() - 3600;
-            conn.execute(
-                "UPDATE assets SET last_seen_at = ?1 WHERE id = 'OLD_ASSET'",
-                rusqlite::params![old_ts],
-            )
-            .unwrap();
-        }
-
-        // Insert a "new" asset -- its last_seen_at will be now()
+        // NEW_ASSET: producer called upsert_seen this sync, consumer never
+        // finalized. This is the stuck-pipeline case the function exists
+        // to catch.
         let new_record = TestAssetRecord::new("NEW_ASSET")
             .checksum("ck_new")
             .filename("new.jpg")
@@ -2129,51 +2262,102 @@ mod tests {
             .build();
         db.upsert_seen(&new_record).await.unwrap();
 
-        // Boundary: 30 minutes ago -- OLD_ASSET (1h ago) is before,
-        // NEW_ASSET (now) is after
-        let boundary = chrono::Utc::now().timestamp() - 1800;
-        let promoted = db.promote_pending_to_failed(boundary).await.unwrap();
+        // sync_started_at: 30 minutes ago. OLD_ASSET (1h ago) is before the
+        // boundary and must be left alone. NEW_ASSET (now) is after and
+        // must be promoted.
+        let sync_started_at = chrono::Utc::now().timestamp() - 1800;
+        let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
 
         let summary = db.get_summary().await.unwrap();
         assert_eq!(
             promoted, 1,
-            "only OLD_ASSET (seen before boundary) should be promoted"
+            "only NEW_ASSET (dispatched this sync) should be promoted"
         );
-        assert_eq!(summary.pending, 1, "NEW_ASSET should remain pending");
-        assert_eq!(summary.failed, 1, "OLD_ASSET should be failed");
+        assert_eq!(summary.pending, 1, "OLD_ASSET should remain pending");
+        assert_eq!(summary.failed, 1, "NEW_ASSET should be failed");
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, "NEW_ASSET");
     }
 
-    // ── Gap: promote_pending_to_failed with very old last_seen_at ────
+    // Regression test for #211: a pending asset the producer didn't enumerate
+    // this sync (because a filter excluded it, the album scope changed, or
+    // the upstream record was deleted) must not be promoted to failed.
+    // Previously, prepare_for_retry + unseen + promote would loop this asset
+    // between pending and failed on every sync.
 
     #[tokio::test]
-    async fn promote_pending_to_failed_promotes_stale_last_seen() {
-        // Assets with last_seen_at from a previous sync cycle (e.g., epoch)
-        // should be promoted when the boundary is recent.
+    async fn promote_pending_to_failed_does_not_loop_filtered_asset() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let record = TestAssetRecord::new("STALE_ASSET")
-            .checksum("ck_stale")
-            .filename("stale.jpg")
+        // Sync 1: asset enumerated, upsert_seen, then never got finalized
+        // and was subsequently "lost" from the enumeration scope (e.g. user
+        // added --skip-videos). We simulate that by backdating last_seen_at.
+        let record = TestAssetRecord::new("GHOST")
+            .checksum("ck_ghost")
+            .filename("ghost.mov")
+            .size(4096)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.backdate_last_seen("GHOST", chrono::Utc::now().timestamp() - 86400);
+
+        // Sync 2 begins now. The asset is filtered out - no upsert_seen, no
+        // touch_last_seen. last_seen_at stays at one_day_ago.
+        let sync_2_start = chrono::Utc::now().timestamp();
+        let promoted = db.promote_pending_to_failed(sync_2_start).await.unwrap();
+        assert_eq!(promoted, 0, "filtered asset must not be promoted");
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.failed, 0);
+
+        // Sync 3, 4, 5: same filter still applied. Assert the state is
+        // stable across repeated calls.
+        for _ in 0..3 {
+            let start = chrono::Utc::now().timestamp();
+            let promoted = db.promote_pending_to_failed(start).await.unwrap();
+            assert_eq!(promoted, 0, "stable: filtered asset stays pending");
+        }
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.failed, 0);
+    }
+
+    // Canary for the touch_last_seen contract: if a caller bumps
+    // last_seen_at on a pending row, promote_pending_to_failed WILL promote
+    // it. The touch_last_seen trait docs warn against this. This test locks
+    // in that behavior so a silent regression (e.g. an unsafe touch added
+    // to a skip path) is caught.
+
+    #[tokio::test]
+    async fn touch_last_seen_on_pending_row_causes_promotion_at_sync_end() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // A pending row carried over from a prior sync (backdated).
+        let record = TestAssetRecord::new("PENDING_CARRYOVER")
+            .checksum("ck_p")
+            .filename("pending.jpg")
             .size(1000)
             .build();
         db.upsert_seen(&record).await.unwrap();
+        db.backdate_last_seen("PENDING_CARRYOVER", chrono::Utc::now().timestamp() - 86400);
 
-        // Backdate to epoch
-        {
-            let conn = db.acquire_lock("test_setup").unwrap();
-            conn.execute(
-                "UPDATE assets SET last_seen_at = 0 WHERE id = 'STALE_ASSET'",
-                [],
-            )
-            .unwrap();
-        }
+        // Capture sync_started_at BEFORE touch_last_seen runs.
+        let sync_started_at = chrono::Utc::now().timestamp();
 
-        let now = chrono::Utc::now().timestamp();
-        let promoted = db.promote_pending_to_failed(now).await.unwrap();
+        // Caller violates the contract: bumps last_seen_at on a pending row.
+        db.touch_last_seen("PENDING_CARRYOVER").await.unwrap();
+
+        let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
         assert_eq!(
             promoted, 1,
-            "asset with epoch last_seen_at should be promoted"
+            "touch_last_seen on a pending row must cause promotion at sync end"
         );
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, "PENDING_CARRYOVER");
     }
 
     // ── Gap: upsert_seen preserves downloaded status across updates ───

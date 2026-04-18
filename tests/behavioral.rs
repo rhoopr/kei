@@ -36,8 +36,14 @@ fn sanitize_username(username: &str) -> String {
         .collect()
 }
 
-/// Create a state DB at the expected path for the given username inside `data_dir`.
+/// Create a state DB at the expected path for the given username inside
+/// `data_dir`. Mirrors the latest schema from `src/state/schema.rs` so
+/// callers don't rely on the binary's migration path to fill in columns
+/// added after v1. Bump `SCHEMA_VERSION` and the DDL below together whenever
+/// schema.rs changes.
 fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Connection {
+    const SCHEMA_VERSION: i32 = 4;
+
     let db_name = format!("{}.db", sanitize_username(username));
     let db_path = data_dir.join(db_name);
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -59,8 +65,12 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             download_attempts INTEGER DEFAULT 0,
             last_error TEXT,
             local_checksum TEXT,
+            download_checksum TEXT,
             PRIMARY KEY (id, version_size)
         );
+        CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
+        CREATE INDEX IF NOT EXISTS idx_assets_local_path ON assets(local_path);
+        CREATE INDEX IF NOT EXISTS idx_assets_checksum ON assets(checksum);
         CREATE TABLE IF NOT EXISTS sync_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at INTEGER NOT NULL,
@@ -77,7 +87,8 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
         ",
     )
     .unwrap();
-    conn.pragma_update(None, "user_version", 3).unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .unwrap();
     conn
 }
 
@@ -2686,6 +2697,262 @@ fn dry_run_creates_no_state_db() {
         "dry-run should not create a state DB, found: {:?}",
         db_files.iter().map(|e| e.path()).collect::<Vec<_>>()
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Status: --pending and --downloaded (issue #211)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn status_pending_shows_pending_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    insert_asset(&conn, "a1", "pending", "photo1.jpg", None, None, None);
+    insert_asset(&conn, "a2", "pending", "photo2.jpg", None, None, None);
+    insert_asset(
+        &conn,
+        "a3",
+        "downloaded",
+        "photo3.jpg",
+        Some("/p/photo3.jpg"),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--pending",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Pending assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("photo1.jpg"), "stdout: {stdout}");
+    assert!(stdout.contains("photo2.jpg"), "stdout: {stdout}");
+    // Downloaded asset must not appear in the pending listing
+    assert!(!stdout.contains("photo3.jpg"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_downloaded_shows_downloaded_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    insert_asset(
+        &conn,
+        "a1",
+        "downloaded",
+        "photo1.jpg",
+        Some("/p/photo1.jpg"),
+        None,
+        None,
+    );
+    insert_asset(&conn, "a2", "pending", "photo2.jpg", None, None, None);
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--downloaded",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Downloaded assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("photo1.jpg"), "stdout: {stdout}");
+    assert!(stdout.contains("/p/photo1.jpg"), "stdout: {stdout}");
+    // Pending asset must not appear in the downloaded listing
+    assert!(!stdout.contains("photo2.jpg"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_pending_empty_when_none_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "a1",
+        "downloaded",
+        "photo1.jpg",
+        Some("/p/photo1.jpg"),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--pending",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("Pending assets:"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_downloaded_with_null_local_path_surfaces_missing_marker() {
+    // Covers the `<MISSING local_path>` display path in print_downloaded.
+    // A downloaded row without a local_path is a state-DB invariant
+    // violation; status must not silently hide it.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    // Directly insert a downloaded row with NULL local_path. insert_asset
+    // helper would still pass None through, so we use it with explicit
+    // Option::None for local_path.
+    insert_asset(&conn, "a1", "downloaded", "broken.jpg", None, None, None);
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--downloaded",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("<MISSING local_path>"),
+        "missing-path marker not surfaced: {stdout}"
+    );
+    assert!(stdout.contains("broken.jpg"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_all_three_flags_render_all_sections() {
+    // End-to-end coverage for --failed --pending --downloaded combined.
+    // Locks in the three-section rendering and proves the flags are
+    // orthogonal in the actual binary (not just clap parsing).
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    insert_asset(
+        &conn,
+        "dl1",
+        "downloaded",
+        "dl.jpg",
+        Some("/p/dl.jpg"),
+        None,
+        None,
+    );
+    insert_asset(&conn, "pend1", "pending", "pend.jpg", None, None, None);
+    insert_asset(
+        &conn,
+        "fail1",
+        "failed",
+        "fail.jpg",
+        None,
+        Some("timeout"),
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--failed",
+            "--pending",
+            "--downloaded",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Failed assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("fail.jpg"), "stdout: {stdout}");
+    assert!(stdout.contains("Pending assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("pend.jpg"), "stdout: {stdout}");
+    assert!(stdout.contains("Downloaded assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("dl.jpg"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_downloaded_paginates_past_500_records() {
+    // Covers the pagination loop in run_status for --downloaded when the
+    // result set exceeds page_size (500). Uses 600 rows to require at
+    // least two page fetches.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    for i in 0..600 {
+        let id = format!("dl{i:04}");
+        let filename = format!("photo_{i:04}.jpg");
+        let local = format!("/p/photo_{i:04}.jpg");
+        insert_asset(
+            &conn,
+            &id,
+            "downloaded",
+            &filename,
+            Some(&local),
+            None,
+            None,
+        );
+    }
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--downloaded",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Downloaded: 600"), "stdout: {stdout}");
+    // First and last rows across the page boundary must both appear.
+    assert!(stdout.contains("photo_0000.jpg"), "first row missing");
+    assert!(stdout.contains("photo_0499.jpg"), "boundary row missing");
+    assert!(
+        stdout.contains("photo_0500.jpg"),
+        "post-boundary row missing"
+    );
+    assert!(stdout.contains("photo_0599.jpg"), "last row missing");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

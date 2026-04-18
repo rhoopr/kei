@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Ghost asset loop on filter / album-scope changes.** Assets the DB knew about but the current sync didn't re-enumerate (filter excluded, album scope changed, upstream record deleted) were promoted to `failed` at sync end. `prepare_for_retry` then reset them to `pending` on the next sync, and the cycle repeated. `kei status --failed` filled with `Not resolved during sync` entries that weren't failures. `promote_pending_to_failed` now promotes only pending assets the producer dispatched this sync (`last_seen_at >= sync_started_at`) that the consumer never finalized. Filtered or out-of-scope assets keep their stale `last_seen_at` and are left alone. ([#211])
+
+### Added
+
+- **`kei status --pending` and `--downloaded`.** Parallel to the existing `--failed` flag, these list assets in the requested state with filename, ID, and last-seen time (pending) or local path (downloaded). ([#211])
+
+[#211]: https://github.com/rhoopr/kei/issues/211
+
+---
+
 ## [0.9.1] - 2026-04-18
 
 ### Fixed
