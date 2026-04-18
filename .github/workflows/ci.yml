@@ -112,52 +112,100 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
         run: |
-          cargo llvm-cov --all-features > coverage.txt
-          cat coverage.txt
+          # Run tests with coverage, defer report generation
+          cargo llvm-cov --all-features --no-report
+          # Human-readable report for the Actions log
+          cargo llvm-cov report
+          # Structured data for parsing - cargo-llvm-cov's text format is
+          # column-position-fragile and the test summary goes to stderr.
+          cargo llvm-cov report --json --output-path coverage.json
       - name: Post coverage comment
         if: github.event_name == 'pull_request'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MARKER: "<!-- coverage-comment -->"
         run: |
-          # Disable strict mode for parsing: greps with no matches and head's
-          # SIGPIPE to upstream are expected and must not abort the script.
-          set +e +o pipefail
+          set -euo pipefail
 
-          # Line coverage % from the TOTAL summary row (column 10 in
-          # cargo-llvm-cov's table: regions/functions/lines/branches).
-          TOTAL=$(awk '/^TOTAL/ {print $10; exit}' coverage.txt)
+          # Strip absolute workspace prefix from filenames in JSON.
+          WORKSPACE="$(pwd)/"
 
-          # Sum "N passed" across every test binary's result line.
-          TESTS=$(awk '/^test result:/ {for (i=1; i<=NF; i++) if ($i == "passed;") s += $(i-1)} END {print s+0}' coverage.txt)
-
-          # Files with 0% and 100% coverage (excluding the TOTAL row).
-          ZERO_COV=$(awk '/0\.00%/ && !/^TOTAL/ {print $1; if (++n >= 5) exit}' coverage.txt | tr '\n' ', ' | sed 's/, $//')
-          FULL_COV=$(awk '/100\.00%/ && !/^TOTAL/ {print $1}' coverage.txt | tr '\n' ', ' | sed 's/, $//')
-
-          set -e -o pipefail
-
-          : "${TOTAL:=N/A}"
-          : "${TESTS:=0}"
-
+          # Build the comment.
           {
+            echo "$MARKER"
             echo "## Coverage Report"
             echo ""
-            echo "| Metric | Value |"
-            echo "|--------|-------|"
-            echo "| **Line Coverage** | ${TOTAL} |"
-            echo "| **Tests Passed** | ${TESTS} |"
+            echo "| Metric | Coverage | Covered / Total |"
+            echo "|--------|----------|-----------------|"
+            jq -r '
+              .data[0].totals as $t |
+              [
+                ["Lines", $t.lines],
+                ["Functions", $t.functions],
+                ["Regions", $t.regions],
+                ["Branches", $t.branches]
+              ] | .[] |
+              "| \(.[0]) | \(.[1].percent | . * 100 | round / 100)% | \(.[1].covered) / \(.[1].count) |"
+            ' coverage.json
             echo ""
-            if [ -n "$FULL_COV" ]; then
-              echo "**100% coverage:** \`${FULL_COV}\`"
+
+            # Lowest-covered files (line coverage ascending), excluding 100%.
+            LOWEST=$(jq -r --arg ws "$WORKSPACE" '
+              .data[0].files
+              | map(select(.summary.lines.percent < 100))
+              | sort_by(.summary.lines.percent)
+              | .[:10]
+              | .[]
+              | "| \(.filename | sub($ws; "")) | \(.summary.lines.percent | . * 100 | round / 100)% | \(.summary.lines.covered) / \(.summary.lines.count) |"
+            ' coverage.json)
+            if [ -n "$LOWEST" ]; then
+              N=$(printf '%s\n' "$LOWEST" | wc -l)
+              echo "<details><summary>${N} lowest-covered files (line coverage)</summary>"
+              echo ""
+              echo "| File | Lines | Covered / Total |"
+              echo "|------|-------|-----------------|"
+              printf '%s\n' "$LOWEST"
+              echo ""
+              echo "</details>"
               echo ""
             fi
-            if [ -n "$ZERO_COV" ]; then
-              echo "**Needs tests:** \`${ZERO_COV}\`"
+
+            # Files at 100% line coverage.
+            FULL=$(jq -r --arg ws "$WORKSPACE" '
+              .data[0].files
+              | map(select(.summary.lines.percent == 100))
+              | sort_by(.filename)
+              | .[]
+              | "- \(.filename | sub($ws; ""))"
+            ' coverage.json)
+            if [ -n "$FULL" ]; then
+              N=$(printf '%s\n' "$FULL" | wc -l)
+              echo "<details><summary>${N} files at 100% line coverage</summary>"
+              echo ""
+              printf '%s\n' "$FULL"
+              echo ""
+              echo "</details>"
             fi
           } > comment.md
 
-          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md || echo "Failed to post comment"
+          # Mirror to the Actions step summary so the report is visible in the run UI.
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+          # Sticky comment: edit the existing one if our marker is present,
+          # otherwise post a new one. Avoids spamming the PR on each push.
+          EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" \
+            | head -n 1)
+
+          if [ -n "$EXISTING" ]; then
+            jq -Rs '{body: .}' < comment.md \
+              | gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" --input -
+          else
+            gh pr comment "$PR_NUMBER" --body-file comment.md
+          fi
 
   # Compiles release builds on all platforms to catch platform-specific compile errors
   # Release mode can surface different issues than debug mode (e.g., optimization bugs)
