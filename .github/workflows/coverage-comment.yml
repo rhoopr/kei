@@ -16,6 +16,13 @@ on:
     workflows: ["Rust CI"]
     types: [completed]
 
+# Serialize runs for the same head SHA so a CI re-run cancels the
+# in-flight comment from the prior run. Fork PRs don't expose PR number
+# on workflow_run reliably, so head_sha is the stable key.
+concurrency:
+  group: coverage-comment-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
