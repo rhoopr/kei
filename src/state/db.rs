@@ -441,10 +441,12 @@ impl StateDb for SqliteStateDb {
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
         let conn = self.acquire_lock("get_failed")?;
 
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+             ORDER BY last_seen_at DESC",
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'failed'",
-            )
+            .prepare(&sql)
             .map_err(|e| StateError::query("get_failed", e))?;
 
         let records = stmt
@@ -459,10 +461,12 @@ impl StateDb for SqliteStateDb {
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
         let conn = self.acquire_lock("get_pending")?;
 
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' \
+             ORDER BY last_seen_at DESC",
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'pending' ORDER BY last_seen_at DESC",
-            )
+            .prepare(&sql)
             .map_err(|e| StateError::query("get_pending", e))?;
 
         let records = stmt
@@ -539,10 +543,12 @@ impl StateDb for SqliteStateDb {
     ) -> Result<Vec<AssetRecord>, StateError> {
         let conn = self.acquire_lock("get_downloaded_page")?;
 
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'downloaded' \
+             ORDER BY rowid LIMIT ?1 OFFSET ?2",
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'downloaded' ORDER BY rowid LIMIT ?1 OFFSET ?2",
-            )
+            .prepare(&sql)
             .map_err(|e| StateError::query("get_downloaded_page", e))?;
 
         let records = stmt
@@ -823,6 +829,12 @@ impl StateDb for SqliteStateDb {
     }
 }
 
+/// Column list for every `SELECT ... FROM assets` that feeds `row_to_asset_record`.
+/// Keep this in sync with the indices read in `row_to_asset_record`.
+const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
+     added_at, size_bytes, media_type, status, downloaded_at, local_path, \
+     last_seen_at, download_attempts, last_error, local_checksum";
+
 /// Convert a database row to an `AssetRecord`.
 ///
 /// Returns `rusqlite::Error` on column extraction failures instead of silently
@@ -878,6 +890,17 @@ mod tests {
 
     fn test_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// Overwrite `last_seen_at` for a specific asset row. Used by tests that
+    /// need to simulate a pending row carried over from a prior sync.
+    fn backdate_last_seen(db: &SqliteStateDb, asset_id: &str, ts: i64) {
+        let conn = db.acquire_lock("test_setup").unwrap();
+        conn.execute(
+            "UPDATE assets SET last_seen_at = ?1 WHERE id = ?2",
+            rusqlite::params![ts, asset_id],
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2166,15 +2189,7 @@ mod tests {
             .size(1000)
             .build();
         db.upsert_seen(&old_record).await.unwrap();
-        {
-            let conn = db.acquire_lock("test_setup").unwrap();
-            let old_ts = chrono::Utc::now().timestamp() - 3600;
-            conn.execute(
-                "UPDATE assets SET last_seen_at = ?1 WHERE id = 'OLD_ASSET'",
-                rusqlite::params![old_ts],
-            )
-            .unwrap();
-        }
+        backdate_last_seen(&db, "OLD_ASSET", chrono::Utc::now().timestamp() - 3600);
 
         // NEW_ASSET: producer called upsert_seen this sync, consumer never
         // finalized. This is the stuck-pipeline case the function exists
@@ -2224,15 +2239,7 @@ mod tests {
             .size(4096)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        {
-            let conn = db.acquire_lock("test_setup").unwrap();
-            let one_day_ago = chrono::Utc::now().timestamp() - 86400;
-            conn.execute(
-                "UPDATE assets SET last_seen_at = ?1 WHERE id = 'GHOST'",
-                rusqlite::params![one_day_ago],
-            )
-            .unwrap();
-        }
+        backdate_last_seen(&db, "GHOST", chrono::Utc::now().timestamp() - 86400);
 
         // Sync 2 begins now. The asset is filtered out - no upsert_seen, no
         // touch_last_seen. last_seen_at stays at one_day_ago.
