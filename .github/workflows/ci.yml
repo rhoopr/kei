@@ -141,25 +141,32 @@ jobs:
             echo "| Metric | Coverage | Covered / Total |"
             echo "|--------|----------|-----------------|"
             jq -r '
+              # Format a percentage as XX.YY (always 2 decimals).
+              def pct: (. * 100 | round) as $x
+                | "\($x / 100 | floor).\($x % 100 | tostring | if length == 1 then "0\(.)" else . end)";
               .data[0].totals as $t |
               [
                 ["Lines", $t.lines],
                 ["Functions", $t.functions],
                 ["Regions", $t.regions],
                 ["Branches", $t.branches]
-              ] | .[] |
-              "| \(.[0]) | \(.[1].percent | . * 100 | round / 100)% | \(.[1].covered) / \(.[1].count) |"
+              ]
+              | map(select(.[1].count > 0))
+              | .[]
+              | "| \(.[0]) | \(.[1].percent | pct)% | \(.[1].covered) / \(.[1].count) |"
             ' coverage.json
             echo ""
 
             # Lowest-covered files (line coverage ascending), excluding 100%.
             LOWEST=$(jq -r --arg ws "$WORKSPACE" '
+              def pct: (. * 100 | round) as $x
+                | "\($x / 100 | floor).\($x % 100 | tostring | if length == 1 then "0\(.)" else . end)";
               .data[0].files
               | map(select(.summary.lines.percent < 100))
               | sort_by(.summary.lines.percent)
               | .[:10]
               | .[]
-              | "| \(.filename | sub($ws; "")) | \(.summary.lines.percent | . * 100 | round / 100)% | \(.summary.lines.covered) / \(.summary.lines.count) |"
+              | "| \(.filename | sub($ws; "")) | \(.summary.lines.percent | pct)% | \(.summary.lines.covered) / \(.summary.lines.count) |"
             ' coverage.json)
             if [ -n "$LOWEST" ]; then
               N=$(printf '%s\n' "$LOWEST" | wc -l)
