@@ -289,7 +289,7 @@ impl MetricsHandle {
 
     /// Update DB-backed gauges from the current state database summary.
     ///
-    /// Call this after [`update`] on every real sync cycle, guarded by a
+    /// Call this after [`Self::update`] on every real sync cycle, guarded by a
     /// `state_db.as_ref()` check so dry-run and metrics-disabled paths are
     /// no-ops. `assets_seen` comes from [`SyncStats`] already in hand at the
     /// call site, so no extra DB query is needed for that gauge.
