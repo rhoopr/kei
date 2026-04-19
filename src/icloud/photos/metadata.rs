@@ -5,12 +5,15 @@
 //! fields that don't fit the canonical schema are preserved verbatim in
 //! `provider_data` so that invariant 4 (capture everything available) holds.
 
-use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 
 use crate::state::AssetMetadata;
 
+use super::asset::f64_to_millis_datetime;
 use super::enc;
+
+/// Provider identifier stored on every iCloud-sourced asset record.
+pub const SOURCE: &str = "icloud";
 
 /// Fields whose raw values we preserve in `provider_data` for fidelity to the
 /// iCloud record even when they don't map cleanly into the canonical schema.
@@ -46,7 +49,7 @@ const PROVIDER_DATA_FIELDS: &[&str] = &[
 /// asset record; the master record is consulted as fallback.
 pub fn extract(master_fields: &Value, asset_fields: &Value) -> AssetMetadata {
     let mut meta = AssetMetadata {
-        source: Some("icloud".into()),
+        source: Some(SOURCE.into()),
         ..AssetMetadata::default()
     };
 
@@ -60,8 +63,7 @@ pub fn extract(master_fields: &Value, asset_fields: &Value) -> AssetMetadata {
     meta.is_hidden = bool_field(asset_fields, "isHidden").unwrap_or(false);
     meta.is_deleted = bool_field(asset_fields, "isDeleted").unwrap_or(false)
         || bool_field(asset_fields, "isExpunged").unwrap_or(false);
-    meta.deleted_at = f64_field(asset_fields, "dateExpunged")
-        .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single());
+    meta.deleted_at = f64_field(asset_fields, "dateExpunged").and_then(f64_to_millis_datetime);
 
     if let Some(loc) = enc::decode_location_with_fallback(asset_fields) {
         meta.latitude = Some(loc.latitude);
@@ -101,32 +103,39 @@ pub fn extract(master_fields: &Value, asset_fields: &Value) -> AssetMetadata {
     meta
 }
 
+/// PHAssetMediaSubtype bit flags. Values match Apple's PhotoKit enum as
+/// observed in CloudKit responses.
+mod subtype {
+    pub const PANORAMA: u64 = 1;
+    pub const HDR: u64 = 1 << 1;
+    pub const SCREENSHOT: u64 = 1 << 2;
+    pub const LIVE_PHOTO: u64 = 1 << 3;
+    pub const PORTRAIT: u64 = 1 << 4;
+    pub const VIDEO_HIGH_FRAME_RATE: u64 = 1 << 17;
+    pub const VIDEO_TIMELAPSE: u64 = 1 << 18;
+}
+
+/// Priority-ordered mapping: specific subtypes resolve first so a photo tagged
+/// as both Portrait and HDR reports as Portrait.
+const MEDIA_SUBTYPE_MAP: &[(u64, &str)] = &[
+    (subtype::PORTRAIT, "portrait"),
+    (subtype::LIVE_PHOTO, "live_photo"),
+    (subtype::SCREENSHOT, "screenshot"),
+    (subtype::HDR, "hdr"),
+    (subtype::PANORAMA, "panorama"),
+    (subtype::VIDEO_HIGH_FRAME_RATE, "slo_mo"),
+    (subtype::VIDEO_TIMELAPSE, "timelapse"),
+];
+
 /// Apple's `assetSubtypeV2` / `assetSubtype` integer bit-flag enum mapped to
-/// canonical string values. Returns the first matching flag in priority order;
-/// unknown values are left `None` and the raw integer is preserved in
-/// `provider_data` for downstream use.
+/// canonical string values. Unknown values leave `media_subtype` as `None`;
+/// the raw integer is preserved in `provider_data` for downstream use.
 fn map_media_subtype(fields: &Value) -> Option<String> {
     let raw = u64_field(fields, "assetSubtypeV2").or_else(|| u64_field(fields, "assetSubtype"))?;
-    // PHAssetMediaSubtype-style bit flags. Values observed in Apple's CloudKit
-    // responses. Priority: specific subtypes first, generic later.
-    let canonical = if raw & 16 != 0 {
-        "portrait"
-    } else if raw & 8 != 0 {
-        "live_photo"
-    } else if raw & 4 != 0 {
-        "screenshot"
-    } else if raw & 2 != 0 {
-        "hdr"
-    } else if raw & 1 != 0 {
-        "panorama"
-    } else if raw & 131_072 != 0 {
-        "slo_mo"
-    } else if raw & 262_144 != 0 {
-        "timelapse"
-    } else {
-        return None;
-    };
-    Some(canonical.into())
+    MEDIA_SUBTYPE_MAP
+        .iter()
+        .find(|(flag, _)| raw & flag != 0)
+        .map(|(_, name)| (*name).into())
 }
 
 fn collect_provider_data(master_fields: &Value, asset_fields: &Value) -> Option<String> {

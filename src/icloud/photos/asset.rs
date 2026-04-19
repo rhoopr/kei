@@ -1,4 +1,3 @@
-use base64::Engine;
 use chrono::{DateTime, TimeZone, Utc};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
@@ -6,6 +5,7 @@ use smallvec::SmallVec;
 use tracing::warn;
 
 use super::cloudkit::Record;
+use super::enc;
 use super::metadata;
 use super::queries::{item_type_from_str, PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
 use super::types::{AssetItemType, AssetVersion, AssetVersionSize, ChangeReason};
@@ -60,30 +60,12 @@ pub struct PhotoAsset {
 /// Apple uses either plain STRING or base64-encoded `ENCRYPTED_BYTES` depending
 /// on the user's iCloud configuration.
 fn decode_filename(fields: &Value) -> Option<String> {
-    let enc = &fields["filenameEnc"];
-    if enc.is_null() {
-        return None;
-    }
-    let value = enc["value"].as_str()?;
-    let enc_type = enc["type"].as_str().unwrap_or("STRING");
-    match enc_type {
-        "STRING" => Some(value.to_string()),
-        "ENCRYPTED_BYTES" => {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(value)
-                .ok()?;
-            String::from_utf8(decoded).ok()
-        }
-        other => {
-            warn!(enc_type = %other, "Unsupported filenameEnc type");
-            None
-        }
-    }
+    enc::decode_string(fields, "filenameEnc")
 }
 
 /// Convert an `f64` millisecond timestamp to a `DateTime<Utc>`, returning
 /// `None` if the value is out of `i64` range.
-fn f64_to_millis_datetime(ms: f64) -> Option<DateTime<Utc>> {
+pub(crate) fn f64_to_millis_datetime(ms: f64) -> Option<DateTime<Utc>> {
     if (i64::MIN as f64..=i64::MAX as f64).contains(&ms) {
         Utc.timestamp_millis_opt(ms as i64).single()
     } else {

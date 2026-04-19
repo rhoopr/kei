@@ -489,14 +489,11 @@ where
     // a full enumeration that populates metadata for these rows without
     // re-downloading files.
     if let Some(db) = &state_db {
-        match db.count_downloaded_without_metadata_hash().await {
-            Ok(n) if n > 0 => {
-                tracing::info!(
-                    assets_to_backfill = n,
-                    "Backfilling metadata for existing assets (one-time after upgrade)"
-                );
+        match db.has_downloaded_without_metadata_hash().await {
+            Ok(true) => {
+                tracing::info!("Backfilling metadata for existing assets (one-time after upgrade)");
             }
-            Ok(_) => {}
+            Ok(false) => {}
             Err(e) => tracing::debug!(error = %e, "Failed to check for metadata backfill"),
         }
     }
@@ -2089,8 +2086,8 @@ mod tests {
         async fn mark_hidden_at_source(&self, _: &str) -> Result<(), StateError> {
             Ok(())
         }
-        async fn count_downloaded_without_metadata_hash(&self) -> Result<u64, StateError> {
-            Ok(0)
+        async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+            Ok(false)
         }
     }
 

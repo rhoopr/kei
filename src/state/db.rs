@@ -14,6 +14,15 @@ use super::types::{
     AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary, VersionSizeKey,
 };
 
+/// Fallback provider identifier when `AssetMetadata::source` is unset.
+///
+/// The `assets.source` column is NOT NULL (v5 migration defaults pre-existing
+/// rows to "icloud"). Test fixtures and legacy call sites that don't populate
+/// metadata get the same value written here so that INSERTs always succeed.
+/// Real provider adapters (iCloud, Takeout, etc.) set `source` explicitly;
+/// this fallback is a safety net, not the intended write path.
+const DEFAULT_SOURCE: &str = "icloud";
+
 /// Trait for state database operations.
 ///
 /// This trait is object-safe and can be used with `Arc<dyn StateDb>` for
@@ -206,11 +215,13 @@ pub trait StateDb: Send + Sync {
     /// Mark an asset as hidden at source.
     async fn mark_hidden_at_source(&self, asset_id: &str) -> Result<(), StateError>;
 
-    /// Count downloaded assets with `metadata_hash IS NULL`.
+    /// Whether any downloaded asset still has `metadata_hash IS NULL`.
     ///
     /// Used at sync start to log a one-time backfill notice after the v5
-    /// upgrade. Returns 0 on a fresh DB or once the backfill sync completes.
-    async fn count_downloaded_without_metadata_hash(&self) -> Result<u64, StateError>;
+    /// upgrade. Returns false on a fresh DB or once the backfill sync
+    /// completes. Early-exits on the first matching row via `EXISTS`, avoiding
+    /// a full COUNT scan.
+    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
 }
 
 /// `SQLite` implementation of the state database.
@@ -377,11 +388,15 @@ impl StateDb for SqliteStateDb {
         let meta = &record.metadata;
         // Lazily compute metadata_hash if caller supplied metadata without one.
         // Storing the hash alongside the metadata is what lets feature 5 detect
-        // metadata-only changes in O(1) during incremental sync.
-        let metadata_hash_owned = meta
-            .metadata_hash
-            .clone()
-            .or_else(|| Some(meta.compute_hash()));
+        // metadata-only changes in O(1) during incremental sync. Computed only
+        // when missing (rare — extract() normally pre-populates it).
+        let computed_hash: Option<String> = if meta.metadata_hash.is_none() {
+            Some(meta.compute_hash())
+        } else {
+            None
+        };
+        let metadata_hash: Option<&str> =
+            meta.metadata_hash.as_deref().or(computed_hash.as_deref());
 
         conn.execute(
             r"
@@ -439,7 +454,7 @@ impl StateDb for SqliteStateDb {
                 i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
                 record.media_type.as_str(),
                 last_seen_at,
-                meta.source.as_deref().unwrap_or("icloud"),
+                meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
                 i64::from(meta.is_favorite),
                 meta.rating.map(i64::from),
                 meta.latitude,
@@ -461,7 +476,7 @@ impl StateDb for SqliteStateDb {
                 i64::from(meta.is_deleted),
                 meta.deleted_at.map(|dt| dt.timestamp()),
                 meta.provider_data.as_deref(),
-                metadata_hash_owned.as_deref(),
+                metadata_hash,
             ],
         )
         .map_err(|e| StateError::query("upsert_seen", e))?;
@@ -967,17 +982,17 @@ impl StateDb for SqliteStateDb {
         Ok(())
     }
 
-    async fn count_downloaded_without_metadata_hash(&self) -> Result<u64, StateError> {
-        let conn = self.acquire_lock("count_downloaded_without_metadata_hash")?;
-        let count: i64 = conn
+    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+        let conn = self.acquire_lock("has_downloaded_without_metadata_hash")?;
+        let exists: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM assets WHERE status = 'downloaded' \
-                 AND metadata_hash IS NULL",
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
+                 AND metadata_hash IS NULL)",
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| StateError::query("count_downloaded_without_metadata_hash", e))?;
-        Ok(u64::try_from(count).unwrap_or(0))
+            .map_err(|e| StateError::query("has_downloaded_without_metadata_hash", e))?;
+        Ok(exists != 0)
     }
 }
 
@@ -999,7 +1014,8 @@ impl SqliteStateDb {
 }
 
 /// Column list for every `SELECT ... FROM assets` that feeds `row_to_asset_record`.
-/// Keep this in sync with the indices read in `row_to_asset_record`.
+/// Keep this in sync with the indices read in `row_to_asset_record` and the
+/// VALUES placeholder count in `upsert_seen`.
 const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
      added_at, size_bytes, media_type, status, downloaded_at, local_path, \
      last_seen_at, download_attempts, last_error, local_checksum, \
@@ -1007,6 +1023,11 @@ const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
      duration_secs, timezone_offset, width, height, title, keywords, description, \
      media_subtype, burst_id, is_hidden, is_archived, modified_at, is_deleted, \
      deleted_at, provider_data, metadata_hash";
+
+/// Total number of columns in `ASSET_COLUMNS`. Validated by a unit test that
+/// asserts `row_to_asset_record` reads exactly this many indices (0..N).
+#[cfg(test)]
+const ASSET_COLUMN_COUNT: usize = 38;
 
 /// Convert a database row to an `AssetRecord`.
 ///
@@ -2874,28 +2895,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn count_downloaded_without_metadata_hash_returns_zero_on_empty() {
+    async fn has_downloaded_without_metadata_hash_returns_false_on_empty() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        assert_eq!(
-            db.count_downloaded_without_metadata_hash().await.unwrap(),
-            0
-        );
+        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
     }
 
     #[tokio::test]
-    async fn count_downloaded_without_metadata_hash_skips_pending() {
+    async fn has_downloaded_without_metadata_hash_skips_pending() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let rec = TestAssetRecord::new("P1").build();
         db.upsert_seen(&rec).await.unwrap();
-        // Still pending, so shouldn't count
-        assert_eq!(
-            db.count_downloaded_without_metadata_hash().await.unwrap(),
-            0
-        );
+        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
     }
 
     #[tokio::test]
-    async fn count_downloaded_without_metadata_hash_detects_missing_hash() {
+    async fn has_downloaded_without_metadata_hash_detects_missing_hash() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let rec = TestAssetRecord::new("D1").build();
         db.upsert_seen(&rec).await.unwrap();
@@ -2908,9 +2922,15 @@ mod tests {
             conn.execute("UPDATE assets SET metadata_hash = NULL WHERE id = 'D1'", [])
                 .unwrap();
         }
+        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+    }
+
+    #[test]
+    fn asset_column_count_matches_projection() {
+        let counted = ASSET_COLUMNS.split(',').count();
         assert_eq!(
-            db.count_downloaded_without_metadata_hash().await.unwrap(),
-            1
+            counted, ASSET_COLUMN_COUNT,
+            "ASSET_COLUMN_COUNT out of sync with ASSET_COLUMNS"
         );
     }
 
