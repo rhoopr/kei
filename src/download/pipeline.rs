@@ -1089,6 +1089,7 @@ pub(super) async fn build_download_outcome(
     }
 
     if downloaded == 0 && failed_tasks.is_empty() {
+        let retry_exhausted = skip_breakdown.retry_exhausted;
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             skipped: skip_breakdown,
@@ -1102,6 +1103,14 @@ pub(super) async fn build_download_outcome(
             tracing::info!(destination = %config.directory.display(), "  destination");
         } else {
             tracing::info!("No new photos to download");
+        }
+        if retry_exhausted > 0 && !config.dry_run {
+            return Ok((
+                DownloadOutcome::PartialFailure {
+                    failed_count: retry_exhausted,
+                },
+                stats,
+            ));
         }
         return Ok((DownloadOutcome::Success, stats));
     }
@@ -1127,6 +1136,7 @@ pub(super) async fn build_download_outcome(
     }
 
     if failed_tasks.is_empty() {
+        let retry_exhausted = skip_breakdown.retry_exhausted;
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
@@ -1141,10 +1151,17 @@ pub(super) async fn build_download_outcome(
             interrupted: shutdown_token.is_cancelled(),
         };
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
-        if state_write_failures > 0 || enumeration_errors > 0 || exif_failures > 0 {
+        if state_write_failures > 0
+            || enumeration_errors > 0
+            || exif_failures > 0
+            || retry_exhausted > 0
+        {
             return Ok((
                 DownloadOutcome::PartialFailure {
-                    failed_count: state_write_failures + enumeration_errors + exif_failures,
+                    failed_count: state_write_failures
+                        + enumeration_errors
+                        + exif_failures
+                        + retry_exhausted,
                 },
                 stats,
             ));
@@ -1213,8 +1230,12 @@ pub(super) async fn build_download_outcome(
     let phase2_succeeded = phase2_task_count - failed;
     let succeeded = downloaded + phase2_succeeded;
 
-    // Log failed downloads before the summary
-    let total_failures = failed + state_write_failures + exif_failures;
+    // Log failed downloads before the summary. `retry_exhausted` is asset
+    // rows the producer skipped because they already exceeded max attempts
+    // across prior syncs — they belong in the failure total so Docker /
+    // systemd / k8s exit-code signalling can notice a chronic backlog.
+    let retry_exhausted = skip_breakdown.retry_exhausted;
+    let total_failures = failed + state_write_failures + exif_failures + retry_exhausted;
     if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
