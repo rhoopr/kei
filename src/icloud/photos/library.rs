@@ -226,9 +226,6 @@ impl PhotoLibrary {
                     "fieldValue": {"type": "STRING", "value": record_name},
                 }])));
 
-                // Build the Arc<str> for the value first (borrowing
-                // folder_name) so the String itself can move into the
-                // HashMap key without a second clone.
                 let name_arc: Arc<str> = Arc::from(folder_name.as_str());
                 albums.insert(
                     folder_name,
