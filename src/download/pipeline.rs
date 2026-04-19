@@ -1370,8 +1370,6 @@ pub(super) async fn run_download_pass(
     }
 }
 
-/// Pack `(latitude, longitude, altitude)` from a payload into `GpsCoords`,
-/// or `None` when either lat or lng is missing.
 fn gps_from_payload(payload: &MetadataPayload) -> Option<super::metadata::GpsCoords> {
     match (payload.latitude, payload.longitude) {
         (Some(lat), Some(lng)) => Some(super::metadata::GpsCoords {
@@ -1411,9 +1409,6 @@ fn plan_sidecar_write(
 /// - **rating / description**: flag gate only — iCloud is the source of truth.
 /// - **XMP-only fields** (title, keywords, people, hidden/archived,
 ///   media_subtype, burst_id): gated on `embed_xmp`.
-///
-/// Populates conditionally (not populate-then-clear) so the common
-/// `embed_xmp=false` config doesn't pay for keyword/people clones it discards.
 fn plan_metadata_write(
     flags: MetadataFlags,
     payload: &MetadataPayload,
@@ -1582,7 +1577,7 @@ async fn download_single_task(
         })
         .await;
         match sidecar_result {
-            Ok(ok) => exif_ok = exif_ok && ok,
+            Ok(ok) => exif_ok &= ok,
             Err(e) => {
                 tracing::warn!(error = %e, "XMP sidecar task panicked");
                 exif_ok = false;

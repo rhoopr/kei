@@ -946,9 +946,6 @@ async fn preload_asset_groupings(
     let Some(db) = state_db else {
         return Arc::new(download::AssetGroupings::default());
     };
-    // Sequential: both reads contend for the same `SqliteStateDb` mutex, so
-    // `tokio::join!` would serialize them anyway. Keep the execution shape
-    // visible in the code.
     let albums = db.get_all_asset_albums().await;
     let people = db.get_all_asset_people().await;
     let mut groupings = download::AssetGroupings::default();

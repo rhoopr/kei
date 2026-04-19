@@ -179,12 +179,11 @@ impl MetadataPayload {
     /// Merge album names into `keywords` (as `dc:subject` tags — the standard
     /// XMP slot photo managers scan for groupings) and set `people`.
     pub(super) fn with_asset_groupings(mut self, albums: &[String], people: &[String]) -> Self {
-        if !albums.is_empty() {
-            let mut seen: rustc_hash::FxHashSet<String> = self.keywords.iter().cloned().collect();
-            for album in albums {
-                if seen.insert(album.clone()) {
-                    self.keywords.push(album.clone());
-                }
+        // Linear scan: typical cardinalities are <10 each, so a HashSet
+        // rebuild costs more than it saves.
+        for album in albums {
+            if !self.keywords.iter().any(|k| k == album) {
+                self.keywords.push(album.clone());
             }
         }
         self.people = people.to_vec();
