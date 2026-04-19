@@ -146,6 +146,13 @@ struct PendingStateWrite {
 const STATE_WRITE_MAX_RETRIES: u32 = 6;
 const _: () = assert!(STATE_WRITE_MAX_RETRIES <= 32, "shift overflow in backoff");
 
+/// Minimum pending-queue size at which a 100% flush failure rate is treated
+/// as "state DB unwritable" rather than a transient lock race. Five is large
+/// enough that a short flurry of lock contention won't trigger a bail, but
+/// small enough that a genuinely-wedged DB is caught before many more cycles
+/// of wasted downloads.
+const STATE_DB_UNWRITABLE_THRESHOLD: usize = 5;
+
 /// Retry all pending state writes that failed during the download loop.
 ///
 /// Each write is attempted up to [`STATE_WRITE_MAX_RETRIES`] times with
@@ -1020,11 +1027,26 @@ where
     // landed on disk before the panic are recorded in state; otherwise the
     // next sync re-downloads them and the pending-retry safety net becomes
     // a no-op on panic paths.
+    let pending_total = pending_state_writes.len();
     let state_write_failures = if let Some(db) = &state_db {
         flush_pending_state_writes(db.as_ref(), &pending_state_writes).await
     } else {
         0
     };
+
+    // If every deferred write failed and there was a non-trivial queue,
+    // the state DB is probably fundamentally unwritable (full disk, readonly
+    // mount, corruption). Bail the whole call so the outer loop stops
+    // downloading into a DB that won't record anything — otherwise watch
+    // mode spins on an infinite rewrite pattern. The threshold avoids
+    // false-positives when just one or two writes race a transient lock.
+    if pending_total >= STATE_DB_UNWRITABLE_THRESHOLD && state_write_failures == pending_total {
+        return Err(anyhow::anyhow!(
+            "State DB appears unwritable: all {pending_total} deferred state writes failed after \
+             {STATE_WRITE_MAX_RETRIES} retries each. Check disk space and permissions on the state \
+             DB file; halting sync to avoid re-downloading into an untracked tree."
+        ));
+    }
 
     if producer_panicked {
         return Err(anyhow::anyhow!(
