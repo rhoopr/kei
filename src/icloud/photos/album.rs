@@ -9,7 +9,6 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::Stream;
-use tracing::debug;
 
 use super::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
 use super::cloudkit::ChangesZoneResponse;
@@ -263,7 +262,7 @@ impl PhotoAlbum {
 
             let stream_error: Option<anyhow::Error> = loop {
                 let body = build_changes_zone_request(&zone_id, Some(&current_token), 200);
-                debug!(
+                tracing::debug!(
                     album = %album_name,
                     token = %current_token,
                     "changes/zone request"
@@ -304,7 +303,7 @@ impl PhotoAlbum {
                 current_token = zone_result.sync_token;
                 let more_coming = zone_result.more_coming;
 
-                debug!(
+                tracing::debug!(
                     album = %album_name,
                     records = zone_result.records.len(),
                     more_coming,
@@ -496,7 +495,7 @@ impl PhotoAlbum {
                     offset,
                     "ASCENDING",
                 );
-                debug!(
+                tracing::debug!(
                     album = %name,
                     range_start = start_offset,
                     range_end = end_offset,
@@ -518,7 +517,7 @@ impl PhotoAlbum {
                         return;
                     }
                 };
-                debug!(
+                tracing::debug!(
                     album = %name,
                     response = %serde_json::to_string_pretty(&response).unwrap_or_default(),
                     "Fetcher response"
@@ -547,7 +546,7 @@ impl PhotoAlbum {
                 let records = query.records;
                 let record_count = records.len();
 
-                debug!(
+                tracing::debug!(
                     album = %name,
                     count = record_count,
                     offset,
@@ -566,7 +565,7 @@ impl PhotoAlbum {
                 let mut page_masters: Vec<super::cloudkit::Record> = Vec::new();
 
                 for rec in records {
-                    debug!(record_type = %rec.record_type, "  record");
+                    tracing::debug!(record_type = %rec.record_type, "  record");
                     if rec.record_type == "CPLAsset" {
                         if let Some(master_id) =
                             rec.fields["masterRef"]["value"]["recordName"].as_str()
@@ -696,12 +695,12 @@ impl PhotoAlbum {
             "filterBy": &filter_by,
             "recordType": list_type,
         });
-        debug!(
+        tracing::debug!(
             count = filter_by.len(),
             query = %serde_json::to_string(&query_part).unwrap_or_default(),
             "list_query filterBy"
         );
-        debug!(
+        tracing::debug!(
             zone_id = %serde_json::to_string(zone_id).unwrap_or_default(),
             "list_query zoneID"
         );

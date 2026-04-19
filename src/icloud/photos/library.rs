@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use base64::Engine;
 use serde_json::{json, Value};
-use tracing::warn;
 
 use super::album::{PhotoAlbum, PhotoAlbumConfig};
 use super::queries::encode_params;
@@ -147,7 +146,7 @@ impl PhotoLibrary {
             .and_then(|r| r.fields["state"]["value"].as_str())
             .unwrap_or("");
         if indexing_state != "FINISHED" {
-            warn!(
+            tracing::warn!(
                 state = indexing_state,
                 "Photo library indexing state is not FINISHED — proceeding anyway, \
                  results may be incomplete"

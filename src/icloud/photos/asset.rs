@@ -4,7 +4,6 @@ use chrono::{DateTime, TimeZone, Utc};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 use smallvec::SmallVec;
-use tracing::warn;
 
 use super::cloudkit::Record;
 use super::enc;
@@ -138,7 +137,7 @@ fn extract_versions(
         let size = if let Some(s) = res_entry["size"].as_u64() {
             s
         } else {
-            warn!(
+            tracing::warn!(
                 asset = %record_name,
                 field = format_args!("{res_field}.size"),
                 "Missing size, defaulting to 0"
@@ -149,7 +148,7 @@ fn extract_versions(
         let url: Box<str> = if let Some(u) = res_entry["downloadURL"].as_str() {
             u.into()
         } else {
-            warn!(
+            tracing::warn!(
                 asset = %record_name,
                 field = format_args!("{res_field}.downloadURL"),
                 "Missing downloadURL, skipping version"
@@ -160,7 +159,7 @@ fn extract_versions(
         let checksum: Box<str> = if let Some(c) = res_entry["fileChecksum"].as_str() {
             c.into()
         } else {
-            warn!(
+            tracing::warn!(
                 asset = %record_name,
                 field = format_args!("{res_field}.fileChecksum"),
                 "Missing fileChecksum, skipping version"
@@ -266,7 +265,7 @@ impl PhotoAsset {
         self.asset_date_ms
             .and_then(f64_to_millis_datetime)
             .unwrap_or_else(|| {
-                warn!(asset_id = %self.record_name, "Missing or invalid assetDate, falling back to epoch");
+                tracing::warn!(asset_id = %self.record_name, "Missing or invalid assetDate, falling back to epoch");
                 DateTime::UNIX_EPOCH
             })
     }
@@ -279,7 +278,7 @@ impl PhotoAsset {
         self.added_date_ms
             .and_then(f64_to_millis_datetime)
             .unwrap_or_else(|| {
-                warn!(asset_id = %self.record_name, "Missing or invalid addedDate, falling back to epoch");
+                tracing::warn!(asset_id = %self.record_name, "Missing or invalid addedDate, falling back to epoch");
                 DateTime::UNIX_EPOCH
             })
     }

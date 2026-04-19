@@ -24,12 +24,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use serde_json::{json, Value};
 
-use crate::retry::RetryConfig;
-use tracing::{debug, error};
-
 use crate::icloud::error::ICloudError;
 use crate::icloud::photos::cloudkit::ChangesDatabaseResponse;
 use crate::icloud::photos::queries::encode_params;
+use crate::retry::RetryConfig;
 
 pub struct PhotosService {
     service_root: String,
@@ -211,11 +209,11 @@ impl PhotosService {
             .await
             {
                 Ok(lib) => {
-                    debug!(zone = %zone_name, "Loaded library zone");
+                    tracing::debug!(zone = %zone_name, "Loaded library zone");
                     libraries.insert(zone_name, lib);
                 }
                 Err(e) => {
-                    error!(zone = %zone_name, error = %e, "Failed to load library zone");
+                    tracing::error!(zone = %zone_name, error = %e, "Failed to load library zone");
                 }
             }
         }

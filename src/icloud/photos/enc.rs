@@ -13,7 +13,6 @@ use std::io::Cursor;
 use base64::Engine;
 use plist::Value as PlistValue;
 use serde_json::Value;
-use tracing::warn;
 
 /// Read the `value` string from a `fieldEnc` JSON entry and base64-decode it.
 ///
@@ -30,7 +29,7 @@ fn decoded_bytes(entry: &Value) -> Option<Vec<u8>> {
         "STRING" => Some(value.as_bytes().to_vec()),
         "ENCRYPTED_BYTES" => base64::engine::general_purpose::STANDARD.decode(value).ok(),
         other => {
-            warn!(enc_type = %other, "Unsupported Enc field type");
+            tracing::warn!(enc_type = %other, "Unsupported Enc field type");
             None
         }
     }
