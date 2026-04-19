@@ -55,11 +55,9 @@ indicatif = "0.18"
 rpassword = "7"
 dialoguer = "0.11"
 
-# EXIF — two libraries because no single crate handles both read and write.
-# kamadak-exif: read-only, used for reading DateTimeOriginal from existing files.
-# little_exif:  write-capable, used for stamping EXIF dates on downloaded photos.
-kamadak-exif = "0.6"
-little_exif = "0.6"
+# XMP metadata via Adobe's XMP Toolkit (vendored C++ source, no system deps).
+# Handles JPEG, HEIC, PNG, TIFF, MP4, MOV, PSD, PDF, and more via XMPFiles.
+xmp_toolkit = "1"
 
 # Error handling
 anyhow = "1"

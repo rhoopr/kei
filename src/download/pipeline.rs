@@ -1358,23 +1358,25 @@ pub(super) async fn run_download_pass(
     }
 }
 
-/// Decide which EXIF fields to apply, honouring the spec's per-tag gates:
+/// Decide which metadata fields to apply, honouring the spec's per-tag gates:
 ///
 /// - **Datetime**: only when the file has no `DateTimeOriginal` (preserves
 ///   camera-supplied timestamps).
-/// - **Rating / description**: always overwrite when the flag is set — iCloud
-///   is the source of truth for these.
-/// - **GPS**: only when the file has no existing GPS IFD.
+/// - **Rating / description / title**: always overwrite when the flag is set —
+///   iCloud is the source of truth.
+/// - **GPS**: only when the file has no existing GPS data.
+/// - **Keywords / people / kei-namespace fields**: always overwrite when
+///   present in the task payload.
 ///
-/// Pure function of a pre-read `ExifProbe` plus the task's own payload, so the
+/// Pure function of a pre-read `ExifProbe` plus the task's payload, so the
 /// caller controls where the file I/O happens (blocking pool, not runtime).
-fn plan_exif_write(
+fn plan_metadata_write(
     flags: ExifFlags,
     payload: &ExifPayload,
     created_local: &chrono::DateTime<chrono::Local>,
     probe: &super::exif::ExifProbe,
-) -> super::exif::ExifWrite {
-    let mut write = super::exif::ExifWrite::default();
+) -> super::exif::MetadataWrite {
+    let mut write = super::exif::MetadataWrite::default();
 
     if flags.datetime && probe.datetime_original.is_none() {
         write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
@@ -1484,12 +1486,12 @@ async fn download_single_task(
                     super::exif::ExifProbe::default()
                 }
             };
-            let write = plan_exif_write(exif_flags, &payload, &created_local, &probe);
+            let write = plan_metadata_write(exif_flags, &payload, &created_local, &probe);
             if write.is_empty() {
                 return true;
             }
-            if let Err(e) = super::exif::apply_exif(&exif_path, &write) {
-                tracing::warn!(path = %exif_path.display(), error = %e, "Failed to write EXIF");
+            if let Err(e) = super::exif::apply_metadata(&exif_path, &write) {
+                tracing::warn!(path = %exif_path.display(), error = %e, "Failed to write metadata");
                 false
             } else {
                 true

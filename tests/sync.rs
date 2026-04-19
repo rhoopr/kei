@@ -620,16 +620,18 @@ fn sync_set_exif_datetime_embeds_date() {
             .collect();
         assert!(!jpeg_files.is_empty(), "should have at least one JPEG file");
 
-        // Read EXIF from the first JPEG and verify DateTimeOriginal is present
-        let file = std::fs::File::open(jpeg_files[0]).expect("open JPEG");
-        let mut reader = std::io::BufReader::new(file);
-        let exif_data = exif::Reader::new()
-            .read_from_container(&mut reader)
-            .expect("read EXIF data");
-        let dt = exif_data.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY);
+        // Read XMP from the first JPEG and verify DateTimeOriginal is present
+        use xmp_toolkit::{xmp_ns, OpenFileOptions, XmpFile};
+        let mut file = XmpFile::new().expect("xmp file handle");
+        file.open_file(jpeg_files[0], OpenFileOptions::default().for_read())
+            .expect("open JPEG for XMP read");
+        let meta = file
+            .xmp()
+            .expect("JPEG should have XMP after --set-exif-datetime");
         assert!(
-            dt.is_some(),
-            "DateTimeOriginal EXIF tag should be present after --set-exif-datetime"
+            meta.property(xmp_ns::EXIF, "DateTimeOriginal").is_some()
+                || meta.property(xmp_ns::XMP, "CreateDate").is_some(),
+            "DateTimeOriginal XMP property should be present after --set-exif-datetime"
         );
     });
 }

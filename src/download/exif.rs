@@ -1,29 +1,71 @@
+//! Embedded metadata (XMP + native EXIF/IPTC reconciliation) via Adobe's
+//! XMP Toolkit.
+//!
+//! The writer runs through [`xmp_toolkit::XmpFile`], which vendors Adobe's
+//! reference XMPFiles implementation. One code path covers JPEG, HEIC, PNG,
+//! TIFF, MP4, MOV, and more — whatever kei downloads from iCloud ends up with
+//! the same metadata embedded in its file bytes.
+//!
+//! XMP Toolkit also reconciles XMP with native EXIF/IPTC blocks on formats
+//! that carry them (notably JPEG), so a consumer reading only EXIF still
+//! sees values like `Rating`, GPS, and `DateTimeOriginal`.
+
 use std::path::Path;
+use std::sync::Once;
 
 use anyhow::{Context, Result};
+use xmp_toolkit::{xmp_ns, OpenFileOptions, XmpFile, XmpMeta, XmpValue};
 
-/// EXIF tag 0x4746 (`xmp:Rating` mapping, short in IFD0, 0-5 scale).
-const EXIF_TAG_RATING: u16 = 0x4746;
+/// Custom XMP namespace for kei-specific fields that don't fit standard
+/// schemas (`hidden`, `archived`, `mediaSubtype`, `burstId`). Consumers that
+/// care about these know to look for the `kei` prefix.
+const KEI_XMP_NS: &str = "https://github.com/rhoopr/kei/ns/1.0/";
+const KEI_XMP_PREFIX: &str = "kei";
 
-/// Bundle of EXIF fields to apply in a single read-modify-write cycle.
-///
-/// Any field left `None` is not written. `None` values also mean the caller
-/// chose not to enrich the corresponding tag — they are distinct from the tag
-/// being explicitly cleared, which kei never does.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct ExifWrite {
-    /// `"YYYY:MM:DD HH:MM:SS"` string applied to DateTime/DateTimeOriginal/
-    /// DateTimeDigitized. Only written when the file has no DateTimeOriginal.
-    pub(crate) datetime: Option<String>,
-    /// 1-5 star rating. Writes EXIF tag 0x4746.
-    pub(crate) rating: Option<u8>,
-    /// GPS triple (decimal degrees WGS84 for lat/lng; meters for alt). Written
-    /// as EXIF GPS IFD tags only when the file has no existing GPS data.
-    pub(crate) gps: Option<GpsCoords>,
-    /// ImageDescription (EXIF tag 0x010E). Always overwrites.
-    pub(crate) description: Option<String>,
+static INIT: Once = Once::new();
+
+fn ensure_initialized() {
+    INIT.call_once(|| {
+        // Registering the same namespace twice is fine; XMP Toolkit returns
+        // the existing prefix. Ignore the Result — even a failure here only
+        // disables the kei: fields, and standard XMP continues to work.
+        let _ = XmpMeta::register_namespace(KEI_XMP_NS, KEI_XMP_PREFIX);
+    });
 }
 
+/// Snapshot of existing metadata fields that gate write decisions. Populated
+/// from whatever XMP Toolkit sees in the file (XMP + reconciled EXIF/IPTC).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExifProbe {
+    pub(crate) datetime_original: Option<String>,
+    pub(crate) has_gps: bool,
+}
+
+pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
+    ensure_initialized();
+    let mut file = XmpFile::new().context("creating XmpFile handle")?;
+    if file
+        .open_file(path, OpenFileOptions::default().for_read().only_xmp())
+        .is_err()
+    {
+        return Ok(ExifProbe::default());
+    }
+    let meta = match file.xmp() {
+        Some(m) => m,
+        None => return Ok(ExifProbe::default()),
+    };
+    let datetime_original = meta
+        .property(xmp_ns::EXIF, "DateTimeOriginal")
+        .map(|v| v.value);
+    let has_gps = meta.contains_property(xmp_ns::EXIF, "GPSLatitude")
+        || meta.contains_property(xmp_ns::EXIF, "GPSLongitude");
+    Ok(ExifProbe {
+        datetime_original,
+        has_gps,
+    })
+}
+
+/// GPS triple passed to [`apply_metadata`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GpsCoords {
     pub(crate) latitude: f64,
@@ -31,198 +73,222 @@ pub(crate) struct GpsCoords {
     pub(crate) altitude: Option<f64>,
 }
 
-impl ExifWrite {
+/// Bundle of every field the writer knows how to embed. Empty / default
+/// fields are skipped.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct MetadataWrite {
+    /// `"YYYY:MM:DD HH:MM:SS"` EXIF-style datetime string.
+    pub(crate) datetime: Option<String>,
+    pub(crate) rating: Option<u8>,
+    pub(crate) gps: Option<GpsCoords>,
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+    /// `dc:subject` bag — iCloud keyword tags and album names merge here.
+    pub(crate) keywords: Vec<String>,
+    /// MWG-RS person names for `iptcExt:PersonInImage`.
+    pub(crate) people: Vec<String>,
+    pub(crate) is_hidden: bool,
+    pub(crate) is_archived: bool,
+    pub(crate) media_subtype: Option<String>,
+    pub(crate) burst_id: Option<String>,
+}
+
+impl MetadataWrite {
     pub(crate) fn is_empty(&self) -> bool {
         self.datetime.is_none()
             && self.rating.is_none()
             && self.gps.is_none()
+            && self.title.is_none()
             && self.description.is_none()
+            && self.keywords.is_empty()
+            && self.people.is_empty()
+            && !self.is_hidden
+            && !self.is_archived
+            && self.media_subtype.is_none()
+            && self.burst_id.is_none()
     }
 }
 
-/// Snapshot of the EXIF fields that gate enrichment decisions. A single
-/// parse answers "do we need to write datetime?" and "do we need to write
-/// GPS?" in one pass, avoiding two file opens per asset.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ExifProbe {
-    pub(crate) datetime_original: Option<String>,
-    pub(crate) has_gps: bool,
-}
-
-/// Parse the image's existing EXIF once and report which gating fields are
-/// present. Returns `Ok(default)` on a file with no EXIF — consumers treat
-/// missing as "unknown" and fall back to overwrite.
-pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
-    let file = std::fs::File::open(path).with_context(|| format!("Opening {}", path.display()))?;
-    let mut bufreader = std::io::BufReader::new(&file);
-    let reader = exif::Reader::new();
-    match reader.read_from_container(&mut bufreader) {
-        Ok(data) => {
-            let datetime_original = data
-                .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
-                .map(|f| f.display_value().to_string());
-            let has_gps = data
-                .get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)
-                .is_some()
-                || data
-                    .get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)
-                    .is_some();
-            Ok(ExifProbe {
-                datetime_original,
-                has_gps,
-            })
-        }
-        Err(e) => {
-            tracing::debug!(path = %path.display(), error = %e, "No EXIF data");
-            Ok(ExifProbe::default())
-        }
-    }
-}
-
-/// Read the `DateTimeOriginal` EXIF tag. Thin test-only wrapper around
-/// `probe_exif` for the tests that only care about that single field.
-#[cfg(test)]
-pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
-    probe_exif(path).map(|p| p.datetime_original)
-}
-
-/// Write the EXIF date tags to a JPEG file — thin test-only wrapper.
+/// Write the requested metadata into the file's XMP packet, with EXIF/IPTC
+/// reconciliation where the container supports it.
 ///
-/// Equivalent to `apply_exif(path, ExifWrite { datetime: Some(..), .. })`.
-/// Production call sites go through `apply_exif` directly.
-#[cfg(test)]
-pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
-    apply_exif(
-        path,
-        &ExifWrite {
-            datetime: Some(datetime_str.to_string()),
-            ..ExifWrite::default()
-        },
-    )
-}
-
-/// Apply the requested EXIF fields to a JPEG file in a single read-modify-write.
-///
-/// Uses `little_exif` (write-capable EXIF crate). A separate crate (`kamadak-exif`)
-/// handles reading because `little_exif` doesn't support fine-grained tag reads.
-///
-/// The write is atomic: metadata is serialized to a sibling `.exif-tmp` file
-/// and renamed over the target. A crash mid-write leaves the original intact.
-pub(crate) fn apply_exif(path: &Path, write: &ExifWrite) -> Result<()> {
-    use little_exif::exif_tag::ExifTag;
-    use little_exif::filetype::FileExtension;
-    use little_exif::ifd::ExifTagGroup;
-    use little_exif::metadata::Metadata;
-
+/// Atomic: we copy the input to a sibling `.meta-tmp`, patch it in place via
+/// XmpFile, then rename over the target. A crash mid-write leaves the
+/// original untouched.
+pub(crate) fn apply_metadata(path: &Path, write: &MetadataWrite) -> Result<()> {
     if write.is_empty() {
         return Ok(());
     }
-
-    // Read into memory with explicit FileExtension::JPEG — the download path is
-    // a .part-style temp file whose extension can't be auto-detected.
-    let mut buf =
-        std::fs::read(path).with_context(|| format!("Reading {} for EXIF", path.display()))?;
-
-    let mut metadata = match Metadata::new_from_vec(&buf, FileExtension::JPEG) {
-        Ok(m) => m,
-        Err(_) => Metadata::new(),
-    };
-
-    if let Some(dt) = &write.datetime {
-        metadata.set_tag(ExifTag::ModifyDate(dt.clone()));
-        metadata.set_tag(ExifTag::DateTimeOriginal(dt.clone()));
-        metadata.set_tag(ExifTag::CreateDate(dt.clone()));
-    }
-
-    if let Some(rating) = write.rating {
-        // EXIF Rating (0x4746) is an INT16U in IFD0. little_exif doesn't have a
-        // named variant, so we use the UnknownINT16U escape hatch.
-        metadata.set_tag(ExifTag::UnknownINT16U(
-            vec![u16::from(rating.min(5))],
-            EXIF_TAG_RATING,
-            ExifTagGroup::GENERIC,
-        ));
-    }
-
-    if let Some(gps) = write.gps {
-        let (lat_ref, lat_triple) = to_gps_ref_and_dms(gps.latitude, "N", "S");
-        let (lng_ref, lng_triple) = to_gps_ref_and_dms(gps.longitude, "E", "W");
-        metadata.set_tag(ExifTag::GPSLatitudeRef(lat_ref));
-        metadata.set_tag(ExifTag::GPSLatitude(lat_triple));
-        metadata.set_tag(ExifTag::GPSLongitudeRef(lng_ref));
-        metadata.set_tag(ExifTag::GPSLongitude(lng_triple));
-        if let Some(alt) = gps.altitude {
-            let alt_ref: u8 = if alt < 0.0 { 1 } else { 0 };
-            metadata.set_tag(ExifTag::GPSAltitudeRef(vec![alt_ref]));
-            metadata.set_tag(ExifTag::GPSAltitude(vec![
-                little_exif::rational::uR64::from(alt.abs()),
-            ]));
-        }
-    }
-
-    if let Some(desc) = &write.description {
-        metadata.set_tag(ExifTag::ImageDescription(desc.clone()));
-    }
-
-    metadata
-        .write_to_vec(&mut buf, FileExtension::JPEG)
-        .with_context(|| format!("Writing EXIF metadata for {}", path.display()))?;
+    ensure_initialized();
 
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".exif-tmp");
+    tmp_name.push(".meta-tmp");
     let tmp_path = path.with_file_name(&tmp_name);
-    std::fs::write(&tmp_path, &buf)
-        .with_context(|| format!("Writing EXIF temp file {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
+    std::fs::copy(path, &tmp_path)
+        .with_context(|| format!("Copying {} -> {}", path.display(), tmp_path.display()))?;
 
-    tracing::debug!(
-        path = %path.display(),
-        datetime = ?write.datetime.as_deref(),
-        rating = ?write.rating,
-        has_gps = write.gps.is_some(),
-        has_description = write.description.is_some(),
-        "Applied EXIF metadata"
-    );
-    Ok(())
+    let result: Result<()> = (|| {
+        let mut file = XmpFile::new().context("creating XmpFile handle")?;
+        file.open_file(
+            &tmp_path,
+            OpenFileOptions::default().for_update().use_smart_handler(),
+        )
+        .with_context(|| format!("Opening {} for XMP update", tmp_path.display()))?;
+
+        let mut meta = file
+            .xmp()
+            .unwrap_or_else(|| XmpMeta::new().unwrap_or_default());
+
+        if let Some(dt) = &write.datetime {
+            // XMP uses ISO 8601 datetimes; our stored form is the EXIF-style
+            // "YYYY:MM:DD HH:MM:SS". Convert for XMP, keep a local EXIF copy
+            // so XMP Toolkit's reconciler writes the native block too.
+            let iso = exif_datetime_to_iso(dt);
+            meta.set_property(xmp_ns::XMP, "CreateDate", &XmpValue::new(iso.clone()))?;
+            meta.set_property(xmp_ns::XMP, "ModifyDate", &XmpValue::new(iso.clone()))?;
+            meta.set_property(
+                xmp_ns::EXIF,
+                "DateTimeOriginal",
+                &XmpValue::new(iso.clone()),
+            )?;
+            meta.set_property(xmp_ns::PHOTOSHOP, "DateCreated", &XmpValue::new(iso))?;
+        }
+
+        if let Some(r) = write.rating {
+            meta.set_property_i32(xmp_ns::XMP, "Rating", &XmpValue::new(i32::from(r.min(5))))?;
+        }
+
+        if let Some(gps) = write.gps {
+            meta.set_property(
+                xmp_ns::EXIF,
+                "GPSLatitude",
+                &XmpValue::new(encode_gps(gps.latitude, 'N', 'S')),
+            )?;
+            meta.set_property(
+                xmp_ns::EXIF,
+                "GPSLongitude",
+                &XmpValue::new(encode_gps(gps.longitude, 'E', 'W')),
+            )?;
+            if let Some(alt) = gps.altitude {
+                meta.set_property(
+                    xmp_ns::EXIF,
+                    "GPSAltitude",
+                    &XmpValue::new(encode_altitude(alt)),
+                )?;
+                meta.set_property(
+                    xmp_ns::EXIF,
+                    "GPSAltitudeRef",
+                    &XmpValue::new(if alt < 0.0 { "1" } else { "0" }.to_string()),
+                )?;
+            }
+        }
+
+        if let Some(title) = &write.title {
+            meta.set_localized_text(xmp_ns::DC, "title", None, "x-default", title)?;
+        }
+
+        if let Some(desc) = &write.description {
+            meta.set_localized_text(xmp_ns::DC, "description", None, "x-default", desc)?;
+        }
+
+        if !write.keywords.is_empty() {
+            // Clear existing dc:subject so we don't accumulate stale entries on
+            // re-writes. XMP Toolkit has no bulk set for bags.
+            let _ = meta.delete_property(xmp_ns::DC, "subject");
+            for kw in &write.keywords {
+                meta.append_array_item(
+                    xmp_ns::DC,
+                    &XmpValue::new("subject".to_string()).set_is_array(true),
+                    &XmpValue::new(kw.clone()),
+                )?;
+            }
+        }
+
+        if !write.people.is_empty() {
+            let _ = meta.delete_property(xmp_ns::IPTC_EXT, "PersonInImage");
+            for name in &write.people {
+                meta.append_array_item(
+                    xmp_ns::IPTC_EXT,
+                    &XmpValue::new("PersonInImage".to_string()).set_is_array(true),
+                    &XmpValue::new(name.clone()),
+                )?;
+            }
+        }
+
+        if write.is_hidden {
+            meta.set_property_bool(KEI_XMP_NS, "hidden", &XmpValue::new(true))?;
+        }
+        if write.is_archived {
+            meta.set_property_bool(KEI_XMP_NS, "archived", &XmpValue::new(true))?;
+        }
+        if let Some(subtype) = &write.media_subtype {
+            meta.set_property(KEI_XMP_NS, "mediaSubtype", &XmpValue::new(subtype.clone()))?;
+        }
+        if let Some(burst) = &write.burst_id {
+            meta.set_property(KEI_XMP_NS, "burstId", &XmpValue::new(burst.clone()))?;
+        }
+
+        if !file.can_put_xmp(&meta) {
+            anyhow::bail!(
+                "format handler for {} does not support writing XMP",
+                tmp_path.display()
+            );
+        }
+        file.put_xmp(&meta)
+            .with_context(|| format!("Writing XMP into {}", tmp_path.display()))?;
+        file.try_close()
+            .with_context(|| format!("Closing {} after XMP update", tmp_path.display()))?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            std::fs::rename(&tmp_path, path).with_context(|| {
+                format!("Renaming {} -> {}", tmp_path.display(), path.display())
+            })?;
+            tracing::debug!(path = %path.display(), "Applied metadata");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
 }
 
-/// Decompose a decimal degree value into an EXIF GPS `[deg, min, sec]` rational
-/// triple plus its hemisphere reference.
-fn to_gps_ref_and_dms(
-    deg: f64,
-    positive_ref: &str,
-    negative_ref: &str,
-) -> (String, Vec<little_exif::rational::uR64>) {
-    use little_exif::rational::uR64;
-    let hemisphere = if deg >= 0.0 {
-        positive_ref
+/// EXIF stores datetimes as `"YYYY:MM:DD HH:MM:SS"`; XMP wants ISO 8601
+/// `"YYYY-MM-DDTHH:MM:SS"`. Best-effort conversion — on malformed input we
+/// return the original so XMP Toolkit can reject it with a clear error.
+fn exif_datetime_to_iso(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() == 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {
+        let mut out = s.to_owned();
+        unsafe {
+            let b = out.as_bytes_mut();
+            b[4] = b'-';
+            b[7] = b'-';
+            b[10] = b'T';
+        }
+        out
     } else {
-        negative_ref
-    };
-    let abs = deg.abs();
-    let d = abs.floor();
-    let m_frac = (abs - d) * 60.0;
-    let m = m_frac.floor();
-    let s = (m_frac - m) * 60.0;
-    // Store seconds with 4-decimal precision, which is enough to round-trip
-    // Apple's f64 lat/lng to ~1 cm accuracy.
-    let s_scaled = (s * 10_000.0).round();
-    let triple = vec![
-        uR64 {
-            nominator: d as u32,
-            denominator: 1,
-        },
-        uR64 {
-            nominator: m as u32,
-            denominator: 1,
-        },
-        uR64 {
-            nominator: s_scaled as u32,
-            denominator: 10_000,
-        },
-    ];
-    (hemisphere.to_string(), triple)
+        s.to_owned()
+    }
+}
+
+/// Encode decimal degrees in the EXIF-in-XMP form `"DEG,MIN.FRACHEMI"` used
+/// by [Xmp.exif.GPSLatitude] / `Xmp.exif.GPSLongitude`.
+fn encode_gps(decimal: f64, pos: char, neg: char) -> String {
+    let hemisphere = if decimal >= 0.0 { pos } else { neg };
+    let abs = decimal.abs();
+    let deg = abs.floor();
+    let min = (abs - deg) * 60.0;
+    format!("{},{:.4}{}", deg as u32, min, hemisphere)
+}
+
+/// XMP `exif:GPSAltitude` is a rational; we use `meters/1` (scale of 1).
+fn encode_altitude(meters: f64) -> String {
+    let scaled = (meters.abs() * 1000.0).round() as u64;
+    format!("{scaled}/1000")
 }
 
 #[cfg(test)]
@@ -231,453 +297,311 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    /// Cross-platform temp directory for tests
     fn test_tmp_dir(subdir: &str) -> PathBuf {
         std::env::temp_dir().join("claude").join(subdir)
     }
 
-    /// Minimal valid JPEG with no EXIF data (SOI + APP0 JFIF + EOI).
+    /// Minimal valid JPEG (SOI + APP0 JFIF + EOI).
     fn minimal_jpeg() -> Vec<u8> {
         vec![
-            0xFF, 0xD8, // SOI
-            0xFF, 0xE0, // APP0 marker
-            0x00, 0x10, // Length: 16
-            0x4A, 0x46, 0x49, 0x46, 0x00, // "JFIF\0"
-            0x01, 0x01, // Version 1.1
-            0x00, // Aspect ratio units: none
-            0x00, 0x01, // X density: 1
-            0x00, 0x01, // Y density: 1
-            0x00, 0x00, // No thumbnail
-            0xFF, 0xD9, // EOI
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
         ]
     }
 
-    #[test]
-    fn test_set_and_get_exif_roundtrip() {
-        let dir = &test_tmp_dir("exif_tests");
+    fn fresh_jpeg(dir: &Path, name: &str) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
-        let path = dir.join("test_roundtrip.jpg");
+        let path = dir.join(name);
         fs::write(&path, minimal_jpeg()).unwrap();
+        path
+    }
 
-        let datetime = "2023:06:15 14:30:00";
-        set_photo_exif(&path, datetime).unwrap();
-
-        let result = get_photo_exif(&path).unwrap();
-        // kamadak-exif formats the date with dashes in the date portion
-        assert_eq!(result, Some("2023-06-15 14:30:00".to_string()));
-
-        fs::remove_file(&path).ok();
+    fn read_meta(path: &Path) -> XmpMeta {
+        ensure_initialized();
+        let mut file = XmpFile::new().unwrap();
+        file.open_file(path, OpenFileOptions::default().for_read())
+            .unwrap();
+        file.xmp().expect("no XMP in file")
     }
 
     #[test]
-    fn test_get_exif_no_exif_data() {
-        let dir = &test_tmp_dir("exif_tests");
-        fs::create_dir_all(dir).unwrap();
-        let path = dir.join("test_no_exif.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-
-        let result = get_photo_exif(&path).unwrap();
-        assert_eq!(result, None);
-
-        fs::remove_file(&path).ok();
-    }
-
-    /// T-1: Simulate the two-phase download flow (download → EXIF on .part → rename).
-    /// If EXIF write panics/fails mid-operation, only the .part file exists — the
-    /// final path is never created, preventing corrupt files from reaching the user.
-    /// On retry, the .part file contains the unmodified download and can be reprocessed.
-    #[test]
-    fn test_exif_crash_leaves_no_corrupt_file() {
-        let dir = &test_tmp_dir("exif_crash_test");
-        fs::create_dir_all(dir).unwrap();
-
-        let final_path = dir.join("photo.jpg");
-        // The real download pipeline uses a base32-encoded .part filename, but
-        // little_exif requires a recognizable image extension. Use .part.jpg so
-        // the EXIF library can identify the file type on retry.
-        let part_path = dir.join("photo_part.jpg");
-
-        // Clean up from any previous run
-        let _ = fs::remove_file(&final_path);
-        let _ = fs::remove_file(&part_path);
-
-        // Phase 1: "Download" — write a valid JPEG to the .part file
-        let jpeg_bytes = minimal_jpeg();
-        fs::write(&part_path, &jpeg_bytes).unwrap();
-
-        // At this point: .part exists, final path does NOT
-        assert!(part_path.exists());
-        assert!(
-            !final_path.exists(),
-            "final path must not exist before rename"
-        );
-
-        // Phase 2: Simulate EXIF crash — attempt EXIF write on a corrupt/non-JPEG file
-        let corrupt_part = dir.join("corrupt_part.jpg");
-        fs::write(&corrupt_part, b"not a jpeg at all").unwrap();
-        let exif_result = set_photo_exif(&corrupt_part, "2023:06:15 14:30:00");
-        assert!(
-            exif_result.is_err(),
-            "EXIF write on corrupt file should fail"
-        );
-
-        // Critical invariant: final path still does not exist because we never renamed
-        assert!(
-            !final_path.exists(),
-            "final path must not exist after EXIF failure"
-        );
-
-        // The original .part file is still intact (unmodified download)
-        assert!(
-            part_path.exists(),
-            ".part file should still exist for retry"
-        );
-        assert_eq!(
-            fs::read(&part_path).unwrap(),
-            jpeg_bytes,
-            ".part file should contain the unmodified download"
-        );
-
-        // Phase 3: Retry — EXIF write succeeds on the valid .part, then rename
-        set_photo_exif(&part_path, "2023:06:15 14:30:00").unwrap();
-        fs::rename(&part_path, &final_path).unwrap();
-
-        // After successful retry: final path exists, .part is gone
-        assert!(
-            final_path.exists(),
-            "final path should exist after successful retry"
-        );
-        assert!(!part_path.exists(), ".part should be gone after rename");
-
-        // Verify EXIF was written correctly
-        let result = get_photo_exif(&final_path).unwrap();
-        assert_eq!(result, Some("2023-06-15 14:30:00".to_string()));
-    }
-
-    #[test]
-    fn test_set_exif_preserves_existing() {
-        let dir = &test_tmp_dir("exif_tests");
-        fs::create_dir_all(dir).unwrap();
-        let path = dir.join("test_preserve.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-
-        let datetime = "2023:01:01 00:00:00";
-        set_photo_exif(&path, datetime).unwrap();
-
-        // Write again with a different date
-        let datetime2 = "2024:12:25 12:00:00";
-        set_photo_exif(&path, datetime2).unwrap();
-
-        let result = get_photo_exif(&path).unwrap();
-        assert_eq!(result, Some("2024-12-25 12:00:00".to_string()));
-
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn test_exif_tmp_file_not_left_behind() {
-        let dir = test_tmp_dir("exif_atomic");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("atomic_test.jpg");
-        let _ = fs::remove_file(&path);
-
-        // Create a minimal valid JPEG
-        fs::write(&path, minimal_jpeg()).unwrap();
-
-        set_photo_exif(&path, "2025:01:01 00:00:00").unwrap();
-
-        // The .exif-tmp file must not exist after a successful call.
-        let mut tmp_name = path.file_name().unwrap().to_os_string();
-        tmp_name.push(".exif-tmp");
-        let tmp_path = path.with_file_name(&tmp_name);
-        assert!(
-            !tmp_path.exists(),
-            ".exif-tmp should be cleaned up after successful write"
-        );
-
-        // The original file should still exist and have valid EXIF.
-        assert!(path.exists());
-        let result = get_photo_exif(&path).unwrap();
-        assert_eq!(result, Some("2025-01-01 00:00:00".to_string()));
-
-        fs::remove_file(&path).ok();
-    }
-
-    // ── Feature 2: rating / GPS / description writers ───────────────────
-
-    fn read_field(path: &Path, tag: exif::Tag) -> Option<String> {
-        let file = std::fs::File::open(path).ok()?;
-        let mut r = std::io::BufReader::new(&file);
-        let data = exif::Reader::new().read_from_container(&mut r).ok()?;
-        data.get_field(tag, exif::In::PRIMARY)
-            .map(|f| f.display_value().to_string())
-    }
-
-    fn read_u32_field(path: &Path, tag: exif::Tag) -> Option<u32> {
-        let file = std::fs::File::open(path).ok()?;
-        let mut r = std::io::BufReader::new(&file);
-        let data = exif::Reader::new().read_from_container(&mut r).ok()?;
-        data.get_field(tag, exif::In::PRIMARY)
-            .and_then(|f| f.value.get_uint(0))
-    }
-
-    #[test]
-    fn apply_exif_is_noop_when_empty() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("noop.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
+    fn apply_metadata_noop_when_empty() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "noop.jpg");
         let before = fs::read(&path).unwrap();
-        apply_exif(&path, &ExifWrite::default()).unwrap();
+        apply_metadata(&path, &MetadataWrite::default()).unwrap();
         let after = fs::read(&path).unwrap();
         assert_eq!(before, after, "empty write must not touch the file");
         fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn apply_exif_rating_roundtrips() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("rating.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-
-        apply_exif(
+    fn apply_metadata_datetime_roundtrips() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "dt.jpg");
+        apply_metadata(
             &path,
-            &ExifWrite {
-                rating: Some(4),
-                ..ExifWrite::default()
-            },
-        )
-        .unwrap();
-
-        // Tag 0x4746 is Rating (no named constant in kamadak-exif).
-        let rating = read_u32_field(&path, exif::Tag(exif::Context::Tiff, 0x4746))
-            .expect("Rating tag missing");
-        assert_eq!(rating, 4);
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn apply_exif_rating_clamps_above_5() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("rating_clamp.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-
-        apply_exif(
-            &path,
-            &ExifWrite {
-                rating: Some(99),
-                ..ExifWrite::default()
-            },
-        )
-        .unwrap();
-
-        let rating = read_u32_field(&path, exif::Tag(exif::Context::Tiff, 0x4746)).unwrap();
-        assert_eq!(rating, 5, "rating must clamp to 5");
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn apply_exif_gps_writes_ref_and_dms_triple() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("gps.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-
-        apply_exif(
-            &path,
-            &ExifWrite {
-                gps: Some(GpsCoords {
-                    latitude: 37.7749,
-                    longitude: -122.4194,
-                    altitude: Some(17.0),
-                }),
-                ..ExifWrite::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            read_field(&path, exif::Tag::GPSLatitudeRef).as_deref(),
-            Some("N")
-        );
-        assert_eq!(
-            read_field(&path, exif::Tag::GPSLongitudeRef).as_deref(),
-            Some("W")
-        );
-        // GPSLatitude / GPSLongitude are displayed as "deg/1, min/1, sec/10000"
-        // in kamadak-exif. Just verify they're present — decomposition is
-        // covered by the unit test on to_gps_ref_and_dms.
-        assert!(read_field(&path, exif::Tag::GPSLatitude).is_some());
-        assert!(read_field(&path, exif::Tag::GPSLongitude).is_some());
-        // Altitude is RATIONAL64U meters; ref=0 means above sea level.
-        assert!(read_field(&path, exif::Tag::GPSAltitude).is_some());
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn apply_exif_gps_negative_altitude_sets_alt_ref_1() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("gps_neg_alt.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-
-        apply_exif(
-            &path,
-            &ExifWrite {
-                gps: Some(GpsCoords {
-                    latitude: 0.0,
-                    longitude: 0.0,
-                    altitude: Some(-50.0),
-                }),
-                ..ExifWrite::default()
-            },
-        )
-        .unwrap();
-
-        let alt_ref = read_u32_field(&path, exif::Tag::GPSAltitudeRef).unwrap();
-        assert_eq!(alt_ref, 1, "below-sea-level altitude must set ref = 1");
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn apply_exif_description_roundtrips() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("desc.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-
-        apply_exif(
-            &path,
-            &ExifWrite {
-                description: Some("Beach sunset".to_string()),
-                ..ExifWrite::default()
-            },
-        )
-        .unwrap();
-
-        let desc = read_field(&path, exif::Tag::ImageDescription).unwrap();
-        assert!(
-            desc.contains("Beach sunset"),
-            "expected description to contain 'Beach sunset', got {desc}"
-        );
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn apply_exif_all_fields_single_pass() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("all.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-
-        apply_exif(
-            &path,
-            &ExifWrite {
+            &MetadataWrite {
                 datetime: Some("2024:06:15 10:00:00".to_string()),
-                rating: Some(3),
-                gps: Some(GpsCoords {
-                    latitude: 1.0,
-                    longitude: 2.0,
-                    altitude: None,
-                }),
-                description: Some("caption".to_string()),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            read_field(&path, exif::Tag::DateTimeOriginal).as_deref(),
-            Some("2024-06-15 10:00:00")
-        );
-        assert_eq!(
-            read_u32_field(&path, exif::Tag(exif::Context::Tiff, 0x4746)),
-            Some(3)
-        );
-        assert_eq!(
-            read_field(&path, exif::Tag::GPSLatitudeRef).as_deref(),
-            Some("N")
-        );
-        assert!(read_field(&path, exif::Tag::ImageDescription)
-            .unwrap()
-            .contains("caption"));
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn probe_exif_reports_no_gps_on_blank_jpeg() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("no_gps.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-        let probe = probe_exif(&path).unwrap();
-        assert!(!probe.has_gps);
-        assert!(probe.datetime_original.is_none());
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn probe_exif_reports_gps_after_write() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("with_gps.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-        apply_exif(
-            &path,
-            &ExifWrite {
-                gps: Some(GpsCoords {
-                    latitude: 10.0,
-                    longitude: 20.0,
-                    altitude: None,
-                }),
-                ..ExifWrite::default()
-            },
-        )
-        .unwrap();
-        assert!(probe_exif(&path).unwrap().has_gps);
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn probe_exif_reports_datetime_when_present() {
-        let dir = test_tmp_dir("exif_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("probe_dt.jpg");
-        fs::write(&path, minimal_jpeg()).unwrap();
-        apply_exif(
-            &path,
-            &ExifWrite {
-                datetime: Some("2024:06:15 10:00:00".to_string()),
-                ..ExifWrite::default()
+                ..MetadataWrite::default()
             },
         )
         .unwrap();
         let probe = probe_exif(&path).unwrap();
         assert!(probe.datetime_original.is_some());
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_rating_roundtrips() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "rating.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                rating: Some(4),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        let meta = read_meta(&path);
+        let rating = meta.property_i32(xmp_ns::XMP, "Rating").unwrap();
+        assert_eq!(rating.value, 4);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_rating_clamps_above_5() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "rating_clamp.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                rating: Some(99),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        let meta = read_meta(&path);
+        let rating = meta.property_i32(xmp_ns::XMP, "Rating").unwrap();
+        assert_eq!(rating.value, 5);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_gps_roundtrips() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "gps.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                gps: Some(GpsCoords {
+                    latitude: 37.7749,
+                    longitude: -122.4194,
+                    altitude: Some(17.0),
+                }),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        let probe = probe_exif(&path).unwrap();
+        assert!(probe.has_gps);
+        let meta = read_meta(&path);
+        let lat = meta.property(xmp_ns::EXIF, "GPSLatitude").unwrap().value;
+        assert!(lat.contains('N'), "lat should end with N: {lat}");
+        let lng = meta.property(xmp_ns::EXIF, "GPSLongitude").unwrap().value;
+        assert!(lng.contains('W'), "lng should end with W: {lng}");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_description_roundtrips() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "desc.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                description: Some("Beach day".to_string()),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        let meta = read_meta(&path);
+        let (desc, _lang) = meta
+            .localized_text(xmp_ns::DC, "description", None, "x-default")
+            .unwrap();
+        assert_eq!(desc.value, "Beach day");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_title_and_keywords_roundtrip() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "tags.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                title: Some("Vacation shot".to_string()),
+                keywords: vec!["vacation".into(), "beach".into(), "Favorites".into()],
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        let meta = read_meta(&path);
+        let (title, _lang) = meta
+            .localized_text(xmp_ns::DC, "title", None, "x-default")
+            .unwrap();
+        assert_eq!(title.value, "Vacation shot");
+        let subjects: Vec<String> = meta
+            .property_array(xmp_ns::DC, "subject")
+            .map(|v| v.value)
+            .collect();
+        assert_eq!(subjects.len(), 3);
+        assert!(subjects.contains(&"vacation".to_string()));
+        assert!(subjects.contains(&"beach".to_string()));
+        assert!(subjects.contains(&"Favorites".to_string()));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_people_roundtrips() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "people.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                people: vec!["Alice".into(), "Bob".into()],
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        let meta = read_meta(&path);
+        let names: Vec<String> = meta
+            .property_array(xmp_ns::IPTC_EXT, "PersonInImage")
+            .map(|v| v.value)
+            .collect();
+        assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_kei_namespace_fields() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "kei_ns.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                is_hidden: true,
+                is_archived: true,
+                media_subtype: Some("portrait".into()),
+                burst_id: Some("burst_abc".into()),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        let meta = read_meta(&path);
+        assert!(meta.property_bool(KEI_XMP_NS, "hidden").unwrap().value);
+        assert!(meta.property_bool(KEI_XMP_NS, "archived").unwrap().value);
+        assert_eq!(
+            meta.property(KEI_XMP_NS, "mediaSubtype").unwrap().value,
+            "portrait"
+        );
+        assert_eq!(
+            meta.property(KEI_XMP_NS, "burstId").unwrap().value,
+            "burst_abc"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_all_fields_single_pass() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "all.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                rating: Some(5),
+                gps: Some(GpsCoords {
+                    latitude: 1.0,
+                    longitude: 2.0,
+                    altitude: None,
+                }),
+                title: Some("T".into()),
+                description: Some("D".into()),
+                keywords: vec!["k".into()],
+                people: vec!["Alice".into()],
+                is_hidden: false,
+                is_archived: true,
+                media_subtype: Some("live_photo".into()),
+                burst_id: None,
+            },
+        )
+        .unwrap();
+        let probe = probe_exif(&path).unwrap();
+        assert!(probe.datetime_original.is_some());
+        assert!(probe.has_gps);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_cleans_up_tmp_on_failure() {
+        let dir = test_tmp_dir("meta_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corrupt.jpg");
+        fs::write(&path, b"not a jpeg").unwrap();
+        let result = apply_metadata(
+            &path,
+            &MetadataWrite {
+                rating: Some(3),
+                ..MetadataWrite::default()
+            },
+        );
+        assert!(result.is_err(), "corrupt file should fail metadata write");
+        let mut tmp_name = path.file_name().unwrap().to_os_string();
+        tmp_name.push(".meta-tmp");
+        let tmp_path = path.with_file_name(&tmp_name);
+        assert!(
+            !tmp_path.exists(),
+            ".meta-tmp must be cleaned up after a failed write"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn probe_exif_reports_empty_on_fresh_jpeg() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "probe_empty.jpg");
+        let probe = probe_exif(&path).unwrap();
+        assert!(probe.datetime_original.is_none());
         assert!(!probe.has_gps);
         fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn to_gps_ref_and_dms_positive_latitude() {
-        let (refstr, triple) = to_gps_ref_and_dms(37.7749, "N", "S");
-        assert_eq!(refstr, "N");
-        assert_eq!(triple.len(), 3);
-        assert_eq!(triple[0].nominator, 37);
-        assert_eq!(triple[1].nominator, 46); // 0.7749 * 60 = 46.494
-                                             // seconds with 4-decimal scaling: (0.494 * 60) * 10000 ≈ 296400
-        assert!(
-            triple[2].nominator > 290_000 && triple[2].nominator < 300_000,
-            "seconds nominator was {}",
-            triple[2].nominator
+    fn exif_datetime_to_iso_converts_valid() {
+        assert_eq!(
+            exif_datetime_to_iso("2024:06:15 10:00:00"),
+            "2024-06-15T10:00:00"
         );
     }
 
     #[test]
-    fn to_gps_ref_and_dms_negative_longitude() {
-        let (refstr, triple) = to_gps_ref_and_dms(-122.4194, "E", "W");
-        assert_eq!(refstr, "W");
-        assert_eq!(triple[0].nominator, 122);
+    fn exif_datetime_to_iso_leaves_invalid_unchanged() {
+        assert_eq!(exif_datetime_to_iso("not a date"), "not a date");
+    }
+
+    #[test]
+    fn encode_gps_positive_is_north() {
+        let s = encode_gps(37.7749, 'N', 'S');
+        assert!(s.ends_with('N'));
+        assert!(s.starts_with("37,"));
+    }
+
+    #[test]
+    fn encode_gps_negative_is_west() {
+        let s = encode_gps(-122.4194, 'E', 'W');
+        assert!(s.ends_with('W'));
+        assert!(s.starts_with("122,"));
     }
 }
