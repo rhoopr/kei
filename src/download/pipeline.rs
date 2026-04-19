@@ -1015,18 +1015,23 @@ where
         }
     }
 
-    if producer_panicked {
-        return Err(anyhow::anyhow!(
-            "Asset producer panicked — sync may be incomplete"
-        ));
-    }
-
-    // Retry any state writes that failed during the streaming loop
+    // Retry any state writes that failed during the streaming loop. This
+    // must run before the producer-panic bail so rows that successfully
+    // landed on disk before the panic are recorded in state; otherwise the
+    // next sync re-downloads them and the pending-retry safety net becomes
+    // a no-op on panic paths.
     let state_write_failures = if let Some(db) = &state_db {
         flush_pending_state_writes(db.as_ref(), &pending_state_writes).await
     } else {
         0
     };
+
+    if producer_panicked {
+        return Err(anyhow::anyhow!(
+            "Asset producer panicked — sync may be incomplete ({} pending state writes flushed)",
+            state_write_failures,
+        ));
+    }
 
     Ok(StreamingResult {
         downloaded,
