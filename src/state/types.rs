@@ -246,6 +246,8 @@ pub struct SyncSummary {
     pub pending: u64,
     /// Number of assets that failed to download.
     pub failed: u64,
+    /// Total size in bytes of downloaded assets.
+    pub downloaded_bytes: u64,
     /// Time of the last completed sync run (if any).
     pub last_sync_completed: Option<DateTime<Utc>>,
     /// Time of the last sync run start (if any).

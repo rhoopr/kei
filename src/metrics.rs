@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::download::SyncStats;
 use crate::health::HealthStatus;
+use crate::state::types::SyncSummary;
 
 // ── Label types ──────────────────────────────────────────────────────────────
 
@@ -36,6 +37,12 @@ use crate::health::HealthStatus;
 #[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
 struct SkipLabels {
     reason: &'static str,
+}
+
+/// Label set for the `kei_db_assets_total` and `kei_db_assets_size_bytes` gauge families.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+struct StatusLabels {
+    status: &'static str,
 }
 
 // ── State shared between the HTTP handlers and the sync loop ─────────────────
@@ -69,6 +76,11 @@ pub(crate) struct MetricsHandle {
     consecutive_failures: Gauge,
     last_success_timestamp: Gauge<f64, AtomicU64>,
     interrupted_cycles: Counter,
+    // DB-backed gauges (only populated when --metrics-port is set).
+    db_assets_total: Family<StatusLabels, Gauge>,
+    db_assets_size_bytes: Family<StatusLabels, Gauge>,
+    db_last_sync_assets_seen: Gauge,
+    db_summary_read_failures: Counter,
 }
 
 impl MetricsHandle {
@@ -174,6 +186,34 @@ impl MetricsHandle {
             interrupted_cycles.clone(),
         );
 
+        let db_assets_total: Family<StatusLabels, Gauge> = Family::default();
+        registry.register(
+            "kei_db_assets_total",
+            "Current number of assets in the database, by status",
+            db_assets_total.clone(),
+        );
+
+        let db_assets_size_bytes: Family<StatusLabels, Gauge> = Family::default();
+        registry.register(
+            "kei_db_assets_size_bytes",
+            "Current total size in bytes of assets in the database, by status",
+            db_assets_size_bytes.clone(),
+        );
+
+        let db_last_sync_assets_seen: Gauge = Gauge::default();
+        registry.register(
+            "kei_db_last_sync_assets_seen",
+            "Number of assets enumerated from iCloud in the most recent sync cycle",
+            db_last_sync_assets_seen.clone(),
+        );
+
+        let db_summary_read_failures = Counter::default();
+        registry.register(
+            "kei_db_summary_read_failures",
+            "Total number of failed attempts to read the DB summary for metrics",
+            db_summary_read_failures.clone(),
+        );
+
         Self {
             registry: Arc::new(registry),
             inner: Arc::new(Mutex::new(Inner {
@@ -193,6 +233,10 @@ impl MetricsHandle {
             consecutive_failures,
             last_success_timestamp,
             interrupted_cycles,
+            db_assets_total,
+            db_assets_size_bytes,
+            db_last_sync_assets_seen,
+            db_summary_read_failures,
         }
     }
 
@@ -250,6 +294,42 @@ impl MetricsHandle {
     /// session, in addition to the normal health update.
     pub(crate) fn record_session_expiration(&self) {
         self.session_expirations.inc();
+    }
+
+    /// Update DB-backed gauges from the current state database summary.
+    ///
+    /// Call this after [`Self::update`] on every real sync cycle, guarded by a
+    /// `state_db.as_ref()` check so dry-run and metrics-disabled paths are
+    /// no-ops. `assets_seen` comes from [`SyncStats`] already in hand at the
+    /// call site, so no extra DB query is needed for that gauge.
+    pub(crate) fn update_db_stats(&self, summary: &SyncSummary, assets_seen: u64) {
+        self.db_assets_total
+            .get_or_create(&StatusLabels {
+                status: "downloaded",
+            })
+            .set(i64::try_from(summary.downloaded).unwrap_or(i64::MAX));
+        self.db_assets_total
+            .get_or_create(&StatusLabels { status: "pending" })
+            .set(i64::try_from(summary.pending).unwrap_or(i64::MAX));
+        self.db_assets_total
+            .get_or_create(&StatusLabels { status: "failed" })
+            .set(i64::try_from(summary.failed).unwrap_or(i64::MAX));
+        self.db_assets_size_bytes
+            .get_or_create(&StatusLabels {
+                status: "downloaded",
+            })
+            .set(i64::try_from(summary.downloaded_bytes).unwrap_or(i64::MAX));
+        self.db_last_sync_assets_seen
+            .set(i64::try_from(assets_seen).unwrap_or(i64::MAX));
+    }
+
+    /// Increment the counter for failed DB summary reads.
+    ///
+    /// Call this whenever [`get_summary`](crate::state::StateDb::get_summary)
+    /// returns an error during a metrics update so the failure is visible in
+    /// the `/metrics` output rather than only in the log.
+    pub(crate) fn record_db_summary_failure(&self) {
+        self.db_summary_read_failures.inc();
     }
 
     async fn update_health_gauges(&self, health: &HealthStatus) {
@@ -754,6 +834,123 @@ mod tests {
         assert!(
             json.get("last_success_at").is_some(),
             "missing last_success_at"
+        );
+    }
+
+    // ── DB-backed gauges ──────────────────────────────────────────────────────
+
+    fn make_summary(
+        downloaded: u64,
+        pending: u64,
+        failed: u64,
+        downloaded_bytes: u64,
+    ) -> SyncSummary {
+        SyncSummary {
+            total_assets: downloaded + pending + failed,
+            downloaded,
+            pending,
+            failed,
+            downloaded_bytes,
+            last_sync_completed: None,
+            last_sync_started: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_db_stats_sets_asset_count_gauges() {
+        let handle = MetricsHandle::new();
+        let summary = make_summary(100, 5, 2, 1_000_000);
+        handle.update_db_stats(&summary, 107);
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains(r#"kei_db_assets_total{status="downloaded"} 100"#),
+            "downloaded count missing or wrong:\n{output}"
+        );
+        assert!(
+            output.contains(r#"kei_db_assets_total{status="pending"} 5"#),
+            "pending count missing or wrong:\n{output}"
+        );
+        assert!(
+            output.contains(r#"kei_db_assets_total{status="failed"} 2"#),
+            "failed count missing or wrong:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_db_stats_sets_size_bytes_gauge() {
+        let handle = MetricsHandle::new();
+        let summary = make_summary(50, 0, 0, 2_048_000);
+        handle.update_db_stats(&summary, 50);
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains(r#"kei_db_assets_size_bytes{status="downloaded"} 2048000"#),
+            "downloaded_bytes gauge missing or wrong:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_db_stats_sets_last_sync_assets_seen_gauge() {
+        let handle = MetricsHandle::new();
+        let summary = make_summary(28_000, 3_000, 71, 0);
+        handle.update_db_stats(&summary, 31_071);
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains("kei_db_last_sync_assets_seen 31071"),
+            "last_sync_assets_seen gauge missing or wrong:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_db_stats_gauges_reflect_latest_call() {
+        let handle = MetricsHandle::new();
+        handle.update_db_stats(&make_summary(100, 10, 0, 500_000), 110);
+        // Second call should overwrite (gauges, not counters).
+        handle.update_db_stats(&make_summary(105, 5, 0, 525_000), 110);
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            !output.contains("kei_db_assets_total{status=\"pending\"} 10"),
+            "stale pending value should not appear:\n{output}"
+        );
+        assert!(
+            output.contains("kei_db_last_sync_assets_seen 110"),
+            "assets_seen gauge wrong:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_metric_names_present_in_output() {
+        let handle = MetricsHandle::new();
+        handle.update_db_stats(&make_summary(1, 0, 0, 1024), 1);
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains("kei_db_assets_total"),
+            "kei_db_assets_total missing from /metrics output:\n{output}"
+        );
+        assert!(
+            output.contains("kei_db_assets_size_bytes"),
+            "kei_db_assets_size_bytes missing from /metrics output:\n{output}"
+        );
+        assert!(
+            output.contains("kei_db_last_sync_assets_seen"),
+            "kei_db_last_sync_assets_seen missing from /metrics output:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_summary_failure_counter_increments() {
+        let handle = MetricsHandle::new();
+        handle.record_db_summary_failure();
+        handle.record_db_summary_failure();
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains("kei_db_summary_read_failures_total 2"),
+            "db_summary_read_failures counter missing or wrong:\n{output}"
         );
     }
 }

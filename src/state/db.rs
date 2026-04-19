@@ -482,13 +482,14 @@ impl StateDb for SqliteStateDb {
     async fn get_summary(&self) -> Result<SyncSummary, StateError> {
         let conn = self.acquire_lock("get_summary")?;
 
-        let (total_assets, downloaded, pending, failed) = conn
+        let (total_assets, downloaded, pending, failed, downloaded_bytes) = conn
             .query_row(
                 "SELECT \
                      COUNT(*), \
                      COUNT(CASE WHEN status = 'downloaded' THEN 1 END), \
                      COUNT(CASE WHEN status = 'pending' THEN 1 END), \
-                     COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+                     COUNT(CASE WHEN status = 'failed' THEN 1 END), \
+                     COALESCE(SUM(CASE WHEN status = 'downloaded' THEN size_bytes ELSE 0 END), 0) \
                  FROM assets",
                 [],
                 |row| {
@@ -497,15 +498,17 @@ impl StateDb for SqliteStateDb {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
-            .map(|(t, d, p, f)| {
+            .map(|(t, d, p, f, b)| {
                 (
                     u64::try_from(t).unwrap_or(0),
                     u64::try_from(d).unwrap_or(0),
                     u64::try_from(p).unwrap_or(0),
                     u64::try_from(f).unwrap_or(0),
+                    u64::try_from(b).unwrap_or(0),
                 )
             })
             .map_err(|e| StateError::query("get_summary", e))?;
@@ -532,6 +535,7 @@ impl StateDb for SqliteStateDb {
             downloaded,
             pending,
             failed,
+            downloaded_bytes,
             last_sync_completed,
             last_sync_started,
         })
