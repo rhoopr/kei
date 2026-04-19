@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`--bandwidth-limit` flag to cap total download throughput.** Accepts human-readable values (`10M`, `500K`, `2Mi`, bare integer = bytes/sec). The cap is global across all concurrent downloads, so total throughput stays within budget regardless of `--threads-num`. Also configurable via `[download] bandwidth_limit` in the TOML config and `KEI_BANDWIDTH_LIMIT` env var. When set without an explicit `--threads-num`, concurrency defaults to 1 so the capped budget isn't fragmented across many starved connections. ([#53])
+
+[#53]: https://github.com/rhoopr/kei/issues/53
+
+---
+
 ## [0.9.2] - 2026-04-18
 
 ### Fixed

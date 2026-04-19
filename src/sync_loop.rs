@@ -358,6 +358,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .map(|d| d.with_timezone(&chrono::Utc));
     let retry_config = api_retry_config;
     let live_photo_size = config.live_photo_size.to_asset_version_size();
+    // One shared limiter per sync run so the configured cap applies to
+    // aggregate throughput across every concurrent download.
+    let bandwidth_limiter = config
+        .bandwidth_limit
+        .map(download::limiter::BandwidthLimiter::new);
+    if let Some(limiter) = &bandwidth_limiter {
+        tracing::info!(
+            bytes_per_sec = limiter.bytes_per_sec(),
+            "Bandwidth limit enabled"
+        );
+    }
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>|
      -> Arc<download::DownloadConfig> {
@@ -391,6 +402,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             sync_mode,
             album_name: None,
             exclude_asset_ids,
+            bandwidth_limiter: bandwidth_limiter.clone(),
         })
     };
 
