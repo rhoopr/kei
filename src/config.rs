@@ -21,6 +21,7 @@ pub(crate) struct TomlConfig {
     pub watch: Option<TomlWatch>,
     pub notifications: Option<TomlNotifications>,
     pub metrics: Option<TomlMetrics>,
+    pub server: Option<TomlServer>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -104,6 +105,12 @@ pub(crate) struct TomlWatch {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlMetrics {
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TomlServer {
     pub port: Option<u16>,
 }
 
@@ -316,7 +323,7 @@ pub struct Config {
 
     // 2-byte primitives
     pub threads_num: u16,
-    pub metrics_port: Option<u16>,
+    pub http_port: u16,
 
     // 1-byte enums
     pub size: VersionSize,
@@ -618,6 +625,7 @@ impl Config {
         let toml_photos = toml.as_ref().and_then(|t| t.photos.as_ref());
         let toml_watch = toml.as_ref().and_then(|t| t.watch.as_ref());
         let toml_metrics = toml.as_ref().and_then(|t| t.metrics.as_ref());
+        let toml_server = toml.as_ref().and_then(|t| t.server.as_ref());
 
         // Download
         let directory = sync
@@ -847,10 +855,28 @@ impl Config {
         // JSON report
         let report_json = sync.report_json;
 
-        // Prometheus metrics port — CLI takes precedence over TOML.
-        let metrics_port = sync
-            .metrics_port
-            .or_else(|| toml_metrics.and_then(|m| m.port));
+        // HTTP server port — CLI > [server] TOML > [metrics] TOML (deprecated) > KEI_METRICS_PORT
+        // env (deprecated) > default 9090.
+        const DEFAULT_HTTP_PORT: u16 = 9090;
+        let http_port = sync
+            .http_port
+            .or_else(|| toml_server.and_then(|s| s.port))
+            .or_else(|| {
+                toml_metrics.and_then(|m| m.port).inspect(|_port| {
+                    tracing::warn!(
+                        "[metrics] port in TOML is deprecated; rename the section to [server]"
+                    );
+                })
+            })
+            .or_else(|| {
+                std::env::var("KEI_METRICS_PORT")
+                    .ok()
+                    .and_then(|v| v.parse::<u16>().ok())
+                    .inspect(|_port| {
+                        tracing::warn!("KEI_METRICS_PORT is deprecated; use KEI_HTTP_PORT instead");
+                    })
+            })
+            .unwrap_or(DEFAULT_HTTP_PORT);
 
         if skip_videos && skip_photos && live_photo_mode == LivePhotoMode::Skip {
             tracing::warn!(
@@ -877,7 +903,7 @@ impl Config {
             pid_file,
             notification_script,
             report_json,
-            metrics_port,
+            http_port,
             watch_with_interval,
             retry_delay_secs,
             recent,
@@ -1075,9 +1101,10 @@ impl Config {
                 .map(|s| TomlNotifications {
                     script: Some(s.display().to_string()),
                 }),
-            metrics: self
-                .metrics_port
-                .map(|port| TomlMetrics { port: Some(port) }),
+            metrics: None,
+            server: Some(TomlServer {
+                port: Some(self.http_port),
+            }),
         }
     }
 }
@@ -1153,6 +1180,7 @@ pub(crate) fn persist_first_run_config(
         watch: None,
         notifications: None,
         metrics: None,
+        server: None,
     };
 
     // Don't write if there's nothing meaningful to persist
@@ -2391,7 +2419,18 @@ mod tests {
     }
 
     #[test]
-    fn test_toml_metrics_port_parsed() {
+    fn test_toml_server_port_parsed() {
+        let toml_str = r#"
+            [server]
+            port = 9090
+        "#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.unwrap().port, Some(9090));
+    }
+
+    #[test]
+    fn test_toml_metrics_port_parsed_deprecated() {
+        // [metrics] section is still accepted for backwards compatibility.
         let toml_str = r#"
             [metrics]
             port = 9090
@@ -2401,7 +2440,29 @@ mod tests {
     }
 
     #[test]
-    fn test_toml_metrics_port_resolves_in_config() {
+    fn test_toml_server_port_resolves_in_config() {
+        let toml_str = r#"
+            [auth]
+            username = "user@example.com"
+            [download]
+            directory = "/photos"
+            [server]
+            port = 9090
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(config.http_port, 9090);
+    }
+
+    #[test]
+    fn test_toml_metrics_port_resolves_in_config_deprecated() {
+        // [metrics] port is still accepted as a deprecated fallback.
         let toml_str = r#"
             [auth]
             username = "user@example.com"
@@ -2418,25 +2479,47 @@ mod tests {
             Some(toml),
         )
         .unwrap();
-        assert_eq!(config.metrics_port, Some(9090));
+        assert_eq!(config.http_port, 9090);
     }
 
     #[test]
-    fn test_cli_metrics_port_overrides_toml() {
+    fn test_cli_http_port_overrides_toml() {
         let toml_str = r#"
             [auth]
             username = "user@example.com"
             [download]
             directory = "/photos"
-            [metrics]
+            [server]
             port = 9090
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
-        sync.metrics_port = Some(8080);
+        sync.http_port = Some(8080);
         let config =
             Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
-        assert_eq!(config.metrics_port, Some(8080));
+        assert_eq!(config.http_port, 8080);
+    }
+
+    #[test]
+    fn test_default_http_port() {
+        // Without any explicit config, http_port should be 9090.
+        let config =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        assert_eq!(config.http_port, 9090);
+    }
+
+    #[test]
+    fn test_toml_server_unknown_field_rejected() {
+        let toml_str = r#"
+            [server]
+            port = 9090
+            unknown_field = true
+        "#;
+        let result: Result<TomlConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "unknown fields in [server] should be rejected"
+        );
     }
 
     #[test]
@@ -3908,6 +3991,7 @@ mod tests {
             watch: None,
             notifications: None,
             metrics: None,
+            server: None,
         };
         let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/data"));
@@ -3932,6 +4016,7 @@ mod tests {
             watch: None,
             notifications: None,
             metrics: None,
+            server: None,
         };
         let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/cookies"));
@@ -3955,6 +4040,7 @@ mod tests {
             watch: None,
             notifications: None,
             metrics: None,
+            server: None,
         };
         let result = resolve_data_dir(
             Some("/cli/data"),

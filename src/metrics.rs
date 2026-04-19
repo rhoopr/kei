@@ -1,8 +1,8 @@
-//! Prometheus metrics and HTTP observability server.
+//! HTTP observability server (watch-mode only).
 //!
-//! When `--metrics-port` is provided, spawns an axum HTTP server that serves:
-//! - `GET /metrics` — Prometheus text format
+//! In watch mode, spawns an axum HTTP server on `--http-port` (default 9091) that serves:
 //! - `GET /healthz`  — JSON health status (same data as `health.json`)
+//! - `GET /metrics`  — Prometheus text format
 //!
 //! Metrics are updated after every sync cycle by calling [`MetricsHandle::update`].
 //! On skipped cycles (no changes detected), call [`MetricsHandle::update_health_only`]
@@ -462,14 +462,14 @@ pub(crate) fn spawn_server(
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let std_listener = std::net::TcpListener::bind(addr)
-        .map_err(|e| anyhow::anyhow!("Failed to bind metrics server on port {port}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to bind HTTP server on port {port}: {e}"))?;
     let local_addr = std_listener.local_addr()?;
     std_listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
 
     tracing::info!(
         port = local_addr.port(),
-        "Prometheus metrics server listening"
+        "HTTP server listening (serving /healthz and /metrics)"
     );
 
     let task = tokio::spawn(async move {
@@ -477,12 +477,9 @@ pub(crate) fn spawn_server(
             .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
             .await
         {
-            tracing::warn!(error = %e, "Metrics server error");
+            tracing::warn!(error = %e, "HTTP server error");
         }
-        tracing::info!(
-            port = local_addr.port(),
-            "Prometheus metrics server stopped"
-        );
+        tracing::info!(port = local_addr.port(), "HTTP server stopped");
     });
 
     Ok((handle, task, local_addr))

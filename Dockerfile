@@ -57,23 +57,19 @@ RUN export TARGET=$(cat /tmp/target) && \
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends bash curl jq ca-certificates libdbus-1-3 && \
+    apt-get install -y --no-install-recommends bash curl ca-certificates libdbus-1-3 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /kei /usr/local/bin/kei
 
 VOLUME ["/config", "/photos"]
 
-# Prometheus metrics + /healthz endpoint (opt-in via --metrics-port / KEI_METRICS_PORT).
-# The port below is a documentation hint only; the actual port is user-configured.
+# Always-on HTTP server: /healthz (health check) and /metrics (Prometheus).
+# Default port 9090; override with --http-port / KEI_HTTP_PORT.
 EXPOSE 9090
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=15m --retries=3 \
-  CMD test -f /config/health.json \
-   && test "$(jq -r '.consecutive_failures' /config/health.json)" -lt 5 \
-   && { LAST=$(jq -r '.last_sync_at' /config/health.json); \
-        [ "$LAST" = "null" ] \
-        || test "$(( $(date +%s) - $(date -d "$LAST" +%s) ))" -lt 7200; }
+  CMD curl -f http://localhost:9090/healthz || exit 1
 
 ENTRYPOINT ["kei"]
-CMD ["sync", "--config", "/config/config.toml", "--data-dir", "/config", "--directory", "/photos"]
+CMD ["sync", "--config", "/config/config.toml", "--data-dir", "/config", "--directory", "/photos", "--watch", "24h"]
