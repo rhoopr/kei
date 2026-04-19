@@ -4,9 +4,10 @@
 //! concurrency, then (2) cleanup pass with fresh CDN URLs for any failures.
 
 pub mod error;
-pub mod exif;
 pub mod file;
 pub(crate) mod filter;
+pub(crate) mod heif;
+pub mod metadata;
 pub mod paths;
 pub(crate) mod pipeline;
 

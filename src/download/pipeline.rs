@@ -1374,9 +1374,9 @@ fn plan_metadata_write(
     flags: ExifFlags,
     payload: &ExifPayload,
     created_local: &chrono::DateTime<chrono::Local>,
-    probe: &super::exif::ExifProbe,
-) -> super::exif::MetadataWrite {
-    let mut write = super::exif::MetadataWrite::default();
+    probe: &super::metadata::ExifProbe,
+) -> super::metadata::MetadataWrite {
+    let mut write = super::metadata::MetadataWrite::default();
 
     if flags.datetime && probe.datetime_original.is_none() {
         write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
@@ -1388,7 +1388,7 @@ fn plan_metadata_write(
 
     if flags.gps && !probe.has_gps {
         if let (Some(lat), Some(lng)) = (payload.latitude, payload.longitude) {
-            write.gps = Some(super::exif::GpsCoords {
+            write.gps = Some(super::metadata::GpsCoords {
                 latitude: lat,
                 longitude: lng,
                 altitude: payload.altitude,
@@ -1479,18 +1479,18 @@ async fn download_single_task(
         // Probe + plan + apply all run on the blocking pool so no file I/O
         // happens on the async runtime's poll thread.
         let exif_result = tokio::task::spawn_blocking(move || {
-            let probe = match super::exif::probe_exif(&exif_path) {
+            let probe = match super::metadata::probe_exif(&exif_path) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(path = %exif_path.display(), error = %e, "Failed to read EXIF");
-                    super::exif::ExifProbe::default()
+                    super::metadata::ExifProbe::default()
                 }
             };
             let write = plan_metadata_write(exif_flags, &payload, &created_local, &probe);
             if write.is_empty() {
                 return true;
             }
-            if let Err(e) = super::exif::apply_metadata(&exif_path, &write) {
+            if let Err(e) = super::metadata::apply_metadata(&exif_path, &write) {
                 tracing::warn!(path = %exif_path.display(), error = %e, "Failed to write metadata");
                 false
             } else {
