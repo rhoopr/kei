@@ -46,6 +46,7 @@ pub(crate) struct TomlDownload {
     pub directory: Option<String>,
     pub folder_structure: Option<String>,
     pub threads_num: Option<u16>,
+    pub bandwidth_limit: Option<String>,
     pub temp_suffix: Option<String>,
     pub set_exif_datetime: Option<bool>,
     pub no_progress_bar: Option<bool>,
@@ -210,6 +211,9 @@ pub struct Config {
     // 4-byte primitives
     pub recent: Option<u32>,
     pub max_retries: u32,
+
+    // 8-byte primitives (cont.)
+    pub bandwidth_limit: Option<u64>,
 
     // 2-byte primitives
     pub threads_num: u16,
@@ -505,7 +509,32 @@ impl Config {
             toml_dl.and_then(|d| d.folder_structure.clone()),
             "%Y/%m/%d".to_string(),
         );
-        let threads_num = resolve(sync.threads_num, toml_dl.and_then(|d| d.threads_num), 10);
+        // Resolve bandwidth limit (CLI bytes/sec > TOML human-readable string > None).
+        let bandwidth_limit: Option<u64> = if let Some(n) = sync.bandwidth_limit {
+            Some(n)
+        } else if let Some(s) = toml_dl.and_then(|d| d.bandwidth_limit.as_ref()) {
+            Some(crate::cli::parse_bandwidth_limit(s).map_err(|e| {
+                anyhow::anyhow!("invalid [download].bandwidth_limit in config: {e}")
+            })?)
+        } else {
+            None
+        };
+
+        // When a bandwidth limit is set without an explicit --threads-num,
+        // default concurrency to 1: many connections starving for a capped
+        // total budget just fragments downloads and adds connection overhead.
+        let threads_explicitly_set =
+            sync.threads_num.is_some() || toml_dl.and_then(|d| d.threads_num).is_some();
+        let threads_default = if bandwidth_limit.is_some() && !threads_explicitly_set {
+            1
+        } else {
+            10
+        };
+        let threads_num = resolve(
+            sync.threads_num,
+            toml_dl.and_then(|d| d.threads_num),
+            threads_default,
+        );
         anyhow::ensure!(
             threads_num >= 1,
             "threads_num must be >= 1, got {threads_num}"
@@ -710,6 +739,7 @@ impl Config {
             retry_delay_secs,
             recent,
             max_retries,
+            bandwidth_limit,
             threads_num,
             size,
             live_photo_size,
@@ -770,6 +800,7 @@ impl Config {
                 },
                 folder_structure: Some(self.folder_structure.clone()),
                 threads_num: Some(self.threads_num),
+                bandwidth_limit: self.bandwidth_limit.map(|n| n.to_string()),
                 temp_suffix: if self.temp_suffix == ".kei-tmp" {
                     None
                 } else {
@@ -945,6 +976,7 @@ pub(crate) fn persist_first_run_config(
             directory: d.directory,
             folder_structure: None,
             threads_num: None,
+            bandwidth_limit: None,
             temp_suffix: None,
             set_exif_datetime: None,
             no_progress_bar: None,
@@ -1360,6 +1392,118 @@ mod tests {
             Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
         assert_eq!(cfg.threads_num, 10);
         assert!(matches!(cfg.align_raw, RawTreatmentPolicy::Unchanged));
+    }
+
+    #[test]
+    fn test_build_bandwidth_limit_resolution() {
+        struct Case {
+            name: &'static str,
+            cli: Option<u64>,
+            toml_cli_threads: Option<u16>,
+            toml: Option<&'static str>,
+            toml_threads: Option<u16>,
+            want_limit: Option<u64>,
+            want_threads: u16,
+        }
+        let cases = [
+            Case {
+                name: "cli sets limit, threads defaults to 1",
+                cli: Some(5_000_000),
+                toml_cli_threads: None,
+                toml: None,
+                toml_threads: None,
+                want_limit: Some(5_000_000),
+                want_threads: 1,
+            },
+            Case {
+                name: "toml string parses into u64",
+                cli: None,
+                toml_cli_threads: None,
+                toml: Some("2M"),
+                toml_threads: None,
+                want_limit: Some(2_000_000),
+                want_threads: 1,
+            },
+            Case {
+                name: "cli overrides toml",
+                cli: Some(10_000_000),
+                toml_cli_threads: None,
+                toml: Some("1M"),
+                toml_threads: None,
+                want_limit: Some(10_000_000),
+                want_threads: 1,
+            },
+            Case {
+                name: "explicit cli threads overrides auto-1",
+                cli: Some(500_000),
+                toml_cli_threads: Some(4),
+                toml: None,
+                toml_threads: None,
+                want_limit: Some(500_000),
+                want_threads: 4,
+            },
+            Case {
+                name: "toml threads overrides auto-1",
+                cli: None,
+                toml_cli_threads: None,
+                toml: Some("1M"),
+                toml_threads: Some(3),
+                want_limit: Some(1_000_000),
+                want_threads: 3,
+            },
+            Case {
+                name: "no limit keeps default 10 threads",
+                cli: None,
+                toml_cli_threads: None,
+                toml: None,
+                toml_threads: None,
+                want_limit: None,
+                want_threads: 10,
+            },
+        ];
+
+        for case in cases {
+            let toml = match (case.toml, case.toml_threads) {
+                (None, None) => None,
+                (limit, threads) => {
+                    let mut body = "[download]\n".to_string();
+                    if let Some(l) = limit {
+                        body.push_str(&format!("bandwidth_limit = \"{l}\"\n"));
+                    }
+                    if let Some(t) = threads {
+                        body.push_str(&format!("threads_num = {t}\n"));
+                    }
+                    Some(toml::from_str::<TomlConfig>(&body).unwrap())
+                }
+            };
+            let mut sync = default_sync();
+            sync.bandwidth_limit = case.cli;
+            sync.threads_num = case.toml_cli_threads;
+            let cfg = Config::build(&default_globals(), default_password(), sync, toml)
+                .unwrap_or_else(|e| panic!("{}: build failed: {e}", case.name));
+            assert_eq!(cfg.bandwidth_limit, case.want_limit, "{}", case.name);
+            assert_eq!(cfg.threads_num, case.want_threads, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_build_bandwidth_limit_invalid_toml_rejected() {
+        let toml_str = r#"
+            [download]
+            bandwidth_limit = "not_a_value"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .expect_err("invalid bandwidth_limit should fail build");
+        assert!(
+            err.to_string().contains("bandwidth_limit"),
+            "error should mention bandwidth_limit: {err}"
+        );
     }
 
     #[test]

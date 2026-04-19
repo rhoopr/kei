@@ -7,8 +7,11 @@ pub mod error;
 pub mod exif;
 pub mod file;
 pub(crate) mod filter;
+pub(crate) mod limiter;
 pub mod paths;
 pub(crate) mod pipeline;
+
+pub(crate) use limiter::BandwidthLimiter;
 
 use pipeline::{
     build_download_outcome, format_duration, log_sync_summary, run_download_pass,
@@ -391,6 +394,9 @@ pub(crate) struct DownloadConfig {
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
     /// Maximum download attempts per asset before giving up (0 = unlimited).
     pub(crate) max_download_attempts: u32,
+    /// Shared token-bucket limiter applied across all concurrent download
+    /// streams. `None` = no throughput cap.
+    pub(crate) bandwidth_limiter: Option<BandwidthLimiter>,
 }
 
 impl DownloadConfig {
@@ -410,6 +416,7 @@ impl DownloadConfig {
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
             exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
+            bandwidth_limiter: self.bandwidth_limiter.clone(),
             ..*self
         }
     }
@@ -450,6 +457,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("album_name", &self.album_name)
             .field("exclude_asset_ids_count", &self.exclude_asset_ids.len())
             .field("max_download_attempts", &self.max_download_attempts)
+            .field("bandwidth_limiter", &self.bandwidth_limiter)
             .finish()
     }
 }
@@ -489,6 +497,7 @@ impl DownloadConfig {
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: std::sync::Arc::new(FxHashSet::default()),
+            bandwidth_limiter: None,
         }
     }
 }
@@ -1283,6 +1292,7 @@ async fn download_photos_incremental(
         temp_suffix: config.temp_suffix.clone(),
         shutdown_token,
         state_db: config.state_db.clone(),
+        bandwidth_limiter: config.bandwidth_limiter.clone(),
     };
     let pass_result = run_download_pass(pass_config, tasks).await;
 
@@ -1801,6 +1811,7 @@ mod tests {
             retry_delay_secs: 5,
             recent: dl_config.recent,
             max_retries: 3,
+            bandwidth_limit: None,
             threads_num: 1,
             size: VersionSize::Original,
             live_photo_size: LivePhotoSize::Original,

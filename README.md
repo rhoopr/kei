@@ -104,6 +104,9 @@ kei sync --library all
 # Keep syncing every hour
 kei sync --watch-with-interval 3600
 
+# Cap total download throughput (global across all workers)
+kei sync --bandwidth-limit 5M
+
 # --- Inspection ---
 
 # Print filenames to stdout (useful for piping)
@@ -144,6 +147,7 @@ State lives in a SQLite database alongside your session data (see `--data-dir`).
 - Multi-library sync (`--library all` for personal + shared)
 - Flexible password sources: prompt, env var, file, shell command, OS keyring
 - Content filtering: live photo mode, filename globs, album exclusions, date ranges, `--recent N`
+- Bandwidth cap with `--bandwidth-limit` (e.g. `10M`, `500K`, `2Mi`) - global across all concurrent downloads
 - Flexible folder structure with `{album}` token and full strftime support, EXIF datetime stamping
 - Multi-arch Docker images (amd64/arm64) with headless 2FA
 - Notification scripts on events (2FA required, sync complete, failures)

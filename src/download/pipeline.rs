@@ -251,6 +251,7 @@ pub(super) struct PassConfig<'a> {
     pub(super) temp_suffix: String,
     pub(super) shutdown_token: CancellationToken,
     pub(super) state_db: Option<Arc<dyn StateDb>>,
+    pub(super) bandwidth_limiter: Option<super::BandwidthLimiter>,
 }
 
 impl std::fmt::Debug for PassConfig<'_> {
@@ -784,10 +785,12 @@ where
     });
 
     let temp_suffix: Arc<str> = config.temp_suffix.clone().into();
+    let bandwidth_limiter = config.bandwidth_limiter.clone();
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
+            let bandwidth_limiter = bandwidth_limiter.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -795,6 +798,7 @@ where
                     &retry_config,
                     set_exif,
                     &temp_suffix,
+                    bandwidth_limiter.as_ref(),
                 ))
                 .await;
                 (task, result)
@@ -1095,6 +1099,7 @@ pub(super) async fn build_download_outcome(
         temp_suffix: config.temp_suffix.clone(),
         shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
+        bandwidth_limiter: config.bandwidth_limiter.clone(),
     };
     let pass_result = run_download_pass(pass_config, fresh_tasks).await;
 
@@ -1179,6 +1184,7 @@ pub(super) async fn run_download_pass(
     let shutdown_token = config.shutdown_token.clone();
     let concurrency = config.concurrency;
     let temp_suffix: Arc<str> = config.temp_suffix.into();
+    let bandwidth_limiter = config.bandwidth_limiter.clone();
 
     type DownloadResult = (
         DownloadTask,
@@ -1189,6 +1195,7 @@ pub(super) async fn run_download_pass(
         .map(|task| {
             let client = client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
+            let bandwidth_limiter = bandwidth_limiter.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -1196,6 +1203,7 @@ pub(super) async fn run_download_pass(
                     retry_config,
                     set_exif,
                     &temp_suffix,
+                    bandwidth_limiter.as_ref(),
                 ))
                 .await;
                 (task, result)
@@ -1308,6 +1316,7 @@ async fn download_single_task(
     retry_config: &RetryConfig,
     set_exif: bool,
     temp_suffix: &str,
+    bandwidth_limiter: Option<&super::BandwidthLimiter>,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -1343,6 +1352,7 @@ async fn download_single_task(
             skip_rename: needs_exif,
             expected_size: if task.size > 0 { Some(task.size) } else { None },
         },
+        bandwidth_limiter,
     ))
     .await?;
 
@@ -1755,6 +1765,7 @@ mod tests {
                             temp_suffix: ".kei-tmp".to_string(),
                             shutdown_token: token,
                             state_db: None,
+                            bandwidth_limiter: None,
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert!(result.failed.is_empty());
@@ -1804,6 +1815,7 @@ mod tests {
                             temp_suffix: ".kei-tmp".to_string(),
                             shutdown_token: token,
                             state_db: None,
+                            bandwidth_limiter: None,
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert_eq!(result.failed.len(), 1);
@@ -2243,6 +2255,7 @@ mod tests {
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
+            bandwidth_limiter: None,
         });
 
         let client = reqwest::Client::builder()
@@ -2313,6 +2326,7 @@ mod tests {
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
+            bandwidth_limiter: None,
         });
         let client = reqwest::Client::new();
         let shutdown_token = CancellationToken::new();
