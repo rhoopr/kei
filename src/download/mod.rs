@@ -865,6 +865,25 @@ pub async fn download_photos_with_sync(
             )
             .await
         }
+        // In `{album}` mode we have to fall back to full enumeration:
+        // `changes_stream` uses the zone-level `/changes/zone` endpoint, so
+        // it returns the same delta for every album in a zone. Without
+        // per-asset album-membership info on the change events, we can't
+        // route assets to the correct album folder — full enumeration uses
+        // the album-scoped `photo_stream_with_token` and stays correct.
+        SyncMode::Incremental { .. } if config.uses_album_expansion() => {
+            tracing::debug!(
+                "`{{album}}` folder template requires full enumeration for correct \
+                 per-album routing, skipping incremental"
+            );
+            download_photos_full_with_token(
+                download_client,
+                passes,
+                &config,
+                shutdown_token.clone(),
+            )
+            .await
+        }
         // Incremental sync only returns new changes — it won't re-enumerate
         // pending assets from previous syncs. Fall back to full so they get
         // retried. Once everything is downloaded, incremental resumes.
@@ -967,10 +986,16 @@ async fn download_photos_full_with_token(
     let started = Instant::now();
     let uses_album_token = config.uses_album_expansion();
 
-    let mut pass_counts: Vec<u64> = Vec::with_capacity(passes.len());
-    for pass in passes {
-        pass_counts.push(pass.album.len().await.unwrap_or(0));
-    }
+    // `album.len()` is one HTTP call per pass. Serialising it scaled fine
+    // when users typed out a few `-a` flags by hand; with `-a all` it's
+    // routinely 20+ round-trips before the first byte of the first
+    // download. `buffered` (not `buffer_unordered`) preserves pass order
+    // so the `zip(&pass_counts)` below stays aligned.
+    let pass_counts: Vec<u64> = stream::iter(passes)
+        .map(|pass| async move { pass.album.len().await.unwrap_or(0) })
+        .buffered(config.concurrent_downloads.max(1))
+        .collect()
+        .await;
     let mut total: u64 = pass_counts.iter().sum();
     if let Some(recent) = config.recent {
         total = total.min(u64::from(recent));
@@ -2396,6 +2421,42 @@ mod tests {
         assert!(
             !derived.folder_structure.contains('/')
                 || !derived.folder_structure.starts_with("My/Album")
+        );
+    }
+
+    // The fast-skip bypass in `stream_and_download_from_stream` keys on
+    // `album_name.is_some()` as its signal that "this asset may legitimately
+    // land at multiple paths, don't trust the DB". `with_album_name` and
+    // `with_pass` must both preserve that signal; if either left it None, a
+    // photo in multiple albums would download to the first album's folder
+    // only.
+    #[test]
+    fn test_with_album_name_sets_album_name_for_fast_skip_bypass() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        config.album_name = None;
+        let derived = config.with_album_name(Arc::from("Vacation"));
+        assert_eq!(
+            derived.album_name.as_deref(),
+            Some("Vacation"),
+            "album_name must be set so the fast-skip bypass fires"
+        );
+    }
+
+    #[test]
+    fn test_with_album_name_empty_name_still_signals_per_album_pass() {
+        // The unfiled pass uses `library.all()` whose name is empty. The
+        // fast-skip bypass still needs to fire for it — an asset in any
+        // concrete album is excluded from the unfiled pass via `exclude_ids`,
+        // but truly-unfiled assets still need path-aware checks.
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        config.album_name = None;
+        let derived = config.with_album_name(Arc::from(""));
+        assert_eq!(
+            derived.album_name.as_deref(),
+            Some(""),
+            "empty album name still signals per-album pass mode"
         );
     }
 

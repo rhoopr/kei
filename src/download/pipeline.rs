@@ -320,7 +320,10 @@ where
                     // Fast-skip is path-blind; in `{album}` mode the same
                     // asset legitimately lives at multiple paths, so we'd
                     // under-report the listing if we trusted the DB here.
-                    if !config.uses_album_expansion() {
+                    // `album_name.is_some()` is the right signal because by
+                    // the time this runs, `with_album_name` has expanded
+                    // `{album}` out of `folder_structure` entirely.
+                    if config.album_name.is_none() {
                         let candidates = extract_skip_candidates(&asset, config);
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
@@ -549,8 +552,12 @@ where
                     // asset may target multiple album folders, so skipping
                     // after the first download would leave later folders
                     // missing their copy. Fall through to the path-aware
-                    // filesystem/dir_cache check below.
-                    if trust_state && !config.uses_album_expansion() {
+                    // filesystem/dir_cache check below. `album_name.is_some`
+                    // is the right signal here: `with_album_name` has
+                    // already expanded `{album}` out of folder_structure
+                    // by the time this runs, so checking the template
+                    // would always be false.
+                    if trust_state && config.album_name.is_none() {
                         let candidates = extract_skip_candidates(&asset, config);
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {

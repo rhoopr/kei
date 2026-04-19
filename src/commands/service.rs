@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use anyhow::Context;
+
 use crate::auth;
 use crate::config;
 use crate::icloud;
@@ -379,7 +381,14 @@ async fn collect_album_asset_ids(
     into: &mut rustc_hash::FxHashSet<String>,
 ) -> anyhow::Result<()> {
     use futures_util::StreamExt;
-    let count = album.len().await.unwrap_or(0);
+    // Propagate `len()` failures — the count is load-bearing for the
+    // `-a all` + `{album}` unfiled pass: a silent 0 here leaves the
+    // exclusion set incomplete and the unfiled pass re-downloads assets
+    // that are already in some user album.
+    let count = album
+        .len()
+        .await
+        .with_context(|| format!("failed to get asset count for album '{}'", album.name))?;
     let (stream, _token_rx) = album.photo_stream_with_token(None, Some(count), 1);
     tokio::pin!(stream);
     while let Some(result) = stream.next().await {
@@ -496,11 +505,29 @@ pub(crate) async fn resolve_albums(
             // ones) into the unfiled exclusion set before consuming the
             // map. Excluded albums must contribute too, otherwise their
             // photos would leak out through the library-wide unfiled pass.
+            // Fetched in parallel because this runs before the first byte
+            // is downloaded; for libraries with many albums the serial
+            // version added minutes of startup latency.
             let mut in_any_album: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
             if has_album_token {
-                for (name, album) in &album_map {
-                    tracing::debug!(album = name, "Pre-fetching IDs for unfiled exclusion set");
-                    collect_album_asset_ids(album, &mut in_any_album).await?;
+                use futures_util::{StreamExt, TryStreamExt};
+                const EXCLUSION_FETCH_CONCURRENCY: usize = 8;
+                let per_album: Vec<rustc_hash::FxHashSet<String>> =
+                    futures_util::stream::iter(album_map.iter())
+                        .map(|(name, album)| async move {
+                            tracing::debug!(
+                                album = %name,
+                                "Pre-fetching IDs for unfiled exclusion set"
+                            );
+                            let mut set = rustc_hash::FxHashSet::default();
+                            collect_album_asset_ids(album, &mut set).await?;
+                            anyhow::Ok(set)
+                        })
+                        .buffer_unordered(EXCLUSION_FETCH_CONCURRENCY)
+                        .try_collect()
+                        .await?;
+                for set in per_album {
+                    in_any_album.extend(set);
                 }
             }
 
