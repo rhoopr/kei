@@ -139,8 +139,14 @@ pub(super) async fn download_file<C: DownloadClient>(
 
 /// Single download attempt with resume support.
 ///
-/// .part files older than this are considered stale (crashed runs) and restarted.
-const STALE_PART_FILE_SECS: u64 = 24 * 3600;
+/// .part files older than this are considered stale (crashed runs) and
+/// restarted. Tightened from the original 24h: a longer resume window
+/// without server-side ETag/Last-Modified validation means bytes from a
+/// pre-rotation version of the asset could end up appended to bytes from
+/// a post-rotation version undetectably when the two happen to have the
+/// same total size. 1h keeps resume useful for typical interrupt/retry
+/// patterns (which complete within minutes) without the long exposure.
+const STALE_PART_FILE_SECS: u64 = 3600;
 
 /// If a .part file already exists, sends a Range request to resume from where
 /// it left off. Falls back to a fresh download if the server doesn't support
@@ -252,6 +258,32 @@ async fn attempt_download<C: DownloadClient>(
     }
 
     let content_length = response.content_length;
+
+    // If we resumed and the server advertises a Content-Length that doesn't
+    // reconcile with the API-reported size, the resource on the server has
+    // likely been rotated since we wrote the .part. Discard and restart
+    // cleanly rather than appending new bytes to a stale prefix.
+    if status == 206 && resume_offset > 0 {
+        if let (Some(cl), Some(expected)) = (content_length, expected_size) {
+            let server_total = resume_offset.saturating_add(cl);
+            if server_total != expected {
+                tracing::warn!(
+                    path = %path_str,
+                    resume_offset,
+                    server_remaining = cl,
+                    server_total,
+                    expected,
+                    "Resume bytes inconsistent with API-reported size; discarding .part and restarting"
+                );
+                let _ = fs::remove_file(&part_path).await;
+                return Err(DownloadError::ContentLengthMismatch {
+                    path: path_str.into(),
+                    expected,
+                    received: server_total,
+                });
+            }
+        }
+    }
 
     let mut file = OpenOptions::new()
         .create(true)
