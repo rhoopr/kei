@@ -406,7 +406,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
-    let mut last_cycle_failed_count = 0usize;
+    // Sum of per-cycle failed_counts across the lifetime of this process.
+    // Surfaced at exit so watch-mode daemons don't mask earlier-cycle
+    // failures behind a clean final cycle.
+    let mut cumulative_failed_count = 0usize;
 
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
     for library in &libraries {
@@ -595,18 +598,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     &config.username,
                     Some(&data),
                 );
+                cumulative_failed_count =
+                    cumulative_failed_count.saturating_add(cycle_result.failed_count);
                 if is_watch_mode {
                     tracing::warn!(
                         failed_count = cycle_result.failed_count,
+                        cumulative = cumulative_failed_count,
                         "Some downloads failed this cycle, will retry next cycle"
                     );
-                    last_cycle_failed_count = cycle_result.failed_count;
                 } else {
                     return Err(PartialSyncError(cycle_result.failed_count).into());
                 }
             } else {
                 reauth_attempts = 0;
-                last_cycle_failed_count = 0;
                 let data = notifications::SyncNotificationData::from(&cycle_result.stats);
                 notifier.notify(
                     notifications::Event::SyncComplete,
@@ -693,8 +697,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         }
     }
 
-    if last_cycle_failed_count > 0 {
-        Err(PartialSyncError(last_cycle_failed_count).into())
+    // Exit non-zero if any cycle in this watch session had failures, not
+    // just the last one. A single successful final cycle must not mask a
+    // multi-cycle failure backlog in Docker / systemd exit-code signalling.
+    if cumulative_failed_count > 0 {
+        Err(PartialSyncError(cumulative_failed_count).into())
     } else {
         Ok(())
     }
