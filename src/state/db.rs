@@ -225,13 +225,45 @@ pub trait StateDb: Send + Sync {
 
     /// Record that a metadata write (EXIF embed or sidecar) failed for this
     /// asset-version pair after the bytes landed on disk. Sets
-    /// `metadata_write_failed_at` to the current timestamp. CF-5's
-    /// metadata-only rewrite path consumes this to retry on subsequent syncs
-    /// even when the file checksum matches.
+    /// `metadata_write_failed_at` to the current timestamp. The metadata-only
+    /// rewrite path consumes this to retry on subsequent syncs even when the
+    /// file checksum matches.
     async fn record_metadata_write_failure(
         &self,
         asset_id: &str,
         version_size: &str,
+    ) -> Result<(), StateError>;
+
+    /// Pre-load every `(asset_id, version_size) -> metadata_hash` for
+    /// downloaded assets. Used at sync start to detect metadata-only changes
+    /// (file checksum matches but e.g. keywords / favorite / GPS drifted)
+    /// without a per-asset DB hit in the producer hot path.
+    async fn get_downloaded_metadata_hashes(
+        &self,
+    ) -> Result<HashMap<(String, String), String>, StateError>;
+
+    /// Pre-load the set of `(asset_id, version_size)` pairs that have a
+    /// non-null `metadata_write_failed_at`. These need a metadata rewrite
+    /// on the next sync regardless of whether the provider reports a
+    /// hash change.
+    async fn get_metadata_retry_markers(&self) -> Result<HashSet<(String, String)>, StateError>;
+
+    /// Fetch up to `limit` downloaded asset rows that carry a metadata
+    /// rewrite marker AND have a local_path pointing at an on-disk file.
+    /// Used by the metadata-rewrite worker to re-apply EXIF/XMP without
+    /// re-downloading bytes.
+    async fn get_pending_metadata_rewrites(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AssetRecord>, StateError>;
+
+    /// Update just the `metadata_hash` column for an asset-version pair
+    /// after a successful metadata rewrite. Leaves every other column alone.
+    async fn update_metadata_hash(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+        metadata_hash: &str,
     ) -> Result<(), StateError>;
 
     /// Clear the metadata-write-failed marker for an asset-version pair
@@ -1084,6 +1116,96 @@ impl StateDb for SqliteStateDb {
             rusqlite::params![asset_id, version_size],
         )
         .map_err(|e| StateError::query("clear_metadata_write_failure", e))?;
+        Ok(())
+    }
+
+    async fn get_downloaded_metadata_hashes(
+        &self,
+    ) -> Result<HashMap<(String, String), String>, StateError> {
+        let conn = self.acquire_lock("get_downloaded_metadata_hashes")?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, version_size, metadata_hash FROM assets \
+                 WHERE status = 'downloaded' AND metadata_hash IS NOT NULL",
+            )
+            .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
+        let mut hashes: HashMap<(String, String), String> = HashMap::new();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
+        for row in rows {
+            let (key, val) =
+                row.map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
+            hashes.insert(key, val);
+        }
+        Ok(hashes)
+    }
+
+    async fn get_pending_metadata_rewrites(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        let conn = self.acquire_lock("get_pending_metadata_rewrites")?;
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets \
+             WHERE metadata_write_failed_at IS NOT NULL \
+               AND status = 'downloaded' \
+               AND local_path IS NOT NULL \
+             ORDER BY metadata_write_failed_at ASC \
+             LIMIT ?1"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
+        let rows = stmt
+            .query_map(
+                [i64::try_from(limit).unwrap_or(i64::MAX)],
+                row_to_asset_record,
+            )
+            .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))
+    }
+
+    async fn get_metadata_retry_markers(&self) -> Result<HashSet<(String, String)>, StateError> {
+        let conn = self.acquire_lock("get_metadata_retry_markers")?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, version_size FROM assets \
+                 WHERE metadata_write_failed_at IS NOT NULL",
+            )
+            .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
+        let mut markers: HashSet<(String, String)> = HashSet::new();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
+        for row in rows {
+            let key = row.map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
+            markers.insert(key);
+        }
+        Ok(markers)
+    }
+
+    async fn update_metadata_hash(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+        metadata_hash: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.acquire_lock("update_metadata_hash")?;
+        conn.execute(
+            "UPDATE assets SET metadata_hash = ?1 \
+             WHERE id = ?2 AND version_size = ?3",
+            rusqlite::params![metadata_hash, asset_id, version_size],
+        )
+        .map_err(|e| StateError::query("update_metadata_hash", e))?;
         Ok(())
     }
 

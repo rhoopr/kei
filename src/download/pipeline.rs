@@ -225,6 +225,174 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
     failures
 }
 
+/// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
+/// tail work at sync end; anything beyond this rolls into the next sync.
+const METADATA_REWRITE_BATCH: usize = 500;
+
+/// Drain persisted metadata-rewrite markers: for each asset whose
+/// `metadata_write_failed_at` is set and whose local file is still on disk,
+/// re-apply EXIF/XMP using the stored provider metadata. On success clears
+/// the marker and refreshes `metadata_hash`; on failure leaves the marker so
+/// the next sync retries.
+async fn run_metadata_rewrites(
+    db: &dyn StateDb,
+    metadata_flags: MetadataFlags,
+    shutdown_token: &CancellationToken,
+) {
+    let pending = match db
+        .get_pending_metadata_rewrites(METADATA_REWRITE_BATCH)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to load pending metadata rewrites");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = pending.len(),
+        "Applying metadata rewrites to on-disk files"
+    );
+    let mut applied = 0usize;
+    let mut skipped_missing = 0usize;
+    let mut errored = 0usize;
+    for record in pending {
+        if shutdown_token.is_cancelled() {
+            tracing::info!("Shutdown requested, deferring remaining metadata rewrites");
+            break;
+        }
+        let Some(local_path) = record.local_path.clone() else {
+            continue;
+        };
+        let path = PathBuf::from(&local_path);
+        if !path.exists() {
+            // File removed between downloads and rewrite pass. Keep the
+            // marker so a future sync that re-downloads the asset will
+            // re-drive the writer.
+            skipped_missing += 1;
+            continue;
+        }
+        let payload = crate::download::filter::MetadataPayload::from_metadata(&record.metadata);
+        let created_local: chrono::DateTime<chrono::Local> =
+            chrono::DateTime::from(record.created_at);
+        let version_size = record.version_size;
+
+        let embed_ok =
+            if metadata_flags.any_embed() && super::metadata::is_embed_writable_path(&path) {
+                let embed_path = path.clone();
+                let embed_payload = payload.clone();
+                let embed_created = created_local;
+                match tokio::task::spawn_blocking(move || {
+                    let probe = match super::metadata::probe_exif(&embed_path) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %embed_path.display(),
+                                error = %e,
+                                "probe_exif failed during metadata rewrite"
+                            );
+                            super::metadata::ExifProbe::default()
+                        }
+                    };
+                    let write =
+                        plan_metadata_write(metadata_flags, &embed_payload, &embed_created, &probe);
+                    if write.is_empty() {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    super::metadata::apply_metadata(&embed_path, &write)
+                })
+                .await
+                {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            asset_id = %record.id,
+                            path = %path.display(),
+                            error = %e,
+                            "Metadata rewrite (embed) failed; leaving marker for future retry"
+                        );
+                        false
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            asset_id = %record.id,
+                            error = %join_err,
+                            "Metadata rewrite (embed) task panicked"
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+
+        let sidecar_ok = if metadata_flags.xmp_sidecar {
+            let sidecar_path = path.clone();
+            let sidecar_payload = payload.clone();
+            let sidecar_created = created_local;
+            match tokio::task::spawn_blocking(move || {
+                let write = plan_sidecar_write(&sidecar_payload, &sidecar_created);
+                if write.is_empty() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                super::metadata::write_sidecar(&sidecar_path, &write)
+            })
+            .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        asset_id = %record.id,
+                        path = %path.display(),
+                        error = %e,
+                        "Metadata rewrite (sidecar) failed; leaving marker for future retry"
+                    );
+                    false
+                }
+                Err(join_err) => {
+                    tracing::warn!(
+                        asset_id = %record.id,
+                        error = %join_err,
+                        "Metadata rewrite (sidecar) task panicked"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        if embed_ok && sidecar_ok {
+            if let Some(new_hash) = record.metadata.metadata_hash.as_deref() {
+                if let Err(e) = db
+                    .update_metadata_hash(&record.id, version_size.as_str(), new_hash)
+                    .await
+                {
+                    tracing::warn!(asset_id = %record.id, error = %e, "Failed to update metadata_hash");
+                }
+            }
+            if let Err(e) = db
+                .clear_metadata_write_failure(&record.id, version_size.as_str())
+                .await
+            {
+                tracing::warn!(asset_id = %record.id, error = %e, "Failed to clear metadata rewrite marker");
+            }
+            applied += 1;
+        } else {
+            errored += 1;
+        }
+    }
+    tracing::info!(
+        applied,
+        errored,
+        skipped_missing,
+        "Metadata rewrite pass complete"
+    );
+}
+
 /// Create a progress bar with a consistent template.
 ///
 /// Returns `ProgressBar::hidden()` when the user passed `--no-progress-bar`,
@@ -610,6 +778,45 @@ where
                                 )
                             })
                         {
+                            // CF-5: bytes are unchanged but metadata may have
+                            // drifted (favorite toggle, keyword add, GPS
+                            // edit). Persist a retry marker for each version
+                            // whose metadata_hash no longer matches; the
+                            // metadata-only rewrite worker consumes these
+                            // markers to re-apply metadata to the existing
+                            // file without re-downloading.
+                            let wants_metadata = config.embed_xmp || config.xmp_sidecar;
+                            if wants_metadata {
+                                if let Some(db) = &producer_state_db {
+                                    let new_hash = asset.metadata().metadata_hash.as_deref();
+                                    for &(vs, _) in &candidates {
+                                        if download_ctx.needs_metadata_rewrite(
+                                            asset.id(),
+                                            vs,
+                                            new_hash,
+                                        ) {
+                                            tracing::info!(
+                                                asset_id = %asset.id(),
+                                                version_size = vs.as_str(),
+                                                "Metadata-only change detected; tagging for rewrite"
+                                            );
+                                            if let Err(e) = db
+                                                .record_metadata_write_failure(
+                                                    asset.id(),
+                                                    vs.as_str(),
+                                                )
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    asset_id = %asset.id(),
+                                                    error = %e,
+                                                    "Failed to set metadata rewrite marker"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(db) = &producer_state_db {
                                 if let Err(e) = db.touch_last_seen(asset.id()).await {
                                     tracing::debug!(error = %e, asset_id = asset.id(), "Failed to update last-seen timestamp");
@@ -630,6 +837,35 @@ where
                         // case). A row left status='pending' by a prior
                         // interrupted sync will be promoted to failed at
                         // sync end as stuck-pipeline recovery.
+                        // CF-5: mirror the trust-state branch — on-disk
+                        // skips also need metadata-rewrite detection.
+                        let wants_metadata = config.embed_xmp || config.xmp_sidecar;
+                        if wants_metadata {
+                            if let Some(db) = &producer_state_db {
+                                let new_hash = asset.metadata().metadata_hash.as_deref();
+                                let candidates = extract_skip_candidates(&asset, config);
+                                for &(vs, _) in &candidates {
+                                    if download_ctx.needs_metadata_rewrite(asset.id(), vs, new_hash)
+                                    {
+                                        tracing::info!(
+                                            asset_id = %asset.id(),
+                                            version_size = vs.as_str(),
+                                            "Metadata-only change detected on-disk; tagging for rewrite"
+                                        );
+                                        if let Err(e) = db
+                                            .record_metadata_write_failure(asset.id(), vs.as_str())
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                asset_id = %asset.id(),
+                                                error = %e,
+                                                "Failed to set metadata rewrite marker"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(db) = &producer_state_db {
                             if let Err(e) = db.touch_last_seen(asset.id()).await {
                                 tracing::debug!(error = %e, asset_id = asset.id(), "Failed to touch last_seen for on-disk asset");
@@ -1066,6 +1302,17 @@ where
     } else {
         0
     };
+
+    // Drain metadata-rewrite markers set earlier in this cycle (or left over
+    // from a previous one). This re-applies EXIF/XMP on the existing files
+    // without re-downloading bytes; the alternative was to leave markers
+    // accumulating in the DB forever.
+    if let Some(db) = &state_db {
+        let metadata_flags = MetadataFlags::from(config.as_ref());
+        if metadata_flags.any_embed() || metadata_flags.xmp_sidecar {
+            run_metadata_rewrites(db.as_ref(), metadata_flags, &shutdown_token).await;
+        }
+    }
 
     // If every deferred write failed and there was a non-trivial queue,
     // the state DB is probably fundamentally unwritable (full disk, readonly
@@ -2472,6 +2719,25 @@ mod tests {
             Ok(())
         }
         async fn clear_metadata_write_failure(&self, _: &str, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_downloaded_metadata_hashes(
+            &self,
+        ) -> Result<HashMap<(String, String), String>, StateError> {
+            Ok(HashMap::new())
+        }
+        async fn get_metadata_retry_markers(
+            &self,
+        ) -> Result<HashSet<(String, String)>, StateError> {
+            Ok(HashSet::new())
+        }
+        async fn get_pending_metadata_rewrites(
+            &self,
+            _: usize,
+        ) -> Result<Vec<AssetRecord>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn update_metadata_hash(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
             Ok(())
         }
         async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {

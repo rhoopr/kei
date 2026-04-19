@@ -536,6 +536,14 @@ struct DownloadContext {
     /// Nested map: `asset_id` -> (`version_size` -> checksum) for downloaded assets.
     /// Used to detect checksum changes (iCloud asset updated) without DB queries.
     downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
+    /// Nested map: `asset_id` -> (`version_size` -> metadata_hash) for downloaded assets.
+    /// Used to detect metadata-only changes (favorite toggle, keywords, GPS edit,
+    /// etc.) when file bytes are unchanged but the provider has newer metadata.
+    downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
+    /// Set of `(asset_id, version_size)` pairs with a non-null
+    /// `metadata_write_failed_at` from a prior sync. These always route to
+    /// the metadata-rewrite path regardless of whether the hash changed.
+    metadata_retry_markers: FxHashSet<(Box<str>, Box<str>)>,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced.
     known_ids: FxHashSet<Box<str>>,
@@ -573,6 +581,36 @@ impl DownloadContext {
                 .insert(version_size.into_boxed_str(), checksum.into_boxed_str());
         }
 
+        let mut downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
+            FxHashMap::default();
+        for ((asset_id, version_size), metadata_hash) in db
+            .get_downloaded_metadata_hashes()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to load metadata hashes from state DB");
+                Default::default()
+            })
+        {
+            downloaded_metadata_hashes
+                .entry(asset_id.into_boxed_str())
+                .or_default()
+                .insert(
+                    version_size.into_boxed_str(),
+                    metadata_hash.into_boxed_str(),
+                );
+        }
+
+        let metadata_retry_markers: FxHashSet<(Box<str>, Box<str>)> = db
+            .get_metadata_retry_markers()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
+                Default::default()
+            })
+            .into_iter()
+            .map(|(id, vs)| (id.into_boxed_str(), vs.into_boxed_str()))
+            .collect();
+
         // In retry-only mode, load all known asset IDs so we can skip new
         // assets that were never synced before.
         let known_ids = if retry_only {
@@ -603,8 +641,42 @@ impl DownloadContext {
         Self {
             downloaded_ids,
             downloaded_checksums,
+            downloaded_metadata_hashes,
+            metadata_retry_markers,
             known_ids,
             attempt_counts,
+        }
+    }
+
+    /// Whether a downloaded asset-version needs a metadata-only rewrite:
+    /// the caller has already matched checksums (bytes unchanged) and now
+    /// checks whether (a) the stored metadata_hash differs from the new
+    /// one or (b) a persisted retry marker is set from a prior sync where
+    /// the writer failed after bytes landed.
+    fn needs_metadata_rewrite(
+        &self,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+        new_metadata_hash: Option<&str>,
+    ) -> bool {
+        let vs_str = version_size.as_str();
+        if self
+            .metadata_retry_markers
+            .iter()
+            .any(|(id, vs)| id.as_ref() == asset_id && vs.as_ref() == vs_str)
+        {
+            return true;
+        }
+        let Some(new_hash) = new_metadata_hash else {
+            return false;
+        };
+        match self
+            .downloaded_metadata_hashes
+            .get(asset_id)
+            .and_then(|map| map.get(vs_str))
+        {
+            Some(stored) => stored.as_ref() != new_hash,
+            None => true, // downloaded row has no stored hash yet → refresh
         }
     }
 
@@ -1927,6 +1999,54 @@ mod tests {
             ctx.should_download_fast("never_seen", VersionSizeKey::Original, "any_ck", false),
             Some(true)
         );
+    }
+
+    #[test]
+    fn needs_metadata_rewrite_detects_hash_change() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_metadata_hashes
+            .entry("asset_md".into())
+            .or_default()
+            .insert("original".into(), "hash-OLD".into());
+
+        // Same hash -> no rewrite needed.
+        assert!(!ctx.needs_metadata_rewrite(
+            "asset_md",
+            VersionSizeKey::Original,
+            Some("hash-OLD")
+        ));
+        // Different hash -> rewrite.
+        assert!(ctx.needs_metadata_rewrite("asset_md", VersionSizeKey::Original, Some("hash-NEW")));
+        // Unknown new hash -> no rewrite (nothing to compare to).
+        assert!(!ctx.needs_metadata_rewrite("asset_md", VersionSizeKey::Original, None));
+    }
+
+    #[test]
+    fn needs_metadata_rewrite_honors_retry_marker() {
+        let mut ctx = DownloadContext::default();
+        ctx.metadata_retry_markers
+            .insert(("asset_retry".into(), "original".into()));
+        // No stored hash at all, but marker is set -> rewrite needed.
+        assert!(ctx.needs_metadata_rewrite("asset_retry", VersionSizeKey::Original, None));
+        // Marker set -> rewrite even if hashes match.
+        ctx.downloaded_metadata_hashes
+            .entry("asset_retry".into())
+            .or_default()
+            .insert("original".into(), "h".into());
+        assert!(ctx.needs_metadata_rewrite("asset_retry", VersionSizeKey::Original, Some("h")));
+    }
+
+    #[test]
+    fn needs_metadata_rewrite_refreshes_null_stored_hash() {
+        // Pre-v5 downloaded rows have metadata_hash IS NULL; even without a
+        // retry marker, a fresh hash should trigger a rewrite so the XMP
+        // gets the provider state this tree has never recorded.
+        let ctx = DownloadContext::default();
+        assert!(ctx.needs_metadata_rewrite(
+            "asset_no_stored_hash",
+            VersionSizeKey::Original,
+            Some("new-hash")
+        ));
     }
 
     #[test]
