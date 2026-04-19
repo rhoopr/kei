@@ -484,6 +484,23 @@ where
         None
     };
 
+    // Log a one-time backfill notice when pre-v5 assets still have NULL
+    // metadata_hash. The sync token invalidation in the v5 migration forces
+    // a full enumeration that populates metadata for these rows without
+    // re-downloading files.
+    if let Some(db) = &state_db {
+        match db.count_downloaded_without_metadata_hash().await {
+            Ok(n) if n > 0 => {
+                tracing::info!(
+                    assets_to_backfill = n,
+                    "Backfilling metadata for existing assets (one-time after upgrade)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "Failed to check for metadata backfill"),
+        }
+    }
+
     let mut downloaded = 0usize;
     let mut exif_failures = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
@@ -645,13 +662,32 @@ where
                                     Some(asset.added_date()),
                                     task.size,
                                     media_type,
-                                );
+                                )
+                                .with_metadata(asset.metadata().clone());
                                 if let Err(e) = db.upsert_seen(&record).await {
                                     tracing::warn!(
                                         asset_id = %task.asset_id,
                                         error = %e,
                                         "Failed to record asset"
                                     );
+                                }
+                                // Per-album config (set when {album} is in folder_structure)
+                                // carries the album name so we can record membership.
+                                // In merged-stream mode album is unknown at this point;
+                                // the next incremental sync fills it in.
+                                if let Some(album) = config.album_name.as_deref() {
+                                    if !album.is_empty() {
+                                        if let Err(e) =
+                                            db.add_asset_album(asset.id(), album, "icloud").await
+                                        {
+                                            tracing::warn!(
+                                                asset_id = %asset.id(),
+                                                album = %album,
+                                                error = %e,
+                                                "Failed to record album membership"
+                                            );
+                                        }
+                                    }
                                 }
 
                                 match download_ctx.should_download_fast(
@@ -2039,6 +2075,22 @@ mod tests {
             _: usize,
         ) -> Result<Vec<std::path::PathBuf>, StateError> {
             unimplemented!()
+        }
+        async fn add_asset_album(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn mark_soft_deleted(
+            &self,
+            _: &str,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn mark_hidden_at_source(&self, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn count_downloaded_without_metadata_hash(&self) -> Result<u64, StateError> {
+            Ok(0)
         }
     }
 

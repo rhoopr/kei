@@ -6,8 +6,10 @@ use smallvec::SmallVec;
 use tracing::warn;
 
 use super::cloudkit::Record;
+use super::metadata;
 use super::queries::{item_type_from_str, PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
 use super::types::{AssetItemType, AssetVersion, AssetVersionSize, ChangeReason};
+use crate::state::AssetMetadata;
 
 /// Type alias for the versions map.
 ///
@@ -42,6 +44,9 @@ pub struct PhotoAsset {
     // Heap types first
     record_name: Box<str>,
     filename: Option<Box<str>>,
+    // Metadata boxed to keep PhotoAsset compact when metadata is large
+    // (keywords, provider_data JSON can be several hundred bytes).
+    asset_metadata: Box<AssetMetadata>,
     // SmallVec with inline storage
     versions: VersionsMap,
     // f64 primitives
@@ -211,9 +216,11 @@ impl PhotoAsset {
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
         let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
+        let asset_metadata = Box::new(metadata::extract(&master_fields, &asset_fields));
         Self {
             record_name,
             filename,
+            asset_metadata,
             item_type_val,
             asset_date_ms,
             added_date_ms,
@@ -233,14 +240,21 @@ impl PhotoAsset {
             &asset.fields,
             &master.record_name,
         );
+        let asset_metadata = Box::new(metadata::extract(&master.fields, &asset.fields));
         Self {
             record_name: master.record_name.into_boxed_str(),
             filename,
+            asset_metadata,
             item_type_val,
             asset_date_ms,
             added_date_ms,
             versions,
         }
+    }
+
+    /// Provider-agnostic metadata extracted at construction time.
+    pub fn metadata(&self) -> &AssetMetadata {
+        &self.asset_metadata
     }
 
     pub fn id(&self) -> &str {

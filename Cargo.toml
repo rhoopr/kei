@@ -83,6 +83,9 @@ urlencoding = "2"
 # SQLite state tracking
 rusqlite = { version = "0.39", features = ["bundled"] }
 
+# Binary plist decoding for iCloud *Enc fields (location, keywords, etc.)
+plist = "1"
+
 # System
 libc = "0.2"
 

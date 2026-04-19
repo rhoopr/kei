@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::icloud::photos::session::PhotosSession;
 use crate::icloud::photos::PhotoAsset;
-use crate::state::types::{AssetRecord, MediaType, VersionSizeKey};
+use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
 
 // ── AssetRecord builder ─────────────────────────────────────────────
 
@@ -30,6 +30,7 @@ pub struct TestAssetRecord {
     added_at: Option<DateTime<Utc>>,
     size_bytes: u64,
     media_type: MediaType,
+    metadata: Option<AssetMetadata>,
 }
 
 impl TestAssetRecord {
@@ -43,6 +44,7 @@ impl TestAssetRecord {
             added_at: None,
             size_bytes: 12345,
             media_type: MediaType::Photo,
+            metadata: None,
         }
     }
 
@@ -76,8 +78,18 @@ impl TestAssetRecord {
         self
     }
 
+    pub fn metadata(mut self, m: AssetMetadata) -> Self {
+        self.metadata = Some(m);
+        self
+    }
+
+    pub fn version_size(mut self, v: VersionSizeKey) -> Self {
+        self.version_size = v;
+        self
+    }
+
     pub fn build(self) -> AssetRecord {
-        AssetRecord::new_pending(
+        let record = AssetRecord::new_pending(
             self.id,
             self.version_size,
             self.checksum,
@@ -86,7 +98,12 @@ impl TestAssetRecord {
             self.added_at,
             self.size_bytes,
             self.media_type,
-        )
+        );
+        if let Some(meta) = self.metadata {
+            record.with_metadata(meta)
+        } else {
+            record
+        }
     }
 }
 

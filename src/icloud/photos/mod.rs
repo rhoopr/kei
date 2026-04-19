@@ -4,8 +4,10 @@
 mod album;
 pub(crate) mod asset;
 pub mod cloudkit;
+pub(crate) mod enc;
 pub mod error;
 mod library;
+pub(crate) mod metadata;
 pub mod queries;
 pub mod session;
 mod smart_folders;

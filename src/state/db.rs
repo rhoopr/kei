@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension};
 use super::error::StateError;
 use super::schema;
 use super::types::{
-    AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary, VersionSizeKey,
+    AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary, VersionSizeKey,
 };
 
 /// Trait for state database operations.
@@ -177,6 +177,40 @@ pub trait StateDb: Send + Sync {
     /// Sample up to `limit` local paths of downloaded assets.
     /// Used to spot-check that "downloaded" files still exist on disk.
     async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError>;
+
+    // ── v5 metadata operations ──
+
+    /// Record an album membership entry. Idempotent via `INSERT OR IGNORE`.
+    ///
+    /// Called during album enumeration when an asset is seen in an album. The
+    /// `(asset_id, album_name, source)` composite key namespaces memberships
+    /// per provider so that multiple providers can coexist.
+    async fn add_asset_album(
+        &self,
+        asset_id: &str,
+        album_name: &str,
+        source: &str,
+    ) -> Result<(), StateError>;
+
+    /// Mark an asset as soft-deleted (all versions under `asset_id`).
+    ///
+    /// Updates `is_deleted` and optional `deleted_at` timestamp. Does not
+    /// remove the row so that history survives and consumers can still reach
+    /// the local file.
+    async fn mark_soft_deleted(
+        &self,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StateError>;
+
+    /// Mark an asset as hidden at source.
+    async fn mark_hidden_at_source(&self, asset_id: &str) -> Result<(), StateError>;
+
+    /// Count downloaded assets with `metadata_hash IS NULL`.
+    ///
+    /// Used at sync start to log a one-time backfill notice after the v5
+    /// upgrade. Returns 0 on a fresh DB or once the backfill sync completes.
+    async fn count_downloaded_without_metadata_hash(&self) -> Result<u64, StateError>;
 }
 
 /// `SQLite` implementation of the state database.
@@ -340,12 +374,29 @@ impl StateDb for SqliteStateDb {
 
         let conn = self.acquire_lock("upsert_seen")?;
 
-        // Use INSERT OR REPLACE to handle both insert and update
-        // But preserve existing status, downloaded_at, local_path, download_attempts, last_error
+        let meta = &record.metadata;
+        // Lazily compute metadata_hash if caller supplied metadata without one.
+        // Storing the hash alongside the metadata is what lets feature 5 detect
+        // metadata-only changes in O(1) during incremental sync.
+        let metadata_hash_owned = meta
+            .metadata_hash
+            .clone()
+            .or_else(|| Some(meta.compute_hash()));
+
         conn.execute(
             r"
-            INSERT INTO assets (id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, last_seen_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)
+            INSERT INTO assets (
+                id, version_size, checksum, filename, created_at, added_at,
+                size_bytes, media_type, status, last_seen_at,
+                source, is_favorite, rating, latitude, longitude, altitude,
+                orientation, duration_secs, timezone_offset, width, height,
+                title, keywords, description, media_subtype, burst_id,
+                is_hidden, is_archived, modified_at, is_deleted, deleted_at,
+                provider_data, metadata_hash
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9,
+                    ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
             ON CONFLICT(id, version_size) DO UPDATE SET
                 checksum = excluded.checksum,
                 filename = excluded.filename,
@@ -353,7 +404,30 @@ impl StateDb for SqliteStateDb {
                 added_at = excluded.added_at,
                 size_bytes = excluded.size_bytes,
                 media_type = excluded.media_type,
-                last_seen_at = excluded.last_seen_at
+                last_seen_at = excluded.last_seen_at,
+                source = COALESCE(excluded.source, assets.source),
+                is_favorite = excluded.is_favorite,
+                rating = excluded.rating,
+                latitude = excluded.latitude,
+                longitude = excluded.longitude,
+                altitude = excluded.altitude,
+                orientation = excluded.orientation,
+                duration_secs = excluded.duration_secs,
+                timezone_offset = excluded.timezone_offset,
+                width = excluded.width,
+                height = excluded.height,
+                title = excluded.title,
+                keywords = excluded.keywords,
+                description = excluded.description,
+                media_subtype = excluded.media_subtype,
+                burst_id = excluded.burst_id,
+                is_hidden = excluded.is_hidden,
+                is_archived = excluded.is_archived,
+                modified_at = excluded.modified_at,
+                is_deleted = excluded.is_deleted,
+                deleted_at = excluded.deleted_at,
+                provider_data = excluded.provider_data,
+                metadata_hash = excluded.metadata_hash
             ",
             rusqlite::params![
                 &record.id,
@@ -365,6 +439,29 @@ impl StateDb for SqliteStateDb {
                 i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
                 record.media_type.as_str(),
                 last_seen_at,
+                meta.source.as_deref().unwrap_or("icloud"),
+                i64::from(meta.is_favorite),
+                meta.rating.map(i64::from),
+                meta.latitude,
+                meta.longitude,
+                meta.altitude,
+                meta.orientation.map(i64::from),
+                meta.duration_secs,
+                meta.timezone_offset.map(i64::from),
+                meta.width.map(i64::from),
+                meta.height.map(i64::from),
+                meta.title.as_deref(),
+                meta.keywords.as_deref(),
+                meta.description.as_deref(),
+                meta.media_subtype.as_deref(),
+                meta.burst_id.as_deref(),
+                i64::from(meta.is_hidden),
+                i64::from(meta.is_archived),
+                meta.modified_at.map(|dt| dt.timestamp()),
+                i64::from(meta.is_deleted),
+                meta.deleted_at.map(|dt| dt.timestamp()),
+                meta.provider_data.as_deref(),
+                metadata_hash_owned.as_deref(),
             ],
         )
         .map_err(|e| StateError::query("upsert_seen", e))?;
@@ -828,6 +925,60 @@ impl StateDb for SqliteStateDb {
 
         Ok(paths)
     }
+
+    async fn add_asset_album(
+        &self,
+        asset_id: &str,
+        album_name: &str,
+        source: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.acquire_lock("add_asset_album")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO asset_albums (asset_id, album_name, source) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![asset_id, album_name, source],
+        )
+        .map_err(|e| StateError::query("add_asset_album", e))?;
+        Ok(())
+    }
+
+    async fn mark_soft_deleted(
+        &self,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StateError> {
+        let conn = self.acquire_lock("mark_soft_deleted")?;
+        conn.execute(
+            "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
+             WHERE id = ?2",
+            rusqlite::params![deleted_at.map(|dt| dt.timestamp()), asset_id],
+        )
+        .map_err(|e| StateError::query("mark_soft_deleted", e))?;
+        Ok(())
+    }
+
+    async fn mark_hidden_at_source(&self, asset_id: &str) -> Result<(), StateError> {
+        let conn = self.acquire_lock("mark_hidden_at_source")?;
+        conn.execute(
+            "UPDATE assets SET is_hidden = 1 WHERE id = ?1",
+            rusqlite::params![asset_id],
+        )
+        .map_err(|e| StateError::query("mark_hidden_at_source", e))?;
+        Ok(())
+    }
+
+    async fn count_downloaded_without_metadata_hash(&self) -> Result<u64, StateError> {
+        let conn = self.acquire_lock("count_downloaded_without_metadata_hash")?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM assets WHERE status = 'downloaded' \
+                 AND metadata_hash IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StateError::query("count_downloaded_without_metadata_hash", e))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -851,7 +1002,11 @@ impl SqliteStateDb {
 /// Keep this in sync with the indices read in `row_to_asset_record`.
 const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
      added_at, size_bytes, media_type, status, downloaded_at, local_path, \
-     last_seen_at, download_attempts, last_error, local_checksum";
+     last_seen_at, download_attempts, last_error, local_checksum, \
+     source, is_favorite, rating, latitude, longitude, altitude, orientation, \
+     duration_secs, timezone_offset, width, height, title, keywords, description, \
+     media_subtype, burst_id, is_hidden, is_archived, modified_at, is_deleted, \
+     deleted_at, provider_data, metadata_hash";
 
 /// Convert a database row to an `AssetRecord`.
 ///
@@ -873,6 +1028,56 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
     let download_attempts: i64 = row.get(12)?;
     let last_error: Option<String> = row.get(13)?;
     let local_checksum: Option<String> = row.get(14)?;
+
+    let source: Option<String> = row.get(15)?;
+    let is_favorite: i64 = row.get(16)?;
+    let rating: Option<i64> = row.get(17)?;
+    let latitude: Option<f64> = row.get(18)?;
+    let longitude: Option<f64> = row.get(19)?;
+    let altitude: Option<f64> = row.get(20)?;
+    let orientation: Option<i64> = row.get(21)?;
+    let duration_secs: Option<f64> = row.get(22)?;
+    let timezone_offset: Option<i64> = row.get(23)?;
+    let width: Option<i64> = row.get(24)?;
+    let height: Option<i64> = row.get(25)?;
+    let title: Option<String> = row.get(26)?;
+    let keywords: Option<String> = row.get(27)?;
+    let description: Option<String> = row.get(28)?;
+    let media_subtype: Option<String> = row.get(29)?;
+    let burst_id: Option<String> = row.get(30)?;
+    let is_hidden: i64 = row.get(31)?;
+    let is_archived: i64 = row.get(32)?;
+    let modified_at_ts: Option<i64> = row.get(33)?;
+    let is_deleted: i64 = row.get(34)?;
+    let deleted_at_ts: Option<i64> = row.get(35)?;
+    let provider_data: Option<String> = row.get(36)?;
+    let metadata_hash: Option<String> = row.get(37)?;
+
+    let metadata = AssetMetadata {
+        source,
+        is_favorite: is_favorite != 0,
+        rating: rating.and_then(|v| u8::try_from(v).ok()),
+        latitude,
+        longitude,
+        altitude,
+        orientation: orientation.and_then(|v| u8::try_from(v).ok()),
+        duration_secs,
+        timezone_offset: timezone_offset.and_then(|v| i32::try_from(v).ok()),
+        width: width.and_then(|v| u32::try_from(v).ok()),
+        height: height.and_then(|v| u32::try_from(v).ok()),
+        title,
+        keywords,
+        description,
+        media_subtype,
+        burst_id,
+        is_hidden: is_hidden != 0,
+        is_archived: is_archived != 0,
+        modified_at: modified_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+        is_deleted: is_deleted != 0,
+        deleted_at: deleted_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+        provider_data,
+        metadata_hash,
+    };
 
     Ok(AssetRecord {
         id,
@@ -897,6 +1102,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
             .unwrap_or(VersionSizeKey::Original),
         media_type: MediaType::from_str(&media_type_str).unwrap_or(MediaType::Photo),
         status: AssetStatus::from_str(&status_str).unwrap_or(AssetStatus::Pending),
+        metadata,
     })
 }
 
@@ -2474,5 +2680,341 @@ mod tests {
                 p
             );
         }
+    }
+
+    // ── v5 metadata round-trip ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upsert_seen_persists_and_roundtrips_metadata() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let mut meta = AssetMetadata {
+            source: Some("icloud".into()),
+            is_favorite: true,
+            rating: Some(4),
+            latitude: Some(37.7749),
+            longitude: Some(-122.4194),
+            altitude: Some(17.0),
+            orientation: Some(6),
+            duration_secs: Some(12.5),
+            timezone_offset: Some(-28800),
+            width: Some(4032),
+            height: Some(3024),
+            title: Some("A caption".into()),
+            keywords: Some(r#"["vacation","beach"]"#.into()),
+            description: Some("A longer description".into()),
+            media_subtype: Some("portrait".into()),
+            burst_id: Some("burst_abc".into()),
+            is_hidden: false,
+            is_archived: false,
+            modified_at: Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap()),
+            is_deleted: false,
+            deleted_at: None,
+            provider_data: Some(r#"{"containerId":"x"}"#.into()),
+            metadata_hash: None,
+        };
+        meta.refresh_hash();
+        let hash = meta.metadata_hash.clone().unwrap();
+        let record = TestAssetRecord::new("META_1")
+            .checksum("ck1")
+            .filename("photo.jpg")
+            .metadata(meta)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+
+        let page = db.get_downloaded_page(0, 10).await.unwrap();
+        assert!(
+            page.is_empty(),
+            "pending rows should not be in downloaded page"
+        );
+        // pull via get_pending to verify round-trip
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let got = &pending[0];
+        assert_eq!(got.metadata.source.as_deref(), Some("icloud"));
+        assert!(got.metadata.is_favorite);
+        assert_eq!(got.metadata.rating, Some(4));
+        assert_eq!(got.metadata.latitude, Some(37.7749));
+        assert_eq!(got.metadata.longitude, Some(-122.4194));
+        assert_eq!(got.metadata.altitude, Some(17.0));
+        assert_eq!(got.metadata.orientation, Some(6));
+        assert_eq!(got.metadata.duration_secs, Some(12.5));
+        assert_eq!(got.metadata.timezone_offset, Some(-28800));
+        assert_eq!(got.metadata.width, Some(4032));
+        assert_eq!(got.metadata.height, Some(3024));
+        assert_eq!(got.metadata.title.as_deref(), Some("A caption"));
+        assert_eq!(
+            got.metadata.keywords.as_deref(),
+            Some(r#"["vacation","beach"]"#)
+        );
+        assert_eq!(
+            got.metadata.description.as_deref(),
+            Some("A longer description")
+        );
+        assert_eq!(got.metadata.media_subtype.as_deref(), Some("portrait"));
+        assert_eq!(got.metadata.burst_id.as_deref(), Some("burst_abc"));
+        assert_eq!(got.metadata.metadata_hash.as_deref(), Some(hash.as_str()));
+    }
+
+    #[tokio::test]
+    async fn upsert_seen_computes_hash_when_caller_omits_it() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let meta = AssetMetadata {
+            is_favorite: true,
+            ..AssetMetadata::default()
+        };
+        let record = TestAssetRecord::new("META_2").metadata(meta).build();
+        db.upsert_seen(&record).await.unwrap();
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].metadata.metadata_hash.is_some(),
+            "upsert_seen must populate metadata_hash even when caller omits it"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_seen_updates_metadata_on_conflict() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let initial = TestAssetRecord::new("META_3")
+            .metadata(AssetMetadata {
+                is_favorite: false,
+                title: Some("old".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&initial).await.unwrap();
+
+        let updated = TestAssetRecord::new("META_3")
+            .metadata(AssetMetadata {
+                is_favorite: true,
+                title: Some("new".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&updated).await.unwrap();
+
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].metadata.is_favorite);
+        assert_eq!(pending[0].metadata.title.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn add_asset_album_is_idempotent() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.add_asset_album("A1", "Favorites", "icloud")
+            .await
+            .unwrap();
+        db.add_asset_album("A1", "Favorites", "icloud")
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("test").unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_albums WHERE asset_id = 'A1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn add_asset_album_respects_source_namespace() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.add_asset_album("A1", "Favorites", "icloud")
+            .await
+            .unwrap();
+        db.add_asset_album("A1", "Favorites", "takeout")
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("test").unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_albums WHERE asset_id = 'A1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn mark_soft_deleted_sets_flags_across_versions() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let orig = TestAssetRecord::new("DEL_1").checksum("c1").build();
+        let med = TestAssetRecord::new("DEL_1")
+            .checksum("c2")
+            .version_size(VersionSizeKey::Medium)
+            .build();
+        db.upsert_seen(&orig).await.unwrap();
+        db.upsert_seen(&med).await.unwrap();
+        let when = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        db.mark_soft_deleted("DEL_1", Some(when)).await.unwrap();
+
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 2);
+        for rec in &pending {
+            assert!(
+                rec.metadata.is_deleted,
+                "is_deleted should be set for all versions"
+            );
+            assert_eq!(rec.metadata.deleted_at, Some(when));
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_hidden_at_source_sets_flag() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("HID_1").build();
+        db.upsert_seen(&rec).await.unwrap();
+        db.mark_hidden_at_source("HID_1").await.unwrap();
+        let pending = db.get_pending().await.unwrap();
+        assert!(pending[0].metadata.is_hidden);
+    }
+
+    #[tokio::test]
+    async fn count_downloaded_without_metadata_hash_returns_zero_on_empty() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        assert_eq!(
+            db.count_downloaded_without_metadata_hash().await.unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn count_downloaded_without_metadata_hash_skips_pending() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("P1").build();
+        db.upsert_seen(&rec).await.unwrap();
+        // Still pending, so shouldn't count
+        assert_eq!(
+            db.count_downloaded_without_metadata_hash().await.unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn count_downloaded_without_metadata_hash_detects_missing_hash() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("D1").build();
+        db.upsert_seen(&rec).await.unwrap();
+        db.mark_downloaded("D1", "original", Path::new("/a.jpg"), "h", None)
+            .await
+            .unwrap();
+        // Manually null the hash to simulate a pre-v5 row
+        {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.execute("UPDATE assets SET metadata_hash = NULL WHERE id = 'D1'", [])
+                .unwrap();
+        }
+        assert_eq!(
+            db.count_downloaded_without_metadata_hash().await.unwrap(),
+            1
+        );
+    }
+
+    /// End-to-end: PhotoAsset constructed from a realistic CloudKit JSON pair
+    /// flows through metadata extraction, `upsert_seen`, and round-trips out
+    /// of the DB with all fields intact. Guards against regressions in any
+    /// link of the pipeline.
+    #[tokio::test]
+    async fn photo_asset_metadata_roundtrips_through_upsert_and_read() {
+        use crate::icloud::photos::PhotoAsset;
+        use base64::Engine;
+        use serde_json::json;
+
+        fn b64(bytes: &[u8]) -> String {
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+        fn bplist(value: plist::Value) -> Vec<u8> {
+            let mut out = Vec::new();
+            plist::to_writer_binary(&mut out, &value).unwrap();
+            out
+        }
+
+        let mut loc_dict = plist::Dictionary::new();
+        loc_dict.insert("lat".into(), plist::Value::Real(37.7749));
+        loc_dict.insert("lng".into(), plist::Value::Real(-122.4194));
+        loc_dict.insert("alt".into(), plist::Value::Real(17.0));
+        let loc_bp = bplist(plist::Value::Dictionary(loc_dict));
+
+        let keywords_bp = bplist(plist::Value::Array(vec![
+            plist::Value::String("vacation".into()),
+            plist::Value::String("beach".into()),
+        ]));
+
+        let master = json!({
+            "recordName": "RT_1",
+            "fields": {
+                "itemType": {"value": "public.jpeg"},
+                "filenameEnc": {"value": "img.jpg", "type": "STRING"},
+                "resOriginalRes": {"value": {"size": 10, "downloadURL": "https://x", "fileChecksum": "ck"}},
+                "resOriginalFileType": {"value": "public.jpeg"},
+            },
+        });
+        let asset_json = json!({
+            "fields": {
+                "assetDate": {"value": 1736899200000_f64},
+                "isFavorite": {"value": 1},
+                "orientation": {"value": 6},
+                "duration": {"value": 12.5},
+                "timeZoneOffset": {"value": -28800},
+                "captionEnc": {"value": "Beach day", "type": "STRING"},
+                "extendedDescEnc": {"value": "Long description", "type": "STRING"},
+                "keywordsEnc": {"value": b64(&keywords_bp), "type": "ENCRYPTED_BYTES"},
+                "locationEnc": {"value": b64(&loc_bp), "type": "ENCRYPTED_BYTES"},
+                "resOriginalWidth": {"value": 4032},
+                "resOriginalHeight": {"value": 3024},
+                "assetSubtypeV2": {"value": 16},
+                "burstId": {"value": "burst_x"},
+                "recordChangeTag": {"value": "tag42"},
+            },
+        });
+        let photo = PhotoAsset::new(master, asset_json);
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = AssetRecord::new_pending(
+            photo.id().to_string(),
+            VersionSizeKey::Original,
+            "ck".to_string(),
+            photo.filename().unwrap_or("").to_string(),
+            photo.created(),
+            Some(photo.added_date()),
+            10,
+            MediaType::Photo,
+        )
+        .with_metadata(photo.metadata().clone());
+        db.upsert_seen(&record).await.unwrap();
+
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let got = &pending[0];
+        let m = &got.metadata;
+        assert_eq!(m.source.as_deref(), Some("icloud"));
+        assert!(m.is_favorite);
+        assert_eq!(m.rating, Some(5));
+        assert_eq!(m.latitude, Some(37.7749));
+        assert_eq!(m.longitude, Some(-122.4194));
+        assert_eq!(m.altitude, Some(17.0));
+        assert_eq!(m.orientation, Some(6));
+        assert_eq!(m.duration_secs, Some(12.5));
+        assert_eq!(m.timezone_offset, Some(-28800));
+        assert_eq!(m.width, Some(4032));
+        assert_eq!(m.height, Some(3024));
+        assert_eq!(m.title.as_deref(), Some("Beach day"));
+        assert_eq!(m.description.as_deref(), Some("Long description"));
+        assert_eq!(m.keywords.as_deref(), Some(r#"["vacation","beach"]"#));
+        assert_eq!(m.media_subtype.as_deref(), Some("portrait"));
+        assert_eq!(m.burst_id.as_deref(), Some("burst_x"));
+        assert!(m.metadata_hash.is_some());
+
+        let provider = m
+            .provider_data
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .expect("provider_data should be valid JSON");
+        assert_eq!(provider["recordChangeTag"], json!("tag42"));
+        assert_eq!(provider["assetSubtypeV2"], json!(16));
     }
 }

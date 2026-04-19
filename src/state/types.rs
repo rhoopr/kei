@@ -138,6 +138,142 @@ impl MediaType {
     }
 }
 
+/// Provider-agnostic metadata for an asset.
+///
+/// Every field is optional or has a safe default: providers populate what they
+/// can, consumers handle missing values. Mapping from provider-specific fields
+/// (iCloud `isFavorite`, Takeout `favorited`, etc.) lives in provider adapters.
+///
+/// `metadata_hash` is computed from the metadata fields and stored alongside
+/// them so that incremental sync can detect metadata-only changes in O(1).
+#[derive(Debug, Clone, Default)]
+pub struct AssetMetadata {
+    /// Provider that created this record ("icloud", "takeout", etc.).
+    pub source: Option<String>,
+    /// Provider-native favorite/heart flag.
+    pub is_favorite: bool,
+    /// 1-5 star rating (providers with boolean favorites set 5).
+    pub rating: Option<u8>,
+    /// Latitude in decimal degrees, WGS84.
+    pub latitude: Option<f64>,
+    /// Longitude in decimal degrees, WGS84.
+    pub longitude: Option<f64>,
+    /// Altitude in meters above sea level.
+    pub altitude: Option<f64>,
+    /// EXIF orientation (1-8).
+    pub orientation: Option<u8>,
+    /// Duration in seconds (video / live photo).
+    pub duration_secs: Option<f64>,
+    /// Timezone offset in seconds from UTC.
+    pub timezone_offset: Option<i32>,
+    /// Width in pixels.
+    pub width: Option<u32>,
+    /// Height in pixels.
+    pub height: Option<u32>,
+    /// Short title / caption.
+    pub title: Option<String>,
+    /// JSON array of keyword strings.
+    pub keywords: Option<String>,
+    /// Longer description / notes.
+    pub description: Option<String>,
+    /// Subtype enum: screenshot, panorama, hdr, burst, timelapse, slo_mo, etc.
+    pub media_subtype: Option<String>,
+    /// Groups burst shots together.
+    pub burst_id: Option<String>,
+    /// Hidden from main timeline.
+    pub is_hidden: bool,
+    /// Archived (hidden from main timeline but retained).
+    pub is_archived: bool,
+    /// When metadata was last edited at source (provider-supplied only).
+    pub modified_at: Option<DateTime<Utc>>,
+    /// Soft-deleted at source.
+    pub is_deleted: bool,
+    /// When the asset was deleted/expunged at source.
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// Opaque JSON blob for provider-specific fields that don't fit the
+    /// canonical schema (invariant 4: capture everything available).
+    pub provider_data: Option<String>,
+    /// SHA-256 of the metadata fields above, for change detection.
+    pub metadata_hash: Option<String>,
+}
+
+impl AssetMetadata {
+    /// Compute a stable SHA-256 hash of metadata fields for change detection.
+    ///
+    /// Does not include `source` (immutable per record) or `metadata_hash`
+    /// itself (the output). Uses a pipe-delimited, tagged encoding so that
+    /// adding None fields or empty strings cannot collide.
+    pub fn compute_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        let h = &mut hasher;
+        hash_bool(h, "fav", self.is_favorite);
+        hash_opt(h, "rat", self.rating.map(|v| v.to_string()));
+        hash_opt(h, "lat", self.latitude.map(format_f64));
+        hash_opt(h, "lng", self.longitude.map(format_f64));
+        hash_opt(h, "alt", self.altitude.map(format_f64));
+        hash_opt(h, "ori", self.orientation.map(|v| v.to_string()));
+        hash_opt(h, "dur", self.duration_secs.map(format_f64));
+        hash_opt(h, "tzo", self.timezone_offset.map(|v| v.to_string()));
+        hash_opt(h, "w", self.width.map(|v| v.to_string()));
+        hash_opt(h, "hh", self.height.map(|v| v.to_string()));
+        hash_opt(h, "tit", self.title.clone());
+        hash_opt(h, "kw", self.keywords.clone());
+        hash_opt(h, "desc", self.description.clone());
+        hash_opt(h, "sub", self.media_subtype.clone());
+        hash_opt(h, "bur", self.burst_id.clone());
+        hash_bool(h, "hid", self.is_hidden);
+        hash_bool(h, "arc", self.is_archived);
+        hash_opt(
+            h,
+            "mod",
+            self.modified_at.map(|dt| dt.timestamp().to_string()),
+        );
+        hash_bool(h, "del", self.is_deleted);
+        hash_opt(
+            h,
+            "delat",
+            self.deleted_at.map(|dt| dt.timestamp().to_string()),
+        );
+        hash_opt(h, "pd", self.provider_data.clone());
+        let digest = hasher.finalize();
+        data_encoding::HEXLOWER.encode(&digest)
+    }
+
+    /// Populate `metadata_hash` from the current field values.
+    pub fn refresh_hash(&mut self) {
+        self.metadata_hash = Some(self.compute_hash());
+    }
+}
+
+fn hash_opt(hasher: &mut sha2::Sha256, tag: &str, value: Option<String>) {
+    use sha2::Digest;
+    hasher.update(tag.as_bytes());
+    hasher.update(b"|");
+    match value {
+        Some(v) => {
+            hasher.update(b"S|");
+            hasher.update(v.as_bytes());
+        }
+        None => hasher.update(b"N"),
+    }
+    hasher.update(b"\x1f");
+}
+
+fn hash_bool(hasher: &mut sha2::Sha256, tag: &str, value: bool) {
+    use sha2::Digest;
+    hasher.update(tag.as_bytes());
+    hasher.update(b"|");
+    hasher.update(if value { b"1" } else { b"0" });
+    hasher.update(b"\x1f");
+}
+
+fn format_f64(v: f64) -> String {
+    // Fixed-precision formatting keeps hash stable across runs even when
+    // floats round-trip through SQLite REAL storage.
+    format!("{v:.9}")
+}
+
 /// A record of an asset's state in the database.
 ///
 /// Fields are ordered for optimal memory layout:
@@ -146,6 +282,8 @@ impl MediaType {
 /// - `DateTime` fields (12-16 bytes each)
 /// - 4-byte primitives (u32)
 /// - 1-byte enums grouped at the end
+/// - `metadata` carried last (variable-size nullable fields, not part of the
+///   memory-hot path for skip decisions)
 #[derive(Debug, Clone)]
 pub struct AssetRecord {
     // 8-byte aligned heap types
@@ -188,6 +326,9 @@ pub struct AssetRecord {
     pub media_type: MediaType,
     /// Current status of the asset.
     pub status: AssetStatus,
+
+    /// Provider-agnostic metadata captured from the source (v5+).
+    pub metadata: AssetMetadata,
 }
 
 impl AssetRecord {
@@ -218,7 +359,18 @@ impl AssetRecord {
             version_size,
             media_type,
             status: AssetStatus::Pending,
+            metadata: AssetMetadata::default(),
         }
+    }
+
+    /// Attach metadata, populating `metadata_hash` if unset.
+    #[must_use]
+    pub fn with_metadata(mut self, mut metadata: AssetMetadata) -> Self {
+        if metadata.metadata_hash.is_none() {
+            metadata.refresh_hash();
+        }
+        self.metadata = metadata;
+        self
     }
 }
 
@@ -373,11 +525,116 @@ mod tests {
 
     #[test]
     fn test_asset_record_size() {
-        // Verify struct size is reasonable (goal: <= 280 bytes)
+        // V5 added AssetMetadata (22 optional fields + 4 bools). Cap lifted
+        // accordingly. The hot-path skip decisions still use the pre-metadata
+        // fields; metadata is loaded separately.
         assert!(
-            size_of::<AssetRecord>() <= 280,
-            "AssetRecord size {} exceeds 280 bytes",
+            size_of::<AssetRecord>() <= 720,
+            "AssetRecord size {} exceeds 720 bytes",
             size_of::<AssetRecord>()
+        );
+    }
+
+    #[test]
+    fn test_asset_metadata_hash_stable_for_empty() {
+        let a = AssetMetadata::default().compute_hash();
+        let b = AssetMetadata::default().compute_hash();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_asset_metadata_hash_changes_with_favorite() {
+        let before = AssetMetadata::default().compute_hash();
+        let after = AssetMetadata {
+            is_favorite: true,
+            ..AssetMetadata::default()
+        }
+        .compute_hash();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn test_asset_metadata_hash_changes_with_location() {
+        let base = AssetMetadata::default().compute_hash();
+        let with_gps = AssetMetadata {
+            latitude: Some(37.7749),
+            longitude: Some(-122.4194),
+            ..AssetMetadata::default()
+        }
+        .compute_hash();
+        assert_ne!(base, with_gps);
+    }
+
+    #[test]
+    fn test_asset_metadata_hash_ignores_source_and_hash() {
+        let a = AssetMetadata {
+            source: Some("icloud".into()),
+            metadata_hash: Some("ignored".into()),
+            is_favorite: true,
+            ..AssetMetadata::default()
+        }
+        .compute_hash();
+        let b = AssetMetadata {
+            source: Some("takeout".into()),
+            metadata_hash: Some("also_ignored".into()),
+            is_favorite: true,
+            ..AssetMetadata::default()
+        }
+        .compute_hash();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_asset_metadata_hash_distinguishes_none_vs_empty_string() {
+        let none_title = AssetMetadata::default().compute_hash();
+        let empty_title = AssetMetadata {
+            title: Some(String::new()),
+            ..AssetMetadata::default()
+        }
+        .compute_hash();
+        assert_ne!(none_title, empty_title);
+    }
+
+    #[test]
+    fn test_with_metadata_refreshes_hash_if_missing() {
+        let now = Utc::now();
+        let record = AssetRecord::new_pending(
+            "A".into(),
+            VersionSizeKey::Original,
+            "ck".into(),
+            "p.jpg".into(),
+            now,
+            None,
+            1,
+            MediaType::Photo,
+        )
+        .with_metadata(AssetMetadata {
+            is_favorite: true,
+            ..AssetMetadata::default()
+        });
+        assert!(record.metadata.metadata_hash.is_some());
+    }
+
+    #[test]
+    fn test_with_metadata_preserves_existing_hash() {
+        let now = Utc::now();
+        let record = AssetRecord::new_pending(
+            "A".into(),
+            VersionSizeKey::Original,
+            "ck".into(),
+            "p.jpg".into(),
+            now,
+            None,
+            1,
+            MediaType::Photo,
+        )
+        .with_metadata(AssetMetadata {
+            metadata_hash: Some("precomputed".into()),
+            ..AssetMetadata::default()
+        });
+        assert_eq!(
+            record.metadata.metadata_hash.as_deref(),
+            Some("precomputed")
         );
     }
 

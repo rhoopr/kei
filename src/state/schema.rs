@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 4;
+pub(crate) const SCHEMA_VERSION: i32 = 5;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -104,6 +104,56 @@ const SCHEMA_V3: &str = "ALTER TABLE assets ADD COLUMN local_checksum TEXT;";
 /// Schema DDL for version 4 migration: add pre-EXIF download checksum column.
 const SCHEMA_V4: &str = "ALTER TABLE assets ADD COLUMN download_checksum TEXT;";
 
+/// V5 metadata columns added to the `assets` table.
+///
+/// `source` records which provider ingested the asset. `DEFAULT 'icloud'` is
+/// correct for migration because every pre-v5 row came from iCloud sync; new
+/// inserts always set `source` explicitly.
+const V5_ASSET_COLUMNS: &[(&str, &str)] = &[
+    ("source", "TEXT NOT NULL DEFAULT 'icloud'"),
+    ("is_favorite", "INTEGER NOT NULL DEFAULT 0"),
+    ("rating", "INTEGER"),
+    ("latitude", "REAL"),
+    ("longitude", "REAL"),
+    ("altitude", "REAL"),
+    ("orientation", "INTEGER"),
+    ("duration_secs", "REAL"),
+    ("timezone_offset", "INTEGER"),
+    ("width", "INTEGER"),
+    ("height", "INTEGER"),
+    ("title", "TEXT"),
+    ("keywords", "TEXT"),
+    ("description", "TEXT"),
+    ("media_subtype", "TEXT"),
+    ("burst_id", "TEXT"),
+    ("is_hidden", "INTEGER NOT NULL DEFAULT 0"),
+    ("is_archived", "INTEGER NOT NULL DEFAULT 0"),
+    ("modified_at", "INTEGER"),
+    ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
+    ("deleted_at", "INTEGER"),
+    ("provider_data", "TEXT"),
+    ("metadata_hash", "TEXT"),
+];
+
+/// V5 table/index DDL executed after the ALTER TABLE pass.
+const SCHEMA_V5_TABLES: &str = r"
+CREATE TABLE IF NOT EXISTS asset_albums (
+    asset_id   TEXT NOT NULL,
+    album_name TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    PRIMARY KEY (asset_id, album_name, source)
+);
+
+CREATE TABLE IF NOT EXISTS asset_people (
+    asset_id    TEXT NOT NULL,
+    person_name TEXT NOT NULL,
+    PRIMARY KEY (asset_id, person_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assets_metadata_hash
+    ON assets (metadata_hash) WHERE status = 'downloaded';
+";
+
 /// Check whether a column exists on a table using `PRAGMA table_info`.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StateError> {
     let mut stmt = conn
@@ -131,6 +181,19 @@ fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError>
             if !column_exists(conn, "assets", "download_checksum")? {
                 conn.execute_batch(SCHEMA_V4)?;
             }
+        }
+        5 => {
+            for (col, decl) in V5_ASSET_COLUMNS {
+                if !column_exists(conn, "assets", col)? {
+                    conn.execute_batch(&format!("ALTER TABLE assets ADD COLUMN {col} {decl};"))?;
+                }
+            }
+            conn.execute_batch(SCHEMA_V5_TABLES)?;
+            // Invalidate sync tokens to force a full enumeration on the next sync.
+            // Without this, incremental sync would skip unchanged assets and they
+            // would keep NULL metadata forever. The backfill pass populates
+            // metadata for every asset without re-downloading files.
+            conn.execute("DELETE FROM metadata WHERE key LIKE 'sync_token:%'", [])?;
         }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
@@ -206,7 +269,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 3); // status, local_path, checksum
+        assert_eq!(count, 4); // status, local_path, checksum, metadata_hash
     }
 
     #[test]
@@ -435,5 +498,134 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ── V5 metadata migration ────────────────────────────────────────
+
+    #[test]
+    fn test_v5_adds_all_metadata_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for (col, _) in V5_ASSET_COLUMNS {
+            let sql = format!("SELECT {col} FROM assets LIMIT 0");
+            assert!(
+                conn.prepare(&sql).is_ok(),
+                "column {col} missing after migration"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v5_creates_asset_albums_and_people_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM asset_albums", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM asset_people", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_v5_backfills_source_as_icloud_for_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a v4 database with an existing row
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        set_schema_version(&conn, 4).unwrap();
+        conn.execute(
+            "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, media_type, last_seen_at) \
+             VALUES ('legacy', 'original', 'ck', 'photo.jpg', 0, 100, 'photo', 0)",
+            [],
+        ).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let source: String = conn
+            .query_row("SELECT source FROM assets WHERE id = 'legacy'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source, "icloud");
+    }
+
+    #[test]
+    fn test_v5_invalidates_sync_tokens() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        set_schema_version(&conn, 4).unwrap();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'abc'), \
+             ('sync_token:SharedSync-xyz', 'def'), ('other:key', 'keep')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let tokens: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'sync_token:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tokens, 0);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key = 'other:key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+    }
+
+    #[test]
+    fn test_v5_idempotent_when_columns_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        set_schema_version(&conn, 4).unwrap();
+        // Pre-add a subset of v5 columns (simulates crash mid-migration)
+        conn.execute_batch("ALTER TABLE assets ADD COLUMN source TEXT NOT NULL DEFAULT 'icloud'")
+            .unwrap();
+        conn.execute_batch("ALTER TABLE assets ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
+            .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        for (col, _) in V5_ASSET_COLUMNS {
+            assert!(
+                conn.prepare(&format!("SELECT {col} FROM assets LIMIT 0"))
+                    .is_ok(),
+                "column {col} missing after idempotent migration"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v5_metadata_hash_index_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let has_index: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_assets_metadata_hash'",
+                [],
+                |row| row.get::<_, i64>(0).map(|_| true),
+            )
+            .unwrap_or(false);
+        assert!(has_index);
     }
 }

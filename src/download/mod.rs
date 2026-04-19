@@ -1076,14 +1076,46 @@ async fn download_photos_incremental(
                 ChangeReason::SoftDeleted => {
                     soft_deleted_count += 1;
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
+                    if let Some(db) = &config.state_db {
+                        let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
+                        if let Err(e) = db.mark_soft_deleted(&event.record_name, deleted_at).await {
+                            tracing::warn!(
+                                record_name = %event.record_name,
+                                error = %e,
+                                "Failed to record soft-delete in state DB"
+                            );
+                        }
+                    }
                 }
                 ChangeReason::HardDeleted => {
                     hard_deleted_count += 1;
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
+                    // CloudKit returns no fields for hard-deleted records, so we
+                    // can't tell master from asset. Treat as soft-delete in DB
+                    // (sets is_deleted=1) — the row stays put so history and
+                    // local_path remain queryable.
+                    if let Some(db) = &config.state_db {
+                        if let Err(e) = db.mark_soft_deleted(&event.record_name, None).await {
+                            tracing::warn!(
+                                record_name = %event.record_name,
+                                error = %e,
+                                "Failed to record hard-delete in state DB"
+                            );
+                        }
+                    }
                 }
                 ChangeReason::Hidden => {
                     hidden_count += 1;
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
+                    if let Some(db) = &config.state_db {
+                        if let Err(e) = db.mark_hidden_at_source(&event.record_name).await {
+                            tracing::warn!(
+                                record_name = %event.record_name,
+                                error = %e,
+                                "Failed to record hidden state in state DB"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1211,12 +1243,26 @@ async fn download_photos_incremental(
                     Some(asset.added_date()),
                     task.size,
                     media_type,
-                );
+                )
+                .with_metadata(asset.metadata().clone());
                 if let Err(e) = db.upsert_seen(&record).await {
                     tracing::warn!(
                         asset_id = %task.asset_id,
                         error = %e,
                         "Failed to record asset in state DB"
+                    );
+                }
+            }
+            // Record this asset's membership in the current album so
+            // consumers (EXIF keywords, XMP sidecars, Immich albums) can
+            // reconstruct the logical album graph from the state DB.
+            if !album_name.is_empty() {
+                if let Err(e) = db.add_asset_album(asset.id(), album_name, "icloud").await {
+                    tracing::warn!(
+                        asset_id = %asset.id(),
+                        album = %album_name,
+                        error = %e,
+                        "Failed to record album membership"
                     );
                 }
             }
