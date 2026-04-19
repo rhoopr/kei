@@ -105,7 +105,10 @@ pub struct SyncArgs {
     #[arg(short = 'd', long, env = "KEI_DIRECTORY", value_parser = non_empty_string)]
     pub directory: Option<String>,
 
-    /// Album(s) to download
+    /// Album(s) to download. Use `-a all` to sync every user-created album
+    /// in one run (Apple's smart folders like "Favorites" are skipped —
+    /// name them explicitly if you want them). `-a all` cannot be combined
+    /// with specific album names.
     #[arg(short = 'a', long = "album", env = "KEI_ALBUM", value_parser = non_empty_string)]
     pub albums: Vec<String>,
 
@@ -165,7 +168,11 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub force_size: Option<bool>,
 
-    /// Folder structure for organizing downloads (e.g., "%Y/%m/%d", "{album}/%Y/%B", "none")
+    /// Folder structure for organizing downloads (e.g., "%Y/%m/%d",
+    /// "{album}/%Y/%B", "none"). `{album}` must be the first segment and
+    /// may only appear once. When `{album}` is used without `-a`, kei
+    /// auto-syncs every user-created album plus a library-wide pass for
+    /// unfiled photos (where `{album}` collapses to empty).
     #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
 
@@ -1849,6 +1856,15 @@ mod tests {
     fn test_albums_empty_by_default() {
         let cli = parse(&base_args());
         assert!(cli.sync.albums.is_empty());
+    }
+
+    #[test]
+    fn test_album_all_accepted() {
+        let mut args = base_args();
+        args.extend(["-a", "all"]);
+        let cli = parse(&args);
+        // CLI layer stays dumb: Config::build interprets "all".
+        assert_eq!(cli.sync.albums, vec!["all"]);
     }
 
     // ── Input validation ───────────────────────────────────────────

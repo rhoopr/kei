@@ -341,77 +341,208 @@ pub(crate) async fn resolve_libraries(
     }
 }
 
-/// Resolve which albums to download from, plus any asset IDs to exclude.
+/// One pass through a specific album (or the library-wide pseudo-album).
 ///
-/// When no `--album` names are specified, returns `library.all()` (a cheap
-/// in-memory construction, no API call). When names are given, calls
-/// `library.albums().await` to discover user-created albums from iCloud.
+/// `exclude_ids` is the per-pass set of asset IDs to filter out. Most passes
+/// carry an empty set; the library-wide pass may pre-populate it with every
+/// album member (for the `-a all` + `{album}` unfiled pass) or with excluded
+/// albums' members (for `--exclude-album` without `--album`).
+pub(crate) struct AlbumPass {
+    pub album: icloud::photos::PhotoAlbum,
+    pub exclude_ids: std::sync::Arc<rustc_hash::FxHashSet<String>>,
+}
+
+/// Ordered list of download passes for a single library.
+#[derive(Debug)]
+pub(crate) struct AlbumPlan {
+    pub passes: Vec<AlbumPass>,
+}
+
+impl std::fmt::Debug for AlbumPass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlbumPass")
+            .field("album_name", &self.album.name)
+            .field("exclude_ids_len", &self.exclude_ids.len())
+            .finish()
+    }
+}
+
+fn empty_exclude_ids() -> std::sync::Arc<rustc_hash::FxHashSet<String>> {
+    std::sync::Arc::new(rustc_hash::FxHashSet::default())
+}
+
+/// Enumerate every asset ID in an album into `into`. Used both for the
+/// legacy `--exclude-album` pre-fetch and for computing the "already in
+/// some album" set that gates the `-a all` + `{album}` unfiled pass.
+async fn collect_album_asset_ids(
+    album: &icloud::photos::PhotoAlbum,
+    into: &mut rustc_hash::FxHashSet<String>,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    let count = album.len().await.unwrap_or(0);
+    let (stream, _token_rx) = album.photo_stream_with_token(None, Some(count), 1);
+    tokio::pin!(stream);
+    while let Some(result) = stream.next().await {
+        let asset = result?;
+        into.insert(asset.id().to_string());
+    }
+    Ok(())
+}
+
+/// Resolve the full download plan for a library.
 ///
-/// The returned `FxHashSet<String>` contains asset IDs from excluded albums
-/// that should be filtered out at download time. This is only populated when
-/// `--exclude-album` is set without `--album`, because the all-photos stream
-/// doesn't carry album membership per asset.
+/// The returned [`AlbumPlan`] contains one or more passes, each paired with
+/// its own exclude-asset-ids set:
+///
+/// - [`AlbumSelection::LibraryOnly`] returns a single library-wide pass.
+///   `--exclude-album X` without `--album` populates the pass's exclude set
+///   with X's members so they don't leak through the library-wide stream.
+/// - [`AlbumSelection::Named`] returns one pass per matched album, minus
+///   anything in `exclude_albums`. Missing names are a hard error.
+/// - [`AlbumSelection::All`] returns one pass per discovered album (minus
+///   `exclude_albums`). When `{album}` is in `folder_structure`, an extra
+///   library-wide "unfiled" pass is appended; its exclude set is the union
+///   of every discovered album's members (including excluded ones — users
+///   explicitly asked to skip those, so they must not fall through to the
+///   unfiled pass either).
+///
+/// `folder_structure` is consulted only for `AlbumSelection::All`, to decide
+/// whether to add the unfiled pass.
 pub(crate) async fn resolve_albums(
     library: &icloud::photos::PhotoLibrary,
-    album_names: &[String],
+    selection: &config::AlbumSelection,
     exclude_albums: &[String],
-) -> anyhow::Result<(
-    Vec<icloud::photos::PhotoAlbum>,
-    rustc_hash::FxHashSet<String>,
-)> {
-    use futures_util::StreamExt;
+    folder_structure: &str,
+) -> anyhow::Result<AlbumPlan> {
+    let empty = empty_exclude_ids();
 
-    let empty_ids = rustc_hash::FxHashSet::default();
-
-    if album_names.is_empty() && exclude_albums.is_empty() {
-        return Ok((vec![library.all()], empty_ids));
-    }
-
-    if album_names.is_empty() {
-        // No --album but --exclude-album is set: use library.all() as the
-        // base (all photos) and pre-collect asset IDs from excluded albums
-        // so they can be filtered at download time. This avoids silently
-        // dropping photos that aren't in any named album.
-        let album_map = library.albums().await?;
-        let mut exclude_ids = rustc_hash::FxHashSet::default();
-        for name in exclude_albums {
-            if let Some(album) = album_map.get(name.as_str()) {
-                let count = album.len().await.unwrap_or(0);
-                tracing::debug!(album = name, count, "Pre-fetching excluded album asset IDs");
-                let (stream, _token_rx) = album.photo_stream_with_token(None, Some(count), 1);
-                tokio::pin!(stream);
-                while let Some(Ok(asset)) = stream.next().await {
-                    exclude_ids.insert(asset.id().to_string());
-                }
-            } else {
-                tracing::warn!(album = name, "Excluded album not found, ignoring");
+    match selection {
+        config::AlbumSelection::LibraryOnly => {
+            if exclude_albums.is_empty() {
+                return Ok(AlbumPlan {
+                    passes: vec![AlbumPass {
+                        album: library.all(),
+                        exclude_ids: empty,
+                    }],
+                });
             }
+            // Legacy: --exclude-album without --album. Pre-collect IDs so
+            // they're filtered from the library-wide stream.
+            let album_map = library.albums().await?;
+            let mut exclude_ids = rustc_hash::FxHashSet::default();
+            for name in exclude_albums {
+                if let Some(album) = album_map.get(name.as_str()) {
+                    tracing::debug!(album = name, "Pre-fetching excluded album asset IDs");
+                    collect_album_asset_ids(album, &mut exclude_ids).await?;
+                } else {
+                    tracing::warn!(album = name, "Excluded album not found, ignoring");
+                }
+            }
+            tracing::debug!(count = exclude_ids.len(), "Collected excluded asset IDs");
+            Ok(AlbumPlan {
+                passes: vec![AlbumPass {
+                    album: library.all(),
+                    exclude_ids: std::sync::Arc::new(exclude_ids),
+                }],
+            })
         }
-        tracing::debug!(count = exclude_ids.len(), "Collected excluded asset IDs");
-        return Ok((vec![library.all()], exclude_ids));
-    }
+        config::AlbumSelection::Named(names) => {
+            // Dedup names so callers passing the same album twice get a
+            // single download pass, not an error.
+            let mut album_map = library.albums().await?;
+            let mut passes = Vec::new();
+            let mut seen = rustc_hash::FxHashSet::default();
+            for name in names {
+                if !seen.insert(name.as_str()) {
+                    continue;
+                }
+                if exclude_albums.iter().any(|e| e == name) {
+                    tracing::debug!(album = name, "Album excluded by --exclude-album");
+                    continue;
+                }
+                if let Some(album) = album_map.remove(name.as_str()) {
+                    passes.push(AlbumPass {
+                        album,
+                        exclude_ids: std::sync::Arc::clone(&empty),
+                    });
+                } else {
+                    let available: Vec<&String> = album_map.keys().collect();
+                    anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
+                }
+            }
+            Ok(AlbumPlan { passes })
+        }
+        config::AlbumSelection::All => {
+            // Filter smart folders (Favorites, Screenshots, Videos, etc.)
+            // out of the expansion. The issue requester wanted "my albums",
+            // meaning user-created folders — surfacing Apple's smart folders
+            // as download targets would be surprising and create confusing
+            // directories like "Recently Deleted" or "Hidden". Users who
+            // explicitly want a smart folder can still name it: `-a Favorites`.
+            let smart_folder_names: rustc_hash::FxHashSet<&'static str> =
+                icloud::photos::smart_folders::smart_folders()
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
+            let album_map: std::collections::HashMap<String, icloud::photos::PhotoAlbum> = library
+                .albums()
+                .await?
+                .into_iter()
+                .filter(|(name, _)| !smart_folder_names.contains(name.as_str()))
+                .collect();
+            let has_album_token = folder_structure.contains("{album}");
 
-    // Explicit --album list: resolve and exclude. Dedup names so callers
-    // passing the same album twice get one download pass, not an error.
-    let mut album_map = library.albums().await?;
-    let mut matched = Vec::new();
-    let mut seen = rustc_hash::FxHashSet::default();
-    for name in album_names {
-        if !seen.insert(name.as_str()) {
-            continue;
-        }
-        if exclude_albums.iter().any(|e| e == name) {
-            tracing::debug!(album = name, "Album excluded by --exclude-album");
-            continue;
-        }
-        if let Some(album) = album_map.remove(name.as_str()) {
-            matched.push(album);
-        } else {
-            let available: Vec<&String> = album_map.keys().collect();
-            anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
+            // Pre-compute the "in any user album" set BEFORE consuming the
+            // map, so the unfiled pass (if any) can skip anything that
+            // already belongs to a concrete user album — including albums
+            // excluded via --exclude-album (the user explicitly asked to
+            // skip those photos, so they must not fall through to unfiled).
+            let mut in_any_album: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+            if has_album_token {
+                for (name, album) in &album_map {
+                    tracing::debug!(
+                        album = name,
+                        "Pre-fetching album asset IDs for unfiled exclusion set"
+                    );
+                    collect_album_asset_ids(album, &mut in_any_album).await?;
+                }
+            }
+
+            // Sort by name for deterministic ordering — HashMap iteration
+            // order is not stable and users inspecting logs or dry-run
+            // output want consistency across runs.
+            let mut named_albums: Vec<(String, icloud::photos::PhotoAlbum)> =
+                album_map.into_iter().collect();
+            named_albums.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut passes: Vec<AlbumPass> = Vec::new();
+            let mut excluded_count = 0usize;
+            for (name, album) in named_albums {
+                if exclude_albums.iter().any(|e| e == &name) {
+                    excluded_count += 1;
+                    tracing::debug!(album = %name, "Album excluded by --exclude-album");
+                    continue;
+                }
+                passes.push(AlbumPass {
+                    album,
+                    exclude_ids: std::sync::Arc::clone(&empty),
+                });
+            }
+            tracing::info!(
+                count = passes.len(),
+                excluded = excluded_count,
+                unfiled_pass = has_album_token,
+                "Expanded '-a all' to every user-created album (smart folders skipped)"
+            );
+            if has_album_token {
+                passes.push(AlbumPass {
+                    album: library.all(),
+                    exclude_ids: std::sync::Arc::new(in_any_album),
+                });
+            }
+            Ok(AlbumPlan { passes })
         }
     }
-    Ok((matched, empty_ids))
 }
 
 #[cfg(test)]
@@ -538,26 +669,46 @@ mod tests {
         })
     }
 
+    // Shortcut for building an AlbumSelection::Named from string literals.
+    fn named(names: &[&str]) -> config::AlbumSelection {
+        config::AlbumSelection::Named(names.iter().map(|s| (*s).to_string()).collect())
+    }
+
     #[tokio::test]
     async fn resolve_albums_no_album_no_exclude() {
         let mock = MockPhotosSession::new();
         let library = stub_library(mock);
-        let (albums, exclude_ids) = resolve_albums(&library, &[], &[]).await.unwrap();
-        assert_eq!(albums.len(), 1, "should return library.all()");
-        assert!(exclude_ids.is_empty());
+        let plan = resolve_albums(
+            &library,
+            &config::AlbumSelection::LibraryOnly,
+            &[],
+            "%Y/%m/%d",
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.passes.len(), 1, "should return library.all()");
+        assert!(plan.passes[0].exclude_ids.is_empty());
     }
 
     #[tokio::test]
     async fn resolve_albums_exclude_not_found_warns() {
-        // fetch_folders returns one album "Vacation", but we exclude "Nonexistent"
-        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []})); // fetch_folders: no user albums
+        // fetch_folders returns no albums, but we exclude "Nonexistent"
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
         let library = stub_library(mock);
 
-        let (albums, exclude_ids) = resolve_albums(&library, &[], &["Nonexistent".to_string()])
-            .await
-            .unwrap();
-        assert_eq!(albums.len(), 1, "should return library.all()");
-        assert!(exclude_ids.is_empty(), "non-existent album produces no IDs");
+        let plan = resolve_albums(
+            &library,
+            &config::AlbumSelection::LibraryOnly,
+            &["Nonexistent".to_string()],
+            "%Y/%m/%d",
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.passes.len(), 1, "should return library.all()");
+        assert!(
+            plan.passes[0].exclude_ids.is_empty(),
+            "non-existent album produces no IDs"
+        );
     }
 
     #[tokio::test]
@@ -568,19 +719,19 @@ mod tests {
         ]}));
         let library = stub_library(mock);
 
-        let (albums, exclude_ids) = resolve_albums(&library, &["Vacation".to_string()], &[])
+        let plan = resolve_albums(&library, &named(&["Vacation"]), &[], "%Y/%m/%d")
             .await
             .unwrap();
-        assert_eq!(albums.len(), 1);
-        assert!(exclude_ids.is_empty());
+        assert_eq!(plan.passes.len(), 1);
+        assert!(plan.passes[0].exclude_ids.is_empty());
     }
 
     #[tokio::test]
     async fn resolve_albums_explicit_album_not_found_errors() {
-        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []})); // no user albums
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
         let library = stub_library(mock);
 
-        let result = resolve_albums(&library, &["DoesNotExist".to_string()], &[]).await;
+        let result = resolve_albums(&library, &named(&["DoesNotExist"]), &[], "%Y/%m/%d").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
@@ -594,14 +745,10 @@ mod tests {
         ]}));
         let library = stub_library(mock);
 
-        let (albums, _) = resolve_albums(
-            &library,
-            &["Vacation".to_string(), "Vacation".to_string()],
-            &[],
-        )
-        .await
-        .unwrap();
-        assert_eq!(albums.len(), 1, "duplicate names dedup to 1");
+        let plan = resolve_albums(&library, &named(&["Vacation", "Vacation"]), &[], "%Y/%m/%d")
+            .await
+            .unwrap();
+        assert_eq!(plan.passes.len(), 1, "duplicate names dedup to 1");
     }
 
     #[tokio::test]
@@ -613,20 +760,21 @@ mod tests {
         ]}));
         let library = stub_library(mock);
 
-        let (albums, exclude_ids) = resolve_albums(
+        let plan = resolve_albums(
             &library,
-            &["Vacation".to_string(), "Hidden".to_string()],
+            &named(&["Vacation", "Hidden"]),
             &["Hidden".to_string()],
+            "%Y/%m/%d",
         )
         .await
         .unwrap();
         assert_eq!(
-            albums.len(),
+            plan.passes.len(),
             1,
             "Hidden should be excluded from matched albums"
         );
         assert!(
-            exclude_ids.is_empty(),
+            plan.passes[0].exclude_ids.is_empty(),
             "explicit album path doesn't populate exclude IDs"
         );
     }
@@ -634,31 +782,112 @@ mod tests {
     #[tokio::test]
     async fn resolve_albums_exclude_without_album_collects_ids() {
         // The mock session needs to handle:
-        // 1. fetch_folders (original session) → returns album "Hidden"
-        // 2. album.len() (cloned session) → returns count
-        // 3. photo_stream fetcher (re-cloned session) → returns one asset page
+        // 1. fetch_folders → returns album "Hidden"
+        // 2. album.len() → returns count
+        // 3. photo_stream fetcher → returns one asset page
         // 4. photo_stream fetcher 2nd call → returns empty (end of stream)
         let mock = MockPhotosSession::new()
-            // 1. fetch_folders
             .ok(serde_json::json!({"records": [
                 folder_record("FOLDER_1", "Hidden")
             ]}))
-            // Remaining responses are cloned into the album's session:
-            // 2. album.len() batch query
             .ok(album_count_response(1))
-            // 3. photo_stream fetcher: first page with one asset
             .ok(asset_page("MASTER_1"))
-            // 4. photo_stream fetcher: empty page (end)
             .ok(serde_json::json!({"records": []}));
         let library = stub_library(mock);
 
-        let (albums, exclude_ids) = resolve_albums(&library, &[], &["Hidden".to_string()])
+        let plan = resolve_albums(
+            &library,
+            &config::AlbumSelection::LibraryOnly,
+            &["Hidden".to_string()],
+            "%Y/%m/%d",
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.passes.len(), 1, "should return library.all()");
+        assert!(
+            plan.passes[0].exclude_ids.contains("MASTER_1"),
+            "should contain the excluded asset ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_all_expands_to_every_album() {
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation"),
+            folder_record("FOLDER_2", "Summer Trip")
+        ]}));
+        let library = stub_library(mock);
+
+        let plan = resolve_albums(&library, &config::AlbumSelection::All, &[], "%Y/%m/%d")
             .await
             .unwrap();
-        assert_eq!(albums.len(), 1, "should return library.all()");
+        assert_eq!(
+            plan.passes.len(),
+            2,
+            "every user-created album becomes a pass, no unfiled pass without {{album}}"
+        );
+        for pass in &plan.passes {
+            assert!(
+                pass.exclude_ids.is_empty(),
+                "concrete album passes carry no exclusion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_all_with_album_token_adds_unfiled_pass() {
+        // fetch_folders returns one album; then len + stream mocks so the
+        // unfiled exclusion set is populated from that album's member.
+        let mock = MockPhotosSession::new()
+            .ok(serde_json::json!({"records": [folder_record("FOLDER_1", "Vacation")]}))
+            .ok(album_count_response(1))
+            .ok(asset_page("MASTER_1"))
+            .ok(serde_json::json!({"records": []}));
+        let library = stub_library(mock);
+
+        let plan = resolve_albums(
+            &library,
+            &config::AlbumSelection::All,
+            &[],
+            "{album}/%Y/%m/%d",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plan.passes.len(),
+            2,
+            "concrete album + unfiled pass when {{album}} is in template"
+        );
         assert!(
-            exclude_ids.contains("MASTER_1"),
-            "should contain the excluded asset ID"
+            plan.passes[0].exclude_ids.is_empty(),
+            "concrete pass carries no exclusion"
+        );
+        assert!(
+            plan.passes[1].exclude_ids.contains("MASTER_1"),
+            "unfiled pass excludes assets already in some album"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_all_respects_exclude_albums() {
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation"),
+            folder_record("FOLDER_2", "Hidden Trip")
+        ]}));
+        let library = stub_library(mock);
+
+        let plan = resolve_albums(
+            &library,
+            &config::AlbumSelection::All,
+            &["Hidden Trip".to_string()],
+            "%Y/%m/%d",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plan.passes.len(),
+            1,
+            "Hidden Trip is filtered out of the concrete passes"
         );
     }
 
@@ -698,15 +927,16 @@ mod tests {
         ]}));
         let library = stub_library(mock);
 
-        let (albums, _) = resolve_albums(
+        let plan = resolve_albums(
             &library,
+            &named(&["Vacation"]),
             &["Vacation".to_string()],
-            &["Vacation".to_string()],
+            "%Y/%m/%d",
         )
         .await
         .unwrap();
         assert!(
-            albums.is_empty(),
+            plan.passes.is_empty(),
             "album present in both --album and --exclude-album should yield zero albums"
         );
     }

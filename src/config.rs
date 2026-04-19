@@ -170,6 +170,111 @@ impl std::fmt::Display for LibrarySelection {
     }
 }
 
+/// Which albums to sync.
+///
+/// `All` is triggered by explicit `-a all` *or* the smart default: no `-a`
+/// flag passed *and* `{album}` appears in `--folder-structure`. In both
+/// cases, every discovered album is enumerated; an additional library-wide
+/// pass for "unfiled" photos is only added when `{album}` is in the template
+/// (decided at `resolve_albums` time, not stored here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlbumSelection {
+    /// No `-a` filter; enumerate the library as a single stream (today's
+    /// default behaviour).
+    LibraryOnly,
+    /// Explicit list of album names to sync.
+    Named(Vec<String>),
+    /// `-a all` (explicit) or the smart default when `{album}` is in the
+    /// folder template: every discovered album.
+    All,
+}
+
+impl AlbumSelection {
+    /// Serialize to a `Vec<String>` for TOML persistence and JSON reports.
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            Self::LibraryOnly => Vec::new(),
+            Self::All => vec!["all".to_string()],
+            Self::Named(v) => v.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for AlbumSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LibraryOnly => f.write_str("<library-only>"),
+            Self::All => f.write_str("all"),
+            Self::Named(names) => f.write_str(&names.join(", ")),
+        }
+    }
+}
+
+/// Strip the Python-style `{:...}` wrapper used in legacy folder-structure
+/// values so validation runs against the same form `expand_album_token`
+/// expands at runtime.
+fn strip_python_wrapper(folder_structure: &str) -> &str {
+    if folder_structure.starts_with("{:") && folder_structure.ends_with('}') {
+        &folder_structure[2..folder_structure.len() - 1]
+    } else {
+        folder_structure
+    }
+}
+
+/// Reject `--folder-structure` values that place `{album}` somewhere other
+/// than the first path segment, or use it more than once. Both cases would
+/// make the "unfiled photos" fallback path shift other segments around
+/// unpredictably when `{album}` collapses to an empty string.
+fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
+    let stripped = strip_python_wrapper(folder_structure);
+    let count = stripped.matches("{album}").count();
+    if count == 0 {
+        return Ok(());
+    }
+    if count > 1 {
+        anyhow::bail!(
+            "'{{album}}' may only appear once in --folder-structure; got {count} occurrences in \"{folder_structure}\""
+        );
+    }
+    if stripped.split('/').next() != Some("{album}") {
+        anyhow::bail!(
+            "'{{album}}' must be the first path segment of --folder-structure; got \"{folder_structure}\""
+        );
+    }
+    Ok(())
+}
+
+/// Convert a raw `Vec<String>` (from CLI or TOML) into an [`AlbumSelection`],
+/// enforcing that `-a all` is not mixed with specific album names.
+fn resolve_album_selection(
+    raw: Vec<String>,
+    folder_structure: &str,
+) -> anyhow::Result<AlbumSelection> {
+    let has_all = raw.iter().any(|s| s.eq_ignore_ascii_case("all"));
+    if has_all {
+        let non_all: Vec<&String> = raw
+            .iter()
+            .filter(|s| !s.eq_ignore_ascii_case("all"))
+            .collect();
+        anyhow::ensure!(
+            non_all.is_empty(),
+            "'-a all' cannot be combined with other album names; got {raw:?}. \
+             Pass either '-a all' alone or a list of specific names."
+        );
+        return Ok(AlbumSelection::All);
+    }
+    if raw.is_empty() {
+        // Smart default: bare `{album}` in the folder template implies
+        // "every album, plus an unfiled pass" without the user having to
+        // also pass `-a all`.
+        if strip_python_wrapper(folder_structure).contains("{album}") {
+            return Ok(AlbumSelection::All);
+        }
+        return Ok(AlbumSelection::LibraryOnly);
+    }
+    Ok(AlbumSelection::Named(raw))
+}
+
 /// Application configuration.
 ///
 /// Fields are ordered for optimal memory layout:
@@ -189,7 +294,7 @@ pub struct Config {
     pub directory: PathBuf,
     pub cookie_directory: PathBuf,
     pub folder_structure: String,
-    pub albums: Vec<String>,
+    pub albums: AlbumSelection,
     pub exclude_albums: Vec<String>,
     pub filename_exclude: Vec<glob::Pattern>,
     pub library: LibrarySelection,
@@ -509,6 +614,7 @@ impl Config {
             toml_dl.and_then(|d| d.folder_structure.clone()),
             "%Y/%m/%d".to_string(),
         );
+        validate_folder_structure(&folder_structure)?;
         // Resolve bandwidth limit (CLI bytes/sec > TOML human-readable string > None).
         let bandwidth_limit: Option<u64> = if let Some(n) = sync.bandwidth_limit {
             Some(n)
@@ -562,13 +668,14 @@ impl Config {
 
         // Filters
         let library = resolve_library_selection(sync.library, toml_filters);
-        let albums = if sync.albums.is_empty() {
+        let raw_albums = if sync.albums.is_empty() {
             toml_filters
                 .and_then(|f| f.albums.clone())
                 .unwrap_or_default()
         } else {
             sync.albums
         };
+        let albums = resolve_album_selection(raw_albums, &folder_structure)?;
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
         // Resolve live photo mode: --live-photo-mode > --skip-live-photos > TOML photos > TOML filters compat
@@ -823,10 +930,10 @@ impl Config {
             }),
             filters: Some(TomlFilters {
                 library: library_str,
-                albums: if self.albums.is_empty() {
-                    None
-                } else {
-                    Some(self.albums.clone())
+                albums: match &self.albums {
+                    AlbumSelection::LibraryOnly => None,
+                    AlbumSelection::All => Some(vec!["all".to_string()]),
+                    AlbumSelection::Named(v) => Some(v.clone()),
                 },
                 exclude_albums: if self.exclude_albums.is_empty() {
                     None
@@ -1621,7 +1728,10 @@ mod tests {
             Some(toml),
         )
         .unwrap();
-        assert_eq!(cfg.albums, vec!["Favorites", "Vacation"]);
+        assert_eq!(
+            cfg.albums,
+            AlbumSelection::Named(vec!["Favorites".to_string(), "Vacation".to_string()])
+        );
     }
 
     #[test]
@@ -1634,7 +1744,10 @@ mod tests {
         let mut sync = default_sync();
         sync.albums = vec!["Screenshots".to_string()];
         let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
-        assert_eq!(cfg.albums, vec!["Screenshots"]);
+        assert_eq!(
+            cfg.albums,
+            AlbumSelection::Named(vec!["Screenshots".to_string()])
+        );
     }
 
     #[test]
@@ -2216,7 +2329,7 @@ mod tests {
             cfg.library,
             LibrarySelection::Single("PrimarySync".to_string())
         );
-        assert!(cfg.albums.is_empty());
+        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
         assert!(!cfg.skip_videos);
         assert!(!cfg.skip_photos);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
@@ -2969,7 +3082,10 @@ mod tests {
             cfg.library,
             LibrarySelection::Single("SharedSync-FULL".to_string())
         );
-        assert_eq!(cfg.albums, vec!["Album1"]);
+        assert_eq!(
+            cfg.albums,
+            AlbumSelection::Named(vec!["Album1".to_string()])
+        );
         assert!(cfg.skip_videos);
         assert_eq!(cfg.recent, Some(50));
         assert!(matches!(cfg.size, VersionSize::Medium));
@@ -3073,14 +3189,178 @@ mod tests {
             Some(toml),
         )
         .unwrap();
-        assert!(cfg.albums.is_empty());
+        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
     }
 
     #[test]
     fn test_build_albums_no_toml_no_cli() {
         let cfg =
             Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
-        assert!(cfg.albums.is_empty());
+        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
+    }
+
+    #[test]
+    fn test_album_selection_to_vec_roundtrip() {
+        assert!(AlbumSelection::LibraryOnly.to_vec().is_empty());
+        assert_eq!(AlbumSelection::All.to_vec(), vec!["all".to_string()]);
+        assert_eq!(
+            AlbumSelection::Named(vec!["A".into(), "B".into()]).to_vec(),
+            vec!["A".to_string(), "B".to_string()]
+        );
+    }
+
+    // ── AlbumSelection resolution tests ────────────────────────────
+
+    #[test]
+    fn test_build_album_all_maps_to_all_variant() {
+        let mut sync = default_sync();
+        sync.albums = vec!["all".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::All);
+    }
+
+    #[test]
+    fn test_build_album_all_is_case_insensitive() {
+        for raw in ["all", "ALL", "All", "aLL"] {
+            let mut sync = default_sync();
+            sync.albums = vec![raw.to_string()];
+            let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+            assert_eq!(
+                cfg.albums,
+                AlbumSelection::All,
+                "'{raw}' should resolve to AlbumSelection::All"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_album_all_mixed_with_names_errors() {
+        let mut sync = default_sync();
+        sync.albums = vec!["all".to_string(), "Vacation".to_string()];
+        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'-a all' cannot be combined"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_build_album_all_from_toml() {
+        let toml_str = r#"
+            [filters]
+            albums = ["all"]
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::All);
+    }
+
+    #[test]
+    fn test_build_album_smart_default_kicks_in_with_album_token() {
+        // No -a passed, but {album} in folder_structure -> implicit All.
+        let mut sync = default_sync();
+        sync.folder_structure = Some("{album}/%Y/%m".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::All);
+    }
+
+    #[test]
+    fn test_build_album_smart_default_inactive_without_album_token() {
+        // No -a, no {album} -> LibraryOnly (today's default).
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%m/%d".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
+    }
+
+    #[test]
+    fn test_build_album_named_preserved() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string(), "Trip".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(
+            cfg.albums,
+            AlbumSelection::Named(vec!["Vacation".to_string(), "Trip".to_string()])
+        );
+    }
+
+    // ── folder_structure {album} placement validation ──────────────
+
+    #[test]
+    fn test_build_album_token_rejected_mid_path() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("Photos/{album}/%Y".to_string());
+        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'{album}' must be the first path segment"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_album_token_rejected_after_date() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/{album}/%m".to_string());
+        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'{album}' must be the first path segment"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_album_token_rejected_as_trailing() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%m/{album}".to_string());
+        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        assert!(err.to_string().contains("must be the first path segment"));
+    }
+
+    #[test]
+    fn test_build_album_token_rejected_duplicate() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("{album}/%Y/{album}".to_string());
+        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        assert!(
+            err.to_string().contains("may only appear once"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_album_token_accepted_at_root() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string()];
+        sync.folder_structure = Some("{album}/%Y/%m".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "{album}/%Y/%m");
+    }
+
+    #[test]
+    fn test_build_album_token_accepted_alone() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string()];
+        sync.folder_structure = Some("{album}".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "{album}");
+    }
+
+    #[test]
+    fn test_build_album_token_accepted_within_python_wrapper() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string()];
+        sync.folder_structure = Some("{:{album}/%Y/%m}".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "{:{album}/%Y/%m}");
     }
 
     #[test]

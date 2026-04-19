@@ -13,7 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`--bandwidth-limit` flag to cap total download throughput.** Accepts human-readable values (`10M`, `500K`, `2Mi`, bare integer = bytes/sec). The cap is global across all concurrent downloads, so total throughput stays within budget regardless of `--threads-num`. Also configurable via `[download] bandwidth_limit` in the TOML config and `KEI_BANDWIDTH_LIMIT` env var. When set without an explicit `--threads-num`, concurrency defaults to 1 so the capped budget isn't fragmented across many starved connections. ([#53])
 
+- **`-a all` to sync every user-created album in one run.** Case-insensitive, works as a CLI flag, `KEI_ALBUM` env var, or `filters.albums = ["all"]` in TOML. Apple's smart folders (Favorites, Screenshots, Videos, Hidden, Recently Deleted, etc.) are skipped - list them explicitly with `-a Favorites` if you want them. Combining `-a all` with specific names is rejected with "cannot combine 'all' with specific album names". ([#215])
+
+- **Smart `{album}` auto-expansion in `--folder-structure`.** When the template contains `{album}` and no `-a` flag is passed, kei implicitly runs `-a all`. In either mode (explicit `-a all` or implicit via template), using `{album}` in the template adds a library-wide pass for photos that aren't in any user-created album - `{album}` collapses to empty for those, so `{album}/%Y/%m/%d` puts unfiled photos at `%Y/%m/%d/`. Without `{album}` in the template, `-a all` skips unfiled photos entirely. Photos that belong to multiple albums are copied into each album folder. ([#215])
+
+- **`{album}` placement validation.** `{album}` must be the first path segment in `--folder-structure` and may only appear once. `{album}/%Y/%m` is fine; `Photos/{album}/%Y`, `%Y/{album}/%m`, and `{album}/%Y/{album}` are rejected at startup with a quoted error message. The restriction keeps unfiled-photo paths stable - without it, collapsing `{album}` shifts segments around and the unfiled tree no longer matches the album tree. ([#215])
+
+### Known limitations
+
+- The state DB tracks a single download path per asset. A photo copied to multiple album folders under `{album}/...` has all copies on disk, but the DB records only the most recently written path. Re-running sync stays idempotent because kei's filesystem-exists check is path-aware - it won't re-download files it already put on disk, regardless of which path the DB currently holds.
+
 [#53]: https://github.com/rhoopr/kei/issues/53
+[#215]: https://github.com/rhoopr/kei/issues/215
 
 ---
 

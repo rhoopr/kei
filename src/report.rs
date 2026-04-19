@@ -57,7 +57,7 @@ impl RunOptions {
             live_photo_mode: format!("{:?}", config.live_photo_mode).to_lowercase(),
             live_photo_size: format!("{:?}", config.live_photo_size).to_lowercase(),
             file_match_policy: format!("{:?}", config.file_match_policy).to_lowercase(),
-            albums: config.albums.clone(),
+            albums: config.albums.to_vec(),
             library: format!("{:?}", config.library).to_lowercase(),
             skip_videos: config.skip_videos,
             skip_photos: config.skip_photos,

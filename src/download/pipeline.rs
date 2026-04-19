@@ -17,7 +17,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::icloud::photos::PhotoAlbum;
 use crate::retry::RetryConfig;
 use crate::state::{AssetRecord, StateDb, SyncRunStats};
 
@@ -318,16 +317,21 @@ where
                     if is_asset_filtered(&asset, config).is_some() {
                         continue;
                     }
-                    let candidates = extract_skip_candidates(&asset, config);
-                    if !candidates.is_empty()
-                        && candidates.iter().all(|&(vs, cs)| {
-                            matches!(
-                                download_ctx.should_download_fast(asset.id(), vs, cs, true),
-                                Some(false)
-                            )
-                        })
-                    {
-                        continue;
+                    // Fast-skip is path-blind; in `{album}` mode the same
+                    // asset legitimately lives at multiple paths, so we'd
+                    // under-report the listing if we trusted the DB here.
+                    if !config.folder_structure.contains("{album}") {
+                        let candidates = extract_skip_candidates(&asset, config);
+                        if !candidates.is_empty()
+                            && candidates.iter().all(|&(vs, cs)| {
+                                matches!(
+                                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                                    Some(false)
+                                )
+                            })
+                        {
+                            continue;
+                        }
                     }
 
                     pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
@@ -541,7 +545,12 @@ where
                         continue;
                     }
 
-                    if trust_state {
+                    // Fast-skip is path-blind; in `{album}` mode the same
+                    // asset may target multiple album folders, so skipping
+                    // after the first download would leave later folders
+                    // missing their copy. Fall through to the path-aware
+                    // filesystem/dir_cache check below.
+                    if trust_state && !config.folder_structure.contains("{album}") {
                         let candidates = extract_skip_candidates(&asset, config);
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
@@ -974,7 +983,7 @@ where
 /// `download_photos_full_with_token`.
 pub(super) async fn build_download_outcome(
     download_client: &Client,
-    albums: &[PhotoAlbum],
+    passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
     streaming_result: StreamingResult,
     started: Instant,
@@ -1083,7 +1092,7 @@ pub(super) async fn build_download_outcome(
         "── Cleanup pass: re-fetching URLs and retrying failed downloads ──"
     );
 
-    let fresh_tasks = super::build_download_tasks(albums, config, shutdown_token.clone()).await?;
+    let fresh_tasks = super::build_download_tasks(passes, config, shutdown_token.clone()).await?;
     tracing::debug!(
         count = fresh_tasks.len(),
         "  Re-fetched tasks with fresh URLs"
