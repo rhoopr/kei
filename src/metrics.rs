@@ -348,12 +348,13 @@ async fn handle_healthz(State(handle): State<MetricsHandle>) -> impl IntoRespons
 ///
 /// Binds synchronously so that a misconfigured port fails at startup rather
 /// than silently. Returns a `MetricsHandle` the sync loop uses to push metrics
-/// after each cycle. The server shuts down gracefully when `shutdown_token` is
-/// cancelled.
+/// after each cycle and a `JoinHandle` so the sync loop can await graceful
+/// shutdown before the runtime drops. The server shuts down gracefully when
+/// `shutdown_token` is cancelled.
 pub(crate) fn spawn_server(
     port: u16,
     shutdown_token: CancellationToken,
-) -> anyhow::Result<MetricsHandle> {
+) -> anyhow::Result<(MetricsHandle, tokio::task::JoinHandle<()>)> {
     let handle = MetricsHandle::new();
     let app = Router::new()
         .route("/metrics", get(handle_metrics))
@@ -368,7 +369,7 @@ pub(crate) fn spawn_server(
 
     tracing::info!(port, "Prometheus metrics server listening");
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app)
             .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
             .await
@@ -378,7 +379,7 @@ pub(crate) fn spawn_server(
         tracing::info!(port, "Prometheus metrics server stopped");
     });
 
-    Ok(handle)
+    Ok((handle, task))
 }
 
 #[cfg(test)]

@@ -425,10 +425,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Spawn the Prometheus metrics + /healthz server if --metrics-port is set.
     // Binds synchronously so a bad port fails at startup rather than silently.
-    let metrics_handle = config
+    let (metrics_handle, metrics_task) = config
         .metrics_port
         .map(|port| crate::metrics::spawn_server(port, shutdown_token.clone()))
-        .transpose()?;
+        .transpose()?
+        .map_or((None, None), |(h, t)| (Some(h), Some(t)));
 
     let mut health = health::HealthStatus::new();
     let mut consecutive_album_refresh_failures = 0u32;
@@ -678,6 +679,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
         } else {
             break;
+        }
+    }
+
+    // Signal the metrics server to shut down (idempotent if SIGINT already
+    // fired) and await its graceful drain so the binary doesn't exit while
+    // an in-flight /metrics scrape is still flushing.
+    if let Some(task) = metrics_task {
+        shutdown_token.cancel();
+        if let Err(e) = task.await {
+            tracing::warn!(error = %e, "metrics server task panicked");
         }
     }
 
