@@ -131,12 +131,11 @@ impl ExifPayload {
     /// Build from `AssetMetadata`, preserving precedence rules from the spec:
     /// rating falls back to `is_favorite -> 5`; description falls back to title.
     pub(super) fn from_metadata(meta: &crate::state::AssetMetadata) -> Self {
-        let rating = meta
-            .rating
-            .or(if meta.is_favorite { Some(5) } else { None });
+        // rating comes straight from meta — provider adapters (e.g. the iCloud
+        // extractor) already map `is_favorite` to 5 at ingest time.
         let description = meta.description.clone().or_else(|| meta.title.clone());
         Self {
-            rating,
+            rating: meta.rating,
             latitude: meta.latitude,
             longitude: meta.longitude,
             altitude: meta.altitude,
@@ -1343,8 +1342,6 @@ mod tests {
     #[test]
     fn test_download_task_size() {
         use std::mem::size_of;
-        // Feature 2 added ExifPayload (rating/GPS/description) so each task
-        // carries its write-ready metadata into the download phase.
         assert!(
             size_of::<DownloadTask>() <= 200,
             "DownloadTask size {} exceeds 200 bytes",

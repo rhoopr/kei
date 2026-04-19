@@ -40,50 +40,50 @@ impl ExifWrite {
     }
 }
 
-/// Read the `DateTimeOriginal` EXIF tag from an image file.
-///
-/// Uses `kamadak-exif` (read-only EXIF crate). A separate crate (`little_exif`)
-/// handles writing because no single Rust EXIF library supports both reliable
-/// reading and writing. See [`apply_exif`] for the write side.
-///
-/// Returns `Ok(Some(value))` if the tag is present, `Ok(None)` if the file
-/// has no EXIF data or the tag is missing, and `Err` only on I/O failure.
-pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
-    read_exif_tag(path, exif::Tag::DateTimeOriginal)
+/// Snapshot of the EXIF fields that gate enrichment decisions. A single
+/// parse answers "do we need to write datetime?" and "do we need to write
+/// GPS?" in one pass, avoiding two file opens per asset.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExifProbe {
+    pub(crate) datetime_original: Option<String>,
+    pub(crate) has_gps: bool,
 }
 
-/// Whether the file already has any of the primary GPS tags populated.
-/// Returns `false` if the file has no EXIF data.
-pub(crate) fn has_gps_data(path: &Path) -> bool {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut bufreader = std::io::BufReader::new(&file);
-    let reader = exif::Reader::new();
-    let Ok(data) = reader.read_from_container(&mut bufreader) else {
-        return false;
-    };
-    data.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)
-        .is_some()
-        || data
-            .get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)
-            .is_some()
-}
-
-fn read_exif_tag(path: &Path, tag: exif::Tag) -> Result<Option<String>> {
+/// Parse the image's existing EXIF once and report which gating fields are
+/// present. Returns `Ok(default)` on a file with no EXIF — consumers treat
+/// missing as "unknown" and fall back to overwrite.
+pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
     let file = std::fs::File::open(path).with_context(|| format!("Opening {}", path.display()))?;
     let mut bufreader = std::io::BufReader::new(&file);
     let reader = exif::Reader::new();
     match reader.read_from_container(&mut bufreader) {
-        Ok(data) => Ok(data
-            .get_field(tag, exif::In::PRIMARY)
-            .map(|f| f.display_value().to_string())),
+        Ok(data) => {
+            let datetime_original = data
+                .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
+                .map(|f| f.display_value().to_string());
+            let has_gps = data
+                .get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)
+                .is_some()
+                || data
+                    .get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)
+                    .is_some();
+            Ok(ExifProbe {
+                datetime_original,
+                has_gps,
+            })
+        }
         Err(e) => {
             tracing::debug!(path = %path.display(), error = %e, "No EXIF data");
-            Ok(None)
+            Ok(ExifProbe::default())
         }
     }
+}
+
+/// Read the `DateTimeOriginal` EXIF tag. Thin test-only wrapper around
+/// `probe_exif` for the tests that only care about that single field.
+#[cfg(test)]
+pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
+    probe_exif(path).map(|p| p.datetime_original)
 }
 
 /// Write the EXIF date tags to a JPEG file — thin test-only wrapper.
@@ -606,17 +606,19 @@ mod tests {
     }
 
     #[test]
-    fn has_gps_data_false_on_blank_jpeg() {
+    fn probe_exif_reports_no_gps_on_blank_jpeg() {
         let dir = test_tmp_dir("exif_tests");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("no_gps.jpg");
         fs::write(&path, minimal_jpeg()).unwrap();
-        assert!(!has_gps_data(&path));
+        let probe = probe_exif(&path).unwrap();
+        assert!(!probe.has_gps);
+        assert!(probe.datetime_original.is_none());
         fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn has_gps_data_true_after_write() {
+    fn probe_exif_reports_gps_after_write() {
         let dir = test_tmp_dir("exif_tests");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("with_gps.jpg");
@@ -633,7 +635,27 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(has_gps_data(&path));
+        assert!(probe_exif(&path).unwrap().has_gps);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn probe_exif_reports_datetime_when_present() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe_dt.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+        apply_exif(
+            &path,
+            &ExifWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                ..ExifWrite::default()
+            },
+        )
+        .unwrap();
+        let probe = probe_exif(&path).unwrap();
+        assert!(probe.datetime_original.is_some());
+        assert!(!probe.has_gps);
         fs::remove_file(&path).ok();
     }
 

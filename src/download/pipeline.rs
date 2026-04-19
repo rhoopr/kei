@@ -257,6 +257,17 @@ impl ExifFlags {
     }
 }
 
+impl From<&DownloadConfig> for ExifFlags {
+    fn from(config: &DownloadConfig) -> Self {
+        Self {
+            datetime: config.set_exif_datetime,
+            rating: config.set_exif_rating,
+            gps: config.set_exif_gps,
+            description: config.set_exif_description,
+        }
+    }
+}
+
 /// Configuration for a download pass.
 pub(super) struct PassConfig<'a> {
     pub(super) client: &'a Client,
@@ -403,12 +414,7 @@ where
 
     let download_client = download_client.clone();
     let retry_config = config.retry;
-    let exif_flags = ExifFlags {
-        datetime: config.set_exif_datetime,
-        rating: config.set_exif_rating,
-        gps: config.set_exif_gps,
-        description: config.set_exif_description,
-    };
+    let exif_flags = ExifFlags::from(config.as_ref());
     let concurrency = config.concurrent_downloads;
     let state_db = config.state_db.clone();
 
@@ -1143,12 +1149,7 @@ pub(super) async fn build_download_outcome(
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
-        exif: ExifFlags {
-            datetime: config.set_exif_datetime,
-            rating: config.set_exif_rating,
-            gps: config.set_exif_gps,
-            description: config.set_exif_description,
-        },
+        exif: ExifFlags::from(config.as_ref()),
         concurrency: cleanup_concurrency,
         no_progress_bar: config.no_progress_bar,
         temp_suffix: config.temp_suffix.clone(),
@@ -1364,39 +1365,32 @@ pub(super) async fn run_download_pass(
 /// - **Rating / description**: always overwrite when the flag is set — iCloud
 ///   is the source of truth for these.
 /// - **GPS**: only when the file has no existing GPS IFD.
+///
+/// Pure function of a pre-read `ExifProbe` plus the task's own payload, so the
+/// caller controls where the file I/O happens (blocking pool, not runtime).
 fn plan_exif_write(
     flags: ExifFlags,
     payload: &ExifPayload,
     created_local: &chrono::DateTime<chrono::Local>,
-    path: &std::path::Path,
+    probe: &super::exif::ExifProbe,
 ) -> super::exif::ExifWrite {
     let mut write = super::exif::ExifWrite::default();
 
-    if flags.datetime {
-        match super::exif::get_photo_exif(path) {
-            Ok(None) => {
-                write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
-            }
-            Ok(Some(_)) => {}
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "Failed to read EXIF");
-            }
-        }
+    if flags.datetime && probe.datetime_original.is_none() {
+        write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
     }
 
     if flags.rating {
         write.rating = payload.rating;
     }
 
-    if flags.gps {
+    if flags.gps && !probe.has_gps {
         if let (Some(lat), Some(lng)) = (payload.latitude, payload.longitude) {
-            if !super::exif::has_gps_data(path) {
-                write.gps = Some(super::exif::GpsCoords {
-                    latitude: lat,
-                    longitude: lng,
-                    altitude: payload.altitude,
-                });
-            }
+            write.gps = Some(super::exif::GpsCoords {
+                latitude: lat,
+                longitude: lng,
+                altitude: payload.altitude,
+            });
         }
     }
 
@@ -1478,8 +1472,19 @@ async fn download_single_task(
     let mut exif_ok = true;
     if let Some(part) = &part_path {
         let exif_path = part.clone();
-        let write = plan_exif_write(exif_flags, &task.exif, &task.created_local, &exif_path);
+        let payload = task.exif.clone();
+        let created_local = task.created_local;
+        // Probe + plan + apply all run on the blocking pool so no file I/O
+        // happens on the async runtime's poll thread.
         let exif_result = tokio::task::spawn_blocking(move || {
+            let probe = match super::exif::probe_exif(&exif_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(path = %exif_path.display(), error = %e, "Failed to read EXIF");
+                    super::exif::ExifProbe::default()
+                }
+            };
+            let write = plan_exif_write(exif_flags, &payload, &created_local, &probe);
             if write.is_empty() {
                 return true;
             }

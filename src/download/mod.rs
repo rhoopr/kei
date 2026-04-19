@@ -1332,12 +1332,7 @@ async fn download_photos_incremental(
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
-        exif: ExifFlags {
-            datetime: config.set_exif_datetime,
-            rating: config.set_exif_rating,
-            gps: config.set_exif_gps,
-            description: config.set_exif_description,
-        },
+        exif: ExifFlags::from(config.as_ref()),
         concurrency: config.concurrent_downloads,
         no_progress_bar: config.no_progress_bar,
         temp_suffix: config.temp_suffix.clone(),
