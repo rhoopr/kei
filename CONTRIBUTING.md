@@ -6,9 +6,15 @@ Contributions are welcome. For anything beyond a small fix, open an issue first 
 
 1. Fork the repo and create a branch from `main`.
 2. Make your changes.
-3. Run the checks:
+3. Run the pre-push gate:
    ```sh
-   cargo fmt -- --check
+   just gate
+   ```
+   This runs the same checks CI does: `cargo fmt --check`, `cargo clippy -D warnings`, the offline test trio (unit + CLI + behavioral), doc lints, lockfile check, `cargo audit`, and typos. Fail-fast.
+
+   Without `just` installed, run the raw commands (see `justfile` for the full list):
+   ```sh
+   cargo fmt --all --check
    cargo clippy --all-targets --all-features -- -D warnings
    cargo test --bin kei --test cli --test behavioral
    ```
@@ -18,7 +24,11 @@ All changes go through PRs - no direct commits to `main`.
 
 ## Auth tests
 
-Some tests (`tests/sync.rs`, `tests/state_auth.rs`) hit the live iCloud API and need real credentials. These are `#[ignore]` by default. See [tests/README.md](tests/README.md) for setup.
+Some tests (`tests/sync.rs`, `tests/state_auth.rs`) hit the live iCloud API and need real credentials. These are `#[ignore]` by default. See [tests/README.md](tests/README.md) for setup, then:
+
+```sh
+just test live
+```
 
 You don't need to run auth tests for most changes. CI runs the offline suite (unit, CLI, behavioral) on every PR.
 

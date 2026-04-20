@@ -168,8 +168,11 @@ State lives in a SQLite database alongside your session data (see `--data-dir`).
 Contributions welcome. Open an issue first if you're planning something big.
 
 ```sh
-cargo fmt -- --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test
+just gate        # run the full pre-push gate (fmt, clippy, tests, doc, audit, typos)
+just --list      # see every recipe (test, dev, docker, cov, release, wt)
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [tests/README.md](tests/README.md) for the test catalog.
 
 ## License
 
