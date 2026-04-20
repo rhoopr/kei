@@ -65,7 +65,7 @@ impl TwoFactorChallenge {
 /// An error entry from Apple's `service_errors` array.
 /// Apple auth APIs sometimes return HTTP 200 with error details in the body
 /// instead of using HTTP status codes.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct AppleServiceError {
     #[serde(default)]
     pub code: String,
@@ -81,7 +81,7 @@ pub(crate) struct AppleServiceError {
 /// Apple sometimes returns HTTP 200 with `hasError: true` and a
 /// `service_errors` array instead of a proper HTTP error status.
 /// Call [`check_errors()`](Self::check_errors) after deserializing to detect these.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLoginResponse {
     #[serde(default)]
@@ -129,7 +129,7 @@ impl AccountLoginResponse {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DsInfo {
     #[serde(default)]
@@ -140,13 +140,13 @@ pub struct DsInfo {
     pub has_i_cloud_qualifying_device: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Webservices {
     #[serde(default)]
     pub ckdatabasews: Option<WebserviceEndpoint>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct WebserviceEndpoint {
     pub url: String,
 }

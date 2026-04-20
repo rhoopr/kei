@@ -239,7 +239,7 @@ pub struct Session {
     /// `persist_jar_cookies` to save session cookies to disk, and kept alive
     /// so the client's internal weak reference remains valid.
     cookie_jar: Arc<reqwest::cookie::Jar>,
-    pub session_data: HashMap<String, String>,
+    pub(crate) session_data: HashMap<String, String>,
     cookie_dir: PathBuf,
     sanitized_username: String,
     home_endpoint: String,

@@ -53,6 +53,24 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
+    /// Check that the configuration is self-consistent. Called from
+    /// `Config::build` so a future TOML-driven `RetryConfig` can't slip
+    /// through with `base_delay_secs > max_delay_secs` (which would clamp
+    /// every retry to `max_delay_secs` and surprise anyone debugging).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `base_delay_secs > max_delay_secs`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.base_delay_secs <= self.max_delay_secs,
+            "retry base_delay_secs ({}) must be <= max_delay_secs ({})",
+            self.base_delay_secs,
+            self.max_delay_secs,
+        );
+        Ok(())
+    }
+
     /// Compute the delay for a given retry attempt (0-indexed).
     ///
     /// Formula: `min(base_delay * 2^retry, max_delay) + random_jitter(0..base_delay)`

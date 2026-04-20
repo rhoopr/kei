@@ -101,6 +101,21 @@ pub(super) struct DownloadOpts {
     pub expected_size: Option<u64>,
 }
 
+/// Side-channel observers / throttles that ride along with a download call
+/// without bloating the direct argument list.
+///
+/// `rate_limit_counter`, when set, is incremented by 1 for every observed
+/// HTTP 429 / 503 error (each retry attempt that hits rate-limiting counts
+/// once). The total is aggregated at the sync level so operators see when
+/// Apple is back-pressuring the run.
+///
+/// `bandwidth_limiter`, when set, caps throughput on the response body read.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct DownloadLimits<'a> {
+    pub rate_limit_counter: Option<&'a std::sync::atomic::AtomicUsize>,
+    pub bandwidth_limiter: Option<&'a BandwidthLimiter>,
+}
+
 /// Download a file with retry support and optional expected-size verification.
 pub(super) async fn download_file<C: DownloadClient>(
     client: &C,
@@ -110,7 +125,7 @@ pub(super) async fn download_file<C: DownloadClient>(
     retry_config: &RetryConfig,
     temp_suffix: &str,
     opts: DownloadOpts,
-    bandwidth_limiter: Option<&BandwidthLimiter>,
+    limits: DownloadLimits<'_>,
 ) -> Result<u64, DownloadError> {
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
@@ -118,6 +133,11 @@ pub(super) async fn download_file<C: DownloadClient>(
     Box::pin(retry::retry_with_backoff(
         retry_config,
         |e: &DownloadError| {
+            if e.is_rate_limited() {
+                if let Some(counter) = limits.rate_limit_counter {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             if e.is_retryable() {
                 RetryAction::Retry
             } else {
@@ -132,7 +152,7 @@ pub(super) async fn download_file<C: DownloadClient>(
                 &part_path,
                 opts.skip_rename,
                 opts.expected_size,
-                bandwidth_limiter,
+                limits.bandwidth_limiter,
             ))
             .await
         },
@@ -142,8 +162,14 @@ pub(super) async fn download_file<C: DownloadClient>(
 
 /// Single download attempt with resume support.
 ///
-/// .part files older than this are considered stale (crashed runs) and restarted.
-const STALE_PART_FILE_SECS: u64 = 24 * 3600;
+/// .part files older than this are considered stale (crashed runs) and
+/// restarted. Tightened from the original 24h: a longer resume window
+/// without server-side ETag/Last-Modified validation means bytes from a
+/// pre-rotation version of the asset could end up appended to bytes from
+/// a post-rotation version undetectably when the two happen to have the
+/// same total size. 1h keeps resume useful for typical interrupt/retry
+/// patterns (which complete within minutes) without the long exposure.
+const STALE_PART_FILE_SECS: u64 = 3600;
 
 /// If a .part file already exists, sends a Range request to resume from where
 /// it left off. Falls back to a fresh download if the server doesn't support
@@ -181,7 +207,7 @@ async fn attempt_download<C: DownloadClient>(
                 tracing::warn!(
                     path = %part_path.display(),
                     size = meta.len(),
-                    "Stale .part file (>24h old), restarting download"
+                    "Stale .part file (>1h old), restarting download"
                 );
                 0
             } else {
@@ -257,16 +283,65 @@ async fn attempt_download<C: DownloadClient>(
 
     let content_length = response.content_length;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(truncate)
-        .append(!truncate)
-        .open(&part_path)
-        .await
-        .map_err(|e| {
-            DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
-        })?;
+    // If we resumed and the server advertises a Content-Length that doesn't
+    // reconcile with the API-reported size, the resource on the server has
+    // likely been rotated since we wrote the .part. Discard and restart
+    // cleanly rather than appending new bytes to a stale prefix.
+    if status == 206 && resume_offset > 0 {
+        if let (Some(cl), Some(expected)) = (content_length, expected_size) {
+            let server_total = resume_offset.saturating_add(cl);
+            if server_total != expected {
+                tracing::warn!(
+                    path = %path_str,
+                    resume_offset,
+                    server_remaining = cl,
+                    server_total,
+                    expected,
+                    "Resume bytes inconsistent with API-reported size; discarding .part and restarting"
+                );
+                let _ = fs::remove_file(&part_path).await;
+                return Err(DownloadError::ContentLengthMismatch {
+                    path: path_str.into(),
+                    expected,
+                    received: server_total,
+                });
+            }
+        }
+    }
+
+    // When starting fresh (no resume), unlink any existing .part and use
+    // create_new so a concurrent kei instance writing the same .part is
+    // detected as a hard error (AlreadyExists) rather than silently racing.
+    // When resuming, open append-only without create (the file must exist —
+    // we read its length at the top of this function).
+    let mut file = if truncate {
+        let _ = fs::remove_file(&part_path).await;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => DownloadError::Other(anyhow::anyhow!(
+                    "Concurrent writer detected on {}: another kei instance appears to be \
+                     downloading the same file. Only one kei instance may target a given \
+                     directory at a time",
+                    part_path.display()
+                )),
+                _ => {
+                    DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
+                }
+            })?
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&part_path)
+            .await
+            .map_err(|e| {
+                DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
+            })?
+    };
 
     let mut stream = response.stream;
     let stream_result: Result<(), DownloadError> = async {
@@ -390,15 +465,19 @@ pub(super) async fn rename_part_to_final(
 /// Used for `local_checksum` / `download_checksum` in the state DB and
 /// by `verify --checksums` for integrity checks.
 pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+    use anyhow::Context;
     use sha2::{Digest, Sha256};
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&path)?;
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("opening {} for SHA-256", path.display()))?;
         let mut sha256 = Sha256::new();
         let mut buf = [0u8; 8192];
         loop {
             use std::io::Read;
-            let n = file.read(&mut buf)?;
+            let n = file
+                .read(&mut buf)
+                .with_context(|| format!("reading {} for SHA-256", path.display()))?;
             if n == 0 {
                 break;
             }
@@ -443,13 +522,49 @@ fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum>
     Ok(DecodedChecksum { hex, is_sha1 })
 }
 
+/// Inspect the first bytes of a downloaded file for known-bad sentinels that
+/// unambiguously identify a non-media error body (HTML error page, JSON error,
+/// etc.). Returns a human-readable reason string when a sentinel is present.
+///
+/// Checks run case-insensitively against ASCII-whitespace-trimmed content so
+/// that e.g. a leading `\n<html>` still fails. These sentinels are never valid
+/// image/video starts — unlike the magic-byte checks further down, which are
+/// only warnings because exotic variants exist.
+fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
+    let trimmed = header
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map_or(header, |pos| &header[pos..]);
+
+    // Note: `<?xml` is deliberately NOT a sentinel because legitimate AAE
+    // sidecar files start with an XML declaration.
+    const HTML_PREFIXES: &[&[u8]] = &[b"<!doctype", b"<html"];
+    for prefix in HTML_PREFIXES {
+        if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return Some("file starts with HTML markup (likely a CDN error page)");
+        }
+    }
+
+    // JSON error envelopes: `{"error"`, `{"errors"`, `{"message"`, `{"code"`.
+    // Match only the quoted-key form so we don't reject arbitrary JSON bodies
+    // that legitimately start with `{` (images never do, but we stay narrow).
+    const JSON_PREFIXES: &[&[u8]] = &[b"{\"error\"", b"{\"errors\"", b"{\"message\"", b"{\"code\""];
+    for prefix in JSON_PREFIXES {
+        if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return Some("file starts with a JSON error envelope (likely a CDN error body)");
+        }
+    }
+
+    None
+}
+
 /// Validate that downloaded content matches expected format for the file extension.
 ///
 /// For known media types (JPEG, PNG, HEIC, MOV, etc.), checks magic bytes in the
 /// file header. Magic byte mismatches are logged as warnings but allowed through,
 /// since format variants exist (e.g. classic QuickTime MOV without `ftyp` box).
-/// HTML content is always rejected as a hard error — Apple's CDN occasionally
-/// returns error pages with HTTP 200.
+/// HTML and JSON error-page sentinels are always rejected as hard errors —
+/// Apple's CDN occasionally returns them with HTTP 200.
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
@@ -471,19 +586,13 @@ fn validate_downloaded_content(
 
     let header = &buf[..n];
 
-    // Reject HTML content regardless of extension. Apple's CDN sometimes returns
-    // error/rate-limit pages as HTTP 200 with text/html bodies.
-    let trimmed = header
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .map_or(header, |pos| &header[pos..]);
-
-    if trimmed.starts_with(b"<!")
-        || (trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html"))
-    {
+    // Reject known-bad error-page sentinels regardless of extension. Apple's
+    // CDN occasionally returns rate-limit / 4xx / 5xx bodies as HTTP 200 with
+    // HTML or JSON content that no valid image file would ever start with.
+    if let Some(reason) = detect_error_sentinel(header) {
         return Err(DownloadError::InvalidContent {
             path: download_path.display().to_string().into(),
-            reason: "file contains HTML (likely a CDN error page)".into(),
+            reason: reason.into(),
         });
     }
 
@@ -864,6 +973,58 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_json_error_envelope_as_jpeg() {
+        let body = b"{\"error\": \"Forbidden\", \"code\": 403}";
+        let (part, dest, _dir) = write_temp_file("photo.jpg", body);
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        match err {
+            DownloadError::InvalidContent { reason, .. } => {
+                assert!(
+                    reason.contains("JSON error envelope"),
+                    "expected JSON-sentinel reason, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_json_error_envelope_with_leading_whitespace() {
+        let body = b"\n  {\"errors\": [\"x\"]}";
+        let (part, dest, _dir) = write_temp_file("clip.heic", body);
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_json_error_envelope_case_insensitive_key() {
+        // Sentinel should match the quoted key regardless of case
+        let body = b"{\"ERROR\": \"nope\"}";
+        let (part, dest, _dir) = write_temp_file("photo.png", body);
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn detect_error_sentinel_unit() {
+        assert!(detect_error_sentinel(b"<!doctype html>").is_some());
+        assert!(detect_error_sentinel(b"<!DOCTYPE HTML>").is_some());
+        assert!(detect_error_sentinel(b"<html><body>x</body></html>").is_some());
+        assert!(detect_error_sentinel(b"  \n<HTML>").is_some());
+        assert!(detect_error_sentinel(b"{\"error\": 1}").is_some());
+        assert!(detect_error_sentinel(b"{\"errors\":[]}").is_some());
+        assert!(detect_error_sentinel(b"{\"message\":\"foo\"}").is_some());
+        assert!(detect_error_sentinel(b"{\"code\":403}").is_some());
+
+        // Valid starts that must NOT be flagged
+        assert!(detect_error_sentinel(b"<?xml version=\"1.0\"?>").is_none());
+        assert!(detect_error_sentinel(&[0xFF, 0xD8, 0xFF, 0xE0]).is_none());
+        assert!(detect_error_sentinel(b"").is_none());
+        // A JSON-looking body that isn't an error envelope should pass through
+        assert!(detect_error_sentinel(b"{\"width\":1024}").is_none());
+    }
+
+    #[test]
     fn validate_rejects_empty_file() {
         let (part, dest, _dir) = write_temp_file("empty.jpg", b"");
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
@@ -1241,6 +1402,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attempt_download_resume_rejects_version_rotation_via_content_length() {
+        // If the .part carries K bytes from version A and the server's Range
+        // response's Content-Length (+ resume_offset) totals a different size
+        // than expected_size, the resume must be rejected to avoid producing
+        // a Frankenfile of {A-prefix || B-suffix} bytes.
+        let (download_path, part_path, _dir) = setup_download_dir("rotation", "jpg");
+        // .part carries 100 bytes from version A (expected size 150)
+        std::fs::write(&part_path, vec![0xAA; 100]).unwrap();
+
+        // Server returns 206 claiming the remaining 80 bytes of a 180-byte file
+        // (version B rotation: total 180, not the expected 150).
+        let client = StubDownloadClient {
+            status: 206,
+            content_length: Some(80),
+            content_type: None,
+            body: vec![0xBB; 80],
+        };
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            Some(150), // expected_size signals version A
+            None,
+        )
+        .await
+        .expect_err("resume across version rotation must be rejected");
+
+        match err {
+            DownloadError::ContentLengthMismatch {
+                expected, received, ..
+            } => {
+                assert_eq!(expected, 150);
+                assert_eq!(received, 180); // resume_offset + reported remaining
+            }
+            other => panic!("expected ContentLengthMismatch, got: {other:?}"),
+        }
+        // The stale .part must be removed so the next attempt starts clean.
+        assert!(
+            !part_path.exists(),
+            ".part should be removed after rotation detection"
+        );
+    }
+
+    #[tokio::test]
     async fn attempt_download_resume_fallback_truncates_and_rewrites() {
         let (download_path, part_path, _dir) = setup_download_dir("resume_fallback", "jpg");
 
@@ -1433,7 +1641,7 @@ mod tests {
                 skip_rename: false,
                 expected_size: None,
             },
-            None,
+            DownloadLimits::default(),
         )
         .await;
 
@@ -1610,7 +1818,7 @@ mod tests {
                     skip_rename: false,
                     expected_size: None,
                 },
-                None,
+                DownloadLimits::default(),
             )
             .await;
             (result, download_path, dir)
@@ -1765,7 +1973,7 @@ mod tests {
                     skip_rename: false,
                     expected_size: None,
                 },
-                None,
+                DownloadLimits::default(),
             )
             .await
             .unwrap();
@@ -1817,7 +2025,10 @@ mod tests {
                     skip_rename: false,
                     expected_size: Some(body_size as u64),
                 },
-                Some(&limiter),
+                DownloadLimits {
+                    bandwidth_limiter: Some(&limiter),
+                    ..Default::default()
+                },
             )
             .await
             .expect("throttled download succeeds");
@@ -2044,7 +2255,7 @@ mod tests {
         assert!(!download_path.exists(), "final file should not exist");
     }
 
-    // ── Gap: stale .part file (>24h) triggers restart from zero ──────
+    // ── Gap: stale .part file (>1h) triggers restart from zero ──────
 
     #[tokio::test]
     async fn attempt_download_stale_part_file_restarted() {
@@ -2126,6 +2337,89 @@ mod tests {
             !part_path.exists(),
             ".part should be removed on size mismatch"
         );
+    }
+
+    // ── Gap: two concurrent writers cannot both succeed ──────────────
+
+    /// Stub that blocks inside `fetch()` on a barrier so two concurrent
+    /// `attempt_download` calls reach the create_new section close enough
+    /// in time for the race to manifest if exclusivity is broken.
+    struct GatedStubDownloadClient {
+        body: Vec<u8>,
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl DownloadClient for GatedStubDownloadClient {
+        async fn fetch(
+            &self,
+            _url: &str,
+            _resume_from: Option<u64>,
+        ) -> Result<DownloadResponse, BoxError> {
+            self.barrier.wait().await;
+            let chunks: Vec<Result<Bytes, BoxError>> = vec![Ok(Bytes::from(self.body.clone()))];
+            Ok(DownloadResponse {
+                status: 200,
+                content_length: Some(self.body.len() as u64),
+                content_type: None,
+                stream: Box::pin(futures_util::stream::iter(chunks)),
+            })
+        }
+    }
+
+    /// Concurrent `attempt_download` calls racing on the same .part path
+    /// must never produce a file whose bytes are interleaved from both
+    /// writers. Whether zero, one, or both writers report Ok depends on
+    /// the interleaving: unlink + create_new is racy, so a retryable
+    /// failure on both sides is a legitimate outcome the caller must be
+    /// prepared for. The non-negotiable is that if a file exists at the
+    /// final path, it matches exactly one writer's body.
+    #[tokio::test]
+    async fn attempt_download_concurrent_writers_never_corrupt_final_file() {
+        use std::sync::Arc;
+
+        for iteration in 0..20 {
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("photo.jpg");
+            let part_path = dir.path().join("photo.part");
+
+            let body_a = vec![0xAAu8; 256];
+            let body_b = vec![0xBBu8; 256];
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let client_a = GatedStubDownloadClient {
+                body: body_a.clone(),
+                barrier: barrier.clone(),
+            };
+            let client_b = GatedStubDownloadClient {
+                body: body_b.clone(),
+                barrier: barrier.clone(),
+            };
+
+            let dp_a = download_path.clone();
+            let pp_a = part_path.clone();
+            let task_a = tokio::spawn(async move {
+                attempt_download(&client_a, "http://stub", &dp_a, &pp_a, false, None, None).await
+            });
+            let dp_b = download_path.clone();
+            let pp_b = part_path.clone();
+            let task_b = tokio::spawn(async move {
+                attempt_download(&client_b, "http://stub", &dp_b, &pp_b, false, None, None).await
+            });
+
+            let a = task_a.await.unwrap();
+            let b = task_b.await.unwrap();
+
+            if let Ok(final_bytes) = std::fs::read(&download_path) {
+                assert!(
+                    final_bytes == body_a || final_bytes == body_b,
+                    "iteration {iteration}: final file must match exactly one writer's body \
+                     (no interleaving); got {} bytes, first: {:?}. a={a:?} b={b:?}",
+                    final_bytes.len(),
+                    &final_bytes[..final_bytes.len().min(8)],
+                );
+            }
+        }
     }
 
     // ── Gap: HTTP 4xx error (not 401/403) is not retryable ──────────

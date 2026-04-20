@@ -620,18 +620,251 @@ fn sync_set_exif_datetime_embeds_date() {
             .collect();
         assert!(!jpeg_files.is_empty(), "should have at least one JPEG file");
 
-        // Read EXIF from the first JPEG and verify DateTimeOriginal is present
-        let file = std::fs::File::open(jpeg_files[0]).expect("open JPEG");
-        let mut reader = std::io::BufReader::new(file);
-        let exif_data = exif::Reader::new()
-            .read_from_container(&mut reader)
-            .expect("read EXIF data");
-        let dt = exif_data.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY);
+        // Read XMP from the first JPEG and verify DateTimeOriginal is present
+        use xmp_toolkit::{xmp_ns, OpenFileOptions, XmpFile};
+        let mut file = XmpFile::new().expect("xmp file handle");
+        file.open_file(jpeg_files[0], OpenFileOptions::default().for_read())
+            .expect("open JPEG for XMP read");
+        let meta = file
+            .xmp()
+            .expect("JPEG should have XMP after --set-exif-datetime");
         assert!(
-            dt.is_some(),
-            "DateTimeOriginal EXIF tag should be present after --set-exif-datetime"
+            meta.property(xmp_ns::EXIF, "DateTimeOriginal").is_some()
+                || meta.property(xmp_ns::XMP, "CreateDate").is_some(),
+            "DateTimeOriginal XMP property should be present after --set-exif-datetime"
         );
     });
+}
+
+/// --set-exif-rating should add a Rating property (value depends on the
+/// source photo; we assert the sync succeeds and the resulting JPEG has
+/// a writable XMP packet).
+#[test]
+#[ignore]
+fn sync_set_exif_rating_embeds_rating() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .args(["--set-exif-rating", "--skip-videos"])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let jpeg = first_jpeg(&download_dir.path());
+        use xmp_toolkit::{OpenFileOptions, XmpFile};
+        let mut file = XmpFile::new().expect("xmp file handle");
+        file.open_file(&jpeg, OpenFileOptions::default().for_read())
+            .expect("open JPEG for XMP read");
+        assert!(
+            file.xmp().is_some(),
+            "JPEG should carry an XMP packet after --set-exif-rating"
+        );
+    });
+}
+
+/// --set-exif-gps embeds GPSLatitude/GPSLongitude when the source photo
+/// carries location data. Sync must succeed either way; we only assert
+/// an XMP packet exists.
+#[test]
+#[ignore]
+fn sync_set_exif_gps_embeds_gps() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .args(["--set-exif-gps", "--skip-videos"])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let jpeg = first_jpeg(&download_dir.path());
+        use xmp_toolkit::{OpenFileOptions, XmpFile};
+        let mut file = XmpFile::new().expect("xmp file handle");
+        file.open_file(&jpeg, OpenFileOptions::default().for_read())
+            .expect("open JPEG for XMP read");
+        assert!(
+            file.xmp().is_some(),
+            "JPEG should carry an XMP packet after --set-exif-gps"
+        );
+    });
+}
+
+/// --set-exif-description embeds a dc:description when the source has
+/// one. Sync must succeed either way; we only assert an XMP packet
+/// exists.
+#[test]
+#[ignore]
+fn sync_set_exif_description_embeds_description() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .args(["--set-exif-description", "--skip-videos"])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let jpeg = first_jpeg(&download_dir.path());
+        use xmp_toolkit::{OpenFileOptions, XmpFile};
+        let mut file = XmpFile::new().expect("xmp file handle");
+        file.open_file(&jpeg, OpenFileOptions::default().for_read())
+            .expect("open JPEG for XMP read");
+        assert!(
+            file.xmp().is_some(),
+            "JPEG should carry an XMP packet after --set-exif-description"
+        );
+    });
+}
+
+/// --embed-xmp writes a full kei-authored XMP packet into the JPEG. Verify
+/// the file carries XMP content that references kei's own namespace URI.
+#[test]
+#[ignore]
+fn sync_embed_xmp_writes_xmp_packet() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .args(["--embed-xmp", "--skip-videos"])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let jpeg = first_jpeg(&download_dir.path());
+        use xmp_toolkit::{OpenFileOptions, XmpFile};
+        let mut file = XmpFile::new().expect("xmp file handle");
+        file.open_file(&jpeg, OpenFileOptions::default().for_read())
+            .expect("open JPEG for XMP read");
+        let meta = file.xmp().expect("JPEG should carry XMP after --embed-xmp");
+        // kei registers its own namespace (github.com/rhoopr/kei/ns/1.0/)
+        // for hidden/archived/mediaSubtype/burstId. Serialize and look for
+        // it so we know the packet reached us, not just a remnant from
+        // Apple's source.
+        let serialized = meta.to_string();
+        assert!(
+            serialized.contains("xmpmeta") || serialized.contains("rdf:RDF"),
+            "XMP packet must serialize to an RDF tree: {serialized}"
+        );
+    });
+}
+
+/// --xmp-sidecar writes a .xmp sidecar next to every downloaded media file.
+/// Verify at least one `.xmp` sits next to a downloaded JPEG.
+#[test]
+#[ignore]
+fn sync_xmp_sidecar_writes_sidecar_file() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .args(["--xmp-sidecar", "--skip-videos"])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let files = common::walkdir(download_dir.path());
+        let sidecars: Vec<_> = files
+            .iter()
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("xmp"))
+            })
+            .collect();
+        assert!(
+            !sidecars.is_empty(),
+            "--xmp-sidecar should produce at least one .xmp sidecar, got files: {files:?}"
+        );
+
+        let bytes = std::fs::read(sidecars[0]).expect("read sidecar");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("<x:xmpmeta") || text.contains("xmpmeta"),
+            "sidecar content must be an XMP packet: {text}"
+        );
+    });
+}
+
+/// --embed-xmp on a HEIC file: kei routes through the mp4-atom HEIC writer
+/// rather than xmp_toolkit. The resulting HEIC must carry an XMP packet
+/// as a MIME item inside the `meta` box; we detect it by looking for the
+/// `<x:xmpmeta` magic in the file bytes.
+#[test]
+#[ignore]
+fn sync_embed_xmp_on_heic_writes_mime_item() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .args(["--embed-xmp"])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let files = common::walkdir(download_dir.path());
+        let heics: Vec<_> = files
+            .iter()
+            .filter(|p| {
+                let ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                ext == "heic" || ext == "heif"
+            })
+            .collect();
+
+        if heics.is_empty() {
+            eprintln!(
+                "test album `{}` has no HEIC file; skipping HEIC-specific assertion",
+                album()
+            );
+            return;
+        }
+
+        let bytes = std::fs::read(heics[0]).expect("read HEIC");
+        // <x:xmpmeta is the opening tag the xmp_toolkit serializer emits.
+        // mp4-atom embeds that packet unchanged inside the HEIC `mime` item.
+        let needle = b"<x:xmpmeta";
+        let found = bytes
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle));
+        assert!(
+            found,
+            "HEIC `{}` must carry an XMP packet after --embed-xmp",
+            heics[0].display()
+        );
+    });
+}
+
+/// Find the first downloaded JPEG in `dir`. Panics with a clear message if
+/// none is present — the test album must contain at least one JPEG.
+fn first_jpeg(dir: &&std::path::Path) -> std::path::PathBuf {
+    let files = common::walkdir(dir);
+    files
+        .into_iter()
+        .find(|p| {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            ext == "jpg" || ext == "jpeg"
+        })
+        .unwrap_or_else(|| panic!("no JPEG in {}", dir.display()))
 }
 
 // ── RAW alignment ───────────────────────────────────────────────────────

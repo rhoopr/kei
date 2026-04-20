@@ -9,13 +9,23 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::Stream;
-use tracing::debug;
 
 use super::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
 use super::cloudkit::ChangesZoneResponse;
 use super::queries::{build_changes_zone_request, encode_params, DESIRED_KEYS_VALUES};
 use super::session::{check_changes_zone_error, PhotosSession};
 use crate::retry::RetryConfig;
+
+/// How many consecutive empty /records/query pages trigger true EOF.
+///
+/// CloudKit's /records/query does not expose a `moreComing` flag; an empty
+/// page can be either real end-of-list or a transient gap at this rank
+/// range (e.g., a block of fully-deleted records aligning with a page
+/// boundary). We probe forward by one `page_size` on each empty page and
+/// only terminate after this many consecutive empty probes — two gives
+/// us defense against a single-page gap at the cost of one extra request
+/// on true EOF.
+const MAX_EMPTY_PAGE_PROBES: u32 = 2;
 
 /// A boxed, pinned stream of photo asset results.
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
@@ -99,6 +109,17 @@ impl PhotoAlbum {
             zone_id: config.zone_id,
             retry_config: config.retry_config,
         }
+    }
+
+    /// Return the CloudKit zone name this album belongs to
+    /// (e.g. `PrimarySync`, `SharedSync-<uuid>`). Falls back to an empty
+    /// string if the zone_id JSON lacks a `zoneName` field, which should
+    /// only happen in hand-constructed test fixtures.
+    pub fn zone_name(&self) -> &str {
+        self.zone_id
+            .get("zoneName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
     }
 
     /// Return total item count for this album via `HyperionIndexCountLookup`.
@@ -263,7 +284,7 @@ impl PhotoAlbum {
 
             let stream_error: Option<anyhow::Error> = loop {
                 let body = build_changes_zone_request(&zone_id, Some(&current_token), 200);
-                debug!(
+                tracing::debug!(
                     album = %album_name,
                     token = %current_token,
                     "changes/zone request"
@@ -291,7 +312,10 @@ impl PhotoAlbum {
                     break Some(anyhow::anyhow!("changes/zone returned empty zones array"));
                 };
 
-                // Check for zone-level errors
+                // Check for zone-level errors BEFORE advancing current_token.
+                // On any zone error (including transient RETRY_LATER), the loop
+                // breaks with current_token still set to the last-known-good
+                // value so the caller can retry from a valid checkpoint.
                 let zone_name = zone_result.zone_id.zone_name.clone();
                 if let Err(sync_err) = check_changes_zone_error(
                     zone_result.server_error_code.as_deref(),
@@ -304,7 +328,7 @@ impl PhotoAlbum {
                 current_token = zone_result.sync_token;
                 let more_coming = zone_result.more_coming;
 
-                debug!(
+                tracing::debug!(
                     album = %album_name,
                     records = zone_result.records.len(),
                     more_coming,
@@ -477,6 +501,7 @@ impl PhotoAlbum {
             let mut total_sent: u64 = 0;
             let mut pending_masters: FxHashMap<String, super::cloudkit::Record> =
                 FxHashMap::default();
+            let mut consecutive_empty_pages: u32 = 0;
             let url = format!(
                 "{}/records/query?{}",
                 service_endpoint,
@@ -496,7 +521,7 @@ impl PhotoAlbum {
                     offset,
                     "ASCENDING",
                 );
-                debug!(
+                tracing::debug!(
                     album = %name,
                     range_start = start_offset,
                     range_end = end_offset,
@@ -518,7 +543,7 @@ impl PhotoAlbum {
                         return;
                     }
                 };
-                debug!(
+                tracing::debug!(
                     album = %name,
                     response = %serde_json::to_string_pretty(&response).unwrap_or_default(),
                     "Fetcher response"
@@ -547,17 +572,41 @@ impl PhotoAlbum {
                 let records = query.records;
                 let record_count = records.len();
 
-                debug!(
+                tracing::debug!(
                     album = %name,
                     count = record_count,
                     offset,
                     "Got records"
                 );
 
-                // No records at all means the API has no more data.
+                // An empty page can mean either true end-of-list or a transient
+                // gap at this rank range (e.g., a run of fully-deleted records
+                // aligning with a page boundary). The API has no `moreComing`
+                // flag on /records/query, so we probe forward by one
+                // page_size before committing to EOF. The guard terminates
+                // after MAX_EMPTY_PAGE_PROBES consecutive empty pages to avoid
+                // unbounded scanning on genuinely empty tails.
                 if record_count == 0 {
-                    break;
+                    consecutive_empty_pages += 1;
+                    if consecutive_empty_pages >= MAX_EMPTY_PAGE_PROBES {
+                        tracing::debug!(
+                            album = %name,
+                            offset,
+                            probes = consecutive_empty_pages,
+                            "End of album (consecutive empty pages)"
+                        );
+                        break;
+                    }
+                    tracing::debug!(
+                        album = %name,
+                        offset,
+                        probes = consecutive_empty_pages,
+                        "Empty page, probing forward one page_size"
+                    );
+                    offset += page_size as u64;
+                    continue;
                 }
+                consecutive_empty_pages = 0;
 
                 // Collect current page's records, trying to pair with
                 // buffered unpaired records from previous pages.
@@ -566,7 +615,7 @@ impl PhotoAlbum {
                 let mut page_masters: Vec<super::cloudkit::Record> = Vec::new();
 
                 for rec in records {
-                    debug!(record_type = %rec.record_type, "  record");
+                    tracing::debug!(record_type = %rec.record_type, "  record");
                     if rec.record_type == "CPLAsset" {
                         if let Some(master_id) =
                             rec.fields["masterRef"]["value"]["recordName"].as_str()
@@ -696,12 +745,12 @@ impl PhotoAlbum {
             "filterBy": &filter_by,
             "recordType": list_type,
         });
-        debug!(
+        tracing::debug!(
             count = filter_by.len(),
             query = %serde_json::to_string(&query_part).unwrap_or_default(),
             "list_query filterBy"
         );
-        debug!(
+        tracing::debug!(
             zone_id = %serde_json::to_string(zone_id).unwrap_or_default(),
             "list_query zoneID"
         );
@@ -910,7 +959,7 @@ mod tests {
                         "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
                         "resOriginalRes": {
                             "value": {
-                                "downloadURL": "https://example.com/photo.jpg",
+                                "downloadURL": "https://p01.icloud-content.com/photo.jpg",
                                 "size": 1024,
                                 "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
                             }
@@ -1132,6 +1181,39 @@ mod tests {
         );
     }
 
+    /// A single empty /records/query page is not sufficient to conclude
+    /// EOF. The fetcher must probe forward by one `page_size` before
+    /// terminating so a transient gap doesn't silently cut enumeration
+    /// short.
+    #[tokio::test]
+    async fn test_photo_stream_probes_past_single_empty_page() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosSession::new()
+            .ok(canned_page("master-1", None))
+            // Page 2 is empty (simulated gap); must not terminate.
+            .ok(json!({"records": []}))
+            // Page 3 contains records past the gap.
+            .ok(canned_page("master-2", None));
+        // MockPhotosSession then returns the default {"records": []} on
+        // every subsequent call; the fetcher requires MAX_EMPTY_PAGE_PROBES
+        // consecutive empties to commit to EOF.
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        tokio::pin!(stream);
+
+        let mut count = 0u32;
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+            count += 1;
+        }
+        assert_eq!(
+            count, 2,
+            "both master-1 and master-2 should be yielded; the single empty page in between must not terminate enumeration"
+        );
+    }
+
     // --- changes_stream tests ---
 
     /// Build a canned `ChangesZoneResponse` JSON with the given records,
@@ -1156,7 +1238,7 @@ mod tests {
                 "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
                 "resOriginalRes": {
                     "value": {
-                        "downloadURL": "https://example.com/photo.jpg",
+                        "downloadURL": "https://p01.icloud-content.com/photo.jpg",
                         "size": 1024,
                         "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
                     }
@@ -1315,6 +1397,41 @@ mod tests {
         assert_eq!(
             token, "bad-token",
             "on error, should preserve the last-good token for checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_changes_stream_transient_zone_error_preserves_initial_token() {
+        // A transient zone code (RETRY_LATER, SERVER_INTERNAL_ERROR, etc.)
+        // on the very first page must not lose the caller's initial sync_token.
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosSession::new().ok(json!({
+            "zones": [{
+                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "syncToken": "",
+                "moreComing": false,
+                "serverErrorCode": "RETRY_LATER",
+                "reason": "temporary backend issue"
+            }]
+        }));
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.changes_stream("token-T0");
+        tokio::pin!(stream);
+
+        let mut errors = 0usize;
+        while let Some(result) = stream.next().await {
+            if result.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(errors, 1, "should surface the zone error");
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(
+            token, "token-T0",
+            "transient zone error on first page must preserve the caller's initial token"
         );
     }
 

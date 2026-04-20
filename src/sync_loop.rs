@@ -235,6 +235,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         base_delay_secs: config.retry_delay_secs,
         max_delay_secs: 60,
     };
+    api_retry_config.validate()?;
 
     // CloudKit session/routing recovery: if init or the first CloudKit query
     // surfaces a session-error signature (401 stale session, or 421 persisting
@@ -301,6 +302,43 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             Ok(db) => {
                 tracing::debug!(path = %db_path.display(), "State database opened");
                 let db = Arc::new(db);
+
+                // Promote any sync_runs rows left in status='running' from a
+                // prior SIGKILL'd or crashed process. Runs once per process,
+                // before any new sync starts.
+                match db.promote_orphaned_sync_runs().await {
+                    Ok(0) => {}
+                    Ok(count) => {
+                        tracing::warn!(
+                            count,
+                            "Promoted orphaned sync_runs rows to 'interrupted' \
+                             (prior process exited uncleanly)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to promote orphaned sync_runs rows");
+                    }
+                }
+
+                // Surface enum_in_progress:<zone> markers left by a prior
+                // interrupted full enumeration so the operator understands
+                // why the next full sync will re-enumerate from scratch.
+                match db.list_interrupted_enumerations().await {
+                    Ok(zones) if !zones.is_empty() => {
+                        tracing::warn!(
+                            zones = zones.join(","),
+                            "Prior full enumeration was interrupted; next sync will re-enumerate \
+                             the affected zones from offset 0"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "Failed to list interrupted enumerations"
+                        );
+                    }
+                }
 
                 // For retry-failed, reset failed assets to pending
                 if is_retry_failed {
@@ -369,7 +407,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         );
     }
     let build_download_config = |sync_mode: download::SyncMode,
-                                 exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>|
+                                 exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
+                                 asset_groupings: Arc<download::AssetGroupings>|
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
             directory: config.directory.clone(),
@@ -380,6 +419,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             skip_created_before,
             skip_created_after,
             set_exif_datetime: config.set_exif_datetime,
+            set_exif_rating: config.set_exif_rating,
+            set_exif_gps: config.set_exif_gps,
+            set_exif_description: config.set_exif_description,
+            embed_xmp: config.embed_xmp,
+            xmp_sidecar: config.xmp_sidecar,
             dry_run: config.dry_run,
             concurrent_downloads: config.threads_num as usize,
             recent: config.recent,
@@ -401,6 +445,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             sync_mode,
             album_name: None,
             exclude_asset_ids,
+            asset_groupings,
             bandwidth_limiter: bandwidth_limiter.clone(),
         })
     };
@@ -409,7 +454,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
-    let mut last_cycle_failed_count = 0usize;
+    // Sum of per-cycle failed_counts across the lifetime of this process.
+    // Surfaced at exit so watch-mode daemons don't mask earlier-cycle
+    // failures behind a clean final cycle.
+    let mut cumulative_failed_count = 0usize;
 
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
     for library in &libraries {
@@ -433,10 +481,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Spawn the Prometheus metrics + /healthz server if --metrics-port is set.
     // Binds synchronously so a bad port fails at startup rather than silently.
-    let metrics_handle = config
+    // Watch mode: a cycle completes at most once per interval. Flag /healthz
+    // as stale after two missed intervals (interval * 2) so a single slow
+    // cycle doesn't flip to 503 but a stuck main loop does.
+    let staleness_threshold = config
+        .watch_with_interval
+        .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
+    let (metrics_handle, metrics_task) = config
         .metrics_port
-        .map(|port| crate::metrics::spawn_server(port, shutdown_token.clone()))
-        .transpose()?;
+        .map(|port| crate::metrics::spawn_server(port, shutdown_token.clone(), staleness_threshold))
+        .transpose()?
+        .map_or((None, None), |(h, t)| (Some(h), Some(t)));
 
     let mut health = health::HealthStatus::new();
     let mut consecutive_album_refresh_failures = 0u32;
@@ -514,12 +569,37 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             // Write JSON report if configured
             if let Some(report_path) = &config.report_json {
-                let status = if cycle_result.session_expired {
-                    "session_expired"
-                } else if cycle_result.failed_count > 0 {
-                    "partial_failure"
-                } else {
-                    "success"
+                let status = crate::report::sync_status_str(
+                    cycle_result.session_expired,
+                    cycle_result.failed_count,
+                );
+                // Populate failed_assets from the state DB so the report
+                // reflects the final committed set, not mid-sync churn.
+                // get_failed_sample pushes the LIMIT into SQL so an account
+                // with thousands of failures doesn't load every row here.
+                let (failed_assets, failed_assets_truncated) = match state_db.as_ref() {
+                    Some(db) => match db
+                        .get_failed_sample(crate::report::FAILED_ASSETS_CAP as u32)
+                        .await
+                    {
+                        Ok((records, total)) => {
+                            let truncated =
+                                (total as usize).saturating_sub(crate::report::FAILED_ASSETS_CAP);
+                            let entries: Vec<_> = records
+                                .iter()
+                                .map(crate::report::FailedAssetEntry::from_record)
+                                .collect();
+                            (entries, truncated)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to load failed_assets for sync_report.json"
+                            );
+                            (Vec::new(), 0)
+                        }
+                    },
+                    None => (Vec::new(), 0),
                 };
                 let report = crate::report::SyncReport {
                     version: "1",
@@ -528,6 +608,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     status: status.to_string(),
                     options: crate::report::RunOptions::from_config(&config),
                     stats: cycle_result.stats.clone(),
+                    failed_assets,
+                    failed_assets_truncated,
                 };
                 if let Err(e) = crate::report::write_report(report_path, &report) {
                     tracing::warn!(error = %e, path = %report_path.display(), "Failed to write JSON report");
@@ -614,18 +696,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     &config.username,
                     Some(&data),
                 );
+                cumulative_failed_count =
+                    cumulative_failed_count.saturating_add(cycle_result.failed_count);
                 if is_watch_mode {
                     tracing::warn!(
                         failed_count = cycle_result.failed_count,
+                        cumulative = cumulative_failed_count,
                         "Some downloads failed this cycle, will retry next cycle"
                     );
-                    last_cycle_failed_count = cycle_result.failed_count;
                 } else {
                     return Err(PartialSyncError(cycle_result.failed_count).into());
                 }
             } else {
                 reauth_attempts = 0;
-                last_cycle_failed_count = 0;
                 let data = notifications::SyncNotificationData::from(&cycle_result.stats);
                 notifier.notify(
                     notifications::Event::SyncComplete,
@@ -706,8 +789,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         }
     }
 
-    if last_cycle_failed_count > 0 {
-        Err(PartialSyncError(last_cycle_failed_count).into())
+    // Signal the metrics server to shut down (idempotent if SIGINT already
+    // fired) and await its graceful drain so the binary doesn't exit while
+    // an in-flight /metrics scrape is still flushing.
+    if let Some(task) = metrics_task {
+        shutdown_token.cancel();
+        if let Err(e) = task.await {
+            tracing::warn!(error = %e, "metrics server task panicked");
+        }
+    }
+
+    // Exit non-zero if any cycle in this watch session had failures, not
+    // just the last one. A single successful final cycle must not mask a
+    // multi-cycle failure backlog in Docker / systemd exit-code signalling.
+    if cumulative_failed_count > 0 {
+        Err(PartialSyncError(cumulative_failed_count).into())
     } else {
         Ok(())
     }
@@ -793,6 +889,7 @@ async fn run_cycle(
     build_download_config: &dyn Fn(
         download::SyncMode,
         Arc<rustc_hash::FxHashSet<String>>,
+        Arc<download::AssetGroupings>,
     ) -> Arc<download::DownloadConfig>,
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
@@ -866,11 +963,20 @@ async fn run_cycle(
         };
         tracing::debug!(sync_mode = sync_mode_label, zone = %lib_state.zone_name, "Starting sync cycle");
 
+        // Skip the DB scan entirely when nothing downstream will read it.
+        let asset_groupings = if config.embed_xmp || config.xmp_sidecar {
+            preload_asset_groupings(state_db).await
+        } else {
+            Arc::new(download::AssetGroupings::default())
+        };
         // Each pass carries its own exclude-asset-ids, so the config built
         // here starts with an empty set; download_photos_with_sync derives
         // per-pass configs internally via `with_exclude_ids`.
-        let download_config =
-            build_download_config(sync_mode, Arc::new(rustc_hash::FxHashSet::default()));
+        let download_config = build_download_config(
+            sync_mode,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            asset_groupings,
+        );
         let download_client = shared_session.read().await.download_client();
         let sync_result = download::download_photos_with_sync(
             &download_client,
@@ -956,6 +1062,36 @@ async fn run_cycle(
 /// Check `changes/database` to determine if this watch cycle can be skipped.
 ///
 /// Returns `true` when no zones report changes and `moreComing` is false.
+/// Bulk-load `asset_albums` + `asset_people` into an in-memory index so the
+/// filter phase can enrich payloads without per-asset DB hits.
+async fn preload_asset_groupings(
+    state_db: &Option<Arc<dyn state::StateDb>>,
+) -> Arc<download::AssetGroupings> {
+    let Some(db) = state_db else {
+        return Arc::new(download::AssetGroupings::default());
+    };
+    let albums = db.get_all_asset_albums().await;
+    let people = db.get_all_asset_people().await;
+    let mut groupings = download::AssetGroupings::default();
+    match albums {
+        Ok(rows) => {
+            for (asset_id, album) in rows {
+                groupings.albums.entry(asset_id).or_default().push(album);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to preload asset_albums"),
+    }
+    match people {
+        Ok(rows) => {
+            for (asset_id, person) in rows {
+                groupings.people.entry(asset_id).or_default().push(person);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to preload asset_people"),
+    }
+    Arc::new(groupings)
+}
+
 async fn check_changes_database(
     state_db: &Option<Arc<dyn state::StateDb>>,
     lib_state: &LibraryState,

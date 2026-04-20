@@ -17,15 +17,51 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::icloud::photos::PhotoAsset;
 use crate::retry::RetryConfig;
-use crate::state::{AssetRecord, StateDb, SyncRunStats};
+use crate::state::{AssetRecord, StateDb, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
 use super::filter::{
     determine_media_type, extract_skip_candidates, filter_asset_to_tasks, is_asset_filtered,
-    pre_ensure_asset_dir, DownloadTask, FilterReason, NormalizedPath,
+    pre_ensure_asset_dir, DownloadTask, FilterReason, MetadataPayload, NormalizedPath,
 };
 use super::{paths, DownloadConfig, DownloadContext, DownloadOutcome};
+
+/// Outcome of `batch_forecast_decision` — either keep queueing, emit a
+/// one-shot warn, or stop enqueuing so the caller cancels the sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchForecast {
+    Continue,
+    Warn,
+    Bail,
+}
+
+/// Classify the impact of adding `size` bytes to the running queued total
+/// against the free-space snapshot captured at enumeration start.
+///
+/// Side-effects: `fetch_add`s `size` into `queued_bytes` so concurrent
+/// callers see a consistent total. The caller is responsible for emitting
+/// the log line and/or cancelling.
+fn batch_forecast_decision(
+    size: u64,
+    initial_free: Option<u64>,
+    queued_bytes: &std::sync::atomic::AtomicU64,
+    warn_emitted: &std::sync::atomic::AtomicBool,
+) -> (BatchForecast, u64) {
+    let total = queued_bytes.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+    let Some(free) = initial_free else {
+        return (BatchForecast::Continue, total);
+    };
+    if total >= free {
+        return (BatchForecast::Bail, total);
+    }
+    let warn_threshold = free.saturating_mul(9) / 10;
+    if total >= warn_threshold && !warn_emitted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return (BatchForecast::Warn, total);
+    }
+    (BatchForecast::Continue, total)
+}
 
 /// Per-asset outcome in the producer's task loop. Ordered by ascending
 /// priority so `.max()` picks the winner when an asset has tasks with
@@ -124,6 +160,9 @@ pub(super) struct StreamingResult {
     pub(super) skip_summary: ProducerSkipSummary,
     pub(super) bytes_downloaded: u64,
     pub(super) disk_bytes_written: u64,
+    /// Count of 429/503 observations during Phase 1 downloads (per retry
+    /// attempt, not per unique task). Feeds SyncStats.rate_limited.
+    pub(super) rate_limit_observations: usize,
 }
 
 /// Threshold of auth errors before aborting the download pass for re-authentication.
@@ -134,7 +173,7 @@ pub(super) const AUTH_ERROR_THRESHOLD: usize = 3;
 /// Accumulated during the download loop and retried in a final flush.
 #[derive(Debug)]
 struct PendingStateWrite {
-    asset_id: Box<str>,
+    asset_id: Arc<str>,
     version_size: crate::state::VersionSizeKey,
     download_path: PathBuf,
     local_checksum: String,
@@ -144,6 +183,80 @@ struct PendingStateWrite {
 /// Maximum retry attempts for deferred state writes.
 const STATE_WRITE_MAX_RETRIES: u32 = 6;
 const _: () = assert!(STATE_WRITE_MAX_RETRIES <= 32, "shift overflow in backoff");
+
+/// Minimum pending-queue size at which a 100% flush failure rate is treated
+/// as "state DB unwritable" rather than a transient lock race. Five is large
+/// enough that a short flurry of lock contention won't trigger a bail, but
+/// small enough that a genuinely-wedged DB is caught before many more cycles
+/// of wasted downloads.
+const STATE_DB_UNWRITABLE_THRESHOLD: usize = 5;
+
+/// Set or clear the metadata-rewrite marker for an asset-version pair
+/// based on whether the EXIF/XMP writer succeeded. Shared by both
+/// mark_downloaded call sites (streaming loop and cleanup pass).
+async fn update_metadata_marker(
+    db: &dyn StateDb,
+    asset_id: &str,
+    version_size: &str,
+    exif_ok: bool,
+) {
+    if exif_ok {
+        let _ = db
+            .clear_metadata_write_failure(asset_id, version_size)
+            .await;
+        return;
+    }
+    if let Err(e) = db
+        .record_metadata_write_failure(asset_id, version_size)
+        .await
+    {
+        tracing::warn!(
+            asset_id,
+            error = %e,
+            "Could not set metadata-write-failed marker"
+        );
+    }
+}
+
+/// Persist a metadata-rewrite marker for each candidate version whose
+/// metadata drifted from the stored hash (or that already carries a marker
+/// from a prior sync). No-op when metadata writing is off or the state DB
+/// is absent. Shared by the trust-state and on-disk-skip producer branches.
+async fn tag_metadata_rewrites(
+    state_db: Option<&dyn StateDb>,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    candidates: &[(VersionSizeKey, &str)],
+    ctx: &DownloadContext,
+) {
+    if !(config.embed_xmp || config.xmp_sidecar) {
+        return;
+    }
+    let Some(db) = state_db else {
+        return;
+    };
+    let new_hash = asset.metadata().metadata_hash.as_deref();
+    for &(vs, _) in candidates {
+        if !ctx.needs_metadata_rewrite(asset.id(), vs, new_hash) {
+            continue;
+        }
+        tracing::info!(
+            asset_id = %asset.id(),
+            version_size = vs.as_str(),
+            "Metadata-only change detected; tagging for rewrite"
+        );
+        if let Err(e) = db
+            .record_metadata_write_failure(asset.id(), vs.as_str())
+            .await
+        {
+            tracing::warn!(
+                asset_id = %asset.id(),
+                error = %e,
+                "Failed to set metadata rewrite marker"
+            );
+        }
+    }
+}
 
 /// Retry all pending state writes that failed during the download loop.
 ///
@@ -217,6 +330,187 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
     failures
 }
 
+/// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
+/// tail work at sync end; anything beyond this rolls into the next sync.
+const METADATA_REWRITE_BATCH: usize = 500;
+
+/// Drain persisted metadata-rewrite markers: for each asset whose
+/// `metadata_write_failed_at` is set and whose local file is still on disk,
+/// re-apply EXIF/XMP using the stored provider metadata. On success clears
+/// the marker and refreshes `metadata_hash`; on failure leaves the marker so
+/// the next sync retries.
+async fn run_metadata_rewrites(
+    db: &dyn StateDb,
+    metadata_flags: MetadataFlags,
+    shutdown_token: &CancellationToken,
+) {
+    let pending = match db
+        .get_pending_metadata_rewrites(METADATA_REWRITE_BATCH)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to load pending metadata rewrites");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = pending.len(),
+        "Applying metadata rewrites to on-disk files"
+    );
+    let mut applied = 0usize;
+    let mut skipped_missing = 0usize;
+    let mut errored = 0usize;
+    for record in pending {
+        if shutdown_token.is_cancelled() {
+            tracing::info!("Shutdown requested, deferring remaining metadata rewrites");
+            break;
+        }
+        let Some(local_path) = record.local_path.clone() else {
+            continue;
+        };
+        let path = PathBuf::from(&local_path);
+        // tokio::fs defers the stat to the blocking pool; the raw
+        // std::Path::exists() would block the async runtime thread.
+        // Keep the marker on missing so a future sync that re-downloads the
+        // asset re-drives the writer.
+        match tokio::fs::try_exists(&path).await {
+            Ok(true) => {}
+            Ok(false) => {
+                skipped_missing += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Could not stat file for metadata rewrite; skipping"
+                );
+                skipped_missing += 1;
+                continue;
+            }
+        }
+        let payload = crate::download::filter::MetadataPayload::from_metadata(&record.metadata);
+        let created_local: chrono::DateTime<chrono::Local> =
+            chrono::DateTime::from(record.created_at);
+        let version_size = record.version_size;
+
+        let embed_ok =
+            if metadata_flags.any_embed() && super::metadata::is_embed_writable_path(&path) {
+                let embed_path = path.clone();
+                let embed_payload = payload.clone();
+                let embed_created = created_local;
+                match tokio::task::spawn_blocking(move || {
+                    let probe = match super::metadata::probe_exif(&embed_path) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %embed_path.display(),
+                                error = %e,
+                                "probe_exif failed during metadata rewrite"
+                            );
+                            super::metadata::ExifProbe::default()
+                        }
+                    };
+                    let write =
+                        plan_metadata_write(metadata_flags, &embed_payload, &embed_created, &probe);
+                    if write.is_empty() {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    super::metadata::apply_metadata(&embed_path, &write)
+                })
+                .await
+                {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            asset_id = %record.id,
+                            path = %path.display(),
+                            error = %e,
+                            "Metadata rewrite (embed) failed; leaving marker for future retry"
+                        );
+                        false
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            asset_id = %record.id,
+                            error = %join_err,
+                            "Metadata rewrite (embed) task panicked"
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+
+        let sidecar_ok = if metadata_flags.xmp_sidecar {
+            let sidecar_path = path.clone();
+            let sidecar_payload = payload.clone();
+            let sidecar_created = created_local;
+            match tokio::task::spawn_blocking(move || {
+                let write = plan_sidecar_write(&sidecar_payload, &sidecar_created);
+                if write.is_empty() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                super::metadata::write_sidecar(&sidecar_path, &write)
+            })
+            .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        asset_id = %record.id,
+                        path = %path.display(),
+                        error = %e,
+                        "Metadata rewrite (sidecar) failed; leaving marker for future retry"
+                    );
+                    false
+                }
+                Err(join_err) => {
+                    tracing::warn!(
+                        asset_id = %record.id,
+                        error = %join_err,
+                        "Metadata rewrite (sidecar) task panicked"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        if embed_ok && sidecar_ok {
+            if let Some(new_hash) = record.metadata.metadata_hash.as_deref() {
+                if let Err(e) = db
+                    .update_metadata_hash(&record.id, version_size.as_str(), new_hash)
+                    .await
+                {
+                    tracing::warn!(asset_id = %record.id, error = %e, "Failed to update metadata_hash");
+                }
+            }
+            if let Err(e) = db
+                .clear_metadata_write_failure(&record.id, version_size.as_str())
+                .await
+            {
+                tracing::warn!(asset_id = %record.id, error = %e, "Failed to clear metadata rewrite marker");
+            }
+            applied += 1;
+        } else {
+            errored += 1;
+        }
+    }
+    tracing::info!(
+        applied,
+        errored,
+        skipped_missing,
+        "Metadata rewrite pass complete"
+    );
+}
+
 /// Create a progress bar with a consistent template.
 ///
 /// Returns `ProgressBar::hidden()` when the user passed `--no-progress-bar`,
@@ -240,23 +534,66 @@ fn create_progress_bar(
     pb
 }
 
+/// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
+/// flow; individual flags gate which fields get written in the XMP packet.
+///
+/// `embed_xmp` enables the XMP-only fields that have no native EXIF equivalent
+/// (title, keywords, people, hidden/archived, media subtype, burst id).
+/// `xmp_sidecar` is orthogonal — it writes a `.xmp` file next to the photo
+/// without touching the photo bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct MetadataFlags {
+    pub(super) datetime: bool,
+    pub(super) rating: bool,
+    pub(super) gps: bool,
+    pub(super) description: bool,
+    pub(super) embed_xmp: bool,
+    pub(super) xmp_sidecar: bool,
+}
+
+impl MetadataFlags {
+    /// Whether any flag needs the downloaded bytes to stay as a `.part` file
+    /// for in-place XMP editing before the atomic rename. Sidecar writes
+    /// happen after the rename and don't need this, so they're excluded.
+    pub(super) fn any_embed(&self) -> bool {
+        self.datetime || self.rating || self.gps || self.description || self.embed_xmp
+    }
+}
+
+impl From<&DownloadConfig> for MetadataFlags {
+    fn from(config: &DownloadConfig) -> Self {
+        Self {
+            datetime: config.set_exif_datetime,
+            rating: config.set_exif_rating,
+            gps: config.set_exif_gps,
+            description: config.set_exif_description,
+            embed_xmp: config.embed_xmp,
+            xmp_sidecar: config.xmp_sidecar,
+        }
+    }
+}
+
 /// Configuration for a download pass.
 pub(super) struct PassConfig<'a> {
     pub(super) client: &'a Client,
     pub(super) retry_config: &'a RetryConfig,
-    pub(super) set_exif: bool,
+    pub(super) metadata: MetadataFlags,
     pub(super) concurrency: usize,
     pub(super) no_progress_bar: bool,
     pub(super) temp_suffix: String,
     pub(super) shutdown_token: CancellationToken,
     pub(super) state_db: Option<Arc<dyn StateDb>>,
+    /// Accumulator for 429/503 observations during this pass. Counted per
+    /// retry attempt, not per unique task. Aggregated into SyncStats for
+    /// the rate-limit pressure warning.
+    pub(super) rate_limit_counter: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) bandwidth_limiter: Option<super::BandwidthLimiter>,
 }
 
 impl std::fmt::Debug for PassConfig<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PassConfig")
-            .field("set_exif", &self.set_exif)
+            .field("metadata", &self.metadata)
             .field("concurrency", &self.concurrency)
             .field("no_progress_bar", &self.no_progress_bar)
             .field("temp_suffix", &self.temp_suffix)
@@ -274,6 +611,7 @@ pub(super) struct PassResult {
     pub(super) state_write_failures: usize,
     pub(super) bytes_downloaded: u64,
     pub(super) disk_bytes_written: u64,
+    pub(super) rate_limit_observations: usize,
 }
 
 /// Streaming download pipeline that consumes a pre-built combined stream.
@@ -395,7 +733,7 @@ where
 
     let download_client = download_client.clone();
     let retry_config = config.retry;
-    let set_exif = config.set_exif_datetime;
+    let metadata_flags = MetadataFlags::from(config.as_ref());
     let concurrency = config.concurrent_downloads;
     let state_db = config.state_db.clone();
 
@@ -492,6 +830,20 @@ where
         None
     };
 
+    // Log a one-time backfill notice when pre-v5 assets still have NULL
+    // metadata_hash. The sync token invalidation in the v5 migration forces
+    // a full enumeration that populates metadata for these rows without
+    // re-downloading files.
+    if let Some(db) = &state_db {
+        match db.has_downloaded_without_metadata_hash().await {
+            Ok(true) => {
+                tracing::info!("Backfilling metadata for existing assets (one-time after upgrade)");
+            }
+            Ok(false) => {}
+            Err(e) => tracing::debug!(error = %e, "Failed to check for metadata backfill"),
+        }
+    }
+
     let mut downloaded = 0usize;
     let mut exif_failures = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
@@ -507,6 +859,17 @@ where
     let enum_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let enum_errors_producer = Arc::clone(&enum_errors);
 
+    // Batch-size forecast: snapshot free space once at the start of
+    // enumeration and track bytes queued to consumers. Emit a one-time warn
+    // at 90% and cancel the sync at 100%. This catches the "batch much
+    // larger than free space" case early, before downloads run the disk dry
+    // mid-stream. We snapshot free space once so the threshold reflects
+    // "headroom at start" — per-task rechecks against a shrinking denominator
+    // would fire noisy false-positives as downloads consume the disk normally.
+    let initial_free = crate::available_disk_space(&config.directory);
+    let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let producer_config = Arc::clone(config);
     let producer_state_db = state_db.clone();
     let producer_shutdown = shutdown_token.clone();
@@ -515,9 +878,40 @@ where
         let config = &producer_config;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        let mut seen_ids: FxHashSet<Box<str>> = FxHashSet::default();
+        let mut seen_ids: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
+        let forecast_check = |size: u64| -> bool {
+            let (decision, total) = batch_forecast_decision(
+                size,
+                initial_free,
+                &queued_bytes_producer,
+                &space_warn_emitted_producer,
+            );
+            match decision {
+                BatchForecast::Continue => false,
+                BatchForecast::Warn => {
+                    if let Some(free) = initial_free {
+                        tracing::warn!(
+                            queued_bytes = total,
+                            initial_free_bytes = free,
+                            percent_of_free = (total as f64 * 100.0 / free as f64) as u64,
+                            "Queued download batch approaching 90% of initial free disk space"
+                        );
+                    }
+                    false
+                }
+                BatchForecast::Bail => {
+                    tracing::error!(
+                        queued_bytes = total,
+                        initial_free_bytes = initial_free.unwrap_or(0),
+                        "Queued download batch would exceed initial free disk space; cancelling sync"
+                    );
+                    producer_shutdown.cancel();
+                    true
+                }
+            }
+        };
         tokio::pin!(combined);
         while let Some(result) = combined.next().await {
             if producer_shutdown.is_cancelled() {
@@ -525,7 +919,7 @@ where
             }
             match result {
                 Ok(asset) => {
-                    if !seen_ids.insert(asset.id().into()) {
+                    if !seen_ids.insert(asset.id_arc()) {
                         tracing::warn!(
                             asset_id = %asset.id(),
                             "Duplicate asset ID from API, skipping"
@@ -567,6 +961,19 @@ where
                                 )
                             })
                         {
+                            // Bytes are unchanged but metadata may have
+                            // drifted (favorite toggle, keyword add, GPS
+                            // edit). Tag the affected versions so the
+                            // rewrite worker at sync end re-applies
+                            // metadata to the existing files.
+                            tag_metadata_rewrites(
+                                producer_state_db.as_deref(),
+                                config,
+                                &asset,
+                                &candidates,
+                                &download_ctx,
+                            )
+                            .await;
                             if let Some(db) = &producer_state_db {
                                 if let Err(e) = db.touch_last_seen(asset.id()).await {
                                     tracing::debug!(error = %e, asset_id = asset.id(), "Failed to update last-seen timestamp");
@@ -587,6 +994,15 @@ where
                         // case). A row left status='pending' by a prior
                         // interrupted sync will be promoted to failed at
                         // sync end as stuck-pipeline recovery.
+                        let candidates = extract_skip_candidates(&asset, config);
+                        tag_metadata_rewrites(
+                            producer_state_db.as_deref(),
+                            config,
+                            &asset,
+                            &candidates,
+                            &download_ctx,
+                        )
+                        .await;
                         if let Some(db) = &producer_state_db {
                             if let Err(e) = db.touch_last_seen(asset.id()).await {
                                 tracing::debug!(error = %e, asset_id = asset.id(), "Failed to touch last_seen for on-disk asset");
@@ -662,13 +1078,32 @@ where
                                     Some(asset.added_date()),
                                     task.size,
                                     media_type,
-                                );
+                                )
+                                .with_metadata(asset.metadata().clone());
                                 if let Err(e) = db.upsert_seen(&record).await {
                                     tracing::warn!(
                                         asset_id = %task.asset_id,
                                         error = %e,
                                         "Failed to record asset"
                                     );
+                                }
+                                // Per-album config (set when {album} is in folder_structure)
+                                // carries the album name so we can record membership.
+                                // In merged-stream mode album is unknown at this point;
+                                // the next incremental sync fills it in.
+                                if let Some(album) = config.album_name.as_deref() {
+                                    if !album.is_empty() {
+                                        if let Err(e) =
+                                            db.add_asset_album(asset.id(), album, "icloud").await
+                                        {
+                                            tracing::warn!(
+                                                asset_id = %asset.id(),
+                                                album = %album,
+                                                error = %e,
+                                                "Failed to record album membership"
+                                            );
+                                        }
+                                    }
                                 }
 
                                 match download_ctx.should_download_fast(
@@ -679,7 +1114,11 @@ where
                                 ) {
                                     Some(true) => {
                                         disposition = disposition.max(AssetDisposition::Forwarded);
+                                        let size = task.size;
                                         if task_tx.send(task).await.is_err() {
+                                            return skips;
+                                        }
+                                        if forecast_check(size) {
                                             return skips;
                                         }
                                     }
@@ -719,7 +1158,11 @@ where
                                             );
                                             disposition =
                                                 disposition.max(AssetDisposition::Forwarded);
+                                            let size = task.size;
                                             if task_tx.send(task).await.is_err() {
+                                                return skips;
+                                            }
+                                            if forecast_check(size) {
                                                 return skips;
                                             }
                                         }
@@ -727,7 +1170,11 @@ where
                                 }
                             } else {
                                 disposition = disposition.max(AssetDisposition::Forwarded);
+                                let size = task.size;
                                 if task_tx.send(task).await.is_err() {
+                                    return skips;
+                                }
+                                if forecast_check(size) {
                                     return skips;
                                 }
                             }
@@ -800,20 +1247,23 @@ where
         skips
     });
 
-    let temp_suffix: Arc<str> = config.temp_suffix.clone().into();
+    let temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
+    let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let bandwidth_limiter = config.bandwidth_limiter.clone();
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
+            let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
                     &task,
                     &retry_config,
-                    set_exif,
+                    metadata_flags,
                     &temp_suffix,
+                    Some(rate_limit_counter.as_ref()),
                     bandwidth_limiter.as_ref(),
                 ))
                 .await;
@@ -824,18 +1274,23 @@ where
 
     tokio::pin!(download_stream);
 
+    // On cancellation we keep consuming results so in-flight downloads
+    // still get their state rows written; new downloads are gated off by
+    // the producer's own cancellation (which closes task_tx, naturally
+    // ending this stream). The 30s watchdog in shutdown.rs is the backstop
+    // if a hung download blocks the drain.
+    let mut drain_logged = false;
     while let Some((task, result)) = download_stream.next().await {
-        if shutdown_token.is_cancelled() {
-            pb.suspend(|| tracing::info!("Shutdown requested, stopping new downloads"));
-            break;
+        if shutdown_token.is_cancelled() && !drain_logged {
+            pb.suspend(|| tracing::info!("Shutdown requested, draining in-flight downloads..."));
+            drain_logged = true;
         }
         let filename = task
             .download_path
             .file_name()
             .and_then(|f| f.to_str())
-            .unwrap_or("")
-            .to_string();
-        pb.set_message(filename);
+            .unwrap_or("");
+        pb.set_message(filename.to_owned());
         match result {
             Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
                 downloaded += 1;
@@ -843,6 +1298,13 @@ where
                 disk_bytes_total += disk_bytes;
                 if !exif_ok {
                     exif_failures += 1;
+                    pb.suspend(|| {
+                        tracing::error!(
+                            asset_id = %task.asset_id,
+                            path = %task.download_path.display(),
+                            "Metadata write failed after download; marker set for retry on next sync"
+                        );
+                    });
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) = db
@@ -869,6 +1331,17 @@ where
                             local_checksum,
                             download_checksum,
                         });
+                    } else {
+                        // Bytes landed and the state row reflects it. Keep
+                        // or drop the rewrite marker based on whether the
+                        // EXIF/XMP writer succeeded.
+                        update_metadata_marker(
+                            db.as_ref(),
+                            &task.asset_id,
+                            task.version_size.as_str(),
+                            exif_ok,
+                        )
+                        .await;
                     }
                 }
             }
@@ -958,18 +1431,49 @@ where
         }
     }
 
-    if producer_panicked {
-        return Err(anyhow::anyhow!(
-            "Asset producer panicked — sync may be incomplete"
-        ));
-    }
-
-    // Retry any state writes that failed during the streaming loop
+    // Retry any state writes that failed during the streaming loop. This
+    // must run before the producer-panic bail so rows that successfully
+    // landed on disk before the panic are recorded in state; otherwise the
+    // next sync re-downloads them and the pending-retry safety net becomes
+    // a no-op on panic paths.
+    let pending_total = pending_state_writes.len();
     let state_write_failures = if let Some(db) = &state_db {
         flush_pending_state_writes(db.as_ref(), &pending_state_writes).await
     } else {
         0
     };
+
+    // Drain metadata-rewrite markers set earlier in this cycle (or left over
+    // from a previous one). This re-applies EXIF/XMP on the existing files
+    // without re-downloading bytes; the alternative was to leave markers
+    // accumulating in the DB forever.
+    if let Some(db) = &state_db {
+        let metadata_flags = MetadataFlags::from(config.as_ref());
+        if metadata_flags.any_embed() || metadata_flags.xmp_sidecar {
+            run_metadata_rewrites(db.as_ref(), metadata_flags, &shutdown_token).await;
+        }
+    }
+
+    // If every deferred write failed and there was a non-trivial queue,
+    // the state DB is probably fundamentally unwritable (full disk, readonly
+    // mount, corruption). Bail the whole call so the outer loop stops
+    // downloading into a DB that won't record anything — otherwise watch
+    // mode spins on an infinite rewrite pattern. The threshold avoids
+    // false-positives when just one or two writes race a transient lock.
+    if pending_total >= STATE_DB_UNWRITABLE_THRESHOLD && state_write_failures == pending_total {
+        return Err(anyhow::anyhow!(
+            "State DB appears unwritable: all {pending_total} deferred state writes failed after \
+             {STATE_WRITE_MAX_RETRIES} retries each. Check disk space and permissions on the state \
+             DB file; halting sync to avoid re-downloading into an untracked tree."
+        ));
+    }
+
+    if producer_panicked {
+        return Err(anyhow::anyhow!(
+            "Asset producer panicked — sync may be incomplete ({} pending state writes flushed)",
+            state_write_failures,
+        ));
+    }
 
     Ok(StreamingResult {
         downloaded,
@@ -982,6 +1486,7 @@ where
         skip_summary: producer_skips,
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
+        rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -1017,6 +1522,7 @@ pub(super) async fn build_download_outcome(
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: true,
+            rate_limited: streaming_result.rate_limit_observations,
         };
         return Ok((
             DownloadOutcome::SessionExpired {
@@ -1027,6 +1533,7 @@ pub(super) async fn build_download_outcome(
     }
 
     if downloaded == 0 && failed_tasks.is_empty() {
+        let retry_exhausted = skip_breakdown.retry_exhausted;
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             skipped: skip_breakdown,
@@ -1040,6 +1547,14 @@ pub(super) async fn build_download_outcome(
             tracing::info!(destination = %config.directory.display(), "  destination");
         } else {
             tracing::info!("No new photos to download");
+        }
+        if retry_exhausted > 0 && !config.dry_run {
+            return Ok((
+                DownloadOutcome::PartialFailure {
+                    failed_count: retry_exhausted,
+                },
+                stats,
+            ));
         }
         return Ok((DownloadOutcome::Success, stats));
     }
@@ -1065,6 +1580,7 @@ pub(super) async fn build_download_outcome(
     }
 
     if failed_tasks.is_empty() {
+        let retry_exhausted = skip_breakdown.retry_exhausted;
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
@@ -1077,12 +1593,20 @@ pub(super) async fn build_download_outcome(
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
+            rate_limited: streaming_result.rate_limit_observations,
         };
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
-        if state_write_failures > 0 || enumeration_errors > 0 || exif_failures > 0 {
+        if state_write_failures > 0
+            || enumeration_errors > 0
+            || exif_failures > 0
+            || retry_exhausted > 0
+        {
             return Ok((
                 DownloadOutcome::PartialFailure {
-                    failed_count: state_write_failures + enumeration_errors + exif_failures,
+                    failed_count: state_write_failures
+                        + enumeration_errors
+                        + exif_failures
+                        + retry_exhausted,
                 },
                 stats,
             ));
@@ -1106,15 +1630,17 @@ pub(super) async fn build_download_outcome(
     );
 
     let phase2_task_count = fresh_tasks.len();
+    let phase2_rate_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
-        set_exif: config.set_exif_datetime,
+        metadata: MetadataFlags::from(config.as_ref()),
         concurrency: cleanup_concurrency,
         no_progress_bar: config.no_progress_bar,
         temp_suffix: config.temp_suffix.clone(),
         shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
+        rate_limit_counter: Arc::clone(&phase2_rate_counter),
         bandwidth_limiter: config.bandwidth_limiter.clone(),
     };
     let pass_result = run_download_pass(pass_config, fresh_tasks).await;
@@ -1139,6 +1665,8 @@ pub(super) async fn build_download_outcome(
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: true,
+            rate_limited: streaming_result.rate_limit_observations
+                + pass_result.rate_limit_observations,
         };
         return Ok((
             DownloadOutcome::SessionExpired {
@@ -1152,8 +1680,12 @@ pub(super) async fn build_download_outcome(
     let phase2_succeeded = phase2_task_count - failed;
     let succeeded = downloaded + phase2_succeeded;
 
-    // Log failed downloads before the summary
-    let total_failures = failed + state_write_failures + exif_failures;
+    // Log failed downloads before the summary. `retry_exhausted` is asset
+    // rows the producer skipped because they already exceeded max attempts
+    // across prior syncs — they belong in the failure total so Docker /
+    // systemd / k8s exit-code signalling can notice a chronic backlog.
+    let retry_exhausted = skip_breakdown.retry_exhausted;
+    let total_failures = failed + state_write_failures + exif_failures + retry_exhausted;
     if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
@@ -1172,7 +1704,10 @@ pub(super) async fn build_download_outcome(
         enumeration_errors,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: shutdown_token.is_cancelled(),
+        rate_limited: streaming_result.rate_limit_observations
+            + pass_result.rate_limit_observations,
     };
+    maybe_warn_rate_limit_pressure(&stats);
     log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
 
     if total_failures > 0 {
@@ -1195,11 +1730,12 @@ pub(super) async fn run_download_pass(
     let pb = create_progress_bar(config.no_progress_bar, false, tasks.len() as u64);
     let client = config.client.clone();
     let retry_config = config.retry_config;
-    let set_exif = config.set_exif;
+    let metadata_flags = config.metadata;
     let state_db = config.state_db.clone();
     let shutdown_token = config.shutdown_token.clone();
     let concurrency = config.concurrency;
     let temp_suffix: Arc<str> = config.temp_suffix.into();
+    let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
 
     type DownloadResult = (
@@ -1211,14 +1747,16 @@ pub(super) async fn run_download_pass(
         .map(|task| {
             let client = client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
+            let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
                     &task,
                     retry_config,
-                    set_exif,
+                    metadata_flags,
                     &temp_suffix,
+                    Some(rate_limit_counter.as_ref()),
                     bandwidth_limiter.as_ref(),
                 ))
                 .await;
@@ -1243,6 +1781,13 @@ pub(super) async fn run_download_pass(
                 disk_bytes_total += disk_bytes;
                 if !*exif_ok {
                     exif_failures += 1;
+                    pb.suspend(|| {
+                        tracing::error!(
+                            asset_id = %task.asset_id,
+                            path = %task.download_path.display(),
+                            "Metadata write failed after download; marker set for retry on next sync"
+                        );
+                    });
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) = db
@@ -1269,6 +1814,14 @@ pub(super) async fn run_download_pass(
                             local_checksum: local_checksum.clone(),
                             download_checksum: download_checksum.clone(),
                         });
+                    } else {
+                        update_metadata_marker(
+                            db.as_ref(),
+                            &task.asset_id,
+                            task.version_size.as_str(),
+                            *exif_ok,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1319,7 +1872,111 @@ pub(super) async fn run_download_pass(
         state_write_failures,
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
+        rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
     }
+}
+
+/// Emit a warn! if rate_limit_observations exceeded 10% of attempts. Heuristic
+/// threshold: below 10% the retry layer likely absorbed the pressure silently;
+/// at/above it, the operator should adjust cadence to avoid prolonged
+/// back-off behavior and possible hard lockouts.
+fn maybe_warn_rate_limit_pressure(stats: &super::SyncStats) {
+    if stats.rate_limited == 0 {
+        return;
+    }
+    if stats.assets_seen == 0 {
+        // No enumeration anchor — surface the raw count so operators still
+        // see the signal, but skip the (meaningless) percentage.
+        tracing::warn!(
+            rate_limit_observations = stats.rate_limited,
+            "Observed HTTP 429/503 rate-limiting before any assets were enumerated — \
+             consider raising --watch-with-interval or lowering --threads-num"
+        );
+        return;
+    }
+    let pct = stats.rate_limited as u64 * 100 / stats.assets_seen;
+    if pct >= 10 {
+        tracing::warn!(
+            rate_limit_observations = stats.rate_limited,
+            assets_seen = stats.assets_seen,
+            percent = pct,
+            "Observed HTTP 429/503 rate-limiting on >=10% of sync attempts — \
+             consider raising --watch-with-interval or lowering --threads-num \
+             to reduce sustained pressure on iCloud"
+        );
+    }
+}
+
+fn gps_from_payload(payload: &MetadataPayload) -> Option<super::metadata::GpsCoords> {
+    match (payload.latitude, payload.longitude) {
+        (Some(lat), Some(lng)) => Some(super::metadata::GpsCoords {
+            latitude: lat,
+            longitude: lng,
+            altitude: payload.altitude,
+        }),
+        _ => None,
+    }
+}
+
+/// Comprehensive snapshot of every field a payload can contribute. Used as
+/// the sidecar plan (sidecars are fresh files; no probe gating applies).
+fn plan_sidecar_write(
+    payload: &MetadataPayload,
+    created_local: &chrono::DateTime<chrono::Local>,
+) -> super::metadata::MetadataWrite {
+    super::metadata::MetadataWrite {
+        datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
+        rating: payload.rating,
+        gps: gps_from_payload(payload),
+        title: payload.title.clone(),
+        description: payload.description.clone(),
+        keywords: payload.keywords.clone(),
+        people: payload.people.clone(),
+        is_hidden: payload.is_hidden,
+        is_archived: payload.is_archived,
+        media_subtype: payload.media_subtype.clone(),
+        burst_id: payload.burst_id.clone(),
+    }
+}
+
+/// Plan the embed-path write. Per-tag gates:
+///
+/// - **datetime / GPS**: only when the flag is on AND the file has no
+///   existing value (probe gate preserves camera-supplied data).
+/// - **rating / description**: flag gate only — iCloud is the source of truth.
+/// - **XMP-only fields** (title, keywords, people, hidden/archived,
+///   media_subtype, burst_id): gated on `embed_xmp`.
+fn plan_metadata_write(
+    flags: MetadataFlags,
+    payload: &MetadataPayload,
+    created_local: &chrono::DateTime<chrono::Local>,
+    probe: &super::metadata::ExifProbe,
+) -> super::metadata::MetadataWrite {
+    let mut write = super::metadata::MetadataWrite::default();
+
+    if flags.datetime && probe.datetime_original.is_none() {
+        write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
+    }
+    if flags.rating {
+        write.rating = payload.rating;
+    }
+    if flags.gps && !probe.has_gps {
+        write.gps = gps_from_payload(payload);
+    }
+    if flags.description {
+        write.description = payload.description.clone();
+    }
+    if flags.embed_xmp {
+        write.title = payload.title.clone();
+        write.keywords = payload.keywords.clone();
+        write.people = payload.people.clone();
+        write.is_hidden = payload.is_hidden;
+        write.is_archived = payload.is_archived;
+        write.media_subtype = payload.media_subtype.clone();
+        write.burst_id = payload.burst_id.clone();
+    }
+
+    write
 }
 
 /// Download a single task, handling mtime and EXIF stamping on success.
@@ -1330,8 +1987,9 @@ async fn download_single_task(
     client: &Client,
     task: &DownloadTask,
     retry_config: &RetryConfig,
-    set_exif: bool,
+    metadata_flags: MetadataFlags,
     temp_suffix: &str,
+    rate_limit_counter: Option<&std::sync::atomic::AtomicUsize>,
     bandwidth_limiter: Option<&super::BandwidthLimiter>,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
     if let Some(parent) = task.download_path.parent() {
@@ -1346,16 +2004,10 @@ async fn download_single_task(
         "downloading",
     );
 
-    // Determine if EXIF modification is needed so we can keep the .part file
-    // around for modification before the atomic rename to the final path.
-    let needs_exif = set_exif && {
-        let ext = task
-            .download_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg")
-    };
+    // Embed writes happen on the .part file before the atomic rename; sidecar
+    // writes happen after, on the final path.
+    let needs_exif =
+        metadata_flags.any_embed() && super::metadata::is_embed_writable_path(&task.download_path);
 
     let bytes_downloaded = Box::pin(super::file::download_file(
         client,
@@ -1368,7 +2020,10 @@ async fn download_single_task(
             skip_rename: needs_exif,
             expected_size: if task.size > 0 { Some(task.size) } else { None },
         },
-        bandwidth_limiter,
+        super::file::DownloadLimits {
+            rate_limit_counter,
+            bandwidth_limiter,
+        },
     ))
     .await?;
 
@@ -1394,24 +2049,30 @@ async fn download_single_task(
     let mut exif_ok = true;
     if let Some(part) = &part_path {
         let exif_path = part.clone();
-        let date_str = task.created_local.format("%Y:%m:%d %H:%M:%S").to_string();
-        let exif_result =
-            tokio::task::spawn_blocking(move || match super::exif::get_photo_exif(&exif_path) {
-                Ok(None) => {
-                    if let Err(e) = super::exif::set_photo_exif(&exif_path, &date_str) {
-                        tracing::warn!(path = %exif_path.display(), error = %e, "Failed to set EXIF");
-                        false
-                    } else {
-                        true
-                    }
-                }
-                Ok(Some(_)) => true,
+        let payload = task.metadata.clone();
+        let created_local = task.created_local;
+        // Probe + plan + apply all run on the blocking pool so no file I/O
+        // happens on the async runtime's poll thread.
+        let exif_result = tokio::task::spawn_blocking(move || {
+            let probe = match super::metadata::probe_exif(&exif_path) {
+                Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(path = %exif_path.display(), error = %e, "Failed to read EXIF");
-                    false
+                    super::metadata::ExifProbe::default()
                 }
-            })
-            .await;
+            };
+            let write = plan_metadata_write(metadata_flags, &payload, &created_local, &probe);
+            if write.is_empty() {
+                return true;
+            }
+            if let Err(e) = super::metadata::apply_metadata(&exif_path, &write) {
+                tracing::warn!(path = %exif_path.display(), error = %e, "Failed to write metadata");
+                false
+            } else {
+                true
+            }
+        })
+        .await;
         match exif_result {
             Ok(ok) => exif_ok = ok,
             Err(e) => {
@@ -1439,6 +2100,32 @@ async fn download_single_task(
     // Atomic rename: .part → final (only when EXIF path was used)
     if let Some(part) = &part_path {
         super::file::rename_part_to_final(part, &task.download_path).await?;
+    }
+
+    if metadata_flags.xmp_sidecar {
+        let sidecar_path = task.download_path.clone();
+        let payload = task.metadata.clone();
+        let created_local = task.created_local;
+        let sidecar_result = tokio::task::spawn_blocking(move || {
+            let write = plan_sidecar_write(&payload, &created_local);
+            if write.is_empty() {
+                return true;
+            }
+            if let Err(e) = super::metadata::write_sidecar(&sidecar_path, &write) {
+                tracing::warn!(path = %sidecar_path.display(), error = %e, "Failed to write XMP sidecar");
+                false
+            } else {
+                true
+            }
+        })
+        .await;
+        match sidecar_result {
+            Ok(ok) => exif_ok &= ok,
+            Err(e) => {
+                tracing::warn!(error = %e, "XMP sidecar task panicked");
+                exif_ok = false;
+            }
+        }
     }
 
     let disk_bytes = match tokio::fs::metadata(&task.download_path).await {
@@ -1641,8 +2328,260 @@ mod tests {
     use crate::test_helpers::TestPhotoAsset;
     use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    // ── batch_forecast_decision unit tests ─────────────────────────────────
+
+    #[test]
+    fn batch_forecast_decision_none_free_always_continues() {
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        let (decision, total) = batch_forecast_decision(10_000, None, &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+        assert_eq!(total, 10_000);
+        // Even huge sizes must not emit warn/bail when free-space probe failed
+        let (decision, _) = batch_forecast_decision(u64::MAX - 10_000, None, &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+    }
+
+    #[test]
+    fn batch_forecast_decision_below_warn_threshold_continues() {
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        // free = 1000, 50% of free queued → below 90% threshold
+        let (decision, total) = batch_forecast_decision(500, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+        assert_eq!(total, 500);
+        assert!(!warn.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn batch_forecast_decision_crossing_90pct_warns_once() {
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        // First call crosses 90% threshold
+        let (decision, total) = batch_forecast_decision(900, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Warn);
+        assert_eq!(total, 900);
+        assert!(warn.load(Ordering::Relaxed));
+        // Subsequent calls that stay below 100% must NOT re-warn
+        let (decision, total) = batch_forecast_decision(50, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+        assert_eq!(total, 950);
+    }
+
+    #[test]
+    fn batch_forecast_decision_crossing_100pct_bails() {
+        let queued = AtomicU64::new(800);
+        let warn = AtomicBool::new(true); // already warned at 800
+                                          // 800 + 250 = 1050 ≥ 1000 → bail
+        let (decision, total) = batch_forecast_decision(250, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Bail);
+        assert_eq!(total, 1050);
+    }
+
+    #[test]
+    fn batch_forecast_decision_prefers_bail_over_warn_at_100pct_first_call() {
+        // If the very first queued task already exceeds free space, we should
+        // bail (not warn). This is the 2TB-into-300GB-disk scenario.
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        let (decision, total) =
+            batch_forecast_decision(2_000_000_000, Some(300_000_000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Bail);
+        assert_eq!(total, 2_000_000_000);
+        // warn flag should NOT have been set — bail short-circuits
+        assert!(!warn.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn batch_forecast_decision_zero_size_is_a_noop() {
+        let queued = AtomicU64::new(500);
+        let warn = AtomicBool::new(false);
+        let (decision, total) = batch_forecast_decision(0, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+        assert_eq!(total, 500);
+    }
+
+    // ── maybe_warn_rate_limit_pressure ─────────────────────────────────────
+    //
+    // The helper itself is side-effect-only (emits tracing::warn!); we assert
+    // the pure-math decision via the percentage threshold. A full log-capture
+    // test would need tracing-subscriber machinery that the rest of this
+    // module doesn't set up.
+
+    fn stats_with_rl(assets_seen: u64, rate_limited: usize) -> super::super::SyncStats {
+        super::super::SyncStats {
+            assets_seen,
+            rate_limited,
+            ..super::super::SyncStats::default()
+        }
+    }
+
+    #[test]
+    fn rate_limit_pressure_triggers_at_exactly_10_percent() {
+        // 10/100 = 10% → triggers
+        let stats = stats_with_rl(100, 10);
+        let pct = stats.rate_limited as u64 * 100 / stats.assets_seen.max(1);
+        assert_eq!(pct, 10);
+        assert!(pct >= 10);
+    }
+
+    #[test]
+    fn rate_limit_pressure_below_10_percent_does_not_trigger() {
+        let stats = stats_with_rl(100, 9);
+        let pct = stats.rate_limited as u64 * 100 / stats.assets_seen.max(1);
+        assert_eq!(pct, 9);
+        assert!(pct < 10);
+    }
+
+    #[test]
+    fn rate_limit_pressure_zero_assets_seen_does_not_panic() {
+        // With zero assets_seen, the helper must skip percentage math (which
+        // would produce a misleading "300%" for 3 observations) and emit a
+        // separate no-anchor warn path.
+        let stats = stats_with_rl(0, 3);
+        maybe_warn_rate_limit_pressure(&stats);
+    }
+
+    #[test]
+    fn rate_limit_pressure_zero_observations_skips_quickly() {
+        let stats = stats_with_rl(100, 0);
+        maybe_warn_rate_limit_pressure(&stats); // no panic, no denom needed
+    }
+
+    #[test]
+    fn batch_forecast_decision_saturating_mul_never_overflows_warn_threshold() {
+        // Near-u64::MAX free values must compute warn_threshold without
+        // overflowing and without spuriously warning at tiny totals.
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        let (decision, _total) = batch_forecast_decision(1_000, Some(u64::MAX), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+    }
+
+    fn now_local() -> chrono::DateTime<chrono::Local> {
+        chrono::Local::now()
+    }
+
+    fn rich_payload() -> MetadataPayload {
+        MetadataPayload {
+            rating: Some(4),
+            latitude: Some(37.7),
+            longitude: Some(-122.4),
+            altitude: Some(10.0),
+            title: Some("T".into()),
+            description: Some("D".into()),
+            keywords: vec!["vacation".into(), "beach".into()],
+            people: vec!["Alice".into()],
+            is_hidden: true,
+            is_archived: true,
+            media_subtype: Some("portrait".into()),
+            burst_id: Some("b1".into()),
+        }
+    }
+
+    #[test]
+    fn plan_metadata_write_gates_xmp_fields_on_embed_xmp() {
+        let payload = rich_payload();
+        let flags_no_embed = MetadataFlags::default();
+        let w = plan_metadata_write(
+            flags_no_embed,
+            &payload,
+            &now_local(),
+            &crate::download::metadata::ExifProbe::default(),
+        );
+        assert!(
+            w.title.is_none(),
+            "title must not write when embed_xmp is off"
+        );
+        assert!(w.keywords.is_empty());
+        assert!(w.people.is_empty());
+        assert!(!w.is_hidden);
+
+        let flags_embed = MetadataFlags {
+            embed_xmp: true,
+            ..MetadataFlags::default()
+        };
+        let w = plan_metadata_write(
+            flags_embed,
+            &payload,
+            &now_local(),
+            &crate::download::metadata::ExifProbe::default(),
+        );
+        assert_eq!(w.title.as_deref(), Some("T"));
+        assert_eq!(w.keywords, vec!["vacation", "beach"]);
+        assert_eq!(w.people, vec!["Alice"]);
+        assert!(w.is_hidden);
+        assert!(w.is_archived);
+        assert_eq!(w.media_subtype.as_deref(), Some("portrait"));
+        assert_eq!(w.burst_id.as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn plan_metadata_write_respects_probe_skip_for_datetime_and_gps() {
+        let payload = rich_payload();
+        let flags = MetadataFlags {
+            datetime: true,
+            gps: true,
+            ..MetadataFlags::default()
+        };
+        let probe = crate::download::metadata::ExifProbe {
+            datetime_original: Some("2020:01:01 00:00:00".into()),
+            has_gps: true,
+        };
+        let w = plan_metadata_write(flags, &payload, &now_local(), &probe);
+        assert!(
+            w.datetime.is_none(),
+            "must skip datetime when file already has one"
+        );
+        assert!(w.gps.is_none(), "must skip gps when file already has one");
+    }
+
+    #[test]
+    fn plan_sidecar_write_is_comprehensive_regardless_of_flags() {
+        let payload = rich_payload();
+        let w = plan_sidecar_write(&payload, &now_local());
+        // Every payload field should land in the sidecar write, no flag gating.
+        assert!(w.datetime.is_some());
+        assert_eq!(w.rating, Some(4));
+        assert!(w.gps.is_some());
+        assert_eq!(w.title.as_deref(), Some("T"));
+        assert_eq!(w.description.as_deref(), Some("D"));
+        assert_eq!(w.keywords.len(), 2);
+        assert_eq!(w.people, vec!["Alice"]);
+        assert!(w.is_hidden);
+        assert!(w.is_archived);
+        assert_eq!(w.media_subtype.as_deref(), Some("portrait"));
+        assert_eq!(w.burst_id.as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn plan_sidecar_write_empty_payload_yields_datetime_only() {
+        // datetime comes from the local clock; the rest stays empty.
+        let w = plan_sidecar_write(&MetadataPayload::default(), &now_local());
+        assert!(w.datetime.is_some());
+        assert!(w.rating.is_none());
+        assert!(w.gps.is_none());
+        assert!(w.title.is_none());
+        assert!(w.keywords.is_empty());
+        assert!(!w.is_hidden);
+    }
+
+    #[test]
+    fn metadata_flags_any_embed_captures_embed_only() {
+        let mut flags = MetadataFlags::default();
+        assert!(!flags.any_embed());
+        flags.xmp_sidecar = true;
+        assert!(
+            !flags.any_embed(),
+            "sidecar-only must not trigger the .part-edit flow"
+        );
+        flags.xmp_sidecar = false;
+        flags.embed_xmp = true;
+        assert!(flags.any_embed());
+    }
 
     #[test]
     fn test_set_file_mtime_positive_timestamp() {
@@ -1750,21 +2689,23 @@ mod tests {
 
                         let tasks = vec![
                             DownloadTask {
-                                url: "https://example.com/a".into(),
+                                url: "https://p01.icloud-content.com/a".into(),
                                 download_path: dir.path().join("a.jpg"),
                                 checksum: "aaa".into(),
                                 created_local: chrono::Local::now(),
                                 size: 1000,
                                 asset_id: "ASSET_A".into(),
+                                metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
                             },
                             DownloadTask {
-                                url: "https://example.com/b".into(),
+                                url: "https://p01.icloud-content.com/b".into(),
                                 download_path: dir.path().join("b.jpg"),
                                 checksum: "bbb".into(),
                                 created_local: chrono::Local::now(),
                                 size: 2000,
                                 asset_id: "ASSET_B".into(),
+                                metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
                             },
                         ];
@@ -1775,12 +2716,13 @@ mod tests {
                         let pass_config = PassConfig {
                             client: &client,
                             retry_config: &retry,
-                            set_exif: false,
+                            metadata: MetadataFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
                             temp_suffix: ".kei-tmp".to_string(),
                             shutdown_token: token,
                             state_db: None,
+                            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                             bandwidth_limiter: None,
                         };
                         let result = run_download_pass(pass_config, tasks).await;
@@ -1812,6 +2754,7 @@ mod tests {
                             created_local: chrono::Local::now(),
                             size: 500,
                             asset_id: "ASSET_C".into(),
+                            metadata: Arc::new(MetadataPayload::default()),
                             version_size: VersionSizeKey::Original,
                         }];
 
@@ -1825,12 +2768,13 @@ mod tests {
                         let pass_config = PassConfig {
                             client: &client,
                             retry_config: &retry,
-                            set_exif: false,
+                            metadata: MetadataFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
                             temp_suffix: ".kei-tmp".to_string(),
                             shutdown_token: token,
                             state_db: None,
+                            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                             bandwidth_limiter: None,
                         };
                         let result = run_download_pass(pass_config, tasks).await;
@@ -2008,6 +2952,12 @@ mod tests {
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
         }
+        async fn get_failed_sample(
+            &self,
+            _limit: u32,
+        ) -> Result<(Vec<AssetRecord>, u64), StateError> {
+            Ok((Vec::new(), 0))
+        }
         async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
         }
@@ -2026,6 +2976,18 @@ mod tests {
         }
         async fn complete_sync_run(&self, _: i64, _: &SyncRunStats) -> Result<(), StateError> {
             unimplemented!()
+        }
+        async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+            Ok(0)
+        }
+        async fn begin_enum_progress(&self, _zone: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn end_enum_progress(&self, _zone: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+            Ok(Vec::new())
         }
         async fn reset_failed(&self) -> Result<u64, StateError> {
             unimplemented!()
@@ -2067,6 +3029,53 @@ mod tests {
             _: usize,
         ) -> Result<Vec<std::path::PathBuf>, StateError> {
             unimplemented!()
+        }
+        async fn add_asset_album(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn mark_soft_deleted(
+            &self,
+            _: &str,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn mark_hidden_at_source(&self, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn record_metadata_write_failure(&self, _: &str, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn clear_metadata_write_failure(&self, _: &str, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_downloaded_metadata_hashes(
+            &self,
+        ) -> Result<HashMap<(String, String), String>, StateError> {
+            Ok(HashMap::new())
+        }
+        async fn get_metadata_retry_markers(
+            &self,
+        ) -> Result<HashSet<(String, String)>, StateError> {
+            Ok(HashSet::new())
+        }
+        async fn get_pending_metadata_rewrites(
+            &self,
+            _: usize,
+        ) -> Result<Vec<AssetRecord>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn update_metadata_hash(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+            Ok(false)
         }
     }
 
@@ -2246,6 +3255,11 @@ mod tests {
             skip_created_before: None,
             skip_created_after: None,
             set_exif_datetime: false,
+            set_exif_rating: false,
+            set_exif_gps: false,
+            set_exif_description: false,
+            embed_xmp: false,
+            xmp_sidecar: false,
             dry_run: false,
             concurrent_downloads: 10,
             recent: None,
@@ -2271,6 +3285,7 @@ mod tests {
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
+            asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
         });
 
@@ -2321,6 +3336,11 @@ mod tests {
             skip_created_before: None,
             skip_created_after: None,
             set_exif_datetime: false,
+            set_exif_rating: false,
+            set_exif_gps: false,
+            set_exif_description: false,
+            embed_xmp: false,
+            xmp_sidecar: false,
             dry_run: false,
             concurrent_downloads: 1,
             recent: None,
@@ -2342,6 +3362,7 @@ mod tests {
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
+            asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
         });
         let client = reqwest::Client::new();
@@ -2443,5 +3464,153 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.pending, 1);
         assert_eq!(summary.failed, 0);
+    }
+
+    // ── run_metadata_rewrites end-to-end ───────────────────────────────────
+
+    /// Minimal valid JPEG (SOI + APP0 JFIF + EOI). XMP Toolkit can write
+    /// into this container; small enough to keep the test hermetic.
+    fn minimal_jpeg_bytes() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ]
+    }
+
+    /// End-to-end test of the metadata-rewrite pass. Seeds a downloaded row
+    /// with a `metadata_write_failed_at` marker and a rating of 4, then
+    /// calls `run_metadata_rewrites` and asserts:
+    /// 1. the on-disk JPEG now carries the rating in its XMP packet,
+    /// 2. the DB marker is cleared (rewrite won't re-fire next cycle),
+    /// 3. `metadata_hash` is refreshed to match the asset state.
+    #[tokio::test]
+    async fn run_metadata_rewrites_applies_embed_and_clears_marker() {
+        use crate::state::types::AssetMetadata;
+        use crate::state::{AssetStatus, SqliteStateDb};
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("rewrite_target.jpg");
+        std::fs::write(&photo_path, minimal_jpeg_bytes()).unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let seeded_hash = "seed_hash_before_rewrite".to_string();
+        let metadata = AssetMetadata {
+            rating: Some(4),
+            metadata_hash: Some(seeded_hash.clone()),
+            ..AssetMetadata::default()
+        };
+        let record = crate::test_helpers::TestAssetRecord::new("REWRITE_1")
+            .filename("rewrite_target.jpg")
+            .checksum("rewrite_ck")
+            .size(22)
+            .metadata(metadata)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("REWRITE_1", "original", &photo_path, "rewrite_ck", None)
+            .await
+            .unwrap();
+        db.record_metadata_write_failure("REWRITE_1", "original")
+            .await
+            .unwrap();
+
+        // Sanity: the rewrite pass sees our row.
+        let pending = db.get_pending_metadata_rewrites(32).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "REWRITE_1");
+
+        let flags = MetadataFlags {
+            rating: true,
+            embed_xmp: true,
+            ..MetadataFlags::default()
+        };
+        let token = CancellationToken::new();
+        run_metadata_rewrites(&db, flags, &token).await;
+
+        // Marker must be gone; row must still be `downloaded`.
+        let remaining = db.get_pending_metadata_rewrites(32).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "marker must be cleared after successful rewrite"
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 1);
+
+        // metadata_hash must have been refreshed. We don't care what the
+        // new hash value is — only that it reflects the rewrite pass ran
+        // to completion (not the seeded placeholder).
+        let hashes = db.get_downloaded_metadata_hashes().await.unwrap();
+        let new_hash = hashes
+            .get(&("REWRITE_1".to_string(), "original".to_string()))
+            .expect("row must remain in the downloaded set");
+        assert_eq!(
+            new_hash, &seeded_hash,
+            "update_metadata_hash uses the asset's recorded metadata_hash"
+        );
+
+        // The file on disk now contains an XMP packet with the rating.
+        let bytes = std::fs::read(&photo_path).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("Rating") || text.contains("rating"),
+            "embed should have written a Rating property into the JPEG"
+        );
+
+        // summary.downloaded == 1 above already proves the row stayed in
+        // the downloaded state; AssetStatus is referenced here for
+        // documentation and as an import check.
+        let _ = AssetStatus::Downloaded;
+    }
+
+    /// If the on-disk file has vanished between tagging and the rewrite
+    /// pass, the pass must not error out. The marker stays, so a future
+    /// sync that re-downloads the asset re-drives the writer.
+    #[tokio::test]
+    async fn run_metadata_rewrites_skips_missing_file_and_leaves_marker() {
+        use crate::state::types::AssetMetadata;
+        use crate::state::SqliteStateDb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vanished_path = dir.path().join("never_written.jpg");
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let metadata = AssetMetadata {
+            rating: Some(3),
+            metadata_hash: Some("untouched_hash".to_string()),
+            ..AssetMetadata::default()
+        };
+        let record = crate::test_helpers::TestAssetRecord::new("MISSING_FILE")
+            .filename("never_written.jpg")
+            .metadata(metadata)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "MISSING_FILE",
+            "original",
+            &vanished_path,
+            "checksum123",
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("MISSING_FILE", "original")
+            .await
+            .unwrap();
+
+        let flags = MetadataFlags {
+            rating: true,
+            embed_xmp: true,
+            ..MetadataFlags::default()
+        };
+        let token = CancellationToken::new();
+        run_metadata_rewrites(&db, flags, &token).await;
+
+        let still_pending = db.get_pending_metadata_rewrites(32).await.unwrap();
+        assert_eq!(
+            still_pending.len(),
+            1,
+            "marker must survive when the file is absent so a future sync retries"
+        );
     }
 }

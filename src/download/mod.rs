@@ -4,10 +4,11 @@
 //! concurrency, then (2) cleanup pass with fresh CDN URLs for any failures.
 
 pub mod error;
-pub mod exif;
 pub mod file;
 pub(crate) mod filter;
+pub(crate) mod heif;
 pub(crate) mod limiter;
+pub mod metadata;
 pub mod paths;
 pub(crate) mod pipeline;
 
@@ -15,10 +16,12 @@ pub(crate) use limiter::BandwidthLimiter;
 
 use pipeline::{
     build_download_outcome, format_duration, log_sync_summary, run_download_pass,
-    stream_and_download_from_stream, PassConfig, StreamingResult, AUTH_ERROR_THRESHOLD,
+    stream_and_download_from_stream, MetadataFlags, PassConfig, StreamingResult,
+    AUTH_ERROR_THRESHOLD,
 };
 
 pub(crate) use filter::determine_media_type;
+pub(crate) use filter::AssetGroupings;
 use filter::{
     extract_skip_candidates, filter_asset_to_tasks, pre_ensure_asset_dir, DownloadTask,
     NormalizedPath,
@@ -94,6 +97,11 @@ pub struct SyncStats {
     pub enumeration_errors: usize,
     pub elapsed_secs: f64,
     pub interrupted: bool,
+    /// Number of tasks that observed at least one HTTP 429 / 503 response
+    /// during retry. A high ratio of rate_limited / assets_seen signals the
+    /// sync is running against a back-pressured account; operators should
+    /// either raise --watch-with-interval or lower --threads-num.
+    pub rate_limited: usize,
 }
 
 /// Per-reason breakdown of skipped assets.
@@ -373,6 +381,15 @@ pub(crate) struct DownloadConfig {
     pub(crate) skip_created_before: Option<DateTime<Utc>>,
     pub(crate) skip_created_after: Option<DateTime<Utc>>,
     pub(crate) set_exif_datetime: bool,
+    pub(crate) set_exif_rating: bool,
+    pub(crate) set_exif_gps: bool,
+    pub(crate) set_exif_description: bool,
+    /// Embed the full XMP packet (title, keywords, people, hidden/archived,
+    /// media subtype, burst id) into the file bytes on supported formats.
+    pub(crate) embed_xmp: bool,
+    /// Write a `.xmp` sidecar file next to each downloaded media file with
+    /// the same composed XMP packet.
+    pub(crate) xmp_sidecar: bool,
     pub(crate) dry_run: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
@@ -404,6 +421,8 @@ pub(crate) struct DownloadConfig {
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
     /// Maximum download attempts per asset before giving up (0 = unlimited).
     pub(crate) max_download_attempts: u32,
+    /// Preloaded asset→album and asset→person indices, shared across clones.
+    pub(crate) asset_groupings: Arc<AssetGroupings>,
     /// Shared token-bucket limiter applied across all concurrent download
     /// streams. `None` = no throughput cap.
     pub(crate) bandwidth_limiter: Option<BandwidthLimiter>,
@@ -442,6 +461,7 @@ impl DownloadConfig {
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
             exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
+            asset_groupings: Arc::clone(&self.asset_groupings),
             bandwidth_limiter: self.bandwidth_limiter.clone(),
             ..*self
         }
@@ -471,6 +491,7 @@ impl DownloadConfig {
             sync_mode: self.sync_mode.clone(),
             album_name: self.album_name.clone(),
             exclude_asset_ids: exclude_ids,
+            asset_groupings: Arc::clone(&self.asset_groupings),
             bandwidth_limiter: self.bandwidth_limiter.clone(),
             ..*self
         }
@@ -488,6 +509,11 @@ impl std::fmt::Debug for DownloadConfig {
             .field("skip_created_before", &self.skip_created_before)
             .field("skip_created_after", &self.skip_created_after)
             .field("set_exif_datetime", &self.set_exif_datetime)
+            .field("set_exif_rating", &self.set_exif_rating)
+            .field("set_exif_gps", &self.set_exif_gps)
+            .field("set_exif_description", &self.set_exif_description)
+            .field("embed_xmp", &self.embed_xmp)
+            .field("xmp_sidecar", &self.xmp_sidecar)
             .field("dry_run", &self.dry_run)
             .field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
@@ -531,6 +557,11 @@ impl DownloadConfig {
             skip_created_before: None,
             skip_created_after: None,
             set_exif_datetime: false,
+            set_exif_rating: false,
+            set_exif_gps: false,
+            set_exif_description: false,
+            embed_xmp: false,
+            xmp_sidecar: false,
             dry_run: false,
             concurrent_downloads: 1,
             recent: None,
@@ -552,6 +583,7 @@ impl DownloadConfig {
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: std::sync::Arc::new(FxHashSet::default()),
+            asset_groupings: Arc::new(AssetGroupings::default()),
             bandwidth_limiter: None,
         }
     }
@@ -574,6 +606,15 @@ struct DownloadContext {
     /// Nested map: `asset_id` -> (`version_size` -> checksum) for downloaded assets.
     /// Used to detect checksum changes (iCloud asset updated) without DB queries.
     downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
+    /// Nested map: `asset_id` -> (`version_size` -> metadata_hash) for downloaded assets.
+    /// Used to detect metadata-only changes (favorite toggle, keywords, GPS edit,
+    /// etc.) when file bytes are unchanged but the provider has newer metadata.
+    downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
+    /// Nested map: `asset_id` -> set of `version_sizes` with a non-null
+    /// `metadata_write_failed_at` from a prior sync. These always route to
+    /// the metadata-rewrite path regardless of whether the hash changed.
+    /// Two-level shape matches `downloaded_ids` for zero-allocation lookups.
+    metadata_retry_markers: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced.
     known_ids: FxHashSet<Box<str>>,
@@ -583,14 +624,58 @@ struct DownloadContext {
 }
 
 impl DownloadContext {
-    /// Load the download context from the state database.
+    /// Load the download context from the state database. All six queries
+    /// are independent and run concurrently so sync start doesn't serialize
+    /// on round-trip latency across them.
     async fn load(db: &dyn StateDb, retry_only: bool) -> Self {
-        // Build nested map structure for zero-allocation lookups
+        let known_ids_fut = async {
+            if retry_only {
+                db.get_all_known_ids().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load known IDs from state DB");
+                    Default::default()
+                })
+            } else {
+                Default::default()
+            }
+        };
+        let (ids, checksums, hashes, markers, attempts, known_ids) = tokio::join!(
+            async {
+                db.get_downloaded_ids().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_downloaded_checksums().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load checksums from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_downloaded_metadata_hashes()
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Failed to load metadata hashes from state DB");
+                        Default::default()
+                    })
+            },
+            async {
+                db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_attempt_counts().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load attempt counts from state DB");
+                    Default::default()
+                })
+            },
+            known_ids_fut,
+        );
+
         let mut downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>> = FxHashMap::default();
-        for (asset_id, version_size) in db.get_downloaded_ids().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
-            Default::default()
-        }) {
+        for (asset_id, version_size) in ids {
             downloaded_ids
                 .entry(asset_id.into_boxed_str())
                 .or_default()
@@ -599,41 +684,40 @@ impl DownloadContext {
 
         let mut downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
-        for ((asset_id, version_size), checksum) in
-            db.get_downloaded_checksums().await.unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to load checksums from state DB");
-                Default::default()
-            })
-        {
+        for ((asset_id, version_size), checksum) in checksums {
             downloaded_checksums
                 .entry(asset_id.into_boxed_str())
                 .or_default()
                 .insert(version_size.into_boxed_str(), checksum.into_boxed_str());
         }
 
-        // In retry-only mode, load all known asset IDs so we can skip new
-        // assets that were never synced before.
-        let known_ids = if retry_only {
-            db.get_all_known_ids()
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load known IDs from state DB");
-                    Default::default()
-                })
-                .into_iter()
-                .map(String::into_boxed_str)
-                .collect()
-        } else {
-            FxHashSet::default()
-        };
+        let mut downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
+            FxHashMap::default();
+        for ((asset_id, version_size), metadata_hash) in hashes {
+            downloaded_metadata_hashes
+                .entry(asset_id.into_boxed_str())
+                .or_default()
+                .insert(
+                    version_size.into_boxed_str(),
+                    metadata_hash.into_boxed_str(),
+                );
+        }
 
-        let attempt_counts: FxHashMap<Box<str>, u32> = db
-            .get_attempt_counts()
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to load attempt counts from state DB");
-                Default::default()
-            })
+        // Two-level shape matches downloaded_ids so lookups are O(1) with
+        // borrowed keys instead of allocating a tuple per probe.
+        let mut metadata_retry_markers: FxHashMap<Box<str>, FxHashSet<Box<str>>> =
+            FxHashMap::default();
+        for (id, vs) in markers {
+            metadata_retry_markers
+                .entry(id.into_boxed_str())
+                .or_default()
+                .insert(vs.into_boxed_str());
+        }
+
+        let known_ids: FxHashSet<Box<str>> =
+            known_ids.into_iter().map(String::into_boxed_str).collect();
+
+        let attempt_counts: FxHashMap<Box<str>, u32> = attempts
             .into_iter()
             .map(|(id, count)| (id.into_boxed_str(), count))
             .collect();
@@ -641,8 +725,42 @@ impl DownloadContext {
         Self {
             downloaded_ids,
             downloaded_checksums,
+            downloaded_metadata_hashes,
+            metadata_retry_markers,
             known_ids,
             attempt_counts,
+        }
+    }
+
+    /// Whether a downloaded asset-version needs a metadata-only rewrite:
+    /// the caller has already matched checksums (bytes unchanged) and now
+    /// checks whether (a) the stored metadata_hash differs from the new
+    /// one or (b) a persisted retry marker is set from a prior sync where
+    /// the writer failed after bytes landed.
+    fn needs_metadata_rewrite(
+        &self,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+        new_metadata_hash: Option<&str>,
+    ) -> bool {
+        let vs_str = version_size.as_str();
+        let has_retry_marker = self
+            .metadata_retry_markers
+            .get(asset_id)
+            .is_some_and(|vsset| vsset.contains(vs_str));
+        if has_retry_marker {
+            return true;
+        }
+        let Some(new_hash) = new_metadata_hash else {
+            return false;
+        };
+        match self
+            .downloaded_metadata_hashes
+            .get(asset_id)
+            .and_then(|map| map.get(vs_str))
+        {
+            Some(stored) => stored.as_ref() != new_hash,
+            None => true, // downloaded row has no stored hash yet -- refresh
         }
     }
 
@@ -676,22 +794,32 @@ impl DownloadContext {
             return Some(true);
         }
 
-        // Check if checksum changed (also zero-allocation lookup)
-        if let Some(versions) = self.downloaded_checksums.get(asset_id) {
-            if let Some(stored_checksum) = versions.get(version_size_str) {
-                if stored_checksum.as_ref() != checksum {
-                    // Checksum changed — needs re-download
-                    return Some(true);
-                }
+        // Check if checksum changed (also zero-allocation lookup). Track
+        // whether a stored checksum is present at all so we can audit the
+        // "no stored checksum" path, which pre-v3 rows fall into.
+        let stored_checksum = self
+            .downloaded_checksums
+            .get(asset_id)
+            .and_then(|versions| versions.get(version_size_str));
+        if let Some(stored) = stored_checksum {
+            if stored.as_ref() != checksum {
+                return Some(true);
             }
+        } else {
+            // Pre-v3 row with no stored local_checksum. Audit so operators can
+            // correlate unexpected "skipped" counts with missing checksum
+            // history (the row will gain a checksum on next download).
+            tracing::debug!(
+                asset_id = asset_id,
+                version_size = %version_size_str,
+                trust_state = trust_state,
+                "no stored checksum for downloaded asset-version; skip decision uses trust_state only"
+            );
         }
 
-        // Downloaded with matching checksum
         if trust_state {
-            // Trust the DB — hard skip without filesystem check
             Some(false)
         } else {
-            // Need filesystem check to confirm file is still on disk
             None
         }
     }
@@ -994,6 +1122,23 @@ async fn download_photos_full_with_token(
     let started = Instant::now();
     let uses_album_token = config.uses_album_expansion();
 
+    // Mark every unique zone as in-progress so an interrupted full
+    // enumeration leaves a trail the next startup can surface to the
+    // operator. Clears once the enumeration returns normally.
+    let mut enum_zones: Vec<String> = passes
+        .iter()
+        .map(|p| p.album.zone_name().to_string())
+        .collect();
+    enum_zones.sort();
+    enum_zones.dedup();
+    if let Some(db) = &config.state_db {
+        for zone in &enum_zones {
+            if let Err(e) = db.begin_enum_progress(zone).await {
+                tracing::debug!(error = %e, zone, "Failed to mark enumeration start");
+            }
+        }
+    }
+
     // `album.len()` is one HTTP call per pass. Serialising it scaled fine
     // when users typed out a few `-a` flags by hand; with `-a all` it's
     // routinely 20+ round-trips before the first byte of the first
@@ -1135,6 +1280,19 @@ async fn download_photos_full_with_token(
     )
     .await?;
 
+    // Clear enumeration-in-progress markers only on non-interrupted
+    // completion. Interrupted / errored runs keep their markers so the
+    // next startup can surface the interruption to the operator.
+    if !stats.interrupted {
+        if let Some(db) = &config.state_db {
+            for zone in &enum_zones {
+                if let Err(e) = db.end_enum_progress(zone).await {
+                    tracing::debug!(error = %e, zone, "Failed to clear enumeration marker");
+                }
+            }
+        }
+    }
+
     Ok(SyncResult {
         outcome,
         sync_token,
@@ -1188,14 +1346,46 @@ async fn download_photos_incremental(
                 ChangeReason::SoftDeleted => {
                     soft_deleted_count += 1;
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
+                    if let Some(db) = &config.state_db {
+                        let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
+                        if let Err(e) = db.mark_soft_deleted(&event.record_name, deleted_at).await {
+                            tracing::warn!(
+                                record_name = %event.record_name,
+                                error = %e,
+                                "Failed to record soft-delete in state DB"
+                            );
+                        }
+                    }
                 }
                 ChangeReason::HardDeleted => {
                     hard_deleted_count += 1;
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
+                    // CloudKit returns no fields for hard-deleted records, so we
+                    // can't tell master from asset. Treat as soft-delete in DB
+                    // (sets is_deleted=1) — the row stays put so history and
+                    // local_path remain queryable.
+                    if let Some(db) = &config.state_db {
+                        if let Err(e) = db.mark_soft_deleted(&event.record_name, None).await {
+                            tracing::warn!(
+                                record_name = %event.record_name,
+                                error = %e,
+                                "Failed to record hard-delete in state DB"
+                            );
+                        }
+                    }
                 }
                 ChangeReason::Hidden => {
                     hidden_count += 1;
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
+                    if let Some(db) = &config.state_db {
+                        if let Err(e) = db.mark_hidden_at_source(&event.record_name).await {
+                            tracing::warn!(
+                                record_name = %event.record_name,
+                                error = %e,
+                                "Failed to record hidden state in state DB"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1321,12 +1511,30 @@ async fn download_photos_incremental(
                     Some(asset.added_date()),
                     task.size,
                     media_type,
-                );
+                )
+                .with_metadata(asset.metadata().clone());
                 if let Err(e) = db.upsert_seen(&record).await {
                     tracing::warn!(
                         asset_id = %task.asset_id,
                         error = %e,
                         "Failed to record asset in state DB"
+                    );
+                }
+            }
+            // Record this asset's membership in the current album so
+            // consumers (EXIF keywords, XMP sidecars, Immich albums) can
+            // reconstruct the logical album graph from the state DB.
+            if let Some(album_name) = effective_config
+                .album_name
+                .as_deref()
+                .filter(|n| !n.is_empty())
+            {
+                if let Err(e) = db.add_asset_album(asset.id(), album_name, "icloud").await {
+                    tracing::warn!(
+                        asset_id = %asset.id(),
+                        album = %album_name,
+                        error = %e,
+                        "Failed to record album membership"
                     );
                 }
             }
@@ -1387,12 +1595,13 @@ async fn download_photos_incremental(
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
-        set_exif: config.set_exif_datetime,
+        metadata: MetadataFlags::from(config.as_ref()),
         concurrency: config.concurrent_downloads,
         no_progress_bar: config.no_progress_bar,
         temp_suffix: config.temp_suffix.clone(),
         shutdown_token,
         state_db: config.state_db.clone(),
+        rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         bandwidth_limiter: config.bandwidth_limiter.clone(),
     };
     let pass_result = run_download_pass(pass_config, tasks).await;
@@ -1419,6 +1628,7 @@ async fn download_photos_incremental(
         enumeration_errors: 0,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
+        rate_limited: pass_result.rate_limit_observations,
     };
     log_sync_summary(
         "\u{2500}\u{2500} Incremental Sync Summary \u{2500}\u{2500}",
@@ -1925,6 +2135,11 @@ mod tests {
             skip_photos: false,
             force_size: false,
             set_exif_datetime: false,
+            set_exif_rating: false,
+            set_exif_gps: false,
+            set_exif_description: false,
+            embed_xmp: false,
+            xmp_sidecar: false,
             dry_run: false,
             no_progress_bar: true,
             keep_unicode_in_filenames: false,
@@ -1963,6 +2178,56 @@ mod tests {
             ctx.should_download_fast("never_seen", VersionSizeKey::Original, "any_ck", false),
             Some(true)
         );
+    }
+
+    #[test]
+    fn needs_metadata_rewrite_detects_hash_change() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_metadata_hashes
+            .entry("asset_md".into())
+            .or_default()
+            .insert("original".into(), "hash-OLD".into());
+
+        // Same hash -> no rewrite needed.
+        assert!(!ctx.needs_metadata_rewrite(
+            "asset_md",
+            VersionSizeKey::Original,
+            Some("hash-OLD")
+        ));
+        // Different hash -> rewrite.
+        assert!(ctx.needs_metadata_rewrite("asset_md", VersionSizeKey::Original, Some("hash-NEW")));
+        // Unknown new hash -> no rewrite (nothing to compare to).
+        assert!(!ctx.needs_metadata_rewrite("asset_md", VersionSizeKey::Original, None));
+    }
+
+    #[test]
+    fn needs_metadata_rewrite_honors_retry_marker() {
+        let mut ctx = DownloadContext::default();
+        ctx.metadata_retry_markers
+            .entry("asset_retry".into())
+            .or_default()
+            .insert("original".into());
+        // No stored hash at all, but marker is set -> rewrite needed.
+        assert!(ctx.needs_metadata_rewrite("asset_retry", VersionSizeKey::Original, None));
+        // Marker set -> rewrite even if hashes match.
+        ctx.downloaded_metadata_hashes
+            .entry("asset_retry".into())
+            .or_default()
+            .insert("original".into(), "h".into());
+        assert!(ctx.needs_metadata_rewrite("asset_retry", VersionSizeKey::Original, Some("h")));
+    }
+
+    #[test]
+    fn needs_metadata_rewrite_refreshes_null_stored_hash() {
+        // Pre-v5 downloaded rows have metadata_hash IS NULL; even without a
+        // retry marker, a fresh hash should trigger a rewrite so the XMP
+        // gets the provider state this tree has never recorded.
+        let ctx = DownloadContext::default();
+        assert!(ctx.needs_metadata_rewrite(
+            "asset_no_stored_hash",
+            VersionSizeKey::Original,
+            Some("new-hash")
+        ));
     }
 
     #[test]

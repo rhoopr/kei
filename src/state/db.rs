@@ -11,8 +11,17 @@ use rusqlite::{Connection, OptionalExtension};
 use super::error::StateError;
 use super::schema;
 use super::types::{
-    AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary, VersionSizeKey,
+    AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary, VersionSizeKey,
 };
+
+/// Fallback provider identifier when `AssetMetadata::source` is unset.
+///
+/// The `assets.source` column is NOT NULL (v5 migration defaults pre-existing
+/// rows to "icloud"). Test fixtures and legacy call sites that don't populate
+/// metadata get the same value written here so that inserts always succeed.
+/// Real provider adapters (iCloud, Takeout, etc.) set `source` explicitly;
+/// this fallback is a safety net, not the intended write path.
+const DEFAULT_SOURCE: &str = "icloud";
 
 /// Trait for state database operations.
 ///
@@ -78,6 +87,11 @@ pub trait StateDb: Send + Sync {
     /// Get all failed assets.
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError>;
 
+    /// Most-recently-seen failed rows up to `limit`, alongside the total
+    /// failed count. Used by the sync-report writer to avoid loading every
+    /// failed row into memory on an account with thousands of failures.
+    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError>;
+
     /// Get all pending assets.
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
 
@@ -99,6 +113,28 @@ pub trait StateDb: Send + Sync {
 
     /// Complete a sync run with statistics.
     async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError>;
+
+    /// Promote any `sync_runs` rows left in `status='running'` to
+    /// `status='interrupted'` (with `interrupted=1`). These are rows from a
+    /// prior process that was SIGKILL'd or crashed without calling
+    /// `complete_sync_run`. Called once at process startup, immediately
+    /// after migrations. Returns the number of rows promoted.
+    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError>;
+
+    /// Mark the start of a full enumeration for `zone`. Pairs with
+    /// `end_enum_progress` on successful completion; a remaining marker at
+    /// next startup means the enumeration was interrupted. Stores the start
+    /// timestamp so the operator can age the marker.
+    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError>;
+
+    /// Clear the in-progress enumeration marker for `zone`. Idempotent.
+    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError>;
+
+    /// Return the zone names of any enumerations that started but never
+    /// ended. Read once at process startup so the operator is warned that
+    /// the next full sync will re-enumerate from scratch until resume
+    /// support lands.
+    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError>;
 
     /// Reset all failed assets to pending status.
     ///
@@ -177,6 +213,101 @@ pub trait StateDb: Send + Sync {
     /// Sample up to `limit` local paths of downloaded assets.
     /// Used to spot-check that "downloaded" files still exist on disk.
     async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError>;
+
+    // ── v5 metadata operations ──
+
+    /// Record an album membership entry. Idempotent via `INSERT OR IGNORE`.
+    ///
+    /// Called during album enumeration when an asset is seen in an album. The
+    /// `(asset_id, album_name, source)` composite key namespaces memberships
+    /// per provider so that multiple providers can coexist.
+    async fn add_asset_album(
+        &self,
+        asset_id: &str,
+        album_name: &str,
+        source: &str,
+    ) -> Result<(), StateError>;
+
+    /// Bulk-load every `(asset_id, album_name)` from `asset_albums`. Used at
+    /// sync start to populate the in-memory groupings index — downstream
+    /// writers look up album memberships without a per-asset DB hit.
+    async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError>;
+
+    /// Bulk-load every `(asset_id, person_name)` from `asset_people`.
+    async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError>;
+
+    /// Mark an asset as soft-deleted (all versions under `asset_id`).
+    ///
+    /// Updates `is_deleted` and optional `deleted_at` timestamp. Does not
+    /// remove the row so that history survives and consumers can still reach
+    /// the local file.
+    async fn mark_soft_deleted(
+        &self,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StateError>;
+
+    /// Mark an asset as hidden at source.
+    async fn mark_hidden_at_source(&self, asset_id: &str) -> Result<(), StateError>;
+
+    /// Record that a metadata write (EXIF embed or sidecar) failed for this
+    /// asset-version pair after the bytes landed on disk. Sets
+    /// `metadata_write_failed_at` to the current timestamp. The metadata-only
+    /// rewrite path consumes this to retry on subsequent syncs even when the
+    /// file checksum matches.
+    async fn record_metadata_write_failure(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError>;
+
+    /// Pre-load every `(asset_id, version_size) -> metadata_hash` for
+    /// downloaded assets. Used at sync start to detect metadata-only changes
+    /// (file checksum matches but e.g. keywords / favorite / GPS drifted)
+    /// without a per-asset DB hit in the producer hot path.
+    async fn get_downloaded_metadata_hashes(
+        &self,
+    ) -> Result<HashMap<(String, String), String>, StateError>;
+
+    /// Pre-load the set of `(asset_id, version_size)` pairs that have a
+    /// non-null `metadata_write_failed_at`. These need a metadata rewrite
+    /// on the next sync regardless of whether the provider reports a
+    /// hash change.
+    async fn get_metadata_retry_markers(&self) -> Result<HashSet<(String, String)>, StateError>;
+
+    /// Fetch up to `limit` downloaded asset rows that carry a metadata
+    /// rewrite marker AND have a local_path pointing at an on-disk file.
+    /// Used by the metadata-rewrite worker to re-apply EXIF/XMP without
+    /// re-downloading bytes.
+    async fn get_pending_metadata_rewrites(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AssetRecord>, StateError>;
+
+    /// Update just the `metadata_hash` column for an asset-version pair
+    /// after a successful metadata rewrite. Leaves every other column alone.
+    async fn update_metadata_hash(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+        metadata_hash: &str,
+    ) -> Result<(), StateError>;
+
+    /// Clear the metadata-write-failed marker for an asset-version pair
+    /// after a successful rewrite.
+    async fn clear_metadata_write_failure(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError>;
+
+    /// Whether any downloaded asset still has `metadata_hash IS NULL`.
+    ///
+    /// Used at sync start to log a one-time backfill notice after the v5
+    /// upgrade. Returns false on a fresh DB or once the backfill sync
+    /// completes. Early-exits on the first matching row via `EXISTS`, avoiding
+    /// a full COUNT scan.
+    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
 }
 
 /// `SQLite` implementation of the state database.
@@ -262,6 +393,30 @@ impl SqliteStateDb {
     }
 }
 
+/// Drain a rusqlite row iterator into `Vec<T>`, dropping parse failures but
+/// logging each at `debug!` and summarising the drop count at `warn!` so a
+/// corrupted row never silently disappears from a bulk loader.
+fn collect_rows_with_warn<T, I>(rows: I, label: &'static str) -> Result<Vec<T>, StateError>
+where
+    I: Iterator<Item = rusqlite::Result<T>>,
+{
+    let mut out = Vec::new();
+    let mut dropped = 0usize;
+    for r in rows {
+        match r {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                dropped += 1;
+                tracing::debug!(error = %e, "{label}: row parse error");
+            }
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(dropped, "{label}: dropped rows with parse errors");
+    }
+    Ok(out)
+}
+
 #[async_trait]
 impl StateDb for SqliteStateDb {
     #[cfg(test)]
@@ -340,12 +495,33 @@ impl StateDb for SqliteStateDb {
 
         let conn = self.acquire_lock("upsert_seen")?;
 
-        // Use INSERT OR REPLACE to handle both insert and update
-        // But preserve existing status, downloaded_at, local_path, download_attempts, last_error
+        let meta = &record.metadata;
+        // Lazily compute metadata_hash if caller supplied metadata without one.
+        // Storing the hash alongside the metadata is what lets feature 5 detect
+        // metadata-only changes in O(1) during incremental sync. Computed only
+        // when missing (rare — extract() normally pre-populates it).
+        let computed_hash: Option<String> = if meta.metadata_hash.is_none() {
+            Some(meta.compute_hash())
+        } else {
+            None
+        };
+        let metadata_hash: Option<&str> =
+            meta.metadata_hash.as_deref().or(computed_hash.as_deref());
+
         conn.execute(
             r"
-            INSERT INTO assets (id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, last_seen_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)
+            INSERT INTO assets (
+                id, version_size, checksum, filename, created_at, added_at,
+                size_bytes, media_type, status, last_seen_at,
+                source, is_favorite, rating, latitude, longitude, altitude,
+                orientation, duration_secs, timezone_offset, width, height,
+                title, keywords, description, media_subtype, burst_id,
+                is_hidden, is_archived, modified_at, is_deleted, deleted_at,
+                provider_data, metadata_hash
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9,
+                    ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
             ON CONFLICT(id, version_size) DO UPDATE SET
                 checksum = excluded.checksum,
                 filename = excluded.filename,
@@ -353,7 +529,30 @@ impl StateDb for SqliteStateDb {
                 added_at = excluded.added_at,
                 size_bytes = excluded.size_bytes,
                 media_type = excluded.media_type,
-                last_seen_at = excluded.last_seen_at
+                last_seen_at = excluded.last_seen_at,
+                source = COALESCE(excluded.source, assets.source),
+                is_favorite = excluded.is_favorite,
+                rating = excluded.rating,
+                latitude = excluded.latitude,
+                longitude = excluded.longitude,
+                altitude = excluded.altitude,
+                orientation = excluded.orientation,
+                duration_secs = excluded.duration_secs,
+                timezone_offset = excluded.timezone_offset,
+                width = excluded.width,
+                height = excluded.height,
+                title = excluded.title,
+                keywords = excluded.keywords,
+                description = excluded.description,
+                media_subtype = excluded.media_subtype,
+                burst_id = excluded.burst_id,
+                is_hidden = excluded.is_hidden,
+                is_archived = excluded.is_archived,
+                modified_at = excluded.modified_at,
+                is_deleted = excluded.is_deleted,
+                deleted_at = excluded.deleted_at,
+                provider_data = excluded.provider_data,
+                metadata_hash = excluded.metadata_hash
             ",
             rusqlite::params![
                 &record.id,
@@ -365,6 +564,29 @@ impl StateDb for SqliteStateDb {
                 i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
                 record.media_type.as_str(),
                 last_seen_at,
+                meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
+                i64::from(meta.is_favorite),
+                meta.rating.map(i64::from),
+                meta.latitude,
+                meta.longitude,
+                meta.altitude,
+                meta.orientation.map(i64::from),
+                meta.duration_secs,
+                meta.timezone_offset.map(i64::from),
+                meta.width.map(i64::from),
+                meta.height.map(i64::from),
+                meta.title.as_deref(),
+                meta.keywords.as_deref(),
+                meta.description.as_deref(),
+                meta.media_subtype.as_deref(),
+                meta.burst_id.as_deref(),
+                i64::from(meta.is_hidden),
+                i64::from(meta.is_archived),
+                meta.modified_at.map(|dt| dt.timestamp()),
+                i64::from(meta.is_deleted),
+                meta.deleted_at.map(|dt| dt.timestamp()),
+                meta.provider_data.as_deref(),
+                metadata_hash,
             ],
         )
         .map_err(|e| StateError::query("upsert_seen", e))?;
@@ -457,6 +679,34 @@ impl StateDb for SqliteStateDb {
             .map_err(|e| StateError::query("get_failed", e))?;
 
         Ok(records)
+    }
+
+    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
+        let conn = self.acquire_lock("get_failed_sample")?;
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM assets WHERE status = 'failed'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StateError::query("get_failed_sample", e))?;
+
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+             ORDER BY last_seen_at DESC LIMIT ?1",
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StateError::query("get_failed_sample", e))?;
+
+        let records = stmt
+            .query_map([i64::from(limit)], row_to_asset_record)
+            .map_err(|e| StateError::query("get_failed_sample", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StateError::query("get_failed_sample", e))?;
+
+        Ok((records, total.max(0) as u64))
     }
 
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
@@ -574,7 +824,7 @@ impl StateDb for SqliteStateDb {
         let conn = self.acquire_lock("start_sync_run")?;
 
         conn.execute(
-            "INSERT INTO sync_runs (started_at) VALUES (?1)",
+            "INSERT INTO sync_runs (started_at, status) VALUES (?1, 'running')",
             [started_at],
         )
         .map_err(|e| StateError::query("start_sync_run", e))?;
@@ -588,17 +838,83 @@ impl StateDb for SqliteStateDb {
         let assets_seen = i64::try_from(stats.assets_seen).unwrap_or(i64::MAX);
         let assets_downloaded = i64::try_from(stats.assets_downloaded).unwrap_or(i64::MAX);
         let assets_failed = i64::try_from(stats.assets_failed).unwrap_or(i64::MAX);
-        let interrupted = i32::from(stats.interrupted);
+        let interrupted_i32 = i32::from(stats.interrupted);
+        let status = if stats.interrupted {
+            "interrupted"
+        } else {
+            "complete"
+        };
 
         let conn = self.acquire_lock("complete_sync_run")?;
 
         conn.execute(
-            "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, assets_failed = ?4, interrupted = ?5 WHERE id = ?6",
-            rusqlite::params![completed_at, assets_seen, assets_downloaded, assets_failed, interrupted, run_id],
+            "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, \
+             assets_failed = ?4, interrupted = ?5, status = ?6 WHERE id = ?7",
+            rusqlite::params![
+                completed_at,
+                assets_seen,
+                assets_downloaded,
+                assets_failed,
+                interrupted_i32,
+                status,
+                run_id
+            ],
         )
         .map_err(|e| StateError::query("complete_sync_run", e))?;
 
         Ok(())
+    }
+
+    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+        let conn = self.acquire_lock("promote_orphaned_sync_runs")?;
+        let rows = conn
+            .execute(
+                "UPDATE sync_runs SET status = 'interrupted', interrupted = 1 \
+                 WHERE status = 'running'",
+                [],
+            )
+            .map_err(|e| StateError::query("promote_orphaned_sync_runs", e))?;
+        Ok(rows as u64)
+    }
+
+    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        let key = format!("enum_in_progress:{zone}");
+        let now = Utc::now().timestamp().to_string();
+        let conn = self.acquire_lock("begin_enum_progress")?;
+        // INSERT OR IGNORE so re-entry doesn't reset the age operators use to
+        // judge stuck zones; `end_enum_progress` is the only path that clears.
+        conn.execute(
+            "INSERT OR IGNORE INTO metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, now],
+        )
+        .map_err(|e| StateError::query("begin_enum_progress", e))?;
+        Ok(())
+    }
+
+    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        let key = format!("enum_in_progress:{zone}");
+        let conn = self.acquire_lock("end_enum_progress")?;
+        conn.execute("DELETE FROM metadata WHERE key = ?1", [key])
+            .map_err(|e| StateError::query("end_enum_progress", e))?;
+        Ok(())
+    }
+
+    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+        let conn = self.acquire_lock("list_interrupted_enumerations")?;
+        let mut stmt = conn
+            .prepare("SELECT key FROM metadata WHERE key LIKE 'enum_in_progress:%'")
+            .map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
+        let mut zones = Vec::new();
+        for row in rows {
+            let key = row.map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
+            if let Some(zone) = key.strip_prefix("enum_in_progress:") {
+                zones.push(zone.to_string());
+            }
+        }
+        Ok(zones)
     }
 
     async fn reset_failed(&self) -> Result<u64, StateError> {
@@ -821,16 +1137,214 @@ impl StateDb for SqliteStateDb {
             )
             .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
 
-        let paths = stmt
+        let rows = stmt
             .query_map(rusqlite::params![limit as i64], |row| {
                 let p: String = row.get(0)?;
                 Ok(PathBuf::from(p))
             })
-            .map_err(|e| StateError::query("sample_downloaded_paths", e))?
-            .filter_map(Result::ok)
-            .collect();
+            .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
+        collect_rows_with_warn(rows, "sample_downloaded_paths")
+    }
 
-        Ok(paths)
+    async fn add_asset_album(
+        &self,
+        asset_id: &str,
+        album_name: &str,
+        source: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.acquire_lock("add_asset_album")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO asset_albums (asset_id, album_name, source) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![asset_id, album_name, source],
+        )
+        .map_err(|e| StateError::query("add_asset_album", e))?;
+        Ok(())
+    }
+
+    async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
+        let conn = self.acquire_lock("get_all_asset_albums")?;
+        let mut stmt = conn
+            .prepare_cached("SELECT asset_id, album_name FROM asset_albums")
+            .map_err(|e| StateError::query("get_all_asset_albums", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| StateError::query("get_all_asset_albums", e))?;
+        collect_rows_with_warn(rows, "get_all_asset_albums")
+    }
+
+    async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
+        let conn = self.acquire_lock("get_all_asset_people")?;
+        let mut stmt = conn
+            .prepare_cached("SELECT asset_id, person_name FROM asset_people")
+            .map_err(|e| StateError::query("get_all_asset_people", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| StateError::query("get_all_asset_people", e))?;
+        collect_rows_with_warn(rows, "get_all_asset_people")
+    }
+
+    async fn mark_soft_deleted(
+        &self,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StateError> {
+        let conn = self.acquire_lock("mark_soft_deleted")?;
+        conn.execute(
+            "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
+             WHERE id = ?2",
+            rusqlite::params![deleted_at.map(|dt| dt.timestamp()), asset_id],
+        )
+        .map_err(|e| StateError::query("mark_soft_deleted", e))?;
+        Ok(())
+    }
+
+    async fn mark_hidden_at_source(&self, asset_id: &str) -> Result<(), StateError> {
+        let conn = self.acquire_lock("mark_hidden_at_source")?;
+        conn.execute(
+            "UPDATE assets SET is_hidden = 1 WHERE id = ?1",
+            rusqlite::params![asset_id],
+        )
+        .map_err(|e| StateError::query("mark_hidden_at_source", e))?;
+        Ok(())
+    }
+
+    async fn record_metadata_write_failure(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        let ts = Utc::now().timestamp();
+        let conn = self.acquire_lock("record_metadata_write_failure")?;
+        conn.execute(
+            "UPDATE assets SET metadata_write_failed_at = ?1 \
+             WHERE id = ?2 AND version_size = ?3",
+            rusqlite::params![ts, asset_id, version_size],
+        )
+        .map_err(|e| StateError::query("record_metadata_write_failure", e))?;
+        Ok(())
+    }
+
+    async fn clear_metadata_write_failure(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.acquire_lock("clear_metadata_write_failure")?;
+        conn.execute(
+            "UPDATE assets SET metadata_write_failed_at = NULL \
+             WHERE id = ?1 AND version_size = ?2",
+            rusqlite::params![asset_id, version_size],
+        )
+        .map_err(|e| StateError::query("clear_metadata_write_failure", e))?;
+        Ok(())
+    }
+
+    async fn get_downloaded_metadata_hashes(
+        &self,
+    ) -> Result<HashMap<(String, String), String>, StateError> {
+        let conn = self.acquire_lock("get_downloaded_metadata_hashes")?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, version_size, metadata_hash FROM assets \
+                 WHERE status = 'downloaded' AND metadata_hash IS NOT NULL",
+            )
+            .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
+        let mut hashes: HashMap<(String, String), String> = HashMap::new();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
+        for row in rows {
+            let (key, val) =
+                row.map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
+            hashes.insert(key, val);
+        }
+        Ok(hashes)
+    }
+
+    async fn get_pending_metadata_rewrites(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        let conn = self.acquire_lock("get_pending_metadata_rewrites")?;
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets \
+             WHERE metadata_write_failed_at IS NOT NULL \
+               AND status = 'downloaded' \
+               AND local_path IS NOT NULL \
+             ORDER BY metadata_write_failed_at ASC \
+             LIMIT ?1"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
+        let rows = stmt
+            .query_map(
+                [i64::try_from(limit).unwrap_or(i64::MAX)],
+                row_to_asset_record,
+            )
+            .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))
+    }
+
+    async fn get_metadata_retry_markers(&self) -> Result<HashSet<(String, String)>, StateError> {
+        let conn = self.acquire_lock("get_metadata_retry_markers")?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, version_size FROM assets \
+                 WHERE metadata_write_failed_at IS NOT NULL",
+            )
+            .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
+        let mut markers: HashSet<(String, String)> = HashSet::new();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
+        for row in rows {
+            let key = row.map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
+            markers.insert(key);
+        }
+        Ok(markers)
+    }
+
+    async fn update_metadata_hash(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+        metadata_hash: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.acquire_lock("update_metadata_hash")?;
+        conn.execute(
+            "UPDATE assets SET metadata_hash = ?1 \
+             WHERE id = ?2 AND version_size = ?3",
+            rusqlite::params![metadata_hash, asset_id, version_size],
+        )
+        .map_err(|e| StateError::query("update_metadata_hash", e))?;
+        Ok(())
+    }
+
+    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+        let conn = self.acquire_lock("has_downloaded_without_metadata_hash")?;
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
+                 AND metadata_hash IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StateError::query("has_downloaded_without_metadata_hash", e))?;
+        Ok(exists != 0)
     }
 }
 
@@ -852,10 +1366,20 @@ impl SqliteStateDb {
 }
 
 /// Column list for every `SELECT ... FROM assets` that feeds `row_to_asset_record`.
-/// Keep this in sync with the indices read in `row_to_asset_record`.
+/// Keep this in sync with the indices read in `row_to_asset_record` and the
+/// VALUES placeholder count in `upsert_seen`.
 const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
      added_at, size_bytes, media_type, status, downloaded_at, local_path, \
-     last_seen_at, download_attempts, last_error, local_checksum";
+     last_seen_at, download_attempts, last_error, local_checksum, \
+     source, is_favorite, rating, latitude, longitude, altitude, orientation, \
+     duration_secs, timezone_offset, width, height, title, keywords, description, \
+     media_subtype, burst_id, is_hidden, is_archived, modified_at, is_deleted, \
+     deleted_at, provider_data, metadata_hash";
+
+/// Total number of columns in `ASSET_COLUMNS`. Validated by a unit test that
+/// asserts `row_to_asset_record` reads exactly this many indices (0..N).
+#[cfg(test)]
+const ASSET_COLUMN_COUNT: usize = 38;
 
 /// Convert a database row to an `AssetRecord`.
 ///
@@ -877,6 +1401,56 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
     let download_attempts: i64 = row.get(12)?;
     let last_error: Option<String> = row.get(13)?;
     let local_checksum: Option<String> = row.get(14)?;
+
+    let source: Option<String> = row.get(15)?;
+    let is_favorite: i64 = row.get(16)?;
+    let rating: Option<i64> = row.get(17)?;
+    let latitude: Option<f64> = row.get(18)?;
+    let longitude: Option<f64> = row.get(19)?;
+    let altitude: Option<f64> = row.get(20)?;
+    let orientation: Option<i64> = row.get(21)?;
+    let duration_secs: Option<f64> = row.get(22)?;
+    let timezone_offset: Option<i64> = row.get(23)?;
+    let width: Option<i64> = row.get(24)?;
+    let height: Option<i64> = row.get(25)?;
+    let title: Option<String> = row.get(26)?;
+    let keywords: Option<String> = row.get(27)?;
+    let description: Option<String> = row.get(28)?;
+    let media_subtype: Option<String> = row.get(29)?;
+    let burst_id: Option<String> = row.get(30)?;
+    let is_hidden: i64 = row.get(31)?;
+    let is_archived: i64 = row.get(32)?;
+    let modified_at_ts: Option<i64> = row.get(33)?;
+    let is_deleted: i64 = row.get(34)?;
+    let deleted_at_ts: Option<i64> = row.get(35)?;
+    let provider_data: Option<String> = row.get(36)?;
+    let metadata_hash: Option<String> = row.get(37)?;
+
+    let metadata = AssetMetadata {
+        source,
+        is_favorite: is_favorite != 0,
+        rating: rating.and_then(|v| u8::try_from(v).ok()),
+        latitude,
+        longitude,
+        altitude,
+        orientation: orientation.and_then(|v| u8::try_from(v).ok()),
+        duration_secs,
+        timezone_offset: timezone_offset.and_then(|v| i32::try_from(v).ok()),
+        width: width.and_then(|v| u32::try_from(v).ok()),
+        height: height.and_then(|v| u32::try_from(v).ok()),
+        title,
+        keywords,
+        description,
+        media_subtype,
+        burst_id,
+        is_hidden: is_hidden != 0,
+        is_archived: is_archived != 0,
+        modified_at: modified_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+        is_deleted: is_deleted != 0,
+        deleted_at: deleted_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+        provider_data,
+        metadata_hash,
+    };
 
     Ok(AssetRecord {
         id,
@@ -901,6 +1475,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
             .unwrap_or(VersionSizeKey::Original),
         media_type: MediaType::from_str(&media_type_str).unwrap_or(MediaType::Photo),
         status: AssetStatus::from_str(&status_str).unwrap_or(AssetStatus::Pending),
+        metadata,
     })
 }
 
@@ -1079,6 +1654,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_failed_sample_respects_limit_and_returns_total() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for i in 0..5 {
+            let id = format!("FAIL_{i}");
+            let record = TestAssetRecord::new(&id)
+                .checksum(&format!("ck_{i}"))
+                .filename(&format!("{i}.jpg"))
+                .size(100)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_failed(&id, "original", "boom").await.unwrap();
+        }
+        // Newest first: FAIL_4 > FAIL_3 > FAIL_2 ...
+        for i in 0..5 {
+            db.backdate_last_seen(&format!("FAIL_{i}"), 1_000 + i as i64);
+        }
+
+        let (sample, total) = db.get_failed_sample(2).await.unwrap();
+        assert_eq!(total, 5, "total should reflect full failed count");
+        assert_eq!(sample.len(), 2, "limit should cap returned rows");
+        assert_eq!(sample[0].id, "FAIL_4");
+        assert_eq!(sample[1].id, "FAIL_3");
+
+        // limit > total returns all and the correct total
+        let (sample, total) = db.get_failed_sample(100).await.unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(sample.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn get_failed_sample_empty_returns_zero_total() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let (sample, total) = db.get_failed_sample(10).await.unwrap();
+        assert!(sample.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
     async fn get_pending_orders_by_last_seen_desc() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
@@ -1191,6 +1805,199 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert!(summary.last_sync_started.is_some());
         assert!(summary.last_sync_completed.is_some());
+    }
+
+    // ── sync_runs status lifecycle ─────────────────────────────────────────
+
+    async fn status_of(db: &SqliteStateDb, run_id: i64) -> String {
+        let conn = db.acquire_lock("test_status_of").unwrap();
+        conn.query_row(
+            "SELECT status FROM sync_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_run_status_is_running_after_start() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        assert_eq!(status_of(&db, run_id).await, "running");
+    }
+
+    #[tokio::test]
+    async fn sync_run_status_is_complete_after_clean_complete() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            assets_seen: 1,
+            assets_downloaded: 1,
+            assets_failed: 0,
+            interrupted: false,
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+        assert_eq!(status_of(&db, run_id).await, "complete");
+    }
+
+    #[tokio::test]
+    async fn sync_run_status_is_interrupted_when_flagged() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            assets_seen: 1,
+            assets_downloaded: 0,
+            assets_failed: 0,
+            interrupted: true,
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+        assert_eq!(status_of(&db, run_id).await, "interrupted");
+    }
+
+    #[tokio::test]
+    async fn promote_orphaned_sync_runs_flips_running_rows() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        // Simulate two crashed runs plus one clean one
+        let a = db.start_sync_run().await.unwrap();
+        let b = db.start_sync_run().await.unwrap();
+        let c = db.start_sync_run().await.unwrap();
+        let clean = SyncRunStats {
+            assets_seen: 0,
+            assets_downloaded: 0,
+            assets_failed: 0,
+            interrupted: false,
+        };
+        db.complete_sync_run(c, &clean).await.unwrap();
+
+        let promoted = db.promote_orphaned_sync_runs().await.unwrap();
+        assert_eq!(promoted, 2);
+        assert_eq!(status_of(&db, a).await, "interrupted");
+        assert_eq!(status_of(&db, b).await, "interrupted");
+        // The cleanly completed row must be untouched
+        assert_eq!(status_of(&db, c).await, "complete");
+    }
+
+    #[tokio::test]
+    async fn promote_orphaned_sync_runs_noop_when_none_pending() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            assets_seen: 0,
+            assets_downloaded: 0,
+            assets_failed: 0,
+            interrupted: false,
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+
+        let promoted = db.promote_orphaned_sync_runs().await.unwrap();
+        assert_eq!(promoted, 0);
+    }
+
+    // ── enum_in_progress markers ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn begin_enum_progress_inserts_marker() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        let zones = db.list_interrupted_enumerations().await.unwrap();
+        assert_eq!(zones, vec!["PrimarySync".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn end_enum_progress_clears_marker() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        db.end_enum_progress("PrimarySync").await.unwrap();
+        let zones = db.list_interrupted_enumerations().await.unwrap();
+        assert!(zones.is_empty());
+    }
+
+    #[tokio::test]
+    async fn end_enum_progress_is_idempotent() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        // No marker set — end should be a no-op without error
+        db.end_enum_progress("NotThere").await.unwrap();
+        assert!(db.list_interrupted_enumerations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_interrupted_enumerations_tracks_multiple_zones() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        db.begin_enum_progress("SharedSync-ABC123").await.unwrap();
+        let mut zones = db.list_interrupted_enumerations().await.unwrap();
+        zones.sort();
+        assert_eq!(zones, vec!["PrimarySync", "SharedSync-ABC123"]);
+    }
+
+    #[tokio::test]
+    async fn begin_enum_progress_is_idempotent_for_same_zone() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        let zones = db.list_interrupted_enumerations().await.unwrap();
+        assert_eq!(zones, vec!["PrimarySync".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn begin_enum_progress_preserves_original_timestamp_on_reentry() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let original_ts = "1700000000";
+
+        fn read_marker(db: &SqliteStateDb) -> Option<String> {
+            let conn = db.acquire_lock("read_marker").unwrap();
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key = 'enum_in_progress:PrimarySync'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        }
+
+        // Seed an older marker timestamp directly.
+        {
+            let conn = db.acquire_lock("seed_marker").unwrap();
+            conn.execute(
+                "INSERT INTO metadata (key, value) VALUES ('enum_in_progress:PrimarySync', ?1)",
+                [original_ts],
+            )
+            .unwrap();
+        }
+
+        // Re-entering begin_enum_progress on a live marker must not overwrite it.
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        assert_eq!(
+            read_marker(&db).as_deref(),
+            Some(original_ts),
+            "re-entering begin_enum_progress must not rewrite the original timestamp"
+        );
+
+        // After end_enum_progress, the marker clears; a subsequent begin
+        // should install a fresh timestamp.
+        db.end_enum_progress("PrimarySync").await.unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        let fresh = read_marker(&db).expect("marker must exist after begin");
+        assert_ne!(
+            fresh, original_ts,
+            "after end_enum_progress, a new begin should install a fresh timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_orphaned_sync_runs_sets_interrupted_flag_too() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let _ = db.promote_orphaned_sync_runs().await.unwrap();
+
+        let conn = db.acquire_lock("verify_interrupted").unwrap();
+        let interrupted: i32 = conn
+            .query_row(
+                "SELECT interrupted FROM sync_runs WHERE id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(interrupted, 1);
     }
 
     #[tokio::test]
@@ -2478,5 +3285,591 @@ mod tests {
                 p
             );
         }
+    }
+
+    // ── v5 metadata round-trip ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upsert_seen_persists_and_roundtrips_metadata() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let mut meta = AssetMetadata {
+            source: Some("icloud".into()),
+            is_favorite: true,
+            rating: Some(4),
+            latitude: Some(37.7749),
+            longitude: Some(-122.4194),
+            altitude: Some(17.0),
+            orientation: Some(6),
+            duration_secs: Some(12.5),
+            timezone_offset: Some(-28800),
+            width: Some(4032),
+            height: Some(3024),
+            title: Some("A caption".into()),
+            keywords: Some(r#"["vacation","beach"]"#.into()),
+            description: Some("A longer description".into()),
+            media_subtype: Some("portrait".into()),
+            burst_id: Some("burst_abc".into()),
+            is_hidden: false,
+            is_archived: false,
+            modified_at: Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap()),
+            is_deleted: false,
+            deleted_at: None,
+            provider_data: Some(r#"{"containerId":"x"}"#.into()),
+            metadata_hash: None,
+        };
+        meta.refresh_hash();
+        let hash = meta.metadata_hash.clone().unwrap();
+        let record = TestAssetRecord::new("META_1")
+            .checksum("ck1")
+            .filename("photo.jpg")
+            .metadata(meta)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+
+        let page = db.get_downloaded_page(0, 10).await.unwrap();
+        assert!(
+            page.is_empty(),
+            "pending rows should not be in downloaded page"
+        );
+        // pull via get_pending to verify round-trip
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let got = &pending[0];
+        assert_eq!(got.metadata.source.as_deref(), Some("icloud"));
+        assert!(got.metadata.is_favorite);
+        assert_eq!(got.metadata.rating, Some(4));
+        assert_eq!(got.metadata.latitude, Some(37.7749));
+        assert_eq!(got.metadata.longitude, Some(-122.4194));
+        assert_eq!(got.metadata.altitude, Some(17.0));
+        assert_eq!(got.metadata.orientation, Some(6));
+        assert_eq!(got.metadata.duration_secs, Some(12.5));
+        assert_eq!(got.metadata.timezone_offset, Some(-28800));
+        assert_eq!(got.metadata.width, Some(4032));
+        assert_eq!(got.metadata.height, Some(3024));
+        assert_eq!(got.metadata.title.as_deref(), Some("A caption"));
+        assert_eq!(
+            got.metadata.keywords.as_deref(),
+            Some(r#"["vacation","beach"]"#)
+        );
+        assert_eq!(
+            got.metadata.description.as_deref(),
+            Some("A longer description")
+        );
+        assert_eq!(got.metadata.media_subtype.as_deref(), Some("portrait"));
+        assert_eq!(got.metadata.burst_id.as_deref(), Some("burst_abc"));
+        assert_eq!(got.metadata.metadata_hash.as_deref(), Some(hash.as_str()));
+    }
+
+    #[tokio::test]
+    async fn upsert_seen_computes_hash_when_caller_omits_it() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let meta = AssetMetadata {
+            is_favorite: true,
+            ..AssetMetadata::default()
+        };
+        let record = TestAssetRecord::new("META_2").metadata(meta).build();
+        db.upsert_seen(&record).await.unwrap();
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].metadata.metadata_hash.is_some(),
+            "upsert_seen must populate metadata_hash even when caller omits it"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_seen_updates_metadata_on_conflict() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let initial = TestAssetRecord::new("META_3")
+            .metadata(AssetMetadata {
+                is_favorite: false,
+                title: Some("old".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&initial).await.unwrap();
+
+        let updated = TestAssetRecord::new("META_3")
+            .metadata(AssetMetadata {
+                is_favorite: true,
+                title: Some("new".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&updated).await.unwrap();
+
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].metadata.is_favorite);
+        assert_eq!(pending[0].metadata.title.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn add_asset_album_is_idempotent() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.add_asset_album("A1", "Favorites", "icloud")
+            .await
+            .unwrap();
+        db.add_asset_album("A1", "Favorites", "icloud")
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("test").unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_albums WHERE asset_id = 'A1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn add_asset_album_respects_source_namespace() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.add_asset_album("A1", "Favorites", "icloud")
+            .await
+            .unwrap();
+        db.add_asset_album("A1", "Favorites", "takeout")
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("test").unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_albums WHERE asset_id = 'A1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn get_all_asset_people_returns_every_pair() {
+        // asset_people has no production writer yet (reserved for future
+        // provider adapters); insert test rows via raw SQL so this covers
+        // the read path without adding a trait method that would sit unused
+        // in production builds.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        {
+            let conn = db.acquire_lock("seed").unwrap();
+            for (aid, person) in [("A1", "Alice"), ("A1", "Bob"), ("A2", "Alice")] {
+                conn.execute(
+                    "INSERT INTO asset_people (asset_id, person_name) VALUES (?1, ?2)",
+                    rusqlite::params![aid, person],
+                )
+                .unwrap();
+            }
+        }
+        let rows = db.get_all_asset_people().await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&("A1".into(), "Alice".into())));
+        assert!(rows.contains(&("A1".into(), "Bob".into())));
+        assert!(rows.contains(&("A2".into(), "Alice".into())));
+    }
+
+    #[tokio::test]
+    async fn get_all_asset_albums_returns_every_pair() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.add_asset_album("A1", "Favorites", "icloud")
+            .await
+            .unwrap();
+        db.add_asset_album("A1", "Trip", "icloud").await.unwrap();
+        db.add_asset_album("A2", "Favorites", "icloud")
+            .await
+            .unwrap();
+        let rows = db.get_all_asset_albums().await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&("A1".into(), "Favorites".into())));
+        assert!(rows.contains(&("A1".into(), "Trip".into())));
+        assert!(rows.contains(&("A2".into(), "Favorites".into())));
+    }
+
+    #[tokio::test]
+    async fn mark_soft_deleted_sets_flags_across_versions() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let orig = TestAssetRecord::new("DEL_1").checksum("c1").build();
+        let med = TestAssetRecord::new("DEL_1")
+            .checksum("c2")
+            .version_size(VersionSizeKey::Medium)
+            .build();
+        db.upsert_seen(&orig).await.unwrap();
+        db.upsert_seen(&med).await.unwrap();
+        let when = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        db.mark_soft_deleted("DEL_1", Some(when)).await.unwrap();
+
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 2);
+        for rec in &pending {
+            assert!(
+                rec.metadata.is_deleted,
+                "is_deleted should be set for all versions"
+            );
+            assert_eq!(rec.metadata.deleted_at, Some(when));
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_hidden_at_source_sets_flag() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("HID_1").build();
+        db.upsert_seen(&rec).await.unwrap();
+        db.mark_hidden_at_source("HID_1").await.unwrap();
+        let pending = db.get_pending().await.unwrap();
+        assert!(pending[0].metadata.is_hidden);
+    }
+
+    #[tokio::test]
+    async fn record_and_clear_metadata_write_failure_roundtrip() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("MWF_1").build();
+        db.upsert_seen(&rec).await.unwrap();
+
+        // Initially, the marker column is NULL.
+        let ts_initial: Option<i64> = {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.query_row(
+                "SELECT metadata_write_failed_at FROM assets WHERE id = 'MWF_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(ts_initial.is_none());
+
+        // Set the marker.
+        db.record_metadata_write_failure("MWF_1", "original")
+            .await
+            .unwrap();
+        let ts_after_set: Option<i64> = {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.query_row(
+                "SELECT metadata_write_failed_at FROM assets WHERE id = 'MWF_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            ts_after_set.is_some(),
+            "marker should be set after record_metadata_write_failure"
+        );
+
+        // Clear the marker after a successful retry.
+        db.clear_metadata_write_failure("MWF_1", "original")
+            .await
+            .unwrap();
+        let ts_after_clear: Option<i64> = {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.query_row(
+                "SELECT metadata_write_failed_at FROM assets WHERE id = 'MWF_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            ts_after_clear.is_none(),
+            "marker should be cleared after clear_metadata_write_failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_downloaded_without_metadata_hash_returns_false_on_empty() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn has_downloaded_without_metadata_hash_skips_pending() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("P1").build();
+        db.upsert_seen(&rec).await.unwrap();
+        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn has_downloaded_without_metadata_hash_detects_missing_hash() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("D1").build();
+        db.upsert_seen(&rec).await.unwrap();
+        db.mark_downloaded("D1", "original", Path::new("/a.jpg"), "h", None)
+            .await
+            .unwrap();
+        // Manually null the hash to simulate a pre-v5 row
+        {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.execute("UPDATE assets SET metadata_hash = NULL WHERE id = 'D1'", [])
+                .unwrap();
+        }
+        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+    }
+
+    #[test]
+    fn asset_column_count_matches_projection() {
+        let counted = ASSET_COLUMNS.split(',').count();
+        assert_eq!(
+            counted, ASSET_COLUMN_COUNT,
+            "ASSET_COLUMN_COUNT out of sync with ASSET_COLUMNS"
+        );
+    }
+
+    /// End-to-end: PhotoAsset constructed from a realistic CloudKit JSON pair
+    /// flows through metadata extraction, `upsert_seen`, and round-trips out
+    /// of the DB with all fields intact. Guards against regressions in any
+    /// link of the pipeline.
+    #[tokio::test]
+    async fn photo_asset_metadata_roundtrips_through_upsert_and_read() {
+        use crate::icloud::photos::PhotoAsset;
+        use base64::Engine;
+        use serde_json::json;
+
+        fn b64(bytes: &[u8]) -> String {
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+        fn bplist(value: plist::Value) -> Vec<u8> {
+            let mut out = Vec::new();
+            plist::to_writer_binary(&mut out, &value).unwrap();
+            out
+        }
+
+        let mut loc_dict = plist::Dictionary::new();
+        loc_dict.insert("lat".into(), plist::Value::Real(37.7749));
+        loc_dict.insert("lng".into(), plist::Value::Real(-122.4194));
+        loc_dict.insert("alt".into(), plist::Value::Real(17.0));
+        let loc_bp = bplist(plist::Value::Dictionary(loc_dict));
+
+        let keywords_bp = bplist(plist::Value::Array(vec![
+            plist::Value::String("vacation".into()),
+            plist::Value::String("beach".into()),
+        ]));
+
+        let master = json!({
+            "recordName": "RT_1",
+            "fields": {
+                "itemType": {"value": "public.jpeg"},
+                "filenameEnc": {"value": "img.jpg", "type": "STRING"},
+                "resOriginalRes": {"value": {"size": 10, "downloadURL": "https://p01.icloud-content.com/x", "fileChecksum": "ck"}},
+                "resOriginalFileType": {"value": "public.jpeg"},
+            },
+        });
+        let asset_json = json!({
+            "fields": {
+                "assetDate": {"value": 1736899200000_f64},
+                "isFavorite": {"value": 1},
+                "orientation": {"value": 6},
+                "duration": {"value": 12.5},
+                "timeZoneOffset": {"value": -28800},
+                "captionEnc": {"value": "Beach day", "type": "STRING"},
+                "extendedDescEnc": {"value": "Long description", "type": "STRING"},
+                "keywordsEnc": {"value": b64(&keywords_bp), "type": "ENCRYPTED_BYTES"},
+                "locationEnc": {"value": b64(&loc_bp), "type": "ENCRYPTED_BYTES"},
+                "resOriginalWidth": {"value": 4032},
+                "resOriginalHeight": {"value": 3024},
+                "assetSubtypeV2": {"value": 16},
+                "burstId": {"value": "burst_x"},
+                "recordChangeTag": {"value": "tag42"},
+            },
+        });
+        let photo = PhotoAsset::new(master, asset_json);
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = AssetRecord::new_pending(
+            photo.id().to_string(),
+            VersionSizeKey::Original,
+            "ck".to_string(),
+            photo.filename().unwrap_or("").to_string(),
+            photo.created(),
+            Some(photo.added_date()),
+            10,
+            MediaType::Photo,
+        )
+        .with_metadata(photo.metadata().clone());
+        db.upsert_seen(&record).await.unwrap();
+
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let got = &pending[0];
+        let m = &got.metadata;
+        assert_eq!(m.source.as_deref(), Some("icloud"));
+        assert!(m.is_favorite);
+        assert_eq!(m.rating, Some(5));
+        assert_eq!(m.latitude, Some(37.7749));
+        assert_eq!(m.longitude, Some(-122.4194));
+        assert_eq!(m.altitude, Some(17.0));
+        assert_eq!(m.orientation, Some(6));
+        assert_eq!(m.duration_secs, Some(12.5));
+        assert_eq!(m.timezone_offset, Some(-28800));
+        assert_eq!(m.width, Some(4032));
+        assert_eq!(m.height, Some(3024));
+        assert_eq!(m.title.as_deref(), Some("Beach day"));
+        assert_eq!(m.description.as_deref(), Some("Long description"));
+        assert_eq!(m.keywords.as_deref(), Some(r#"["vacation","beach"]"#));
+        assert_eq!(m.media_subtype.as_deref(), Some("portrait"));
+        assert_eq!(m.burst_id.as_deref(), Some("burst_x"));
+        assert!(m.metadata_hash.is_some());
+
+        let provider = m
+            .provider_data
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .expect("provider_data should be valid JSON");
+        assert_eq!(provider["recordChangeTag"], json!("tag42"));
+        assert_eq!(provider["assetSubtypeV2"], json!(16));
+    }
+
+    // WAL mid-transaction rollback invariant: a second connection that
+    // begins a transaction modifying committed rows, then is dropped
+    // without calling commit(), must not leave those modifications
+    // visible to any subsequent SqliteStateDb::open(). This stands in
+    // for the crash-between-BEGIN-and-COMMIT scenario (OOM kill, power
+    // loss, SIGKILL) that WAL mode is supposed to make safe.
+    //
+    // If kei ever flipped journal_mode away from WAL (or mis-used
+    // autocommit so every write lands without tx grouping), a single
+    // interrupted mark_downloaded batch could leave half-complete state
+    // that the next sync would read as truth, silently drifting the DB
+    // from the file system.
+    #[tokio::test]
+    async fn wal_uncommitted_transaction_is_invisible_on_reopen() {
+        use rusqlite::Connection;
+
+        let dir = test_dir();
+        let path = dir.path().join("wal_rollback.db");
+        let file_path = dir.path().join("keeper.jpg");
+        fs::write(&file_path, b"bytes").unwrap();
+
+        // Step 1: open, commit a downloaded row, close.
+        {
+            let db = SqliteStateDb::open(&path).await.unwrap();
+            let record = TestAssetRecord::new("WAL_KEEPER")
+                .checksum("ck_w")
+                .filename("keeper.jpg")
+                .size(5)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded("WAL_KEEPER", "original", &file_path, "localhash", None)
+                .await
+                .unwrap();
+        }
+
+        // Step 2: open a raw rusqlite connection, begin an explicit
+        // transaction that would corrupt the downloaded row, then drop
+        // the connection WITHOUT committing. rusqlite's Connection Drop
+        // rolls back any open transaction — which is exactly the
+        // observable state SQLite exposes after a hard crash mid-tx.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("BEGIN; UPDATE assets SET status = 'failed', last_error = 'would be set by crashed tx' WHERE id = 'WAL_KEEPER'; ").unwrap();
+            // Confirm the UPDATE actually landed inside the open tx, so the
+            // final assertion is proving rollback rather than a silent no-op
+            // (e.g. row missing, UPDATE matching zero rows).
+            let mid_tx_status: String = conn
+                .query_row(
+                    "SELECT status FROM assets WHERE id = 'WAL_KEEPER'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(mid_tx_status, "failed");
+            // Drop without commit → rollback.
+            drop(conn);
+        }
+
+        // Step 3: reopen. The rolled-back UPDATE must not be visible.
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        let ids = db.get_downloaded_ids().await.unwrap();
+        assert!(
+            ids.contains(&("WAL_KEEPER".into(), "original".into())),
+            "committed downloaded row must survive an adjacent uncommitted \
+             transaction's rollback; got downloaded set: {ids:?}"
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(
+            summary.downloaded, 1,
+            "rolled-back UPDATE must not alter the committed status"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "WAL_KEEPER must not have been promoted to failed by the \
+             rolled-back transaction"
+        );
+    }
+
+    // Full-sync conservatism invariant: an asset downloaded in a prior sync
+    // that is absent from every page of the current full enumeration must
+    // remain in the state DB as status='downloaded', untouched. Full sync
+    // does NOT infer "remotely deleted" from "not seen on any page" — that
+    // inference is reserved for incremental sync's explicit delete events.
+    //
+    // If a regression ever added a "sweep assets not seen this sync" pass
+    // to the full-sync path, users would silently lose local copies of
+    // assets that briefly dropped out of view (album scope change, filter
+    // tweak, pagination hiccup).
+    #[tokio::test]
+    async fn full_sync_absent_downloaded_asset_stays_downloaded() {
+        let dir = test_dir();
+        let file_path = dir.path().join("keeper.heic");
+        fs::write(&file_path, b"image-bytes").unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Sync N (prior run): asset KEEPER_1 enumerated + downloaded. Then
+        // we backdate last_seen_at so it looks like the upsert happened
+        // well before the current sync's start boundary.
+        let record = TestAssetRecord::new("KEEPER_1")
+            .checksum("ck_keeper")
+            .filename("keeper.heic")
+            .size(11)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("KEEPER_1", "original", &file_path, "localhash", None)
+            .await
+            .unwrap();
+        let prior_sync_ts = chrono::Utc::now().timestamp() - 86_400;
+        db.backdate_last_seen("KEEPER_1", prior_sync_ts);
+
+        let summary_before = db.get_summary().await.unwrap();
+        assert_eq!(summary_before.downloaded, 1);
+        let ids_before = db.get_downloaded_ids().await.unwrap();
+        assert!(ids_before.contains(&("KEEPER_1".into(), "original".into())));
+
+        // Sync N+1 begins now. Producer enumerates zero assets (absent from
+        // every page). Nothing calls upsert_seen for KEEPER_1. At sync end,
+        // promote_pending_to_failed runs with the new sync_started_at.
+        let sync_started_at = chrono::Utc::now().timestamp();
+        let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
+        assert_eq!(
+            promoted, 0,
+            "full-sync with zero enumerated assets must not promote anything; \
+             KEEPER_1's last_seen_at predates sync_started_at AND its status \
+             is downloaded, so both filters protect it"
+        );
+
+        // Downloaded row is intact: same status, still in the downloaded set.
+        let summary_after = db.get_summary().await.unwrap();
+        assert_eq!(
+            summary_after.downloaded, 1,
+            "downloaded count must be unchanged after a zero-asset sync cycle"
+        );
+        assert_eq!(summary_after.failed, 0);
+        assert_eq!(summary_after.pending, 0);
+
+        let ids_after = db.get_downloaded_ids().await.unwrap();
+        assert!(
+            ids_after.contains(&("KEEPER_1".into(), "original".into())),
+            "KEEPER_1 must remain in the downloaded set after a full sync that \
+             didn't re-enumerate it"
+        );
+
+        // last_seen_at was NOT refreshed (nothing touched it). A caller that
+        // later wants to implement "assets not seen for N syncs" can use the
+        // stale timestamp as a signal, but it must be an opt-in policy, not
+        // a silent cleanup.
+        let failed = db.get_failed().await.unwrap();
+        assert!(
+            failed.is_empty(),
+            "the asset that wasn't enumerated this sync must not appear in the failed set"
+        );
     }
 }

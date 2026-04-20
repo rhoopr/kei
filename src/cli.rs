@@ -137,7 +137,7 @@ pub struct SyncArgs {
     pub recent: Option<u32>,
 
     /// Number of concurrent download threads (default: 10)
-    #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..=64))]
     pub threads_num: Option<u16>,
 
     /// Cap total download throughput across all concurrent downloads.
@@ -180,12 +180,35 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_SET_EXIF_DATETIME", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub set_exif_datetime: Option<bool>,
 
+    /// Write EXIF `Rating` tag (0x4746) for favorited photos (1-5 scale)
+    #[arg(long, env = "KEI_SET_EXIF_RATING", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub set_exif_rating: Option<bool>,
+
+    /// Write EXIF GPS tags from iCloud location metadata (only when the file lacks GPS)
+    #[arg(long, env = "KEI_SET_EXIF_GPS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub set_exif_gps: Option<bool>,
+
+    /// Write EXIF `ImageDescription` tag from iCloud description / title
+    #[arg(long, env = "KEI_SET_EXIF_DESCRIPTION", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub set_exif_description: Option<bool>,
+
+    /// Embed a full XMP packet (title, keywords, album memberships, people,
+    /// hidden/archived, media subtype, burst id) into downloaded media bytes
+    /// on supported formats (JPEG/HEIC/PNG/TIFF/MP4/MOV)
+    #[arg(long, env = "KEI_EMBED_XMP", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub embed_xmp: Option<bool>,
+
+    /// Write a `.xmp` sidecar file next to each downloaded media file with
+    /// every available metadata field
+    #[arg(long, env = "KEI_XMP_SIDECAR", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub xmp_sidecar: Option<bool>,
+
     /// Do not modify local system or iCloud
     #[arg(long, conflicts_with = "watch_with_interval")]
     pub dry_run: bool,
 
-    /// Run continuously, waiting N seconds between runs (minimum: 60)
-    #[arg(long, env = "KEI_WATCH_WITH_INTERVAL", value_parser = clap::value_parser!(u64).range(60..))]
+    /// Run continuously, waiting N seconds between runs (60..=86400)
+    #[arg(long, env = "KEI_WATCH_WITH_INTERVAL", value_parser = clap::value_parser!(u64).range(60..=86400))]
     pub watch_with_interval: Option<u64>,
 
     /// Disable progress bar
@@ -248,6 +271,8 @@ pub struct SyncArgs {
 
     /// Script to run on events (2FA required, sync complete, etc.).
     /// Called with `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars.
+    /// Fire-and-forget: script failures are logged at warn! but never block
+    /// the sync or affect the exit code.
     #[arg(long, env = "KEI_NOTIFICATION_SCRIPT")]
     pub notification_script: Option<String>,
 
@@ -347,6 +372,14 @@ pub struct VerifyArgs {
     /// Verify checksums (slower but more thorough)
     #[arg(long)]
     pub checksums: bool,
+}
+
+/// Arguments for the reconcile command.
+#[derive(Parser, Debug, Clone)]
+pub struct ReconcileArgs {
+    /// Show what would change without updating the state database.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 // ── New subcommand types ─────────────────────────────────────────────
@@ -484,6 +517,11 @@ pub enum Command {
 
     /// Verify downloaded files exist and optionally check checksums
     Verify(VerifyArgs),
+
+    /// Reconcile state database with files on disk: mark assets as
+    /// failed when their local file is missing, so the next sync
+    /// re-downloads them.
+    Reconcile(ReconcileArgs),
 
     // ── Hidden legacy aliases (deprecated, still parse) ──────────
     /// Deprecated: use `kei login get-code`
@@ -637,6 +675,21 @@ impl SyncArgs {
         }
         if self.set_exif_datetime.is_none() {
             self.set_exif_datetime = fallback.set_exif_datetime;
+        }
+        if self.set_exif_rating.is_none() {
+            self.set_exif_rating = fallback.set_exif_rating;
+        }
+        if self.set_exif_gps.is_none() {
+            self.set_exif_gps = fallback.set_exif_gps;
+        }
+        if self.set_exif_description.is_none() {
+            self.set_exif_description = fallback.set_exif_description;
+        }
+        if self.embed_xmp.is_none() {
+            self.embed_xmp = fallback.embed_xmp;
+        }
+        if self.xmp_sidecar.is_none() {
+            self.xmp_sidecar = fallback.xmp_sidecar;
         }
         self.dry_run = self.dry_run || fallback.dry_run;
         if self.watch_with_interval.is_none() {
@@ -892,6 +945,7 @@ impl Command {
             | Self::Config { .. }
             | Self::Status(_)
             | Self::Verify(_)
+            | Self::Reconcile(_)
             | Self::ResetState { .. }
             | Self::ResetSyncToken
             | Self::Setup { .. } => None,
@@ -1490,6 +1544,25 @@ mod tests {
     }
 
     #[test]
+    fn test_threads_num_accepts_upper_bound() {
+        let mut args = base_args();
+        args.extend(["--threads-num", "64"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.threads_num, Some(64));
+    }
+
+    #[test]
+    fn test_threads_num_rejects_above_upper_bound() {
+        let mut args = base_args();
+        args.extend(["--threads-num", "65"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+
+        let mut args = base_args();
+        args.extend(["--threads-num", "5000"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
     fn test_bandwidth_limit_bare_bytes() {
         let mut args = base_args();
         args.extend(["--bandwidth-limit", "1500000"]);
@@ -1615,6 +1688,30 @@ mod tests {
         args.push("--set-exif-datetime");
         let cli = parse(&args);
         assert_eq!(cli.sync.set_exif_datetime, Some(true));
+    }
+
+    #[test]
+    fn test_embed_xmp_flag() {
+        let mut args = base_args();
+        args.push("--embed-xmp");
+        let cli = parse(&args);
+        assert_eq!(cli.sync.embed_xmp, Some(true));
+    }
+
+    #[test]
+    fn test_embed_xmp_flag_explicit_false() {
+        let mut args = base_args();
+        args.push("--embed-xmp=false");
+        let cli = parse(&args);
+        assert_eq!(cli.sync.embed_xmp, Some(false));
+    }
+
+    #[test]
+    fn test_xmp_sidecar_flag() {
+        let mut args = base_args();
+        args.push("--xmp-sidecar");
+        let cli = parse(&args);
+        assert_eq!(cli.sync.xmp_sidecar, Some(true));
     }
 
     #[test]
@@ -1826,6 +1923,18 @@ mod tests {
         let mut args = base_args();
         args.extend(["--watch-with-interval", "60"]);
         assert!(Cli::try_parse_from(&args).is_ok());
+    }
+
+    #[test]
+    fn test_watch_with_interval_rejects_above_maximum() {
+        // 86400s = 24h ceiling
+        let mut args = base_args();
+        args.extend(["--watch-with-interval", "86400"]);
+        assert!(Cli::try_parse_from(&args).is_ok());
+
+        let mut args = base_args();
+        args.extend(["--watch-with-interval", "86401"]);
+        assert!(Cli::try_parse_from(&args).is_err());
     }
 
     #[test]
@@ -2128,6 +2237,26 @@ mod tests {
             assert!(args.checksums);
         } else {
             panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_reconcile_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "reconcile"]).unwrap();
+        if let Some(Command::Reconcile(args)) = cli.command {
+            assert!(!args.dry_run);
+        } else {
+            panic!("Expected Reconcile command");
+        }
+    }
+
+    #[test]
+    fn test_reconcile_dry_run_flag() {
+        let cli = Cli::try_parse_from(["kei", "reconcile", "--dry-run"]).unwrap();
+        if let Some(Command::Reconcile(args)) = cli.command {
+            assert!(args.dry_run);
+        } else {
+            panic!("Expected Reconcile command");
         }
     }
 

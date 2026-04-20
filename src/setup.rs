@@ -263,7 +263,7 @@ fn ask_account(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     let region_items = ["iCloud.com", "iCloud.com.cn (China)"];
     let region = Select::new()
         .with_prompt("iCloud region")
-        .items(&region_items)
+        .items(region_items)
         .default(0)
         .interact()?;
 
@@ -294,7 +294,7 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     ];
     let folder = Select::new()
         .with_prompt("How should photos be organized into folders?")
-        .items(&folder_items)
+        .items(folder_items)
         .default(0)
         .interact()?;
 
@@ -323,7 +323,7 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     let scope_items = ["Entire library", "Specific albums"];
     let scope = Select::new()
         .with_prompt("Download your entire library or specific albums?")
-        .items(&scope_items)
+        .items(scope_items)
         .default(0)
         .interact()?;
 
@@ -348,7 +348,7 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     ];
     let library = Select::new()
         .with_prompt("Do you use shared or family libraries?")
-        .items(&library_items)
+        .items(library_items)
         .default(0)
         .interact()?;
 
@@ -383,7 +383,7 @@ fn ask_media_types(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         ];
         let mov_policy = Select::new()
             .with_prompt("How should the video part of live photos be named?")
-            .items(&mov_items)
+            .items(mov_items)
             .default(0)
             .interact()?;
         answers.live_photo_mov_filename_policy = match mov_policy {
@@ -402,7 +402,7 @@ fn ask_quality(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     let size_items = ["Original (full resolution)", "Medium", "Thumbnail"];
     let size = Select::new()
         .with_prompt("What size should photos be downloaded at?")
-        .items(&size_items)
+        .items(size_items)
         .default(0)
         .interact()?;
 
@@ -435,7 +435,7 @@ fn ask_quality(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         ];
         let raw_policy = Select::new()
             .with_prompt("When both RAW and JPEG versions exist:")
-            .items(&raw_items)
+            .items(raw_items)
             .default(0)
             .interact()?;
         answers.align_raw = match raw_policy {
@@ -505,7 +505,7 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     ];
     let mode = Select::new()
         .with_prompt("How will you run kei?")
-        .items(&mode_items)
+        .items(mode_items)
         .default(0)
         .interact()?;
 
@@ -614,7 +614,7 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     ];
     let dedup = Select::new()
         .with_prompt("File deduplication strategy")
-        .items(&dedup_items)
+        .items(dedup_items)
         .default(0)
         .interact()?;
     if dedup == 1 {
@@ -635,7 +635,7 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     let log_items = ["info", "debug", "warn", "error"];
     let log = Select::new()
         .with_prompt("Log level")
-        .items(&log_items)
+        .items(log_items)
         .default(0)
         .interact()?;
     answers.log_level = match log {
@@ -708,6 +708,9 @@ fn generate_toml(answers: &SetupAnswers) -> String {
     } else {
         writeln!(out, "# set_exif_datetime = false").ok();
     }
+    writeln!(out, "# set_exif_rating = false").ok();
+    writeln!(out, "# set_exif_gps = false").ok();
+    writeln!(out, "# set_exif_description = false").ok();
     writeln!(out, "# temp_suffix = \".kei-tmp\"").ok();
     writeln!(out, "# no_progress_bar = false").ok();
 

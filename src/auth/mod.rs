@@ -130,9 +130,18 @@ async fn authenticate_inner(
         }
     }
 
-    // Track whether we've already reset the HTTP pool so a persistent 421
-    // doesn't reset it twice (no upside) and so subsequent calls benefit
-    // from the fresh connection.
+    // The 421-recovery flow below is bounded. Each branch takes at most one
+    // action and then advances:
+    //   1. /validate 421  → reset HTTP pool, fall through to /accountLogin
+    //   2. /accountLogin 421 after pool_reset → fall through to SRP (no
+    //      second reset because pool_reset is sticky)
+    //   3. /accountLogin 421 without prior pool_reset → reset pool, fall
+    //      through to SRP
+    //   4. SRP → one final /accountLogin; if that 421s we reset the pool
+    //      and retry /accountLogin exactly once more
+    // Max pool resets across the function: 2. Max /accountLogin calls: 3.
+    // No branch loops back to an earlier stage, so the function cannot
+    // diverge.
     let mut pool_reset = false;
     if has_session_token {
         tracing::debug!("Checking session token validity");

@@ -48,7 +48,10 @@ impl CredentialStore {
                 Ok(())
             }
             Err(e) => {
-                tracing::debug!(error = %e, "Keyring unavailable, using encrypted file");
+                tracing::warn!(
+                    error = %e,
+                    "Keyring unavailable; falling back to encrypted file in config directory"
+                );
                 self.file_store(password)?;
                 tracing::debug!(backend = "encrypted-file", "Credential stored");
                 Ok(())
@@ -65,7 +68,10 @@ impl CredentialStore {
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::debug!(error = %e, "Keyring unavailable, trying encrypted file");
+                tracing::warn!(
+                    error = %e,
+                    "Keyring unavailable; trying encrypted file in config directory"
+                );
             }
         }
         let result = self.file_retrieve()?;

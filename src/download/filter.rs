@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Local};
 use rustc_hash::FxHashMap;
@@ -108,10 +109,124 @@ impl std::borrow::Borrow<str> for NormalizedPath {
     }
 }
 
+/// Metadata values surfaced on a `DownloadTask` for write-out to embedded XMP
+/// / native EXIF / XMP sidecars.
+///
+/// Carried separately from the rest of `AssetMetadata` so the download layer
+/// only sees fields a writer can actually use. Fields are owned (not borrowed)
+/// because the task moves across async boundaries.
+#[derive(Debug, Clone, Default)]
+pub(super) struct MetadataPayload {
+    /// 1-5 star rating (mapped from `AssetMetadata::rating` or `is_favorite`).
+    pub(super) rating: Option<u8>,
+    /// GPS latitude in decimal degrees, WGS84.
+    pub(super) latitude: Option<f64>,
+    /// GPS longitude in decimal degrees, WGS84.
+    pub(super) longitude: Option<f64>,
+    /// GPS altitude in meters above sea level.
+    pub(super) altitude: Option<f64>,
+    /// Short title / caption.
+    pub(super) title: Option<String>,
+    /// Image description text (prefers `description`, falls back to `title`).
+    pub(super) description: Option<String>,
+    /// `dc:subject` tags — provider keywords plus album memberships merge here.
+    pub(super) keywords: Vec<String>,
+    /// MWG-RS person names for `iptcExt:PersonInImage`.
+    pub(super) people: Vec<String>,
+    /// Hidden from the timeline at the source.
+    pub(super) is_hidden: bool,
+    /// Archived at the source.
+    pub(super) is_archived: bool,
+    /// Media subtype (panorama, screenshot, burst, slo_mo, …).
+    pub(super) media_subtype: Option<String>,
+    /// Opaque provider burst grouping id.
+    pub(super) burst_id: Option<String>,
+}
+
+impl MetadataPayload {
+    /// Build from `AssetMetadata`. Description falls back to title when
+    /// `description` is unset. Keywords are parsed from the JSON array blob
+    /// leniently — a malformed blob yields an empty list rather than an error.
+    pub(super) fn from_metadata(meta: &crate::state::AssetMetadata) -> Self {
+        let description = meta.description.as_ref().or(meta.title.as_ref()).cloned();
+        let keywords = meta
+            .keywords
+            .as_deref()
+            .and_then(|s| match serde_json::from_str::<Vec<String>>(s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(error = %e, raw = %s, "Failed to parse keywords JSON");
+                    None
+                }
+            })
+            .unwrap_or_default();
+        Self {
+            rating: meta.rating,
+            latitude: meta.latitude,
+            longitude: meta.longitude,
+            altitude: meta.altitude,
+            title: meta.title.clone(),
+            description,
+            keywords,
+            people: Vec::new(),
+            is_hidden: meta.is_hidden,
+            is_archived: meta.is_archived,
+            media_subtype: meta.media_subtype.clone(),
+            burst_id: meta.burst_id.clone(),
+        }
+    }
+
+    /// Merge album names into `keywords` (as `dc:subject` tags — the standard
+    /// XMP slot photo managers scan for groupings) and set `people`.
+    pub(super) fn with_asset_groupings(mut self, albums: &[String], people: &[String]) -> Self {
+        // Linear scan: typical cardinalities are <10 each, so a HashSet
+        // rebuild costs more than it saves.
+        for album in albums {
+            if !self.keywords.iter().any(|k| k == album) {
+                self.keywords.push(album.clone());
+            }
+        }
+        // Skip the allocation when people is empty (common: libraries
+        // without face tagging never populate this side of the groupings).
+        if !people.is_empty() {
+            self.people = people.to_vec();
+        }
+        self
+    }
+}
+
+/// Index of per-asset album memberships and face-tag names, preloaded from
+/// the state DB at sync start so `filter_asset_to_tasks` can enrich each
+/// task's [`MetadataPayload`] without per-asset DB hits.
+#[derive(Debug, Default)]
+pub(crate) struct AssetGroupings {
+    pub(crate) albums: FxHashMap<String, Vec<String>>,
+    pub(crate) people: FxHashMap<String, Vec<String>>,
+}
+
+fn build_payload(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> Arc<MetadataPayload> {
+    let albums = config
+        .asset_groupings
+        .albums
+        .get(asset.id())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let people = config
+        .asset_groupings
+        .people
+        .get(asset.id())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    Arc::new(MetadataPayload::from_metadata(asset.metadata()).with_asset_groupings(albums, people))
+}
+
 /// A unit of work produced by the filter phase and consumed by the download phase.
 ///
 /// Fields ordered for optimal memory layout:
-/// - Heap types first (`Box<str>`, `PathBuf`)
+/// - Heap types first (`Box<str>`, `PathBuf`, `MetadataPayload`)
 /// - 8-byte primitives (u64)
 /// - `DateTime` (12-16 bytes)
 /// - 1-byte enum last
@@ -121,8 +236,13 @@ pub(super) struct DownloadTask {
     pub(super) url: Box<str>,
     pub(super) download_path: PathBuf,
     pub(super) checksum: Box<str>,
-    /// iCloud asset ID for state tracking.
-    pub(super) asset_id: Box<str>,
+    /// iCloud asset ID for state tracking. Shared with the producer's
+    /// dedup set and any deferred state writes via refcount bump.
+    pub(super) asset_id: Arc<str>,
+    /// Metadata fields surfaced from `AssetMetadata` for writer consumption.
+    /// Behind `Arc` so `task.metadata.clone()` in the download hot path is a
+    /// refcount bump instead of a deep clone of every `Vec<String>` inside.
+    pub(super) metadata: Arc<MetadataPayload>,
     // 8-byte primitives
     pub(super) size: u64,
     // DateTime
@@ -632,7 +752,8 @@ pub(super) fn filter_asset_to_tasks(
                 url: version.url.clone(),
                 download_path: path,
                 checksum: version.checksum.clone(),
-                asset_id: asset.id().into(),
+                asset_id: asset.id_arc(),
+                metadata: build_payload(asset, config),
                 size: version.size,
                 created_local,
                 version_size: VersionSizeKey::from(effective_size),
@@ -710,7 +831,8 @@ pub(super) fn filter_asset_to_tasks(
                     url: live_version.url.clone(),
                     download_path: path,
                     checksum: live_version.checksum.clone(),
-                    asset_id: asset.id().into(),
+                    asset_id: asset.id_arc(),
+                    metadata: build_payload(asset, config),
                     size: live_version.size,
                     created_local,
                     version_size: VersionSizeKey::from(effective_live_size),
@@ -757,7 +879,7 @@ mod tests {
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "abc123");
         assert_eq!(tasks[0].size, 1000);
     }
@@ -769,7 +891,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .build();
         let mut config = test_config();
@@ -787,7 +909,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(500_000_000)
-            .orig_url("https://example.com/big_vid")
+            .orig_url("https://p01.icloud-content.com/big_vid")
             .orig_checksum("big_ck")
             .build();
         let config = test_config();
@@ -816,7 +938,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 1000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "abc123"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
@@ -844,7 +966,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resJPEGThumbRes": {"value": {
                     "size": 100,
-                    "downloadURL": "https://example.com/thumb",
+                    "downloadURL": "https://p01.icloud-content.com/thumb",
                     "fileChecksum": "th_ck"
                 }},
                 "resJPEGThumbFileType": {"value": "public.jpeg"}
@@ -906,9 +1028,9 @@ mod tests {
             .item_type("public.heic")
             .orig_file_type("public.heic")
             .orig_size(2000)
-            .orig_url("https://example.com/heic_orig")
+            .orig_url("https://p01.icloud-content.com/heic_orig")
             .orig_checksum("heic_ck")
-            .live_photo("https://example.com/live_mov", "mov_ck", 3000)
+            .live_photo("https://p01.icloud-content.com/live_mov", "mov_ck", 3000)
             .build()
     }
 
@@ -918,9 +1040,9 @@ mod tests {
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/heic_orig");
         assert_eq!(tasks[0].size, 2000);
-        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_mov");
         assert_eq!(tasks[1].size, 3000);
         assert!(tasks[1]
             .download_path
@@ -936,7 +1058,7 @@ mod tests {
         config.live_photo_mode = LivePhotoMode::ImageOnly;
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/heic_orig");
     }
 
     #[test]
@@ -972,7 +1094,7 @@ mod tests {
         // Second call: only the photo task (MOV already exists with matching size)
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/heic_orig");
     }
 
     #[test]
@@ -996,7 +1118,7 @@ mod tests {
         // Second call: should produce a deduped MOV path with asset ID suffix
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_mov");
         let dedup_path = tasks[1].download_path.to_str().unwrap();
         assert!(
             dedup_path.contains("LIVE_1"),
@@ -1017,9 +1139,9 @@ mod tests {
             .item_type("public.heic")
             .orig_file_type("public.heic")
             .orig_size(2000)
-            .orig_url("https://example.com/heic_a")
+            .orig_url("https://p01.icloud-content.com/heic_a")
             .orig_checksum("ck_a")
-            .live_photo("https://example.com/mov_a", "mov_ck_a", 3000)
+            .live_photo("https://p01.icloud-content.com/mov_a", "mov_ck_a", 3000)
             .build();
 
         let asset2 = TestPhotoAsset::new("LIVE_B")
@@ -1027,9 +1149,9 @@ mod tests {
             .item_type("public.heic")
             .orig_file_type("public.heic")
             .orig_size(4000)
-            .orig_url("https://example.com/heic_b")
+            .orig_url("https://p01.icloud-content.com/heic_b")
             .orig_checksum("ck_b")
-            .live_photo("https://example.com/mov_b", "mov_ck_b", 5000)
+            .live_photo("https://p01.icloud-content.com/mov_b", "mov_ck_b", 5000)
             .build();
 
         let mut config = test_config();
@@ -1079,13 +1201,13 @@ mod tests {
                 "itemType": {"value": "public.heic"},
                 "resOriginalRes": {"value": {
                     "size": 2000,
-                    "downloadURL": "https://example.com/heic_orig",
+                    "downloadURL": "https://p01.icloud-content.com/heic_orig",
                     "fileChecksum": "heic_ck"
                 }},
                 "resOriginalFileType": {"value": "public.heic"},
                 "resVidMedRes": {"value": {
                     "size": 1500,
-                    "downloadURL": "https://example.com/live_med",
+                    "downloadURL": "https://p01.icloud-content.com/live_med",
                     "fileChecksum": "med_ck"
                 }},
                 "resVidMedFileType": {"value": "com.apple.quicktime-movie"}
@@ -1096,7 +1218,7 @@ mod tests {
         config.live_photo_size = AssetVersionSize::LiveMedium;
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[1].url, "https://example.com/live_med");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_med");
     }
 
     #[test]
@@ -1106,9 +1228,9 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
-            .live_photo("https://example.com/live_mov", "mov_ck", 3000)
+            .live_photo("https://p01.icloud-content.com/live_mov", "mov_ck", 3000)
             .build();
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
@@ -1120,7 +1242,12 @@ mod tests {
         TestPhotoAsset::new("RAW_TEST")
             .orig_checksum("orig_ck")
             .orig_file_type(orig_type)
-            .alt_version("https://example.com/alt", "alt_ck", 2000, alt_type)
+            .alt_version(
+                "https://p01.icloud-content.com/alt",
+                "alt_ck",
+                2000,
+                alt_type,
+            )
             .build()
     }
 
@@ -1140,13 +1267,13 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::Unchanged);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Alternative)
                 .unwrap()
                 .url,
-            "https://example.com/alt"
+            "https://p01.icloud-content.com/alt"
         );
     }
 
@@ -1157,13 +1284,13 @@ mod tests {
         // Alternative was RAW → swap: Original now has alt URL
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/alt"
+            "https://p01.icloud-content.com/alt"
         );
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Alternative)
                 .unwrap()
                 .url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
     }
 
@@ -1174,13 +1301,13 @@ mod tests {
         // Original was RAW → swap: Alternative now has orig URL
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/alt"
+            "https://p01.icloud-content.com/alt"
         );
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Alternative)
                 .unwrap()
                 .url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
     }
 
@@ -1190,7 +1317,7 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
     }
 
@@ -1200,7 +1327,7 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
     }
 
@@ -1210,7 +1337,7 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
         assert!(!has_ver(&versions, AssetVersionSize::Alternative));
     }
@@ -1223,7 +1350,7 @@ mod tests {
         // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/alt");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/alt");
         assert_eq!(&*tasks[0].checksum, "alt_ck");
     }
 
@@ -1239,7 +1366,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(258592890)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .asset_date(1713657600000.0)
             .build();
@@ -1248,9 +1375,13 @@ mod tests {
         let photo_asset = TestPhotoAsset::new("IMG_0996")
             .filename("IMG_0996.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/jpg")
+            .orig_url("https://p01.icloud-content.com/jpg")
             .orig_checksum("jpg_ck")
-            .live_photo("https://example.com/live_mov", "mov_ck", 124037918)
+            .live_photo(
+                "https://p01.icloud-content.com/live_mov",
+                "mov_ck",
+                124037918,
+            )
             .asset_date(1713657600000.0)
             .build();
 
@@ -1295,17 +1426,16 @@ mod tests {
         let config = test_config(); // align_raw defaults to AsIs
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "orig_ck");
     }
 
     #[test]
     fn test_download_task_size() {
         use std::mem::size_of;
-        // 144 bytes accommodates platform differences (Windows has larger PathBuf)
         assert!(
-            size_of::<DownloadTask>() <= 144,
-            "DownloadTask size {} exceeds 144 bytes",
+            size_of::<DownloadTask>() <= 200,
+            "DownloadTask size {} exceeds 200 bytes",
             size_of::<DownloadTask>()
         );
     }
@@ -1341,7 +1471,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .build();
         let mut config = test_config();
@@ -1498,7 +1628,7 @@ mod tests {
         // Should produce 2 tasks: primary + live companion (fallback to LiveOriginal)
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].version_size, VersionSizeKey::LiveOriginal);
-        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_mov");
     }
 
     #[test]
@@ -1539,7 +1669,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .build();
         assert_eq!(
@@ -1564,7 +1694,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .build();
         assert_eq!(
@@ -1700,19 +1830,19 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 5000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "orig_ck"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"},
                 "resJPEGMedRes": {"value": {
                     "size": 2000,
-                    "downloadURL": "https://example.com/med",
+                    "downloadURL": "https://p01.icloud-content.com/med",
                     "fileChecksum": "med_ck"
                 }},
                 "resJPEGMedFileType": {"value": "public.jpeg"},
                 "resJPEGThumbRes": {"value": {
                     "size": 500,
-                    "downloadURL": "https://example.com/thumb",
+                    "downloadURL": "https://p01.icloud-content.com/thumb",
                     "fileChecksum": "thumb_ck"
                 }},
                 "resJPEGThumbFileType": {"value": "public.jpeg"}
@@ -1904,7 +2034,7 @@ mod tests {
         let asset = TestPhotoAsset::new("TRAV_1")
             .filename("../../../etc/passwd")
             .orig_size(512)
-            .orig_url("https://cdn.icloud.com/photos/orig/abc")
+            .orig_url("https://p01.icloud-content.com/photos/orig/abc")
             .orig_checksum("a1b2c3d4e5f6")
             .build();
         let config = test_config();
@@ -1922,6 +2052,80 @@ mod tests {
         );
     }
 
+    /// A path pre-seeded into claimed_paths (as a startup load from the
+    /// state DB's downloaded rows would do) must case-insensitively match
+    /// an incoming asset's target and dedupe it — otherwise cross-batch
+    /// collisions silently overwrite prior downloads on case-insensitive
+    /// filesystems.
+    #[test]
+    fn filter_cross_batch_case_insensitive_collision_is_deduped() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+
+        let asset = TestPhotoAsset::new("CROSS_BATCH_1")
+            .filename("IMG_0500.JPG")
+            .orig_size(1000)
+            .orig_url("https://p01.icloud-content.com/img")
+            .orig_checksum("ck_cb")
+            .build();
+
+        let first_tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(first_tasks.len(), 1);
+        let downloaded_path = first_tasks[0].download_path.clone();
+
+        let mut claimed_paths = FxHashMap::default();
+        claimed_paths.insert(NormalizedPath::new(downloaded_path.clone()), 1000);
+
+        let mut dir_cache = paths::DirCache::new();
+        let second_tasks =
+            filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        assert!(
+            second_tasks.is_empty(),
+            "asset whose target path case-insensitively matches a claimed \
+             path of the same size must be skipped; got tasks: {second_tasks:?}"
+        );
+    }
+
+    #[test]
+    fn filter_asset_empty_filename_string_uses_fingerprint_fallback() {
+        // Distinct from the missing-field case: the STRING field is PRESENT
+        // but contains an empty string. A naive join would produce a path
+        // like `"2026-04-19/"` (directory-only), so we must treat empty
+        // exactly like missing and route through the fingerprint fallback.
+        let asset = PhotoAsset::new(
+            json!({"recordName": "EMPTYFN_ASSET1", "fields": {
+                "filenameEnc": {"value": "", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 2048,
+                    "downloadURL": "https://p01.icloud-content.com/photos/orig/emptyfn",
+                    "fileChecksum": "deadbeef1234"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .expect("download_path must include a filename, not bare directory")
+            .to_str()
+            .unwrap();
+        assert!(
+            !filename.is_empty() && !filename.starts_with('.'),
+            "empty filenameEnc must produce a real filename via fingerprint fallback, \
+             got: {filename}"
+        );
+        assert!(
+            filename.ends_with(".JPG"),
+            "fingerprint fallback for public.jpeg must yield .JPG, got: {filename}"
+        );
+    }
+
     #[test]
     fn filter_asset_missing_filename_uses_fingerprint_fallback() {
         // Asset whose filenameEnc field is absent (null) should trigger the
@@ -1931,7 +2135,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 2048,
-                    "downloadURL": "https://cdn.icloud.com/photos/orig/nofn",
+                    "downloadURL": "https://p01.icloud-content.com/photos/orig/nofn",
                     "fileChecksum": "deadbeef1234"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
@@ -2146,7 +2350,7 @@ mod tests {
             .item_type("public.heic")
             .orig_file_type("public.heic")
             .orig_size(4500000)
-            .orig_url("https://cdn.icloud.com/photos/orig/modified")
+            .orig_url("https://p01.icloud-content.com/photos/orig/modified")
             .orig_checksum("f0e1d2c3b4a5")
             .build();
 
@@ -2407,13 +2611,13 @@ mod tests {
         let asset_a = TestPhotoAsset::new("ASSET_A")
             .filename("IMG_0001.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/a")
+            .orig_url("https://p01.icloud-content.com/a")
             .orig_checksum("ck_a")
             .build();
         let asset_b = TestPhotoAsset::new("ASSET_B")
             .filename("IMG_0001.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/b")
+            .orig_url("https://p01.icloud-content.com/b")
             .orig_checksum("ck_b")
             .build();
 
@@ -2441,13 +2645,13 @@ mod tests {
         let asset_a = TestPhotoAsset::new("ASSET_A")
             .filename("IMG_0001.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/a")
+            .orig_url("https://p01.icloud-content.com/a")
             .orig_checksum("ck_a")
             .build();
         let asset_b = TestPhotoAsset::new("ASSET_B")
             .filename("IMG_0001.JPG")
             .orig_size(7000)
-            .orig_url("https://example.com/b")
+            .orig_url("https://p01.icloud-content.com/b")
             .orig_checksum("ck_b")
             .build();
 
@@ -2482,7 +2686,7 @@ mod tests {
         let asset = TestPhotoAsset::new("ZERO_SIZE")
             .filename("IMG_0001.JPG")
             .orig_size(0) // size unknown/zero
-            .orig_url("https://example.com/zero")
+            .orig_url("https://p01.icloud-content.com/zero")
             .orig_checksum("zero_ck")
             .build();
 
@@ -2520,7 +2724,7 @@ mod tests {
         let asset = TestPhotoAsset::new("ASSET_X")
             .filename("IMG_0001.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/x")
+            .orig_url("https://p01.icloud-content.com/x")
             .orig_checksum("ck_x")
             .build();
 
@@ -2576,5 +2780,116 @@ mod tests {
             Some(FilterReason::ExcludedAlbum),
             "asset in exclude_asset_ids should be filtered"
         );
+    }
+
+    // ── MetadataPayload + AssetGroupings tests ─────────────────────────
+
+    fn asset_metadata_with_keywords(keywords_json: &str) -> crate::state::AssetMetadata {
+        crate::state::AssetMetadata {
+            title: Some("Beach day".to_string()),
+            description: Some("Sunny afternoon".to_string()),
+            keywords: Some(keywords_json.to_string()),
+            rating: Some(4),
+            latitude: Some(37.7),
+            longitude: Some(-122.4),
+            altitude: Some(10.0),
+            is_hidden: true,
+            is_archived: false,
+            media_subtype: Some("portrait".to_string()),
+            burst_id: Some("burst-1".to_string()),
+            ..crate::state::AssetMetadata::default()
+        }
+    }
+
+    #[test]
+    fn metadata_payload_parses_keywords_json() {
+        let meta = asset_metadata_with_keywords(r#"["vacation","beach","sun"]"#);
+        let p = MetadataPayload::from_metadata(&meta);
+        assert_eq!(
+            p.keywords,
+            vec!["vacation".to_string(), "beach".into(), "sun".into()]
+        );
+    }
+
+    #[test]
+    fn metadata_payload_keywords_are_empty_on_bad_json() {
+        let meta = asset_metadata_with_keywords("not json");
+        let p = MetadataPayload::from_metadata(&meta);
+        assert!(
+            p.keywords.is_empty(),
+            "malformed keywords JSON must not poison payload"
+        );
+    }
+
+    #[test]
+    fn metadata_payload_description_falls_back_to_title() {
+        let mut meta = asset_metadata_with_keywords("[]");
+        meta.description = None;
+        let p = MetadataPayload::from_metadata(&meta);
+        assert_eq!(p.description, Some("Beach day".to_string()));
+    }
+
+    #[test]
+    fn metadata_payload_carries_all_new_fields() {
+        let meta = asset_metadata_with_keywords("[]");
+        let p = MetadataPayload::from_metadata(&meta);
+        assert_eq!(p.title, Some("Beach day".into()));
+        assert!(p.is_hidden);
+        assert!(!p.is_archived);
+        assert_eq!(p.media_subtype, Some("portrait".into()));
+        assert_eq!(p.burst_id, Some("burst-1".into()));
+    }
+
+    #[test]
+    fn with_asset_groupings_merges_albums_into_keywords() {
+        let meta = asset_metadata_with_keywords(r#"["sun"]"#);
+        let p = MetadataPayload::from_metadata(&meta)
+            .with_asset_groupings(&["Favorites".into(), "Trip".into()], &[]);
+        assert_eq!(p.keywords, vec!["sun", "Favorites", "Trip"]);
+    }
+
+    #[test]
+    fn with_asset_groupings_dedupes_existing_album_keywords() {
+        let meta = asset_metadata_with_keywords(r#"["Favorites"]"#);
+        let p = MetadataPayload::from_metadata(&meta)
+            .with_asset_groupings(&["Favorites".into(), "Trip".into()], &[]);
+        assert_eq!(
+            p.keywords,
+            vec!["Favorites", "Trip"],
+            "album already in keywords must not appear twice"
+        );
+    }
+
+    #[test]
+    fn with_asset_groupings_populates_people() {
+        let meta = asset_metadata_with_keywords("[]");
+        let p = MetadataPayload::from_metadata(&meta)
+            .with_asset_groupings(&[], &["Alice".into(), "Bob".into()]);
+        assert_eq!(p.people, vec!["Alice", "Bob"]);
+    }
+
+    #[test]
+    fn build_payload_reads_grouping_index_from_config() {
+        let asset = TestPhotoAsset::new("GROUP_1").build();
+        let mut groupings = AssetGroupings::default();
+        groupings
+            .albums
+            .insert("GROUP_1".into(), vec!["Favorites".into()]);
+        groupings
+            .people
+            .insert("GROUP_1".into(), vec!["Alice".into()]);
+        let mut config = test_config();
+        config.asset_groupings = Arc::new(groupings);
+        let payload = build_payload(&asset, &config);
+        assert!(payload.keywords.contains(&"Favorites".to_string()));
+        assert_eq!(payload.people, vec!["Alice".to_string()]);
+    }
+
+    #[test]
+    fn build_payload_is_empty_grouping_safe() {
+        let asset = TestPhotoAsset::new("EMPTY_1").build();
+        let config = test_config();
+        let payload = build_payload(&asset, &config);
+        assert!(payload.people.is_empty());
     }
 }

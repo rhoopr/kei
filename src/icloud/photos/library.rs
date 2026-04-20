@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use base64::Engine;
 use serde_json::{json, Value};
-use tracing::warn;
 
 use super::album::{PhotoAlbum, PhotoAlbumConfig};
 use super::queries::encode_params;
@@ -147,7 +146,7 @@ impl PhotoLibrary {
             .and_then(|r| r.fields["state"]["value"].as_str())
             .unwrap_or("");
         if indexing_state != "FINISHED" {
-            warn!(
+            tracing::warn!(
                 state = indexing_state,
                 "Photo library indexing state is not FINISHED — proceeding anyway, \
                  results may be incomplete"
@@ -205,9 +204,8 @@ impl PhotoLibrary {
                     continue;
                 }
 
-                let folder_id = record_name.clone();
                 let folder_obj_type =
-                    format!("CPLContainerRelationNotDeletedByAssetDate:{folder_id}");
+                    format!("CPLContainerRelationNotDeletedByAssetDate:{record_name}");
 
                 let folder_name = match folder.fields["albumNameEnc"]["value"].as_str() {
                     Some(enc) => {
@@ -215,25 +213,26 @@ impl PhotoLibrary {
                             .decode(enc)
                             .unwrap_or_default();
                         let raw_name =
-                            String::from_utf8(decoded).unwrap_or_else(|_| folder_id.clone());
+                            String::from_utf8(decoded).unwrap_or_else(|_| record_name.clone());
                         crate::download::paths::sanitize_path_component(&raw_name)
                     }
-                    None => folder_id.clone(),
+                    None => record_name.clone(),
                 };
 
                 let query_filter = Some(Arc::new(json!([{
                     "fieldName": "parentId",
                     "comparator": "EQUALS",
-                    "fieldValue": {"type": "STRING", "value": &folder_id},
+                    "fieldValue": {"type": "STRING", "value": record_name},
                 }])));
 
+                let name_arc: Arc<str> = Arc::from(folder_name.as_str());
                 albums.insert(
-                    folder_name.clone(),
+                    folder_name,
                     PhotoAlbum::new(
                         PhotoAlbumConfig {
                             params: Arc::clone(&self.params),
                             service_endpoint: Arc::clone(&self.service_endpoint),
-                            name: Arc::from(folder_name),
+                            name: name_arc,
                             list_type: Arc::from(QUERY_FOLDER_LIST),
                             obj_type: Arc::from(folder_obj_type),
                             query_filter,

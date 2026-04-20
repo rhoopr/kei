@@ -1,13 +1,16 @@
-use base64::Engine;
+use std::sync::Arc;
+
 use chrono::{DateTime, TimeZone, Utc};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 use smallvec::SmallVec;
-use tracing::warn;
 
 use super::cloudkit::Record;
+use super::enc;
+use super::metadata;
 use super::queries::{item_type_from_str, PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
 use super::types::{AssetItemType, AssetVersion, AssetVersionSize, ChangeReason};
+use crate::state::AssetMetadata;
 
 /// Type alias for the versions map.
 ///
@@ -33,15 +36,23 @@ pub struct ChangeEvent {
 /// A photo or video asset from iCloud.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (`Box<str>`, `Option<Box<str>>`)
+/// - Heap types first (`Arc<str>`, `Option<Box<str>>`)
 /// - `VersionsMap` (`SmallVec` inline storage)
 /// - f64 primitives
 /// - Small enums last
+///
+/// `record_name` is `Arc<str>` so downstream consumers (producer
+/// dedup set, `DownloadTask`, deferred state writes) can share the
+/// same allocation via refcount bumps instead of re-cloning the
+/// record ID at every stage boundary.
 #[derive(Debug, Clone)]
 pub struct PhotoAsset {
     // Heap types first
-    record_name: Box<str>,
+    record_name: Arc<str>,
     filename: Option<Box<str>>,
+    // Metadata boxed to keep PhotoAsset compact when metadata is large
+    // (keywords, provider_data JSON can be several hundred bytes).
+    asset_metadata: Box<AssetMetadata>,
     // SmallVec with inline storage
     versions: VersionsMap,
     // f64 primitives
@@ -54,31 +65,22 @@ pub struct PhotoAsset {
 /// Decode filename from `CloudKit`'s `filenameEnc` field.
 /// Apple uses either plain STRING or base64-encoded `ENCRYPTED_BYTES` depending
 /// on the user's iCloud configuration.
+///
+/// An empty string is treated as missing so downstream path construction
+/// routes through the fingerprint fallback rather than producing a
+/// directory-only path like `2026-04-19/` or an extension-only hidden file
+/// like `.JPG`.
 fn decode_filename(fields: &Value) -> Option<String> {
-    let enc = &fields["filenameEnc"];
-    if enc.is_null() {
+    let name = enc::decode_string(fields, "filenameEnc")?;
+    if name.is_empty() {
         return None;
     }
-    let value = enc["value"].as_str()?;
-    let enc_type = enc["type"].as_str().unwrap_or("STRING");
-    match enc_type {
-        "STRING" => Some(value.to_string()),
-        "ENCRYPTED_BYTES" => {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(value)
-                .ok()?;
-            String::from_utf8(decoded).ok()
-        }
-        other => {
-            warn!(enc_type = %other, "Unsupported filenameEnc type");
-            None
-        }
-    }
+    Some(name)
 }
 
 /// Convert an `f64` millisecond timestamp to a `DateTime<Utc>`, returning
 /// `None` if the value is out of `i64` range.
-fn f64_to_millis_datetime(ms: f64) -> Option<DateTime<Utc>> {
+pub(crate) fn f64_to_millis_datetime(ms: f64) -> Option<DateTime<Utc>> {
     if (i64::MIN as f64..=i64::MAX as f64).contains(&ms) {
         Utc.timestamp_millis_opt(ms as i64).single()
     } else {
@@ -144,29 +146,42 @@ fn extract_versions(
         let size = if let Some(s) = res_entry["size"].as_u64() {
             s
         } else {
-            warn!(
+            tracing::warn!(
                 asset = %record_name,
                 field = format_args!("{res_field}.size"),
-                "Missing size, defaulting to 0"
-            );
-            0
-        };
-
-        let url: Box<str> = if let Some(u) = res_entry["downloadURL"].as_str() {
-            u.into()
-        } else {
-            warn!(
-                asset = %record_name,
-                field = format_args!("{res_field}.downloadURL"),
-                "Missing downloadURL, skipping version"
+                "Missing size, skipping version"
             );
             continue;
+        };
+
+        let url: Box<str> = match res_entry["downloadURL"].as_str() {
+            Some(u) => match validate_download_url(u) {
+                Ok(()) => u.into(),
+                Err(reason) => {
+                    tracing::warn!(
+                        asset = %record_name,
+                        field = format_args!("{res_field}.downloadURL"),
+                        url = u,
+                        reason,
+                        "Rejected downloadURL, skipping version"
+                    );
+                    continue;
+                }
+            },
+            None => {
+                tracing::warn!(
+                    asset = %record_name,
+                    field = format_args!("{res_field}.downloadURL"),
+                    "Missing downloadURL, skipping version"
+                );
+                continue;
+            }
         };
 
         let checksum: Box<str> = if let Some(c) = res_entry["fileChecksum"].as_str() {
             c.into()
         } else {
-            warn!(
+            tracing::warn!(
                 asset = %record_name,
                 field = format_args!("{res_field}.fileChecksum"),
                 "Missing fileChecksum, skipping version"
@@ -199,11 +214,44 @@ fn extract_versions(
     versions
 }
 
+/// Host suffixes kei will download from. Narrow to content-delivery hosts
+/// so a compromised or malformed CloudKit response can't point kei at an
+/// auth/gateway/marketing subdomain. Add new suffixes explicitly when
+/// Apple introduces one; a loud skip is preferable to a silent
+/// cross-origin fetch.
+const ALLOWED_DOWNLOAD_HOST_SUFFIXES: &[&str] = &[
+    ".icloud-content.com",
+    ".icloud-content.com.cn",
+    ".cdn-apple.com",
+];
+
+/// Validate that a CloudKit-provided download URL is safe to fetch from.
+/// Rejects empty strings, non-https schemes, and hosts outside the Apple
+/// CDN allowlist. On reject, returns a short reason suitable for a log line.
+fn validate_download_url(raw: &str) -> Result<(), &'static str> {
+    if raw.is_empty() {
+        return Err("empty URL");
+    }
+    let parsed = url::Url::parse(raw).map_err(|_| "malformed URL")?;
+    if parsed.scheme() != "https" {
+        return Err("non-https scheme");
+    }
+    let host = parsed.host_str().ok_or("missing host")?;
+    let host_lc = host.to_ascii_lowercase();
+    let host_allowed = ALLOWED_DOWNLOAD_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host_lc.ends_with(suffix));
+    if !host_allowed {
+        return Err("host not in Apple CDN allowlist");
+    }
+    Ok(())
+}
+
 impl PhotoAsset {
     /// Construct from raw JSON values (used by tests).
     #[cfg(test)]
     pub fn new(master_record: Value, asset_record: Value) -> Self {
-        let record_name: Box<str> = master_record["recordName"].as_str().unwrap_or("").into();
+        let record_name: Arc<str> = master_record["recordName"].as_str().unwrap_or("").into();
         let master_fields = master_record.get("fields").cloned().unwrap_or(Value::Null);
         let asset_fields = asset_record.get("fields").cloned().unwrap_or(Value::Null);
         let filename = decode_filename(&master_fields).map(String::into_boxed_str);
@@ -211,9 +259,11 @@ impl PhotoAsset {
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
         let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
+        let asset_metadata = Box::new(metadata::extract(&master_fields, &asset_fields));
         Self {
             record_name,
             filename,
+            asset_metadata,
             item_type_val,
             asset_date_ms,
             added_date_ms,
@@ -233,9 +283,11 @@ impl PhotoAsset {
             &asset.fields,
             &master.record_name,
         );
+        let asset_metadata = Box::new(metadata::extract(&master.fields, &asset.fields));
         Self {
-            record_name: master.record_name.into_boxed_str(),
+            record_name: Arc::from(master.record_name),
             filename,
+            asset_metadata,
             item_type_val,
             asset_date_ms,
             added_date_ms,
@@ -243,8 +295,21 @@ impl PhotoAsset {
         }
     }
 
+    /// Provider-agnostic metadata extracted at construction time.
+    pub fn metadata(&self) -> &AssetMetadata {
+        &self.asset_metadata
+    }
+
     pub fn id(&self) -> &str {
         &self.record_name
+    }
+
+    /// Shared handle on the record ID. Consumers that want to store the ID
+    /// (producer dedup set, `DownloadTask`, deferred state writes) clone the
+    /// `Arc<str>` instead of allocating a fresh owned copy.
+    #[must_use]
+    pub fn id_arc(&self) -> Arc<str> {
+        Arc::clone(&self.record_name)
     }
 
     pub fn filename(&self) -> Option<&str> {
@@ -255,7 +320,7 @@ impl PhotoAsset {
         self.asset_date_ms
             .and_then(f64_to_millis_datetime)
             .unwrap_or_else(|| {
-                warn!(asset_id = %self.record_name, "Missing or invalid assetDate, falling back to epoch");
+                tracing::warn!(asset_id = %self.record_name, "Missing or invalid assetDate, falling back to epoch");
                 DateTime::UNIX_EPOCH
             })
     }
@@ -268,7 +333,7 @@ impl PhotoAsset {
         self.added_date_ms
             .and_then(f64_to_millis_datetime)
             .unwrap_or_else(|| {
-                warn!(asset_id = %self.record_name, "Missing or invalid addedDate, falling back to epoch");
+                tracing::warn!(asset_id = %self.record_name, "Missing or invalid addedDate, falling back to epoch");
                 DateTime::UNIX_EPOCH
             })
     }
@@ -636,7 +701,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 1000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "abc123"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
@@ -645,7 +710,7 @@ mod tests {
         );
         assert!(asset.contains_version(AssetVersionSize::Original));
         let orig = asset.get_version(AssetVersionSize::Original).unwrap();
-        assert_eq!(&*orig.url, "https://example.com/orig");
+        assert_eq!(&*orig.url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*orig.checksum, "abc123");
     }
 
@@ -679,7 +744,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 1000,
-                    "downloadURL": "https://example.com/orig"
+                    "downloadURL": "https://p01.icloud-content.com/orig"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
             }}),
@@ -699,7 +764,7 @@ mod tests {
             fields: json!({
                 "filenameEnc": {"value": "vacation.jpg", "type": "STRING"},
                 "itemType": {"value": "public.jpeg"},
-                "resOriginalRes": {"value": {"size": 5000, "downloadURL": "https://example.com/dl", "fileChecksum": "ck1"}},
+                "resOriginalRes": {"value": {"size": 5000, "downloadURL": "https://p01.icloud-content.com/dl", "fileChecksum": "ck1"}},
                 "resOriginalFileType": {"value": "public.jpeg"}
             }),
             deleted: None,
@@ -732,7 +797,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 1000,
-                    "downloadURL": "https://master.example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/master-orig",
                     "fileChecksum": "master_ck"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
@@ -740,14 +805,14 @@ mod tests {
             json!({"fields": {
                 "resOriginalRes": {"value": {
                     "size": 2000,
-                    "downloadURL": "https://asset.example.com/adjusted",
+                    "downloadURL": "https://p01.icloud-content.com/asset-adjusted",
                     "fileChecksum": "asset_ck"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
             }}),
         );
         let orig = asset.get_version(AssetVersionSize::Original).unwrap();
-        assert_eq!(&*orig.url, "https://asset.example.com/adjusted");
+        assert_eq!(&*orig.url, "https://p01.icloud-content.com/asset-adjusted");
         assert_eq!(orig.size, 2000);
     }
 
@@ -758,13 +823,13 @@ mod tests {
                 "itemType": {"value": "com.apple.quicktime-movie"},
                 "resOriginalRes": {"value": {
                     "size": 50000,
-                    "downloadURL": "https://example.com/video",
+                    "downloadURL": "https://p01.icloud-content.com/video",
                     "fileChecksum": "vid_ck"
                 }},
                 "resOriginalFileType": {"value": "com.apple.quicktime-movie"},
                 "resVidMedRes": {"value": {
                     "size": 10000,
-                    "downloadURL": "https://example.com/vid_med",
+                    "downloadURL": "https://p01.icloud-content.com/vid_med",
                     "fileChecksum": "vid_med_ck"
                 }},
                 "resVidMedFileType": {"value": "com.apple.quicktime-movie"}
@@ -776,7 +841,7 @@ mod tests {
         // PHOTO_VERSION_LOOKUP maps Medium to resJPEGMed, but for videos
         // VIDEO_VERSION_LOOKUP maps Medium to resVidMed — verify the right one was used
         let medium = asset.get_version(AssetVersionSize::Medium).unwrap();
-        assert_eq!(&*medium.url, "https://example.com/vid_med");
+        assert_eq!(&*medium.url, "https://p01.icloud-content.com/vid_med");
     }
 
     #[test]
@@ -786,13 +851,13 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 5000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "ck_orig"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"},
                 "resJPEGThumbRes": {"value": {
                     "size": 100,
-                    "downloadURL": "https://example.com/thumb",
+                    "downloadURL": "https://p01.icloud-content.com/thumb",
                     "fileChecksum": "ck_thumb"
                 }},
                 "resJPEGThumbFileType": {"value": "public.jpeg"}
@@ -839,7 +904,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 1000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "abc123"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
@@ -1516,6 +1581,46 @@ mod tests {
     }
 
     #[test]
+    fn asset_date_f64_infinity_falls_back_to_epoch() {
+        let asset = make_asset(
+            json!({"recordName": "BAD_DATE"}),
+            json!({"fields": {"assetDate": {"value": f64::INFINITY}}}),
+        );
+        let dt = asset.asset_date();
+        assert_eq!(
+            dt,
+            DateTime::UNIX_EPOCH,
+            "out-of-range f64 assetDate must not produce a bogus date; \
+             must fall back to epoch so the user sees 1970-01-01, not silent garbage"
+        );
+    }
+
+    #[test]
+    fn asset_date_f64_nan_falls_back_to_epoch() {
+        let asset = make_asset(
+            json!({"recordName": "NAN_DATE"}),
+            json!({"fields": {"assetDate": {"value": f64::NAN}}}),
+        );
+        let dt = asset.asset_date();
+        assert_eq!(
+            dt,
+            DateTime::UNIX_EPOCH,
+            "NaN assetDate must fall back to epoch — (i64::MIN..=i64::MAX).contains(&NaN) is false"
+        );
+    }
+
+    #[test]
+    fn asset_empty_record_name_still_exposes_empty_id() {
+        let asset = make_asset(json!({"recordName": ""}), json!({}));
+        assert_eq!(
+            asset.id(),
+            "",
+            "empty recordName must be reflected as empty id so upstream producers \
+             can detect and reject; no silent defaulting to a placeholder"
+        );
+    }
+
+    #[test]
     fn versions_completely_empty_fields_returns_empty_map() {
         // Both master and asset have fields: {} — no version resources at all
         let asset = make_asset(json!({"fields": {}}), json!({"fields": {}}));
@@ -1530,7 +1635,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": large_size,
-                    "downloadURL": "https://example.com/huge",
+                    "downloadURL": "https://p01.icloud-content.com/huge",
                     "fileChecksum": "ck_huge"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
@@ -1541,7 +1646,7 @@ mod tests {
         // serde_json may not round-trip u64::MAX exactly through f64,
         // but the version should still be present and have a non-zero size
         assert!(orig.size > 0);
-        assert_eq!(&*orig.url, "https://example.com/huge");
+        assert_eq!(&*orig.url, "https://p01.icloud-content.com/huge");
     }
 
     #[test]
@@ -1593,7 +1698,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 4096,
-                    "downloadURL": "https://example.com/split",
+                    "downloadURL": "https://p01.icloud-content.com/split",
                     "fileChecksum": "split_ck"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
@@ -1650,12 +1755,12 @@ mod tests {
                     "filenameEnc": {"value": "IMG_0001.HEIC", "type": "STRING"},
                     "itemType": {"value": "public.heic"},
                     "resOriginalRes": {"value": {
-                        "size": 2000, "downloadURL": "https://example.com/heic",
+                        "size": 2000, "downloadURL": "https://p01.icloud-content.com/heic",
                         "fileChecksum": "heic_ck"
                     }},
                     "resOriginalFileType": {"value": "public.heic"},
                     "resOriginalVidComplRes": {"value": {
-                        "size": 3000, "downloadURL": "https://example.com/mov",
+                        "size": 3000, "downloadURL": "https://p01.icloud-content.com/mov",
                         "fileChecksum": "mov_ck"
                     }},
                     "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
@@ -1674,7 +1779,7 @@ mod tests {
                 "fields": {
                     "itemType": {"value": "public.jpeg"},
                     "resOriginalRes": {"value": {
-                        "size": 1000, "downloadURL": "https://example.com/jpg",
+                        "size": 1000, "downloadURL": "https://p01.icloud-content.com/jpg",
                         "fileChecksum": "jpg_ck"
                     }}
                 }
@@ -1692,11 +1797,11 @@ mod tests {
                 "fields": {
                     "itemType": {"value": "com.apple.quicktime-movie"},
                     "resOriginalRes": {"value": {
-                        "size": 5000, "downloadURL": "https://example.com/mov",
+                        "size": 5000, "downloadURL": "https://p01.icloud-content.com/mov",
                         "fileChecksum": "vid_ck"
                     }},
                     "resOriginalVidComplRes": {"value": {
-                        "size": 3000, "downloadURL": "https://example.com/mov2",
+                        "size": 3000, "downloadURL": "https://p01.icloud-content.com/mov2",
                         "fileChecksum": "mov2_ck"
                     }}
                 }
@@ -1717,7 +1822,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 5000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "ck_orig"
                 }}
                 // resOriginalFileType intentionally omitted
@@ -1737,7 +1842,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 5000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "ck_orig"
                 }},
                 "resOriginalFileType": {"value": null}
@@ -1782,37 +1887,35 @@ mod tests {
         );
     }
 
-    // ── Gap: asset with missing size defaults to 0 ───────────────────
+    // ── Gap: asset with missing size skips the version ───────────────
 
     #[test]
-    fn extract_versions_missing_size_defaults_to_zero() {
+    fn extract_versions_missing_size_skips_version() {
         let asset = make_asset(
             json!({"fields": {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "abc123"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
             }}),
             json!({"fields": {}}),
         );
-        // Missing size should default to 0, not skip the version entirely
-        assert_eq!(
-            asset.versions().len(),
-            1,
-            "version with missing size should still be extracted"
+        // A size-less version cannot be reliably downloaded or verified.
+        // Skip it so a 0-byte placeholder doesn't poison downstream decisions.
+        assert!(
+            asset.versions().is_empty(),
+            "version with missing size should be skipped"
         );
-        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
-        assert_eq!(orig.size, 0, "missing size should default to 0");
     }
 
     // ── Gap: asset with empty string downloadURL ─────────────────────
 
     #[test]
-    fn extract_versions_empty_download_url_is_preserved() {
-        // An empty-but-present URL is technically valid JSON -- verify it's
-        // not confused with null/missing.
+    fn extract_versions_empty_download_url_is_rejected() {
+        // An empty-but-present URL is a CloudKit shape we cannot safely
+        // download from; the version is skipped.
         let asset = make_asset(
             json!({"fields": {
                 "itemType": {"value": "public.jpeg"},
@@ -1825,13 +1928,101 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        assert_eq!(
-            asset.versions().len(),
-            1,
-            "empty string URL should not be treated as missing"
+        assert!(
+            asset.versions().is_empty(),
+            "empty URL should cause the version to be skipped"
         );
-        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
-        assert_eq!(&*orig.url, "", "empty URL should be stored as empty");
+    }
+
+    #[test]
+    fn extract_versions_non_https_url_is_rejected() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "http://p01.icloud-content.com/foo",
+                    "fileChecksum": "ck_http"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "http URL should cause the version to be skipped"
+        );
+    }
+
+    #[test]
+    fn extract_versions_foreign_host_is_rejected() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "https://attacker.example.com/pwned.jpg",
+                    "fileChecksum": "ck_bad"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "non-Apple host should cause the version to be skipped"
+        );
+    }
+
+    #[test]
+    fn validate_download_url_accepts_allowlisted_hosts() {
+        for u in [
+            "https://p01.icloud-content.com/path",
+            "https://P99.ICLOUD-CONTENT.COM/path",
+            "https://cvws.icloud-content.com/B/foo",
+            "https://cvws.icloud-content.com.cn/B/foo",
+            "https://something.cdn-apple.com/resource",
+        ] {
+            assert!(super::validate_download_url(u).is_ok(), "expected ok: {u}");
+        }
+    }
+
+    #[test]
+    fn validate_download_url_rejects_bad_inputs() {
+        for u in [
+            "",
+            "ftp://p01.icloud-content.com/path",
+            "http://p01.icloud-content.com/path",
+            "https://evil.example.com/x",
+            "not-a-url",
+            "https://",
+        ] {
+            assert!(
+                super::validate_download_url(u).is_err(),
+                "expected err: {u}"
+            );
+        }
+    }
+
+    /// Auth, gateway, and marketing subdomains of icloud.com / apple.com must
+    /// not be reachable as download origins even over HTTPS.
+    #[test]
+    fn validate_download_url_rejects_icloud_and_apple_subdomains() {
+        for u in [
+            "https://www.icloud.com/photos/asset",
+            "https://gateway.icloud.com/foo",
+            "https://appleid.icloud.com/token",
+            "https://www.apple.com/resource",
+            "https://configuration.apple.com/cfg",
+            "https://developer.apple.com/sdk",
+            "https://www.icloud.com.cn/x",
+            "https://www.apple.com.cn/x",
+        ] {
+            assert!(
+                super::validate_download_url(u).is_err(),
+                "expected err (not a CDN host): {u}"
+            );
+        }
     }
 
     // ── Gap: multiple versions with partial failures ─────────────────
@@ -1845,13 +2036,13 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 5000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "ck_orig"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"},
                 "resJPEGThumbRes": {"value": {
                     "size": 100,
-                    "downloadURL": "https://example.com/thumb"
+                    "downloadURL": "https://p01.icloud-content.com/thumb"
                 }},
                 "resJPEGThumbFileType": {"value": "public.jpeg"}
             }}),
@@ -1880,13 +2071,13 @@ mod tests {
                 "itemType": {"value": "com.apple.quicktime-movie"},
                 "resOriginalRes": {"value": {
                     "size": 50000,
-                    "downloadURL": "https://example.com/vid",
+                    "downloadURL": "https://p01.icloud-content.com/vid",
                     "fileChecksum": "vid_ck"
                 }},
                 "resOriginalFileType": {"value": "com.apple.quicktime-movie"},
                 "resOriginalVidComplRes": {"value": {
                     "size": 3000,
-                    "downloadURL": "https://example.com/live",
+                    "downloadURL": "https://p01.icloud-content.com/live",
                     "fileChecksum": "live_ck"
                 }},
                 "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}

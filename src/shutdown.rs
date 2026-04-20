@@ -20,6 +20,12 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// Install signal handlers and return a [`CancellationToken`] that is
 /// cancelled on the first SIGINT / SIGTERM / SIGHUP.  A second signal
 /// force-exits the process.
+///
+/// The signal-handler task and the force-exit watchdog are deliberately
+/// fire-and-forget: they must live for the lifetime of the process and
+/// must not block any caller. No `JoinHandle` is returned — a panic inside
+/// the handler would be surfaced by tokio's panic logger, and there is no
+/// meaningful "shutdown" for these tasks short of the process exiting.
 pub(crate) fn install_signal_handler(
     notifier: SystemdNotifier,
 ) -> anyhow::Result<CancellationToken> {

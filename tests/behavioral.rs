@@ -1308,7 +1308,9 @@ fn config_watch_interval_below_60_in_toml() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("watch interval must be >= 60"));
+        .stderr(predicate::str::contains(
+            "watch interval must be in 60..=86400 seconds, got 30",
+        ));
 }
 
 #[test]
@@ -2971,4 +2973,176 @@ fn kei_config_env_var_loads_toml() {
         .assert()
         .success()
         .stdout(predicate::str::contains("fromenv@example.com"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// kei reconcile: end-to-end CLI routing (no network)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn reconcile_subcommand_marks_missing_and_preserves_present() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let photos_dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(data_dir.path(), username);
+
+    let present_path = photos_dir.path().join("present.jpg");
+    std::fs::write(&present_path, b"x").unwrap();
+    let missing_path = photos_dir.path().join("gone.jpg");
+
+    insert_asset(
+        &conn,
+        "PRESENT",
+        "downloaded",
+        "present.jpg",
+        Some(present_path.to_str().unwrap()),
+        None,
+        None,
+    );
+    insert_asset(
+        &conn,
+        "MISSING",
+        "downloaded",
+        "gone.jpg",
+        Some(missing_path.to_str().unwrap()),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "reconcile",
+            "--username",
+            username,
+            "--data-dir",
+            data_dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("MISSING:") && stdout.contains("gone.jpg"),
+        "missing file must be reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("Present:  1"),
+        "present count must be 1: {stdout}"
+    );
+    assert!(
+        stdout.contains("Missing:  1"),
+        "missing count must be 1: {stdout}"
+    );
+    assert!(
+        stdout.contains("Marked failed: 1"),
+        "one mark_failed must have fired: {stdout}"
+    );
+
+    // Verify state transition landed in the DB.
+    let db_name = format!("{}.db", sanitize_username(username));
+    let conn = rusqlite::Connection::open(data_dir.path().join(db_name)).unwrap();
+    let missing_status: String = conn
+        .query_row("SELECT status FROM assets WHERE id = 'MISSING'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(missing_status, "failed");
+    let missing_error: String = conn
+        .query_row(
+            "SELECT last_error FROM assets WHERE id = 'MISSING'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(missing_error, "FILE_MISSING_AT_STARTUP");
+    let present_status: String = conn
+        .query_row("SELECT status FROM assets WHERE id = 'PRESENT'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(present_status, "downloaded");
+}
+
+#[test]
+fn reconcile_dry_run_reports_but_does_not_mutate() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let photos_dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(data_dir.path(), username);
+
+    let missing_path = photos_dir.path().join("gone.jpg");
+    insert_asset(
+        &conn,
+        "MISSING_DRY",
+        "downloaded",
+        "gone.jpg",
+        Some(missing_path.to_str().unwrap()),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "reconcile",
+            "--dry-run",
+            "--username",
+            username,
+            "--data-dir",
+            data_dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dry run") || stdout.contains("Dry run"),
+        "dry-run wording must appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("Missing:  1"),
+        "missing count must still be 1 in dry-run: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Marked failed:"),
+        "dry-run must not print Marked failed summary: {stdout}"
+    );
+
+    let db_name = format!("{}.db", sanitize_username(username));
+    let conn = rusqlite::Connection::open(data_dir.path().join(db_name)).unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM assets WHERE id = 'MISSING_DRY'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "downloaded", "dry-run must leave the DB unchanged");
+}
+
+#[test]
+fn reconcile_on_empty_db_prints_guidance_and_exits_clean() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+
+    let out = clean_cmd()
+        .args([
+            "reconcile",
+            "--username",
+            username,
+            "--data-dir",
+            data_dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("No state database") || stdout.contains("no state database"),
+        "operator must see guidance when DB doesn't exist: {stdout}"
+    );
 }

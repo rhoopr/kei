@@ -1,7 +1,10 @@
 # ── Build stage ──────────────────────────────────────────────────────
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
 
-# Install cross-compilation toolchains when cross-compiling
+# Install cross-compilation toolchains when cross-compiling.
+# xmp_toolkit vendors Adobe's C++ XMP Toolkit and compiles it via `cc` on
+# every build, so the arm64 branch needs g++-aarch64-linux-gnu in addition
+# to the C compiler.
 ARG TARGETPLATFORM
 RUN case "$TARGETPLATFORM" in \
       "linux/amd64") \
@@ -10,7 +13,7 @@ RUN case "$TARGETPLATFORM" in \
       "linux/arm64") \
         dpkg --add-architecture arm64 && \
         apt-get update && \
-        apt-get install -y gcc-aarch64-linux-gnu libdbus-1-dev:arm64 ;; \
+        apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libdbus-1-dev:arm64 ;; \
     esac
 
 WORKDIR /build
@@ -31,6 +34,8 @@ RUN case "$TARGETPLATFORM" in \
 COPY Cargo.toml Cargo.lock ./
 RUN export TARGET=$(cat /tmp/target) && \
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
+    export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ && \
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_CXX=aarch64-linux-gnu-g++ && \
     export PKG_CONFIG_ALLOW_CROSS=1 && \
     export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig && \
     mkdir src && echo 'fn main() {}' > src/main.rs && \
@@ -41,6 +46,8 @@ COPY src/ src/
 
 RUN export TARGET=$(cat /tmp/target) && \
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
+    export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ && \
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_CXX=aarch64-linux-gnu-g++ && \
     export PKG_CONFIG_ALLOW_CROSS=1 && \
     export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig && \
     cargo build --release --target $TARGET && \

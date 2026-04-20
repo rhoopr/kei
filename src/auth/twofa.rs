@@ -36,6 +36,20 @@ fn check_apple_rscd(response: &Response) -> Option<u16> {
     check_rscd_from_headers(response.headers())
 }
 
+/// Consume a `reqwest::Response` body as text, logging any read failure at
+/// `warn!` and returning an empty string. Auth flows pattern-match on the
+/// body contents, so a silent swallow here would hide mid-response connection
+/// drops behind what looks like a blank response.
+async fn read_response_body(response: Response, context: &str) -> String {
+    match response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(error = %e, context = %context, "failed to read auth response body");
+            String::new()
+        }
+    }
+}
+
 /// Build the `ServiceError` that corresponds to an Apple rscd rejection.
 pub(crate) fn rscd_service_error(rscd: u16, body: &str) -> AuthError {
     tracing::debug!(rscd, "Apple rejected session via rscd header");
@@ -49,7 +63,7 @@ pub(crate) fn rscd_service_error(rscd: u16, body: &str) -> AuthError {
 /// and return a `ServiceError`. Otherwise return `Ok(response)` unchanged.
 async fn reject_on_rscd(response: Response) -> Result<Response, AuthError> {
     if let Some(rscd) = check_apple_rscd(&response) {
-        let text = response.text().await.unwrap_or_default();
+        let text = read_response_body(response, "rscd rejection").await;
         return Err(rscd_service_error(rscd, &text));
     }
     Ok(response)
@@ -168,7 +182,7 @@ async fn retry_auth_request(
         let status = response.status();
         let is_last = attempt + 1 >= total_attempts;
         if status.is_success() || !is_transient_auth_status(status.as_u16()) || is_last {
-            let text = response.text().await.unwrap_or_default();
+            let text = read_response_body(response, log_label).await;
             return Ok((status, text));
         }
 
@@ -400,7 +414,7 @@ pub async fn validate_token(
 
     let status = response.status();
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
+        let text = read_response_body(response, "validate_token error").await;
         return Err(
             classify_auth_http_error(status.as_u16(), &text, "validation", || {
                 tracing::debug!("Invalid authentication token");
@@ -413,7 +427,7 @@ pub async fn validate_token(
     let response = reject_on_rscd(response).await?;
 
     tracing::debug!("Session token is still valid");
-    let text = response.text().await.unwrap_or_default();
+    let text = read_response_body(response, "validate_token body").await;
     let data: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
         let mut n = text.len().min(200);
         while n > 0 && !text.is_char_boundary(n) {
@@ -449,7 +463,7 @@ pub async fn authenticate_with_token(
 
     let status = response.status();
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
+        let text = read_response_body(response, "accountLogin error").await;
         return Err(
             classify_auth_http_error(status.as_u16(), &text, "login", || {
                 AuthError::FailedLogin(format!("Invalid authentication token: {text}"))
@@ -460,7 +474,7 @@ pub async fn authenticate_with_token(
 
     let response = reject_on_rscd(response).await?;
 
-    let text = response.text().await.unwrap_or_default();
+    let text = read_response_body(response, "accountLogin body").await;
     let body: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
         let mut n = text.len().min(200);
         while n > 0 && !text.is_char_boundary(n) {

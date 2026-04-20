@@ -1,6 +1,6 @@
 [package]
 name = "kei"
-version = "0.9.2"
+version = "0.10.0-dev"
 edition = "2021"
 
 [[bin]]
@@ -56,20 +56,25 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 # Progress / UI
 indicatif = "0.18"
 rpassword = "7"
-dialoguer = "0.11"
+dialoguer = "0.12"
 
-# EXIF — two libraries because no single crate handles both read and write.
-# kamadak-exif: read-only, used for reading DateTimeOriginal from existing files.
-# little_exif:  write-capable, used for stamping EXIF dates on downloaded photos.
-kamadak-exif = "0.6"
-little_exif = "0.6"
+# XMP metadata via Adobe's XMP Toolkit (vendored C++ source).
+# Handles JPEG, PNG, TIFF, MP4, MOV, PSD, PDF, and more via XMPFiles.
+# Does NOT handle HEIC — the bundled XMPFiles has no HEIF handler, so HEIC
+# embedded XMP is handled separately via libheif-rs.
+xmp_toolkit = "1"
+
+# ISO-BMFF (MP4 / HEIF / HEIC) atom parsing + encoding. HEIC's XMP packet
+# lives in a `mime`-type item inside the `meta` box; mp4-atom gives us the
+# box primitives to surgically insert it without decoding image data.
+mp4-atom = "0.10"
 
 # Error handling
 anyhow = "1"
 thiserror = "2"
 
 # Random
-rand = "0.10"
+rand = "0.10.1"
 
 # File locking
 fs4 = "0.13"
@@ -85,6 +90,9 @@ urlencoding = "2"
 
 # SQLite state tracking
 rusqlite = { version = "0.39", features = ["bundled"] }
+
+# Binary plist decoding for iCloud *Enc fields (location, keywords, etc.)
+plist = "1"
 
 # System
 libc = "0.2"

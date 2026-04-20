@@ -49,6 +49,11 @@ pub(crate) struct TomlDownload {
     pub bandwidth_limit: Option<String>,
     pub temp_suffix: Option<String>,
     pub set_exif_datetime: Option<bool>,
+    pub set_exif_rating: Option<bool>,
+    pub set_exif_gps: Option<bool>,
+    pub set_exif_description: Option<bool>,
+    pub embed_xmp: Option<bool>,
+    pub xmp_sidecar: Option<bool>,
     pub no_progress_bar: Option<bool>,
     pub retry: Option<TomlRetry>,
 }
@@ -327,6 +332,11 @@ pub struct Config {
     pub skip_photos: bool,
     pub force_size: bool,
     pub set_exif_datetime: bool,
+    pub set_exif_rating: bool,
+    pub set_exif_gps: bool,
+    pub set_exif_description: bool,
+    pub embed_xmp: bool,
+    pub xmp_sidecar: bool,
     pub dry_run: bool,
     pub no_progress_bar: bool,
     pub keep_unicode_in_filenames: bool,
@@ -380,6 +390,14 @@ fn resolve<T>(cli: Option<T>, toml: Option<T>, default: T) -> T {
     cli.or(toml).unwrap_or(default)
 }
 
+/// Same as `resolve`, but takes references so callers don't clone both
+/// sources before choosing the winner. Only the chosen value is cloned.
+/// Prefer this for owned types (`String`, `Vec<_>`) where the `resolve`
+/// version would double-allocate; for `Copy` types the two are equivalent.
+fn resolve_ref<T: Clone>(cli: Option<&T>, toml: Option<&T>, default: T) -> T {
+    cli.or(toml).cloned().unwrap_or(default)
+}
+
 /// For boolean flags: CLI explicit value wins, then TOML, then false.
 /// `Option<bool>` allows the CLI to explicitly pass `--flag false` to
 /// override a TOML `true`.
@@ -418,9 +436,9 @@ pub(crate) fn resolve_auth(
 ) -> (String, Option<String>, Domain, PathBuf) {
     let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
-    let username = resolve(
-        globals.username.clone(),
-        toml_auth.and_then(|a| a.username.clone()),
+    let username = resolve_ref(
+        globals.username.as_ref(),
+        toml_auth.and_then(|a| a.username.as_ref()),
         String::new(),
     );
 
@@ -631,8 +649,8 @@ impl Config {
             threads_default,
         );
         anyhow::ensure!(
-            threads_num >= 1,
-            "threads_num must be >= 1, got {threads_num}"
+            (1..=64).contains(&threads_num),
+            "threads_num must be in 1..=64, got {threads_num}"
         );
         let temp_suffix = resolve(
             sync.temp_suffix,
@@ -643,17 +661,33 @@ impl Config {
             sync.set_exif_datetime,
             toml_dl.and_then(|d| d.set_exif_datetime),
         );
+        let set_exif_rating = resolve_flag(
+            sync.set_exif_rating,
+            toml_dl.and_then(|d| d.set_exif_rating),
+        );
+        let set_exif_gps = resolve_flag(sync.set_exif_gps, toml_dl.and_then(|d| d.set_exif_gps));
+        let set_exif_description = resolve_flag(
+            sync.set_exif_description,
+            toml_dl.and_then(|d| d.set_exif_description),
+        );
+        let embed_xmp = resolve_flag(sync.embed_xmp, toml_dl.and_then(|d| d.embed_xmp));
+        let xmp_sidecar = resolve_flag(sync.xmp_sidecar, toml_dl.and_then(|d| d.xmp_sidecar));
         let no_progress_bar = resolve_flag(
             sync.no_progress_bar,
             toml_dl.and_then(|d| d.no_progress_bar),
         );
 
-        // Retry
+        // Re-validate; clap range attrs run on CLI only.
         let max_retries = resolve(sync.max_retries, toml_retry.and_then(|r| r.max_retries), 3);
+        anyhow::ensure!(
+            max_retries <= 100,
+            "retry max_retries must be <= 100, got {max_retries}"
+        );
         let retry_delay_secs = resolve(sync.retry_delay, toml_retry.and_then(|r| r.delay), 5);
-        if retry_delay_secs == 0 {
-            anyhow::bail!("retry delay must be >= 1, got 0");
-        }
+        anyhow::ensure!(
+            (1..=3600).contains(&retry_delay_secs),
+            "retry delay must be in 1..=3600 seconds, got {retry_delay_secs}"
+        );
 
         // Filters
         let library = resolve_library_selection(sync.library, toml_filters);
@@ -776,9 +810,10 @@ impl Config {
             .watch_with_interval
             .or_else(|| toml_watch.and_then(|w| w.interval));
         if let Some(n) = watch_with_interval {
-            if n < 60 {
-                anyhow::bail!("watch interval must be >= 60 seconds, got {n}");
-            }
+            anyhow::ensure!(
+                (60..=86400).contains(&n),
+                "watch interval must be in 60..=86400 seconds, got {n}"
+            );
         }
         let notify_systemd = resolve_flag(
             sync.notify_systemd,
@@ -848,6 +883,11 @@ impl Config {
             skip_photos,
             force_size,
             set_exif_datetime,
+            set_exif_rating,
+            set_exif_gps,
+            set_exif_description,
+            embed_xmp,
+            xmp_sidecar,
             dry_run: sync.dry_run,
             no_progress_bar,
             keep_unicode_in_filenames,
@@ -907,6 +947,19 @@ impl Config {
                 } else {
                     None
                 },
+                set_exif_rating: if self.set_exif_rating {
+                    Some(true)
+                } else {
+                    None
+                },
+                set_exif_gps: if self.set_exif_gps { Some(true) } else { None },
+                set_exif_description: if self.set_exif_description {
+                    Some(true)
+                } else {
+                    None
+                },
+                embed_xmp: if self.embed_xmp { Some(true) } else { None },
+                xmp_sidecar: if self.xmp_sidecar { Some(true) } else { None },
                 no_progress_bar: if self.no_progress_bar {
                     Some(true)
                 } else {
@@ -1075,6 +1128,11 @@ pub(crate) fn persist_first_run_config(
             bandwidth_limit: None,
             temp_suffix: None,
             set_exif_datetime: None,
+            set_exif_rating: None,
+            set_exif_gps: None,
+            set_exif_description: None,
+            embed_xmp: None,
+            xmp_sidecar: None,
             no_progress_bar: None,
             retry: None,
         }),
@@ -1624,6 +1682,49 @@ mod tests {
     }
 
     #[test]
+    fn test_build_embed_xmp_and_sidecar_from_toml() {
+        let toml_str = r#"
+            [download]
+            embed_xmp = true
+            xmp_sidecar = true
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert!(cfg.embed_xmp);
+        assert!(cfg.xmp_sidecar);
+    }
+
+    #[test]
+    fn test_cli_embed_xmp_overrides_toml() {
+        let toml_str = r#"
+            [download]
+            embed_xmp = true
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.embed_xmp = Some(false);
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert!(
+            !cfg.embed_xmp,
+            "--embed-xmp=false must override TOML embed_xmp = true"
+        );
+    }
+
+    #[test]
+    fn test_embed_xmp_default_false_when_unset() {
+        let cfg =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        assert!(!cfg.embed_xmp);
+        assert!(!cfg.xmp_sidecar);
+    }
+
+    #[test]
     fn test_build_cli_flag_overrides_toml_false() {
         let toml_str = r#"
             [filters]
@@ -1669,6 +1770,46 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("threads_num"),
             "Error should mention threads_num"
+        );
+    }
+
+    #[test]
+    fn test_build_threads_num_above_upper_bound_from_toml_rejected() {
+        let toml_str = r#"
+            [download]
+            threads_num = 128
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("threads_num"),
+            "Error should mention threads_num"
+        );
+    }
+
+    #[test]
+    fn test_build_watch_interval_above_upper_bound_from_toml_rejected() {
+        let toml_str = r#"
+            [watch]
+            interval = 100000
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("watch interval"),
+            "Error should mention watch interval"
         );
     }
 
@@ -1800,6 +1941,67 @@ mod tests {
             result.unwrap_err().to_string().contains("retry delay"),
             "Error should mention retry delay"
         );
+    }
+
+    #[test]
+    fn test_build_retry_delay_above_upper_bound_from_toml_rejected() {
+        let toml_str = r#"
+            [download.retry]
+            delay = 86400
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        assert!(result.is_err(), "TOML delay > 3600 must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("retry delay") && msg.contains("3600"),
+            "Error should mention retry delay and the bound: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_build_max_retries_above_upper_bound_from_toml_rejected() {
+        let toml_str = r#"
+            [download.retry]
+            max_retries = 9999
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        assert!(result.is_err(), "TOML max_retries > 100 must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("max_retries") && msg.contains("100"),
+            "Error should mention max_retries and the bound: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_build_retry_clamp_accepts_upper_bound_from_toml() {
+        let toml_str = r#"
+            [download.retry]
+            max_retries = 100
+            delay = 3600
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .expect("max_retries=100, delay=3600 must be accepted");
+        assert_eq!(cfg.max_retries, 100);
+        assert_eq!(cfg.retry_delay_secs, 3600);
     }
 
     #[test]

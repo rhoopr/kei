@@ -45,7 +45,17 @@ impl PhotosSession for reqwest::Client {
         if status.is_client_error() || status.is_server_error() {
             let url = resp.url().to_string();
             let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
-            let resp_body = resp.text().await.unwrap_or_default();
+            let resp_body = match resp.text().await {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        url = %url,
+                        "CloudKit error-response body read failed; proceeding with empty body"
+                    );
+                    String::new()
+                }
+            };
             if !resp_body.is_empty() {
                 // 421 bodies are the most diagnostic signal for distinguishing
                 // ADP-class from session-class misdirected requests (e.g. the
@@ -223,19 +233,40 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
         if has_errors {
             // Log each errored record and capture the last error
             let mut last_ck_err = None;
+            let mut permanent_errors = 0usize;
+            let mut retryable_errors = 0usize;
             for record in records {
                 if let Some(code) = record["serverErrorCode"].as_str() {
                     let reason = record["reason"].as_str().unwrap_or("unknown");
+                    let record_name = record["recordName"].as_str().unwrap_or("(unknown)");
                     let retryable = RETRYABLE_SERVER_ERRORS
                         .iter()
                         .any(|&s| s.eq_ignore_ascii_case(code));
                     let service_not_activated = is_service_not_activated(code, reason);
-                    tracing::warn!(
-                        error_code = code,
-                        retryable,
-                        service_not_activated,
-                        "CloudKit per-record error: {reason}"
-                    );
+                    // Permanent errors (e.g. ACCESS_DENIED on a revoked
+                    // shared asset) silently drop records from the
+                    // enumeration; log at error! so operators can audit
+                    // which assets were skipped and why. Retryable errors
+                    // are a matter of the retry loop and stay at warn!.
+                    if retryable {
+                        retryable_errors += 1;
+                        tracing::warn!(
+                            record_name,
+                            error_code = code,
+                            retryable,
+                            service_not_activated,
+                            "CloudKit per-record error (retryable): {reason}"
+                        );
+                    } else {
+                        permanent_errors += 1;
+                        tracing::error!(
+                            record_name,
+                            error_code = code,
+                            retryable,
+                            service_not_activated,
+                            "CloudKit per-record error (permanent, record skipped): {reason}"
+                        );
+                    }
                     last_ck_err = Some(CloudKitServerError {
                         code: code.into(),
                         reason: reason.into(),
@@ -252,10 +283,16 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                 records.retain(|r| r["serverErrorCode"].as_str().is_none());
                 let valid_count = records.len();
                 if valid_count == 0 {
+                    // Control only reaches here because the loop above walked
+                    // at least one record with `serverErrorCode` set, which
+                    // always assigns `last_ck_err`. The expect encodes that
+                    // invariant — it cannot fire at runtime.
                     return Err(last_ck_err.expect("errored is non-empty").into());
                 }
                 tracing::warn!(
                     errored = total - valid_count,
+                    permanent = permanent_errors,
+                    retryable = retryable_errors,
                     valid = valid_count,
                     total,
                     "Filtered errored records from CloudKit response"
@@ -1093,6 +1130,34 @@ mod tests {
             http_err.body.is_none(),
             "empty response body must be None, not Some(\"\"), got: {:?}",
             http_err.body
+        );
+    }
+
+    /// HTTP 200 with a truncated / malformed JSON body must surface as an
+    /// error, not a silently-empty parse. A silent parse would let a
+    /// pathological CloudKit page pretend to be a valid zero-record
+    /// response and halt enumeration prematurely.
+    #[tokio::test]
+    async fn wiremock_200_with_truncated_json_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("{\"records\": [{\"incomplete\""),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "200 with malformed JSON body must be reported as an error, not a silent empty parse"
         );
     }
 

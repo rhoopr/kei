@@ -97,7 +97,7 @@ pub(crate) async fn run_verify(
     }
 
     if missing > 0 || corrupted > 0 {
-        std::process::exit(1);
+        anyhow::bail!("verify failed: {missing} missing, {corrupted} corrupted");
     }
 
     Ok(())

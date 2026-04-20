@@ -14,6 +14,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use chrono::Utc;
+
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -34,7 +36,7 @@ use crate::state::types::SyncSummary;
 // ── Label types ──────────────────────────────────────────────────────────────
 
 /// Label set for the `kei_sync_skipped_total` counter family.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
 struct SkipLabels {
     reason: &'static str,
 }
@@ -52,6 +54,12 @@ struct StatusLabels {
 /// letting /metrics encode without taking the lock.
 struct Inner {
     health_snapshot: Option<HealthStatus>,
+    /// Maximum age of `last_success_at` before /healthz returns 503. `None`
+    /// disables the staleness check (e.g. one-shot syncs where a single
+    /// success is final). Set at construction time from `watch_interval * 2`
+    /// so a single missed cycle is tolerable but two consecutive misses flip
+    /// the endpoint to failing.
+    staleness_threshold: Option<chrono::Duration>,
 }
 
 /// Cheap-to-clone handle passed to the sync loop and into axum state.
@@ -218,6 +226,7 @@ impl MetricsHandle {
             registry: Arc::new(registry),
             inner: Arc::new(Mutex::new(Inner {
                 health_snapshot: None,
+                staleness_threshold: None,
             })),
             assets_seen,
             downloaded,
@@ -379,12 +388,17 @@ async fn handle_metrics(State(handle): State<MetricsHandle>) -> impl IntoRespons
 
 async fn handle_healthz(State(handle): State<MetricsHandle>) -> impl IntoResponse {
     let inner = handle.inner.lock().await;
+    let staleness_threshold = inner.staleness_threshold;
     match &inner.health_snapshot {
         Some(h) => {
             let consecutive_failures = h.consecutive_failures;
+            let stale = match (staleness_threshold, h.last_success_at) {
+                (Some(max_age), Some(last_success)) => (Utc::now() - last_success) > max_age,
+                _ => false,
+            };
             match serde_json::to_string_pretty(h) {
                 Ok(json) => {
-                    let status = if consecutive_failures >= 5 {
+                    let status = if consecutive_failures >= 5 || stale {
                         StatusCode::SERVICE_UNAVAILABLE
                     } else {
                         StatusCode::OK
@@ -428,13 +442,21 @@ async fn handle_healthz(State(handle): State<MetricsHandle>) -> impl IntoRespons
 ///
 /// Binds synchronously so that a misconfigured port fails at startup rather
 /// than silently. Returns a `MetricsHandle` the sync loop uses to push metrics
-/// after each cycle. The server shuts down gracefully when `shutdown_token` is
-/// cancelled.
+/// after each cycle and a `JoinHandle` so the sync loop can await graceful
+/// shutdown before the runtime drops. The server shuts down gracefully when
+/// `shutdown_token` is cancelled.
 pub(crate) fn spawn_server(
     port: u16,
     shutdown_token: CancellationToken,
-) -> anyhow::Result<MetricsHandle> {
+    staleness_threshold: Option<chrono::Duration>,
+) -> anyhow::Result<(MetricsHandle, tokio::task::JoinHandle<()>)> {
     let handle = MetricsHandle::new();
+    if let Some(max_age) = staleness_threshold {
+        let inner = Arc::clone(&handle.inner);
+        // Lock is uncontended at this point (no readers exist yet), so
+        // blocking_lock is safe and avoids making the function async.
+        inner.blocking_lock().staleness_threshold = Some(max_age);
+    }
     let app = Router::new()
         .route("/metrics", get(handle_metrics))
         .route("/healthz", get(handle_healthz))
@@ -448,7 +470,7 @@ pub(crate) fn spawn_server(
 
     tracing::info!(port, "Prometheus metrics server listening");
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app)
             .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
             .await
@@ -458,7 +480,7 @@ pub(crate) fn spawn_server(
         tracing::info!(port, "Prometheus metrics server stopped");
     });
 
-    Ok(handle)
+    Ok((handle, task))
 }
 
 #[cfg(test)]
@@ -835,6 +857,90 @@ mod tests {
             json.get("last_success_at").is_some(),
             "missing last_success_at"
         );
+    }
+
+    // ── /healthz staleness threshold ───────────────────────────────────────
+
+    async fn set_threshold(handle: &MetricsHandle, max_age: Option<chrono::Duration>) {
+        handle.inner.lock().await.staleness_threshold = max_age;
+    }
+
+    async fn backdate_last_success(handle: &MetricsHandle, secs_ago: i64) {
+        let mut inner = handle.inner.lock().await;
+        if let Some(snap) = inner.health_snapshot.as_mut() {
+            let past = Utc::now() - chrono::Duration::seconds(secs_ago);
+            snap.last_sync_at = Some(past);
+            snap.last_success_at = Some(past);
+        }
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_503_when_last_success_is_stale() {
+        let handle = MetricsHandle::new();
+        handle
+            .update(&SyncStats::default(), &healthy_status(0))
+            .await;
+        // 600s threshold; backdate last_success to 1200s ago
+        set_threshold(&handle, Some(chrono::Duration::seconds(600))).await;
+        backdate_last_success(&handle, 1200).await;
+
+        let (status, _body) = render_healthz(&handle).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_200_when_last_success_is_fresh() {
+        let handle = MetricsHandle::new();
+        handle
+            .update(&SyncStats::default(), &healthy_status(0))
+            .await;
+        set_threshold(&handle, Some(chrono::Duration::seconds(600))).await;
+        backdate_last_success(&handle, 100).await;
+
+        let (status, _body) = render_healthz(&handle).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_staleness_disabled_when_threshold_is_none() {
+        let handle = MetricsHandle::new();
+        handle
+            .update(&SyncStats::default(), &healthy_status(0))
+            .await;
+        // No threshold set, last_success 10 years ago — must still be 200
+        backdate_last_success(&handle, 10 * 365 * 24 * 3600).await;
+
+        let (status, _body) = render_healthz(&handle).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_staleness_tripped_also_when_failures_high() {
+        // Both conditions at once -> 503
+        let handle = MetricsHandle::new();
+        handle
+            .update(&SyncStats::default(), &healthy_status(5))
+            .await;
+        set_threshold(&handle, Some(chrono::Duration::seconds(60))).await;
+        backdate_last_success(&handle, 120).await;
+
+        let (status, _body) = render_healthz(&handle).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn healthz_staleness_ignored_when_last_success_never_set() {
+        // First cycle failed -> no last_success_at. Staleness must not trip
+        // because we have no anchor timestamp yet; failures alone drive 503.
+        let handle = MetricsHandle::new();
+        let mut h = HealthStatus::new();
+        h.record_failure("first ever");
+        handle.update(&SyncStats::default(), &h).await;
+        set_threshold(&handle, Some(chrono::Duration::seconds(1))).await;
+
+        let (status, _body) = render_healthz(&handle).await;
+        // 1 consecutive failure is below 5, and last_success is None, so 200
+        assert_eq!(status, axum::http::StatusCode::OK);
     }
 
     // ── DB-backed gauges ──────────────────────────────────────────────────────

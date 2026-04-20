@@ -57,6 +57,17 @@ impl DownloadError {
         }
     }
 
+    /// Whether this error indicates HTTP 429 or upstream 503 — i.e. Apple is
+    /// signalling we should back off. Used to aggregate a rate-limited count
+    /// at the sync level so operators see "hit 429 on 30% of assets" without
+    /// grepping the log.
+    pub const fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::HttpStatus { status, .. } => *status == 429 || *status == 503,
+            _ => false,
+        }
+    }
+
     /// Whether this error indicates the session has expired.
     ///
     /// HTTP 401 (Unauthorized) and 403 (Forbidden) typically indicate that
@@ -76,6 +87,55 @@ impl DownloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_rate_limited_429() {
+        let e = DownloadError::HttpStatus {
+            status: 429,
+            path: "x".into(),
+        };
+        assert!(e.is_rate_limited());
+    }
+
+    #[test]
+    fn is_rate_limited_503() {
+        let e = DownloadError::HttpStatus {
+            status: 503,
+            path: "x".into(),
+        };
+        assert!(e.is_rate_limited());
+    }
+
+    #[test]
+    fn is_rate_limited_500_is_not() {
+        // Other 5xx errors are retryable but don't imply rate-limiting
+        let e = DownloadError::HttpStatus {
+            status: 500,
+            path: "x".into(),
+        };
+        assert!(!e.is_rate_limited());
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn is_rate_limited_404_is_not() {
+        let e = DownloadError::HttpStatus {
+            status: 404,
+            path: "x".into(),
+        };
+        assert!(!e.is_rate_limited());
+    }
+
+    #[test]
+    fn is_rate_limited_non_http_variants() {
+        let e = DownloadError::Disk(Box::new(std::io::Error::other("boom")));
+        assert!(!e.is_rate_limited());
+        let e = DownloadError::InvalidContent {
+            path: "x".into(),
+            reason: "y".into(),
+        };
+        assert!(!e.is_rate_limited());
+    }
 
     #[test]
     fn test_http_404_not_retryable() {
