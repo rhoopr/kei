@@ -1308,7 +1308,9 @@ fn config_watch_interval_below_60_in_toml() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("watch interval must be >= 60"));
+        .stderr(predicate::str::contains(
+            "watch interval must be in 60..=86400 seconds, got 30",
+        ));
 }
 
 #[test]

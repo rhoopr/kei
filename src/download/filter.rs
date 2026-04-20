@@ -2053,6 +2053,45 @@ mod tests {
     }
 
     #[test]
+    fn filter_asset_empty_filename_string_uses_fingerprint_fallback() {
+        // Distinct from the missing-field case: the STRING field is PRESENT
+        // but contains an empty string. A naive join would produce a path
+        // like `"2026-04-19/"` (directory-only), so we must treat empty
+        // exactly like missing and route through the fingerprint fallback.
+        let asset = PhotoAsset::new(
+            json!({"recordName": "EMPTYFN_ASSET1", "fields": {
+                "filenameEnc": {"value": "", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 2048,
+                    "downloadURL": "https://p01.icloud-content.com/photos/orig/emptyfn",
+                    "fileChecksum": "deadbeef1234"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .expect("download_path must include a filename, not bare directory")
+            .to_str()
+            .unwrap();
+        assert!(
+            !filename.is_empty() && !filename.starts_with('.'),
+            "empty filenameEnc must produce a real filename via fingerprint fallback, \
+             got: {filename}"
+        );
+        assert!(
+            filename.ends_with(".JPG"),
+            "fingerprint fallback for public.jpeg must yield .JPG, got: {filename}"
+        );
+    }
+
+    #[test]
     fn filter_asset_missing_filename_uses_fingerprint_fallback() {
         // Asset whose filenameEnc field is absent (null) should trigger the
         // fingerprint fallback path, generating a filename from the asset ID.

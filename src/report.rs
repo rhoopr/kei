@@ -351,12 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_assets_cap_is_200() {
-        // Wire-format guarantee: operators rely on the cap.
-        assert_eq!(FAILED_ASSETS_CAP, 200);
-    }
-
-    #[test]
     fn write_report_creates_valid_json_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.json");

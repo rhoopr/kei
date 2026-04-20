@@ -65,8 +65,17 @@ pub struct PhotoAsset {
 /// Decode filename from `CloudKit`'s `filenameEnc` field.
 /// Apple uses either plain STRING or base64-encoded `ENCRYPTED_BYTES` depending
 /// on the user's iCloud configuration.
+///
+/// An empty string is treated as missing so downstream path construction
+/// routes through the fingerprint fallback rather than producing a
+/// directory-only path like `2026-04-19/` or an extension-only hidden file
+/// like `.JPG`.
 fn decode_filename(fields: &Value) -> Option<String> {
-    enc::decode_string(fields, "filenameEnc")
+    let name = enc::decode_string(fields, "filenameEnc")?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
 }
 
 /// Convert an `f64` millisecond timestamp to a `DateTime<Utc>`, returning
@@ -1573,6 +1582,42 @@ mod tests {
         let asset = make_asset(json!({}), json!({"fields": {"assetDate": {"value": 0.0}}}));
         let dt = asset.asset_date();
         assert_eq!(dt, DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn asset_date_f64_infinity_falls_back_to_epoch() {
+        let asset = make_asset(
+            json!({"recordName": "BAD_DATE"}),
+            json!({"fields": {"assetDate": {"value": f64::INFINITY}}}),
+        );
+        let dt = asset.asset_date();
+        assert_eq!(
+            dt,
+            DateTime::UNIX_EPOCH,
+            "out-of-range f64 assetDate must not produce a bogus date; \
+             must fall back to epoch so the user sees 1970-01-01, not silent garbage"
+        );
+    }
+
+    #[test]
+    fn asset_date_f64_nan_falls_back_to_epoch() {
+        let asset = make_asset(
+            json!({"recordName": "NAN_DATE"}),
+            json!({"fields": {"assetDate": {"value": f64::NAN}}}),
+        );
+        let dt = asset.asset_date();
+        assert_eq!(dt, DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn asset_empty_record_name_still_exposes_empty_id() {
+        let asset = make_asset(json!({"recordName": ""}), json!({}));
+        assert_eq!(
+            asset.id(),
+            "",
+            "empty recordName must be reflected as empty id so upstream producers \
+             can detect and reject; no silent defaulting to a placeholder"
+        );
     }
 
     #[test]

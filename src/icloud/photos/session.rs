@@ -1133,6 +1133,34 @@ mod tests {
         );
     }
 
+    /// HTTP 200 with a truncated / malformed JSON body must surface as an
+    /// error, not a silently-empty parse. A silent parse would let a
+    /// pathological CloudKit page pretend to be a valid zero-record
+    /// response and halt enumeration prematurely.
+    #[tokio::test]
+    async fn wiremock_200_with_truncated_json_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("{\"records\": [{\"incomplete\""),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "200 with malformed JSON body must be reported as an error, not a silent empty parse"
+        );
+    }
+
     /// An oversized body is truncated with the `…` marker so a
     /// pathological CloudKit response (HTML error page, stack trace)
     /// can't blow up the error path.
