@@ -541,13 +541,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             // Write JSON report if configured
             if let Some(report_path) = &config.report_json {
-                let status = if cycle_result.session_expired {
-                    "session_expired"
-                } else if cycle_result.failed_count > 0 {
-                    "partial_failure"
-                } else {
-                    "success"
-                };
+                let status = crate::report::sync_status_str(
+                    cycle_result.session_expired,
+                    cycle_result.failed_count,
+                );
                 // Populate failed_assets from the state DB so the report
                 // reflects the final committed set, not mid-sync churn.
                 // get_failed_sample pushes the LIMIT into SQL so an account

@@ -125,6 +125,23 @@ impl RunOptions {
     }
 }
 
+/// Derive the `status` field for `sync_report.json` from the cycle outcome.
+///
+/// Zero-asset sync (nothing enumerated remotely, `failed_count == 0`) resolves
+/// to `"success"` so operator automation sees exit-0 / status-success when a
+/// library legitimately has no matching assets. `session_expired` dominates
+/// `failed_count` because session loss explains any per-asset failures and
+/// the correct caller action is re-authenticate, not retry.
+pub(crate) fn sync_status_str(session_expired: bool, failed_count: usize) -> &'static str {
+    if session_expired {
+        "session_expired"
+    } else if failed_count > 0 {
+        "partial_failure"
+    } else {
+        "success"
+    }
+}
+
 /// Write a JSON report to the given path atomically (temp file + rename).
 pub(crate) fn write_report(path: &Path, report: &SyncReport) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(report)?;
@@ -149,6 +166,31 @@ pub(crate) fn write_report(path: &Path, report: &SyncReport) -> anyhow::Result<(
 mod tests {
     use super::*;
     use crate::download::SkipBreakdown;
+
+    #[test]
+    fn sync_status_zero_assets_no_failures_is_success() {
+        assert_eq!(sync_status_str(false, 0), "success");
+    }
+
+    #[test]
+    fn sync_status_any_failure_is_partial_failure() {
+        assert_eq!(sync_status_str(false, 1), "partial_failure");
+        assert_eq!(sync_status_str(false, 999), "partial_failure");
+    }
+
+    #[test]
+    fn sync_status_session_expired_dominates_failure_count() {
+        assert_eq!(
+            sync_status_str(true, 0),
+            "session_expired",
+            "session expiration with no per-asset failures is still session_expired"
+        );
+        assert_eq!(
+            sync_status_str(true, 42),
+            "session_expired",
+            "session expiration dominates failed_count because the failures are attributable to session loss, not per-asset errors"
+        );
+    }
 
     #[test]
     fn report_serialization_roundtrip() {
