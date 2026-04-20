@@ -7,9 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.10.0] - 2026-04-20
 
 ### Added
+
+- **Provider-agnostic metadata capture.** Every asset now stores a full `AssetMetadata` record alongside the binary: favorite, rating, GPS (latitude/longitude/altitude), orientation, keywords, title, description, duration, dimensions, timezone offset, is_hidden, is_deleted, modified_at, plus a `provider_data` JSON column for fields without a neutral slot. iCloud fields decode through `src/icloud/photos/metadata.rs`, which handles Apple's plist-encoded location, keywords, and caption fields. Stored via a v5 schema migration with a `metadata_hash` column for drift detection. CloudKit `SoftDeleted` / `HardDeleted` events from `changes/zone` flip `is_deleted` and stamp `deleted_at`; local files are left alone. ([#239], [#19], [#83])
+
+- **EXIF and XMP write-through (opt-in, default false).** New flags embed captured metadata after the file lands on disk:
+  - `--set-exif-rating` maps iCloud's favorite flag to rating=5, otherwise writes the explicit rating.
+  - `--set-exif-gps` embeds latitude / longitude / altitude.
+  - `--set-exif-description` writes `dc:description`.
+  - `--embed-xmp` writes a full XMP packet. JPEG / PNG / TIFF / MP4 / MOV go through Adobe's XMP Toolkit (vendored C++). HEIC / HEIF / AVIF go through a pure-Rust `mp4-atom` writer that inserts the packet as a MIME item inside the `meta` box without touching the encoded image bytes.
+  - `--xmp-sidecar` writes a `.xmp` sidecar next to each media file. Existing sidecars from Darktable, digiKam, or Lightroom are parsed and kei's fields are layered on top rather than overwriting.
+
+  Metadata-only drift on the server (rating change, keyword edit) is detected via `metadata_hash` comparison and queues a rewrite pass that patches EXIF/XMP on the already-downloaded file without re-fetching bytes. ([#239], [#84], [#85])
+
+- **`kei reconcile` subcommand.** Scans the state DB for `downloaded` rows whose `local_path` no longer exists and marks them failed so the next sync re-downloads. `--dry-run` previews without writing. Never deletes files or DB rows. ([#239], [#230])
 
 - **`--bandwidth-limit` flag to cap total download throughput.** Accepts human-readable values (`10M`, `500K`, `2Mi`, bare integer = bytes/sec). The cap is global across all concurrent downloads, so total throughput stays within budget regardless of `--threads-num`. Also configurable via `[download] bandwidth_limit` in the TOML config and `KEI_BANDWIDTH_LIMIT` env var. When set without an explicit `--threads-num`, concurrency defaults to 1 so the capped budget isn't fragmented across many starved connections. ([#53])
 
@@ -19,12 +32,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`{album}` placement validation.** `{album}` must be the first path segment in `--folder-structure` and may only appear once. `{album}/%Y/%m` is fine; `Photos/{album}/%Y`, `%Y/{album}/%m`, and `{album}/%Y/{album}` are rejected at startup with a quoted error message. The restriction keeps unfiled-photo paths stable - without it, collapsing `{album}` shifts segments around and the unfiled tree no longer matches the album tree. ([#215])
 
+- **DB-backed asset gauges on `/metrics`.** Three new Prometheus gauges updated once per real sync cycle: `kei_db_assets_total{status="downloaded|pending|failed"}`, `kei_db_assets_size_bytes{status="downloaded"}`, and `kei_db_last_sync_assets_seen`. The gap between `last_sync_assets_seen` and the `downloaded` count is the most actionable derived metric for "how far behind is the local copy?". No-op when `--metrics-port` is not set. ([#234])
+
+### Changed
+
+- **CLI and TOML bounds validation.** `--threads-num` clamped to 1..=64, `--watch-with-interval` to 60..=86400, `--max-retries` to 0..=100, `--retry-delay` to 1..=3600. Validation runs on both CLI and TOML paths so hand-written configs can't bypass the bounds. ([#239])
+
+- **`/healthz` flips to 503 when sync is stale.** Returns 503 when `last_success_at` exceeds `watch-interval * 2`. Orchestrators and Docker healthchecks can now catch stuck syncs. ([#239])
+
+- **Structured `failed_assets[]` in `sync_report.json`.** Each entry has `id`, `version_size`, and `error_message`. Capped at 200 entries with `failed_assets_truncated` carrying the tail count. ([#239])
+
+### Fixed
+
+- **CloudKit pagination EOF now requires two consecutive empty pages.** A single empty `/records/query` page no longer cuts enumeration short. ([#239])
+
+- **`.part` resume window tightened to 1h with server-byte reconciliation on 206 responses.** Splicing bytes from pre- and post-rotation versions of the same asset is no longer possible. `.part` creation uses `OpenOptions::create_new` to reject concurrent writers. ([#239])
+
+- **CDN allowlist on download URLs.** CloudKit-returned URLs are validated against a narrow allowlist (`.icloud-content.com[.cn]`, `.cdn-apple.com`) before any byte hits disk. ([#239])
+
+- **JSON error envelopes no longer written as images.** Known CloudKit error envelope shapes are rejected during content validation, so an error page can't be saved out as `IMG_001.JPG`. ([#239])
+
+- **Disk-space forecast before enqueueing a batch.** Batch-size estimate against free disk space warns at 90% and bails at 100%. ([#239])
+
+- **State DB unwritable at startup bails the sync.** Previously accumulated progress that could not be saved. ([#239])
+
+- **PID file liveness check before overwrite.** A second kei no longer clobbers a live process's PID file. ([#239])
+
+- **Atomic EXIF/XMP/sidecar writes.** EXIF/XMP embeds write into a `.part` copy, patch in place, atomic rename. A RAII guard removes the `.meta-tmp` on any exit path including FFI panic from xmp_toolkit. Sidecar and sync-report writers share one `fs_util::atomic_install` helper that prefers rename and falls back to copy-to-sibling-then-rename under EXDEV. ([#239])
+
+### Dependencies
+
+- Added: `xmp_toolkit` (Adobe XMP Toolkit, vendored C++), `mp4-atom` (pure-Rust ISO-BMFF atom editing), `plist` (binary plist decoding for Apple's `Enc` fields), `async-speed-limit` (bandwidth throttle).
+- Removed: `kamadak-exif`, `little_exif`.
+- Bumped: `dialoguer` 0.11 -> 0.12.
+
 ### Known limitations
 
 - The state DB tracks a single download path per asset. A photo copied to multiple album folders under `{album}/...` has all copies on disk, but the DB records only the most recently written path. Re-running sync stays idempotent because kei's filesystem-exists check is path-aware - it won't re-download files it already put on disk, regardless of which path the DB currently holds.
 
+[#19]: https://github.com/rhoopr/kei/issues/19
 [#53]: https://github.com/rhoopr/kei/issues/53
+[#83]: https://github.com/rhoopr/kei/issues/83
+[#84]: https://github.com/rhoopr/kei/issues/84
+[#85]: https://github.com/rhoopr/kei/issues/85
 [#215]: https://github.com/rhoopr/kei/issues/215
+[#230]: https://github.com/rhoopr/kei/issues/230
+[#234]: https://github.com/rhoopr/kei/pull/234
+[#239]: https://github.com/rhoopr/kei/pull/239
 
 ---
 
