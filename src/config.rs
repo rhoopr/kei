@@ -677,12 +677,19 @@ impl Config {
             toml_dl.and_then(|d| d.no_progress_bar),
         );
 
-        // Retry
+        // Retry — clamps must apply on both the CLI and TOML paths. clap
+        // enforces the ranges on CLI; Config::build re-validates after
+        // merging TOML so a hand-written config.toml can't bypass them.
         let max_retries = resolve(sync.max_retries, toml_retry.and_then(|r| r.max_retries), 3);
+        anyhow::ensure!(
+            max_retries <= 100,
+            "retry max_retries must be <= 100, got {max_retries}"
+        );
         let retry_delay_secs = resolve(sync.retry_delay, toml_retry.and_then(|r| r.delay), 5);
-        if retry_delay_secs == 0 {
-            anyhow::bail!("retry delay must be >= 1, got 0");
-        }
+        anyhow::ensure!(
+            (1..=3600).contains(&retry_delay_secs),
+            "retry delay must be in 1..=3600 seconds, got {retry_delay_secs}"
+        );
 
         // Filters
         let library = resolve_library_selection(sync.library, toml_filters);
@@ -1936,6 +1943,76 @@ mod tests {
             result.unwrap_err().to_string().contains("retry delay"),
             "Error should mention retry delay"
         );
+    }
+
+    /// Regression: the CLI clamps `--retry-delay` to 1..=3600, but that
+    /// validation is enforced by clap and does not run on the TOML path.
+    /// Config::build must re-validate after resolving so a hand-written
+    /// config.toml can't request a day-long backoff between retries.
+    #[test]
+    fn test_build_retry_delay_above_upper_bound_from_toml_rejected() {
+        let toml_str = r#"
+            [download.retry]
+            delay = 86400
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        assert!(result.is_err(), "TOML delay > 3600 must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("retry delay") && msg.contains("3600"),
+            "Error should mention retry delay and the bound: {msg}"
+        );
+    }
+
+    /// Regression: CLI clamps `--max-retries` to 0..=100. TOML `max_retries`
+    /// must be subjected to the same upper bound so a config.toml value of
+    /// `max_retries = 10_000_000` can't multiply outbound requests to Apple
+    /// before giving up.
+    #[test]
+    fn test_build_max_retries_above_upper_bound_from_toml_rejected() {
+        let toml_str = r#"
+            [download.retry]
+            max_retries = 9999
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        assert!(result.is_err(), "TOML max_retries > 100 must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("max_retries") && msg.contains("100"),
+            "Error should mention max_retries and the bound: {msg}"
+        );
+    }
+
+    /// At the upper bound, both fields remain valid.
+    #[test]
+    fn test_build_retry_clamp_accepts_upper_bound_from_toml() {
+        let toml_str = r#"
+            [download.retry]
+            max_retries = 100
+            delay = 3600
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .expect("max_retries=100, delay=3600 must be accepted");
+        assert_eq!(cfg.max_retries, 100);
+        assert_eq!(cfg.retry_delay_secs, 3600);
     }
 
     #[test]
