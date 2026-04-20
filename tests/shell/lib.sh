@@ -80,15 +80,13 @@ kei_scratch_dir() {
     printf '%s' "$dir"
 }
 
-# Path to the built release binary. Shell suites invoke this directly so
-# sync latency reflects prod.
 kei_release_bin() {
     printf '%s/target/release/kei' "$PROJECT_DIR"
 }
 
-# Ensure $PROJECT_DIR/target/release/kei exists, building it if missing
-# or older than Cargo.toml/Cargo.lock. A version bump or dependency change
-# therefore can't leave shell suites running a stale binary.
+# Build if missing or older than Cargo.toml/Cargo.lock. The stat short-
+# circuit skips cargo's own freshness check (a warm but noop cargo call
+# is ~300-500ms) on the common up-to-date path.
 kei_require_release_binary() {
     local bin
     bin="$(kei_release_bin)"
@@ -107,9 +105,9 @@ kei_require_release_binary() {
     fi
 }
 
-# Confirm the pre-authenticated session still works. Emits a PASS line
-# and returns 0 on success; aborts the script on a bad session so we
-# don't cascade failures through a dozen subsequent sync invocations.
+# Validate the pre-authenticated session. Increments the PASS counter on
+# success so callers don't reach into `_KEI_PASS`; exits the script on a
+# bad session so we don't cascade 12 subsequent sync failures.
 kei_preflight_session() {
     local bin cookies out
     bin="$(kei_release_bin)"
@@ -119,7 +117,7 @@ kei_preflight_session() {
         --password "$ICLOUD_PASSWORD" \
         --data-dir "$cookies" 2>&1)
     if echo "$out" | grep -q "Authentication completed\|Session OK\|already authenticated"; then
-        echo "  OK: session valid"
+        kei_check "session valid" 0
         return 0
     fi
     echo "  ABORT: session invalid or rate-limited"
@@ -128,8 +126,18 @@ kei_preflight_session() {
     exit 1
 }
 
-# PASS/FAIL/SKIP counters. Callers init once, emit per check, summarize
-# at the end.
+# sqlite3 against the state DB. `kei_db_query` returns the first column
+# of each row on stdout; `kei_db_exec` runs a mutating statement and
+# discards output. Both suppress the "unable to open" error that fires
+# before the first sync has created the DB.
+kei_db_query() {
+    sqlite3 "$(kei_db_path)" "$1" 2>/dev/null
+}
+
+kei_db_exec() {
+    sqlite3 "$(kei_db_path)" "$1" 2>/dev/null
+}
+
 kei_check_init() {
     _KEI_PASS=0
     _KEI_FAIL=0
@@ -178,9 +186,8 @@ kei_elapsed() {
     printf '%dm %02ds' $((delta / 60)) $((delta % 60))
 }
 
-# Remove only the lock file scoped to the current test's username. The
-# older `rm -f "$COOKIES"/*.lock` pattern would stomp on any other
-# running kei process sharing the cookie dir.
+# Remove the current user's lock only, not every lock in the cookie
+# dir - other kei processes may share the dir.
 kei_clear_stale_lock() {
     local cookies slug
     cookies="$(kei_cookie_dir)"
@@ -188,8 +195,16 @@ kei_clear_stale_lock() {
     rm -f "$cookies/$slug.lock"
 }
 
-# Print a banner with the suite name and timestamp. Used at the top of
-# each shell suite so output is self-describing when piped to a log.
+# Install an EXIT trap that removes this PID's scratch dirs. Crashed
+# runs would otherwise accumulate `<base>/<suite>-<pid>` directories
+# under /tmp across a day of development.
+kei_install_scratch_cleanup() {
+    local base
+    base="$(kei_scratch_base)"
+    # shellcheck disable=SC2064
+    trap "rm -rf \"$base\"/*-$$" EXIT
+}
+
 kei_suite_banner() {
     local title="${1:?kei_suite_banner: title required}"
     echo "=================================================="

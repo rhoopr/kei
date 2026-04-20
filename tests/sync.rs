@@ -982,10 +982,8 @@ fn sync_threads_num_reflected_in_log() {
     });
 }
 
-/// --only-print-filenames emits at least one filename to stdout and writes
-/// nothing to disk. Moved from the former run-gap-tests.sh suite: the
-/// scenario needs a live sync to exercise the real producer output, so it
-/// doesn't fit the wiremock-less behavioral suite.
+/// --only-print-filenames emits at least one filename to stdout and
+/// writes nothing to disk.
 #[test]
 #[ignore]
 fn sync_only_print_filenames_emits_names_without_downloading() {

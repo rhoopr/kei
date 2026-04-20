@@ -68,10 +68,10 @@ done
 echo ""
 echo "--- 3. All files non-empty ---"
 EMPTY=0
-for f in $(find "$DOCKER_PHOTOS" -type f 2>/dev/null); do
+while IFS= read -r -d '' f; do
     size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)
     [ "$size" -eq 0 ] && EMPTY=$((EMPTY + 1))
-done
+done < <(find "$DOCKER_PHOTOS" -type f -print0 2>/dev/null)
 [ "$EMPTY" -eq 0 ]; kei_check "no empty files (found $EMPTY empty)"
 
 echo ""

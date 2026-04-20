@@ -1,9 +1,6 @@
-# kei — local dev recipes.
-#
-# Bare `just` lists every recipe. Each recipe either composes multiple
-# steps, sets up env/prereqs, or takes a mode argument. One-shot aliases
-# for single cargo commands are deliberately absent - raw `cargo fmt` is
-# shorter to remember and keeps autocomplete uncluttered.
+# Local dev recipes. Bare `just` lists them. No one-shot aliases over
+# raw cargo commands - recipes only exist when they compose, set up
+# env, or dispatch on a mode.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -24,6 +21,17 @@ gate:
 test MODE="":
     #!/usr/bin/env bash
     set -euo pipefail
+    # Shared live-auth setup: sources .env if needed, applies the
+    # maintainer's cookie-dir / album defaults so the Rust-live and
+    # shell-live paths don't diverge. Overridable via the environment.
+    _live_env() {
+        if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
+            set -a; source .env; set +a
+        fi
+        : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
+        export ICLOUD_TEST_COOKIE_DIR="${ICLOUD_TEST_COOKIE_DIR:-$HOME/.config/kei}"
+        export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
+    }
     case "{{MODE}}" in
         "")
             cargo test --all-features
@@ -32,22 +40,20 @@ test MODE="":
             cargo test --bin kei --test cli --test behavioral
             ;;
         live)
-            if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
-                set -a; source .env; set +a
-            fi
-            : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
-            export ICLOUD_TEST_COOKIE_DIR="${ICLOUD_TEST_COOKIE_DIR:-$HOME/.config/kei}"
-            export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
+            _live_env
             cargo test --test sync -- --ignored --test-threads=1
             cargo test --test state_auth -- --ignored --test-threads=1
             ;;
         concurrency)
+            _live_env
             ./tests/shell/concurrency.sh
             ;;
         state)
+            _live_env
             ./tests/shell/state-machine.sh
             ;;
         docker)
+            _live_env
             ./tests/shell/docker.sh
             ;;
         *)
