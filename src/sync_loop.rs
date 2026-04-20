@@ -429,9 +429,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Spawn the Prometheus metrics + /healthz server if --metrics-port is set.
     // Binds synchronously so a bad port fails at startup rather than silently.
+    // Watch mode: a cycle completes at most once per interval. Flag /healthz
+    // as stale after two missed intervals (interval * 2) so a single slow
+    // cycle doesn't flip to 503 but a stuck main loop does.
+    let staleness_threshold = config
+        .watch_with_interval
+        .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
     let (metrics_handle, metrics_task) = config
         .metrics_port
-        .map(|port| crate::metrics::spawn_server(port, shutdown_token.clone()))
+        .map(|port| crate::metrics::spawn_server(port, shutdown_token.clone(), staleness_threshold))
         .transpose()?
         .map_or((None, None), |(h, t)| (Some(h), Some(t)));
 
