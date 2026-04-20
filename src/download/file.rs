@@ -2242,6 +2242,105 @@ mod tests {
         );
     }
 
+    // ── Gap: two concurrent writers cannot both succeed ──────────────
+
+    /// Stub that blocks inside `fetch()` on a barrier so two concurrent
+    /// `attempt_download` calls reach the create_new section close enough
+    /// in time for the race to manifest if exclusivity is broken.
+    struct GatedStubDownloadClient {
+        body: Vec<u8>,
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl DownloadClient for GatedStubDownloadClient {
+        async fn fetch(
+            &self,
+            _url: &str,
+            _resume_from: Option<u64>,
+        ) -> Result<DownloadResponse, BoxError> {
+            self.barrier.wait().await;
+            let chunks: Vec<Result<Bytes, BoxError>> = vec![Ok(Bytes::from(self.body.clone()))];
+            Ok(DownloadResponse {
+                status: 200,
+                content_length: Some(self.body.len() as u64),
+                content_type: None,
+                stream: Box::pin(futures_util::stream::iter(chunks)),
+            })
+        }
+    }
+
+    /// Two concurrent `attempt_download` calls targeting the same .part
+    /// path must not both succeed. The create_new(true) guard on the
+    /// exclusive open is the safety net: if it regresses to a plain
+    /// create+truncate, two writers could interleave bytes and the final
+    /// renamed file would be garbage. Loop iterations widen the race
+    /// window so any interleaving that breaks exclusivity is caught.
+    #[tokio::test]
+    async fn attempt_download_two_concurrent_writers_only_one_succeeds() {
+        use std::sync::Arc;
+
+        for iteration in 0..20 {
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("photo.jpg");
+            let part_path = dir.path().join("photo.part");
+
+            let body_a = vec![0xAAu8; 256];
+            let body_b = vec![0xBBu8; 256];
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let client_a = GatedStubDownloadClient {
+                body: body_a.clone(),
+                barrier: barrier.clone(),
+            };
+            let client_b = GatedStubDownloadClient {
+                body: body_b.clone(),
+                barrier: barrier.clone(),
+            };
+
+            let dp_a = download_path.clone();
+            let pp_a = part_path.clone();
+            let task_a = tokio::spawn(async move {
+                attempt_download(&client_a, "http://stub", &dp_a, &pp_a, false, None).await
+            });
+            let dp_b = download_path.clone();
+            let pp_b = part_path.clone();
+            let task_b = tokio::spawn(async move {
+                attempt_download(&client_b, "http://stub", &dp_b, &pp_b, false, None).await
+            });
+
+            let a = task_a.await.unwrap();
+            let b = task_b.await.unwrap();
+
+            let ok_count = [&a, &b].iter().filter(|r| r.is_ok()).count();
+            assert!(
+                ok_count <= 1,
+                "iteration {iteration}: two writers cannot both succeed. a={a:?} b={b:?}"
+            );
+
+            // At least one must have made it: either one succeeded cleanly, or
+            // one succeeded and the other reported the concurrent-writer error.
+            // (Both failing would indicate a deadlock or a new error category
+            //  worth investigating.)
+            assert!(
+                ok_count >= 1,
+                "iteration {iteration}: at least one writer must succeed. a={a:?} b={b:?}"
+            );
+
+            // The final file, when one writer won, must be exactly one body —
+            // no interleaving of bytes from both writers.
+            let final_bytes = std::fs::read(&download_path)
+                .unwrap_or_else(|e| panic!("iteration {iteration}: final file missing: {e}"));
+            assert!(
+                final_bytes == body_a || final_bytes == body_b,
+                "iteration {iteration}: final file must match exactly one writer's body \
+                 (no interleaving); got {} bytes, first bytes: {:?}",
+                final_bytes.len(),
+                &final_bytes[..final_bytes.len().min(8)]
+            );
+        }
+    }
+
     // ── Gap: HTTP 4xx error (not 401/403) is not retryable ──────────
 
     #[tokio::test]
