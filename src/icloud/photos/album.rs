@@ -111,6 +111,17 @@ impl PhotoAlbum {
         }
     }
 
+    /// Return the CloudKit zone name this album belongs to
+    /// (e.g. "PrimarySync", "SharedSync-<uuid>"). Falls back to an empty
+    /// string if the zone_id JSON lacks a `zoneName` field, which should
+    /// only happen in hand-constructed test fixtures.
+    pub fn zone_name(&self) -> &str {
+        self.zone_id
+            .get("zoneName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    }
+
     /// Return total item count for this album via `HyperionIndexCountLookup`.
     pub async fn len(&self) -> anyhow::Result<u64> {
         let url = format!(

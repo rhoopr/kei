@@ -1021,6 +1021,20 @@ async fn download_photos_full_with_token(
     let started = Instant::now();
     let uses_album_token = config.folder_structure.contains("{album}");
 
+    // Mark every unique zone as in-progress so an interrupted full
+    // enumeration leaves a trail the next startup can surface to the
+    // operator. Clears once the enumeration returns normally.
+    let mut enum_zones: Vec<String> = albums.iter().map(|a| a.zone_name().to_string()).collect();
+    enum_zones.sort();
+    enum_zones.dedup();
+    if let Some(db) = &config.state_db {
+        for zone in &enum_zones {
+            if let Err(e) = db.begin_enum_progress(zone).await {
+                tracing::debug!(error = %e, zone, "Failed to mark enumeration start");
+            }
+        }
+    }
+
     // Build token-aware streams for each album
     let mut album_counts: Vec<u64> = Vec::with_capacity(albums.len());
     for album in albums {
@@ -1150,6 +1164,19 @@ async fn download_photos_full_with_token(
         shutdown_token,
     )
     .await?;
+
+    // Clear enumeration-in-progress markers only on non-interrupted
+    // completion. Interrupted / errored runs keep their markers so the
+    // next startup can surface the interruption to the operator.
+    if !stats.interrupted {
+        if let Some(db) = &config.state_db {
+            for zone in &enum_zones {
+                if let Err(e) = db.end_enum_progress(zone).await {
+                    tracing::debug!(error = %e, zone, "Failed to clear enumeration marker");
+                }
+            }
+        }
+    }
 
     Ok(SyncResult {
         outcome,

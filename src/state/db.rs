@@ -116,6 +116,21 @@ pub trait StateDb: Send + Sync {
     /// after migrations. Returns the number of rows promoted.
     async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError>;
 
+    /// Mark the start of a full enumeration for `zone`. Pairs with
+    /// `end_enum_progress` on successful completion; a remaining marker at
+    /// next startup means the enumeration was interrupted. Stores the start
+    /// timestamp so the operator can age the marker.
+    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError>;
+
+    /// Clear the in-progress enumeration marker for `zone`. Idempotent.
+    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError>;
+
+    /// Return the zone names of any enumerations that started but never
+    /// ended. Read once at process startup so the operator is warned that
+    /// the next full sync will re-enumerate from scratch until MS-4 resume
+    /// support lands.
+    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError>;
+
     /// Reset all failed assets to pending status.
     ///
     /// Returns the number of assets reset.
@@ -823,6 +838,44 @@ impl StateDb for SqliteStateDb {
             )
             .map_err(|e| StateError::query("promote_orphaned_sync_runs", e))?;
         Ok(rows as u64)
+    }
+
+    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        let key = format!("enum_in_progress:{zone}");
+        let now = Utc::now().timestamp().to_string();
+        let conn = self.acquire_lock("begin_enum_progress")?;
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, now],
+        )
+        .map_err(|e| StateError::query("begin_enum_progress", e))?;
+        Ok(())
+    }
+
+    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        let key = format!("enum_in_progress:{zone}");
+        let conn = self.acquire_lock("end_enum_progress")?;
+        conn.execute("DELETE FROM metadata WHERE key = ?1", [key])
+            .map_err(|e| StateError::query("end_enum_progress", e))?;
+        Ok(())
+    }
+
+    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+        let conn = self.acquire_lock("list_interrupted_enumerations")?;
+        let mut stmt = conn
+            .prepare("SELECT key FROM metadata WHERE key LIKE 'enum_in_progress:%'")
+            .map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
+        let mut zones = Vec::new();
+        for row in rows {
+            let key = row.map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
+            if let Some(zone) = key.strip_prefix("enum_in_progress:") {
+                zones.push(zone.to_string());
+            }
+        }
+        Ok(zones)
     }
 
     async fn reset_failed(&self) -> Result<u64, StateError> {
@@ -1760,6 +1813,52 @@ mod tests {
 
         let promoted = db.promote_orphaned_sync_runs().await.unwrap();
         assert_eq!(promoted, 0);
+    }
+
+    // ── enum_in_progress markers (MS-4) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn begin_enum_progress_inserts_marker() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        let zones = db.list_interrupted_enumerations().await.unwrap();
+        assert_eq!(zones, vec!["PrimarySync".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn end_enum_progress_clears_marker() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        db.end_enum_progress("PrimarySync").await.unwrap();
+        let zones = db.list_interrupted_enumerations().await.unwrap();
+        assert!(zones.is_empty());
+    }
+
+    #[tokio::test]
+    async fn end_enum_progress_is_idempotent() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        // No marker set — end should be a no-op without error
+        db.end_enum_progress("NotThere").await.unwrap();
+        assert!(db.list_interrupted_enumerations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_interrupted_enumerations_tracks_multiple_zones() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        db.begin_enum_progress("SharedSync-ABC123").await.unwrap();
+        let mut zones = db.list_interrupted_enumerations().await.unwrap();
+        zones.sort();
+        assert_eq!(zones, vec!["PrimarySync", "SharedSync-ABC123"]);
+    }
+
+    #[tokio::test]
+    async fn begin_enum_progress_is_idempotent_for_same_zone() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap(); // overwrite timestamp
+        let zones = db.list_interrupted_enumerations().await.unwrap();
+        assert_eq!(zones, vec!["PrimarySync".to_string()]);
     }
 
     #[tokio::test]

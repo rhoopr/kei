@@ -321,6 +321,26 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     }
                 }
 
+                // Surface enum_in_progress:<zone> markers left by a prior
+                // interrupted full enumeration so the operator understands
+                // why the next full sync will re-enumerate from scratch.
+                match db.list_interrupted_enumerations().await {
+                    Ok(zones) if !zones.is_empty() => {
+                        tracing::warn!(
+                            zones = zones.join(","),
+                            "Prior full enumeration was interrupted; next sync will re-enumerate \
+                             the affected zones from offset 0"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "Failed to list interrupted enumerations"
+                        );
+                    }
+                }
+
                 // For retry-failed, reset failed assets to pending
                 if is_retry_failed {
                     match db.reset_failed().await {

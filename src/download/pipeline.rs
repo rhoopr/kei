@@ -2933,6 +2933,15 @@ mod tests {
         async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
             Ok(0)
         }
+        async fn begin_enum_progress(&self, _zone: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn end_enum_progress(&self, _zone: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+            Ok(Vec::new())
+        }
         async fn reset_failed(&self) -> Result<u64, StateError> {
             unimplemented!()
         }
