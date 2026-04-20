@@ -677,9 +677,7 @@ impl Config {
             toml_dl.and_then(|d| d.no_progress_bar),
         );
 
-        // Retry — clamps must apply on both the CLI and TOML paths. clap
-        // enforces the ranges on CLI; Config::build re-validates after
-        // merging TOML so a hand-written config.toml can't bypass them.
+        // Retry upper bounds are re-validated here so TOML can't bypass clap's clamps.
         let max_retries = resolve(sync.max_retries, toml_retry.and_then(|r| r.max_retries), 3);
         anyhow::ensure!(
             max_retries <= 100,
@@ -1945,10 +1943,6 @@ mod tests {
         );
     }
 
-    /// Regression: the CLI clamps `--retry-delay` to 1..=3600, but that
-    /// validation is enforced by clap and does not run on the TOML path.
-    /// Config::build must re-validate after resolving so a hand-written
-    /// config.toml can't request a day-long backoff between retries.
     #[test]
     fn test_build_retry_delay_above_upper_bound_from_toml_rejected() {
         let toml_str = r#"
@@ -1970,10 +1964,6 @@ mod tests {
         );
     }
 
-    /// Regression: CLI clamps `--max-retries` to 0..=100. TOML `max_retries`
-    /// must be subjected to the same upper bound so a config.toml value of
-    /// `max_retries = 10_000_000` can't multiply outbound requests to Apple
-    /// before giving up.
     #[test]
     fn test_build_max_retries_above_upper_bound_from_toml_rejected() {
         let toml_str = r#"
@@ -1995,7 +1985,6 @@ mod tests {
         );
     }
 
-    /// At the upper bound, both fields remain valid.
     #[test]
     fn test_build_retry_clamp_accepts_upper_bound_from_toml() {
         let toml_str = r#"

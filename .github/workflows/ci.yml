@@ -445,11 +445,8 @@ jobs:
       #                    reqwest -> quinn -> quinn-proto, where we can't upgrade it.
       - run: cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2026-0097
 
-  # Verifies the Dockerfile builds successfully for both release targets.
-  # Catches build breakage before it hits the publish workflow on main.
-  # Building linux/arm64 on PRs gates arm64-specific regressions (e.g. a
-  # new dep that vendors C++ but lacks an aarch64 cross-compile toolchain)
-  # that the main-only docker.yml would otherwise surface after merge.
+  # Verifies the Dockerfile builds successfully for both release targets,
+  # gating arm64-specific regressions on PRs rather than at the release tag.
   docker:
     name: Docker Build
     needs: detect

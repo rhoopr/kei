@@ -214,14 +214,11 @@ fn extract_versions(
     versions
 }
 
-/// Host suffixes kei will download from. Apple CloudKit returns photo/video
-/// bytes on `*.icloud-content.com` (and `*.icloud-content.com.cn` in the
-/// china region); other static assets occasionally come from `*.cdn-apple.com`.
-/// The allowlist is deliberately narrow to content-delivery hosts so a
-/// compromised or malformed CloudKit response can't point kei at an
-/// auth/gateway/marketing subdomain of `icloud.com` / `apple.com`. Add
-/// new suffixes explicitly when Apple introduces one; a loud skip is
-/// preferable to a silent cross-origin fetch.
+/// Host suffixes kei will download from. Narrow to content-delivery hosts
+/// so a compromised or malformed CloudKit response can't point kei at an
+/// auth/gateway/marketing subdomain. Add new suffixes explicitly when
+/// Apple introduces one; a loud skip is preferable to a silent
+/// cross-origin fetch.
 const ALLOWED_DOWNLOAD_HOST_SUFFIXES: &[&str] = &[
     ".icloud-content.com",
     ".icloud-content.com.cn",
@@ -2007,11 +2004,8 @@ mod tests {
         }
     }
 
-    /// Regression: the URL allowlist is narrow to content-delivery hosts.
-    /// Auth, gateway, and marketing subdomains of `icloud.com` / `apple.com`
-    /// must not be accepted as download origins even over HTTPS — a
-    /// compromised CloudKit response pointing at one is a silent-redirect
-    /// risk that the narrowed allowlist now rejects at the validation step.
+    /// Auth, gateway, and marketing subdomains of icloud.com / apple.com must
+    /// not be reachable as download origins even over HTTPS.
     #[test]
     fn validate_download_url_rejects_icloud_and_apple_subdomains() {
         for u in [

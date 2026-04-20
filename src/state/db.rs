@@ -881,12 +881,8 @@ impl StateDb for SqliteStateDb {
         let key = format!("enum_in_progress:{zone}");
         let now = Utc::now().timestamp().to_string();
         let conn = self.acquire_lock("begin_enum_progress")?;
-        // INSERT OR IGNORE preserves the original start timestamp across
-        // re-entry. If a prior enumeration was interrupted and never cleared
-        // the marker, a new call on the same zone must not erase the age of
-        // the original interruption — operators rely on that age to decide
-        // whether to intervene. `end_enum_progress` is the only path that
-        // clears the marker.
+        // INSERT OR IGNORE so re-entry doesn't reset the age operators use to
+        // judge stuck zones; `end_enum_progress` is the only path that clears.
         conn.execute(
             "INSERT OR IGNORE INTO metadata (key, value) VALUES (?1, ?2)",
             rusqlite::params![key, now],
@@ -1943,15 +1939,6 @@ mod tests {
         assert_eq!(zones, vec!["PrimarySync".to_string()]);
     }
 
-    /// Regression: if a prior enumeration was interrupted and the marker
-    /// survives, a later `begin_enum_progress` on the same zone must not
-    /// reset the stored timestamp — operators rely on the marker age to
-    /// judge whether to intervene on a long-stuck enumeration.
-    ///
-    /// Each read of the marker runs inside its own lock scope: the DB uses a
-    /// plain std::sync::Mutex guarding the Connection, so holding a guard
-    /// across a later async `db.*_enum_progress` call would deadlock on
-    /// re-acquisition.
     #[tokio::test]
     async fn begin_enum_progress_preserves_original_timestamp_on_reentry() {
         let db = SqliteStateDb::open_in_memory().unwrap();
