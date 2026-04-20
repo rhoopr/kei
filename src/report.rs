@@ -151,14 +151,41 @@ pub(crate) fn write_report(path: &Path, report: &SyncReport) -> anyhow::Result<(
     let temp_path = parent.join(format!(".kei-report-{}.tmp", std::process::id()));
 
     std::fs::write(&temp_path, json.as_bytes())?;
-    std::fs::rename(&temp_path, path).or_else(|_| {
-        // Cross-device rename fallback: copy + remove
-        std::fs::copy(&temp_path, path)?;
-        std::fs::remove_file(&temp_path).ok();
-        Ok::<(), std::io::Error>(())
-    })?;
+    atomic_install(&temp_path, path)?;
 
     tracing::debug!(path = %path.display(), "Wrote JSON report");
+    Ok(())
+}
+
+/// Install `src` at `dst` atomically. Prefers `rename` (truly atomic on the
+/// same device). On `EXDEV` (tmp and dst on different devices — rare but
+/// possible when `path`'s parent is a bind mount / symlink to another fs),
+/// copies `src` to a sibling of `dst` on the destination device, then
+/// renames the sibling into place. A crash during the cross-device copy
+/// leaves the sidecar tmp but never exposes a half-written `dst` to
+/// consumers — which is the entire point of the atomic-write invariant.
+fn atomic_install(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Err(rename_err) = std::fs::rename(src, dst) {
+        let ext = dst.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
+        let dst_sibling = dst.with_extension(format!("{ext}.kei-xdev-tmp-{}", std::process::id()));
+        if let Err(copy_err) = std::fs::copy(src, &dst_sibling) {
+            let _ = std::fs::remove_file(src);
+            tracing::warn!(
+                src = %src.display(),
+                dst = %dst.display(),
+                rename_err = %rename_err,
+                copy_err = %copy_err,
+                "rename failed and cross-device copy also failed"
+            );
+            return Err(rename_err);
+        }
+        if let Err(final_err) = std::fs::rename(&dst_sibling, dst) {
+            let _ = std::fs::remove_file(&dst_sibling);
+            let _ = std::fs::remove_file(src);
+            return Err(final_err);
+        }
+        let _ = std::fs::remove_file(src);
+    }
     Ok(())
 }
 
@@ -435,5 +462,42 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
         assert_eq!(parsed["version"], "1");
         assert_eq!(parsed["options"]["username"], "test@example.com");
+    }
+
+    /// Happy-path test of the atomic_install helper. Same-device rename
+    /// succeeds on the first attempt; the sidecar tmp is never created.
+    #[test]
+    fn atomic_install_same_device_rename_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.tmp");
+        let dst = dir.path().join("dst.json");
+        std::fs::write(&src, b"hello").unwrap();
+
+        atomic_install(&src, &dst).expect("atomic_install");
+
+        assert!(!src.exists(), "src must be consumed by the rename");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
+
+        // No cross-device sidecar left behind.
+        for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.contains("kei-xdev-tmp"),
+                "unexpected sidecar tmp {name}",
+            );
+        }
+    }
+
+    /// If the source does not exist, atomic_install returns the rename error
+    /// and does not poison `dst` with a partially-written file.
+    #[test]
+    fn atomic_install_missing_src_returns_err_without_touching_dst() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("nope.tmp");
+        let dst = dir.path().join("dst.json");
+
+        assert!(atomic_install(&src, &dst).is_err());
+        assert!(!dst.exists(), "dst must not be created on failure");
     }
 }
