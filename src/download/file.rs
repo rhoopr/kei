@@ -207,7 +207,7 @@ async fn attempt_download<C: DownloadClient>(
                 tracing::warn!(
                     path = %part_path.display(),
                     size = meta.len(),
-                    "Stale .part file (>24h old), restarting download"
+                    "Stale .part file (>1h old), restarting download"
                 );
                 0
             } else {
@@ -2255,7 +2255,7 @@ mod tests {
         assert!(!download_path.exists(), "final file should not exist");
     }
 
-    // ── Gap: stale .part file (>24h) triggers restart from zero ──────
+    // ── Gap: stale .part file (>1h) triggers restart from zero ──────
 
     #[tokio::test]
     async fn attempt_download_stale_part_file_restarted() {
