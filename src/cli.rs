@@ -314,6 +314,14 @@ pub struct VerifyArgs {
     pub checksums: bool,
 }
 
+/// Arguments for the reconcile command.
+#[derive(Parser, Debug, Clone)]
+pub struct ReconcileArgs {
+    /// Show what would change without updating the state database.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 // ── New subcommand types ─────────────────────────────────────────────
 
 /// Login subcommands.
@@ -449,6 +457,11 @@ pub enum Command {
 
     /// Verify downloaded files exist and optionally check checksums
     Verify(VerifyArgs),
+
+    /// Reconcile state database with files on disk: mark assets as
+    /// failed when their local file is missing, so the next sync
+    /// re-downloads them.
+    Reconcile(ReconcileArgs),
 
     // ── Hidden legacy aliases (deprecated, still parse) ──────────
     /// Deprecated: use `kei login get-code`
@@ -869,6 +882,7 @@ impl Command {
             | Self::Config { .. }
             | Self::Status(_)
             | Self::Verify(_)
+            | Self::Reconcile(_)
             | Self::ResetState { .. }
             | Self::ResetSyncToken
             | Self::Setup { .. } => None,
@@ -2103,6 +2117,26 @@ mod tests {
             assert!(args.checksums);
         } else {
             panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_reconcile_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "reconcile"]).unwrap();
+        if let Some(Command::Reconcile(args)) = cli.command {
+            assert!(!args.dry_run);
+        } else {
+            panic!("Expected Reconcile command");
+        }
+    }
+
+    #[test]
+    fn test_reconcile_dry_run_flag() {
+        let cli = Cli::try_parse_from(["kei", "reconcile", "--dry-run"]).unwrap();
+        if let Some(Command::Reconcile(args)) = cli.command {
+            assert!(args.dry_run);
+        } else {
+            panic!("Expected Reconcile command");
         }
     }
 
