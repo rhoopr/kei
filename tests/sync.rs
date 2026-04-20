@@ -992,8 +992,11 @@ fn sync_only_print_filenames_emits_names_without_downloading() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
+        // --dry-run makes the test state-independent: kei emits a
+        // filename for every album member regardless of what the state
+        // DB already considers downloaded.
         let out = album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--only-print-filenames", "--no-incremental"])
+            .args(["--only-print-filenames", "--dry-run"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success()

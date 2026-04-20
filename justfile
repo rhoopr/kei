@@ -61,9 +61,7 @@ test MODE="":
             ;;
     esac
 
-# Coverage: (none) | html | live | patch [BASE]. `live` merges the live
-# sync + state_auth runs into the offline baseline - the only way to see
-# the real coverage of orchestration code that offline tests can't reach.
+# Coverage: (none) | html | live | patch [BASE]. `live` merges sync + state_auth into the offline baseline.
 cov MODE="" BASE="main":
     #!/usr/bin/env bash
     set -euo pipefail
