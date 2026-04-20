@@ -3667,4 +3667,81 @@ mod tests {
         assert_eq!(provider["recordChangeTag"], json!("tag42"));
         assert_eq!(provider["assetSubtypeV2"], json!(16));
     }
+
+    // Full-sync conservatism invariant: an asset downloaded in a prior sync
+    // that is absent from every page of the current full enumeration must
+    // remain in the state DB as status='downloaded', untouched. Full sync
+    // does NOT infer "remotely deleted" from "not seen on any page" — that
+    // inference is reserved for incremental sync's explicit delete events.
+    //
+    // If a regression ever added a "sweep assets not seen this sync" pass
+    // to the full-sync path, users would silently lose local copies of
+    // assets that briefly dropped out of view (album scope change, filter
+    // tweak, pagination hiccup).
+    #[tokio::test]
+    async fn full_sync_absent_downloaded_asset_stays_downloaded() {
+        let dir = test_dir();
+        let file_path = dir.path().join("keeper.heic");
+        fs::write(&file_path, b"image-bytes").unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Sync N (prior run): asset KEEPER_1 enumerated + downloaded. Then
+        // we backdate last_seen_at so it looks like the upsert happened
+        // well before the current sync's start boundary.
+        let record = TestAssetRecord::new("KEEPER_1")
+            .checksum("ck_keeper")
+            .filename("keeper.heic")
+            .size(11)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("KEEPER_1", "original", &file_path, "localhash", None)
+            .await
+            .unwrap();
+        let prior_sync_ts = chrono::Utc::now().timestamp() - 86_400;
+        db.backdate_last_seen("KEEPER_1", prior_sync_ts);
+
+        let summary_before = db.get_summary().await.unwrap();
+        assert_eq!(summary_before.downloaded, 1);
+        let ids_before = db.get_downloaded_ids().await.unwrap();
+        assert!(ids_before.contains(&("KEEPER_1".into(), "original".into())));
+
+        // Sync N+1 begins now. Producer enumerates zero assets (absent from
+        // every page). Nothing calls upsert_seen for KEEPER_1. At sync end,
+        // promote_pending_to_failed runs with the new sync_started_at.
+        let sync_started_at = chrono::Utc::now().timestamp();
+        let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
+        assert_eq!(
+            promoted, 0,
+            "full-sync with zero enumerated assets must not promote anything; \
+             KEEPER_1's last_seen_at predates sync_started_at AND its status \
+             is downloaded, so both filters protect it"
+        );
+
+        // Downloaded row is intact: same status, still in the downloaded set.
+        let summary_after = db.get_summary().await.unwrap();
+        assert_eq!(
+            summary_after.downloaded, 1,
+            "downloaded count must be unchanged after a zero-asset sync cycle"
+        );
+        assert_eq!(summary_after.failed, 0);
+        assert_eq!(summary_after.pending, 0);
+
+        let ids_after = db.get_downloaded_ids().await.unwrap();
+        assert!(
+            ids_after.contains(&("KEEPER_1".into(), "original".into())),
+            "KEEPER_1 must remain in the downloaded set after a full sync that \
+             didn't re-enumerate it"
+        );
+
+        // last_seen_at was NOT refreshed (nothing touched it). A caller that
+        // later wants to implement "assets not seen for N syncs" can use the
+        // stale timestamp as a signal, but it must be an opt-in policy, not
+        // a silent cleanup.
+        let failed = db.get_failed().await.unwrap();
+        assert!(
+            failed.is_empty(),
+            "the asset that wasn't enumerated this sync must not appear in the failed set"
+        );
+    }
 }
