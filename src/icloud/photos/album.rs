@@ -301,7 +301,10 @@ impl PhotoAlbum {
                     break Some(anyhow::anyhow!("changes/zone returned empty zones array"));
                 };
 
-                // Check for zone-level errors
+                // Check for zone-level errors BEFORE advancing current_token.
+                // On any zone error (including transient RETRY_LATER), the loop
+                // breaks with current_token still set to the last-known-good
+                // value so the caller can retry from a valid checkpoint.
                 let zone_name = zone_result.zone_id.zone_name.clone();
                 if let Err(sync_err) = check_changes_zone_error(
                     zone_result.server_error_code.as_deref(),
@@ -1383,6 +1386,41 @@ mod tests {
         assert_eq!(
             token, "bad-token",
             "on error, should preserve the last-good token for checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_changes_stream_transient_zone_error_preserves_initial_token() {
+        // NB-2 regression: a transient zone code (RETRY_LATER, SERVER_INTERNAL_ERROR,
+        // etc.) on the very first page must not lose the caller's initial sync_token.
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosSession::new().ok(json!({
+            "zones": [{
+                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "syncToken": "",
+                "moreComing": false,
+                "serverErrorCode": "RETRY_LATER",
+                "reason": "temporary backend issue"
+            }]
+        }));
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.changes_stream("token-T0");
+        tokio::pin!(stream);
+
+        let mut errors = 0usize;
+        while let Some(result) = stream.next().await {
+            if result.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(errors, 1, "should surface the zone error");
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(
+            token, "token-T0",
+            "transient zone error on first page must preserve the caller's initial token"
         );
     }
 
