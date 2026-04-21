@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Startup panic when `--metrics-port` is set.** Launching kei with `--metrics-port` (or `KEI_METRICS_PORT` / `[metrics] port` in TOML) crashed at startup with a `blocking_lock()` panic. Regression from 0.10.0: the `/healthz` staleness threshold was applied to the mutex-wrapped metrics handle after construction, and `blocking_lock()` panics unconditionally when called from inside a tokio runtime. The threshold is now passed into `MetricsHandle::new()` before the mutex wraps the inner state, so no locking is needed. ([#248], [#249])
+- **Startup panic when `--metrics-port` is set.** Launching kei with `--metrics-port` (or `KEI_METRICS_PORT` / `[metrics] port` in TOML) crashed at startup with a `blocking_lock()` panic. Regression from 0.10.0: the `/healthz` staleness threshold was applied to the mutex-wrapped metrics handle after construction, and `blocking_lock()` panics unconditionally when called from inside a tokio runtime. The threshold is now passed into `MetricsHandle::new()` before the mutex wraps the inner state, so no locking is needed. ([#248], [#249], thanks @billimek)
 
 [#248]: https://github.com/rhoopr/kei/issues/248
 [#249]: https://github.com/rhoopr/kei/pull/249
