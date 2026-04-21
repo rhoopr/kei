@@ -1,1 +1,7 @@
 too-many-arguments-threshold = 8
+
+disallowed-methods = [
+    { path = "tokio::sync::Mutex::blocking_lock", reason = "panics inside a tokio runtime; see PR #249. Restructure to async or take the value at construction." },
+    { path = "tokio::sync::RwLock::blocking_read", reason = "panics inside a tokio runtime. Restructure to async or take the value at construction." },
+    { path = "tokio::sync::RwLock::blocking_write", reason = "panics inside a tokio runtime. Restructure to async or take the value at construction." },
+]

@@ -449,7 +449,7 @@ pub(crate) fn spawn_server(
     port: u16,
     shutdown_token: CancellationToken,
     staleness_threshold: Option<chrono::Duration>,
-) -> anyhow::Result<(MetricsHandle, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(MetricsHandle, tokio::task::JoinHandle<()>, SocketAddr)> {
     let handle = MetricsHandle::new(staleness_threshold);
     let app = Router::new()
         .route("/metrics", get(handle_metrics))
@@ -459,10 +459,14 @@ pub(crate) fn spawn_server(
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let std_listener = std::net::TcpListener::bind(addr)
         .map_err(|e| anyhow::anyhow!("Failed to bind metrics server on port {port}: {e}"))?;
+    let local_addr = std_listener.local_addr()?;
     std_listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
 
-    tracing::info!(port, "Prometheus metrics server listening");
+    tracing::info!(
+        port = local_addr.port(),
+        "Prometheus metrics server listening"
+    );
 
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app)
@@ -471,10 +475,13 @@ pub(crate) fn spawn_server(
         {
             tracing::warn!(error = %e, "Metrics server error");
         }
-        tracing::info!(port, "Prometheus metrics server stopped");
+        tracing::info!(
+            port = local_addr.port(),
+            "Prometheus metrics server stopped"
+        );
     });
 
-    Ok((handle, task))
+    Ok((handle, task, local_addr))
 }
 
 #[cfg(test)]
@@ -1071,5 +1078,59 @@ mod tests {
             result.err()
         );
         token.cancel();
+    }
+
+    /// Full end-to-end smoke test: the real axum stack, a real TCP socket, and a
+    /// real HTTP client. Catches regressions anywhere between `spawn_server` and
+    /// the response body that the handler unit tests (which call `handle_*`
+    /// directly against a `State`) cannot see.
+    #[tokio::test]
+    async fn spawn_server_serves_metrics_and_healthz_over_http() {
+        let token = CancellationToken::new();
+        let (handle, task, addr) =
+            spawn_server(0, token.clone(), Some(chrono::Duration::seconds(3600)))
+                .expect("spawn_server should bind and spawn");
+
+        // Push a healthy cycle so /healthz returns 200 instead of the pre-first-cycle 503.
+        handle
+            .update(&SyncStats::default(), &healthy_status(0))
+            .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let metrics_resp = client
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .expect("GET /metrics should succeed");
+        assert_eq!(metrics_resp.status(), reqwest::StatusCode::OK);
+        let ct = metrics_resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.contains("application/openmetrics-text"),
+            "unexpected content-type: {ct}"
+        );
+        let body = metrics_resp.text().await.unwrap();
+        assert!(
+            body.contains("kei_sync_assets_seen_total"),
+            "expected kei_sync_* counters in body:\n{body}"
+        );
+
+        let healthz_resp = client
+            .get(format!("http://{addr}/healthz"))
+            .send()
+            .await
+            .expect("GET /healthz should succeed");
+        assert_eq!(healthz_resp.status(), reqwest::StatusCode::OK);
+
+        token.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
     }
 }
