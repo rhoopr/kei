@@ -491,7 +491,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .metrics_port
         .map(|port| crate::metrics::spawn_server(port, shutdown_token.clone(), staleness_threshold))
         .transpose()?
-        .map_or((None, None), |(h, t)| (Some(h), Some(t)));
+        .map_or((None, None), |(h, t, _addr)| (Some(h), Some(t)));
 
     let mut health = health::HealthStatus::new();
     let mut consecutive_album_refresh_failures = 0u32;

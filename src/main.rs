@@ -6,6 +6,7 @@
 //! failures.
 
 #![warn(clippy::all)]
+#![warn(clippy::await_holding_lock)]
 
 mod auth;
 mod cli;
