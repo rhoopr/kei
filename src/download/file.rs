@@ -558,6 +558,52 @@ fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Classify whether `header` matches a known-valid magic-byte signature for
+/// the file extension `ext` (lowercase, no leading dot).
+///
+/// Returns:
+/// - `Some(true)` — header matches a known-valid signature
+/// - `Some(false)` — extension is recognized but header does not match
+///   (caller logs a warning; the file is still saved)
+/// - `None` — extension is not in the signature table; skip the check
+///
+/// MOV handling intentionally differs from the other ISO-BMFF extensions.
+/// `.heic`, `.heif`, `.mp4`, and `.m4v` must start with an `ftyp` box.
+/// `.mov` may start with any classic QuickTime top-level atom: Apple's
+/// Photos pipeline commonly serves live-photo and HEVC videos in classic
+/// QuickTime format, whose first atom is padding (`wide`) or media data
+/// (`mdat`) rather than `ftyp`.
+fn classify_magic(ext: &str, header: &[u8]) -> Option<bool> {
+    let n = header.len();
+    match ext {
+        "jpg" | "jpeg" => Some(n >= 2 && header[..2] == [0xFF, 0xD8]),
+        "png" => Some(n >= 4 && header[..4] == [0x89, 0x50, 0x4E, 0x47]),
+        "heic" | "heif" | "mp4" | "m4v" => Some(n >= 8 && &header[4..8] == b"ftyp"),
+        "mov" => Some(n >= 8 && is_mov_top_atom(&header[4..8])),
+        "gif" => Some(n >= 4 && &header[..4] == b"GIF8"),
+        "tiff" | "tif" | "dng" => Some(
+            n >= 4
+                && (header[..4] == [0x49, 0x49, 0x2A, 0x00]
+                    || header[..4] == [0x4D, 0x4D, 0x00, 0x2A]),
+        ),
+        "webp" => Some(n >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"WEBP"),
+        _ => None,
+    }
+}
+
+/// Valid top-level atom types at offset 4 of a QuickTime `.mov` file.
+///
+/// Modern ISO-BMFF MOVs begin with `ftyp`. Classic QuickTime MOVs (produced
+/// by older iOS versions and by the live-photo / HEVC pipeline) may begin
+/// with any atom: padding (`wide`), media data (`mdat`), movie header
+/// (`moov`), unused space (`free`/`skip`), or a preview resource (`pnot`).
+fn is_mov_top_atom(atom: &[u8]) -> bool {
+    matches!(
+        atom,
+        b"ftyp" | b"wide" | b"mdat" | b"moov" | b"free" | b"skip" | b"pnot"
+    )
+}
+
 /// Validate that downloaded content matches expected format for the file extension.
 ///
 /// For known media types (JPEG, PNG, HEIC, MOV, etc.), checks magic bytes in the
@@ -602,24 +648,7 @@ fn validate_downloaded_content(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // For known media types, check magic bytes. Mismatches are warnings, not errors,
-    // because format variants exist (e.g. classic QuickTime MOV files starting with
-    // `wide`/`mdat` instead of `ftyp`).
-    let magic_ok = match ext.as_str() {
-        "jpg" | "jpeg" => Some(n >= 2 && header[..2] == [0xFF, 0xD8]),
-        "png" => Some(n >= 4 && header[..4] == [0x89, 0x50, 0x4E, 0x47]),
-        "heic" | "heif" | "mov" | "mp4" | "m4v" => Some(n >= 8 && header[4..8] == *b"ftyp"),
-        "gif" => Some(n >= 4 && header[..4] == *b"GIF8"),
-        "tiff" | "tif" => Some(
-            n >= 4
-                && (header[..4] == [0x49, 0x49, 0x2A, 0x00]
-                    || header[..4] == [0x4D, 0x4D, 0x00, 0x2A]),
-        ),
-        "webp" => Some(n >= 12 && header[..4] == *b"RIFF" && header[8..12] == *b"WEBP"),
-        _ => None,
-    };
-
-    if magic_ok == Some(false) {
+    if classify_magic(&ext, header) == Some(false) {
         tracing::warn!(
             path = %download_path.display(),
             header = %format_args!("{:02x?}", &header[..n.min(8)]),
@@ -1031,6 +1060,110 @@ mod tests {
         assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 
+    /// Build a 12-byte ISO-BMFF-style header with `box_type` at offset 4.
+    fn mov_header(box_type: &[u8; 4]) -> [u8; 12] {
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x08]);
+        buf[4..8].copy_from_slice(box_type);
+        buf
+    }
+
+    #[test]
+    fn classify_magic_accepts_mov_ftyp() {
+        assert_eq!(classify_magic("mov", &mov_header(b"ftyp")), Some(true));
+    }
+
+    #[test]
+    fn classify_magic_accepts_mov_classic_qt_atoms() {
+        // Live photos and HEVC MOVs from iCloud commonly begin with a classic
+        // QuickTime atom instead of `ftyp` (see issue #247).
+        for atom in [b"wide", b"mdat", b"moov", b"free", b"skip", b"pnot"] {
+            assert_eq!(
+                classify_magic("mov", &mov_header(atom)),
+                Some(true),
+                "{:?} should be accepted as a classic QuickTime top-level atom",
+                std::str::from_utf8(atom).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn classify_magic_exact_bytes_from_issue_247() {
+        // Exact header reported in #247:
+        //   "header=[00, 00, 00, 08, 77, 69, 64, 65]" → `0x00000008 "wide"`.
+        let header = [0x00, 0x00, 0x00, 0x08, 0x77, 0x69, 0x64, 0x65];
+        assert_eq!(classify_magic("mov", &header), Some(true));
+    }
+
+    #[test]
+    fn classify_magic_rejects_mov_unknown_atom() {
+        // An unrecognized box type should still warn — we accept only the
+        // documented QuickTime top-level atoms plus ISO-BMFF `ftyp`.
+        assert_eq!(classify_magic("mov", &mov_header(b"xxxx")), Some(false));
+    }
+
+    #[test]
+    fn classify_magic_rejects_mov_too_short() {
+        assert_eq!(
+            classify_magic("mov", &[0x00, 0x00, 0x00, 0x08]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn classify_magic_heic_requires_ftyp() {
+        // HEIC/HEIF are strict ISO-BMFF: classic QuickTime atoms are not valid.
+        assert_eq!(classify_magic("heic", &mov_header(b"wide")), Some(false));
+        assert_eq!(classify_magic("heif", &mov_header(b"mdat")), Some(false));
+        assert_eq!(classify_magic("heic", &mov_header(b"ftyp")), Some(true));
+    }
+
+    #[test]
+    fn classify_magic_mp4_requires_ftyp() {
+        // MP4/M4V are strict ISO-BMFF: no classic QuickTime atom acceptance.
+        assert_eq!(classify_magic("mp4", &mov_header(b"wide")), Some(false));
+        assert_eq!(classify_magic("m4v", &mov_header(b"moov")), Some(false));
+        assert_eq!(classify_magic("mp4", &mov_header(b"ftyp")), Some(true));
+    }
+
+    #[test]
+    fn classify_magic_dng_accepts_tiff_magic() {
+        // DNG is TIFF-based; accept both byte orders.
+        assert_eq!(
+            classify_magic("dng", &[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00]),
+            Some(true),
+        );
+        assert_eq!(
+            classify_magic("dng", &[0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x08]),
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn classify_magic_dng_rejects_non_tiff_header() {
+        assert_eq!(
+            classify_magic("dng", &[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn classify_magic_unknown_extension_returns_none() {
+        assert_eq!(classify_magic("bin", &[0x00, 0x01, 0x02, 0x03]), None);
+        assert_eq!(classify_magic("", &[0xFF, 0xD8]), None);
+        assert_eq!(classify_magic("aae", b"<?xml version=\"1.0\"?>"), None);
+    }
+
+    #[test]
+    fn classify_magic_basic_image_types() {
+        assert_eq!(classify_magic("jpg", &[0xFF, 0xD8]), Some(true));
+        assert_eq!(classify_magic("jpeg", &[0xFF, 0xD8]), Some(true));
+        assert_eq!(classify_magic("jpg", &[0x89, 0x50]), Some(false));
+        assert_eq!(classify_magic("png", &[0x89, 0x50, 0x4E, 0x47]), Some(true),);
+        assert_eq!(classify_magic("gif", b"GIF89a"), Some(true));
+        assert_eq!(classify_magic("gif", b"GIF77a"), Some(false));
+    }
+
     #[test]
     fn validate_warns_but_accepts_mismatched_heic_magic() {
         // Non-ftyp header with .heic extension — warn but accept
@@ -1059,6 +1192,25 @@ mod tests {
         let (part, dest, _dir) =
             write_temp_file("photo.tiff", &[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00]);
         assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_dng_as_tiff() {
+        let (part, dest, _dir) = write_temp_file("raw.dng", &[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00]);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    /// End-to-end regression for issue #247: the exact header Wouter reported
+    /// (`00 00 00 08 77 69 64 65` == `0x00000008 "wide"`) on a live-photo MOV
+    /// must validate cleanly, with no warning worth following up on.
+    #[test]
+    fn validate_accepts_hevc_live_photo_mov_header_issue_247() {
+        let header = [0x00, 0x00, 0x00, 0x08, 0x77, 0x69, 0x64, 0x65];
+        let (part, dest, _dir) = write_temp_file("IMG_1410_HEVC.MOV", &header);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+        // Confirm the classifier treats this header as a positive match, not
+        // just a tolerated warning.
+        assert_eq!(classify_magic("mov", &header), Some(true));
     }
 
     #[test]
