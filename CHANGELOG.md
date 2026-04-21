@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Spurious `File header does not match expected format` warning on live-photo MOVs.** The magic-byte check only accepted the ISO-BMFF `ftyp` box at offset 4 and warned on everything else. Apple serves live-photo and HEVC videos as classic QuickTime, which commonly begins with a `wide` padding atom (`00 00 00 08 77 69 64 65`) or an `mdat` data atom instead. The `.mov` branch now accepts `ftyp`, `wide`, `mdat`, `moov`, `free`, `skip`, and `pnot` - all valid QuickTime top-level atoms. `.heic`, `.heif`, `.mp4`, and `.m4v` remain strict ISO-BMFF (`ftyp` only). `.dng` now runs the TIFF magic check. Files were already being saved correctly; only the warning is gone. ([#247], thanks @woutervanwijk)
+
+[#247]: https://github.com/rhoopr/kei/issues/247
+
+---
+
 ## [0.10.1] - 2026-04-21
 
 ### Fixed
