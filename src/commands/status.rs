@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    reason = "CLI subcommand whose primary purpose is to print a status report to stdout"
+)]
+
 use crate::cli;
 use crate::config;
 use crate::state;

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    reason = "CLI subcommand whose primary purpose is to print reset status to stdout"
+)]
+
 use crate::config;
 use crate::state;
 use crate::state::StateDb;

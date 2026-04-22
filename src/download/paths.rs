@@ -390,6 +390,10 @@ pub(crate) fn normalize_ampm(s: &str) -> String {
         } else {
             // Multi-byte UTF-8: decode the char and advance past it
             // Safe: i < len and bytes[i] >= 0x80 guarantees a multi-byte char starts here
+            #[allow(
+                clippy::expect_used,
+                reason = "i < len bound checked above; &str guarantees valid UTF-8 so chars().next() is Some"
+            )]
             let ch = s[i..]
                 .chars()
                 .next()

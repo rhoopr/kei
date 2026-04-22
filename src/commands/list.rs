@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    reason = "CLI subcommand whose primary purpose is to print album/library lists to stdout"
+)]
+
 use crate::auth;
 use crate::cli;
 use crate::config;

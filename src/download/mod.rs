@@ -1569,6 +1569,10 @@ async fn download_photos_incremental(
     }
 
     if config.only_print_filenames {
+        #[allow(
+            clippy::print_stdout,
+            reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
+        )]
         for task in &tasks {
             println!("{}", task.download_path.display());
         }

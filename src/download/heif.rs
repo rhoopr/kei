@@ -52,7 +52,15 @@ pub(crate) fn extract_xmp_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
         let extent = loc.extents.first()?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "HEIC file byte offsets/lengths fit in usize on 64-bit; kei targets 64-bit platforms"
+        )]
         let start = loc.base_offset.saturating_add(extent.offset) as usize;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "HEIC extent length fits in usize on 64-bit"
+        )]
         let end = start + extent.length as usize;
         if end > bytes.len() {
             return None;
@@ -135,6 +143,10 @@ pub(crate) fn insert_xmp(input: &[u8], xmp: &[u8]) -> Result<Vec<u8>> {
     // of offset value, so we can append the mdat atom first, compute the
     // resulting running offsets, then populate the iloc offset.
     let new_item_id = {
+        #[allow(
+            clippy::unreachable,
+            reason = "meta_idx comes from matches!(a, Any::Meta(_)) above"
+        )]
         let Any::Meta(meta) = &atoms[meta_idx] else {
             unreachable!()
         };
@@ -147,6 +159,10 @@ pub(crate) fn insert_xmp(input: &[u8], xmp: &[u8]) -> Result<Vec<u8>> {
     // Insert placeholder iloc entry (offset=0) and iinf entry so that running
     // offsets reflect the final meta size.
     {
+        #[allow(
+            clippy::unreachable,
+            reason = "meta_idx comes from matches!(a, Any::Meta(_)) above"
+        )]
         let Any::Meta(meta) = &mut atoms[meta_idx] else {
             unreachable!()
         };
@@ -375,21 +391,21 @@ fn next_free_item_id(meta: &Meta) -> u32 {
 }
 
 fn push_iinf_entry(meta: &mut Meta, entry: ItemInfoEntry) {
-    if meta.get::<Iinf>().is_none() {
-        meta.push(Iinf {
-            item_infos: Vec::new(),
-        });
+    match meta.get_mut::<Iinf>() {
+        Some(iinf) => iinf.item_infos.push(entry),
+        None => meta.push(Iinf {
+            item_infos: vec![entry],
+        }),
     }
-    meta.get_mut::<Iinf>().unwrap().item_infos.push(entry);
 }
 
 fn push_iloc_entry(meta: &mut Meta, loc: ItemLocation) {
-    if meta.get::<Iloc>().is_none() {
-        meta.push(Iloc {
-            item_locations: Vec::new(),
-        });
+    match meta.get_mut::<Iloc>() {
+        Some(iloc) => iloc.item_locations.push(loc),
+        None => meta.push(Iloc {
+            item_locations: vec![loc],
+        }),
     }
-    meta.get_mut::<Iloc>().unwrap().item_locations.push(loc);
 }
 
 #[cfg(test)]

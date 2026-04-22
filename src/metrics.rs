@@ -346,7 +346,11 @@ impl MetricsHandle {
             .set(i64::from(health.consecutive_failures));
         let last_success_ts = health
             .last_success_at
-            .map(|t| t.timestamp() as f64)
+            .map(|t| {
+                #[allow(clippy::cast_precision_loss, reason = "OpenMetrics timestamp format is f64 seconds; precision loss at the second level is below the metric's granularity")]
+                let ts = t.timestamp() as f64;
+                ts
+            })
             .unwrap_or(0.0);
         self.last_success_timestamp.set(last_success_ts);
 

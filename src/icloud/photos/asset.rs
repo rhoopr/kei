@@ -81,8 +81,15 @@ fn decode_filename(fields: &Value) -> Option<String> {
 /// Convert an `f64` millisecond timestamp to a `DateTime<Utc>`, returning
 /// `None` if the value is out of `i64` range.
 pub(crate) fn f64_to_millis_datetime(ms: f64) -> Option<DateTime<Utc>> {
-    if (i64::MIN as f64..=i64::MAX as f64).contains(&ms) {
-        Utc.timestamp_millis_opt(ms as i64).single()
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "range check is conservative; exact i64 precision loss at the extremes is fine since we only need a membership test"
+    )]
+    let in_range = (i64::MIN as f64..=i64::MAX as f64).contains(&ms);
+    if in_range {
+        #[allow(clippy::cast_possible_truncation, reason = "bounds checked above")]
+        let ms_i64 = ms as i64;
+        Utc.timestamp_millis_opt(ms_i64).single()
     } else {
         None
     }

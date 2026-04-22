@@ -706,7 +706,12 @@ impl StateDb for SqliteStateDb {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| StateError::query("get_failed_sample", e))?;
 
-        Ok((records, total.max(0) as u64))
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = ".max(0) clamps any negative COUNT(*) result to 0 before the cast"
+        )]
+        let total_u64 = total.max(0) as u64;
+        Ok((records, total_u64))
     }
 
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
@@ -948,6 +953,7 @@ impl StateDb for SqliteStateDb {
                 |row| row.get(0),
             )
             .map_err(|e| StateError::query("prepare_for_retry", e))?;
+        #[allow(clippy::cast_sign_loss, reason = "SQL COUNT(*) is always non-negative")]
         let total_pending = total_pending as u64;
 
         Ok((failed, pending, total_pending))

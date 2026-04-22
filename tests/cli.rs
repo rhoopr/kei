@@ -3,6 +3,17 @@
 //! Validates that every subcommand, flag, and enum value is accepted or
 //! rejected by the argument parser as expected.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented,
+    clippy::print_stderr,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+
 mod common;
 
 use predicates::prelude::*;

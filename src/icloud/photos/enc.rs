@@ -96,6 +96,10 @@ pub fn decode_location(fields: &Value, key: &str) -> Option<Location> {
 fn plist_to_f64(value: &PlistValue) -> Option<f64> {
     match value {
         PlistValue::Real(r) => Some(*r),
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "plist integers encoding GPS/location values fit well within f64 mantissa"
+        )]
         PlistValue::Integer(i) => i.as_signed().map(|v| v as f64),
         _ => None,
     }

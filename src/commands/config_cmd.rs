@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    reason = "CLI subcommand whose primary purpose is to print the resolved config to stdout"
+)]
+
 use crate::cli;
 use crate::config;
 

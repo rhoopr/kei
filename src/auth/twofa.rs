@@ -361,6 +361,10 @@ async fn submit_2fa_code_inner(
 ///
 /// Returns the trimmed input. An empty string means the user pressed Enter
 /// without typing a code (i.e. they want a new code sent to their device).
+#[allow(
+    clippy::print_stdout,
+    reason = "interactive TTY prompt; tracing is not appropriate for a user input prompt"
+)]
 pub async fn prompt_2fa_code() -> Result<String> {
     Ok(tokio::task::spawn_blocking(|| {
         print!("Enter 2FA code (or press Enter to request a new code): ");

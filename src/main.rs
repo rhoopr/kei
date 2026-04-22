@@ -4,9 +4,26 @@
 //! Authentication uses SRP-6a with Apple's custom variant, followed by optional
 //! 2FA. Photos are streamed with exponential-backoff retries on transient
 //! failures.
+//!
+//! Lint configuration lives in `[lints.clippy]` in `Cargo.toml`.
 
-#![warn(clippy::all)]
-#![warn(clippy::await_holding_lock)]
+// Test code is exempt from the panic-footgun, logging-hygiene, and
+// numeric-cast lints that prod code enforces: unwrap/expect/panic are
+// idiomatic in tests, a few tests write to stderr for failure diagnostics,
+// and test fixtures commonly use `as` casts on values known to fit.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unimplemented,
+        clippy::print_stderr,
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+    )
+)]
 
 mod auth;
 mod cli;
@@ -315,6 +332,10 @@ fn main() -> ExitCode {
     // SAFETY: no other threads exist yet — the tokio runtime has not been built.
     unsafe { std::env::remove_var("ICLOUD_PASSWORD") };
 
+    #[allow(
+        clippy::expect_used,
+        reason = "startup failure: no runtime means nothing can run"
+    )]
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -337,7 +358,13 @@ fn main() -> ExitCode {
                 // Also echo to stderr unconditionally as a fallback for early
                 // failures before `tracing_subscriber::fmt().init()` runs.
                 tracing::error!(error = format!("{e:#}"), "kei exited with error");
-                eprintln!("Error: {e:#}");
+                #[allow(
+                    clippy::print_stderr,
+                    reason = "fallback for failures that happen before tracing subscriber is installed"
+                )]
+                {
+                    eprintln!("Error: {e:#}");
+                }
                 if e.downcast_ref::<PartialSyncError>().is_some() {
                     ExitCode::from(EXIT_PARTIAL)
                 } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
@@ -539,6 +566,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         },
         Command::Sync { password, sync } => (sync.retry_failed, password, sync),
         // Legacy variants should never reach here (effective_command maps them)
+        #[allow(
+            clippy::unreachable,
+            reason = "effective_command() maps every legacy variant to a modern one before this match"
+        )]
         _ => unreachable!("legacy command variants should be mapped by effective_command()"),
     };
     sync_loop::run_sync(

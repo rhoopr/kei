@@ -147,7 +147,13 @@ where
 
     // This is unreachable: the loop always runs at least once (total_attempts >= 1)
     // and either returns Ok, returns Err on abort, or returns Err on last attempt.
-    unreachable!("retry loop must return before exhausting iterations")
+    #[allow(
+        clippy::unreachable,
+        reason = "loop always returns via Ok, abort-Err, or last-attempt Err"
+    )]
+    {
+        unreachable!("retry loop must return before exhausting iterations")
+    }
 }
 
 #[cfg(test)]

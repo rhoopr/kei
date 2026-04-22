@@ -287,6 +287,10 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                     // at least one record with `serverErrorCode` set, which
                     // always assigns `last_ck_err`. The expect encodes that
                     // invariant — it cannot fire at runtime.
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "invariant: valid_count==0 implies the errored loop ran and assigned last_ck_err"
+                    )]
                     return Err(last_ck_err.expect("errored is non-empty").into());
                 }
                 tracing::warn!(

@@ -53,7 +53,12 @@ type ChangeStream = Pin<Box<dyn Stream<Item = anyhow::Result<ChangeEvent>> + Sen
 /// and never more than the requested concurrency level.
 fn determine_fetcher_count(total_items: u64, page_size: usize, concurrency: usize) -> usize {
     let total_pages = total_items.div_ceil(page_size as u64);
-    (total_pages as usize).min(concurrency).max(1)
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "bounded to concurrency (usize) immediately via .min()"
+    )]
+    let pages_as_usize = total_pages as usize;
+    pages_as_usize.min(concurrency).max(1)
 }
 
 /// Configuration for creating a `PhotoAlbum`, bundling all non-session fields.
@@ -413,6 +418,10 @@ impl PhotoAlbum {
             mpsc::channel::<anyhow::Result<PhotoAsset>>((page_size * num_fetchers).min(500));
 
         if num_fetchers > 1 {
+            #[allow(
+                clippy::expect_used,
+                reason = "effective_total is unconditionally set when num_fetchers > 1 (see compute above)"
+            )]
             let total = effective_total.expect("effective_total set when num_fetchers > 1");
             // Partition offset range into non-overlapping chunks aligned to
             // page_size boundaries so each fetcher starts on a clean page.
@@ -441,7 +450,12 @@ impl PhotoAlbum {
                 let fetcher_limit = match limit {
                     Some(lim) => {
                         let remaining = u64::from(lim).saturating_sub(start);
-                        Some(remaining.min(end - start) as u32)
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "bounded by min(end-start, limit) where both operands originated from u32 fetcher limits"
+                        )]
+                        let capped = remaining.min(end - start) as u32;
+                        Some(capped)
                     }
                     None => None,
                 };

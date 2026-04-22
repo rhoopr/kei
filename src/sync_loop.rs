@@ -248,6 +248,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             .is_some_and(crate::icloud::error::ICloudError::is_session_error)
     };
     let (shared_session, mut photos_service, libraries) = loop {
+        #[allow(
+            clippy::expect_used,
+            reason = "pending_auth is re-populated at the end of every retry branch before looping"
+        )]
         let this_auth = pending_auth
             .take()
             .expect("auth_result present at start of attempt");
@@ -577,14 +581,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 // reflects the final committed set, not mid-sync churn.
                 // get_failed_sample pushes the LIMIT into SQL so an account
                 // with thousands of failures doesn't load every row here.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "FAILED_ASSETS_CAP is a small compile-time constant well under u32::MAX"
+                )]
+                let cap_u32 = crate::report::FAILED_ASSETS_CAP as u32;
                 let (failed_assets, failed_assets_truncated) = match state_db.as_ref() {
-                    Some(db) => match db
-                        .get_failed_sample(crate::report::FAILED_ASSETS_CAP as u32)
-                        .await
-                    {
+                    Some(db) => match db.get_failed_sample(cap_u32).await {
                         Ok((records, total)) => {
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                reason = "failed-asset totals are persisted counts of per-sync failures, comfortably below usize::MAX on 64-bit"
+                            )]
+                            let total_usize = total as usize;
                             let truncated =
-                                (total as usize).saturating_sub(crate::report::FAILED_ASSETS_CAP);
+                                total_usize.saturating_sub(crate::report::FAILED_ASSETS_CAP);
                             let entries: Vec<_> = records
                                 .iter()
                                 .map(crate::report::FailedAssetEntry::from_record)

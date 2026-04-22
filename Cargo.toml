@@ -137,3 +137,30 @@ path = "tests/sync.rs"
 [[test]]
 name = "state_auth"
 path = "tests/state_auth.rs"
+
+[lints.clippy]
+# Baseline lint group. Lower priority so individual lints below can override.
+all = { level = "warn", priority = -1 }
+
+# Locking footguns: holding a std::sync lock across .await deadlocks.
+# Same failure class as #249's blocking_lock panic.
+await_holding_lock = "warn"
+
+# Panic footguns. Tests scope these off inside `#[cfg(test)] mod tests`.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+
+# Logging hygiene. `tracing` is the only approved logger. Allowed with reasons
+# in the stdout-producing CLI subcommands and a few pre-tracing paths.
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"
+
+# Numeric-cast correctness. Every remaining site has a reviewed `#[allow]` + reason.
+cast_possible_truncation = "warn"
+cast_precision_loss = "warn"
+cast_sign_loss = "warn"

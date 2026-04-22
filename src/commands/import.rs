@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    reason = "CLI subcommand whose primary purpose is to print import-existing progress to stdout"
+)]
+
 use std::sync::Arc;
 
 use crate::auth;

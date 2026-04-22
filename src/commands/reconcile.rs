@@ -15,6 +15,11 @@
 //! change is status transitions from `downloaded` -> `failed`, which the
 //! normal sync path knows how to retry.
 
+#![allow(
+    clippy::print_stdout,
+    reason = "CLI subcommand whose primary purpose is to print a reconcile report to stdout"
+)]
+
 use std::path::PathBuf;
 
 use crate::cli;
@@ -145,11 +150,17 @@ pub(crate) async fn run_reconcile(
             {
                 Ok(()) => marked_failed += 1,
                 Err(e) => {
-                    eprintln!(
-                        "  failed to mark {}:{} as failed: {e}",
-                        m.id,
-                        m.version_size.as_str()
-                    );
+                    #[allow(
+                        clippy::print_stderr,
+                        reason = "reconcile is a CLI subcommand that reports to the user via stdout/stderr"
+                    )]
+                    {
+                        eprintln!(
+                            "  failed to mark {}:{} as failed: {e}",
+                            m.id,
+                            m.version_size.as_str()
+                        );
+                    }
                     mark_errors += 1;
                 }
             }

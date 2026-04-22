@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    reason = "CLI subcommand whose primary purpose is to print verification results to stdout"
+)]
+
 use std::path::Path;
 
 use crate::cli;

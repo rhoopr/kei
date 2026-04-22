@@ -678,6 +678,10 @@ where
                     pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
+                    #[allow(
+                        clippy::print_stdout,
+                        reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
+                    )]
                     for task in &tasks {
                         println!("{}", task.download_path.display());
                     }
@@ -892,10 +896,17 @@ where
                 BatchForecast::Continue => false,
                 BatchForecast::Warn => {
                     if let Some(free) = initial_free {
+                        #[allow(
+                            clippy::cast_precision_loss,
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "percent is 0..=100 after ratio; logged as a diagnostic, not used for control flow"
+                        )]
+                        let percent = (total as f64 * 100.0 / free as f64) as u64;
                         tracing::warn!(
                             queued_bytes = total,
                             initial_free_bytes = free,
-                            percent_of_free = (total as f64 * 100.0 / free as f64) as u64,
+                            percent_of_free = percent,
                             "Queued download batch approaching 90% of initial free disk space"
                         );
                     }
@@ -2171,6 +2182,10 @@ pub(super) fn format_duration(d: Duration) -> String {
     }
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only byte-size formatting; precision loss at exabyte scale is fine for a human-readable string"
+)]
 fn format_bytes(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {
         format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)

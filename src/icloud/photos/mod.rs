@@ -148,6 +148,10 @@ impl PhotosService {
             self.private_libraries = Some(libs);
         }
         // Safe: we just ensured private_libraries is Some above
+        #[allow(
+            clippy::unreachable,
+            reason = "private_libraries was set to Some on the line above; None is impossible here"
+        )]
         Ok(self
             .private_libraries
             .as_ref()
@@ -163,6 +167,10 @@ impl PhotosService {
             self.shared_libraries = Some(libs);
         }
         // Safe: we just ensured shared_libraries is Some above
+        #[allow(
+            clippy::unreachable,
+            reason = "shared_libraries was set to Some on the line above; None is impossible here"
+        )]
         Ok(self
             .shared_libraries
             .as_ref()

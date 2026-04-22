@@ -20,6 +20,10 @@ pub(crate) struct BandwidthLimiter {
 impl BandwidthLimiter {
     pub(crate) fn new(bytes_per_sec: u64) -> Self {
         Self {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "bandwidth limits are configured by humans and fit easily in f64 precision"
+            )]
             inner: <Limiter>::builder(bytes_per_sec as f64).build(),
         }
     }
@@ -33,7 +37,13 @@ impl BandwidthLimiter {
     }
 
     pub(crate) fn bytes_per_sec(&self) -> u64 {
-        self.inner.speed_limit() as u64
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "speed_limit is a non-negative rate configured as u64 originally; round-tripping is lossless for realistic values"
+        )]
+        let v = self.inner.speed_limit() as u64;
+        v
     }
 }
 

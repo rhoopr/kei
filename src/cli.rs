@@ -70,6 +70,10 @@ fn parse_2fa_code(s: &str) -> Result<String, String> {
 }
 
 /// Print a deprecation warning to stderr.
+#[allow(
+    clippy::print_stderr,
+    reason = "runs during CLI arg parsing, before tracing subscriber is installed"
+)]
 pub(crate) fn deprecation_warning(old: &str, new: &str) {
     eprintln!("warning: `{old}` is deprecated, use `{new}` instead");
 }

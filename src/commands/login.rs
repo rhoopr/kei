@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    reason = "CLI subcommand whose primary purpose is to print login/2FA status to stdout"
+)]
+
 use crate::auth;
 use crate::cli;
 use crate::config;

@@ -13,6 +13,17 @@
 //! cargo test --test sync -- --ignored --test-threads=1
 //! ```
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented,
+    clippy::print_stderr,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+
 mod common;
 
 use predicates::prelude::*;

@@ -299,6 +299,10 @@ where
             Err(e) => return Err(e),
         }
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "loop runs MAX_ATTEMPTS >= 1 times; last_err set on every iteration"
+    )]
     Err(last_err.expect("MAX_ATTEMPTS must be >= 1"))
 }
 

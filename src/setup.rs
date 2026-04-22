@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    reason = "interactive setup wizard whose purpose is to drive a stdout dialogue"
+)]
+
 use std::fmt::Write as FmtWrite;
 use std::io::IsTerminal;
 use std::path::Path;
