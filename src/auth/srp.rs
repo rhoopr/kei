@@ -195,8 +195,8 @@ fn compute_m1(
     let h_g = Sha256::digest(&g_padded);
     // XOR the hashes into a fixed array instead of Vec
     let mut h_xor = [0u8; 32];
-    for (i, (a, b)) in h_n.iter().zip(h_g.iter()).enumerate() {
-        h_xor[i] = a ^ b;
+    for ((out, a), b) in h_xor.iter_mut().zip(h_n.iter()).zip(h_g.iter()) {
+        *out = a ^ b;
     }
     let h_username = Sha256::digest(username);
 

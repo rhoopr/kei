@@ -126,6 +126,11 @@ sha1 = "0.10"
 # tests in the auth layer don't sleep through real wall-clock delays.
 tokio = { version = "1", features = ["test-util"] }
 
+[lints.clippy]
+# Flag `[]` / `[..]` panic footguns so we reach for `.get()` / `.first()` or an
+# explicit, invariant-documenting `#[allow]` at each site.
+indexing_slicing = "warn"
+
 [[test]]
 name = "cli"
 path = "tests/cli.rs"
@@ -164,3 +169,7 @@ dbg_macro = "warn"
 cast_possible_truncation = "warn"
 cast_precision_loss = "warn"
 cast_sign_loss = "warn"
+
+# `[]` / `[..]` panic footguns. Refactor to `.get()` / `.first()` / pattern
+# match, or scope an `#[allow]` with a comment naming the invariant.
+indexing_slicing = "warn"

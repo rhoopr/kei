@@ -481,6 +481,8 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
             if n == 0 {
                 break;
             }
+            // `n` is bounded by buf.len() because read() returns bytes written.
+            #[allow(clippy::indexing_slicing)]
             sha256.update(&buf[..n]);
         }
         Ok(format!("{:x}", sha256.finalize()))
@@ -530,6 +532,9 @@ fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum>
 /// that e.g. a leading `\n<html>` still fails. These sentinels are never valid
 /// image/video starts — unlike the magic-byte checks further down, which are
 /// only warnings because exotic variants exist.
+// `pos` comes from `header.iter().position(...)` so `header[pos..]` is
+// in-bounds; the prefix slices below are guarded by explicit length checks.
+#[allow(clippy::indexing_slicing)]
 fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
     let trimmed = header
         .iter()
@@ -611,6 +616,9 @@ fn is_mov_top_atom(atom: &[u8]) -> bool {
 /// since format variants exist (e.g. classic QuickTime MOV without `ftyp` box).
 /// HTML and JSON error-page sentinels are always rejected as hard errors —
 /// Apple's CDN occasionally returns them with HTTP 200.
+// Every slice of `header` below is guarded by an `n >= N` check earlier in
+// the same match arm; the `header = &buf[..n]` narrowing bounds `n <= 16`.
+#[allow(clippy::indexing_slicing)]
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,

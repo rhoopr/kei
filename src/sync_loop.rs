@@ -509,10 +509,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // In watch mode with incremental sync, use changes/database as a
         // cheap pre-check to skip cycles when nothing has changed.
         // Only used for single-library mode; multi-library skips this optimization.
-        let skip_cycle = if is_watch_mode && !config.no_incremental && library_states.len() == 1 {
-            check_changes_database(&state_db, &library_states[0], &mut photos_service).await
-        } else {
-            false
+        let skip_cycle = match library_states.as_slice() {
+            [only] if is_watch_mode && !config.no_incremental => {
+                check_changes_database(&state_db, only, &mut photos_service).await
+            }
+            _ => false,
         };
 
         if skip_cycle {

@@ -168,7 +168,12 @@ impl PhotoAlbum {
             .batch
             .first()
             .and_then(|q| q.records.first())
-            .and_then(|r| r.fields["itemCount"]["value"].as_u64())
+            .and_then(|r| {
+                r.fields
+                    .get("itemCount")
+                    .and_then(|f| f.get("value"))
+                    .and_then(Value::as_u64)
+            })
             .unwrap_or(0);
         Ok(count)
     }
@@ -631,8 +636,12 @@ impl PhotoAlbum {
                 for rec in records {
                     tracing::debug!(record_type = %rec.record_type, "  record");
                     if rec.record_type == "CPLAsset" {
-                        if let Some(master_id) =
-                            rec.fields["masterRef"]["value"]["recordName"].as_str()
+                        if let Some(master_id) = rec
+                            .fields
+                            .get("masterRef")
+                            .and_then(|f| f.get("value"))
+                            .and_then(|v| v.get("recordName"))
+                            .and_then(Value::as_str)
                         {
                             let master_id = master_id.to_string();
                             // Try to pair with a buffered master from a previous page

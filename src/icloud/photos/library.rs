@@ -143,7 +143,12 @@ impl PhotoLibrary {
         let indexing_state = query
             .records
             .first()
-            .and_then(|r| r.fields["state"]["value"].as_str())
+            .and_then(|r| {
+                r.fields
+                    .get("state")
+                    .and_then(|f| f.get("value"))
+                    .and_then(Value::as_str)
+            })
             .unwrap_or("");
         if indexing_state != "FINISHED" {
             tracing::warn!(
@@ -197,8 +202,11 @@ impl PhotoLibrary {
                 if record_name == ROOT_FOLDER || record_name == PROJECT_ROOT_FOLDER {
                     continue;
                 }
-                if folder.fields["isDeleted"]["value"]
-                    .as_bool()
+                if folder
+                    .fields
+                    .get("isDeleted")
+                    .and_then(|f| f.get("value"))
+                    .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
                     continue;
@@ -207,7 +215,12 @@ impl PhotoLibrary {
                 let folder_obj_type =
                     format!("CPLContainerRelationNotDeletedByAssetDate:{record_name}");
 
-                let folder_name = match folder.fields["albumNameEnc"]["value"].as_str() {
+                let folder_name = match folder
+                    .fields
+                    .get("albumNameEnc")
+                    .and_then(|f| f.get("value"))
+                    .and_then(Value::as_str)
+                {
                     Some(enc) => {
                         let decoded = base64::engine::general_purpose::STANDARD
                             .decode(enc)

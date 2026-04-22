@@ -335,6 +335,8 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
     let hash = Sha256::digest(asset_id.as_bytes());
     let ext = item_type_extension(asset_type);
     let mut result = String::with_capacity(12 + 1 + ext.len());
+    // SHA-256 output is always 32 bytes; 6 is unconditionally in-bounds.
+    #[allow(clippy::indexing_slicing)]
     for &b in &hash[..6] {
         let _ = Write::write_fmt(&mut result, format_args!("{b:02x}"));
     }
@@ -352,6 +354,10 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
 ///
 /// This function strips any of these to produce a consistent `1.40.01PM` form,
 /// enabling matching between files created with different locale settings.
+// Every `bytes[i + k]` read below is preceded by an `i + k < len` check or a
+// `bytes[i] < 0x80` ASCII guard that makes `i + 1 <= len`. The UTF-8 fallback
+// slice `s[i..]` is valid because `i < len` and we land on a char boundary.
+#[allow(clippy::indexing_slicing)]
 pub(crate) fn normalize_ampm(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -531,6 +537,9 @@ impl DirCache {
         // self.dirs immutably, which the borrow checker cannot release
         // before the mutable entry() call below.
         if self.dirs.contains_key(dir) {
+            // contains_key() above proves `dir` is present; two-lookup dance
+            // avoids the borrow-checker complaint the comment describes.
+            #[allow(clippy::indexing_slicing)]
             return &self.dirs[dir];
         }
         self.dirs

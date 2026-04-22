@@ -426,6 +426,8 @@ fn build_xmp_packet(write: &MetadataWrite) -> Result<Vec<u8>> {
 /// EXIF stores datetimes as `"YYYY:MM:DD HH:MM:SS"`; XMP wants ISO 8601
 /// `"YYYY-MM-DDTHH:MM:SS"`. Best-effort conversion — on malformed input we
 /// return the original so XMP Toolkit can reject it with a clear error.
+// Indices 4, 7, 10 are provably in-bounds under the `bytes.len() == 19` guard.
+#[allow(clippy::indexing_slicing)]
 fn exif_datetime_to_iso(s: &str) -> String {
     let bytes = s.as_bytes();
     if bytes.len() == 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {

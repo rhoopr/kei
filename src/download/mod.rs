@@ -176,7 +176,9 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
 
     let hash = hasher.finalize();
     let mut hex = String::with_capacity(16);
-    // First 8 bytes is plenty for collision avoidance in this context
+    // First 8 bytes is plenty for collision avoidance in this context.
+    // SHA-256 output is always 32 bytes; 8 is unconditionally in-bounds.
+    #[allow(clippy::indexing_slicing)]
     for &b in &hash[..8] {
         let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
     }
@@ -862,6 +864,9 @@ async fn build_download_tasks(
     let mut dir_cache = paths::DirCache::new();
     for pass_result in pass_results {
         let (pass_index, assets) = pass_result?;
+        // pass_index comes from enumerate() over `passes`; pass_configs is
+        // built 1:1 from the same slice.
+        #[allow(clippy::indexing_slicing)]
         let pass_config = &pass_configs[pass_index];
 
         for asset in &assets {
@@ -1455,6 +1460,9 @@ async fn download_photos_incremental(
     let pass_configs = build_pass_configs(passes, config);
 
     for (asset, pass_index) in &downloadable_assets {
+        // pass_index was assigned by the producer from the same `passes` slice
+        // that pass_configs was built from; indices are valid.
+        #[allow(clippy::indexing_slicing)]
         let effective_config = &pass_configs[*pass_index];
 
         if let Some(reason) = filter::is_asset_filtered(asset, effective_config) {

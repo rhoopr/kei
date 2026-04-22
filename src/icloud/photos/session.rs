@@ -198,10 +198,11 @@ fn is_service_not_activated(code: &str, reason: &str) -> bool {
 /// Returns `Err` if a server error is found, `Ok(response)` otherwise.
 fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
     // Top-level serverErrorCode (e.g. from CAS Op-Lock)
-    if let Some(code) = response["serverErrorCode"].as_str() {
-        let reason = response["reason"]
-            .as_str()
-            .or_else(|| response["serverErrorMessage"].as_str())
+    if let Some(code) = response.get("serverErrorCode").and_then(Value::as_str) {
+        let reason = response
+            .get("reason")
+            .and_then(Value::as_str)
+            .or_else(|| response.get("serverErrorMessage").and_then(Value::as_str))
             .unwrap_or("unknown");
         let retryable = RETRYABLE_SERVER_ERRORS
             .iter()
@@ -224,11 +225,11 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
 
     // Per-record errors: filter out errored records and keep valid ones.
     // Only return Err if ALL records are errored.
-    if let Some(records) = response["records"].as_array() {
+    if let Some(records) = response.get("records").and_then(Value::as_array) {
         // Check if any records have errors before taking the mutable path
         let has_errors = records
             .iter()
-            .any(|r| r["serverErrorCode"].as_str().is_some());
+            .any(|r| r.get("serverErrorCode").and_then(Value::as_str).is_some());
 
         if has_errors {
             // Log each errored record and capture the last error
@@ -236,9 +237,15 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
             let mut permanent_errors = 0usize;
             let mut retryable_errors = 0usize;
             for record in records {
-                if let Some(code) = record["serverErrorCode"].as_str() {
-                    let reason = record["reason"].as_str().unwrap_or("unknown");
-                    let record_name = record["recordName"].as_str().unwrap_or("(unknown)");
+                if let Some(code) = record.get("serverErrorCode").and_then(Value::as_str) {
+                    let reason = record
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let record_name = record
+                        .get("recordName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(unknown)");
                     let retryable = RETRYABLE_SERVER_ERRORS
                         .iter()
                         .any(|&s| s.eq_ignore_ascii_case(code));
@@ -278,9 +285,12 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
 
             // Now mutate in-place: retain only valid records
             let mut response = response;
-            let total = response["records"].as_array().map_or(0, Vec::len);
-            if let Some(records) = response["records"].as_array_mut() {
-                records.retain(|r| r["serverErrorCode"].as_str().is_none());
+            let total = response
+                .get("records")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if let Some(records) = response.get_mut("records").and_then(Value::as_array_mut) {
+                records.retain(|r| r.get("serverErrorCode").and_then(Value::as_str).is_none());
                 let valid_count = records.len();
                 if valid_count == 0 {
                     // Control only reaches here because the loop above walked

@@ -254,6 +254,9 @@ pub(super) struct DownloadTask {
 
 /// Apply the RAW alignment policy by swapping Original and Alternative versions
 /// when appropriate, matching Python's `apply_raw_policy()`.
+// orig_idx / alt_idx are produced by `enumerate()` over `versions`; indexing
+// back into `versions` or its clone is in-bounds by construction.
+#[allow(clippy::indexing_slicing)]
 fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'_, VersionsMap> {
     if policy == RawTreatmentPolicy::Unchanged {
         return Cow::Borrowed(versions);

@@ -260,7 +260,9 @@ pub(crate) fn build_changes_zone_request(
         "resultsLimit": results_limit,
     });
     if let Some(token) = sync_token {
-        zone_entry["syncToken"] = json!(token);
+        if let Some(obj) = zone_entry.as_object_mut() {
+            obj.insert("syncToken".into(), json!(token));
+        }
     }
     json!({"zones": [zone_entry]})
 }

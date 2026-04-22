@@ -95,11 +95,20 @@ pub(crate) fn f64_to_millis_datetime(ms: f64) -> Option<DateTime<Utc>> {
     }
 }
 
+/// True when `fields.key` is a non-null `Value`.
+fn field_present(fields: &Value, key: &str) -> bool {
+    fields.get(key).is_some_and(|v| !v.is_null())
+}
+
 /// Determine asset type from the `itemType` `CloudKit` field, falling back to
 /// file extension heuristics. Defaults to Movie for unknown types because
 /// videos are more likely to have non-standard UTI strings.
 fn resolve_item_type(fields: &Value, filename: Option<&str>) -> AssetItemType {
-    if let Some(s) = fields["itemType"]["value"].as_str() {
+    if let Some(s) = fields
+        .get("itemType")
+        .and_then(|f| f.get("value"))
+        .and_then(Value::as_str)
+    {
         if let Some(t) = item_type_from_str(s) {
             return t;
         }
@@ -137,20 +146,23 @@ fn extract_versions(
     for (key, res_field, type_field) in lookup {
         // Asset record has adjusted versions; master has originals.
         // Prefer asset record so adjusted/edited versions take priority.
-        let fields = if !asset_fields[res_field].is_null() {
+        let fields = if field_present(asset_fields, res_field) {
             asset_fields
-        } else if !master_fields[res_field].is_null() {
+        } else if field_present(master_fields, res_field) {
             master_fields
         } else {
             continue;
         };
 
-        let res_entry = &fields[res_field]["value"];
+        let res_entry = fields
+            .get(res_field)
+            .and_then(|f| f.get("value"))
+            .unwrap_or(&Value::Null);
         if res_entry.is_null() {
             continue;
         }
 
-        let size = if let Some(s) = res_entry["size"].as_u64() {
+        let size = if let Some(s) = res_entry.get("size").and_then(Value::as_u64) {
             s
         } else {
             tracing::warn!(
@@ -161,7 +173,7 @@ fn extract_versions(
             continue;
         };
 
-        let url: Box<str> = match res_entry["downloadURL"].as_str() {
+        let url: Box<str> = match res_entry.get("downloadURL").and_then(Value::as_str) {
             Some(u) => match validate_download_url(u) {
                 Ok(()) => u.into(),
                 Err(reason) => {
@@ -185,18 +197,23 @@ fn extract_versions(
             }
         };
 
-        let checksum: Box<str> = if let Some(c) = res_entry["fileChecksum"].as_str() {
-            c.into()
-        } else {
-            tracing::warn!(
-                asset = %record_name,
-                field = format_args!("{res_field}.fileChecksum"),
-                "Missing fileChecksum, skipping version"
-            );
-            continue;
-        };
+        let checksum: Box<str> =
+            if let Some(c) = res_entry.get("fileChecksum").and_then(Value::as_str) {
+                c.into()
+            } else {
+                tracing::warn!(
+                    asset = %record_name,
+                    field = format_args!("{res_field}.fileChecksum"),
+                    "Missing fileChecksum, skipping version"
+                );
+                continue;
+            };
 
-        let asset_type: Box<str> = match fields[type_field]["value"].as_str() {
+        let asset_type: Box<str> = match fields
+            .get(type_field)
+            .and_then(|f| f.get("value"))
+            .and_then(Value::as_str)
+        {
             Some(s) if !s.is_empty() => s.into(),
             _ => {
                 tracing::warn!(
@@ -282,8 +299,16 @@ impl PhotoAsset {
     pub fn from_records(master: super::cloudkit::Record, asset: super::cloudkit::Record) -> Self {
         let filename = decode_filename(&master.fields).map(String::into_boxed_str);
         let item_type_val = Some(resolve_item_type(&master.fields, filename.as_deref()));
-        let asset_date_ms = asset.fields["assetDate"]["value"].as_f64();
-        let added_date_ms = asset.fields["addedDate"]["value"].as_f64();
+        let asset_date_ms = asset
+            .fields
+            .get("assetDate")
+            .and_then(|f| f.get("value"))
+            .and_then(Value::as_f64);
+        let added_date_ms = asset
+            .fields
+            .get("addedDate")
+            .and_then(|f| f.get("value"))
+            .and_then(Value::as_f64);
         let versions = extract_versions(
             item_type_val,
             &master.fields,
