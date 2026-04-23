@@ -15,49 +15,25 @@
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
 </p>
 
-Fast, parallel photo sync from the cloud to local storage. Single binary, runs unattended.
+Sync your cloud photos to local storage. Fast, resumable, single binary, runs unattended.
 
-- **Parallel downloads** - configurable concurrency, starts downloading before enumeration completes
-- **Incremental sync** - scans large libraries in seconds via CloudKit sync tokens, only fetches what changed
-- **Resumable transfers** - partial downloads resume via HTTP Range, verified by size and content hash
-- **Single binary** - no runtime dependencies, runs on macOS, Linux, and Windows
-- **Unattended operation** - watch mode, systemd integration, headless 2FA, Docker-ready
+- Parallel downloads with incremental sync (seconds on large libraries after the first run)
+- Resumable transfers verified by size and content hash
+- Watch mode, systemd integration, headless 2FA, Docker-ready
 
 iCloud Photos is supported today. Google Takeout and Immich are next.
 
 > [!TIP]
 > Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) maps every flag and shows how to pick up where you left off without re-downloading.
 
----
-
 ## Install
 
-**Homebrew**
-
 ```sh
-brew install rhoopr/kei/kei
+brew install rhoopr/kei/kei          # Homebrew
+docker pull ghcr.io/rhoopr/kei:latest # Docker
 ```
 
-**Docker**
-
-```sh
-docker pull ghcr.io/rhoopr/kei:latest
-```
-
-See the [Docker guide](https://github.com/rhoopr/kei/wiki/Docker) for compose files and headless 2FA.
-
-**Pre-built binaries**
-
-Grab one from [GitHub Releases](https://github.com/rhoopr/kei/releases). macOS (Apple Silicon + Intel), Linux (ARM64 + x86_64), Windows (x86_64).
-
-**From source**
-
-```sh
-git clone https://github.com/rhoopr/kei.git kei && cd kei
-cargo build --release
-```
-
-Building requires a C++ compiler (already present via `build-essential` / Xcode CLT / VS Build Tools) because the XMP writer vendors Adobe's XMP Toolkit and compiles it from source. No other system libraries are required — HEIC metadata writes go through a pure-Rust ISO-BMFF writer, so `libheif` is not needed.
+Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, and other install paths, see the [wiki](https://github.com/rhoopr/kei/wiki).
 
 **FreeBSD**
 
@@ -70,7 +46,7 @@ cargo build --release --no-default-features
 The default `xmp` feature pulls in Adobe's vendored XMP Toolkit, which doesn't build on FreeBSD ([#256](https://github.com/rhoopr/kei/issues/256)). `--no-default-features` drops it along with the `--embed-xmp`, `--xmp-sidecar`, and `--set-exif-*` flags, and HEIC metadata writes. Download, auth, state tracking, and sidecar reads from other tools all work as usual.
 
 > [!IMPORTANT]
-> If you have Advanced Data Protection (ADP) enabled on your iCloud account, kei can't access your photos. ADP blocks the web API that kei uses. To fix this, you need to change both settings on your iPhone/iPad: disable ADP (Settings > Apple ID > iCloud > Advanced Data Protection) and enable "Access iCloud Data on the Web" (Settings > Apple ID > iCloud). See the [Authentication wiki](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp) for details.
+> kei can't access your photos if Advanced Data Protection is on. Turn ADP off and enable "Access iCloud Data on the Web" in your Apple ID settings. Details: [Authentication wiki](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
 
 ## Quick start
 
@@ -78,98 +54,18 @@ The default `xmp` feature pulls in Adobe's vendored XMP Toolkit, which doesn't b
 kei sync -u you@example.com -d ~/Photos/iCloud --save-password
 ```
 
-You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after. `--save-password` encrypts your password in the OS keyring (or an AES-256 file on headless systems), and kei saves your username and directory to `~/.config/kei/config.toml`, so subsequent runs are just:
+You'll be prompted for your password, then asked to approve 2FA on a trusted device. Downloads start right after. After the first run, just `kei sync` - username, directory, and password are all remembered.
 
-```sh
-kei sync
-```
-
-Or use the interactive wizard: `kei config setup`.
-
-For Docker, cron, and systemd setups, `--password-file` and `--password-command` give you more control over secret delivery. See the [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) wiki page.
-
-## Usage
-
-```sh
-# --- Filtering ---
-
-# Specific albums, skip videos, last 100 photos only
-kei sync --album "Favorites" --recent 100 --skip-videos
-
-# Everything except screenshots and AAE sidecars
-kei sync --exclude-album "Screenshots" --filename-exclude "*.AAE"
-
-# Only photos from 2024
-kei sync --skip-created-before "2024-01-01" --skip-created-after "2025-01-01"
-
-# Just the MOV clips from live photos, no stills
-kei sync --skip-photos --live-photo-mode video-only
-
-# --- Output control ---
-
-# Smaller files, organized by album and month, with EXIF dates stamped
-kei sync --size medium --folder-structure "{album}/%Y/%m" --set-exif-datetime
-
-# All libraries (personal + shared) in one run
-kei sync --library all
-
-# Keep syncing every hour
-kei sync --watch-with-interval 3600
-
-# Cap total download throughput (global across all workers)
-kei sync --bandwidth-limit 5M
-
-# --- Inspection ---
-
-# Print filenames to stdout (useful for piping)
-kei sync --only-print-filenames
-
-# Dry run (no writes to disk)
-kei sync --dry-run
-```
-
-Run `kei sync --help` for all flags, or see the [wiki](https://github.com/rhoopr/kei/wiki) for the full CLI reference.
-
-## How it works
-
-kei downloads on a streaming pipeline - it starts fetching files as soon as the first API page comes back, rather than waiting to enumerate the whole library. After the first full sync, it uses Apple's CloudKit syncToken to pull only what changed. A no-change check takes 1-2 API calls.
-
-Downloads run with configurable concurrency (default 10). Partial downloads are saved as `.kei-tmp` files and resumed via HTTP Range headers. Every file is verified against its expected size and content-type before being committed.
-
-State lives in a SQLite database alongside your session data (see `--data-dir`). The DB tracks what's been downloaded, what failed, and where files landed on disk.
-
-## Commands
-
-| Command | |
-|---|---|
-| `sync` | Download photos |
-| `login` | Authenticate and complete 2FA |
-| `list` | List albums or libraries |
-| `password` | Manage stored credentials (`set`, `clear`, `backend`) |
-| `config` | Show resolved config (`show`) or run the setup wizard (`setup`) |
-| `reset` | Delete state database (`state`) or clear sync tokens (`sync-token`) |
-| `status` | Show sync stats and database summary |
-| `verify` | Check downloads exist; `--checksums` for SHA256 |
-| `import-existing` | Import local files so they aren't re-downloaded |
-
-## Features
-
-- SQLite state tracking - never re-downloads what it already has
-- Watch mode with systemd notify, PID file, graceful shutdown
-- Multi-library sync (`--library all` for personal + shared)
-- Flexible password sources: prompt, env var, file, shell command, OS keyring
-- Content filtering: live photo mode, filename globs, album exclusions, date ranges, `--recent N`
-- Bandwidth cap with `--bandwidth-limit` (e.g. `10M`, `500K`, `2Mi`) - global across all concurrent downloads
-- Flexible folder structure with `{album}` token and full strftime support, EXIF datetime stamping
-- Multi-arch Docker images (amd64/arm64) with headless 2FA
-- Notification scripts on events (2FA required, sync complete, failures)
-- TOML config with env var overrides (`KEI_*`) for every flag
-- Structured exit codes (0 success, 2 partial, 3 auth) for scripting
+For a guided walkthrough, run `kei config setup` instead.
 
 ## Docs
 
-- [Wiki](https://github.com/rhoopr/kei/wiki) - full CLI reference, configuration, Docker, troubleshooting
-- [Migration Guide](docs/migration-from-python.md) - switching from `icloudpd`
+Everything else lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CLI reference, filtering and folder templates, watch mode, Docker Compose, credentials, troubleshooting, and more.
+
+- [Commands](https://github.com/rhoopr/kei/wiki/Home#commands) - `sync`, `login`, `list`, `password`, `config`, `reset`, `status`, `verify`, `import-existing`
+- [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) - TOML file, env vars, precedence
+- [Docker](https://github.com/rhoopr/kei/wiki/Docker) - Compose files and headless 2FA
+- [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) - keyring, encrypted file, password files and commands
 - [Changelog](CHANGELOG.md)
 - [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - deep dive on CloudKit syncTokens
 
@@ -178,8 +74,8 @@ State lives in a SQLite database alongside your session data (see `--data-dir`).
 Contributions welcome. Open an issue first if you're planning something big.
 
 ```sh
-just gate        # run the full pre-push gate (fmt, clippy, tests, doc, audit, typos)
-just --list      # see every recipe (test, dev, docker, cov, release, wt)
+just gate    # pre-push gate: fmt, clippy, tests, doc, audit, typos
+just --list  # see every recipe
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [tests/README.md](tests/README.md) for the test catalog.
