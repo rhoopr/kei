@@ -483,19 +483,25 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
     sd_notifier.notify_ready();
 
-    // Spawn the Prometheus metrics + /healthz server if --metrics-port is set.
-    // Binds synchronously so a bad port fails at startup rather than silently.
-    // Watch mode: a cycle completes at most once per interval. Flag /healthz
-    // as stale after two missed intervals (interval * 2) so a single slow
-    // cycle doesn't flip to 503 but a stuck main loop does.
+    // Spawn the HTTP server (/healthz + /metrics) only in watch mode.
+    // A one-shot sync exits before anything could scrape /healthz, so there
+    // is no value in binding the port. In watch mode, flag /healthz as stale
+    // after two missed intervals so a single slow cycle doesn't flip to 503
+    // but a stuck main loop does.
+    // Binds synchronously so a misconfigured port fails at startup.
     let staleness_threshold = config
         .watch_with_interval
         .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
-    let (metrics_handle, metrics_task) = config
-        .metrics_port
-        .map(|port| crate::metrics::spawn_server(port, shutdown_token.clone(), staleness_threshold))
-        .transpose()?
-        .map_or((None, None), |(h, t, _addr)| (Some(h), Some(t)));
+    let (metrics_handle, metrics_task) = if config.watch_with_interval.is_some() {
+        let (h, t, _addr) = crate::metrics::spawn_server(
+            config.http_port,
+            shutdown_token.clone(),
+            staleness_threshold,
+        )?;
+        (Some(h), Some(t))
+    } else {
+        (None, None)
+    };
 
     let mut health = health::HealthStatus::new();
     let mut consecutive_album_refresh_failures = 0u32;

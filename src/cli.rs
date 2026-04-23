@@ -284,11 +284,10 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_REPORT_JSON")]
     pub report_json: Option<std::path::PathBuf>,
 
-    /// Expose a Prometheus /metrics endpoint on this port (e.g. 9090).
-    /// Also serves a /healthz JSON endpoint on the same port.
-    /// When not set, no HTTP server is started.
-    #[arg(long, env = "KEI_METRICS_PORT", value_parser = clap::value_parser!(u16).range(1..))]
-    pub metrics_port: Option<u16>,
+    /// Port for the always-on HTTP server that serves `/healthz` and `/metrics` (default: 9090).
+    /// Set `KEI_HTTP_PORT` to override via environment.
+    #[arg(long, env = "KEI_HTTP_PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub http_port: Option<u16>,
 
     /// After successful auth, persist the password to the credential store
     /// (OS keyring or encrypted file).
