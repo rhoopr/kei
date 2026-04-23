@@ -383,7 +383,7 @@ fn import_existing_requires_directory() {
 
 #[test]
 fn boolean_sync_flags_accepted() {
-    for flag in [
+    let mut flags = vec![
         "--auth-only",
         "--list-albums",
         "--list-libraries",
@@ -391,14 +391,17 @@ fn boolean_sync_flags_accepted() {
         "--skip-photos",
         "--skip-live-photos",
         "--force-size",
-        "--set-exif-datetime",
         "--dry-run",
         "--no-progress-bar",
         "--keep-unicode-in-filenames",
         "--notify-systemd",
         "--no-incremental",
         "--reset-sync-token",
-    ] {
+    ];
+    if cfg!(feature = "xmp") {
+        flags.push("--set-exif-datetime");
+    }
+    for flag in flags {
         common::cmd()
             .args(["sync", flag, "--help"])
             .assert()

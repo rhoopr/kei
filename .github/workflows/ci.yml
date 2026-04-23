@@ -100,6 +100,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features
 
+  # Keeps the `--no-default-features` build honest so FreeBSD and any other
+  # platform without a working C++ toolchain for xmp_toolkit (see #256) can
+  # still build kei. Runs clippy + tests on the narrower surface; tests
+  # make sure we also catch runtime regressions, not just compile breaks.
+  test_no_default:
+    name: Test (no-default-features)
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo test --no-default-features
+
   # Runs the test suite on all major platforms to catch platform-specific bugs
   # fail-fast: false ensures all platforms run even if one fails
   test:

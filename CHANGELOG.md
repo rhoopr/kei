@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`KEI_METRICS_PORT` env var and `[metrics] port` TOML section.** Use `KEI_HTTP_PORT` and `[server] port` instead. The old spellings are still accepted and log a deprecation warning; they will be removed in a future release. ([#237], thanks @billimek)
 
+### Added
+
+- **`xmp` Cargo feature (default-on) to support builds without Adobe's XMP Toolkit.** `xmp_toolkit` vendors Adobe's C++ XMP Toolkit, which doesn't build on FreeBSD. Building with `cargo build --no-default-features` now compiles cleanly: it drops the `--embed-xmp`, `--xmp-sidecar`, `--set-exif-datetime`, `--set-exif-rating`, `--set-exif-gps`, and `--set-exif-description` flags (and the corresponding `[download]` TOML keys), and disables HEIC metadata writes. Download, auth, state tracking, magic-byte validation, and sidecar reads from other tools are unaffected. Default feature set is unchanged for every existing user. Also adds a FreeBSD target block for the `keyring` crate so the build doesn't fall through the OS-specific dependency matrix. ([#256], thanks @jan666)
+
+[#256]: https://github.com/rhoopr/kei/issues/256
+
 ### Fixed
 
 - **Spurious `File header does not match expected format` warning on live-photo MOVs.** The magic-byte check only accepted the ISO-BMFF `ftyp` box at offset 4 and warned on everything else. Apple serves live-photo and HEVC videos as classic QuickTime, which commonly begins with a `wide` padding atom (`00 00 00 08 77 69 64 65`) or an `mdat` data atom instead. The `.mov` branch now accepts `ftyp`, `wide`, `mdat`, `moov`, `free`, `skip`, and `pnot` - all valid QuickTime top-level atoms. `.heic`, `.heif`, `.mp4`, and `.m4v` remain strict ISO-BMFF (`ftyp` only). `.dng` now runs the TIFF magic check. Files were already being saved correctly; only the warning is gone. ([#247], thanks @woutervanwijk)

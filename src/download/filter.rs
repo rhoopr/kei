@@ -116,6 +116,7 @@ impl std::borrow::Borrow<str> for NormalizedPath {
 /// only sees fields a writer can actually use. Fields are owned (not borrowed)
 /// because the task moves across async boundaries.
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(not(feature = "xmp"), allow(dead_code))]
 pub(super) struct MetadataPayload {
     /// 1-5 star rating (mapped from `AssetMetadata::rating` or `is_favorite`).
     pub(super) rating: Option<u8>,
@@ -242,6 +243,7 @@ pub(super) struct DownloadTask {
     /// Metadata fields surfaced from `AssetMetadata` for writer consumption.
     /// Behind `Arc` so `task.metadata.clone()` in the download hot path is a
     /// refcount bump instead of a deep clone of every `Vec<String>` inside.
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     pub(super) metadata: Arc<MetadataPayload>,
     // 8-byte primitives
     pub(super) size: u64,

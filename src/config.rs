@@ -49,11 +49,17 @@ pub(crate) struct TomlDownload {
     pub threads_num: Option<u16>,
     pub bandwidth_limit: Option<String>,
     pub temp_suffix: Option<String>,
+    #[cfg(feature = "xmp")]
     pub set_exif_datetime: Option<bool>,
+    #[cfg(feature = "xmp")]
     pub set_exif_rating: Option<bool>,
+    #[cfg(feature = "xmp")]
     pub set_exif_gps: Option<bool>,
+    #[cfg(feature = "xmp")]
     pub set_exif_description: Option<bool>,
+    #[cfg(feature = "xmp")]
     pub embed_xmp: Option<bool>,
+    #[cfg(feature = "xmp")]
     pub xmp_sidecar: Option<bool>,
     pub no_progress_bar: Option<bool>,
     pub retry: Option<TomlRetry>,
@@ -338,11 +344,17 @@ pub struct Config {
     pub skip_videos: bool,
     pub skip_photos: bool,
     pub force_size: bool,
+    #[cfg(feature = "xmp")]
     pub set_exif_datetime: bool,
+    #[cfg(feature = "xmp")]
     pub set_exif_rating: bool,
+    #[cfg(feature = "xmp")]
     pub set_exif_gps: bool,
+    #[cfg(feature = "xmp")]
     pub set_exif_description: bool,
+    #[cfg(feature = "xmp")]
     pub embed_xmp: bool,
+    #[cfg(feature = "xmp")]
     pub xmp_sidecar: bool,
     pub dry_run: bool,
     pub no_progress_bar: bool,
@@ -677,20 +689,26 @@ impl Config {
             toml_dl.and_then(|d| d.temp_suffix.clone()),
             ".kei-tmp".to_string(),
         );
+        #[cfg(feature = "xmp")]
         let set_exif_datetime = resolve_flag(
             sync.set_exif_datetime,
             toml_dl.and_then(|d| d.set_exif_datetime),
         );
+        #[cfg(feature = "xmp")]
         let set_exif_rating = resolve_flag(
             sync.set_exif_rating,
             toml_dl.and_then(|d| d.set_exif_rating),
         );
+        #[cfg(feature = "xmp")]
         let set_exif_gps = resolve_flag(sync.set_exif_gps, toml_dl.and_then(|d| d.set_exif_gps));
+        #[cfg(feature = "xmp")]
         let set_exif_description = resolve_flag(
             sync.set_exif_description,
             toml_dl.and_then(|d| d.set_exif_description),
         );
+        #[cfg(feature = "xmp")]
         let embed_xmp = resolve_flag(sync.embed_xmp, toml_dl.and_then(|d| d.embed_xmp));
+        #[cfg(feature = "xmp")]
         let xmp_sidecar = resolve_flag(sync.xmp_sidecar, toml_dl.and_then(|d| d.xmp_sidecar));
         let no_progress_bar = resolve_flag(
             sync.no_progress_bar,
@@ -920,11 +938,17 @@ impl Config {
             skip_videos,
             skip_photos,
             force_size,
+            #[cfg(feature = "xmp")]
             set_exif_datetime,
+            #[cfg(feature = "xmp")]
             set_exif_rating,
+            #[cfg(feature = "xmp")]
             set_exif_gps,
+            #[cfg(feature = "xmp")]
             set_exif_description,
+            #[cfg(feature = "xmp")]
             embed_xmp,
+            #[cfg(feature = "xmp")]
             xmp_sidecar,
             dry_run: sync.dry_run,
             no_progress_bar,
@@ -980,23 +1004,29 @@ impl Config {
                 } else {
                     Some(self.temp_suffix.clone())
                 },
+                #[cfg(feature = "xmp")]
                 set_exif_datetime: if self.set_exif_datetime {
                     Some(true)
                 } else {
                     None
                 },
+                #[cfg(feature = "xmp")]
                 set_exif_rating: if self.set_exif_rating {
                     Some(true)
                 } else {
                     None
                 },
+                #[cfg(feature = "xmp")]
                 set_exif_gps: if self.set_exif_gps { Some(true) } else { None },
+                #[cfg(feature = "xmp")]
                 set_exif_description: if self.set_exif_description {
                     Some(true)
                 } else {
                     None
                 },
+                #[cfg(feature = "xmp")]
                 embed_xmp: if self.embed_xmp { Some(true) } else { None },
+                #[cfg(feature = "xmp")]
                 xmp_sidecar: if self.xmp_sidecar { Some(true) } else { None },
                 no_progress_bar: if self.no_progress_bar {
                     Some(true)
@@ -1166,11 +1196,17 @@ pub(crate) fn persist_first_run_config(
             threads_num: None,
             bandwidth_limit: None,
             temp_suffix: None,
+            #[cfg(feature = "xmp")]
             set_exif_datetime: None,
+            #[cfg(feature = "xmp")]
             set_exif_rating: None,
+            #[cfg(feature = "xmp")]
             set_exif_gps: None,
+            #[cfg(feature = "xmp")]
             set_exif_description: None,
+            #[cfg(feature = "xmp")]
             embed_xmp: None,
+            #[cfg(feature = "xmp")]
             xmp_sidecar: None,
             no_progress_bar: None,
             retry: None,
@@ -1348,7 +1384,6 @@ mod tests {
             folder_structure = "%Y/%m/%d"
             threads_num = 10
             temp_suffix = ".kei-tmp"
-            set_exif_datetime = true
             no_progress_bar = false
 
             [download.retry]
@@ -1700,6 +1735,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_build_boolean_flag_from_toml() {
         let toml_str = r#"
@@ -1721,6 +1757,7 @@ mod tests {
         assert!(cfg.skip_videos);
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_build_embed_xmp_and_sidecar_from_toml() {
         let toml_str = r#"
@@ -1740,6 +1777,7 @@ mod tests {
         assert!(cfg.xmp_sidecar);
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_cli_embed_xmp_overrides_toml() {
         let toml_str = r#"
@@ -1756,6 +1794,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_embed_xmp_default_false_when_unset() {
         let cfg =
@@ -2331,6 +2370,7 @@ mod tests {
         assert_eq!(config.auth.unwrap().password.as_deref(), Some("secret"));
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_toml_download_all_fields() {
         let toml_str = r#"
@@ -2605,6 +2645,7 @@ mod tests {
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
         assert_eq!(cfg.threads_num, 10);
         assert_eq!(cfg.temp_suffix, ".kei-tmp");
+        #[cfg(feature = "xmp")]
         assert!(!cfg.set_exif_datetime);
         assert!(!cfg.no_progress_bar);
         // Retry
@@ -3037,6 +3078,7 @@ mod tests {
 
     // ── Config::build: boolean flag merge exhaustive ───────────────
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_build_all_boolean_flags_from_toml() {
         let toml_str = r#"
@@ -3074,6 +3116,7 @@ mod tests {
         assert!(cfg.notify_systemd);
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_build_all_boolean_flags_cli_overrides() {
         let mut sync = default_sync();
@@ -3294,6 +3337,7 @@ mod tests {
 
     // ── Config::build: full TOML config ────────────────────────────
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_build_full_toml_all_sections() {
         let dir = tempfile::tempdir().unwrap();

@@ -59,6 +59,16 @@ cargo build --release
 
 Building requires a C++ compiler (already present via `build-essential` / Xcode CLT / VS Build Tools) because the XMP writer vendors Adobe's XMP Toolkit and compiles it from source. No other system libraries are required — HEIC metadata writes go through a pure-Rust ISO-BMFF writer, so `libheif` is not needed.
 
+**FreeBSD**
+
+```sh
+pkg install dbus
+git clone https://github.com/rhoopr/kei.git kei && cd kei
+cargo build --release --no-default-features
+```
+
+The default `xmp` feature pulls in Adobe's vendored XMP Toolkit, which doesn't build on FreeBSD ([#256](https://github.com/rhoopr/kei/issues/256)). `--no-default-features` drops it along with the `--embed-xmp`, `--xmp-sidecar`, and `--set-exif-*` flags, and HEIC metadata writes. Download, auth, state tracking, and sidecar reads from other tools all work as usual.
+
 > [!IMPORTANT]
 > If you have Advanced Data Protection (ADP) enabled on your iCloud account, kei can't access your photos. ADP blocks the web API that kei uses. To fix this, you need to change both settings on your iPhone/iPad: disable ADP (Settings > Apple ID > iCloud > Advanced Data Protection) and enable "Access iCloud Data on the Web" (Settings > Apple ID > iCloud). See the [Authentication wiki](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp) for details.
 

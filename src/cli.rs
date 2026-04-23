@@ -181,29 +181,35 @@ pub struct SyncArgs {
     pub folder_structure: Option<String>,
 
     /// Write `DateTimeOriginal` EXIF tag if missing
+    #[cfg(feature = "xmp")]
     #[arg(long, env = "KEI_SET_EXIF_DATETIME", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub set_exif_datetime: Option<bool>,
 
     /// Write EXIF `Rating` tag (0x4746) for favorited photos (1-5 scale)
+    #[cfg(feature = "xmp")]
     #[arg(long, env = "KEI_SET_EXIF_RATING", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub set_exif_rating: Option<bool>,
 
     /// Write EXIF GPS tags from iCloud location metadata (only when the file lacks GPS)
+    #[cfg(feature = "xmp")]
     #[arg(long, env = "KEI_SET_EXIF_GPS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub set_exif_gps: Option<bool>,
 
     /// Write EXIF `ImageDescription` tag from iCloud description / title
+    #[cfg(feature = "xmp")]
     #[arg(long, env = "KEI_SET_EXIF_DESCRIPTION", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub set_exif_description: Option<bool>,
 
     /// Embed a full XMP packet (title, keywords, album memberships, people,
     /// hidden/archived, media subtype, burst id) into downloaded media bytes
     /// on supported formats (JPEG/HEIC/PNG/TIFF/MP4/MOV)
+    #[cfg(feature = "xmp")]
     #[arg(long, env = "KEI_EMBED_XMP", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub embed_xmp: Option<bool>,
 
     /// Write a `.xmp` sidecar file next to each downloaded media file with
     /// every available metadata field
+    #[cfg(feature = "xmp")]
     #[arg(long, env = "KEI_XMP_SIDECAR", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub xmp_sidecar: Option<bool>,
 
@@ -676,23 +682,26 @@ impl SyncArgs {
         if self.folder_structure.is_none() {
             self.folder_structure.clone_from(&fallback.folder_structure);
         }
-        if self.set_exif_datetime.is_none() {
-            self.set_exif_datetime = fallback.set_exif_datetime;
-        }
-        if self.set_exif_rating.is_none() {
-            self.set_exif_rating = fallback.set_exif_rating;
-        }
-        if self.set_exif_gps.is_none() {
-            self.set_exif_gps = fallback.set_exif_gps;
-        }
-        if self.set_exif_description.is_none() {
-            self.set_exif_description = fallback.set_exif_description;
-        }
-        if self.embed_xmp.is_none() {
-            self.embed_xmp = fallback.embed_xmp;
-        }
-        if self.xmp_sidecar.is_none() {
-            self.xmp_sidecar = fallback.xmp_sidecar;
+        #[cfg(feature = "xmp")]
+        {
+            if self.set_exif_datetime.is_none() {
+                self.set_exif_datetime = fallback.set_exif_datetime;
+            }
+            if self.set_exif_rating.is_none() {
+                self.set_exif_rating = fallback.set_exif_rating;
+            }
+            if self.set_exif_gps.is_none() {
+                self.set_exif_gps = fallback.set_exif_gps;
+            }
+            if self.set_exif_description.is_none() {
+                self.set_exif_description = fallback.set_exif_description;
+            }
+            if self.embed_xmp.is_none() {
+                self.embed_xmp = fallback.embed_xmp;
+            }
+            if self.xmp_sidecar.is_none() {
+                self.xmp_sidecar = fallback.xmp_sidecar;
+            }
         }
         self.dry_run = self.dry_run || fallback.dry_run;
         if self.watch_with_interval.is_none() {
@@ -1685,6 +1694,7 @@ mod tests {
         assert_eq!(cli.sync.force_size, Some(true));
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_set_exif_datetime_flag() {
         let mut args = base_args();
@@ -1693,6 +1703,7 @@ mod tests {
         assert_eq!(cli.sync.set_exif_datetime, Some(true));
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_embed_xmp_flag() {
         let mut args = base_args();
@@ -1701,6 +1712,7 @@ mod tests {
         assert_eq!(cli.sync.embed_xmp, Some(true));
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_embed_xmp_flag_explicit_false() {
         let mut args = base_args();
@@ -1709,6 +1721,7 @@ mod tests {
         assert_eq!(cli.sync.embed_xmp, Some(false));
     }
 
+    #[cfg(feature = "xmp")]
     #[test]
     fn test_xmp_sidecar_flag() {
         let mut args = base_args();

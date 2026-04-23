@@ -6,8 +6,10 @@
 pub mod error;
 pub mod file;
 pub(crate) mod filter;
+#[cfg(feature = "xmp")]
 pub(crate) mod heif;
 pub(crate) mod limiter;
+#[cfg(feature = "xmp")]
 pub mod metadata;
 pub mod paths;
 pub(crate) mod pipeline;
@@ -382,15 +384,21 @@ pub(crate) struct DownloadConfig {
     pub(crate) skip_photos: bool,
     pub(crate) skip_created_before: Option<DateTime<Utc>>,
     pub(crate) skip_created_after: Option<DateTime<Utc>>,
+    #[cfg(feature = "xmp")]
     pub(crate) set_exif_datetime: bool,
+    #[cfg(feature = "xmp")]
     pub(crate) set_exif_rating: bool,
+    #[cfg(feature = "xmp")]
     pub(crate) set_exif_gps: bool,
+    #[cfg(feature = "xmp")]
     pub(crate) set_exif_description: bool,
     /// Embed the full XMP packet (title, keywords, people, hidden/archived,
     /// media subtype, burst id) into the file bytes on supported formats.
+    #[cfg(feature = "xmp")]
     pub(crate) embed_xmp: bool,
     /// Write a `.xmp` sidecar file next to each downloaded media file with
     /// the same composed XMP packet.
+    #[cfg(feature = "xmp")]
     pub(crate) xmp_sidecar: bool,
     pub(crate) dry_run: bool,
     pub(crate) concurrent_downloads: usize,
@@ -502,21 +510,22 @@ impl DownloadConfig {
 
 impl std::fmt::Debug for DownloadConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DownloadConfig")
-            .field("directory", &self.directory)
+        let mut s = f.debug_struct("DownloadConfig");
+        s.field("directory", &self.directory)
             .field("folder_structure", &self.folder_structure)
             .field("size", &self.size)
             .field("skip_videos", &self.skip_videos)
             .field("skip_photos", &self.skip_photos)
             .field("skip_created_before", &self.skip_created_before)
-            .field("skip_created_after", &self.skip_created_after)
-            .field("set_exif_datetime", &self.set_exif_datetime)
+            .field("skip_created_after", &self.skip_created_after);
+        #[cfg(feature = "xmp")]
+        s.field("set_exif_datetime", &self.set_exif_datetime)
             .field("set_exif_rating", &self.set_exif_rating)
             .field("set_exif_gps", &self.set_exif_gps)
             .field("set_exif_description", &self.set_exif_description)
             .field("embed_xmp", &self.embed_xmp)
-            .field("xmp_sidecar", &self.xmp_sidecar)
-            .field("dry_run", &self.dry_run)
+            .field("xmp_sidecar", &self.xmp_sidecar);
+        s.field("dry_run", &self.dry_run)
             .field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
             .field("retry", &self.retry)
@@ -558,11 +567,17 @@ impl DownloadConfig {
             skip_photos: false,
             skip_created_before: None,
             skip_created_after: None,
+            #[cfg(feature = "xmp")]
             set_exif_datetime: false,
+            #[cfg(feature = "xmp")]
             set_exif_rating: false,
+            #[cfg(feature = "xmp")]
             set_exif_gps: false,
+            #[cfg(feature = "xmp")]
             set_exif_description: false,
+            #[cfg(feature = "xmp")]
             embed_xmp: false,
+            #[cfg(feature = "xmp")]
             xmp_sidecar: false,
             dry_run: false,
             concurrent_downloads: 1,
@@ -611,11 +626,13 @@ struct DownloadContext {
     /// Nested map: `asset_id` -> (`version_size` -> metadata_hash) for downloaded assets.
     /// Used to detect metadata-only changes (favorite toggle, keywords, GPS edit,
     /// etc.) when file bytes are unchanged but the provider has newer metadata.
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
     /// Nested map: `asset_id` -> set of `version_sizes` with a non-null
     /// `metadata_write_failed_at` from a prior sync. These always route to
     /// the metadata-rewrite path regardless of whether the hash changed.
     /// Two-level shape matches `downloaded_ids` for zero-allocation lookups.
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     metadata_retry_markers: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced.
@@ -739,6 +756,7 @@ impl DownloadContext {
     /// checks whether (a) the stored metadata_hash differs from the new
     /// one or (b) a persisted retry marker is set from a prior sync where
     /// the writer failed after bytes landed.
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     fn needs_metadata_rewrite(
         &self,
         asset_id: &str,
@@ -2146,11 +2164,17 @@ mod tests {
             skip_videos: false,
             skip_photos: false,
             force_size: false,
+            #[cfg(feature = "xmp")]
             set_exif_datetime: false,
+            #[cfg(feature = "xmp")]
             set_exif_rating: false,
+            #[cfg(feature = "xmp")]
             set_exif_gps: false,
+            #[cfg(feature = "xmp")]
             set_exif_description: false,
+            #[cfg(feature = "xmp")]
             embed_xmp: false,
+            #[cfg(feature = "xmp")]
             xmp_sidecar: false,
             dry_run: false,
             no_progress_bar: true,
@@ -2662,7 +2686,10 @@ mod tests {
         config.force_size = true;
         config.keep_unicode_in_filenames = true;
         config.dry_run = true;
-        config.set_exif_datetime = true;
+        #[cfg(feature = "xmp")]
+        {
+            config.set_exif_datetime = true;
+        }
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
         config.temp_suffix = ".custom-tmp".to_string();
         let derived = config.with_album_name(Arc::from("Test"));
@@ -2672,6 +2699,7 @@ mod tests {
         assert!(derived.force_size);
         assert!(derived.keep_unicode_in_filenames);
         assert!(derived.dry_run);
+        #[cfg(feature = "xmp")]
         assert!(derived.set_exif_datetime);
         assert_eq!(derived.filename_exclude.len(), 1);
         assert_eq!(derived.temp_suffix, ".custom-tmp");

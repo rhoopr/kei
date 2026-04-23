@@ -67,6 +67,7 @@ struct SetupAnswers {
     max_retries: Option<u32>,
     retry_delay: Option<u64>,
     keep_unicode_in_filenames: bool,
+    #[cfg(feature = "xmp")]
     set_exif_datetime: bool,
     file_match_policy: Option<FileMatchPolicy>,
     cookie_directory: Option<String>,
@@ -100,6 +101,7 @@ impl Default for SetupAnswers {
             max_retries: None,
             retry_delay: None,
             keep_unicode_in_filenames: false,
+            #[cfg(feature = "xmp")]
             set_exif_datetime: false,
             file_match_policy: None,
             cookie_directory: None,
@@ -606,10 +608,13 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .default(false)
         .interact()?;
 
-    answers.set_exif_datetime = Confirm::new()
-        .with_prompt("Write EXIF date tag if missing from photo?")
-        .default(false)
-        .interact()?;
+    #[cfg(feature = "xmp")]
+    {
+        answers.set_exif_datetime = Confirm::new()
+            .with_prompt("Write EXIF date tag if missing from photo?")
+            .default(false)
+            .interact()?;
+    }
 
     // Dedup
     println!();
@@ -708,14 +713,17 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         Some(n) => writeln!(out, "threads_num = {n}").ok(),
         None => writeln!(out, "# threads_num = 10").ok(),
     };
-    if answers.set_exif_datetime {
-        writeln!(out, "set_exif_datetime = true").ok();
-    } else {
-        writeln!(out, "# set_exif_datetime = false").ok();
+    #[cfg(feature = "xmp")]
+    {
+        if answers.set_exif_datetime {
+            writeln!(out, "set_exif_datetime = true").ok();
+        } else {
+            writeln!(out, "# set_exif_datetime = false").ok();
+        }
+        writeln!(out, "# set_exif_rating = false").ok();
+        writeln!(out, "# set_exif_gps = false").ok();
+        writeln!(out, "# set_exif_description = false").ok();
     }
-    writeln!(out, "# set_exif_rating = false").ok();
-    writeln!(out, "# set_exif_gps = false").ok();
-    writeln!(out, "# set_exif_description = false").ok();
     writeln!(out, "# temp_suffix = \".kei-tmp\"").ok();
     writeln!(out, "# no_progress_bar = false").ok();
 
@@ -963,6 +971,7 @@ mod tests {
             max_retries: Some(5),
             retry_delay: Some(10),
             keep_unicode_in_filenames: true,
+            #[cfg(feature = "xmp")]
             set_exif_datetime: true,
             file_match_policy: Some(FileMatchPolicy::NameId7),
             cookie_directory: Some("~/.cookies".to_string()),
@@ -984,6 +993,7 @@ mod tests {
         assert!(toml_str.contains("threads_num = 4"));
         assert!(toml_str.contains("file_match_policy = \"name-id7\""));
         assert!(toml_str.contains("log_level = \"debug\""));
+        #[cfg(feature = "xmp")]
         assert!(toml_str.contains("set_exif_datetime = true"));
         assert!(toml_str.contains("keep_unicode_in_filenames = true"));
         assert!(toml_str.contains("cookie_directory = \"~/.cookies\""));
@@ -1021,6 +1031,7 @@ mod tests {
             max_retries: Some(0),
             retry_delay: Some(1),
             keep_unicode_in_filenames: true,
+            #[cfg(feature = "xmp")]
             set_exif_datetime: true,
             file_match_policy: Some(FileMatchPolicy::NameId7),
             cookie_directory: Some("/tmp/cookies".to_string()),
@@ -1039,6 +1050,7 @@ mod tests {
         assert_eq!(dl.directory.as_deref(), Some("/data/photos"));
         assert_eq!(dl.folder_structure.as_deref(), Some("%Y-%m"));
         assert_eq!(dl.threads_num, Some(2));
+        #[cfg(feature = "xmp")]
         assert_eq!(dl.set_exif_datetime, Some(true));
         let retry = dl.retry.unwrap();
         assert_eq!(retry.max_retries, Some(0));

@@ -7,6 +7,16 @@ edition = "2021"
 name = "kei"
 path = "src/main.rs"
 
+[features]
+# XMP metadata embedding + sidecar writing. Default-on; build with
+# `--no-default-features` on platforms where Adobe's vendored C++ XMP
+# Toolkit does not compile (notably FreeBSD — see #256). Disabling drops
+# the `--embed-xmp`, `--xmp-sidecar`, and `--set-exif-*` CLI flags and the
+# code paths behind them; HEIC container edits go with it because the
+# XMP packet serializer lives in xmp_toolkit.
+default = ["xmp"]
+xmp = ["dep:xmp_toolkit"]
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -62,7 +72,9 @@ dialoguer = "0.12"
 # Handles JPEG, PNG, TIFF, MP4, MOV, PSD, PDF, and more via XMPFiles.
 # Does NOT handle HEIC — the bundled XMPFiles has no HEIF handler, so HEIC
 # embedded XMP is handled separately via libheif-rs.
-xmp_toolkit = "1"
+# Optional (behind the `xmp` feature, default-on) so platforms without a
+# working C++ toolchain for the vendored sources can opt out. See #256.
+xmp_toolkit = { version = "1", optional = true }
 
 # ISO-BMFF (MP4 / HEIF / HEIC) atom parsing + encoding. HEIC's XMP packet
 # lives in a `mime`-type item inside the `meta` box; mp4-atom gives us the
@@ -108,6 +120,12 @@ keyring = { version = "3", features = ["apple-native"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
 sd-notify = "0.5"
+
+# FreeBSD: Secret Service D-Bus API is available via ports (dbus + a
+# keyring daemon like gnome-keyring or KWallet). If no daemon is running,
+# `CredentialStore` falls back to the encrypted file backend. See #256.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }

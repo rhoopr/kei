@@ -604,6 +604,7 @@ fn sync_keep_unicode_preserves_special_chars() {
 // ── EXIF ────────────────────────────────────────────────────────────────
 
 /// --set-exif-datetime should embed DateTimeOriginal in downloaded JPEG files.
+#[cfg(feature = "xmp")]
 #[test]
 #[ignore]
 fn sync_set_exif_datetime_embeds_date() {
@@ -651,6 +652,7 @@ fn sync_set_exif_datetime_embeds_date() {
 /// --set-exif-rating should add a Rating property (value depends on the
 /// source photo; we assert the sync succeeds and the resulting JPEG has
 /// a writable XMP packet).
+#[cfg(feature = "xmp")]
 #[test]
 #[ignore]
 fn sync_set_exif_rating_embeds_rating() {
@@ -680,6 +682,7 @@ fn sync_set_exif_rating_embeds_rating() {
 /// --set-exif-gps embeds GPSLatitude/GPSLongitude when the source photo
 /// carries location data. Sync must succeed either way; we only assert
 /// an XMP packet exists.
+#[cfg(feature = "xmp")]
 #[test]
 #[ignore]
 fn sync_set_exif_gps_embeds_gps() {
@@ -709,6 +712,7 @@ fn sync_set_exif_gps_embeds_gps() {
 /// --set-exif-description embeds a dc:description when the source has
 /// one. Sync must succeed either way; we only assert an XMP packet
 /// exists.
+#[cfg(feature = "xmp")]
 #[test]
 #[ignore]
 fn sync_set_exif_description_embeds_description() {
@@ -737,6 +741,7 @@ fn sync_set_exif_description_embeds_description() {
 
 /// --embed-xmp writes a full kei-authored XMP packet into the JPEG. Verify
 /// the file carries XMP content that references kei's own namespace URI.
+#[cfg(feature = "xmp")]
 #[test]
 #[ignore]
 fn sync_embed_xmp_writes_xmp_packet() {
@@ -771,6 +776,7 @@ fn sync_embed_xmp_writes_xmp_packet() {
 
 /// --xmp-sidecar writes a .xmp sidecar next to every downloaded media file.
 /// Verify at least one `.xmp` sits next to a downloaded JPEG.
+#[cfg(feature = "xmp")]
 #[test]
 #[ignore]
 fn sync_xmp_sidecar_writes_sidecar_file() {
@@ -864,6 +870,7 @@ fn sync_embed_xmp_on_heic_writes_mime_item() {
 
 /// Find the first downloaded JPEG in `dir`. Panics with a clear message if
 /// none is present — the test album must contain at least one JPEG.
+#[cfg(feature = "xmp")]
 fn first_jpeg(dir: &&std::path::Path) -> std::path::PathBuf {
     let files = common::walkdir(dir);
     files

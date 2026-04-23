@@ -113,12 +113,30 @@ impl RunOptions {
             library: format!("{:?}", config.library).to_lowercase(),
             skip_videos: config.skip_videos,
             skip_photos: config.skip_photos,
+            #[cfg(feature = "xmp")]
             set_exif_datetime: config.set_exif_datetime,
+            #[cfg(not(feature = "xmp"))]
+            set_exif_datetime: false,
+            #[cfg(feature = "xmp")]
             set_exif_rating: config.set_exif_rating,
+            #[cfg(not(feature = "xmp"))]
+            set_exif_rating: false,
+            #[cfg(feature = "xmp")]
             set_exif_gps: config.set_exif_gps,
+            #[cfg(not(feature = "xmp"))]
+            set_exif_gps: false,
+            #[cfg(feature = "xmp")]
             set_exif_description: config.set_exif_description,
+            #[cfg(not(feature = "xmp"))]
+            set_exif_description: false,
+            #[cfg(feature = "xmp")]
             embed_xmp: config.embed_xmp,
+            #[cfg(not(feature = "xmp"))]
+            embed_xmp: false,
+            #[cfg(feature = "xmp")]
             xmp_sidecar: config.xmp_sidecar,
+            #[cfg(not(feature = "xmp"))]
+            xmp_sidecar: false,
             threads_num: config.threads_num,
             no_incremental: config.no_incremental,
             dry_run: config.dry_run,

@@ -231,9 +231,11 @@ pub trait StateDb: Send + Sync {
     /// Bulk-load every `(asset_id, album_name)` from `asset_albums`. Used at
     /// sync start to populate the in-memory groupings index — downstream
     /// writers look up album memberships without a per-asset DB hit.
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError>;
 
     /// Bulk-load every `(asset_id, person_name)` from `asset_people`.
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError>;
 
     /// Mark an asset as soft-deleted (all versions under `asset_id`).
@@ -279,6 +281,7 @@ pub trait StateDb: Send + Sync {
     /// rewrite marker AND have a local_path pointing at an on-disk file.
     /// Used by the metadata-rewrite worker to re-apply EXIF/XMP without
     /// re-downloading bytes.
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     async fn get_pending_metadata_rewrites(
         &self,
         limit: usize,
@@ -286,6 +289,7 @@ pub trait StateDb: Send + Sync {
 
     /// Update just the `metadata_hash` column for an asset-version pair
     /// after a successful metadata rewrite. Leaves every other column alone.
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     async fn update_metadata_hash(
         &self,
         asset_id: &str,

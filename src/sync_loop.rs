@@ -422,11 +422,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             skip_photos: config.skip_photos,
             skip_created_before,
             skip_created_after,
+            #[cfg(feature = "xmp")]
             set_exif_datetime: config.set_exif_datetime,
+            #[cfg(feature = "xmp")]
             set_exif_rating: config.set_exif_rating,
+            #[cfg(feature = "xmp")]
             set_exif_gps: config.set_exif_gps,
+            #[cfg(feature = "xmp")]
             set_exif_description: config.set_exif_description,
+            #[cfg(feature = "xmp")]
             embed_xmp: config.embed_xmp,
+            #[cfg(feature = "xmp")]
             xmp_sidecar: config.xmp_sidecar,
             dry_run: config.dry_run,
             concurrent_downloads: config.threads_num as usize,
@@ -982,11 +988,14 @@ async fn run_cycle(
         tracing::debug!(sync_mode = sync_mode_label, zone = %lib_state.zone_name, "Starting sync cycle");
 
         // Skip the DB scan entirely when nothing downstream will read it.
+        #[cfg(feature = "xmp")]
         let asset_groupings = if config.embed_xmp || config.xmp_sidecar {
             preload_asset_groupings(state_db).await
         } else {
             Arc::new(download::AssetGroupings::default())
         };
+        #[cfg(not(feature = "xmp"))]
+        let asset_groupings = Arc::new(download::AssetGroupings::default());
         // Each pass carries its own exclude-asset-ids, so the config built
         // here starts with an empty set; download_photos_with_sync derives
         // per-pass configs internally via `with_exclude_ids`.
@@ -1082,6 +1091,7 @@ async fn run_cycle(
 /// Returns `true` when no zones report changes and `moreComing` is false.
 /// Bulk-load `asset_albums` + `asset_people` into an in-memory index so the
 /// filter phase can enrich payloads without per-asset DB hits.
+#[cfg(feature = "xmp")]
 async fn preload_asset_groupings(
     state_db: &Option<Arc<dyn state::StateDb>>,
 ) -> Arc<download::AssetGroupings> {
