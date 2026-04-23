@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.11.0] - 2026-04-22
+
+### Added
+
+- **Always-on `/healthz` and `/metrics` HTTP server in watch mode.** Running with `--watch` now starts an HTTP server on port 9090 (default) exposing both `/healthz` (JSON health status) and `/metrics` (Prometheus text format) with no extra flag. One-shot syncs skip the server since the process exits before anything could scrape it. The Docker image's `HEALTHCHECK` now uses `curl -f http://localhost:9090/healthz` instead of parsing `health.json` with `jq`, and `jq` has been removed from the runtime image. The default `CMD` gains `--watch 24h` so the healthcheck has something to probe out of the box; override `CMD` to run a one-shot. ([#237], thanks @billimek)
+
+### Changed
+
+- **`--metrics-port` renamed to `--http-port`.** The flag now sets the server port rather than gating whether the server runs. Default is 9090. ([#237], thanks @billimek)
+
+### Deprecated
+
+- **`KEI_METRICS_PORT` env var and `[metrics] port` TOML section.** Use `KEI_HTTP_PORT` and `[server] port` instead. The old spellings are still accepted and log a deprecation warning; they will be removed in a future release. ([#237], thanks @billimek)
 
 ### Added
 
@@ -19,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Spurious `File header does not match expected format` warning on live-photo MOVs.** The magic-byte check only accepted the ISO-BMFF `ftyp` box at offset 4 and warned on everything else. Apple serves live-photo and HEVC videos as classic QuickTime, which commonly begins with a `wide` padding atom (`00 00 00 08 77 69 64 65`) or an `mdat` data atom instead. The `.mov` branch now accepts `ftyp`, `wide`, `mdat`, `moov`, `free`, `skip`, and `pnot` - all valid QuickTime top-level atoms. `.heic`, `.heif`, `.mp4`, and `.m4v` remain strict ISO-BMFF (`ftyp` only). `.dng` now runs the TIFF magic check. Files were already being saved correctly; only the warning is gone. ([#247], thanks @woutervanwijk)
 
+[#237]: https://github.com/rhoopr/kei/pull/237
 [#247]: https://github.com/rhoopr/kei/issues/247
 
 ---
