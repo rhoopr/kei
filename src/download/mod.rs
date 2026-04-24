@@ -619,34 +619,35 @@ impl DownloadConfig {
 /// in-memory lookups instead of per-asset DB queries. For 100K+ asset
 /// libraries, this significantly reduces DB roundtrips.
 ///
-/// Uses a two-level map structure (`asset_id` -> `version_sizes`) to enable
-/// zero-allocation lookups via `&str` keys, avoiding the need to allocate
-/// `(String, String)` tuples for each lookup.
+/// Asset-id keys are `Arc<str>` rather than `Box<str>` so the same id
+/// allocation is shared across every map here (and with the producer's
+/// seen-ids / touched-ids sets). On a 100k-asset library this collapses
+/// ~4-6 independent `Box<str>` allocations per asset into one.
 #[derive(Debug, Default)]
 struct DownloadContext {
     /// Nested map: `asset_id` -> set of `version_sizes` that are already downloaded.
     /// Two-level structure enables O(1) borrowed lookups without allocation.
-    downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
+    downloaded_ids: FxHashMap<Arc<str>, FxHashSet<Box<str>>>,
     /// Nested map: `asset_id` -> (`version_size` -> checksum) for downloaded assets.
     /// Used to detect checksum changes (iCloud asset updated) without DB queries.
-    downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
+    downloaded_checksums: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>,
     /// Nested map: `asset_id` -> (`version_size` -> metadata_hash) for downloaded assets.
     /// Used to detect metadata-only changes (favorite toggle, keywords, GPS edit,
     /// etc.) when file bytes are unchanged but the provider has newer metadata.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
+    downloaded_metadata_hashes: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>,
     /// Nested map: `asset_id` -> set of `version_sizes` with a non-null
     /// `metadata_write_failed_at` from a prior sync. These always route to
     /// the metadata-rewrite path regardless of whether the hash changed.
     /// Two-level shape matches `downloaded_ids` for zero-allocation lookups.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    metadata_retry_markers: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
+    metadata_retry_markers: FxHashMap<Arc<str>, FxHashSet<Box<str>>>,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced.
-    known_ids: FxHashSet<Box<str>>,
+    known_ids: FxHashSet<Arc<str>>,
     /// Per-asset maximum download attempt count (from failed assets).
     /// Used to skip assets that have exceeded `max_download_attempts`.
-    attempt_counts: FxHashMap<Box<str>, u32>,
+    attempt_counts: FxHashMap<Arc<str>, u32>,
 }
 
 impl DownloadContext {
@@ -700,53 +701,75 @@ impl DownloadContext {
             known_ids_fut,
         );
 
-        let mut downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>> = FxHashMap::default();
+        // Shared interner so the same asset_id allocates exactly one
+        // `Arc<str>` across every map below (and is cheaply cloneable
+        // into each via Arc::clone). This collapses the former 4-6
+        // independent `String -> Box<str>` conversions per id into one.
+        let mut interner: FxHashMap<String, Arc<str>> = FxHashMap::default();
+        let intern = |interner: &mut FxHashMap<String, Arc<str>>, s: String| -> Arc<str> {
+            if let Some(existing) = interner.get(&s) {
+                return Arc::clone(existing);
+            }
+            let a: Arc<str> = Arc::from(s.as_str());
+            interner.insert(s, Arc::clone(&a));
+            a
+        };
+
+        let mut downloaded_ids: FxHashMap<Arc<str>, FxHashSet<Box<str>>> = FxHashMap::default();
         for (asset_id, version_size) in ids {
+            let id = intern(&mut interner, asset_id);
             downloaded_ids
-                .entry(asset_id.into_boxed_str())
+                .entry(id)
                 .or_default()
                 .insert(version_size.into_boxed_str());
         }
 
-        let mut downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
+        let mut downloaded_checksums: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
         for ((asset_id, version_size), checksum) in checksums {
+            let id = intern(&mut interner, asset_id);
             downloaded_checksums
-                .entry(asset_id.into_boxed_str())
+                .entry(id)
                 .or_default()
                 .insert(version_size.into_boxed_str(), checksum.into_boxed_str());
         }
 
-        let mut downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
+        let mut downloaded_metadata_hashes: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
         for ((asset_id, version_size), metadata_hash) in hashes {
-            downloaded_metadata_hashes
-                .entry(asset_id.into_boxed_str())
-                .or_default()
-                .insert(
-                    version_size.into_boxed_str(),
-                    metadata_hash.into_boxed_str(),
-                );
+            let id = intern(&mut interner, asset_id);
+            downloaded_metadata_hashes.entry(id).or_default().insert(
+                version_size.into_boxed_str(),
+                metadata_hash.into_boxed_str(),
+            );
         }
 
         // Two-level shape matches downloaded_ids so lookups are O(1) with
         // borrowed keys instead of allocating a tuple per probe.
-        let mut metadata_retry_markers: FxHashMap<Box<str>, FxHashSet<Box<str>>> =
+        let mut metadata_retry_markers: FxHashMap<Arc<str>, FxHashSet<Box<str>>> =
             FxHashMap::default();
         for (id, vs) in markers {
+            let id = intern(&mut interner, id);
             metadata_retry_markers
-                .entry(id.into_boxed_str())
+                .entry(id)
                 .or_default()
                 .insert(vs.into_boxed_str());
         }
 
-        let known_ids: FxHashSet<Box<str>> =
-            known_ids.into_iter().map(String::into_boxed_str).collect();
-
-        let attempt_counts: FxHashMap<Box<str>, u32> = attempts
+        let known_ids: FxHashSet<Arc<str>> = known_ids
             .into_iter()
-            .map(|(id, count)| (id.into_boxed_str(), count))
+            .map(|id| intern(&mut interner, id))
             .collect();
+
+        let attempt_counts: FxHashMap<Arc<str>, u32> = attempts
+            .into_iter()
+            .map(|(id, count)| (intern(&mut interner, id), count))
+            .collect();
+
+        // Drop the interner: every `Arc<str>` it minted is now owned by
+        // one of the maps above, so the temporary `String` keys can be
+        // freed without breaking the `Arc` reference graph.
+        drop(interner);
 
         Self {
             downloaded_ids,
