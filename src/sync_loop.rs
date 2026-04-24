@@ -543,7 +543,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                                  asset_groupings: Arc<download::AssetGroupings>|
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
-            directory: config.directory.clone(),
+            directory: Arc::from(config.directory.as_path()),
             folder_structure: config.folder_structure.clone(),
             size: config.size.into(),
             skip_videos: config.skip_videos,
@@ -575,8 +575,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             file_match_policy: config.file_match_policy,
             force_size: config.force_size,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,
-            filename_exclude: config.filename_exclude.clone(),
-            temp_suffix: config.temp_suffix.clone(),
+            filename_exclude: Arc::from(config.filename_exclude.clone()),
+            temp_suffix: Arc::from(config.temp_suffix.as_str()),
             state_db: state_db.clone(),
             retry_only: is_retry_failed,
             max_download_attempts,

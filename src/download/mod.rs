@@ -29,6 +29,7 @@ use filter::{
     NormalizedPath,
 };
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -377,7 +378,10 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
 pub(crate) struct DownloadConfig {
-    pub(crate) directory: std::path::PathBuf,
+    /// Behind `Arc` so per-pass clones (`with_album_name`, `with_pass`,
+    /// `with_exclude_ids`) refcount-bump instead of deep-cloning the
+    /// PathBuf. Same pattern as `asset_groupings` and `exclude_asset_ids`.
+    pub(crate) directory: Arc<Path>,
     pub(crate) folder_structure: String,
     pub(crate) size: AssetVersionSize,
     pub(crate) skip_videos: bool,
@@ -414,9 +418,12 @@ pub(crate) struct DownloadConfig {
     pub(crate) force_size: bool,
     pub(crate) keep_unicode_in_filenames: bool,
     /// Compiled glob patterns for filename exclusion.
-    pub(crate) filename_exclude: Vec<glob::Pattern>,
+    ///
+    /// Behind `Arc<[_]>` so per-pass clones share one allocation
+    /// (significant with `-a all` over 100+ albums).
+    pub(crate) filename_exclude: Arc<[glob::Pattern]>,
     /// Temp file suffix for partial downloads (e.g. `.kei-tmp`).
-    pub(crate) temp_suffix: String,
+    pub(crate) temp_suffix: Arc<str>,
     /// State database for tracking download progress.
     pub(crate) state_db: Option<Arc<dyn StateDb>>,
     /// When true (retry-failed mode), only download assets already known to the
@@ -464,10 +471,10 @@ impl DownloadConfig {
         let folder_structure = paths::expand_album_token(&self.folder_structure, album_ref);
         Self {
             album_name: Some(name),
-            directory: self.directory.clone(),
+            directory: Arc::clone(&self.directory),
             folder_structure,
-            filename_exclude: self.filename_exclude.clone(),
-            temp_suffix: self.temp_suffix.clone(),
+            filename_exclude: Arc::clone(&self.filename_exclude),
+            temp_suffix: Arc::clone(&self.temp_suffix),
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
             exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
@@ -493,10 +500,10 @@ impl DownloadConfig {
     /// share a single config but the exclude set is lifted off the plan.
     fn with_exclude_ids(&self, exclude_ids: Arc<FxHashSet<String>>) -> Self {
         Self {
-            directory: self.directory.clone(),
+            directory: Arc::clone(&self.directory),
             folder_structure: self.folder_structure.clone(),
-            filename_exclude: self.filename_exclude.clone(),
-            temp_suffix: self.temp_suffix.clone(),
+            filename_exclude: Arc::clone(&self.filename_exclude),
+            temp_suffix: Arc::clone(&self.temp_suffix),
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
             album_name: self.album_name.clone(),
@@ -560,7 +567,7 @@ impl DownloadConfig {
     pub(super) fn test_default() -> Self {
         use rustc_hash::FxHashSet;
         Self {
-            directory: std::path::PathBuf::from("/nonexistent/download_filter_tests"),
+            directory: Arc::from(Path::new("/nonexistent/download_filter_tests")),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
@@ -592,8 +599,8 @@ impl DownloadConfig {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Vec::new(),
-            temp_suffix: ".kei-tmp".to_string(),
+            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
+            temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
             retry_only: false,
             max_download_attempts: 10,
@@ -937,8 +944,8 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
         return;
     }
 
-    let suffix = config.temp_suffix.clone();
-    let dir = dir.clone();
+    let suffix = Arc::clone(&config.temp_suffix);
+    let dir: std::path::PathBuf = dir.to_path_buf();
     let cutoff_secs = cutoff.timestamp();
 
     let cleaned = tokio::task::spawn_blocking(move || {
@@ -953,7 +960,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(&suffix) {
+                    if name.ends_with(suffix.as_ref()) {
                         if let Ok(meta) = path.metadata() {
                             if let Ok(mtime) = meta.modified() {
                                 let mtime_secs = mtime
@@ -1628,7 +1635,7 @@ async fn download_photos_incremental(
         metadata: MetadataFlags::from(config.as_ref()),
         concurrency: config.concurrent_downloads,
         no_progress_bar: config.no_progress_bar,
-        temp_suffix: config.temp_suffix.clone(),
+        temp_suffix: Arc::clone(&config.temp_suffix),
         shutdown_token,
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1696,7 +1703,6 @@ mod tests {
     use super::*;
     use crate::icloud::photos::asset::ChangeEvent;
     use crate::test_helpers::TestPhotoAsset;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn test_config() -> DownloadConfig {
@@ -1715,9 +1721,9 @@ mod tests {
     #[test]
     fn test_hash_download_config_changes_on_directory() {
         let mut config1 = test_config();
-        config1.directory = PathBuf::from("/photos/a");
+        config1.directory = std::sync::Arc::from(std::path::Path::new("/photos/a"));
         let mut config2 = test_config();
-        config2.directory = PathBuf::from("/photos/b");
+        config2.directory = std::sync::Arc::from(std::path::Path::new("/photos/b"));
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -2134,14 +2140,14 @@ mod tests {
             password: Some(SecretString::from("x")),
             password_file: None,
             password_command: None,
-            directory: dl_config.directory.clone(),
+            directory: dl_config.directory.to_path_buf(),
             cookie_directory: std::path::PathBuf::from("/tmp"),
             folder_structure: dl_config.folder_structure.clone(),
             albums: crate::config::AlbumSelection::LibraryOnly,
             exclude_albums: vec![],
             filename_exclude: vec![],
             library: crate::config::LibrarySelection::Single("PrimarySync".into()),
-            temp_suffix: dl_config.temp_suffix.clone(),
+            temp_suffix: dl_config.temp_suffix.to_string(),
             skip_created_before: None,
             skip_created_after: None,
             pid_file: None,
@@ -2652,7 +2658,7 @@ mod tests {
     fn test_hash_changes_on_filename_exclude() {
         let config1 = test_config();
         let mut config2 = test_config();
-        config2.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config2.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -2691,8 +2697,8 @@ mod tests {
         {
             config.set_exif_datetime = true;
         }
-        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
-        config.temp_suffix = ".custom-tmp".to_string();
+        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
+        config.temp_suffix = std::sync::Arc::from(".custom-tmp");
         let derived = config.with_album_name(Arc::from("Test"));
         assert!(derived.skip_videos);
         assert!(derived.skip_photos);
@@ -2703,7 +2709,7 @@ mod tests {
         #[cfg(feature = "xmp")]
         assert!(derived.set_exif_datetime);
         assert_eq!(derived.filename_exclude.len(), 1);
-        assert_eq!(derived.temp_suffix, ".custom-tmp");
+        assert_eq!(&*derived.temp_suffix, ".custom-tmp");
         assert_eq!(derived.directory, config.directory);
     }
 
@@ -2776,7 +2782,7 @@ mod tests {
     #[test]
     fn golden_hash_download_config_non_defaults() {
         let mut config = test_config();
-        config.directory = PathBuf::from("/my/photos");
+        config.directory = std::sync::Arc::from(std::path::Path::new("/my/photos"));
         config.folder_structure = "{:%Y/%m}".to_string();
         config.size = AssetVersionSize::Medium;
         config.live_photo_size = AssetVersionSize::LiveMedium;
@@ -2799,10 +2805,10 @@ mod tests {
         config.skip_videos = true;
         config.skip_photos = false;
         config.live_photo_mode = LivePhotoMode::ImageOnly;
-        config.filename_exclude = vec![
+        config.filename_exclude = std::sync::Arc::from(vec![
             glob::Pattern::new("*.AAE").unwrap(),
             glob::Pattern::new("*.THM").unwrap(),
-        ];
+        ]);
         let hash = hash_download_config(&config);
         assert_eq!(
             hash, "e17212f54c74936b",

@@ -993,7 +993,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
 
         // First call should produce a task (file doesn't exist yet)
         let tasks = filter_asset_fresh(&asset, &config);
@@ -1011,7 +1011,7 @@ mod tests {
 
         let asset = TestPhotoAsset::new("TEST_1").build(); // version.size = 1000
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
 
         // First call: file doesn't exist yet
         let tasks = filter_asset_fresh(&asset, &config);
@@ -1092,7 +1092,7 @@ mod tests {
 
         let asset = test_live_photo_asset();
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
 
         // First call: both photo and MOV
         let tasks = filter_asset_fresh(&asset, &config);
@@ -1114,7 +1114,7 @@ mod tests {
 
         let asset = test_live_photo_asset();
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
 
         // First call to get the expected MOV path
         let tasks = filter_asset_fresh(&asset, &config);
@@ -1166,7 +1166,7 @@ mod tests {
             .build();
 
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
 
         // Process asset1: creates IMG_0001.HEIC (2000 bytes) and its MOV
         let mut claimed_paths = FxHashMap::default();
@@ -1397,7 +1397,7 @@ mod tests {
             .build();
 
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
 
         // Process both assets through claimed_paths
         let mut claimed_paths = FxHashMap::default();
@@ -1776,7 +1776,7 @@ mod tests {
         let mut config = test_config();
         config.file_match_policy = FileMatchPolicy::NameId7;
         let dir = TempDir::new().unwrap();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
 
         // First call to get the expected path
         let tasks = filter_asset_fresh(&asset, &config);
@@ -2106,7 +2106,7 @@ mod tests {
     fn filter_cross_batch_case_insensitive_collision_is_deduped() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
 
         let asset = TestPhotoAsset::new("CROSS_BATCH_1")
             .filename("IMG_0500.JPG")
@@ -2295,7 +2295,7 @@ mod tests {
 
         let asset = TestPhotoAsset::new("TEST_1").build(); // recordName "TEST_1", "photo.jpg"
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
         config.file_match_policy = FileMatchPolicy::NameId7;
 
         // Get the NameId7 path
@@ -2527,7 +2527,7 @@ mod tests {
             .filename("IMG_0001.AAE")
             .build();
         let mut config = test_config();
-        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         assert_eq!(
             is_asset_filtered(&asset, &config),
             Some(FilterReason::Filename),
@@ -2539,7 +2539,7 @@ mod tests {
     fn test_filter_filename_exclude_case_insensitive() {
         let asset = TestPhotoAsset::new("EXCL_2").filename("Photo.aae").build();
         let mut config = test_config();
-        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         assert_eq!(
             is_asset_filtered(&asset, &config),
             Some(FilterReason::Filename),
@@ -2553,7 +2553,7 @@ mod tests {
             .filename("IMG_0001.JPG")
             .build();
         let mut config = test_config();
-        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         let tasks = filter_asset_fresh(&asset, &config);
         assert!(!tasks.is_empty(), "Non-matching files should pass through");
     }
@@ -2611,7 +2611,7 @@ mod tests {
     fn test_extract_skip_candidates_filename_exclude_matches() {
         let asset = TestPhotoAsset::new("TEST_1").filename("photo.AAE").build();
         let mut config = test_config();
-        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         assert_eq!(
             is_asset_filtered(&asset, &config),
             Some(FilterReason::Filename),
@@ -2623,7 +2623,7 @@ mod tests {
     fn test_extract_skip_candidates_filename_exclude_no_match_passes() {
         let asset = TestPhotoAsset::new("TEST_1").build(); // filename = "test_photo.jpg"
         let mut config = test_config();
-        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         assert!(
             !extract_skip_candidates(&asset, &config).is_empty(),
             "non-matching filename should pass through"
@@ -2634,7 +2634,7 @@ mod tests {
     fn test_extract_skip_candidates_filename_exclude_case_insensitive() {
         let asset = TestPhotoAsset::new("TEST_1").filename("photo.aae").build();
         let mut config = test_config();
-        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         assert_eq!(
             is_asset_filtered(&asset, &config),
             Some(FilterReason::Filename),
@@ -2736,7 +2736,7 @@ mod tests {
             .build();
 
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
 
         // Create an existing file with some content (non-zero size)
         let tasks_first = filter_asset_fresh(&asset, &config);
@@ -2774,7 +2774,7 @@ mod tests {
             .build();
 
         let mut config = test_config();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
         config.file_match_policy = FileMatchPolicy::NameId7;
 
         // First call: no file on disk

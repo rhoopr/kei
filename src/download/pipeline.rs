@@ -605,7 +605,7 @@ pub(super) struct PassConfig<'a> {
     pub(super) metadata: MetadataFlags,
     pub(super) concurrency: usize,
     pub(super) no_progress_bar: bool,
-    pub(super) temp_suffix: String,
+    pub(super) temp_suffix: Arc<str>,
     pub(super) shutdown_token: CancellationToken,
     pub(super) state_db: Option<Arc<dyn StateDb>>,
     /// Accumulator for 429/503 observations during this pass. Counted per
@@ -1283,7 +1283,7 @@ where
         skips
     });
 
-    let temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
+    let temp_suffix: Arc<str> = Arc::clone(&config.temp_suffix);
     let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let bandwidth_limiter = config.bandwidth_limiter.clone();
     let download_stream = ReceiverStream::new(task_rx)
@@ -1674,7 +1674,7 @@ pub(super) async fn build_download_outcome(
         metadata: MetadataFlags::from(config.as_ref()),
         concurrency: cleanup_concurrency,
         no_progress_bar: config.no_progress_bar,
-        temp_suffix: config.temp_suffix.clone(),
+        temp_suffix: Arc::clone(&config.temp_suffix),
         shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::clone(&phase2_rate_counter),
@@ -2777,7 +2777,7 @@ mod tests {
                             metadata: MetadataFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
-                            temp_suffix: ".kei-tmp".to_string(),
+                            temp_suffix: std::sync::Arc::from(".kei-tmp"),
                             shutdown_token: token,
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2829,7 +2829,7 @@ mod tests {
                             metadata: MetadataFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
-                            temp_suffix: ".kei-tmp".to_string(),
+                            temp_suffix: std::sync::Arc::from(".kei-tmp"),
                             shutdown_token: token,
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3305,7 +3305,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let config = Arc::new(DownloadConfig {
-            directory: dir.path().to_path_buf(),
+            directory: std::sync::Arc::from(dir.path()),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
@@ -3341,8 +3341,8 @@ mod tests {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Vec::new(),
-            temp_suffix: ".kei-tmp".to_string(),
+            filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
+            temp_suffix: std::sync::Arc::from(".kei-tmp"),
             state_db: None,
             retry_only: false,
             max_download_attempts: 10,
@@ -3392,7 +3392,9 @@ mod tests {
         use rustc_hash::FxHashSet;
 
         let config = Arc::new(DownloadConfig {
-            directory: PathBuf::from("/nonexistent/download_filter_tests"),
+            directory: std::sync::Arc::from(std::path::Path::new(
+                "/nonexistent/download_filter_tests",
+            )),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
@@ -3424,8 +3426,8 @@ mod tests {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Vec::new(),
-            temp_suffix: ".kei-tmp".to_string(),
+            filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
+            temp_suffix: std::sync::Arc::from(".kei-tmp"),
             state_db: None,
             retry_only: false,
             max_download_attempts: 10,
@@ -3498,7 +3500,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut config = DownloadConfig::test_default();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
         config.skip_videos = true;
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
