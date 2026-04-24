@@ -28,17 +28,13 @@ use crate::config;
 use crate::state;
 use crate::state::{StateDb, VersionSizeKey};
 
+use super::{print_truncation_tail, LISTING_CAP};
+
 /// Stable sentinel written to `assets.last_error` so monitoring tools can
 /// key on the reason a row flipped from downloaded back to failed.
 const FILE_MISSING_REASON: &str = "FILE_MISSING_AT_STARTUP";
 
 const SCAN_PAGE_SIZE: u32 = 1000;
-
-/// Cap on per-issue `MISSING:` / `NO PATH:` lines emitted. Mirrors the
-/// cap used by `kei status` and `kei verify` so the three surfaces feel
-/// consistent on large libraries. Summary counts at the end are always
-/// the true totals — only the per-line listings are capped.
-const ISSUE_PRINT_CAP: u64 = 200;
 
 #[derive(Debug)]
 struct MissingAsset {
@@ -133,12 +129,12 @@ pub(crate) async fn run_reconcile(
 
     // Shared cell so both callbacks can bump the same counter under the
     // FnMut + FnMut constraint. Single-threaded; Cell is cheap here.
-    let printed = Cell::new(0u64);
+    let printed: Cell<usize> = Cell::new(0);
 
     let (counts, missing) = scan_missing(
         &db,
         |m| {
-            if printed.get() < ISSUE_PRINT_CAP {
+            if printed.get() < LISTING_CAP {
                 println!(
                     "MISSING: {} ({}, {})",
                     m.local_path.display(),
@@ -149,7 +145,7 @@ pub(crate) async fn run_reconcile(
             }
         },
         |id| {
-            if printed.get() < ISSUE_PRINT_CAP {
+            if printed.get() < LISTING_CAP {
                 println!("NO PATH: {id} - no local path recorded");
                 printed.set(printed.get() + 1);
             }
@@ -157,14 +153,14 @@ pub(crate) async fn run_reconcile(
     )
     .await?;
 
-    let total_issues = counts.missing + counts.no_path;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "scan counts come from pagination over the state DB; well under usize::MAX on supported targets"
+    )]
+    let total_issues = (counts.missing + counts.no_path) as usize;
     if total_issues > printed.get() {
         println!();
-        println!(
-            "... and {} more issue(s) not listed (listing capped at {})",
-            total_issues - printed.get(),
-            ISSUE_PRINT_CAP,
-        );
+        print_truncation_tail(total_issues, printed.get());
     }
 
     let mut marked_failed = 0u64;

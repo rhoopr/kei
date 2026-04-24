@@ -8,6 +8,8 @@ use crate::config;
 use crate::state;
 use crate::state::{AssetRecord, StateDb};
 
+use super::{print_truncation_tail, LISTING_CAP};
+
 /// Run the status command.
 pub(crate) async fn run_status(
     args: cli::StatusArgs,
@@ -51,8 +53,8 @@ pub(crate) async fn run_status(
         println!();
         println!("Failed assets:");
         let failed = db.get_failed().await?;
-        let shown = failed.len().min(PRINT_CAP);
-        for asset in failed.iter().take(PRINT_CAP) {
+        let shown = failed.len().min(LISTING_CAP);
+        for asset in failed.iter().take(LISTING_CAP) {
             print_failed(asset);
         }
         print_truncation_tail(failed.len(), shown);
@@ -62,8 +64,8 @@ pub(crate) async fn run_status(
         println!();
         println!("Pending assets:");
         let pending = db.get_pending().await?;
-        let shown = pending.len().min(PRINT_CAP);
-        for asset in pending.iter().take(PRINT_CAP) {
+        let shown = pending.len().min(LISTING_CAP);
+        for asset in pending.iter().take(LISTING_CAP) {
             print_pending(asset);
         }
         print_truncation_tail(pending.len(), shown);
@@ -72,7 +74,7 @@ pub(crate) async fn run_status(
     if args.downloaded && summary.downloaded > 0 {
         println!();
         println!("Downloaded assets:");
-        // page_size is smaller than PRINT_CAP so pagination is still
+        // page_size is smaller than LISTING_CAP so pagination is still
         // exercised before the cap kicks in — the post-cap rows are
         // skipped via an early break, not by narrowing the SQL query.
         let page_size: u32 = 100;
@@ -84,7 +86,7 @@ pub(crate) async fn run_status(
                 break;
             }
             for asset in &page {
-                if printed >= PRINT_CAP {
+                if printed >= LISTING_CAP {
                     break 'outer;
                 }
                 print_downloaded(asset);
@@ -104,23 +106,6 @@ pub(crate) async fn run_status(
     }
 
     Ok(())
-}
-
-/// Default maximum per-section listing cap for `kei status --failed /
-/// --pending / --downloaded`. Matches the `failed_assets` cap used by
-/// `sync_report.json` so operators see a consistent amount of detail
-/// across the two surfaces.
-const PRINT_CAP: usize = 200;
-
-/// If a listing was truncated, print a tail line stating how many were
-/// hidden. No-op when the full set fit under the cap.
-fn print_truncation_tail(total: usize, shown: usize) {
-    if total > shown {
-        println!(
-            "  ... and {remaining} more (listing capped at {PRINT_CAP})",
-            remaining = total - shown,
-        );
-    }
 }
 
 fn print_failed(asset: &AssetRecord) {

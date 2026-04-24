@@ -327,11 +327,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         Err(e) => return Err(e),
     };
 
-    // Save password to credential store if requested. Source-aware: only
-    // the ephemeral `Direct` source (CLI flag / env var) should actually
-    // persist; File / Command / Store / Interactive all emit a warning
-    // explaining why the flag is a no-op for that source instead of
-    // silently doing nothing.
+    // Save password to credential store if requested. Only the ephemeral
+    // `Direct` source (CLI flag / env var) persists; File / Command /
+    // Store / Interactive each emit a warning explaining why the flag is
+    // a no-op for that source.
     if config.save_password {
         match password::decide_save_password_action(password_source_kind) {
             password::SavePasswordAction::Save => {

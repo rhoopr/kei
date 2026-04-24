@@ -3016,7 +3016,7 @@ fn verify_truncates_issue_listing_past_cap() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Missing:   250"), "stdout: {stdout}");
     assert!(
-        stdout.contains("... and 50 more issue(s) not listed (listing capped at 200)"),
+        stdout.contains("... and 50 more (listing capped at 200)"),
         "truncation tail missing; stdout: {stdout}"
     );
     // First 200 MISSING lines present, 201st+ suppressed.
@@ -3081,7 +3081,7 @@ fn reconcile_truncates_issue_listing_past_cap() {
         "every row should be re-queued regardless of the print cap; stdout: {stdout}"
     );
     assert!(
-        stdout.contains("... and 50 more issue(s) not listed (listing capped at 200)"),
+        stdout.contains("... and 50 more (listing capped at 200)"),
         "truncation tail missing; stdout: {stdout}"
     );
     assert!(stdout.contains("missing_0000.jpg"), "first row absent");
