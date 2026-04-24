@@ -2,6 +2,10 @@
 name = "kei"
 version = "0.11.1-dev"
 edition = "2021"
+# src/download/paths.rs calls str::floor_char_boundary, stabilized in 1.91.
+# Cargo refuses to build on older toolchains with a clean error naming this
+# version; the clippy::incompatible_msrv lint below catches regressions on PR.
+rust-version = "1.91"
 
 [[bin]]
 name = "kei"
@@ -185,3 +189,7 @@ cast_sign_loss = "warn"
 # `[]` / `[..]` panic footguns. Refactor to `.get()` / `.first()` / pattern
 # match, or scope an `#[allow]` with a comment naming the invariant.
 indexing_slicing = "warn"
+
+# Flags std API calls stabilized after the declared `rust-version`. Would
+# have caught #259's floor_char_boundary use at PR time, not at user build.
+incompatible_msrv = "warn"
