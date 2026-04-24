@@ -5,7 +5,6 @@ use anyhow::Context;
 use crate::auth;
 use crate::config;
 use crate::icloud;
-use crate::password::SecretString;
 use crate::retry;
 
 /// Maximum number of re-authentication attempts before giving up.
@@ -132,16 +131,13 @@ fn is_misdirected_request(err: &icloud::error::ICloudError) -> bool {
 /// heavier `authenticate` call to avoid blocking download tasks. A 30-second
 /// timeout guards against a hung validation request holding the lock
 /// indefinitely.
-pub(crate) async fn attempt_reauth<F>(
+pub(crate) async fn attempt_reauth(
     shared_session: &auth::SharedSession,
     cookie_directory: &Path,
     username: &str,
     domain: &str,
-    password_provider: &F,
-) -> anyhow::Result<()>
-where
-    F: Fn() -> Option<SecretString>,
-{
+    password_provider: &crate::password::PasswordProvider,
+) -> anyhow::Result<()> {
     let mut session = shared_session.write().await;
 
     // Try validation first — timeout prevents a hung HTTP request from

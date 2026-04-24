@@ -984,7 +984,7 @@ struct CycleResult {
 /// waiting for `kei login submit-code`.
 async fn reauth_with_srp(
     config: &config::Config,
-    password_provider: &dyn Fn() -> Option<SecretString>,
+    password_provider: &crate::password::PasswordProvider,
     notifier: &Notifier,
     live: Option<(auth::SharedSession, crate::icloud::photos::PhotosService)>,
 ) -> anyhow::Result<auth::AuthResult> {
@@ -1355,13 +1355,11 @@ async fn determine_sync_mode(
 }
 
 /// Re-validate the session after an idle sleep and re-acquire the lock.
-async fn reacquire_session<F>(
+async fn reacquire_session(
     shared_session: &auth::SharedSession,
     config: &config::Config,
-    password_provider: &F,
-) where
-    F: Fn() -> Option<SecretString>,
-{
+    password_provider: &crate::password::PasswordProvider,
+) {
     match attempt_reauth(
         shared_session,
         &config.cookie_directory,

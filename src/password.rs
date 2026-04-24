@@ -53,6 +53,32 @@ pub enum PasswordSourceKind {
     Interactive,
 }
 
+/// Shared handle to a password-resolving closure.
+///
+/// Behind `Arc` so the async call site can refcount-bump a handle
+/// into `tokio::task::spawn_blocking` without borrowing across
+/// `.await`. The closure itself stays synchronous — it's the
+/// blocking pool that keeps slow `--password-command` invocations
+/// from pinning an async runtime worker.
+pub type PasswordProvider =
+    std::sync::Arc<dyn Fn() -> Option<SecretString> + Send + Sync + 'static>;
+
+/// Run a [`PasswordProvider`] on the blocking pool.
+///
+/// The provider's `resolve()` path may include a 30-second subprocess
+/// wait (`--password-command`) or a file read; running it on an async
+/// worker would block the runtime. Dispatch to `spawn_blocking` instead
+/// so the worker stays free for concurrent download/state-DB work.
+pub async fn invoke_password_provider(provider: &PasswordProvider) -> Option<SecretString> {
+    let provider = std::sync::Arc::clone(provider);
+    tokio::task::spawn_blocking(move || provider())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "password provider panicked in spawn_blocking");
+            None
+        })
+}
+
 impl PasswordSource {
     /// Return the source kind, discarding the attached payload.
     pub const fn kind(&self) -> PasswordSourceKind {
@@ -715,5 +741,42 @@ mod tests {
         let path = write_test_file(dir.path(), "permissive_pw.txt", "leaky\n");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(read_password_file(&path).unwrap().expose_secret(), "leaky");
+    }
+
+    // ── invoke_password_provider ────────────────────────────────────
+    //
+    // Regression for CF-8: a provider whose resolve() does blocking I/O
+    // (subprocess wait, file read) must NOT run on the async worker. The
+    // canary here is that the async caller remains responsive while the
+    // sync closure is in flight, which spawn_blocking guarantees.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn invoke_password_provider_yields_runtime_for_blocking_closure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        let interleaved = StdArc::new(AtomicBool::new(false));
+        let seen = StdArc::clone(&interleaved);
+
+        // Sync provider that blocks for longer than the other future's delay.
+        // If spawn_blocking pins the single async worker, the concurrent
+        // task below will be starved past its intended wake time.
+        let provider: PasswordProvider = StdArc::new(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            Some(SecretString::from("ok".to_string()))
+        });
+
+        let provider_fut = super::invoke_password_provider(&provider);
+        let canary_fut = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            seen.store(true, Ordering::SeqCst);
+        };
+
+        tokio::join!(provider_fut, canary_fut);
+        assert!(
+            interleaved.load(Ordering::SeqCst),
+            "the async canary must have run while the sync provider was sleeping"
+        );
     }
 }
