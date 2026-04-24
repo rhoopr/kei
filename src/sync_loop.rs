@@ -42,6 +42,21 @@ struct LibraryState {
 /// data dir the next time it's used.
 const SHARED_LIBRARY_NOTICE_KEY: &str = "shared_library_notice_shown_v1";
 
+/// Classify whether an error from `init_photos_service` or
+/// `resolve_libraries` indicates a stale session / routing state that
+/// an SRP re-auth would fix.
+///
+/// Returns `true` for `ICloudError::SessionExpired` (CloudKit 401/403)
+/// and `ICloudError::MisdirectedRequest` (persistent 421 after pool
+/// reset) — the two classes that invalidate the cached session and
+/// trigger the reauth retry branch. Extracted as a free function so
+/// the classification is independently testable without spinning up
+/// a full sync cycle.
+fn session_error_signature(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::icloud::error::ICloudError>()
+        .is_some_and(crate::icloud::error::ICloudError::is_session_error)
+}
+
 /// Given the user's library selection, the count of iCloud shared libraries
 /// on the account, and whether the notice has already fired, return the
 /// warning message to emit, or `None` if no notice is warranted.
@@ -366,10 +381,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // failure bails cleanly instead of looping under Docker's restart policy.
     let mut pending_auth = Some(auth_result);
     let mut retried_after_session_error = false;
-    let is_session_error = |e: &anyhow::Error| {
-        e.downcast_ref::<crate::icloud::error::ICloudError>()
-            .is_some_and(crate::icloud::error::ICloudError::is_session_error)
-    };
     let (shared_session, mut photos_service, libraries) = loop {
         #[allow(
             clippy::expect_used,
@@ -381,7 +392,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         let init_result = init_photos_service(this_auth, api_retry_config).await;
         let (ss, mut ps) = match init_result {
             Ok(pair) => pair,
-            Err(e) if !retried_after_session_error && is_session_error(&e) => {
+            Err(e) if !retried_after_session_error && session_error_signature(&e) => {
                 tracing::warn!(
                     error = %e,
                     "CloudKit init failed with stale-session signature; forcing SRP re-authentication"
@@ -395,7 +406,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         };
         match resolve_libraries(&config.library, &mut ps).await {
             Ok(libs) => break (ss, ps, libs),
-            Err(e) if !retried_after_session_error && is_session_error(&e) => {
+            Err(e) if !retried_after_session_error && session_error_signature(&e) => {
                 tracing::warn!(
                     error = %e,
                     "CloudKit returned stale-session signature; forcing SRP re-authentication"
@@ -1466,5 +1477,80 @@ mod tests {
     fn notice_suppressed_when_both_user_opted_out_and_already_notified() {
         // Belt-and-braces: every suppression condition stacks correctly.
         assert!(should_notify_shared_libraries(&config::LibrarySelection::All, 0, true).is_none());
+    }
+
+    // ── session_error_signature (CF-10 regression coverage) ─────────
+    //
+    // The run_sync reauth retry branch (lines 370-408) keys on whether
+    // an error coming back from init_photos_service or resolve_libraries
+    // is a "session error". Misclassifying would either (a) retry SRP on
+    // a non-session failure (wasting an Apple rate-limit slot) or
+    // (b) fail to retry on a real 401/421 (visible to the operator as
+    // an immediate Docker restart). Pin down every variant here so a
+    // refactor of ICloudError can't silently regress the match arm.
+
+    #[test]
+    fn session_error_signature_true_for_cloudkit_401_403() {
+        let e: anyhow::Error =
+            crate::icloud::error::ICloudError::SessionExpired { status: 401 }.into();
+        assert!(session_error_signature(&e), "401 must trigger reauth");
+
+        let e: anyhow::Error =
+            crate::icloud::error::ICloudError::SessionExpired { status: 403 }.into();
+        assert!(session_error_signature(&e), "403 must trigger reauth");
+    }
+
+    #[test]
+    fn session_error_signature_true_for_cloudkit_421() {
+        let e: anyhow::Error = crate::icloud::error::ICloudError::MisdirectedRequest.into();
+        assert!(
+            session_error_signature(&e),
+            "persistent 421 must trigger reauth (stale routing state needs fresh SRP)"
+        );
+    }
+
+    #[test]
+    fn session_error_signature_false_for_service_not_activated() {
+        // ADP / ZONE_NOT_FOUND is a permanent failure, not a session issue.
+        // Reauth would burn an Apple rate-limit slot for nothing.
+        let e: anyhow::Error = crate::icloud::error::ICloudError::ServiceNotActivated {
+            code: "ADP".into(),
+            reason: "Advanced Data Protection".into(),
+        }
+        .into();
+        assert!(!session_error_signature(&e));
+    }
+
+    #[test]
+    fn session_error_signature_false_for_connection_and_io() {
+        let e: anyhow::Error =
+            crate::icloud::error::ICloudError::Connection("DNS failure".into()).into();
+        assert!(!session_error_signature(&e));
+
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "x");
+        let e: anyhow::Error = crate::icloud::error::ICloudError::from(io).into();
+        assert!(!session_error_signature(&e));
+    }
+
+    #[test]
+    fn session_error_signature_false_for_non_icloud_error() {
+        // Any other anyhow error (config parsing, state DB, etc.) must not
+        // be classified as a session error — that would trigger an
+        // inappropriate SRP cycle.
+        let e = anyhow::anyhow!("unrelated top-level error");
+        assert!(!session_error_signature(&e));
+    }
+
+    #[test]
+    fn session_error_signature_peers_through_context() {
+        // Real error chains are wrapped in .context() before hitting the
+        // retry branch. The classifier downcasts on the root cause, which
+        // anyhow exposes as downcast_ref — wrap here to pin the contract.
+        let root = crate::icloud::error::ICloudError::SessionExpired { status: 401 };
+        let e = anyhow::Error::from(root).context("while initializing photos service");
+        assert!(
+            session_error_signature(&e),
+            "classifier must downcast through context wrappers"
+        );
     }
 }
