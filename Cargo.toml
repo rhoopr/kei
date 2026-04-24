@@ -42,8 +42,7 @@ toml = "1"
 
 # Crypto (SRP auth)
 sha2 = "0.10"
-pbkdf2 = { version = "0.12", features = ["simple"] }
-hmac = "0.12"
+pbkdf2 = "0.12"
 num-bigint = "0.4"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
