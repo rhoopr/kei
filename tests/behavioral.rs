@@ -1317,6 +1317,10 @@ fn config_toml_password_field_rejected() {
         .stderr(predicate::str::contains("kei password set"));
 }
 
+// On Windows, `--password-command` / `[auth] password_command` is rejected
+// at config::build before the "pick one" check runs, so the assertion on
+// "pick one" doesn't hold. Unix covers the path this test is guarding.
+#[cfg(unix)]
 #[test]
 fn config_multiple_password_sources_in_toml() {
     // Both `password_file` and `password_command` set in the same TOML is
@@ -1682,10 +1686,12 @@ fn config_show_does_not_read_password_file_contents() {
     let pw_file = dir.path().join("pw");
     std::fs::write(&pw_file, "my_secret_pw\n").unwrap();
     let config_path = dir.path().join("config.toml");
+    // Use TOML literal strings (single quotes) for the path so Windows
+    // paths like `C:\Users\...` don't get interpreted as `\U...` escapes.
     std::fs::write(
         &config_path,
         format!(
-            "[auth]\nusername = \"x@x.com\"\npassword_file = \"{}\"\n",
+            "[auth]\nusername = \"x@x.com\"\npassword_file = '{}'\n",
             pw_file.display()
         ),
     )
@@ -2276,6 +2282,9 @@ fn password_file_newline_only() {
         );
 }
 
+// `--password-command` is rejected at startup on Windows (see Flag 8 in the
+// audit); the success path this test is asserting only applies on unix.
+#[cfg(unix)]
 #[test]
 fn password_command_success() {
     let dir = tempfile::tempdir().unwrap();
