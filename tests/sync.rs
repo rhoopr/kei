@@ -324,27 +324,27 @@ fn sync_skip_live_photos_excludes_companions() {
     });
 }
 
-/// Skipping all media types (videos + photos + live photos) should download nothing.
+/// `--skip-videos` + `--skip-photos` + a live-photo mode that drops everything
+/// is rejected at startup (since v0.11.x's flag-audit) rather than silently
+/// completing with zero downloads.
 #[test]
 #[ignore]
-fn sync_skip_all_media_downloads_nothing() {
+fn sync_skip_all_media_rejected_at_startup() {
     let (username, password, cookie_dir) = common::require_preauth();
 
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
+    let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--skip-videos", "--skip-photos", "--skip-live-photos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
-
-        let files = common::walkdir(download_dir.path());
-        assert!(
-            files.is_empty(),
-            "skipping all media types should download nothing, found: {files:?}"
-        );
-    });
+    album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        .args([
+            "--skip-videos",
+            "--skip-photos",
+            "--live-photo-mode",
+            "skip",
+        ])
+        .timeout(Duration::from_secs(TIMEOUT_META))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("would download nothing"));
 }
 
 /// Date filters with extreme values should filter everything out.
