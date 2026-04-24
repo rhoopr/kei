@@ -1967,7 +1967,7 @@ mod tests {
 
     // ── sync_runs status lifecycle ─────────────────────────────────────────
 
-    async fn status_of(db: &SqliteStateDb, run_id: i64) -> String {
+    fn status_of(db: &SqliteStateDb, run_id: i64) -> String {
         let conn = db.acquire_lock("test_status_of").unwrap();
         conn.query_row(
             "SELECT status FROM sync_runs WHERE id = ?1",
@@ -1981,7 +1981,7 @@ mod tests {
     async fn sync_run_status_is_running_after_start() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let run_id = db.start_sync_run().await.unwrap();
-        assert_eq!(status_of(&db, run_id).await, "running");
+        assert_eq!(status_of(&db, run_id), "running");
     }
 
     #[tokio::test]
@@ -1995,7 +1995,7 @@ mod tests {
             interrupted: false,
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
-        assert_eq!(status_of(&db, run_id).await, "complete");
+        assert_eq!(status_of(&db, run_id), "complete");
     }
 
     #[tokio::test]
@@ -2009,7 +2009,7 @@ mod tests {
             interrupted: true,
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
-        assert_eq!(status_of(&db, run_id).await, "interrupted");
+        assert_eq!(status_of(&db, run_id), "interrupted");
     }
 
     #[tokio::test]
@@ -2029,10 +2029,10 @@ mod tests {
 
         let promoted = db.promote_orphaned_sync_runs().await.unwrap();
         assert_eq!(promoted, 2);
-        assert_eq!(status_of(&db, a).await, "interrupted");
-        assert_eq!(status_of(&db, b).await, "interrupted");
+        assert_eq!(status_of(&db, a), "interrupted");
+        assert_eq!(status_of(&db, b), "interrupted");
         // The cleanly completed row must be untouched
-        assert_eq!(status_of(&db, c).await, "complete");
+        assert_eq!(status_of(&db, c), "complete");
     }
 
     #[tokio::test]

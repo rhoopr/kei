@@ -2964,7 +2964,9 @@ mod tests {
     /// If variant order changes, `.max()` silently picks the wrong winner.
     #[test]
     fn test_asset_disposition_ordering() {
-        use AssetDisposition::*;
+        use AssetDisposition::{
+            AmpmVariant, Forwarded, OnDisk, RetryExhausted, RetryOnly, StateSkip, Unresolved,
+        };
         assert!(Forwarded > OnDisk);
         assert!(OnDisk > AmpmVariant);
         assert!(AmpmVariant > StateSkip);

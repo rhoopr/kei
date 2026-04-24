@@ -81,10 +81,12 @@ pub(crate) fn extract_xmp_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
 /// Writing to a `Write` (typically `BufWriter<File>`) rather than returning
 /// a `Vec<u8>` eliminates one full-file-sized allocation on the metadata-
 /// embed path — meaningful for large ProRAW HEICs under high concurrency.
-// meta_idx is produced by .position() over atoms; new_mdat_idx is
-// atoms.len() - 1 after a push; new_positions is built from the same atoms
-// vec. All indexing here is in-bounds by construction.
-#[allow(clippy::indexing_slicing)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "meta_idx comes from .position() over atoms; new_mdat_idx is atoms.len() - 1 \
+              after a push; new_positions is built from the same atoms vec; all indexing \
+              here is in-bounds by construction"
+)]
 pub(crate) fn insert_xmp<W: Write>(input: &[u8], xmp: &[u8], mut writer: W) -> Result<()> {
     // Record each top-level atom along with its original byte offset in the
     // input so we can rewrite file-absolute iloc entries correctly — the
@@ -249,9 +251,11 @@ pub(crate) fn insert_xmp<W: Write>(input: &[u8], xmp: &[u8], mut writer: W) -> R
 /// Criteria: an iinf entry flagged as `mime` + `application/rdf+xml`, its
 /// iloc entry references a range that lies entirely within a single trailing
 /// mdat atom, and no other iloc entry references into that atom.
-// Indexing by meta_idx (caller-validated) and by idx from atoms.iter().enumerate()
-// (with original_offsets built 1:1 alongside atoms in insert_xmp) is in-bounds.
-#[allow(clippy::indexing_slicing)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "meta_idx is caller-validated and idx comes from atoms.iter().enumerate() \
+              with original_offsets built 1:1 alongside atoms in insert_xmp"
+)]
 fn locate_stale_kei_mdat(
     atoms: &[Any],
     original_offsets: &[u64],
