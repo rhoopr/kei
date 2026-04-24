@@ -22,12 +22,19 @@ pub(crate) struct TomlConfig {
     pub notifications: Option<TomlNotifications>,
     pub metrics: Option<TomlMetrics>,
     pub server: Option<TomlServer>,
+    pub report: Option<TomlReport>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlNotifications {
     pub script: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TomlReport {
+    pub json: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -46,6 +53,7 @@ pub(crate) struct TomlAuth {
 pub(crate) struct TomlDownload {
     pub directory: Option<String>,
     pub folder_structure: Option<String>,
+    pub threads: Option<u16>,
     pub threads_num: Option<u16>,
     pub bandwidth_limit: Option<String>,
     pub temp_suffix: Option<String>,
@@ -82,7 +90,7 @@ pub(crate) struct TomlFilters {
     pub skip_videos: Option<bool>,
     pub skip_photos: Option<bool>,
     pub skip_live_photos: Option<bool>,
-    pub recent: Option<u32>,
+    pub recent: Option<crate::cli::RecentLimit>,
     pub skip_created_before: Option<String>,
     pub skip_created_after: Option<String>,
 }
@@ -118,6 +126,7 @@ pub(crate) struct TomlMetrics {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlServer {
     pub port: Option<u16>,
+    pub bind: Option<String>,
 }
 
 /// Load a TOML config file. Returns `Ok(None)` if the file doesn't exist
@@ -331,6 +340,9 @@ pub struct Config {
     pub threads_num: u16,
     pub http_port: u16,
 
+    // Net addresses
+    pub http_bind: std::net::IpAddr,
+
     // 1-byte enums
     pub size: VersionSize,
     pub live_photo_size: LivePhotoSize,
@@ -446,6 +458,43 @@ impl GlobalArgs {
     }
 }
 
+/// Resolve `--notify-systemd` given the explicit CLI / TOML values and
+/// whether `NOTIFY_SOCKET` is present in the environment.
+///
+/// Explicit settings (CLI or TOML) take precedence in that order. When
+/// nothing is set, auto-detect: `NOTIFY_SOCKET` is the env var systemd's
+/// `Type=notify` units publish, so its presence is a reliable signal that
+/// the sd_notify messages will have a listener. No other launcher sets it,
+/// so false positives are effectively zero.
+///
+/// Pure policy function so the truth table is testable without touching
+/// process environment state.
+pub(crate) fn resolve_notify_systemd(
+    cli: Option<bool>,
+    toml: Option<bool>,
+    notify_socket_present: bool,
+) -> bool {
+    cli.or(toml).unwrap_or(notify_socket_present)
+}
+
+/// Smart initial retry delay (seconds) derived from `--max-retries`.
+///
+/// Higher max implies the user is patient and wants retries to give failing
+/// services time to recover (rate limits, 5xx, slow endpoints). Lower max
+/// implies "fail fast" and retries should be quick.
+///
+/// `max_retries == 0` means no retries happen so the delay is irrelevant;
+/// returns 5 (within the validation range) as a non-load-bearing placeholder.
+pub(crate) fn smart_retry_delay(max_retries: u32) -> u64 {
+    match max_retries {
+        0 => 5,
+        1 | 2 => 2,
+        3 => 5,
+        4..=6 => 10,
+        _ => 30,
+    }
+}
+
 /// Resolve auth fields from global CLI args + password args + optional TOML config.
 /// Returns (username, password, domain, `cookie_directory`).
 pub(crate) fn resolve_auth(
@@ -461,10 +510,9 @@ pub(crate) fn resolve_auth(
         String::new(),
     );
 
-    let password = password_args
-        .password
-        .clone()
-        .or_else(|| toml_auth.and_then(|a| a.password.clone()));
+    // `[auth].password` in TOML is rejected in `Config::build()`; resolve_auth
+    // only pulls the password from CLI / env.
+    let password = password_args.password.clone();
 
     let domain = resolve(
         globals.domain,
@@ -516,7 +564,9 @@ pub(crate) fn resolve_data_dir(
             reason = "runs during config load, before tracing subscriber is installed"
         )]
         {
-            eprintln!("warning: `--cookie-directory` is deprecated, use `--data-dir` instead");
+            eprintln!(
+                "warning: `--cookie-directory` is deprecated and will be removed in v0.20.0, use `--data-dir` instead"
+            );
         }
         return expand_tilde(d);
     }
@@ -533,7 +583,7 @@ pub(crate) fn resolve_data_dir(
         )]
         {
             eprintln!(
-                "warning: `[auth] cookie_directory` is deprecated, use top-level `data_dir` instead"
+                "warning: `[auth] cookie_directory` is deprecated and will be removed in v0.20.0, use top-level `data_dir` instead"
             );
         }
         return expand_tilde(d);
@@ -576,11 +626,37 @@ impl Config {
         toml: Option<TomlConfig>,
     ) -> anyhow::Result<Self> {
         let toml_auth = toml.as_ref().and_then(|t| t.auth.as_ref());
+
+        // `[auth].password` is no longer accepted. Plaintext passwords in config
+        // files are a standing security risk; kei ships a credential store
+        // (`kei password set`), password files, and shell-command sources.
+        if toml_auth.and_then(|a| a.password.as_ref()).is_some() {
+            anyhow::bail!(
+                "config file sets `[auth] password`, which is no longer supported. \
+                 Plaintext passwords in config files are a security risk. \
+                 Use one of: `kei password set` (OS keyring or encrypted file), \
+                 `[auth] password_file`, or `[auth] password_command` instead."
+            );
+        }
+
         let (username, password_str, domain, cookie_directory) =
             resolve_auth(globals, &pw, toml.as_ref());
         let password_file = resolve_password_file(&pw, toml_auth);
         let password_command = resolve_password_command(&pw, toml_auth);
         let save_password = sync.save_password;
+
+        // `--password-command` / `[auth] password_command` is Unix-only: the
+        // command runs via `sh -c`, which isn't on a stock Windows PATH. Fail
+        // at startup with a clear message instead of a cryptic "No such file
+        // or directory" from the first auth attempt.
+        #[cfg(windows)]
+        if password_command.is_some() {
+            anyhow::bail!(
+                "`--password-command` / `[auth] password_command` is not supported on Windows: \
+                 kei runs commands via `sh -c`, which isn't on the stock Windows PATH. \
+                 Use `--password-file` / `[auth] password_file`, or run kei under WSL."
+            );
+        }
 
         // Reject explicitly provided empty username/password (CLI value_parser
         // catches the CLI case; this catches empty strings from TOML).
@@ -596,19 +672,30 @@ impl Config {
             anyhow::ensure!(!pw_str.is_empty(), "password must not be empty");
         }
 
-        // Reject multiple password sources in TOML (CLI enforces this via
-        // conflicts_with, but TOML has no such mechanism).
+        // Reject both `password_file` and `password_command` in the same TOML
+        // (CLI enforces this via `conflicts_with`, TOML has no such mechanism).
         if let Some(toml_a) = toml_auth {
-            let sources = [
-                toml_a.password.is_some(),
-                toml_a.password_file.is_some(),
-                toml_a.password_command.is_some(),
-            ];
             anyhow::ensure!(
-                sources.iter().filter(|&&s| s).count() <= 1,
-                "config file sets multiple password sources (password, password_file, \
-                 password_command) — pick one"
+                !(toml_a.password_file.is_some() && toml_a.password_command.is_some()),
+                "config file sets both `[auth] password_file` and \
+                 `[auth] password_command` — pick one"
             );
+        }
+
+        // `--no-incremental` duplicates the effect of `kei reset sync-token`
+        // plus a normal sync, with one narrow edge case around failed-run
+        // recovery that's not worth a flag. Deprecate and point users at
+        // the subcommand.
+        if sync.no_incremental {
+            #[allow(
+                clippy::print_stderr,
+                reason = "runs during config load, before tracing subscriber is installed"
+            )]
+            {
+                eprintln!(
+                    "warning: `--no-incremental` is deprecated and will be removed in v0.20.0, use `kei reset sync-token` before sync for the same effect"
+                );
+            }
         }
 
         // Convert plain password string to SecretString
@@ -640,8 +727,33 @@ impl Config {
         let toml_server = toml.as_ref().and_then(|t| t.server.as_ref());
 
         // Download
-        let directory = sync
-            .directory
+        //
+        // `--directory` / `KEI_DIRECTORY` is the legacy spelling kept for
+        // backward compat. Prefer the new `--download-dir` / `KEI_DOWNLOAD_DIR`
+        // and warn when the old one is the only source. Fail loudly if both
+        // are supplied so users don't silently rely on undefined precedence.
+        anyhow::ensure!(
+            !(sync.download_dir.is_some() && sync.directory.is_some()),
+            "both `--download-dir` and `--directory` are set; `--directory` is \
+             deprecated and will be removed in v0.20.0 — pick one"
+        );
+        let directory_cli = if let Some(d) = sync.download_dir {
+            Some(d)
+        } else if let Some(d) = sync.directory {
+            #[allow(
+                clippy::print_stderr,
+                reason = "runs during config load, before tracing subscriber is installed"
+            )]
+            {
+                eprintln!(
+                    "warning: `--directory` / `KEI_DIRECTORY` is deprecated and will be removed in v0.20.0, use `--download-dir` / `KEI_DOWNLOAD_DIR` instead"
+                );
+            }
+            Some(d)
+        } else {
+            None
+        };
+        let directory = directory_cli
             .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
             .map(|d| expand_tilde(&d))
             .unwrap_or_default();
@@ -665,21 +777,68 @@ impl Config {
             None
         };
 
-        // When a bandwidth limit is set without an explicit --threads-num,
+        // Reject mixing the new `--threads` with the deprecated
+        // `--threads-num` on the same invocation - keeps user intent
+        // unambiguous. The TOML pair is handled the same way below.
+        anyhow::ensure!(
+            !(sync.threads.is_some() && sync.threads_num.is_some()),
+            "both `--threads` and `--threads-num` are set; `--threads-num` is \
+             deprecated and will be removed in v0.20.0 - pick one"
+        );
+        let toml_threads = toml_dl.and_then(|d| d.threads);
+        let toml_threads_num = toml_dl.and_then(|d| d.threads_num);
+        anyhow::ensure!(
+            !(toml_threads.is_some() && toml_threads_num.is_some()),
+            "`[download] threads` and `[download] threads_num` are both set in \
+             the config file; `threads_num` is deprecated and will be removed \
+             in v0.20.0 - pick one"
+        );
+
+        // When a bandwidth limit is set without an explicit thread-count flag,
         // default concurrency to 1: many connections starving for a capped
         // total budget just fragments downloads and adds connection overhead.
-        let threads_explicitly_set =
-            sync.threads_num.is_some() || toml_dl.and_then(|d| d.threads_num).is_some();
+        let threads_explicitly_set = sync.threads.is_some()
+            || sync.threads_num.is_some()
+            || toml_threads.is_some()
+            || toml_threads_num.is_some();
         let threads_default = if bandwidth_limit.is_some() && !threads_explicitly_set {
             1
         } else {
             10
         };
-        let threads_num = resolve(
-            sync.threads_num,
-            toml_dl.and_then(|d| d.threads_num),
-            threads_default,
-        );
+
+        // Resolve the concurrency. CLI beats TOML for each spelling, new
+        // spelling beats old, and the legacy path emits a warning so users
+        // know to migrate before v0.20.0.
+        let threads_num = if let Some(n) = sync.threads {
+            n
+        } else if let Some(n) = sync.threads_num {
+            #[allow(
+                clippy::print_stderr,
+                reason = "runs during config load, before tracing subscriber is installed"
+            )]
+            {
+                eprintln!(
+                    "warning: `--threads-num` / `KEI_THREADS_NUM` is deprecated and will be removed in v0.20.0, use `--threads` / `KEI_THREADS` instead"
+                );
+            }
+            n
+        } else if let Some(n) = toml_threads {
+            n
+        } else if let Some(n) = toml_threads_num {
+            #[allow(
+                clippy::print_stderr,
+                reason = "runs during config load, before tracing subscriber is installed"
+            )]
+            {
+                eprintln!(
+                    "warning: `[download] threads_num` is deprecated and will be removed in v0.20.0, use `[download] threads` instead"
+                );
+            }
+            n
+        } else {
+            threads_default
+        };
         anyhow::ensure!(
             (1..=64).contains(&threads_num),
             "threads_num must be in 1..=64, got {threads_num}"
@@ -721,7 +880,25 @@ impl Config {
             max_retries <= 100,
             "retry max_retries must be <= 100, got {max_retries}"
         );
-        let retry_delay_secs = resolve(sync.retry_delay, toml_retry.and_then(|r| r.delay), 5);
+        // Retry delay is now derived from `max_retries` via a smart table
+        // (higher max => more patient initial delay). `--retry-delay` and
+        // `[download.retry] delay` are deprecated; setting either still
+        // wins during the deprecation window but emits a warning.
+        let explicit_retry_delay = sync.retry_delay.or(toml_retry.and_then(|r| r.delay));
+        let retry_delay_secs = if let Some(d) = explicit_retry_delay {
+            #[allow(
+                clippy::print_stderr,
+                reason = "runs during config load, before tracing subscriber is installed"
+            )]
+            {
+                eprintln!(
+                    "warning: `--retry-delay` / `KEI_RETRY_DELAY` / `[download.retry] delay` is deprecated and will be removed in v0.20.0. The initial retry delay is now derived from `--max-retries`; remove the explicit setting to use the smart default."
+                );
+            }
+            d
+        } else {
+            smart_retry_delay(max_retries)
+        };
         anyhow::ensure!(
             (1..=3600).contains(&retry_delay_secs),
             "retry delay must be in 1..=3600 seconds, got {retry_delay_secs}"
@@ -743,11 +920,28 @@ impl Config {
         let live_photo_mode = if let Some(mode) = sync.live_photo_mode {
             mode
         } else if sync.skip_live_photos == Some(true) {
-            crate::cli::deprecation_warning("--skip-live-photos", "--live-photo-mode skip");
+            #[allow(
+                clippy::print_stderr,
+                reason = "runs during config load, before tracing subscriber is installed"
+            )]
+            {
+                eprintln!(
+                    "warning: `--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS` is deprecated and will be removed in v0.20.0, use `--live-photo-mode skip` instead"
+                );
+            }
             LivePhotoMode::Skip
         } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
             mode
         } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
+            #[allow(
+                clippy::print_stderr,
+                reason = "runs during config load, before tracing subscriber is installed"
+            )]
+            {
+                eprintln!(
+                    "warning: `[filters] skip_live_photos` is deprecated and will be removed in v0.20.0, use `[photos] live_photo_mode = \"skip\"` instead"
+                );
+            }
             LivePhotoMode::Skip
         } else {
             LivePhotoMode::Both
@@ -774,13 +968,32 @@ impl Config {
                     .map_err(|e| anyhow::anyhow!("invalid --filename-exclude pattern '{p}': {e}"))
             })
             .collect::<anyhow::Result<_>>()?;
-        let recent = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
-        if recent == Some(0) {
-            anyhow::bail!("recent must be >= 1 (got 0)");
-        }
-        let skip_created_before_str = sync
+        let recent_raw = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
+        let explicit_skip_created_before_str = sync
             .skip_created_before
             .or_else(|| toml_filters.and_then(|f| f.skip_created_before.clone()));
+
+        // Split the RecentLimit: Count(n) is a post-enumeration cap held on
+        // config.recent. Days(n) translates into a skip_created_before cutoff
+        // since "last N days" = "skip everything created before N days ago".
+        // Reject combining the two forms on the same invocation so user
+        // intent stays unambiguous.
+        let (recent, recent_days) = match recent_raw {
+            None => (None, None),
+            Some(crate::cli::RecentLimit::Count(n)) => (Some(n), None),
+            Some(crate::cli::RecentLimit::Days(n)) => {
+                anyhow::ensure!(
+                    explicit_skip_created_before_str.is_none(),
+                    "`--recent {n}d` and `--skip-created-before` are equivalent controls - pick one"
+                );
+                (None, Some(n))
+            }
+        };
+        let skip_created_before_str = if let Some(n) = recent_days {
+            Some(format!("{n}d"))
+        } else {
+            explicit_skip_created_before_str
+        };
         let skip_created_after_str = sync
             .skip_created_after
             .or_else(|| toml_filters.and_then(|f| f.skip_created_after.clone()));
@@ -853,9 +1066,12 @@ impl Config {
                 "watch interval must be in 60..=86400 seconds, got {n}"
             );
         }
-        let notify_systemd = resolve_flag(
+        // Auto-detect systemd via `NOTIFY_SOCKET` when neither CLI nor TOML
+        // sets the flag explicitly. See `resolve_notify_systemd`.
+        let notify_systemd = resolve_notify_systemd(
             sync.notify_systemd,
             toml_watch.and_then(|w| w.notify_systemd),
+            std::env::var_os("NOTIFY_SOCKET").is_some(),
         );
         let pid_file = sync.pid_file.or_else(|| {
             toml_watch
@@ -870,8 +1086,13 @@ impl Config {
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
 
-        // JSON report
-        let report_json = sync.report_json;
+        // JSON report: CLI > [report] json TOML > none.
+        let toml_report = toml.as_ref().and_then(|t| t.report.as_ref());
+        let report_json = sync.report_json.or_else(|| {
+            toml_report
+                .and_then(|r| r.json.as_deref())
+                .map(expand_tilde)
+        });
 
         // HTTP server port — CLI > [server] TOML > [metrics] TOML (deprecated) > KEI_METRICS_PORT
         // env (deprecated) > default 9090.
@@ -882,7 +1103,8 @@ impl Config {
             .or_else(|| {
                 toml_metrics.and_then(|m| m.port).inspect(|_port| {
                     tracing::warn!(
-                        "[metrics] port in TOML is deprecated; rename the section to [server]"
+                        "[metrics] port in TOML is deprecated and will be removed in v0.20.0; \
+                         rename the section to [server]"
                     );
                 })
             })
@@ -891,16 +1113,50 @@ impl Config {
                     .ok()
                     .and_then(|v| v.parse::<u16>().ok())
                     .inspect(|_port| {
-                        tracing::warn!("KEI_METRICS_PORT is deprecated; use KEI_HTTP_PORT instead");
+                        tracing::warn!(
+                            "KEI_METRICS_PORT is deprecated and will be removed in v0.20.0; \
+                             use KEI_HTTP_PORT instead"
+                        );
                     })
             })
             .unwrap_or(DEFAULT_HTTP_PORT);
 
-        if skip_videos && skip_photos && live_photo_mode == LivePhotoMode::Skip {
-            tracing::warn!(
-                "All media types are being skipped (--skip-videos, --skip-photos, \
-                 --live-photo-mode skip) -- nothing will be downloaded"
-            );
+        // HTTP server bind address — CLI > [server] bind TOML > default 0.0.0.0.
+        // 0.0.0.0 preserves the historical behavior and keeps Docker's `-p 9090:9090`
+        // working out of the box; desktop users can set 127.0.0.1 to restrict
+        // /healthz and /metrics to loopback.
+        const DEFAULT_HTTP_BIND: std::net::IpAddr =
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0));
+        let http_bind = match sync.http_bind {
+            Some(addr) => addr,
+            None => match toml_server.and_then(|s| s.bind.as_deref()) {
+                Some(raw) => raw.parse::<std::net::IpAddr>().map_err(|e| {
+                    anyhow::anyhow!("[server] bind is not a valid IP address ({raw:?}): {e}")
+                })?,
+                None => DEFAULT_HTTP_BIND,
+            },
+        };
+
+        // Reject combinations that would produce zero downloads. When both
+        // skip flags are set, the only live-photo modes that still produce
+        // output are `both` and `video-only` (Live Photo MOV companions
+        // download even with stills suppressed); `skip` and `image-only`
+        // suppress the MOV too and produce nothing.
+        let mode_name = match live_photo_mode {
+            LivePhotoMode::Skip => Some("skip"),
+            LivePhotoMode::ImageOnly => Some("image-only"),
+            LivePhotoMode::VideoOnly | LivePhotoMode::Both => None,
+        };
+        if skip_videos && skip_photos {
+            if let Some(mode) = mode_name {
+                anyhow::bail!(
+                    "`--skip-videos` + `--skip-photos` + `--live-photo-mode {mode}` \
+                     would download nothing. Unset one of the skip flags, use \
+                     `--live-photo-mode video-only` if you only want Live Photo \
+                     video companions, or use `kei login` / `--dry-run` for an \
+                     auth-only test."
+                );
+            }
         }
 
         Ok(Self {
@@ -922,6 +1178,7 @@ impl Config {
             notification_script,
             report_json,
             http_port,
+            http_bind,
             watch_with_interval,
             retry_delay_secs,
             recent,
@@ -997,7 +1254,8 @@ impl Config {
                     Some(self.directory.display().to_string())
                 },
                 folder_structure: Some(self.folder_structure.clone()),
-                threads_num: Some(self.threads_num),
+                threads: Some(self.threads_num),
+                threads_num: None, // deprecated, canonical spelling is `threads`
                 bandwidth_limit: self.bandwidth_limit.map(|n| n.to_string()),
                 temp_suffix: if self.temp_suffix == ".kei-tmp" {
                     None
@@ -1035,7 +1293,15 @@ impl Config {
                 },
                 retry: Some(TomlRetry {
                     max_retries: Some(self.max_retries),
-                    delay: Some(self.retry_delay_secs),
+                    // `delay` is deprecated and derived from max_retries by
+                    // default. Emit it only when it differs from the smart
+                    // value so config dumps stay clean for the common case
+                    // and round-trip correctly when the user has overridden.
+                    delay: if self.retry_delay_secs == smart_retry_delay(self.max_retries) {
+                        None
+                    } else {
+                        Some(self.retry_delay_secs)
+                    },
                 }),
             }),
             filters: Some(TomlFilters {
@@ -1134,6 +1400,20 @@ impl Config {
             metrics: None,
             server: Some(TomlServer {
                 port: Some(self.http_port),
+                // Only emit `bind` when it's been changed from the default.
+                // Keeps `config show` output clean for the common case where
+                // the user hasn't set an explicit bind.
+                bind: {
+                    let default = std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0));
+                    if self.http_bind == default {
+                        None
+                    } else {
+                        Some(self.http_bind.to_string())
+                    }
+                },
+            }),
+            report: self.report_json.as_ref().map(|p| TomlReport {
+                json: Some(p.display().to_string()),
             }),
         }
     }
@@ -1193,7 +1473,8 @@ pub(crate) fn persist_first_run_config(
         download: full.download.map(|d| TomlDownload {
             directory: d.directory,
             folder_structure: None,
-            threads_num: None,
+            threads: None,
+            threads_num: None, // deprecated
             bandwidth_limit: None,
             temp_suffix: None,
             #[cfg(feature = "xmp")]
@@ -1217,6 +1498,7 @@ pub(crate) fn persist_first_run_config(
         notifications: None,
         metrics: None,
         server: None,
+        report: None,
     };
 
     // Don't write if there's nothing meaningful to persist
@@ -1279,7 +1561,6 @@ pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>>
 mod tests {
     use super::*;
     use crate::cli::SyncArgs;
-    use secrecy::ExposeSecret;
 
     #[test]
     fn test_expand_tilde_with_home() {
@@ -1382,7 +1663,7 @@ mod tests {
             [download]
             directory = "/photos"
             folder_structure = "%Y/%m/%d"
-            threads_num = 10
+            threads = 10
             temp_suffix = ".kei-tmp"
             no_progress_bar = false
 
@@ -1420,13 +1701,14 @@ mod tests {
         assert_eq!(auth.username.as_deref(), Some("user@example.com"));
         assert_eq!(auth.domain, Some(Domain::Com));
         let dl = config.download.unwrap();
-        assert_eq!(dl.threads_num, Some(10));
+        assert_eq!(dl.threads, Some(10));
+        assert_eq!(dl.threads_num, None);
         let retry = dl.retry.unwrap();
         assert_eq!(retry.max_retries, Some(3));
         assert_eq!(retry.delay, Some(5));
         let filters = config.filters.unwrap();
         assert_eq!(filters.albums, Some(vec!["Favorites".to_string()]));
-        assert_eq!(filters.recent, Some(500));
+        assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(500)));
         let photos = config.photos.unwrap();
         assert_eq!(photos.size, Some(VersionSize::Original));
         assert_eq!(photos.align_raw, Some(RawTreatmentPolicy::Unchanged));
@@ -1537,7 +1819,7 @@ mod tests {
     fn test_build_toml_provides_defaults() {
         let toml_str = r#"
             [download]
-            threads_num = 4
+            threads = 4
             folder_structure = "%Y-%m"
 
             [filters]
@@ -1563,7 +1845,7 @@ mod tests {
     fn test_build_cli_overrides_toml() {
         let toml_str = r#"
             [download]
-            threads_num = 4
+            threads = 4
 
             [filters]
             library = "SharedSync-ABC"
@@ -1571,7 +1853,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
 
         let mut sync = default_sync();
-        sync.threads_num = Some(8);
+        sync.threads = Some(8);
         sync.library = Some("PrimarySync".to_string());
 
         let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
@@ -2102,7 +2384,36 @@ mod tests {
     }
 
     #[test]
-    fn test_build_empty_password_from_toml_rejected() {
+    fn test_build_toml_password_rejected_nonempty() {
+        let toml_str = r#"
+            [auth]
+            password = "secret"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("`[auth] password`"),
+            "Error should name the rejected field; got: {err}"
+        );
+        assert!(
+            err.contains("no longer supported"),
+            "Error should explain removal; got: {err}"
+        );
+        assert!(
+            err.contains("kei password set"),
+            "Error should point at the credential-store migration; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_toml_password_rejected_empty() {
         let toml_str = r#"
             [auth]
             password = ""
@@ -2116,9 +2427,138 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("password"),
-            "Error should mention password"
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("`[auth] password`"),
+            "Error should name the rejected field even for empty values"
         );
+    }
+
+    #[test]
+    fn test_build_toml_password_rejected_even_with_cli_password() {
+        // A CLI password does NOT rescue a TOML password; the TOML field is
+        // rejected on its own, so users can't silently ignore the deprecation.
+        let toml_str = r#"
+            [auth]
+            password = "toml-pw"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut pw = default_password();
+        pw.password = Some("cli-pw".to_string());
+        let result = Config::build(&default_globals(), pw, default_sync(), Some(toml));
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_build_password_command_rejected_on_windows() {
+        // `--password-command` requires `sh -c`, which isn't on a stock
+        // Windows PATH. `Config::build` must reject at startup instead of
+        // punting the failure to the first auth attempt.
+        let mut pw = default_password();
+        pw.password_command = Some("echo anything".to_string());
+        let result = Config::build(&default_globals(), pw, default_sync(), None);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not supported on Windows"), "{err}");
+        assert!(err.contains("--password-file"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_build_toml_password_command_rejected_on_windows() {
+        let toml_str = r#"
+            [auth]
+            password_command = "echo anything"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not supported on Windows"), "{err}");
+    }
+
+    // ── Download directory: --download-dir vs deprecated --directory ───
+
+    #[test]
+    fn test_build_download_dir_from_cli() {
+        let mut sync = default_sync();
+        sync.download_dir = Some("/photos/new".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.directory, PathBuf::from("/photos/new"));
+    }
+
+    #[test]
+    fn test_build_legacy_directory_from_cli_still_works() {
+        // `--directory` keeps working through v0.20.0. Warning is stderr-only
+        // and not asserted here (tested via integration test in tests/cli.rs).
+        let mut sync = default_sync();
+        sync.directory = Some("/photos/legacy".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.directory, PathBuf::from("/photos/legacy"));
+    }
+
+    #[test]
+    fn test_build_both_download_dir_and_directory_rejected() {
+        // Using both forms at once is ambiguous. Fail loudly instead of
+        // picking one silently.
+        let mut sync = default_sync();
+        sync.download_dir = Some("/photos/new".to_string());
+        sync.directory = Some("/photos/old".to_string());
+        let result = Config::build(&default_globals(), default_password(), sync, None);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("--download-dir"), "{err}");
+        assert!(err.contains("--directory"), "{err}");
+        assert!(err.contains("v0.20.0"), "{err}");
+    }
+
+    #[test]
+    fn test_build_download_dir_cli_beats_toml() {
+        let toml_str = r#"
+            [download]
+            directory = "/photos/toml"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.download_dir = Some("/photos/cli".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(cfg.directory, PathBuf::from("/photos/cli"));
+    }
+
+    #[test]
+    fn test_build_legacy_directory_cli_beats_toml() {
+        let toml_str = r#"
+            [download]
+            directory = "/photos/toml"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.directory = Some("/photos/cli-legacy".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(cfg.directory, PathBuf::from("/photos/cli-legacy"));
+    }
+
+    #[test]
+    fn test_build_toml_directory_unchanged() {
+        // The TOML key stays `[download].directory` - we didn't rename it,
+        // only the CLI flag. Make sure nothing else broke.
+        let toml_str = r#"
+            [download]
+            directory = "/photos/via-toml"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.directory, PathBuf::from("/photos/via-toml"));
     }
 
     #[test]
@@ -2361,7 +2801,10 @@ mod tests {
     // ── TOML individual field parsing ──────────────────────────────
 
     #[test]
-    fn test_toml_auth_password() {
+    fn test_toml_auth_password_still_parses() {
+        // The field stays on `TomlAuth` so `Config::build()` can detect and
+        // reject it with a targeted migration message rather than a generic
+        // "unknown field" error from serde's `deny_unknown_fields`.
         let toml_str = r#"
             [auth]
             password = "secret"
@@ -2412,7 +2855,7 @@ mod tests {
         assert_eq!(f.skip_videos, Some(true));
         assert_eq!(f.skip_photos, Some(true));
         assert_eq!(f.skip_live_photos, Some(true));
-        assert_eq!(f.recent, Some(100));
+        assert_eq!(f.recent, Some(crate::cli::RecentLimit::Count(100)));
         assert_eq!(f.skip_created_before.as_deref(), Some("2024-01-01"));
         assert_eq!(f.skip_created_after.as_deref(), Some("2025-12-31"));
     }
@@ -2546,6 +2989,94 @@ mod tests {
         let config =
             Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
         assert_eq!(config.http_port, 9090);
+    }
+
+    #[test]
+    fn test_default_http_bind_is_all_interfaces() {
+        // The historical default. Kept so Docker's `-p 9090:9090` works out
+        // of the box without an extra flag.
+        let config =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        assert_eq!(
+            config.http_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+        );
+    }
+
+    #[test]
+    fn test_http_bind_from_toml() {
+        let toml_str = r#"
+            [server]
+            bind = "127.0.0.1"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(
+            config.http_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        );
+    }
+
+    #[test]
+    fn test_http_bind_cli_overrides_toml() {
+        let toml_str = r#"
+            [server]
+            bind = "0.0.0.0"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.http_bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let config =
+            Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(
+            config.http_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        );
+    }
+
+    #[test]
+    fn test_http_bind_accepts_ipv6() {
+        let toml_str = r#"
+            [server]
+            bind = "::1"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(
+            config.http_bind,
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        );
+    }
+
+    #[test]
+    fn test_http_bind_invalid_string_errors() {
+        let toml_str = r#"
+            [server]
+            bind = "not-an-ip"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .expect_err("invalid IP in [server] bind must error at build time");
+        let msg = format!("{err}");
+        assert!(msg.contains("bind"), "{msg}");
+        assert!(msg.contains("not-an-ip"), "{msg}");
     }
 
     #[test]
@@ -2686,43 +3217,6 @@ mod tests {
         assert!(!cfg.only_print_filenames);
         // Notifications
         assert!(cfg.notification_script.is_none());
-    }
-
-    #[test]
-    fn test_build_password_cli_overrides_toml() {
-        let toml_str = r#"
-            [auth]
-            password = "toml-pw"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let globals = default_globals();
-        let mut pw = default_password();
-        pw.password = Some("cli-pw".to_string());
-        let cfg = Config::build(&globals, pw, default_sync(), Some(toml)).unwrap();
-        assert_eq!(
-            cfg.password.as_ref().map(|s| s.expose_secret()),
-            Some("cli-pw")
-        );
-    }
-
-    #[test]
-    fn test_build_password_from_toml() {
-        let toml_str = r#"
-            [auth]
-            password = "toml-pw"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            default_password(),
-            default_sync(),
-            Some(toml),
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.password.as_ref().map(|s| s.expose_secret()),
-            Some("toml-pw")
-        );
     }
 
     #[test]
@@ -3081,6 +3575,10 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[test]
     fn test_build_all_boolean_flags_from_toml() {
+        // `skip_photos = true` is intentionally omitted: combining it with
+        // `skip_videos = true` and `skip_live_photos = true` would download
+        // nothing and is rejected at Config::build. See
+        // `test_build_skip_videos_and_photos_with_live_skip_rejected`.
         let toml_str = r#"
             [download]
             set_exif_datetime = true
@@ -3088,7 +3586,6 @@ mod tests {
 
             [filters]
             skip_videos = true
-            skip_photos = true
             skip_live_photos = true
 
             [photos]
@@ -3109,7 +3606,7 @@ mod tests {
         assert!(cfg.set_exif_datetime);
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
-        assert!(cfg.skip_photos);
+        assert!(!cfg.skip_photos);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::Skip);
         assert!(cfg.force_size);
         assert!(cfg.keep_unicode_in_filenames);
@@ -3119,11 +3616,12 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[test]
     fn test_build_all_boolean_flags_cli_overrides() {
+        // `skip_photos = Some(true)` is intentionally omitted here too; see
+        // the matching TOML test above.
         let mut sync = default_sync();
         sync.set_exif_datetime = Some(true);
         sync.no_progress_bar = Some(true);
         sync.skip_videos = Some(true);
-        sync.skip_photos = Some(true);
         sync.skip_live_photos = Some(true);
         sync.force_size = Some(true);
         sync.keep_unicode_in_filenames = Some(true);
@@ -3132,7 +3630,7 @@ mod tests {
         assert!(cfg.set_exif_datetime);
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
-        assert!(cfg.skip_photos);
+        assert!(!cfg.skip_photos);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::Skip);
         assert!(cfg.force_size);
         assert!(cfg.keep_unicode_in_filenames);
@@ -3232,6 +3730,43 @@ mod tests {
     }
 
     #[test]
+    fn test_build_report_json_from_toml() {
+        let toml_str = r#"
+            [report]
+            json = "/toml/run.json"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.report_json, Some(PathBuf::from("/toml/run.json")));
+    }
+
+    #[test]
+    fn test_build_report_json_cli_overrides_toml() {
+        let toml_str = r#"
+            [report]
+            json = "/toml/run.json"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.report_json = Some(PathBuf::from("/cli/run.json"));
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(cfg.report_json, Some(PathBuf::from("/cli/run.json")));
+    }
+
+    #[test]
+    fn test_build_report_json_none_by_default() {
+        let cfg =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        assert!(cfg.report_json.is_none());
+    }
+
+    #[test]
     fn test_toml_notifications_section() {
         let toml_str = r#"
             [notifications]
@@ -3254,7 +3789,7 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
-        sync.recent = Some(100);
+        sync.recent = Some(crate::cli::RecentLimit::Count(100));
         let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.recent, Some(100));
     }
@@ -3348,7 +3883,6 @@ mod tests {
 
             [auth]
             username = "full@example.com"
-            password = "fullpw"
             domain = "cn"
             cookie_directory = "{cookie}"
 
@@ -3394,10 +3928,7 @@ mod tests {
         .unwrap();
         // default_auth username overrides toml
         assert_eq!(cfg.username, "u@example.com");
-        assert_eq!(
-            cfg.password.as_ref().map(|s| s.expose_secret()),
-            Some("fullpw")
-        );
+        assert!(cfg.password.is_none());
         assert!(matches!(cfg.domain, Domain::Cn));
         assert_eq!(cfg.cookie_directory, cookie_path);
         assert_eq!(cfg.directory, PathBuf::from("/full/photos"));
@@ -3438,10 +3969,12 @@ mod tests {
 
     #[test]
     fn test_resolve_auth_all_from_toml() {
+        // `[auth].password` is rejected in `Config::build()`, so resolve_auth
+        // itself never reads it from TOML. Username, domain, and cookie
+        // directory still flow through.
         let toml_str = r#"
             [auth]
             username = "toml@example.com"
-            password = "toml-pw"
             domain = "cn"
             cookie_directory = "/toml/cookies"
         "#;
@@ -3455,7 +3988,7 @@ mod tests {
         let pw = crate::cli::PasswordArgs::default();
         let (username, password, domain, cookie_dir) = resolve_auth(&globals, &pw, Some(&toml));
         assert_eq!(username, "toml@example.com");
-        assert_eq!(password.as_deref(), Some("toml-pw"));
+        assert!(password.is_none());
         assert!(matches!(domain, Domain::Cn));
         assert_eq!(cookie_dir, PathBuf::from("/toml/cookies"));
     }
@@ -3465,7 +3998,6 @@ mod tests {
         let toml_str = r#"
             [auth]
             username = "toml@example.com"
-            password = "toml-pw"
             domain = "cn"
             cookie_directory = "/toml/cookies"
         "#;
@@ -3485,6 +4017,30 @@ mod tests {
         assert_eq!(password.as_deref(), Some("cli-pw"));
         assert!(matches!(domain, Domain::Com));
         assert_eq!(cookie_dir, PathBuf::from("/cli/cookies"));
+    }
+
+    #[test]
+    fn test_resolve_auth_ignores_toml_password_field() {
+        // Belt-and-braces: even if a TOML config somehow reaches resolve_auth
+        // without passing through Config::build (e.g. a future caller),
+        // resolve_auth itself must not surface the plaintext password.
+        let toml_str = r#"
+            [auth]
+            password = "toml-pw"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let globals = GlobalArgs {
+            username: None,
+            domain: None,
+            data_dir: None,
+            cookie_directory: None,
+        };
+        let pw = crate::cli::PasswordArgs::default();
+        let (_, password, _, _) = resolve_auth(&globals, &pw, Some(&toml));
+        assert!(
+            password.is_none(),
+            "resolve_auth must not read plaintext password from TOML"
+        );
     }
 
     #[test]
@@ -3821,7 +4377,7 @@ mod tests {
     #[test]
     fn test_to_toml_per_run_fields_omitted() {
         let mut sync = default_sync();
-        sync.recent = Some(50);
+        sync.recent = Some(crate::cli::RecentLimit::Count(50));
         sync.skip_created_before = Some("2025-01-01".to_string());
         sync.skip_created_after = Some("2025-12-31".to_string());
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
@@ -4036,6 +4592,7 @@ mod tests {
             notifications: None,
             metrics: None,
             server: None,
+            report: None,
         };
         let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/data"));
@@ -4061,6 +4618,7 @@ mod tests {
             notifications: None,
             metrics: None,
             server: None,
+            report: None,
         };
         let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/cookies"));
@@ -4085,6 +4643,7 @@ mod tests {
             notifications: None,
             metrics: None,
             server: None,
+            report: None,
         };
         let result = resolve_data_dir(
             Some("/cli/data"),
@@ -4417,5 +4976,461 @@ mod tests {
             resolve_library_selection(Some("all".to_string()), None),
             LibrarySelection::All
         );
+    }
+
+    // ── --notify-systemd auto-detect via NOTIFY_SOCKET ────────────────
+    //
+    // Pure policy via `resolve_notify_systemd` so the truth table is
+    // testable without mutating the process environment (which would race
+    // under parallel test execution).
+
+    #[test]
+    fn resolve_notify_systemd_cli_true_wins() {
+        // CLI true: enabled regardless of socket presence.
+        assert!(resolve_notify_systemd(Some(true), None, false));
+        assert!(resolve_notify_systemd(Some(true), None, true));
+        assert!(resolve_notify_systemd(Some(true), Some(false), true));
+    }
+
+    #[test]
+    fn resolve_notify_systemd_cli_false_wins_even_under_systemd() {
+        // Explicit CLI false is the escape hatch: user is under systemd
+        // (NOTIFY_SOCKET set) but wants kei to stay silent.
+        assert!(!resolve_notify_systemd(Some(false), None, true));
+        assert!(!resolve_notify_systemd(Some(false), Some(true), true));
+    }
+
+    #[test]
+    fn resolve_notify_systemd_toml_used_when_cli_absent() {
+        assert!(resolve_notify_systemd(None, Some(true), false));
+        assert!(!resolve_notify_systemd(None, Some(false), true));
+    }
+
+    #[test]
+    fn resolve_notify_systemd_auto_detect_when_nothing_set() {
+        // No explicit setting: follow the NOTIFY_SOCKET signal.
+        assert!(resolve_notify_systemd(None, None, true));
+        assert!(!resolve_notify_systemd(None, None, false));
+    }
+
+    // ── Smart retry delay from max_retries ────────────────────────────
+
+    #[test]
+    fn test_smart_retry_delay_table() {
+        assert_eq!(smart_retry_delay(0), 5);
+        assert_eq!(smart_retry_delay(1), 2);
+        assert_eq!(smart_retry_delay(2), 2);
+        assert_eq!(smart_retry_delay(3), 5);
+        assert_eq!(smart_retry_delay(4), 10);
+        assert_eq!(smart_retry_delay(5), 10);
+        assert_eq!(smart_retry_delay(6), 10);
+        assert_eq!(smart_retry_delay(7), 30);
+        assert_eq!(smart_retry_delay(25), 30);
+        assert_eq!(smart_retry_delay(100), 30);
+    }
+
+    #[test]
+    fn test_build_retry_delay_smart_default_from_max_retries() {
+        // No explicit retry-delay anywhere; max_retries=5 should pull the
+        // 4..=6 bucket from the smart table (10s).
+        let mut sync = default_sync();
+        sync.max_retries = Some(5);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.retry_delay_secs, 10);
+    }
+
+    #[test]
+    fn test_build_retry_delay_smart_default_patient_bucket() {
+        let mut sync = default_sync();
+        sync.max_retries = Some(10);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.retry_delay_secs, 30);
+    }
+
+    #[test]
+    fn test_build_retry_delay_smart_default_fail_fast_bucket() {
+        let mut sync = default_sync();
+        sync.max_retries = Some(1);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.retry_delay_secs, 2);
+    }
+
+    #[test]
+    fn test_build_retry_delay_explicit_cli_still_wins() {
+        // Deprecated-but-functional: explicit delay overrides the smart
+        // default during the deprecation window. Warning is stderr-only,
+        // not asserted here (covered in a behavioral test).
+        let mut sync = default_sync();
+        sync.max_retries = Some(3);
+        sync.retry_delay = Some(42);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.retry_delay_secs, 42);
+    }
+
+    #[test]
+    fn test_build_retry_delay_explicit_toml_still_wins() {
+        let toml_str = r#"
+            [download.retry]
+            delay = 77
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.retry_delay_secs, 77);
+    }
+
+    #[test]
+    fn test_to_toml_omits_delay_when_matches_smart_default() {
+        // Smart default for max_retries=3 is 5. to_toml should NOT write
+        // `delay = 5` back out because it's redundant (and deprecated).
+        let mut sync = default_sync();
+        sync.max_retries = Some(3);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let retry = toml.download.unwrap().retry.unwrap();
+        assert_eq!(retry.max_retries, Some(3));
+        assert_eq!(retry.delay, None);
+    }
+
+    #[test]
+    fn test_to_toml_writes_delay_when_overridden() {
+        // User set delay=20 against max_retries=3 (smart default would be 5).
+        // to_toml preserves the override so round-trips don't silently lose
+        // the user's intent while the flag is still accepted.
+        let mut sync = default_sync();
+        sync.max_retries = Some(3);
+        sync.retry_delay = Some(20);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let retry = toml.download.unwrap().retry.unwrap();
+        assert_eq!(retry.delay, Some(20));
+    }
+
+    // ── --threads vs deprecated --threads-num ─────────────────────────
+
+    #[test]
+    fn test_build_threads_cli_canonical() {
+        let mut sync = default_sync();
+        sync.threads = Some(7);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.threads_num, 7);
+    }
+
+    #[test]
+    fn test_build_legacy_threads_num_still_works() {
+        let mut sync = default_sync();
+        sync.threads_num = Some(12);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.threads_num, 12);
+    }
+
+    #[test]
+    fn test_build_both_threads_forms_rejected_cli() {
+        let mut sync = default_sync();
+        sync.threads = Some(4);
+        sync.threads_num = Some(8);
+        let err = Config::build(&default_globals(), default_password(), sync, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--threads"), "{err}");
+        assert!(err.contains("--threads-num"), "{err}");
+        assert!(err.contains("v0.20.0"), "{err}");
+        assert!(err.contains("pick one"), "{err}");
+    }
+
+    #[test]
+    fn test_build_both_threads_forms_rejected_toml() {
+        let toml_str = r#"
+            [download]
+            threads = 4
+            threads_num = 8
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("[download] threads"), "{err}");
+        assert!(err.contains("threads_num"), "{err}");
+        assert!(err.contains("v0.20.0"), "{err}");
+    }
+
+    #[test]
+    fn test_build_threads_cli_beats_legacy_toml() {
+        let toml_str = r#"
+            [download]
+            threads_num = 2
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.threads = Some(20);
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(cfg.threads_num, 20);
+    }
+
+    #[test]
+    fn test_build_legacy_threads_num_cli_beats_toml_new() {
+        // CLI always wins over TOML, even when the CLI spelling is the
+        // legacy one. Warning still fires - not asserted here (stderr-only).
+        let toml_str = r#"
+            [download]
+            threads = 2
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.threads_num = Some(20);
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(cfg.threads_num, 20);
+    }
+
+    #[test]
+    fn test_build_toml_threads_canonical() {
+        let toml_str = r#"
+            [download]
+            threads = 16
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.threads_num, 16);
+    }
+
+    // ── --recent count vs days ────────────────────────────────────────
+
+    #[test]
+    fn test_build_recent_count_populates_recent_field() {
+        let mut sync = default_sync();
+        sync.recent = Some(crate::cli::RecentLimit::Count(100));
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.recent, Some(100));
+        assert!(
+            cfg.skip_created_before.is_none(),
+            "Count form must not touch skip_created_before"
+        );
+    }
+
+    #[test]
+    fn test_build_recent_days_populates_skip_created_before() {
+        let mut sync = default_sync();
+        sync.recent = Some(crate::cli::RecentLimit::Days(30));
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert!(
+            cfg.recent.is_none(),
+            "Days form must not populate recent (count-only field)"
+        );
+        assert!(
+            cfg.skip_created_before.is_some(),
+            "Days form must populate skip_created_before cutoff"
+        );
+        // The cutoff should be ~30 days ago; give it a wide window to avoid
+        // flakiness on slow CI.
+        let cutoff = cfg.skip_created_before.unwrap();
+        let now = chrono::Local::now();
+        let delta = now.signed_duration_since(cutoff);
+        assert!(
+            delta.num_days() >= 29 && delta.num_days() <= 31,
+            "cutoff should be ~30 days ago; got {} days",
+            delta.num_days()
+        );
+    }
+
+    #[test]
+    fn test_build_recent_days_conflicts_with_skip_created_before() {
+        let mut sync = default_sync();
+        sync.recent = Some(crate::cli::RecentLimit::Days(30));
+        sync.skip_created_before = Some("2024-01-01".to_string());
+        let err = Config::build(&default_globals(), default_password(), sync, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--recent 30d"), "{err}");
+        assert!(err.contains("--skip-created-before"), "{err}");
+        assert!(err.contains("pick one"), "{err}");
+    }
+
+    #[test]
+    fn test_build_recent_count_orthogonal_with_skip_created_before() {
+        // Count and skip_created_before are orthogonal - take the N most
+        // recent assets, filtered to those after the cutoff.
+        let mut sync = default_sync();
+        sync.recent = Some(crate::cli::RecentLimit::Count(100));
+        sync.skip_created_before = Some("2024-01-01".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.recent, Some(100));
+        assert!(cfg.skip_created_before.is_some());
+    }
+
+    #[test]
+    fn test_build_recent_days_from_toml() {
+        let toml_str = r#"
+            [filters]
+            recent = "14d"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert!(cfg.recent.is_none());
+        assert!(cfg.skip_created_before.is_some());
+    }
+
+    #[test]
+    fn test_build_recent_count_from_toml_integer() {
+        let toml_str = r#"
+            [filters]
+            recent = 250
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.recent, Some(250));
+    }
+
+    #[test]
+    fn test_build_recent_days_conflicts_with_toml_skip_created_before() {
+        // CLI Days form should also conflict with a TOML skip_created_before.
+        let toml_str = r#"
+            [filters]
+            skip_created_before = "2024-01-01"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.recent = Some(crate::cli::RecentLimit::Days(7));
+        let err = Config::build(&default_globals(), default_password(), sync, Some(toml))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--recent 7d"), "{err}");
+    }
+
+    // ── skip-videos + skip-photos empty-result guard ──────────────────
+
+    #[test]
+    fn test_build_skip_videos_and_photos_with_live_skip_rejected() {
+        // Classic "user thought these were orthogonal" mistake: both flags
+        // true with live-photo-mode skip means nothing at all downloads.
+        let mut sync = default_sync();
+        sync.skip_videos = Some(true);
+        sync.skip_photos = Some(true);
+        sync.live_photo_mode = Some(LivePhotoMode::Skip);
+        let err = Config::build(&default_globals(), default_password(), sync, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("would download nothing"),
+            "error should explain the outcome; got: {err}"
+        );
+        assert!(
+            err.contains("--live-photo-mode skip"),
+            "error should name the specific mode; got: {err}"
+        );
+        assert!(
+            err.contains("video-only"),
+            "error should suggest the escape hatch; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_skip_videos_and_photos_with_image_only_rejected() {
+        // image-only drops Live Photo MOVs, so combined with both skip
+        // flags the result is still nothing. Same error applies.
+        let mut sync = default_sync();
+        sync.skip_videos = Some(true);
+        sync.skip_photos = Some(true);
+        sync.live_photo_mode = Some(LivePhotoMode::ImageOnly);
+        let err = Config::build(&default_globals(), default_password(), sync, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would download nothing"), "{err}");
+        assert!(err.contains("--live-photo-mode image-only"), "{err}");
+    }
+
+    #[test]
+    fn test_build_skip_videos_and_photos_with_video_only_allowed() {
+        // Obscure but legitimate: user wants only Live Photo MOV
+        // companions. video-only mode keeps the MOV while both skip flags
+        // drop everything else. Must not error.
+        let mut sync = default_sync();
+        sync.skip_videos = Some(true);
+        sync.skip_photos = Some(true);
+        sync.live_photo_mode = Some(LivePhotoMode::VideoOnly);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert!(cfg.skip_videos);
+        assert!(cfg.skip_photos);
+        assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
+    }
+
+    #[test]
+    fn test_build_skip_videos_and_photos_with_both_allowed() {
+        // Default live-photo-mode is Both. With both skip flags set, Live
+        // Photo MOVs still download (skip_videos targets pure videos, not
+        // Live Photo video companions). Must not error.
+        let mut sync = default_sync();
+        sync.skip_videos = Some(true);
+        sync.skip_photos = Some(true);
+        sync.live_photo_mode = Some(LivePhotoMode::Both);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
+    }
+
+    #[test]
+    fn test_build_skip_videos_alone_ok() {
+        let mut sync = default_sync();
+        sync.skip_videos = Some(true);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert!(cfg.skip_videos);
+        assert!(!cfg.skip_photos);
+    }
+
+    #[test]
+    fn test_build_skip_photos_alone_ok() {
+        let mut sync = default_sync();
+        sync.skip_photos = Some(true);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert!(cfg.skip_photos);
+        assert!(!cfg.skip_videos);
+    }
+
+    #[test]
+    fn test_build_skip_videos_and_photos_from_toml_rejected() {
+        // TOML version of the same check. Live-photo-mode comes from
+        // [filters] skip_live_photos which maps to Skip mode.
+        let toml_str = r#"
+            [filters]
+            skip_videos = true
+            skip_photos = true
+            skip_live_photos = true
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("would download nothing"), "{err}");
     }
 }

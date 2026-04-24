@@ -592,14 +592,12 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     if retries != 3 {
         answers.max_retries = Some(retries);
     }
-
-    let delay: u64 = Input::new()
-        .with_prompt("Retry delay in seconds")
-        .default(5u64)
-        .interact_text()?;
-    if delay != 5 {
-        answers.retry_delay = Some(delay);
-    }
+    // Initial retry delay is now derived from `--max-retries` via a smart
+    // default, so the wizard no longer prompts for it. The deprecated
+    // `retry_delay` field on `Answers` is left untouched; if a user is
+    // migrating a config that already has `[download.retry] delay = N`,
+    // `Config::build` warns and keeps using the explicit value until
+    // v0.20.0.
 
     // Filenames
     println!();
@@ -710,8 +708,8 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         None => writeln!(out, "# folder_structure = \"%Y/%m/%d\"").ok(),
     };
     match answers.threads_num {
-        Some(n) => writeln!(out, "threads_num = {n}").ok(),
-        None => writeln!(out, "# threads_num = 10").ok(),
+        Some(n) => writeln!(out, "threads = {n}").ok(),
+        None => writeln!(out, "# threads = 10").ok(),
     };
     #[cfg(feature = "xmp")]
     {
@@ -734,10 +732,12 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         Some(n) => writeln!(out, "max_retries = {n}").ok(),
         None => writeln!(out, "# max_retries = 3").ok(),
     };
-    match answers.retry_delay {
-        Some(n) => writeln!(out, "delay = {n}").ok(),
-        None => writeln!(out, "# delay = 5").ok(),
-    };
+    // `delay` is deprecated; the wizard doesn't emit it. Users migrating an
+    // older config that sets it will see a warning at startup directing them
+    // to remove it before v0.20.0. See `smart_retry_delay`.
+    if let Some(n) = answers.retry_delay {
+        writeln!(out, "# delay = {n}  # deprecated, remove before v0.20.0").ok();
+    }
 
     // [filters]
     writeln!(out).ok();
@@ -914,7 +914,7 @@ mod tests {
         assert!(!toml.contains("secret"));
         // Defaults should be commented out
         assert!(toml.contains("# size = \"original\""));
-        assert!(toml.contains("# threads_num = 10"));
+        assert!(toml.contains("# threads = 10"));
         assert!(toml.contains("# log_level = \"warn\""));
     }
 
@@ -990,7 +990,7 @@ mod tests {
         assert!(toml_str.contains("recent = 100"));
         assert!(toml_str.contains("interval = 1800"));
         assert!(toml_str.contains("notify_systemd = true"));
-        assert!(toml_str.contains("threads_num = 4"));
+        assert!(toml_str.contains("threads = 4"));
         assert!(toml_str.contains("file_match_policy = \"name-id7\""));
         assert!(toml_str.contains("log_level = \"debug\""));
         #[cfg(feature = "xmp")]
@@ -1049,18 +1049,23 @@ mod tests {
         let dl = parsed.download.unwrap();
         assert_eq!(dl.directory.as_deref(), Some("/data/photos"));
         assert_eq!(dl.folder_structure.as_deref(), Some("%Y-%m"));
-        assert_eq!(dl.threads_num, Some(2));
+        assert_eq!(dl.threads, Some(2));
+        assert_eq!(dl.threads_num, None);
         #[cfg(feature = "xmp")]
         assert_eq!(dl.set_exif_datetime, Some(true));
         let retry = dl.retry.unwrap();
         assert_eq!(retry.max_retries, Some(0));
-        assert_eq!(retry.delay, Some(1));
+        // `retry_delay` is deprecated; the wizard emits it as a commented-out
+        // line so migration-in-place is visible but the key is inert. That
+        // means the parsed TOML back doesn't carry the value as an active
+        // field.
+        assert_eq!(retry.delay, None);
 
         let filters = parsed.filters.unwrap();
         assert_eq!(filters.albums.as_deref(), Some(&["A".to_string()][..]));
         assert_eq!(filters.skip_videos, Some(true));
         assert_eq!(filters.skip_live_photos, Some(true));
-        assert_eq!(filters.recent, Some(50));
+        assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(50)));
         assert_eq!(filters.skip_created_before.as_deref(), Some("30d"));
         assert_eq!(filters.skip_created_after.as_deref(), Some("2025-06-01"));
 

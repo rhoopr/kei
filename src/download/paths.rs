@@ -273,8 +273,13 @@ pub(crate) fn map_filename_extension(filename: &str, asset_type: &str) -> String
 /// Compute the first 7 characters of the base64-encoded asset ID.
 ///
 /// Used by the `name-id7` file match policy to create unique filenames.
+/// Uses the URL-safe base64 alphabet (`-` / `_`) so the result is always
+/// safe to embed in a filename. Standard base64 would emit `/` (path
+/// separator!) or `+` for certain input byte sequences — CloudKit asset
+/// IDs can contain bytes that trigger that, e.g. an ID containing `?`
+/// would produce `/` at base64 position 4.
 fn base64_id7(id: &str) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(id.as_bytes());
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id.as_bytes());
     encoded[..encoded.len().min(7)].to_string()
 }
 
@@ -676,14 +681,16 @@ mod tests {
     #[test]
     fn test_apply_name_id7() {
         let result = apply_name_id7("IMG_0001.JPG", "ABC123");
-        // base64("ABC123") = "QUJDMTIz", first 7 = "QUJDMTI"
+        // URL-safe base64("ABC123") = "QUJDMTIz", first 7 = "QUJDMTI"
+        // (URL_SAFE_NO_PAD and STANDARD agree on inputs that don't hit
+        // the `+` / `/` positions; this test stays stable.)
         assert_eq!(result, "IMG_0001_QUJDMTI.JPG");
     }
 
     #[test]
     fn test_apply_name_id7_no_extension() {
         let result = apply_name_id7("photo", "XYZ");
-        // base64("XYZ") = "WFla", first 7 (only 4 available) = "WFla"
+        // URL-safe base64("XYZ") = "WFla", first 7 (only 4 available) = "WFla"
         assert_eq!(result, "photo_WFla");
     }
 
@@ -692,6 +699,40 @@ mod tests {
         // Longer IDs should produce exactly 7 chars
         let result = base64_id7("AaBbCcDdEeFfGg/HhIiJj+KkLl");
         assert_eq!(result.len(), 7);
+    }
+
+    #[test]
+    fn test_base64_id7_never_emits_path_separator() {
+        // STANDARD base64 would put `/` at position 4 for this input
+        // (byte `?` = 0x3F makes the 4th 6-bit group = 63 = `/`).
+        // URL-safe base64 must translate that to `_` instead — otherwise
+        // the filename suffix contains a literal path separator and the
+        // file lands in a surprise subdirectory.
+        let result = base64_id7("AB?xxxxx");
+        assert!(
+            !result.contains('/'),
+            "id suffix must never contain path separator; got {result:?}"
+        );
+        assert!(
+            !result.contains('+'),
+            "id suffix must never contain `+` (standard-base64 leak); got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_base64_id7_only_safe_characters_under_fuzz() {
+        // Every byte 0x00..=0xFF as a single-byte ID must produce a
+        // suffix containing only URL-safe base64 characters.
+        for b in 0u8..=255 {
+            let id = String::from_utf8_lossy(&[b]).to_string();
+            let result = base64_id7(&id);
+            for c in result.chars() {
+                assert!(
+                    matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_'),
+                    "unsafe char {c:?} in suffix for input byte 0x{b:02x}"
+                );
+            }
+        }
     }
 
     #[test]

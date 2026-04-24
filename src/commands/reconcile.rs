@@ -20,6 +20,7 @@
     reason = "CLI subcommand whose primary purpose is to print a reconcile report to stdout"
 )]
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use crate::cli;
@@ -32,6 +33,12 @@ use crate::state::{StateDb, VersionSizeKey};
 const FILE_MISSING_REASON: &str = "FILE_MISSING_AT_STARTUP";
 
 const SCAN_PAGE_SIZE: u32 = 1000;
+
+/// Cap on per-issue `MISSING:` / `NO PATH:` lines emitted. Mirrors the
+/// cap used by `kei status` and `kei verify` so the three surfaces feel
+/// consistent on large libraries. Summary counts at the end are always
+/// the true totals — only the per-line listings are capped.
+const ISSUE_PRINT_CAP: u64 = 200;
 
 #[derive(Debug)]
 struct MissingAsset {
@@ -124,21 +131,41 @@ pub(crate) async fn run_reconcile(
     }
     println!();
 
+    // Shared cell so both callbacks can bump the same counter under the
+    // FnMut + FnMut constraint. Single-threaded; Cell is cheap here.
+    let printed = Cell::new(0u64);
+
     let (counts, missing) = scan_missing(
         &db,
         |m| {
-            println!(
-                "MISSING: {} ({}, {})",
-                m.local_path.display(),
-                m.id,
-                m.version_size.as_str(),
-            );
+            if printed.get() < ISSUE_PRINT_CAP {
+                println!(
+                    "MISSING: {} ({}, {})",
+                    m.local_path.display(),
+                    m.id,
+                    m.version_size.as_str(),
+                );
+                printed.set(printed.get() + 1);
+            }
         },
         |id| {
-            println!("NO PATH: {id} - no local path recorded");
+            if printed.get() < ISSUE_PRINT_CAP {
+                println!("NO PATH: {id} - no local path recorded");
+                printed.set(printed.get() + 1);
+            }
         },
     )
     .await?;
+
+    let total_issues = counts.missing + counts.no_path;
+    if total_issues > printed.get() {
+        println!();
+        println!(
+            "... and {} more issue(s) not listed (listing capped at {})",
+            total_issues - printed.get(),
+            ISSUE_PRINT_CAP,
+        );
+    }
 
     let mut marked_failed = 0u64;
     let mut mark_errors = 0u64;

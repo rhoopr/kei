@@ -67,18 +67,35 @@ fn sync_help_succeeds() {
         .args(["sync", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--directory"));
+        .stdout(predicate::str::contains("--download-dir"));
 }
 
 #[test]
-fn sync_help_lists_sync_token_flags() {
+fn sync_help_hides_deprecated_directory_flag() {
+    // `--directory` still parses for backward compat but must not appear in
+    // help output; users should only see the new spelling.
+    common::cmd()
+        .args(["sync", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--directory").not());
+}
+
+#[test]
+fn sync_help_hides_deprecated_sync_token_flags() {
+    // Both `--no-incremental` (deprecated, use `kei reset sync-token`) and
+    // `--reset-sync-token` (hidden compat, use `kei reset sync-token`) are
+    // kept out of sync help. The canonical way is the subcommand.
     let assert = common::cmd().args(["sync", "--help"]).assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     assert!(
-        stdout.contains("--no-incremental"),
-        "sync help missing --no-incremental"
+        !stdout.contains("--no-incremental"),
+        "sync help should not advertise the deprecated `--no-incremental` flag"
     );
-    // --reset-sync-token is now a hidden compat flag (use `kei reset sync-token`)
+    assert!(
+        !stdout.contains("--reset-sync-token"),
+        "sync help should not advertise the deprecated `--reset-sync-token` flag"
+    );
 }
 
 #[test]
@@ -105,7 +122,7 @@ fn import_existing_help_succeeds() {
         .args(["import-existing", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--directory"));
+        .stdout(predicate::str::contains("--download-dir"));
 }
 
 #[test]
@@ -142,7 +159,7 @@ fn retry_failed_help_succeeds() {
         .args(["retry-failed", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--directory"));
+        .stdout(predicate::str::contains("--download-dir"));
 }
 
 // ── Invalid subcommand / unknown flags ──────────────────────────────────
@@ -341,7 +358,17 @@ fn file_match_policy_rejects_invalid() {
 // ── Numeric validation (rejection only — acceptance covered by unit tests)
 
 #[test]
-fn threads_num_rejects_zero() {
+fn threads_rejects_zero() {
+    common::cmd()
+        .args(["sync", "--username", "x@x.com", "--threads", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error"));
+}
+
+#[test]
+fn legacy_threads_num_rejects_zero() {
+    // Same validator on the deprecated flag path - 0 is still 0.
     common::cmd()
         .args(["sync", "--username", "x@x.com", "--threads-num", "0"])
         .assert()
@@ -376,7 +403,7 @@ fn import_existing_requires_directory() {
         .args(["import-existing", "--username", "x@x.com"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--directory is required"));
+        .stderr(predicate::str::contains("--download-dir is required"));
 }
 
 // ── Boolean flags are accepted ──────────────────────────────────────────
@@ -417,7 +444,7 @@ fn value_sync_flags_accepted() {
         ("--directory", "/tmp"),
         ("--folder-structure", "%Y-%m"),
         ("--recent", "10"),
-        ("--threads-num", "4"),
+        ("--threads", "4"),
         ("--watch-with-interval", "3600"),
         ("--max-retries", "5"),
         ("--retry-delay", "10"),
@@ -496,6 +523,22 @@ fn import_existing_folder_structure_flag() {
             "/tmp",
             "--folder-structure",
             "%Y-%m",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn import_existing_dry_run_flag_parses() {
+    // Covers the new --dry-run flag on import-existing. Must parse; actual
+    // DB-skip behavior is covered by the handler-level integration.
+    common::cmd()
+        .args([
+            "import-existing",
+            "--download-dir",
+            "/tmp",
+            "--dry-run",
             "--help",
         ])
         .assert()
@@ -676,7 +719,7 @@ fn retry_failed_accepts_sync_flags() {
             "--recent",
             "10",
             "--skip-videos",
-            "--threads-num",
+            "--threads",
             "2",
             "--help",
         ])

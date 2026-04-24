@@ -34,6 +34,13 @@ pub(crate) async fn run_verify(
     let mut missing = 0u64;
     let mut corrupted = 0u64;
     let mut verified = 0u64;
+    let mut printed_issues = 0u64;
+
+    // Cap the per-issue listing so a library with thousands of missing
+    // or corrupted files doesn't produce a wall of output. Summary
+    // counts at the end always reflect the true total. Matches the
+    // `status` subcommand's cap so the two surfaces feel consistent.
+    const ISSUE_PRINT_CAP: u64 = 200;
 
     const PAGE_SIZE: u32 = 1000;
     let mut offset = 0u64;
@@ -49,16 +56,19 @@ pub(crate) async fn run_verify(
 
             if let Some(local_path) = &asset.local_path {
                 if !local_path.exists() {
-                    let downloaded_at = asset.downloaded_at.map_or_else(
-                        || "unknown".to_string(),
-                        |dt| dt.format("%Y-%m-%d").to_string(),
-                    );
-                    println!(
-                        "MISSING: {} ({}) - downloaded {}",
-                        local_path.display(),
-                        asset.id,
-                        downloaded_at
-                    );
+                    if printed_issues < ISSUE_PRINT_CAP {
+                        let downloaded_at = asset.downloaded_at.map_or_else(
+                            || "unknown".to_string(),
+                            |dt| dt.format("%Y-%m-%d").to_string(),
+                        );
+                        println!(
+                            "MISSING: {} ({}) - downloaded {}",
+                            local_path.display(),
+                            asset.id,
+                            downloaded_at
+                        );
+                        printed_issues += 1;
+                    }
                     missing += 1;
                     continue;
                 }
@@ -68,11 +78,17 @@ pub(crate) async fn run_verify(
                         match verify_local_checksum(local_path, local_cksum).await {
                             Ok(true) => verified += 1,
                             Ok(false) => {
-                                println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
+                                if printed_issues < ISSUE_PRINT_CAP {
+                                    println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
+                                    printed_issues += 1;
+                                }
                                 corrupted += 1;
                             }
                             Err(e) => {
-                                println!("ERROR: {} - {}", local_path.display(), e);
+                                if printed_issues < ISSUE_PRINT_CAP {
+                                    println!("ERROR: {} - {}", local_path.display(), e);
+                                    printed_issues += 1;
+                                }
                                 corrupted += 1;
                             }
                         }
@@ -87,10 +103,23 @@ pub(crate) async fn run_verify(
                     verified += 1;
                 }
             } else {
-                println!("NO PATH: {} - no local path recorded", asset.id);
+                if printed_issues < ISSUE_PRINT_CAP {
+                    println!("NO PATH: {} - no local path recorded", asset.id);
+                    printed_issues += 1;
+                }
                 missing += 1;
             }
         }
+    }
+
+    let total_issues = missing + corrupted;
+    if total_issues > printed_issues {
+        println!();
+        println!(
+            "... and {} more issue(s) not listed (listing capped at {})",
+            total_issues - printed_issues,
+            ISSUE_PRINT_CAP,
+        );
     }
 
     println!();

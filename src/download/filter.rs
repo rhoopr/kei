@@ -1731,6 +1731,40 @@ mod tests {
     }
 
     #[test]
+    fn test_name_id7_never_embeds_path_separator_in_filename() {
+        // Regression: under STANDARD base64, an asset ID containing `?`
+        // (0x3F) at position 2 produces `/` as the 4th base64 char,
+        // which is a literal path separator. URL-safe base64 must
+        // translate that to `_` instead.
+        let asset = TestPhotoAsset::new("AB?xxxxx").build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            !filename.contains('/'),
+            "NameId7 filename leaked a path separator: {filename}"
+        );
+        assert!(
+            !filename.contains('+'),
+            "NameId7 filename leaked a `+` char (standard-base64 leak): {filename}"
+        );
+        // Confirm the `_` is actually in the suffix slot — proves the
+        // URL-safe alphabet kicked in (STANDARD would have put `/`
+        // there; `_` is the URL-safe replacement for `/`).
+        assert!(
+            filename.contains('_'),
+            "expected URL-safe `_` in id7 suffix, got: {filename}"
+        );
+    }
+
+    #[test]
     fn test_name_id7_skips_existing_file() {
         let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();

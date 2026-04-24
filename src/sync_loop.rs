@@ -37,6 +37,110 @@ struct LibraryState {
     plan: crate::commands::AlbumPlan,
 }
 
+/// State-DB metadata key for the first-sync shared-library notice. Bumping
+/// the version suffix (e.g. `_v2`) re-fires the notice for every existing
+/// data dir the next time it's used.
+const SHARED_LIBRARY_NOTICE_KEY: &str = "shared_library_notice_shown_v1";
+
+/// Given the user's library selection, the count of iCloud shared libraries
+/// on the account, and whether the notice has already fired, return the
+/// warning message to emit, or `None` if no notice is warranted.
+///
+/// Pure function so the policy is unit-testable without mocking the
+/// `PhotosService` or the state DB. The I/O wrapper lives in
+/// [`maybe_notify_shared_libraries`].
+fn should_notify_shared_libraries(
+    selection: &config::LibrarySelection,
+    shared_count: usize,
+    already_notified: bool,
+) -> Option<String> {
+    if already_notified || shared_count == 0 {
+        return None;
+    }
+    // Only users on the `PrimarySync` default see the notice. Anyone who
+    // explicitly picked `--library all` or a specific shared zone has
+    // already made a deliberate choice.
+    if !matches!(selection, config::LibrarySelection::Single(s) if s == "PrimarySync") {
+        return None;
+    }
+    let (word, verb) = if shared_count == 1 {
+        ("library", "is")
+    } else {
+        ("libraries", "are")
+    };
+    Some(format!(
+        "Detected {shared_count} iCloud shared {word} on this account; only the primary \
+         library {verb} being synced. To include shared libraries too, set \
+         `[filters] library = \"all\"` in config.toml (or pass `--library all`). \
+         Run `kei list libraries` to enumerate every zone."
+    ))
+}
+
+/// One-shot probe + warning for users on the `PrimarySync` default who also
+/// have shared libraries. Fires at most once per data dir; the marker lives
+/// in the state DB's `metadata` table under [`SHARED_LIBRARY_NOTICE_KEY`].
+///
+/// The network probe and the marker write are both best-effort: failures
+/// degrade to `tracing::debug!` and skip without breaking the sync.
+async fn maybe_notify_shared_libraries(
+    selection: &config::LibrarySelection,
+    photos_service: &mut crate::icloud::photos::PhotosService,
+    state_db: Option<&Arc<dyn state::StateDb>>,
+) {
+    // Read the marker first; if we've already notified on this data dir,
+    // skip the network probe entirely.
+    let already_notified = match state_db {
+        Some(db) => match db.get_metadata(SHARED_LIBRARY_NOTICE_KEY).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "shared-library notice: metadata read failed; skipping"
+                );
+                return;
+            }
+        },
+        None => false,
+    };
+    if already_notified {
+        return;
+    }
+
+    // Short-circuit before the API call for users who aren't on the default.
+    // Saves one request per sync once we persist the marker on next sync.
+    if !matches!(selection, config::LibrarySelection::Single(s) if s == "PrimarySync") {
+        return;
+    }
+
+    let shared_count = match photos_service.fetch_shared_libraries().await {
+        Ok(map) => map.len(),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "shared-library notice: enumeration failed; skipping"
+            );
+            return;
+        }
+    };
+
+    if let Some(msg) = should_notify_shared_libraries(selection, shared_count, already_notified) {
+        tracing::warn!("{msg}");
+    }
+
+    // Persist the marker regardless of whether a notice fired, so the next
+    // sync doesn't re-probe. A user who adds a shared library later can
+    // clear the marker via `kei reset state`.
+    if let Some(db) = state_db {
+        if let Err(e) = db.set_metadata(SHARED_LIBRARY_NOTICE_KEY, "1").await {
+            tracing::debug!(
+                error = %e,
+                "shared-library notice: failed to persist marker"
+            );
+        }
+    }
+}
+
 /// Arguments that [`run_sync`] needs from the CLI dispatch layer.
 pub(crate) struct SyncArgs {
     pub is_one_shot: bool,
@@ -64,6 +168,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let is_retry_failed = sync.retry_failed;
     let max_download_attempts = sync.max_download_attempts.unwrap_or(10);
     let reset_sync_token = sync.reset_sync_token;
+    if reset_sync_token {
+        crate::cli::deprecation_warning("--reset-sync-token", "kei reset sync-token");
+    }
     let toml_existed = toml_config.is_some();
     let cli_data_dir = globals
         .data_dir
@@ -171,6 +278,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         config.password_file.as_deref(),
         cred_store,
     );
+    // Snapshot the source kind before moving `source` into the provider
+    // closure — used by the --save-password hook after auth succeeds.
+    let password_source_kind = source.kind();
     let password_provider = make_password_provider(source);
 
     let auth_result = match auth::authenticate(
@@ -217,16 +327,32 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         Err(e) => return Err(e),
     };
 
-    // Save password to credential store if requested
-    if let (true, Some(ref pw)) = (config.save_password, &config.password) {
-        let store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
-        if let Err(e) = store.store(pw.expose_secret()) {
-            tracing::warn!(error = %e, "Failed to save password to credential store");
-        } else {
-            tracing::info!(
-                backend = store.backend_name(),
-                "Password saved to credential store"
-            );
+    // Save password to credential store if requested. Source-aware: only
+    // the ephemeral `Direct` source (CLI flag / env var) should actually
+    // persist; File / Command / Store / Interactive all emit a warning
+    // explaining why the flag is a no-op for that source instead of
+    // silently doing nothing.
+    if config.save_password {
+        match password::decide_save_password_action(password_source_kind) {
+            password::SavePasswordAction::Save => {
+                if let Some(ref pw) = config.password {
+                    let store = credential::CredentialStore::new(
+                        &config.username,
+                        &config.cookie_directory,
+                    );
+                    if let Err(e) = store.store(pw.expose_secret()) {
+                        tracing::warn!(error = %e, "Failed to save password to credential store");
+                    } else {
+                        tracing::info!(
+                            backend = store.backend_name(),
+                            "Password saved to credential store"
+                        );
+                    }
+                }
+            }
+            password::SavePasswordAction::SkipWithWarning(reason) => {
+                tracing::warn!("{reason}");
+            }
         }
     }
 
@@ -368,6 +494,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         }
     };
 
+    // First-sync notice: tell users on the `PrimarySync` default about any
+    // shared libraries they could be syncing. Runs once per data dir,
+    // gated by state DB metadata.
+    maybe_notify_shared_libraries(&config.library, &mut photos_service, state_db.as_ref()).await;
+
     // Handle --reset-sync-token (hidden compat flag): clear stored tokens before the sync loop
     if reset_sync_token {
         if let Some(db) = &state_db {
@@ -500,6 +631,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
     let (metrics_handle, metrics_task) = if config.watch_with_interval.is_some() {
         let (h, t, _addr) = crate::metrics::spawn_server(
+            config.http_bind,
             config.http_port,
             shutdown_token.clone(),
             staleness_threshold,
@@ -541,6 +673,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         } else {
             sd_notifier.notify_status("Syncing...");
             sd_notifier.notify_watchdog();
+            notifier.notify(
+                notifications::Event::SyncStarted,
+                "Sync cycle starting",
+                &config.username,
+                None,
+            );
 
             let cycle_result = run_cycle(
                 &library_states,
@@ -588,6 +726,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             if let Some(report_path) = &config.report_json {
                 let status = crate::report::sync_status_str(
                     cycle_result.session_expired,
+                    cycle_result.stats.interrupted,
                     cycle_result.failed_count,
                 );
                 // Populate failed_assets from the state DB so the report
@@ -1253,5 +1392,84 @@ async fn reacquire_session<F>(
         Err(e) => {
             tracing::warn!(error = %e, "Pre-cycle reauth failed, will retry mid-sync");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn primary() -> config::LibrarySelection {
+        config::LibrarySelection::Single("PrimarySync".to_string())
+    }
+
+    #[test]
+    fn notice_suppressed_when_already_shown() {
+        // The marker overrides everything: even a user with 5 shared libraries
+        // and the default selection gets no notice on re-entry.
+        assert!(should_notify_shared_libraries(&primary(), 5, true).is_none());
+    }
+
+    #[test]
+    fn notice_suppressed_when_no_shared_libraries() {
+        assert!(should_notify_shared_libraries(&primary(), 0, false).is_none());
+    }
+
+    #[test]
+    fn notice_suppressed_when_user_picked_all() {
+        // Anyone who explicitly set `--library all` has already opted in;
+        // nothing to tell them.
+        assert!(should_notify_shared_libraries(&config::LibrarySelection::All, 3, false).is_none());
+    }
+
+    #[test]
+    fn notice_suppressed_when_user_picked_shared_zone_explicitly() {
+        // A user who typed out `--library SharedSync-ABCD1234` has also made
+        // a choice; don't second-guess them.
+        let explicit = config::LibrarySelection::Single("SharedSync-ABCD1234".to_string());
+        assert!(should_notify_shared_libraries(&explicit, 3, false).is_none());
+    }
+
+    #[test]
+    fn notice_fires_with_singular_wording_for_one_library() {
+        let msg = should_notify_shared_libraries(&primary(), 1, false).unwrap();
+        assert!(
+            msg.contains("1 iCloud shared library"),
+            "singular 'library' wording expected; got: {msg}"
+        );
+        assert!(
+            msg.contains("is being synced"),
+            "singular verb 'is' expected; got: {msg}"
+        );
+        // The guidance is what the notice is for - it must name the config
+        // key, the CLI flag, and the discovery subcommand.
+        assert!(
+            msg.contains("[filters] library = \"all\""),
+            "TOML guidance missing: {msg}"
+        );
+        assert!(msg.contains("--library all"), "CLI guidance missing: {msg}");
+        assert!(
+            msg.contains("kei list libraries"),
+            "discovery guidance missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn notice_fires_with_plural_wording_for_multiple_libraries() {
+        let msg = should_notify_shared_libraries(&primary(), 3, false).unwrap();
+        assert!(
+            msg.contains("3 iCloud shared libraries"),
+            "plural 'libraries' wording expected; got: {msg}"
+        );
+        assert!(
+            msg.contains("are being synced"),
+            "plural verb 'are' expected; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn notice_suppressed_when_both_user_opted_out_and_already_notified() {
+        // Belt-and-braces: every suppression condition stacks correctly.
+        assert!(should_notify_shared_libraries(&config::LibrarySelection::All, 0, true).is_none());
     }
 }

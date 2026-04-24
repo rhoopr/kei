@@ -450,6 +450,7 @@ async fn handle_healthz(State(handle): State<MetricsHandle>) -> impl IntoRespons
 /// shutdown before the runtime drops. The server shuts down gracefully when
 /// `shutdown_token` is cancelled.
 pub(crate) fn spawn_server(
+    bind: std::net::IpAddr,
     port: u16,
     shutdown_token: CancellationToken,
     staleness_threshold: Option<chrono::Duration>,
@@ -460,14 +461,15 @@ pub(crate) fn spawn_server(
         .route("/healthz", get(handle_healthz))
         .with_state(handle.clone());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::new(bind, port);
     let std_listener = std::net::TcpListener::bind(addr)
-        .map_err(|e| anyhow::anyhow!("Failed to bind HTTP server on port {port}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to bind HTTP server on {bind}:{port}: {e}"))?;
     let local_addr = std_listener.local_addr()?;
     std_listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
 
     tracing::info!(
+        bind = %local_addr.ip(),
         port = local_addr.port(),
         "HTTP server listening (serving /healthz and /metrics)"
     );
@@ -1072,7 +1074,12 @@ mod tests {
     async fn spawn_server_with_staleness_threshold_does_not_panic_inside_runtime() {
         let token = CancellationToken::new();
         // Port 0 lets the OS pick a free ephemeral port.
-        let result = spawn_server(0, token.clone(), Some(chrono::Duration::seconds(3600)));
+        let result = spawn_server(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+            token.clone(),
+            Some(chrono::Duration::seconds(3600)),
+        );
         assert!(
             result.is_ok(),
             "spawn_server panicked or errored inside tokio runtime: {:?}",
@@ -1088,9 +1095,13 @@ mod tests {
     #[tokio::test]
     async fn spawn_server_serves_metrics_and_healthz_over_http() {
         let token = CancellationToken::new();
-        let (handle, task, addr) =
-            spawn_server(0, token.clone(), Some(chrono::Duration::seconds(3600)))
-                .expect("spawn_server should bind and spawn");
+        let (handle, task, addr) = spawn_server(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+            token.clone(),
+            Some(chrono::Duration::seconds(3600)),
+        )
+        .expect("spawn_server should bind and spawn");
 
         // Push a healthy cycle so /healthz returns 200 instead of the pre-first-cycle 503.
         handle
@@ -1102,8 +1113,9 @@ mod tests {
             .build()
             .unwrap();
 
-        // spawn_server binds to 0.0.0.0; dial via 127.0.0.1 because Windows
-        // treats 0.0.0.0 as AddrNotAvailable on connect.
+        // Test binds loopback explicitly; dial the same. (Prod binds 0.0.0.0
+        // by default, but keeping the test on loopback sidesteps Windows'
+        // AddrNotAvailable-on-connect behavior for 0.0.0.0.)
         let base = format!("http://127.0.0.1:{}", addr.port());
 
         let metrics_resp = client

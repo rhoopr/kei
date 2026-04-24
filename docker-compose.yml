@@ -28,7 +28,7 @@ services:
     #     sync
     #     --config /config/config.toml
     #     --data-dir /config
-    #     --directory /photos
+    #     --download-dir /photos
     #     --password-file /run/secrets/icloud_password
     #
     # Option 4: External secret manager (zero password on host)
@@ -36,7 +36,7 @@ services:
     #     sync
     #     --config /config/config.toml
     #     --data-dir /config
-    #     --directory /photos
+    #     --download-dir /photos
     #     --password-command "cat /run/secrets/icloud_password"
 
 # Uncomment for Docker secrets (Option 3):

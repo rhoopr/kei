@@ -11,6 +11,8 @@ use std::time::Duration;
 pub(crate) enum Event {
     /// 2FA code is needed (session expired in headless mode)
     TwoFaRequired,
+    /// A sync cycle is about to run (fires before run_cycle, after skip-check)
+    SyncStarted,
     /// Sync cycle completed successfully
     SyncComplete,
     /// Sync cycle had failures
@@ -23,6 +25,7 @@ impl Event {
     const fn as_str(self) -> &'static str {
         match self {
             Self::TwoFaRequired => "2fa_required",
+            Self::SyncStarted => "sync_started",
             Self::SyncComplete => "sync_complete",
             Self::SyncFailed => "sync_failed",
             Self::SessionExpired => "session_expired",
@@ -98,7 +101,17 @@ pub(crate) struct Notifier {
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Notifier {
-    pub const fn new(script: Option<PathBuf>) -> Self {
+    pub fn new(script: Option<PathBuf>) -> Self {
+        // kei invokes scripts via `/bin/sh`, which isn't available on Windows.
+        // Rather than let spawn fail silently on every event, drop the script
+        // and warn once at construction time.
+        if script.is_some() && cfg!(windows) {
+            tracing::warn!(
+                "--notification-script is unix-only (kei invokes scripts via /bin/sh). \
+                 Ignoring the configured script on Windows."
+            );
+            return Self { script: None };
+        }
         Self { script }
     }
 
@@ -240,9 +253,17 @@ mod tests {
     #[test]
     fn event_as_str() {
         assert_eq!(Event::TwoFaRequired.as_str(), "2fa_required");
+        assert_eq!(Event::SyncStarted.as_str(), "sync_started");
         assert_eq!(Event::SyncComplete.as_str(), "sync_complete");
         assert_eq!(Event::SyncFailed.as_str(), "sync_failed");
         assert_eq!(Event::SessionExpired.as_str(), "session_expired");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn notifier_drops_script_on_windows() {
+        let notifier = Notifier::new(Some(PathBuf::from("C:/does/not/matter.sh")));
+        assert!(notifier.script.is_none());
     }
 
     #[test]

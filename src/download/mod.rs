@@ -2148,6 +2148,7 @@ mod tests {
             notification_script: None,
             report_json: None,
             http_port: 9090,
+            http_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
             watch_with_interval: None,
             retry_delay_secs: 5,
             recent: dl_config.recent,
@@ -2607,7 +2608,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.recent = Some(100);
+            s.recent = Some(crate::cli::RecentLimit::Count(100));
         });
         assert_eq!(
             compute_config_hash(&a),

@@ -15,26 +15,35 @@ fn non_empty_string(s: &str) -> Result<String, String> {
 
 /// Parse a human-readable byte-rate into bytes per second.
 ///
-/// Accepts a leading positive integer followed by an optional unit suffix:
-/// decimal `K`/`M`/`G` (×1000) or binary `Ki`/`Mi`/`Gi` (×1024). Suffix is
-/// case-insensitive. No suffix means bytes/sec. Zero is rejected.
+/// Accepts a non-negative number (integer or decimal, e.g. `1.5`) followed by
+/// an optional unit suffix: decimal `K`/`M`/`G` (x1000) or binary
+/// `Ki`/`Mi`/`Gi` (x1024). Suffix is case-insensitive. No suffix means
+/// bytes/sec. Values that round to zero bytes/sec are rejected.
 pub(crate) fn parse_bandwidth_limit(s: &str) -> Result<u64, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err("value must not be empty".to_string());
     }
-    let digit_end = trimmed
-        .find(|c: char| !c.is_ascii_digit())
+    // Numeric part is digits plus at most one decimal point; everything after
+    // that is the unit suffix. Leading sign is not accepted here (negative
+    // bandwidth is meaningless; `-5M` errors with "must start with a number").
+    let num_end = trimmed
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(trimmed.len());
-    if digit_end == 0 {
+    if num_end == 0 {
         return Err(format!(
             "invalid bandwidth value `{s}`: must start with a number"
         ));
     }
-    let (num_str, suffix) = trimmed.split_at(digit_end);
-    let n: u64 = num_str
+    let (num_str, suffix) = trimmed.split_at(num_end);
+    let n: f64 = num_str
         .parse()
         .map_err(|_| format!("invalid bandwidth number `{num_str}`"))?;
+    if !n.is_finite() || n < 0.0 {
+        return Err(format!(
+            "invalid bandwidth number `{num_str}`: must be a finite non-negative number"
+        ));
+    }
     let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
         "" | "b" => 1,
         "k" | "kb" => 1_000,
@@ -49,13 +58,30 @@ pub(crate) fn parse_bandwidth_limit(s: &str) -> Result<u64, String> {
             ));
         }
     };
-    let bytes_per_sec = n
-        .checked_mul(multiplier)
-        .ok_or_else(|| format!("bandwidth value `{s}` overflows u64 bytes/sec"))?;
-    if bytes_per_sec == 0 {
-        return Err("bandwidth limit must be greater than zero".to_string());
+    // f64 multiplication is exact for the typical bandwidth range (KB/s to
+    // GB/s) and off by less than a byte for extreme values; round to nearest
+    // so inputs like `0.1K` land on 100 bytes/sec rather than 99.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "multiplier is a small constant (<= 2^30); u64::MAX is only a comparison bound where exact precision doesn't matter"
+    )]
+    let (max_f64, multiplier_f64) = (u64::MAX as f64, multiplier as f64);
+    let total = n * multiplier_f64;
+    if !total.is_finite() || total > max_f64 {
+        return Err(format!("bandwidth value `{s}` overflows u64 bytes/sec"));
     }
-    Ok(bytes_per_sec)
+    let rounded = total.round();
+    if rounded < 1.0 {
+        return Err(format!(
+            "bandwidth value `{s}` rounds to zero bytes/sec; must be at least 1 byte/sec"
+        ));
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounds checked above: 1.0 <= rounded <= u64::MAX as f64"
+    )]
+    Ok(rounded as u64)
 }
 
 /// Strip non-digit characters and validate that the result is exactly 6 digits.
@@ -75,7 +101,83 @@ fn parse_2fa_code(s: &str) -> Result<String, String> {
     reason = "runs during CLI arg parsing, before tracing subscriber is installed"
 )]
 pub(crate) fn deprecation_warning(old: &str, new: &str) {
-    eprintln!("warning: `{old}` is deprecated, use `{new}` instead");
+    eprintln!("warning: `{old}` is deprecated and will be removed in v0.20.0; use `{new}` instead");
+}
+
+/// Limit on which assets a sync pass processes.
+///
+/// `--recent 100` is a count limit (top N most-recent assets). `--recent 30d`
+/// is a days limit (assets created in the last 30 days) and translates to a
+/// `skip_created_before` cutoff at `Config::build` time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecentLimit {
+    /// Take the N most-recent assets by creation date.
+    Count(u32),
+    /// Take assets created in the last N days.
+    Days(u32),
+}
+
+/// Parse `--recent N` (count) or `--recent Nd` (days). Clap `value_parser`.
+///
+/// Rejects zero, empty, and unknown suffixes. Only `d` (days) is supported
+/// today; this keeps the syntax open for future units without locking us in.
+pub(crate) fn parse_recent_limit(s: &str) -> Result<RecentLimit, String> {
+    if s.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    let (num_str, is_days) = if let Some(stripped) = s.strip_suffix('d') {
+        (stripped, true)
+    } else {
+        (s, false)
+    };
+    let n: u32 = num_str
+        .parse()
+        .map_err(|_| format!("expected a positive integer or `Nd` form (got `{s}`)"))?;
+    if n == 0 {
+        return Err(format!("must be greater than zero (got `{s}`)"));
+    }
+    Ok(if is_days {
+        RecentLimit::Days(n)
+    } else {
+        RecentLimit::Count(n)
+    })
+}
+
+impl std::fmt::Display for RecentLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Count(n) => write!(f, "{n}"),
+            Self::Days(n) => write!(f, "{n}d"),
+        }
+    }
+}
+
+impl serde::Serialize for RecentLimit {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // Count serializes as a bare integer so TOML round-trips cleanly
+            // for the common case (`recent = 100`, not `recent = "100"`).
+            Self::Count(n) => s.serialize_u32(*n),
+            Self::Days(n) => s.serialize_str(&format!("{n}d")),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RecentLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Int(u32),
+            Str(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Int(0) => Err(D::Error::custom("`recent` must be greater than zero")),
+            Raw::Int(n) => Ok(Self::Count(n)),
+            Raw::Str(s) => parse_recent_limit(&s).map_err(D::Error::custom),
+        }
+    }
 }
 
 /// Password arguments shared across commands that authenticate.
@@ -106,7 +208,11 @@ pub struct PasswordArgs {
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
     /// Local directory for downloads
-    #[arg(short = 'd', long, env = "KEI_DIRECTORY", value_parser = non_empty_string)]
+    #[arg(short = 'd', long = "download-dir", env = "KEI_DOWNLOAD_DIR", value_parser = non_empty_string)]
+    pub download_dir: Option<String>,
+
+    /// Deprecated: use --download-dir (will be removed in v0.20.0)
+    #[arg(long = "directory", env = "KEI_DIRECTORY", value_parser = non_empty_string, hide = true)]
     pub directory: Option<String>,
 
     /// Album(s) to download. Use `-a all` to sync every user-created album
@@ -136,18 +242,24 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum)]
     pub live_photo_size: Option<LivePhotoSize>,
 
-    /// Number of recent photos to download
-    #[arg(long, env = "KEI_RECENT", value_parser = clap::value_parser!(u32).range(1..))]
-    pub recent: Option<u32>,
+    /// Number of recent photos to download (e.g. `--recent 100`) or a recency
+    /// window in days (e.g. `--recent 30d`). Days form maps to
+    /// `--skip-created-before` internally.
+    #[arg(long, env = "KEI_RECENT", value_parser = parse_recent_limit)]
+    pub recent: Option<RecentLimit>,
 
     /// Number of concurrent download threads (default: 10)
-    #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..=64))]
+    #[arg(long = "threads", env = "KEI_THREADS", value_parser = clap::value_parser!(u16).range(1..=64))]
+    pub threads: Option<u16>,
+
+    /// Deprecated: use --threads (will be removed in v0.20.0)
+    #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..=64), hide = true)]
     pub threads_num: Option<u16>,
 
     /// Cap total download throughput across all concurrent downloads.
     /// Accepts human-readable values: `10M` (10 MB/s), `500K` (500 KB/s),
     /// `1Mi` (1 MiB/s), bare integer = bytes/s. When set without an explicit
-    /// `--threads-num`, concurrency defaults to 1 to avoid fragmenting the
+    /// `--threads`, concurrency defaults to 1 to avoid fragmenting the
     /// capped pipe across many starved connections.
     #[arg(long = "bandwidth-limit", env = "KEI_BANDWIDTH_LIMIT", value_parser = parse_bandwidth_limit)]
     pub bandwidth_limit: Option<u64>,
@@ -164,7 +276,7 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_LIVE_PHOTO_MODE", value_enum)]
     pub live_photo_mode: Option<LivePhotoMode>,
 
-    /// Deprecated: use `--live-photo-mode skip` instead
+    /// Deprecated: use `--live-photo-mode skip` (will be removed in v0.20.0)
     #[arg(long, env = "KEI_SKIP_LIVE_PHOTOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true, hide = true)]
     pub skip_live_photos: Option<bool>,
 
@@ -257,8 +369,9 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_MAX_RETRIES", value_parser = clap::value_parser!(u32).range(0..=100))]
     pub max_retries: Option<u32>,
 
-    /// Initial retry delay in seconds (default: 5, range: 1-3600)
-    #[arg(long, env = "KEI_RETRY_DELAY", value_parser = clap::value_parser!(u64).range(1..=3600))]
+    /// Deprecated: initial retry delay is now derived from `--max-retries`
+    /// (will be removed in v0.20.0)
+    #[arg(long, env = "KEI_RETRY_DELAY", value_parser = clap::value_parser!(u64).range(1..=3600), hide = true)]
     pub retry_delay: Option<u64>,
 
     /// Temp file suffix for partial downloads (default: .kei-tmp).
@@ -266,12 +379,14 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_TEMP_SUFFIX")]
     pub temp_suffix: Option<String>,
 
-    /// Force full library enumeration even if a sync token exists
-    #[arg(long)]
+    /// Deprecated: use `kei reset sync-token` before a sync for the same
+    /// effect (will be removed in v0.20.0)
+    #[arg(long, hide = true)]
     pub no_incremental: bool,
 
     /// Send systemd `sd_notify` messages (READY, STOPPING, STATUS).
-    /// Only effective on Linux with a systemd service unit.
+    /// Auto-detected via `NOTIFY_SOCKET` under `Type=notify` units; pass
+    /// `--notify-systemd=false` to suppress even then.
     #[arg(long, env = "KEI_NOTIFY_SYSTEMD", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub notify_systemd: Option<bool>,
 
@@ -279,14 +394,17 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_PID_FILE")]
     pub pid_file: Option<std::path::PathBuf>,
 
-    /// Script to run on events (2FA required, sync complete, etc.).
+    /// Script to run on events: 2FA required, sync started/complete/failed, session expired.
     /// Called with `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars.
     /// Fire-and-forget: script failures are logged at warn! but never block
-    /// the sync or affect the exit code.
+    /// the sync or affect the exit code. Unix only: ignored with a warning on Windows.
     #[arg(long, env = "KEI_NOTIFICATION_SCRIPT")]
     pub notification_script: Option<String>,
 
     /// Write a JSON run report to this path after each sync cycle.
+    /// Also configurable via `[report] json = "..."` in the TOML config.
+    /// In watch mode the file is overwritten every cycle - it reflects the
+    /// most recent cycle only, not a history log. Atomic write (temp + rename).
     #[arg(long, env = "KEI_REPORT_JSON")]
     pub report_json: Option<std::path::PathBuf>,
 
@@ -294,6 +412,12 @@ pub struct SyncArgs {
     /// Set `KEI_HTTP_PORT` to override via environment.
     #[arg(long, env = "KEI_HTTP_PORT", value_parser = clap::value_parser!(u16).range(1..))]
     pub http_port: Option<u16>,
+
+    /// Bind address for the HTTP server (default: 0.0.0.0 - all interfaces).
+    /// Set to `127.0.0.1` to restrict to loopback only (desktop use). Also configurable
+    /// via `[server] bind` in TOML. Accepts any IPv4 or IPv6 address.
+    #[arg(long, env = "KEI_HTTP_BIND")]
+    pub http_bind: Option<std::net::IpAddr>,
 
     /// After successful auth, persist the password to the credential store
     /// (OS keyring or encrypted file).
@@ -355,7 +479,11 @@ pub struct ImportArgs {
     pub library: Option<String>,
 
     /// Local directory containing existing downloads
-    #[arg(short = 'd', long, env = "KEI_DIRECTORY", value_parser = non_empty_string)]
+    #[arg(short = 'd', long = "download-dir", env = "KEI_DOWNLOAD_DIR", value_parser = non_empty_string)]
+    pub download_dir: Option<String>,
+
+    /// Deprecated: use --download-dir (will be removed in v0.20.0)
+    #[arg(long = "directory", env = "KEI_DIRECTORY", value_parser = non_empty_string, hide = true)]
     pub directory: Option<String>,
 
     /// Folder structure used for existing downloads
@@ -366,9 +494,16 @@ pub struct ImportArgs {
     #[arg(long)]
     pub keep_unicode_in_filenames: Option<bool>,
 
-    /// Number of recent photos to check
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-    pub recent: Option<u32>,
+    /// Number of recent photos to check (`--recent 100`). The `--recent Nd`
+    /// days form is only supported in `sync`; import-existing errors on use.
+    #[arg(long, value_parser = parse_recent_limit)]
+    pub recent: Option<RecentLimit>,
+
+    /// Scan and report matches without writing to the state DB. Useful for
+    /// verifying that `--folder-structure` and `--keep-unicode-in-filenames`
+    /// match the tree you're importing before committing.
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Disable progress bar
     #[arg(long)]
@@ -621,7 +756,7 @@ pub struct Cli {
     #[arg(long, global = true, env = "KEI_DATA_DIR")]
     pub data_dir: Option<String>,
 
-    /// Deprecated: use --data-dir
+    /// Deprecated: use --data-dir (will be removed in v0.20.0)
     #[arg(long, global = true, hide = true)]
     pub cookie_directory: Option<String>,
 
@@ -640,6 +775,9 @@ impl SyncArgs {
     /// Merge top-level (fallback) sync args into self.
     /// Subcommand values take precedence; top-level fills in gaps.
     fn merge_from(&mut self, fallback: &Self) {
+        if self.download_dir.is_none() {
+            self.download_dir.clone_from(&fallback.download_dir);
+        }
         if self.directory.is_none() {
             self.directory.clone_from(&fallback.directory);
         }
@@ -660,6 +798,9 @@ impl SyncArgs {
         }
         if self.recent.is_none() {
             self.recent = fallback.recent;
+        }
+        if self.threads.is_none() {
+            self.threads = fallback.threads;
         }
         if self.threads_num.is_none() {
             self.threads_num = fallback.threads_num;
@@ -974,6 +1115,110 @@ mod tests {
         Cli::try_parse_from(args).unwrap()
     }
 
+    // ── RecentLimit parser ──────────────────────────────────────────
+
+    #[test]
+    fn parse_recent_limit_bare_count() {
+        assert_eq!(parse_recent_limit("100").unwrap(), RecentLimit::Count(100));
+        assert_eq!(parse_recent_limit("1").unwrap(), RecentLimit::Count(1));
+    }
+
+    #[test]
+    fn parse_recent_limit_days_suffix() {
+        assert_eq!(parse_recent_limit("30d").unwrap(), RecentLimit::Days(30));
+        assert_eq!(parse_recent_limit("1d").unwrap(), RecentLimit::Days(1));
+    }
+
+    #[test]
+    fn parse_recent_limit_rejects_zero() {
+        assert!(parse_recent_limit("0").unwrap_err().contains("zero"));
+        assert!(parse_recent_limit("0d").unwrap_err().contains("zero"));
+    }
+
+    #[test]
+    fn parse_recent_limit_rejects_empty() {
+        assert!(parse_recent_limit("").is_err());
+    }
+
+    #[test]
+    fn parse_recent_limit_rejects_unknown_suffix() {
+        // Only `d` is accepted today. Other units (w, m, y) would need
+        // explicit design decisions around month/year boundaries.
+        assert!(parse_recent_limit("3w").is_err());
+        assert!(parse_recent_limit("1y").is_err());
+        assert!(parse_recent_limit("2m").is_err());
+        assert!(parse_recent_limit("30days").is_err());
+    }
+
+    #[test]
+    fn parse_recent_limit_rejects_garbage() {
+        assert!(parse_recent_limit("abc").is_err());
+        assert!(parse_recent_limit("-5").is_err());
+        assert!(parse_recent_limit("10.5").is_err());
+        assert!(parse_recent_limit("10 d").is_err());
+    }
+
+    #[test]
+    fn recent_limit_toml_parses_integer() {
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            recent: RecentLimit,
+        }
+        let got: Wrap = toml::from_str("recent = 100").unwrap();
+        assert_eq!(got.recent, RecentLimit::Count(100));
+    }
+
+    #[test]
+    fn recent_limit_toml_parses_days_string() {
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            recent: RecentLimit,
+        }
+        let got: Wrap = toml::from_str(r#"recent = "30d""#).unwrap();
+        assert_eq!(got.recent, RecentLimit::Days(30));
+    }
+
+    #[test]
+    fn recent_limit_toml_rejects_zero_integer() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Wrap {
+            #[allow(dead_code)]
+            recent: RecentLimit,
+        }
+        let err = toml::from_str::<Wrap>("recent = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zero"), "got: {err}");
+    }
+
+    #[test]
+    fn recent_limit_toml_rejects_garbage_string() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Wrap {
+            #[allow(dead_code)]
+            recent: RecentLimit,
+        }
+        assert!(toml::from_str::<Wrap>(r#"recent = "abc""#).is_err());
+    }
+
+    #[test]
+    fn recent_limit_display_roundtrip() {
+        assert_eq!(RecentLimit::Count(100).to_string(), "100");
+        assert_eq!(RecentLimit::Days(30).to_string(), "30d");
+    }
+
+    #[test]
+    fn recent_limit_serializes_count_as_integer() {
+        let json = serde_json::to_string(&RecentLimit::Count(5)).unwrap();
+        assert_eq!(json, "5");
+    }
+
+    #[test]
+    fn recent_limit_serializes_days_as_string() {
+        let json = serde_json::to_string(&RecentLimit::Days(7)).unwrap();
+        assert_eq!(json, "\"7d\"");
+    }
+
     fn base_args() -> Vec<&'static str> {
         vec!["kei", "--username", "test@example.com"]
     }
@@ -1090,14 +1335,14 @@ mod tests {
             "kei",
             "--username",
             "test@example.com",
-            "--directory",
+            "--download-dir",
             "/photos",
         ])
         .unwrap();
         assert!(cli.command.is_none());
         match cli.effective_command() {
             Command::Sync { sync, .. } => {
-                assert_eq!(sync.directory, Some("/photos".to_string()));
+                assert_eq!(sync.download_dir, Some("/photos".to_string()));
             }
             _ => panic!("Expected Sync command"),
         }
@@ -1259,8 +1504,9 @@ mod tests {
 
     #[test]
     fn test_sync_retry_failed_flag() {
-        let cli = Cli::try_parse_from(["kei", "sync", "--retry-failed", "--directory", "/photos"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["kei", "sync", "--retry-failed", "--download-dir", "/photos"])
+                .unwrap();
         match cli.effective_command() {
             Command::Sync { sync, .. } => assert!(sync.retry_failed),
             _ => panic!("Expected Sync"),
@@ -1307,11 +1553,12 @@ mod tests {
 
     #[test]
     fn test_legacy_retry_failed_maps_to_sync() {
-        let cli = Cli::try_parse_from(["kei", "retry-failed", "--directory", "/photos"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["kei", "retry-failed", "--download-dir", "/photos"]).unwrap();
         match cli.effective_command() {
             Command::Sync { sync, .. } => {
                 assert!(sync.retry_failed);
-                assert_eq!(sync.directory, Some("/photos".to_string()));
+                assert_eq!(sync.download_dir, Some("/photos".to_string()));
             }
             _ => panic!("Expected Sync with retry_failed"),
         }
@@ -1324,7 +1571,7 @@ mod tests {
             "sync",
             "--max-download-attempts",
             "5",
-            "--directory",
+            "--download-dir",
             "/photos",
         ])
         .unwrap();
@@ -1338,7 +1585,7 @@ mod tests {
 
     #[test]
     fn test_max_download_attempts_defaults_to_none() {
-        let cli = Cli::try_parse_from(["kei", "sync", "--directory", "/photos"]).unwrap();
+        let cli = Cli::try_parse_from(["kei", "sync", "--download-dir", "/photos"]).unwrap();
         match cli.effective_command() {
             Command::Sync { sync, .. } => {
                 assert_eq!(sync.max_download_attempts, None);
@@ -1619,7 +1866,64 @@ mod tests {
         assert!(parse_bandwidth_limit("abc").is_err());
         assert!(parse_bandwidth_limit("10X").is_err());
         assert!(parse_bandwidth_limit("-5M").is_err());
-        assert!(parse_bandwidth_limit("1.5M").is_err());
+        // 1.5M is NOW accepted (see test_bandwidth_limit_decimal_*).
+        // Malformed decimals like `1..5M` or `1.5.5M` stay rejected.
+        assert!(parse_bandwidth_limit("1..5M").is_err());
+        assert!(parse_bandwidth_limit("1.5.5M").is_err());
+    }
+
+    // ── Decimal bandwidth values ───────────────────────────────────
+
+    #[test]
+    fn test_bandwidth_limit_decimal_mb() {
+        assert_eq!(parse_bandwidth_limit("1.5M"), Ok(1_500_000));
+        assert_eq!(parse_bandwidth_limit("2.5G"), Ok(2_500_000_000));
+        assert_eq!(parse_bandwidth_limit("0.5K"), Ok(500));
+    }
+
+    #[test]
+    fn test_bandwidth_limit_decimal_binary() {
+        // 2.5 * 1_048_576 = 2_621_440
+        assert_eq!(parse_bandwidth_limit("2.5Mi"), Ok(2_621_440));
+        // 1.5 * 1024 = 1536
+        assert_eq!(parse_bandwidth_limit("1.5Ki"), Ok(1_536));
+    }
+
+    #[test]
+    fn test_bandwidth_limit_decimal_leading_dot() {
+        assert_eq!(parse_bandwidth_limit(".5M"), Ok(500_000));
+        assert_eq!(parse_bandwidth_limit(".25K"), Ok(250));
+    }
+
+    #[test]
+    fn test_bandwidth_limit_decimal_trailing_dot() {
+        // Trailing dot means integer-valued decimal - `1.M` is 1.0 MB/s.
+        assert_eq!(parse_bandwidth_limit("1.M"), Ok(1_000_000));
+    }
+
+    #[test]
+    fn test_bandwidth_limit_decimal_rounds_to_zero_rejected() {
+        // 0.0001 * 1000 = 0.1 bytes/sec, rounds to 0 - reject so users
+        // don't think kei is throttling when it effectively isn't.
+        let err = parse_bandwidth_limit("0.0001K").unwrap_err();
+        assert!(err.contains("rounds to zero"), "{err}");
+        // 0.4 bare bytes/sec rounds to 0 too.
+        assert!(parse_bandwidth_limit("0.4").is_err());
+    }
+
+    #[test]
+    fn test_bandwidth_limit_decimal_rounds_to_nearest_byte() {
+        // 0.1 * 1000 = 100 in theory, 99.99999... in f64. Round to 100.
+        assert_eq!(parse_bandwidth_limit("0.1K"), Ok(100));
+    }
+
+    #[test]
+    fn test_bandwidth_limit_rejects_special_floats() {
+        // f64::parse accepts "nan", "inf", "infinity" - but these make no
+        // sense as a bandwidth value.
+        assert!(parse_bandwidth_limit("nanK").is_err());
+        assert!(parse_bandwidth_limit("infM").is_err());
+        assert!(parse_bandwidth_limit("inf").is_err());
     }
 
     #[test]
@@ -1911,11 +2215,23 @@ mod tests {
     }
 
     #[test]
-    fn test_directory_custom() {
+    fn test_download_dir_custom() {
+        let mut args = base_args();
+        args.extend(["--download-dir", "/photos"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.download_dir.as_deref(), Some("/photos"));
+    }
+
+    #[test]
+    fn test_legacy_directory_still_parses() {
+        // `--directory` is deprecated but must still parse into the legacy
+        // field so Config::build can emit the deprecation warning. Removal
+        // happens in v0.20.0, not now.
         let mut args = base_args();
         args.extend(["--directory", "/photos"]);
         let cli = parse(&args);
         assert_eq!(cli.sync.directory.as_deref(), Some("/photos"));
+        assert!(cli.sync.download_dir.is_none());
     }
 
     #[test]
@@ -2008,7 +2324,22 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_directory_rejected() {
+    fn test_empty_download_dir_rejected() {
+        let args = [
+            "kei",
+            "--username",
+            "user@example.com",
+            "--download-dir",
+            "",
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn test_empty_legacy_directory_rejected() {
+        // `non_empty_string` validator applies to the legacy field too, so an
+        // empty `--directory` fails at parse time rather than slipping through
+        // to emit a deprecation warning on an invalid value.
         let args = ["kei", "--username", "user@example.com", "--directory", ""];
         assert!(Cli::try_parse_from(args).is_err());
     }
@@ -2122,7 +2453,7 @@ mod tests {
             "sync",
             "--username",
             "test@example.com",
-            "--directory",
+            "--download-dir",
             "/photos",
         ])
         .unwrap();
@@ -2205,11 +2536,24 @@ mod tests {
     #[test]
     fn test_import_existing_subcommand() {
         let cli =
+            Cli::try_parse_from(["kei", "import-existing", "--download-dir", "/photos"]).unwrap();
+        if let Some(Command::ImportExisting(args)) = cli.command {
+            assert_eq!(args.download_dir.as_deref(), Some("/photos"));
+            assert!(args.directory.is_none());
+            assert!(args.folder_structure.is_none());
+            assert!(args.recent.is_none());
+        } else {
+            panic!("Expected ImportExisting command");
+        }
+    }
+
+    #[test]
+    fn test_import_existing_legacy_directory_still_parses() {
+        let cli =
             Cli::try_parse_from(["kei", "import-existing", "--directory", "/photos"]).unwrap();
         if let Some(Command::ImportExisting(args)) = cli.command {
             assert_eq!(args.directory.as_deref(), Some("/photos"));
-            assert!(args.folder_structure.is_none());
-            assert!(args.recent.is_none());
+            assert!(args.download_dir.is_none());
         } else {
             panic!("Expected ImportExisting command");
         }
@@ -2222,7 +2566,7 @@ mod tests {
             "import-existing",
             "--library",
             "SharedSync-ABCD1234",
-            "--directory",
+            "--download-dir",
             "/photos",
         ])
         .unwrap();

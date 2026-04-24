@@ -32,6 +32,7 @@ fn clean_cmd() -> assert_cmd::Command {
         .env_remove("KEI_CONFIG")
         .env_remove("KEI_DATA_DIR")
         .env_remove("KEI_DIRECTORY")
+        .env_remove("KEI_DOWNLOAD_DIR")
         .env_remove("KEI_DOMAIN")
         .env_remove("KEI_LOG_LEVEL")
         .env_remove("KEI_NO_AUTO_CONFIG")
@@ -274,6 +275,63 @@ fn deprecation_list_albums_flag() {
 }
 
 #[test]
+fn deprecation_reset_sync_token_flag_on_sync() {
+    // Covers the `kei sync --reset-sync-token ...` path specifically,
+    // distinct from the legacy top-level `kei reset-sync-token` subcommand.
+    // The flag is hidden, still parses, still clears the token, but must
+    // now warn and name v0.20.0 as the removal target.
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+    let dl_dir = tempfile::tempdir().unwrap();
+    let assert = clean_cmd()
+        .args([
+            "sync",
+            "--reset-sync-token",
+            "--username",
+            "x@x.com",
+            "--download-dir",
+            dl_dir.path().to_str().unwrap(),
+            "--data-dir",
+            data_dir,
+            "--dry-run", // still goes through run_sync; fails at password resolution
+        ])
+        .assert()
+        .failure();
+    // Regardless of the password-resolution failure that follows, the
+    // --reset-sync-token warning fires earlier at flag-read time.
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("--reset-sync-token") && stderr.contains("kei reset sync-token"),
+        "expected reset-sync-token flag deprecation warning; stderr={stderr}"
+    );
+}
+
+#[test]
+fn deprecation_warning_names_v0_20_0_removal() {
+    // Guards the shared `deprecation_warning()` helper — every flag-rename
+    // warning in the codebase flows through it, so asserting one path
+    // carries v0.20.0 protects all of them from regressing back to a
+    // vague "a future release" wording.
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+    let assert = clean_cmd()
+        .args([
+            "--list-libraries",
+            "--username",
+            "x@x.com",
+            "--data-dir",
+            data_dir,
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("v0.20.0"),
+        "deprecation warning must name v0.20.0 as removal target; stderr={stderr}"
+    );
+}
+
+#[test]
 fn deprecation_list_libraries_flag() {
     assert_deprecated(
         &[
@@ -467,7 +525,9 @@ fn config_show_reflects_directory_from_toml() {
 }
 
 #[test]
-fn config_show_never_contains_password() {
+fn config_show_rejects_toml_with_password() {
+    // `[auth] password` is banned; `config show` should fail loudly with
+    // the migration message rather than silently dropping the field.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
@@ -486,13 +546,13 @@ fn config_show_never_contains_password() {
             dir.path().to_str().unwrap(),
         ])
         .assert()
-        .success()
+        .code(1)
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains("super_secret_value"),
-        "config show must never contain password, got:\n{stdout}"
+        "password must not appear in stdout even on rejection, got:\n{stdout}"
     );
 }
 
@@ -667,7 +727,7 @@ fn sync_requires_username() {
     clean_cmd()
         .args([
             "sync",
-            "--directory",
+            "--download-dir",
             "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -707,7 +767,7 @@ fn import_existing_requires_directory() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "--directory is required for import-existing",
+            "--download-dir is required for import-existing",
         ));
 }
 
@@ -719,7 +779,7 @@ fn import_existing_rejects_nonexistent_directory() {
             "import-existing",
             "--username",
             "x@x.com",
-            "--directory",
+            "--download-dir",
             "/does/not/exist/anywhere",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -1034,7 +1094,7 @@ fn first_run_auto_config_creates_file() {
             config_path.to_str().unwrap(),
             "--username",
             "auto@example.com",
-            "--directory",
+            "--download-dir",
             "/auto/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -1218,7 +1278,7 @@ fn config_empty_username_in_toml() {
             "sync",
             "--config",
             config_path.to_str().unwrap(),
-            "--directory",
+            "--download-dir",
             "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -1229,7 +1289,9 @@ fn config_empty_username_in_toml() {
 }
 
 #[test]
-fn config_empty_password_in_toml() {
+fn config_toml_password_field_rejected() {
+    // `[auth] password` is no longer accepted, empty or otherwise; kei must
+    // exit with a migration message pointing at the supported alternatives.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
@@ -1243,23 +1305,28 @@ fn config_empty_password_in_toml() {
             "sync",
             "--config",
             config_path.to_str().unwrap(),
-            "--directory",
+            "--download-dir",
             "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("must not be empty"));
+        .stderr(predicate::str::contains("`[auth] password`"))
+        .stderr(predicate::str::contains("no longer supported"))
+        .stderr(predicate::str::contains("kei password set"));
 }
 
 #[test]
 fn config_multiple_password_sources_in_toml() {
+    // Both `password_file` and `password_command` set in the same TOML is
+    // still rejected with "pick one" (the `password` variant is rejected
+    // upstream by the stronger deprecation check).
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        "[auth]\nusername = \"x@x.com\"\npassword = \"secret\"\npassword_file = \"/tmp/pw\"\n",
+        "[auth]\nusername = \"x@x.com\"\npassword_file = \"/tmp/pw\"\npassword_command = \"echo hi\"\n",
     )
     .unwrap();
 
@@ -1268,7 +1335,7 @@ fn config_multiple_password_sources_in_toml() {
             "sync",
             "--config",
             config_path.to_str().unwrap(),
-            "--directory",
+            "--download-dir",
             "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -1589,10 +1656,15 @@ fn config_resolution_default_values() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Default threads_num = 10
+    // Default threads = 10 (new canonical spelling; the `threads_num` TOML
+    // key is deprecated but the serialized default uses the new name).
     assert!(
-        stdout.contains("threads_num = 10"),
-        "default threads_num should be 10, stdout: {stdout}"
+        stdout.contains("threads = 10"),
+        "default threads should be 10, stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("threads_num"),
+        "serialized config should use the new `threads` key, not `threads_num`: {stdout}"
     );
     // Default folder_structure = "%Y/%m/%d"
     assert!(
@@ -1602,12 +1674,20 @@ fn config_resolution_default_values() {
 }
 
 #[test]
-fn config_resolution_password_never_shown() {
+fn config_show_does_not_read_password_file_contents() {
+    // `config show` may echo the `password_file` path back to the user, but
+    // it must never open the file and leak its contents. This guards against
+    // accidental eager resolution in future refactors of the config pipeline.
     let dir = tempfile::tempdir().unwrap();
+    let pw_file = dir.path().join("pw");
+    std::fs::write(&pw_file, "my_secret_pw\n").unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        "[auth]\nusername = \"x@x.com\"\npassword = \"my_secret_pw\"\n",
+        format!(
+            "[auth]\nusername = \"x@x.com\"\npassword_file = \"{}\"\n",
+            pw_file.display()
+        ),
     )
     .unwrap();
 
@@ -1627,7 +1707,12 @@ fn config_resolution_password_never_shown() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains("my_secret_pw"),
-        "password must not appear in config show, stdout: {stdout}"
+        "config show must not dereference password_file, stdout: {stdout}"
+    );
+    // The path itself is expected to appear (it's a config value, not a secret).
+    assert!(
+        stdout.contains(&pw_file.display().to_string()),
+        "password_file path should be echoed back, stdout: {stdout}"
     );
 }
 
@@ -1649,7 +1734,7 @@ fn auto_config_suppressed_by_env() {
             config_path.to_str().unwrap(),
             "--username",
             "suppress@example.com",
-            "--directory",
+            "--download-dir",
             "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -1678,7 +1763,7 @@ fn auto_config_has_0600_perms() {
             config_path.to_str().unwrap(),
             "--username",
             "perms@example.com",
-            "--directory",
+            "--download-dir",
             "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -2275,7 +2360,7 @@ fn exit_1_for_missing_username_on_sync() {
     clean_cmd()
         .args([
             "sync",
-            "--directory",
+            "--download-dir",
             "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -2298,7 +2383,7 @@ fn log_level_default_info() {
             "sync",
             "--username",
             "x@x.com",
-            "--directory",
+            "--download-dir",
             "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -2334,7 +2419,7 @@ fn log_level_debug() {
             "sync",
             "--username",
             "x@x.com",
-            "--directory",
+            "--download-dir",
             dl_dir.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -2360,7 +2445,7 @@ fn log_level_error() {
             "sync",
             "--username",
             "x@x.com",
-            "--directory",
+            "--download-dir",
             "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
@@ -2674,17 +2759,15 @@ fn reset_sync_token_empty_metadata() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn config_show_threads_num_cli_override() {
+fn config_show_reflects_threads_from_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\nthreads_num = 4\n",
+        "[auth]\nusername = \"x@x.com\"\n\n[download]\nthreads = 4\n",
     )
     .unwrap();
 
-    // config show does not accept --threads-num directly (it's a sync arg),
-    // but we can verify the TOML value is reflected
     let out = clean_cmd()
         .args([
             "config",
@@ -2699,7 +2782,144 @@ fn config_show_threads_num_cli_override() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("threads_num = 4"), "stdout: {stdout}");
+    assert!(stdout.contains("threads = 4"), "stdout: {stdout}");
+}
+
+#[test]
+fn config_show_legacy_threads_num_emits_deprecation() {
+    // The old `threads_num` TOML key still parses but must warn on load and
+    // round-trip into the new `threads` key on the way out.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[auth]\nusername = \"x@x.com\"\n\n[download]\nthreads_num = 7\n",
+    )
+    .unwrap();
+
+    let assert = clean_cmd()
+        .args([
+            "config",
+            "show",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let output = assert.get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`[download] threads_num`"), "{stderr}");
+    assert!(stderr.contains("v0.20.0"), "{stderr}");
+    assert!(stdout.contains("threads = 7"), "{stdout}");
+}
+
+#[test]
+fn config_show_reflects_report_json_from_toml() {
+    // [report] json = "..." is the canonical TOML home for --report-json.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[auth]\nusername = \"x@x.com\"\n\n[report]\njson = \"/tmp/kei-run.json\"\n",
+    )
+    .unwrap();
+
+    let out = clean_cmd()
+        .args([
+            "config",
+            "show",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[report]"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("json = \"/tmp/kei-run.json\""),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn legacy_threads_num_cli_flag_warns() {
+    // The hidden `--threads-num` still parses for backward compat but must
+    // tell the user to migrate to `--threads` and name the v0.20.0 removal.
+    let dir = tempfile::tempdir().unwrap();
+    let dl_dir = tempfile::tempdir().unwrap();
+    clean_cmd()
+        .args([
+            "sync",
+            "--username",
+            "legacy-threads@example.com",
+            "--download-dir",
+            dl_dir.path().to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--threads-num",
+            "3",
+            "--only-print-filenames",
+        ])
+        .assert()
+        .stderr(predicate::str::contains("--threads-num"))
+        .stderr(predicate::str::contains("--threads"))
+        .stderr(predicate::str::contains("v0.20.0"));
+}
+
+#[test]
+fn legacy_retry_delay_cli_flag_warns() {
+    // `--retry-delay` still accepts a value but must tell the user it's
+    // deprecated and point at the new smart-default behavior.
+    let dir = tempfile::tempdir().unwrap();
+    let dl_dir = tempfile::tempdir().unwrap();
+    clean_cmd()
+        .args([
+            "sync",
+            "--username",
+            "legacy-retry-delay@example.com",
+            "--download-dir",
+            dl_dir.path().to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--retry-delay",
+            "10",
+            "--only-print-filenames",
+        ])
+        .assert()
+        .stderr(predicate::str::contains("--retry-delay"))
+        .stderr(predicate::str::contains("--max-retries"))
+        .stderr(predicate::str::contains("v0.20.0"));
+}
+
+#[test]
+fn both_threads_forms_fails_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    let dl_dir = tempfile::tempdir().unwrap();
+    clean_cmd()
+        .args([
+            "sync",
+            "--username",
+            "double-threads@example.com",
+            "--download-dir",
+            dl_dir.path().to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--threads",
+            "4",
+            "--threads-num",
+            "8",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("both"))
+        .stderr(predicate::str::contains("pick one"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2754,6 +2974,124 @@ fn verify_mixed_present_and_missing() {
     assert!(stdout.contains("Missing:   1"), "stdout: {stdout}");
 }
 
+#[test]
+fn verify_truncates_issue_listing_past_cap() {
+    // Covers the 200-issue listing cap for `kei verify` on large libraries
+    // where many files have gone missing. 250 missing assets should print
+    // 200 MISSING lines plus a truncation tail, with the summary showing
+    // the full count.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    for i in 0..250 {
+        let id = format!("miss{i:04}");
+        let filename = format!("missing_{i:04}.jpg");
+        // local_path points at a file that doesn't exist on disk
+        let path = dir.path().join(&filename);
+        insert_asset(
+            &conn,
+            &id,
+            "downloaded",
+            &filename,
+            Some(path.to_str().unwrap()),
+            None,
+            None,
+        );
+    }
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "verify",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Missing:   250"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("... and 50 more issue(s) not listed (listing capped at 200)"),
+        "truncation tail missing; stdout: {stdout}"
+    );
+    // First 200 MISSING lines present, 201st+ suppressed.
+    assert!(
+        stdout.contains("missing_0000.jpg"),
+        "first missing line absent"
+    );
+    assert!(
+        stdout.contains("missing_0199.jpg"),
+        "200th missing line absent"
+    );
+    assert!(
+        !stdout.contains("missing_0200.jpg"),
+        "201st missing line should have been suppressed; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn reconcile_truncates_issue_listing_past_cap() {
+    // Covers the 200-issue listing cap for `kei reconcile`. 250 seeded
+    // missing rows produce 200 MISSING lines + a tail; summary shows
+    // the full count and the `Marked failed` line confirms every row
+    // was re-queued regardless of which lines printed.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    for i in 0..250 {
+        let id = format!("rid{i:04}");
+        let filename = format!("missing_{i:04}.jpg");
+        let path = dir.path().join(&filename);
+        // Path is under the tempdir but we never write the file, so
+        // the existence check inside reconcile reports it as missing.
+        insert_asset(
+            &conn,
+            &id,
+            "downloaded",
+            &filename,
+            Some(path.to_str().unwrap()),
+            None,
+            None,
+        );
+    }
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "reconcile",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Missing:  250"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Marked failed: 250"),
+        "every row should be re-queued regardless of the print cap; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("... and 50 more issue(s) not listed (listing capped at 200)"),
+        "truncation tail missing; stdout: {stdout}"
+    );
+    assert!(stdout.contains("missing_0000.jpg"), "first row absent");
+    assert!(stdout.contains("missing_0199.jpg"), "200th row absent");
+    assert!(
+        !stdout.contains("missing_0200.jpg"),
+        "201st row should be suppressed; stdout: {stdout}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Dry run + retry-failed conflict
 // ═══════════════════════════════════════════════════════════════════════
@@ -2767,7 +3105,7 @@ fn dry_run_and_retry_failed_conflict() {
             "sync",
             "--username",
             "x@x.com",
-            "--directory",
+            "--download-dir",
             "/photos",
             "--dry-run",
             "--retry-failed",
@@ -2776,6 +3114,58 @@ fn dry_run_and_retry_failed_conflict() {
         ])
         .assert()
         .code(2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// --directory deprecation
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn legacy_directory_flag_emits_deprecation_warning() {
+    // `--directory` still works but must tell the user to switch to
+    // `--download-dir` and note the v0.20.0 removal target. We pair it with
+    // `--only-print-filenames` so the command exits before hitting auth.
+    let dir = tempfile::tempdir().unwrap();
+    let dl_dir = tempfile::tempdir().unwrap();
+
+    clean_cmd()
+        .args([
+            "sync",
+            "--username",
+            "legacy-dir@example.com",
+            "--directory",
+            dl_dir.path().to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--only-print-filenames",
+        ])
+        .assert()
+        .stderr(predicate::str::contains("--directory"))
+        .stderr(predicate::str::contains("--download-dir"))
+        .stderr(predicate::str::contains("v0.20.0"));
+}
+
+#[test]
+fn both_directory_and_download_dir_fails_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    let dl_dir = tempfile::tempdir().unwrap();
+
+    clean_cmd()
+        .args([
+            "sync",
+            "--username",
+            "double-dir@example.com",
+            "--directory",
+            dl_dir.path().to_str().unwrap(),
+            "--download-dir",
+            dl_dir.path().to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("both"))
+        .stderr(predicate::str::contains("pick one"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2792,7 +3182,7 @@ fn dry_run_creates_no_state_db() {
             "sync",
             "--username",
             "drytest@example.com",
-            "--directory",
+            "--download-dir",
             dl_dir.path().to_str().unwrap(),
             "--data-dir",
             data_dir.path().to_str().unwrap(),
@@ -3021,15 +3411,16 @@ fn status_all_three_flags_render_all_sections() {
 }
 
 #[test]
-fn status_downloaded_paginates_past_500_records() {
+fn status_downloaded_paginates_past_page_size() {
     // Covers the pagination loop in run_status for --downloaded when the
-    // result set exceeds page_size (500). Uses 600 rows to require at
-    // least two page fetches.
+    // result set exceeds page_size (100) but stays under the print cap
+    // (200). 150 rows require at least two page fetches and all should
+    // render (no truncation tail).
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
 
-    for i in 0..600 {
+    for i in 0..150 {
         let id = format!("dl{i:04}");
         let filename = format!("photo_{i:04}.jpg");
         let local = format!("/p/photo_{i:04}.jpg");
@@ -3059,15 +3450,104 @@ fn status_downloaded_paginates_past_500_records() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Downloaded: 600"), "stdout: {stdout}");
+    assert!(stdout.contains("Downloaded: 150"), "stdout: {stdout}");
     // First and last rows across the page boundary must both appear.
     assert!(stdout.contains("photo_0000.jpg"), "first row missing");
-    assert!(stdout.contains("photo_0499.jpg"), "boundary row missing");
+    assert!(stdout.contains("photo_0099.jpg"), "boundary row missing");
     assert!(
-        stdout.contains("photo_0500.jpg"),
+        stdout.contains("photo_0100.jpg"),
         "post-boundary row missing"
     );
-    assert!(stdout.contains("photo_0599.jpg"), "last row missing");
+    assert!(stdout.contains("photo_0149.jpg"), "last row missing");
+    assert!(
+        !stdout.contains("listing capped"),
+        "no truncation tail expected when under cap; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn status_downloaded_truncates_past_print_cap() {
+    // Covers the 200-row listing cap for --downloaded on large libraries.
+    // With 250 rows, the first 200 render and a tail names 50 more.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    for i in 0..250 {
+        let id = format!("dl{i:04}");
+        let filename = format!("photo_{i:04}.jpg");
+        let local = format!("/p/photo_{i:04}.jpg");
+        insert_asset(
+            &conn,
+            &id,
+            "downloaded",
+            &filename,
+            Some(&local),
+            None,
+            None,
+        );
+    }
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--downloaded",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Downloaded: 250"), "stdout: {stdout}");
+    assert!(stdout.contains("photo_0000.jpg"), "first row missing");
+    assert!(stdout.contains("photo_0199.jpg"), "200th row missing");
+    assert!(
+        !stdout.contains("photo_0200.jpg"),
+        "201st row should have been truncated; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("... and 50 more (listing capped at 200)"),
+        "truncation tail missing; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn status_failed_truncates_past_print_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    for i in 0..250 {
+        let id = format!("fail{i:04}");
+        let filename = format!("photo_{i:04}.jpg");
+        insert_asset(&conn, &id, "failed", &filename, None, Some("timeout"), None);
+    }
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--failed",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Failed:     250"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("... and 50 more (listing capped at 200)"),
+        "truncation tail missing; stdout: {stdout}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════

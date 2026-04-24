@@ -67,7 +67,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Both Python `{:%Y}` and plain `%Y` strftime syntax accepted. You can keep using the Python format. |
 | `--size original` | `--size original` | Same values, but Python allows multiple `--size` flags (not yet supported in Rust - [#14](https://github.com/rhoopr/kei/issues/14)) |
 | `--cookie-directory ~/.pyicloud` | `--data-dir ~/.config/kei/` | New flag name and default path. `--cookie-directory` still accepted as hidden alias. |
-| `--threads-num` (deprecated, always 1) | `--threads-num 10` | Actually works in Rust. Default: 10 parallel downloads. |
+| `--threads-num` (deprecated, always 1) | `--threads 10` | Actually works in Rust. Default: 10 parallel downloads. kei's `--threads-num` still parses as a deprecated alias. |
 | `--notification-script` | `--notification-script` | Same flag name, but kei passes `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars. Python only fired on 2FA expiry; kei also fires on `sync_complete`, `sync_failed`, `session_expired`. |
 
 ### Flags not yet implemented
@@ -114,7 +114,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--exclude-album` | Exclude specific albums from sync. Multi-value. |
 | `--filename-exclude` | Exclude files by glob pattern (e.g., `*.AAE`, `Screenshot*`). Case-insensitive, multi-value. |
 | `{album}` in `--folder-structure` | Organize by album name: `--folder-structure "{album}/%Y/%m"`. |
-| `KEI_*` env vars | Every CLI flag has an env var (`KEI_DIRECTORY`, `KEI_DATA_DIR`, `KEI_SIZE`, etc.). Useful for Docker. |
+| `KEI_*` env vars | Every CLI flag has an env var (`KEI_DOWNLOAD_DIR`, `KEI_DATA_DIR`, `KEI_SIZE`, etc.). Useful for Docker. |
 
 ## Docker migration
 
