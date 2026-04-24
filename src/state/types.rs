@@ -288,11 +288,11 @@ fn format_f64(v: f64) -> String {
 pub struct AssetRecord {
     // 8-byte aligned heap types
     /// iCloud asset ID (recordName).
-    pub id: String,
+    pub id: Box<str>,
     /// SHA256 checksum of the file.
-    pub checksum: String,
+    pub checksum: Box<str>,
     /// Original filename from iCloud.
-    pub filename: String,
+    pub filename: Box<str>,
     /// Local file path (if downloaded).
     pub local_path: Option<PathBuf>,
     /// Last error message (if failed).
@@ -344,9 +344,9 @@ impl AssetRecord {
         media_type: MediaType,
     ) -> Self {
         Self {
-            id,
-            checksum,
-            filename,
+            id: id.into_boxed_str(),
+            checksum: checksum.into_boxed_str(),
+            filename: filename.into_boxed_str(),
             local_path: None,
             last_error: None,
             local_checksum: None,

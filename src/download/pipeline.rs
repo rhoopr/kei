@@ -3512,7 +3512,7 @@ mod tests {
 
         let pending = db.get_pending().await.unwrap();
         assert_eq!(pending.len(), 1, "asset must remain the only pending row");
-        assert_eq!(pending[0].id, "GHOST");
+        assert_eq!(&*pending[0].id, "GHOST");
         assert_eq!(
             pending[0].last_seen_at.timestamp(),
             prior_seen_at,
@@ -3589,7 +3589,7 @@ mod tests {
         // Sanity: the rewrite pass sees our row.
         let pending = db.get_pending_metadata_rewrites(32).await.unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, "REWRITE_1");
+        assert_eq!(&*pending[0].id, "REWRITE_1");
 
         let flags = MetadataFlags {
             rating: true,

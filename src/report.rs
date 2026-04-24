@@ -41,7 +41,7 @@ pub(crate) struct FailedAssetEntry {
 impl FailedAssetEntry {
     pub(crate) fn from_record(r: &AssetRecord) -> Self {
         Self {
-            id: r.id.clone(),
+            id: r.id.to_string(),
             version_size: r.version_size.as_str().to_string(),
             error_message: r.last_error.clone(),
         }

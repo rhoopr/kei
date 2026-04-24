@@ -38,7 +38,7 @@ const SCAN_PAGE_SIZE: u32 = 1000;
 
 #[derive(Debug)]
 struct MissingAsset {
-    id: String,
+    id: Box<str>,
     version_size: VersionSizeKey,
     local_path: PathBuf,
 }
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(counts.present, 1);
         assert_eq!(counts.missing, 1);
         assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].id, "MISSING_1");
+        assert_eq!(&*missing[0].id, "MISSING_1");
 
         for m in &missing {
             db.mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
@@ -274,7 +274,7 @@ mod tests {
 
         let failed = db.get_failed().await.unwrap();
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].id, "MISSING_1");
+        assert_eq!(&*failed[0].id, "MISSING_1");
         assert_eq!(failed[0].status, AssetStatus::Failed);
         assert_eq!(
             failed[0].last_error.as_deref(),

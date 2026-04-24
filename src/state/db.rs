@@ -1463,9 +1463,9 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
     };
 
     Ok(AssetRecord {
-        id,
-        checksum,
-        filename,
+        id: id.into_boxed_str(),
+        checksum: checksum.into_boxed_str(),
+        filename: filename.into_boxed_str(),
         local_path: local_path_str.map(PathBuf::from),
         last_error,
         local_checksum,
@@ -1630,7 +1630,7 @@ mod tests {
 
         let failed = db.get_failed().await.unwrap();
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].id, "ABC123");
+        assert_eq!(&*failed[0].id, "ABC123");
         assert_eq!(failed[0].last_error.as_deref(), Some("Connection timeout"));
         assert_eq!(failed[0].download_attempts, 1);
     }
@@ -1655,7 +1655,7 @@ mod tests {
         db.backdate_last_seen("NEWEST", 3_000);
 
         let failed = db.get_failed().await.unwrap();
-        let ids: Vec<&str> = failed.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<&str> = failed.iter().map(|r| &*r.id).collect();
         assert_eq!(
             ids,
             vec!["NEWEST", "MIDDLE", "OLDEST"],
@@ -1685,8 +1685,8 @@ mod tests {
         let (sample, total) = db.get_failed_sample(2).await.unwrap();
         assert_eq!(total, 5, "total should reflect full failed count");
         assert_eq!(sample.len(), 2, "limit should cap returned rows");
-        assert_eq!(sample[0].id, "FAIL_4");
-        assert_eq!(sample[1].id, "FAIL_3");
+        assert_eq!(&*sample[0].id, "FAIL_4");
+        assert_eq!(&*sample[1].id, "FAIL_3");
 
         // limit > total returns all and the correct total
         let (sample, total) = db.get_failed_sample(100).await.unwrap();
@@ -1720,7 +1720,7 @@ mod tests {
         db.backdate_last_seen("NEW", 3_000);
 
         let pending = db.get_pending().await.unwrap();
-        let ids: Vec<&str> = pending.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<&str> = pending.iter().map(|r| &*r.id).collect();
         assert_eq!(
             ids,
             vec!["NEW", "MID", "OLD"],
@@ -2393,9 +2393,9 @@ mod tests {
                 break;
             }
             if total == 0 {
-                first_id = page[0].id.clone();
+                first_id = page[0].id.to_string();
             }
-            last_id = page.last().unwrap().id.clone();
+            last_id = page.last().unwrap().id.to_string();
             assert!(page.iter().all(|r| r.status == AssetStatus::Downloaded));
             total += page.len();
             offset += page.len() as u64;
@@ -3099,7 +3099,7 @@ mod tests {
 
         let failed = db.get_failed().await.unwrap();
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].id, "NEW_ASSET");
+        assert_eq!(&*failed[0].id, "NEW_ASSET");
     }
 
     // Regression test for #211: a pending asset the producer didn't enumerate
@@ -3178,7 +3178,7 @@ mod tests {
 
         let failed = db.get_failed().await.unwrap();
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].id, "PENDING_CARRYOVER");
+        assert_eq!(&*failed[0].id, "PENDING_CARRYOVER");
     }
 
     // ── Gap: upsert_seen preserves downloaded status across updates ───
@@ -3247,7 +3247,7 @@ mod tests {
         // Verify via get_downloaded_page that the asset is downloaded
         let page = db.get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(page.len(), 1);
-        assert_eq!(page[0].id, "DL_CK");
+        assert_eq!(&*page[0].id, "DL_CK");
         assert_eq!(
             page[0].local_checksum.as_deref(),
             Some("local_sha256"),
