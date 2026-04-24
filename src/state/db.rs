@@ -326,10 +326,15 @@ pub trait StateDb: Send + Sync {
 
 /// `SQLite` implementation of the state database.
 pub struct SqliteStateDb {
-    /// Wrapped in Mutex because `rusqlite::Connection` is not Sync.
-    /// Operations hold the lock briefly for fast `SQLite` queries (WAL mode).
-    /// Only `open()` uses `spawn_blocking` for the heavier initial setup.
-    conn: Mutex<Connection>,
+    /// Wrapped in `Arc<Mutex<...>>` because `rusqlite::Connection` is
+    /// not `Sync` and every async method runs its body on the blocking
+    /// pool (see [`Self::with_conn`] / [`Self::with_conn_mut`]). The
+    /// `Arc` lets those closures own a handle to the shared connection
+    /// without borrowing `&self`.
+    ///
+    /// WAL mode keeps reader/writer contention low; the mutex only
+    /// serializes at the Rust level, not the `SQLite` file level.
+    conn: Arc<Mutex<Connection>>,
     /// Path to the database file (for error messages).
     path: PathBuf,
 }
@@ -371,7 +376,7 @@ impl SqliteStateDb {
         .await??;
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             path,
         })
     }
@@ -385,7 +390,7 @@ impl SqliteStateDb {
         })?;
         schema::migrate(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             path: PathBuf::from(":memory:"),
         })
     }
@@ -397,6 +402,12 @@ impl SqliteStateDb {
     }
 
     /// Acquire the database lock, adding the operation name to any error.
+    ///
+    /// Used only from tests that need to poke the connection directly;
+    /// production code goes through [`Self::with_conn`] /
+    /// [`Self::with_conn_mut`] so the sync rusqlite call runs on the
+    /// blocking pool.
+    #[cfg(test)]
     fn acquire_lock(
         &self,
         operation: &str,
@@ -404,6 +415,41 @@ impl SqliteStateDb {
         self.conn
             .lock()
             .map_err(|e| StateError::LockPoisoned(format!("{operation}: {e}")))
+    }
+
+    /// Run a synchronous rusqlite closure on the blocking pool with
+    /// `&Connection` access. This is the correct entry point for every
+    /// read-path StateDb method.
+    async fn with_conn<F, T>(&self, operation: &'static str, f: F) -> Result<T, StateError>
+    where
+        F: FnOnce(&Connection) -> Result<T, StateError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|e| StateError::LockPoisoned(format!("{operation}: {e}")))?;
+            f(&guard)
+        })
+        .await?
+    }
+
+    /// Variant of [`Self::with_conn`] that hands the closure `&mut
+    /// Connection`. Required for methods that open a `Transaction`.
+    async fn with_conn_mut<F, T>(&self, operation: &'static str, f: F) -> Result<T, StateError>
+    where
+        F: FnOnce(&mut Connection) -> Result<T, StateError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn
+                .lock()
+                .map_err(|e| StateError::LockPoisoned(format!("{operation}: {e}")))?;
+            f(&mut guard)
+        })
+        .await?
     }
 }
 
@@ -441,18 +487,19 @@ impl StateDb for SqliteStateDb {
         checksum: &str,
         local_path: &Path,
     ) -> Result<bool, StateError> {
-        // Query DB in a separate scope to ensure MutexGuard is dropped before any await
-        let result: Option<(String, String, Option<String>)> = {
-            let conn = self.acquire_lock("should_download")?;
-
-            conn.query_row(
-                "SELECT status, checksum, local_path FROM assets WHERE id = ?1 AND version_size = ?2",
-                [id, version_size],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(|e| StateError::query("should_download", e))?
-        };
+        let id_owned = id.to_owned();
+        let version_size_owned = version_size.to_owned();
+        let result: Option<(String, String, Option<String>)> = self
+            .with_conn("should_download", move |conn| {
+                conn.query_row(
+                    "SELECT status, checksum, local_path FROM assets WHERE id = ?1 AND version_size = ?2",
+                    [&id_owned, &version_size_owned],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| StateError::query("should_download", e))
+            })
+            .await?;
 
         match result {
             None => {
@@ -505,107 +552,109 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
-        let last_seen_at = Utc::now().timestamp();
+        let record = record.clone();
+        self.with_conn("upsert_seen", move |conn| {
+            let last_seen_at = Utc::now().timestamp();
 
-        let conn = self.acquire_lock("upsert_seen")?;
+            let meta = &record.metadata;
+            // Lazily compute metadata_hash if caller supplied metadata without one.
+            // Storing the hash alongside the metadata is what lets feature 5 detect
+            // metadata-only changes in O(1) during incremental sync. Computed only
+            // when missing (rare — extract() normally pre-populates it).
+            let computed_hash: Option<String> = if meta.metadata_hash.is_none() {
+                Some(meta.compute_hash())
+            } else {
+                None
+            };
+            let metadata_hash: Option<&str> =
+                meta.metadata_hash.as_deref().or(computed_hash.as_deref());
 
-        let meta = &record.metadata;
-        // Lazily compute metadata_hash if caller supplied metadata without one.
-        // Storing the hash alongside the metadata is what lets feature 5 detect
-        // metadata-only changes in O(1) during incremental sync. Computed only
-        // when missing (rare — extract() normally pre-populates it).
-        let computed_hash: Option<String> = if meta.metadata_hash.is_none() {
-            Some(meta.compute_hash())
-        } else {
-            None
-        };
-        let metadata_hash: Option<&str> =
-            meta.metadata_hash.as_deref().or(computed_hash.as_deref());
-
-        conn.execute(
-            r"
-            INSERT INTO assets (
-                id, version_size, checksum, filename, created_at, added_at,
-                size_bytes, media_type, status, last_seen_at,
-                source, is_favorite, rating, latitude, longitude, altitude,
-                orientation, duration_secs, timezone_offset, width, height,
-                title, keywords, description, media_subtype, burst_id,
-                is_hidden, is_archived, modified_at, is_deleted, deleted_at,
-                provider_data, metadata_hash
+            conn.execute(
+                r"
+                INSERT INTO assets (
+                    id, version_size, checksum, filename, created_at, added_at,
+                    size_bytes, media_type, status, last_seen_at,
+                    source, is_favorite, rating, latitude, longitude, altitude,
+                    orientation, duration_secs, timezone_offset, width, height,
+                    title, keywords, description, media_subtype, burst_id,
+                    is_hidden, is_archived, modified_at, is_deleted, deleted_at,
+                    provider_data, metadata_hash
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9,
+                        ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
+                ON CONFLICT(id, version_size) DO UPDATE SET
+                    checksum = excluded.checksum,
+                    filename = excluded.filename,
+                    created_at = excluded.created_at,
+                    added_at = excluded.added_at,
+                    size_bytes = excluded.size_bytes,
+                    media_type = excluded.media_type,
+                    last_seen_at = excluded.last_seen_at,
+                    source = COALESCE(excluded.source, assets.source),
+                    is_favorite = excluded.is_favorite,
+                    rating = excluded.rating,
+                    latitude = excluded.latitude,
+                    longitude = excluded.longitude,
+                    altitude = excluded.altitude,
+                    orientation = excluded.orientation,
+                    duration_secs = excluded.duration_secs,
+                    timezone_offset = excluded.timezone_offset,
+                    width = excluded.width,
+                    height = excluded.height,
+                    title = excluded.title,
+                    keywords = excluded.keywords,
+                    description = excluded.description,
+                    media_subtype = excluded.media_subtype,
+                    burst_id = excluded.burst_id,
+                    is_hidden = excluded.is_hidden,
+                    is_archived = excluded.is_archived,
+                    modified_at = excluded.modified_at,
+                    is_deleted = excluded.is_deleted,
+                    deleted_at = excluded.deleted_at,
+                    provider_data = excluded.provider_data,
+                    metadata_hash = excluded.metadata_hash
+                ",
+                rusqlite::params![
+                    &record.id,
+                    record.version_size.as_str(),
+                    &record.checksum,
+                    &record.filename,
+                    record.created_at.timestamp(),
+                    record.added_at.map(|dt| dt.timestamp()),
+                    i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
+                    record.media_type.as_str(),
+                    last_seen_at,
+                    meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
+                    i64::from(meta.is_favorite),
+                    meta.rating.map(i64::from),
+                    meta.latitude,
+                    meta.longitude,
+                    meta.altitude,
+                    meta.orientation.map(i64::from),
+                    meta.duration_secs,
+                    meta.timezone_offset.map(i64::from),
+                    meta.width.map(i64::from),
+                    meta.height.map(i64::from),
+                    meta.title.as_deref(),
+                    meta.keywords.as_deref(),
+                    meta.description.as_deref(),
+                    meta.media_subtype.as_deref(),
+                    meta.burst_id.as_deref(),
+                    i64::from(meta.is_hidden),
+                    i64::from(meta.is_archived),
+                    meta.modified_at.map(|dt| dt.timestamp()),
+                    i64::from(meta.is_deleted),
+                    meta.deleted_at.map(|dt| dt.timestamp()),
+                    meta.provider_data.as_deref(),
+                    metadata_hash,
+                ],
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9,
-                    ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
-            ON CONFLICT(id, version_size) DO UPDATE SET
-                checksum = excluded.checksum,
-                filename = excluded.filename,
-                created_at = excluded.created_at,
-                added_at = excluded.added_at,
-                size_bytes = excluded.size_bytes,
-                media_type = excluded.media_type,
-                last_seen_at = excluded.last_seen_at,
-                source = COALESCE(excluded.source, assets.source),
-                is_favorite = excluded.is_favorite,
-                rating = excluded.rating,
-                latitude = excluded.latitude,
-                longitude = excluded.longitude,
-                altitude = excluded.altitude,
-                orientation = excluded.orientation,
-                duration_secs = excluded.duration_secs,
-                timezone_offset = excluded.timezone_offset,
-                width = excluded.width,
-                height = excluded.height,
-                title = excluded.title,
-                keywords = excluded.keywords,
-                description = excluded.description,
-                media_subtype = excluded.media_subtype,
-                burst_id = excluded.burst_id,
-                is_hidden = excluded.is_hidden,
-                is_archived = excluded.is_archived,
-                modified_at = excluded.modified_at,
-                is_deleted = excluded.is_deleted,
-                deleted_at = excluded.deleted_at,
-                provider_data = excluded.provider_data,
-                metadata_hash = excluded.metadata_hash
-            ",
-            rusqlite::params![
-                &record.id,
-                record.version_size.as_str(),
-                &record.checksum,
-                &record.filename,
-                record.created_at.timestamp(),
-                record.added_at.map(|dt| dt.timestamp()),
-                i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
-                record.media_type.as_str(),
-                last_seen_at,
-                meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
-                i64::from(meta.is_favorite),
-                meta.rating.map(i64::from),
-                meta.latitude,
-                meta.longitude,
-                meta.altitude,
-                meta.orientation.map(i64::from),
-                meta.duration_secs,
-                meta.timezone_offset.map(i64::from),
-                meta.width.map(i64::from),
-                meta.height.map(i64::from),
-                meta.title.as_deref(),
-                meta.keywords.as_deref(),
-                meta.description.as_deref(),
-                meta.media_subtype.as_deref(),
-                meta.burst_id.as_deref(),
-                i64::from(meta.is_hidden),
-                i64::from(meta.is_archived),
-                meta.modified_at.map(|dt| dt.timestamp()),
-                i64::from(meta.is_deleted),
-                meta.deleted_at.map(|dt| dt.timestamp()),
-                meta.provider_data.as_deref(),
-                metadata_hash,
-            ],
-        )
-        .map_err(|e| StateError::query("upsert_seen", e))?;
+            .map_err(|e| StateError::query("upsert_seen", e))?;
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn mark_downloaded(
@@ -617,34 +666,40 @@ impl StateDb for SqliteStateDb {
         download_checksum: Option<&str>,
     ) -> Result<(), StateError> {
         let downloaded_at = Utc::now().timestamp();
+        let id = id.to_owned();
+        let version_size = version_size.to_owned();
+        let local_path = local_path.to_path_buf();
+        let local_checksum = local_checksum.to_owned();
+        let download_checksum = download_checksum.map(str::to_owned);
 
-        let conn = self.acquire_lock("mark_downloaded")?;
+        self.with_conn("mark_downloaded", move |conn| {
+            let rows = conn
+                .execute(
+                    "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
+                     local_checksum = ?3, download_checksum = ?4, last_error = NULL \
+                     WHERE id = ?5 AND version_size = ?6",
+                    rusqlite::params![
+                        downloaded_at,
+                        local_path.to_string_lossy(),
+                        &local_checksum,
+                        download_checksum.as_deref(),
+                        &id,
+                        &version_size
+                    ],
+                )
+                .map_err(|e| StateError::query("mark_downloaded", e))?;
 
-        let rows = conn
-            .execute(
-                "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
-                 local_checksum = ?3, download_checksum = ?4, last_error = NULL \
-                 WHERE id = ?5 AND version_size = ?6",
-                rusqlite::params![
-                    downloaded_at,
-                    local_path.to_string_lossy(),
-                    local_checksum,
-                    download_checksum,
-                    id,
-                    version_size
-                ],
-            )
-            .map_err(|e| StateError::query("mark_downloaded", e))?;
+            if rows == 0 {
+                tracing::warn!(
+                    id = %id,
+                    version_size = %version_size,
+                    "mark_downloaded matched 0 rows — asset may not have been recorded via upsert_seen"
+                );
+            }
 
-        if rows == 0 {
-            tracing::warn!(
-                id,
-                version_size,
-                "mark_downloaded matched 0 rows — asset may not have been recorded via upsert_seen"
-            );
-        }
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn mark_failed(
@@ -653,161 +708,170 @@ impl StateDb for SqliteStateDb {
         version_size: &str,
         error: &str,
     ) -> Result<(), StateError> {
-        let conn = self.acquire_lock("mark_failed")?;
+        let id = id.to_owned();
+        let version_size = version_size.to_owned();
+        let error = error.to_owned();
 
-        let rows = conn
-            .execute(
-                "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, \
-                 last_error = ?1 WHERE id = ?2 AND version_size = ?3",
-                rusqlite::params![error, id, version_size],
-            )
-            .map_err(|e| StateError::query("mark_failed", e))?;
+        self.with_conn("mark_failed", move |conn| {
+            let rows = conn
+                .execute(
+                    "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, \
+                     last_error = ?1 WHERE id = ?2 AND version_size = ?3",
+                    rusqlite::params![&error, &id, &version_size],
+                )
+                .map_err(|e| StateError::query("mark_failed", e))?;
 
-        if rows == 0 {
-            tracing::warn!(
-                id,
-                version_size,
-                "mark_failed matched 0 rows; caller must upsert_seen before mark_failed \
-                 (producer-dispatch invariant). Failure not persisted"
-            );
-        }
+            if rows == 0 {
+                tracing::warn!(
+                    id = %id,
+                    version_size = %version_size,
+                    "mark_failed matched 0 rows; caller must upsert_seen before mark_failed \
+                     (producer-dispatch invariant). Failure not persisted"
+                );
+            }
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
-        let conn = self.acquire_lock("get_failed")?;
+        self.with_conn("get_failed", move |conn| {
+            let sql = format!(
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+                 ORDER BY last_seen_at DESC",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| StateError::query("get_failed", e))?;
 
-        let sql = format!(
-            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
-             ORDER BY last_seen_at DESC",
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| StateError::query("get_failed", e))?;
+            let records = stmt
+                .query_map([], row_to_asset_record)
+                .map_err(|e| StateError::query("get_failed", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_failed", e))?;
 
-        let records = stmt
-            .query_map([], row_to_asset_record)
-            .map_err(|e| StateError::query("get_failed", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query("get_failed", e))?;
-
-        Ok(records)
+            Ok(records)
+        })
+        .await
     }
 
     async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
-        let conn = self.acquire_lock("get_failed_sample")?;
+        self.with_conn("get_failed_sample", move |conn| {
+            let total: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM assets WHERE status = 'failed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("get_failed_sample", e))?;
 
-        let total: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assets WHERE status = 'failed'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| StateError::query("get_failed_sample", e))?;
+            let sql = format!(
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+                 ORDER BY last_seen_at DESC LIMIT ?1",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| StateError::query("get_failed_sample", e))?;
 
-        let sql = format!(
-            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
-             ORDER BY last_seen_at DESC LIMIT ?1",
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| StateError::query("get_failed_sample", e))?;
+            let records = stmt
+                .query_map([i64::from(limit)], row_to_asset_record)
+                .map_err(|e| StateError::query("get_failed_sample", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_failed_sample", e))?;
 
-        let records = stmt
-            .query_map([i64::from(limit)], row_to_asset_record)
-            .map_err(|e| StateError::query("get_failed_sample", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query("get_failed_sample", e))?;
-
-        #[allow(
-            clippy::cast_sign_loss,
-            reason = ".max(0) clamps any negative COUNT(*) result to 0 before the cast"
-        )]
-        let total_u64 = total.max(0) as u64;
-        Ok((records, total_u64))
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = ".max(0) clamps any negative COUNT(*) result to 0 before the cast"
+            )]
+            let total_u64 = total.max(0) as u64;
+            Ok((records, total_u64))
+        })
+        .await
     }
 
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
-        let conn = self.acquire_lock("get_pending")?;
+        self.with_conn("get_pending", move |conn| {
+            let sql = format!(
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' \
+                 ORDER BY last_seen_at DESC",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| StateError::query("get_pending", e))?;
 
-        let sql = format!(
-            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' \
-             ORDER BY last_seen_at DESC",
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| StateError::query("get_pending", e))?;
+            let records = stmt
+                .query_map([], row_to_asset_record)
+                .map_err(|e| StateError::query("get_pending", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_pending", e))?;
 
-        let records = stmt
-            .query_map([], row_to_asset_record)
-            .map_err(|e| StateError::query("get_pending", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query("get_pending", e))?;
-
-        Ok(records)
+            Ok(records)
+        })
+        .await
     }
 
     async fn get_summary(&self) -> Result<SyncSummary, StateError> {
-        let conn = self.acquire_lock("get_summary")?;
-
-        let (total_assets, downloaded, pending, failed, downloaded_bytes) = conn
-            .query_row(
-                "SELECT \
-                     COUNT(*), \
-                     COUNT(CASE WHEN status = 'downloaded' THEN 1 END), \
-                     COUNT(CASE WHEN status = 'pending' THEN 1 END), \
-                     COUNT(CASE WHEN status = 'failed' THEN 1 END), \
-                     COALESCE(SUM(CASE WHEN status = 'downloaded' THEN size_bytes ELSE 0 END), 0) \
-                 FROM assets",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .map(|(t, d, p, f, b)| {
-                (
-                    u64::try_from(t).unwrap_or(0),
-                    u64::try_from(d).unwrap_or(0),
-                    u64::try_from(p).unwrap_or(0),
-                    u64::try_from(f).unwrap_or(0),
-                    u64::try_from(b).unwrap_or(0),
+        self.with_conn("get_summary", move |conn| {
+            let (total_assets, downloaded, pending, failed, downloaded_bytes) = conn
+                .query_row(
+                    "SELECT \
+                         COUNT(*), \
+                         COUNT(CASE WHEN status = 'downloaded' THEN 1 END), \
+                         COUNT(CASE WHEN status = 'pending' THEN 1 END), \
+                         COUNT(CASE WHEN status = 'failed' THEN 1 END), \
+                         COALESCE(SUM(CASE WHEN status = 'downloaded' THEN size_bytes ELSE 0 END), 0) \
+                     FROM assets",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
                 )
+                .map(|(t, d, p, f, b)| {
+                    (
+                        u64::try_from(t).unwrap_or(0),
+                        u64::try_from(d).unwrap_or(0),
+                        u64::try_from(p).unwrap_or(0),
+                        u64::try_from(f).unwrap_or(0),
+                        u64::try_from(b).unwrap_or(0),
+                    )
+                })
+                .map_err(|e| StateError::query("get_summary", e))?;
+
+            let last_sync: Option<(Option<i64>, Option<i64>)> = conn
+                .query_row(
+                    "SELECT started_at, completed_at FROM sync_runs ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| StateError::query("get_summary", e))?;
+
+            let (last_sync_started, last_sync_completed) = match last_sync {
+                Some((started, completed)) => (
+                    started.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+                    completed.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+                ),
+                None => (None, None),
+            };
+
+            Ok(SyncSummary {
+                total_assets,
+                downloaded,
+                pending,
+                failed,
+                downloaded_bytes,
+                last_sync_completed,
+                last_sync_started,
             })
-            .map_err(|e| StateError::query("get_summary", e))?;
-
-        let last_sync: Option<(Option<i64>, Option<i64>)> = conn
-            .query_row(
-                "SELECT started_at, completed_at FROM sync_runs ORDER BY id DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| StateError::query("get_summary", e))?;
-
-        let (last_sync_started, last_sync_completed) = match last_sync {
-            Some((started, completed)) => (
-                started.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
-                completed.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
-            ),
-            None => (None, None),
-        };
-
-        Ok(SyncSummary {
-            total_assets,
-            downloaded,
-            pending,
-            failed,
-            downloaded_bytes,
-            last_sync_completed,
-            last_sync_started,
         })
+        .await
     }
 
     async fn get_downloaded_page(
@@ -815,41 +879,41 @@ impl StateDb for SqliteStateDb {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<AssetRecord>, StateError> {
-        let conn = self.acquire_lock("get_downloaded_page")?;
+        self.with_conn("get_downloaded_page", move |conn| {
+            let sql = format!(
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'downloaded' \
+                 ORDER BY rowid LIMIT ?1 OFFSET ?2",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| StateError::query("get_downloaded_page", e))?;
 
-        let sql = format!(
-            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'downloaded' \
-             ORDER BY rowid LIMIT ?1 OFFSET ?2",
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| StateError::query("get_downloaded_page", e))?;
+            let records = stmt
+                .query_map(
+                    rusqlite::params![i64::from(limit), offset as i64],
+                    row_to_asset_record,
+                )
+                .map_err(|e| StateError::query("get_downloaded_page", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_downloaded_page", e))?;
 
-        let records = stmt
-            .query_map(
-                rusqlite::params![i64::from(limit), offset as i64],
-                row_to_asset_record,
-            )
-            .map_err(|e| StateError::query("get_downloaded_page", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query("get_downloaded_page", e))?;
-
-        Ok(records)
+            Ok(records)
+        })
+        .await
     }
 
     async fn start_sync_run(&self) -> Result<i64, StateError> {
         let started_at = Utc::now().timestamp();
+        self.with_conn("start_sync_run", move |conn| {
+            conn.execute(
+                "INSERT INTO sync_runs (started_at, status) VALUES (?1, 'running')",
+                [started_at],
+            )
+            .map_err(|e| StateError::query("start_sync_run", e))?;
 
-        let conn = self.acquire_lock("start_sync_run")?;
-
-        conn.execute(
-            "INSERT INTO sync_runs (started_at, status) VALUES (?1, 'running')",
-            [started_at],
-        )
-        .map_err(|e| StateError::query("start_sync_run", e))?;
-
-        let id = conn.last_insert_rowid();
-        Ok(id)
+            Ok(conn.last_insert_rowid())
+        })
+        .await
     }
 
     async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
@@ -864,76 +928,85 @@ impl StateDb for SqliteStateDb {
             "complete"
         };
 
-        let conn = self.acquire_lock("complete_sync_run")?;
+        self.with_conn("complete_sync_run", move |conn| {
+            conn.execute(
+                "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, \
+                 assets_failed = ?4, interrupted = ?5, status = ?6 WHERE id = ?7",
+                rusqlite::params![
+                    completed_at,
+                    assets_seen,
+                    assets_downloaded,
+                    assets_failed,
+                    interrupted_i32,
+                    status,
+                    run_id
+                ],
+            )
+            .map_err(|e| StateError::query("complete_sync_run", e))?;
 
-        conn.execute(
-            "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, \
-             assets_failed = ?4, interrupted = ?5, status = ?6 WHERE id = ?7",
-            rusqlite::params![
-                completed_at,
-                assets_seen,
-                assets_downloaded,
-                assets_failed,
-                interrupted_i32,
-                status,
-                run_id
-            ],
-        )
-        .map_err(|e| StateError::query("complete_sync_run", e))?;
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
-        let conn = self.acquire_lock("promote_orphaned_sync_runs")?;
-        let rows = conn
-            .execute(
-                "UPDATE sync_runs SET status = 'interrupted', interrupted = 1 \
-                 WHERE status = 'running'",
-                [],
-            )
-            .map_err(|e| StateError::query("promote_orphaned_sync_runs", e))?;
-        Ok(rows as u64)
+        self.with_conn("promote_orphaned_sync_runs", move |conn| {
+            let rows = conn
+                .execute(
+                    "UPDATE sync_runs SET status = 'interrupted', interrupted = 1 \
+                     WHERE status = 'running'",
+                    [],
+                )
+                .map_err(|e| StateError::query("promote_orphaned_sync_runs", e))?;
+            Ok(rows as u64)
+        })
+        .await
     }
 
     async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
         let key = format!("enum_in_progress:{zone}");
         let now = Utc::now().timestamp().to_string();
-        let conn = self.acquire_lock("begin_enum_progress")?;
-        // INSERT OR IGNORE so re-entry doesn't reset the age operators use to
-        // judge stuck zones; `end_enum_progress` is the only path that clears.
-        conn.execute(
-            "INSERT OR IGNORE INTO metadata (key, value) VALUES (?1, ?2)",
-            rusqlite::params![key, now],
-        )
-        .map_err(|e| StateError::query("begin_enum_progress", e))?;
-        Ok(())
+        self.with_conn("begin_enum_progress", move |conn| {
+            // INSERT OR IGNORE so re-entry doesn't reset the age operators use to
+            // judge stuck zones; `end_enum_progress` is the only path that clears.
+            conn.execute(
+                "INSERT OR IGNORE INTO metadata (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, now],
+            )
+            .map_err(|e| StateError::query("begin_enum_progress", e))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
         let key = format!("enum_in_progress:{zone}");
-        let conn = self.acquire_lock("end_enum_progress")?;
-        conn.execute("DELETE FROM metadata WHERE key = ?1", [key])
-            .map_err(|e| StateError::query("end_enum_progress", e))?;
-        Ok(())
+        self.with_conn("end_enum_progress", move |conn| {
+            conn.execute("DELETE FROM metadata WHERE key = ?1", [key])
+                .map_err(|e| StateError::query("end_enum_progress", e))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
-        let conn = self.acquire_lock("list_interrupted_enumerations")?;
-        let mut stmt = conn
-            .prepare("SELECT key FROM metadata WHERE key LIKE 'enum_in_progress:%'")
-            .map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
-        let mut zones = Vec::new();
-        for row in rows {
-            let key = row.map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
-            if let Some(zone) = key.strip_prefix("enum_in_progress:") {
-                zones.push(zone.to_string());
+        self.with_conn("list_interrupted_enumerations", move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT key FROM metadata WHERE key LIKE 'enum_in_progress:%'")
+                .map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
+            let mut zones = Vec::new();
+            for row in rows {
+                let key = row.map_err(|e| StateError::query("list_interrupted_enumerations", e))?;
+                if let Some(zone) = key.strip_prefix("enum_in_progress:") {
+                    zones.push(zone.to_string());
+                }
             }
-        }
-        Ok(zones)
+            Ok(zones)
+        })
+        .await
     }
 
     async fn reset_failed(&self) -> Result<u64, StateError> {
@@ -942,238 +1015,257 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
-        let conn = self.acquire_lock("prepare_for_retry")?;
+        self.with_conn("prepare_for_retry", move |conn| {
+            let failed = conn
+                .execute(
+                    "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
+                     WHERE status = 'failed'",
+                    [],
+                )
+                .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
 
-        let failed = conn
-            .execute(
-                "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
-                 WHERE status = 'failed'",
-                [],
-            )
-            .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
+            let pending = conn
+                .execute(
+                    "UPDATE assets SET download_attempts = 0, last_error = NULL \
+                     WHERE status = 'pending' AND download_attempts > 0",
+                    [],
+                )
+                .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
 
-        let pending = conn
-            .execute(
-                "UPDATE assets SET download_attempts = 0, last_error = NULL \
-                 WHERE status = 'pending' AND download_attempts > 0",
-                [],
-            )
-            .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
+            let total_pending: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM assets WHERE status = 'pending'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("prepare_for_retry", e))?;
+            #[allow(clippy::cast_sign_loss, reason = "SQL COUNT(*) is always non-negative")]
+            let total_pending = total_pending as u64;
 
-        let total_pending: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assets WHERE status = 'pending'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| StateError::query("prepare_for_retry", e))?;
-        #[allow(clippy::cast_sign_loss, reason = "SQL COUNT(*) is always non-negative")]
-        let total_pending = total_pending as u64;
-
-        Ok((failed, pending, total_pending))
+            Ok((failed, pending, total_pending))
+        })
+        .await
     }
 
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
-        let conn = self.acquire_lock("promote_pending_to_failed")?;
+        self.with_conn("promote_pending_to_failed", move |conn| {
+            // Only promote assets the producer dispatched this sync (last_seen_at
+            // was bumped by upsert_seen at or after sync_started_at) that never
+            // reached mark_downloaded or mark_failed. See the trait doc comment
+            // and issue #211 for the rationale.
+            let promoted = conn
+                .execute(
+                    "UPDATE assets SET status = 'failed', last_error = 'Not resolved during sync' \
+                     WHERE status = 'pending' AND last_seen_at >= ?1",
+                    rusqlite::params![seen_since],
+                )
+                .map_err(|e| StateError::query("promote_pending_to_failed", e))?
+                as u64;
 
-        // Only promote assets the producer dispatched this sync (last_seen_at
-        // was bumped by upsert_seen at or after sync_started_at) that never
-        // reached mark_downloaded or mark_failed. See the trait doc comment
-        // and issue #211 for the rationale.
-        let promoted =
-            conn.execute(
-                "UPDATE assets SET status = 'failed', last_error = 'Not resolved during sync' \
-                 WHERE status = 'pending' AND last_seen_at >= ?1",
-                rusqlite::params![seen_since],
-            )
-            .map_err(|e| StateError::query("promote_pending_to_failed", e))? as u64;
-
-        Ok(promoted)
+            Ok(promoted)
+        })
+        .await
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
-        let conn = self.acquire_lock("get_downloaded_ids")?;
+        self.with_conn("get_downloaded_ids", move |conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM assets WHERE status = 'downloaded'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("get_downloaded_ids", e))?;
+            let count = usize::try_from(count).unwrap_or(0);
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assets WHERE status = 'downloaded'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| StateError::query("get_downloaded_ids", e))?;
-        let count = usize::try_from(count).unwrap_or(0);
+            let mut stmt = conn
+                .prepare_cached("SELECT id, version_size FROM assets WHERE status = 'downloaded'")
+                .map_err(|e| StateError::query("get_downloaded_ids", e))?;
 
-        let mut stmt = conn
-            .prepare_cached("SELECT id, version_size FROM assets WHERE status = 'downloaded'")
-            .map_err(|e| StateError::query("get_downloaded_ids", e))?;
+            let mut ids = HashSet::with_capacity(count);
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StateError::query("get_downloaded_ids", e))?;
+            for row in rows {
+                ids.insert(row.map_err(|e| StateError::query("get_downloaded_ids", e))?);
+            }
 
-        let mut ids = HashSet::with_capacity(count);
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| StateError::query("get_downloaded_ids", e))?;
-        for row in rows {
-            ids.insert(row.map_err(|e| StateError::query("get_downloaded_ids", e))?);
-        }
-
-        Ok(ids)
+            Ok(ids)
+        })
+        .await
     }
 
     async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
-        let conn = self.acquire_lock("get_all_known_ids")?;
+        self.with_conn("get_all_known_ids", move |conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT DISTINCT id FROM assets")
+                .map_err(|e| StateError::query("get_all_known_ids", e))?;
 
-        let mut stmt = conn
-            .prepare_cached("SELECT DISTINCT id FROM assets")
-            .map_err(|e| StateError::query("get_all_known_ids", e))?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| StateError::query("get_all_known_ids", e))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|e| StateError::query("get_all_known_ids", e))?;
 
-        let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| StateError::query("get_all_known_ids", e))?
-            .collect::<Result<HashSet<_>, _>>()
-            .map_err(|e| StateError::query("get_all_known_ids", e))?;
-
-        Ok(ids)
+            Ok(ids)
+        })
+        .await
     }
 
     async fn get_downloaded_checksums(
         &self,
     ) -> Result<HashMap<(String, String), String>, StateError> {
-        let conn = self.acquire_lock("get_downloaded_checksums")?;
+        self.with_conn("get_downloaded_checksums", move |conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM assets WHERE status = 'downloaded'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
+            let count = usize::try_from(count).unwrap_or(0);
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assets WHERE status = 'downloaded'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
-        let count = usize::try_from(count).unwrap_or(0);
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, version_size, checksum FROM assets WHERE status = 'downloaded'",
+                )
+                .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
 
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, version_size, checksum FROM assets WHERE status = 'downloaded'",
-            )
-            .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
+            let mut checksums = HashMap::with_capacity(count);
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
+            for row in rows {
+                let (key, val) =
+                    row.map_err(|e| StateError::query("get_downloaded_checksums", e))?;
+                checksums.insert(key, val);
+            }
 
-        let mut checksums = HashMap::with_capacity(count);
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
-        for row in rows {
-            let (key, val) = row.map_err(|e| StateError::query("get_downloaded_checksums", e))?;
-            checksums.insert(key, val);
-        }
-
-        Ok(checksums)
+            Ok(checksums)
+        })
+        .await
     }
 
     async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
-        let conn = self.acquire_lock("get_attempt_counts")?;
+        self.with_conn("get_attempt_counts", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, MAX(download_attempts) FROM assets \
+                     WHERE download_attempts > 0 GROUP BY id",
+                )
+                .map_err(|e| StateError::query("get_attempt_counts", e))?;
 
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, MAX(download_attempts) FROM assets \
-                 WHERE download_attempts > 0 GROUP BY id",
-            )
-            .map_err(|e| StateError::query("get_attempt_counts", e))?;
+            let counts = stmt
+                .query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let count: i64 = row.get(1)?;
+                    Ok((id, u32::try_from(count).unwrap_or(u32::MAX)))
+                })
+                .map_err(|e| StateError::query("get_attempt_counts", e))?
+                .collect::<Result<HashMap<_, _>, _>>()
+                .map_err(|e| StateError::query("get_attempt_counts", e))?;
 
-        let counts = stmt
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let count: i64 = row.get(1)?;
-                Ok((id, u32::try_from(count).unwrap_or(u32::MAX)))
-            })
-            .map_err(|e| StateError::query("get_attempt_counts", e))?
-            .collect::<Result<HashMap<_, _>, _>>()
-            .map_err(|e| StateError::query("get_attempt_counts", e))?;
-
-        Ok(counts)
+            Ok(counts)
+        })
+        .await
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
-        let conn = self.acquire_lock("get_metadata")?;
+        let key = key.to_owned();
+        self.with_conn("get_metadata", move |conn| {
+            let value = conn
+                .query_row("SELECT value FROM metadata WHERE key = ?1", [&key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|e| StateError::query("get_metadata", e))?;
 
-        let value = conn
-            .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()
-            .map_err(|e| StateError::query("get_metadata", e))?;
-
-        Ok(value)
+            Ok(value)
+        })
+        .await
     }
 
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
-        let conn = self.acquire_lock("set_metadata")?;
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.with_conn("set_metadata", move |conn| {
+            conn.execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, value],
+            )
+            .map_err(|e| StateError::query("set_metadata", e))?;
 
-        conn.execute(
-            "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![key, value],
-        )
-        .map_err(|e| StateError::query("set_metadata", e))?;
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
-        let conn = self.acquire_lock("delete_metadata_by_prefix")?;
+        let prefix = prefix.to_owned();
+        self.with_conn("delete_metadata_by_prefix", move |conn| {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM metadata WHERE key LIKE ?1",
+                    [format!("{prefix}%")],
+                )
+                .map_err(|e| StateError::query("delete_metadata_by_prefix", e))?;
 
-        let deleted = conn
-            .execute(
-                "DELETE FROM metadata WHERE key LIKE ?1",
-                [format!("{prefix}%")],
-            )
-            .map_err(|e| StateError::query("delete_metadata_by_prefix", e))?;
-
-        Ok(deleted as u64)
+            Ok(deleted as u64)
+        })
+        .await
     }
 
     async fn touch_last_seen_many(&self, asset_ids: &[&str]) -> Result<(), StateError> {
         if asset_ids.is_empty() {
             return Ok(());
         }
-        let mut conn = self.acquire_lock("touch_last_seen_many")?;
-        let now = Utc::now().timestamp();
-        let tx = conn
-            .transaction()
-            .map_err(|e| StateError::query("touch_last_seen_many::begin", e))?;
-        {
-            let mut stmt = tx
-                .prepare_cached("UPDATE assets SET last_seen_at = ?1 WHERE id = ?2")
-                .map_err(|e| StateError::query("touch_last_seen_many::prepare", e))?;
-            for id in asset_ids {
-                stmt.execute(rusqlite::params![now, id])
-                    .map_err(|e| StateError::query("touch_last_seen_many::execute", e))?;
+        let ids: Vec<String> = asset_ids.iter().map(|s| (*s).to_owned()).collect();
+        self.with_conn_mut("touch_last_seen_many", move |conn| {
+            let now = Utc::now().timestamp();
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("touch_last_seen_many::begin", e))?;
+            {
+                let mut stmt = tx
+                    .prepare_cached("UPDATE assets SET last_seen_at = ?1 WHERE id = ?2")
+                    .map_err(|e| StateError::query("touch_last_seen_many::prepare", e))?;
+                for id in &ids {
+                    stmt.execute(rusqlite::params![now, id])
+                        .map_err(|e| StateError::query("touch_last_seen_many::execute", e))?;
+                }
             }
-        }
-        tx.commit()
-            .map_err(|e| StateError::query("touch_last_seen_many::commit", e))?;
-        Ok(())
+            tx.commit()
+                .map_err(|e| StateError::query("touch_last_seen_many::commit", e))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError> {
-        let conn = self.acquire_lock("sample_downloaded_paths")?;
+        self.with_conn("sample_downloaded_paths", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT local_path FROM assets WHERE status = 'downloaded' \
+                     AND local_path IS NOT NULL ORDER BY RANDOM() LIMIT ?1",
+                )
+                .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
 
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT local_path FROM assets WHERE status = 'downloaded' \
-                 AND local_path IS NOT NULL ORDER BY RANDOM() LIMIT ?1",
-            )
-            .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
-
-        let rows = stmt
-            .query_map(rusqlite::params![limit as i64], |row| {
-                let p: String = row.get(0)?;
-                Ok(PathBuf::from(p))
-            })
-            .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
-        collect_rows_with_warn(rows, "sample_downloaded_paths")
+            let rows = stmt
+                .query_map(rusqlite::params![limit as i64], |row| {
+                    let p: String = row.get(0)?;
+                    Ok(PathBuf::from(p))
+                })
+                .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
+            collect_rows_with_warn(rows, "sample_downloaded_paths")
+        })
+        .await
     }
 
     async fn add_asset_album(
@@ -1182,40 +1274,49 @@ impl StateDb for SqliteStateDb {
         album_name: &str,
         source: &str,
     ) -> Result<(), StateError> {
-        let conn = self.acquire_lock("add_asset_album")?;
-        conn.execute(
-            "INSERT OR IGNORE INTO asset_albums (asset_id, album_name, source) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![asset_id, album_name, source],
-        )
-        .map_err(|e| StateError::query("add_asset_album", e))?;
-        Ok(())
+        let asset_id = asset_id.to_owned();
+        let album_name = album_name.to_owned();
+        let source = source.to_owned();
+        self.with_conn("add_asset_album", move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO asset_albums (asset_id, album_name, source) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![asset_id, album_name, source],
+            )
+            .map_err(|e| StateError::query("add_asset_album", e))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
-        let conn = self.acquire_lock("get_all_asset_albums")?;
-        let mut stmt = conn
-            .prepare_cached("SELECT asset_id, album_name FROM asset_albums")
-            .map_err(|e| StateError::query("get_all_asset_albums", e))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| StateError::query("get_all_asset_albums", e))?;
-        collect_rows_with_warn(rows, "get_all_asset_albums")
+        self.with_conn("get_all_asset_albums", move |conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT asset_id, album_name FROM asset_albums")
+                .map_err(|e| StateError::query("get_all_asset_albums", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StateError::query("get_all_asset_albums", e))?;
+            collect_rows_with_warn(rows, "get_all_asset_albums")
+        })
+        .await
     }
 
     async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
-        let conn = self.acquire_lock("get_all_asset_people")?;
-        let mut stmt = conn
-            .prepare_cached("SELECT asset_id, person_name FROM asset_people")
-            .map_err(|e| StateError::query("get_all_asset_people", e))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| StateError::query("get_all_asset_people", e))?;
-        collect_rows_with_warn(rows, "get_all_asset_people")
+        self.with_conn("get_all_asset_people", move |conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT asset_id, person_name FROM asset_people")
+                .map_err(|e| StateError::query("get_all_asset_people", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StateError::query("get_all_asset_people", e))?;
+            collect_rows_with_warn(rows, "get_all_asset_people")
+        })
+        .await
     }
 
     async fn mark_soft_deleted(
@@ -1223,24 +1324,30 @@ impl StateDb for SqliteStateDb {
         asset_id: &str,
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<(), StateError> {
-        let conn = self.acquire_lock("mark_soft_deleted")?;
-        conn.execute(
-            "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
-             WHERE id = ?2",
-            rusqlite::params![deleted_at.map(|dt| dt.timestamp()), asset_id],
-        )
-        .map_err(|e| StateError::query("mark_soft_deleted", e))?;
-        Ok(())
+        let asset_id = asset_id.to_owned();
+        self.with_conn("mark_soft_deleted", move |conn| {
+            conn.execute(
+                "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
+                 WHERE id = ?2",
+                rusqlite::params![deleted_at.map(|dt| dt.timestamp()), asset_id],
+            )
+            .map_err(|e| StateError::query("mark_soft_deleted", e))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn mark_hidden_at_source(&self, asset_id: &str) -> Result<(), StateError> {
-        let conn = self.acquire_lock("mark_hidden_at_source")?;
-        conn.execute(
-            "UPDATE assets SET is_hidden = 1 WHERE id = ?1",
-            rusqlite::params![asset_id],
-        )
-        .map_err(|e| StateError::query("mark_hidden_at_source", e))?;
-        Ok(())
+        let asset_id = asset_id.to_owned();
+        self.with_conn("mark_hidden_at_source", move |conn| {
+            conn.execute(
+                "UPDATE assets SET is_hidden = 1 WHERE id = ?1",
+                rusqlite::params![asset_id],
+            )
+            .map_err(|e| StateError::query("mark_hidden_at_source", e))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn record_metadata_write_failure(
@@ -1249,14 +1356,18 @@ impl StateDb for SqliteStateDb {
         version_size: &str,
     ) -> Result<(), StateError> {
         let ts = Utc::now().timestamp();
-        let conn = self.acquire_lock("record_metadata_write_failure")?;
-        conn.execute(
-            "UPDATE assets SET metadata_write_failed_at = ?1 \
-             WHERE id = ?2 AND version_size = ?3",
-            rusqlite::params![ts, asset_id, version_size],
-        )
-        .map_err(|e| StateError::query("record_metadata_write_failure", e))?;
-        Ok(())
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        self.with_conn("record_metadata_write_failure", move |conn| {
+            conn.execute(
+                "UPDATE assets SET metadata_write_failed_at = ?1 \
+                 WHERE id = ?2 AND version_size = ?3",
+                rusqlite::params![ts, asset_id, version_size],
+            )
+            .map_err(|e| StateError::query("record_metadata_write_failure", e))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn clear_metadata_write_failure(
@@ -1264,88 +1375,98 @@ impl StateDb for SqliteStateDb {
         asset_id: &str,
         version_size: &str,
     ) -> Result<(), StateError> {
-        let conn = self.acquire_lock("clear_metadata_write_failure")?;
-        conn.execute(
-            "UPDATE assets SET metadata_write_failed_at = NULL \
-             WHERE id = ?1 AND version_size = ?2",
-            rusqlite::params![asset_id, version_size],
-        )
-        .map_err(|e| StateError::query("clear_metadata_write_failure", e))?;
-        Ok(())
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        self.with_conn("clear_metadata_write_failure", move |conn| {
+            conn.execute(
+                "UPDATE assets SET metadata_write_failed_at = NULL \
+                 WHERE id = ?1 AND version_size = ?2",
+                rusqlite::params![asset_id, version_size],
+            )
+            .map_err(|e| StateError::query("clear_metadata_write_failure", e))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn get_downloaded_metadata_hashes(
         &self,
     ) -> Result<HashMap<(String, String), String>, StateError> {
-        let conn = self.acquire_lock("get_downloaded_metadata_hashes")?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, version_size, metadata_hash FROM assets \
-                 WHERE status = 'downloaded' AND metadata_hash IS NOT NULL",
-            )
-            .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
-        let mut hashes: HashMap<(String, String), String> = HashMap::new();
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
-        for row in rows {
-            let (key, val) =
-                row.map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
-            hashes.insert(key, val);
-        }
-        Ok(hashes)
+        self.with_conn("get_downloaded_metadata_hashes", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, version_size, metadata_hash FROM assets \
+                     WHERE status = 'downloaded' AND metadata_hash IS NOT NULL",
+                )
+                .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
+            let mut hashes: HashMap<(String, String), String> = HashMap::new();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
+            for row in rows {
+                let (key, val) =
+                    row.map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
+                hashes.insert(key, val);
+            }
+            Ok(hashes)
+        })
+        .await
     }
 
     async fn get_pending_metadata_rewrites(
         &self,
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError> {
-        let conn = self.acquire_lock("get_pending_metadata_rewrites")?;
-        let sql = format!(
-            "SELECT {ASSET_COLUMNS} FROM assets \
-             WHERE metadata_write_failed_at IS NOT NULL \
-               AND status = 'downloaded' \
-               AND local_path IS NOT NULL \
-             ORDER BY metadata_write_failed_at ASC \
-             LIMIT ?1"
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-        let rows = stmt
-            .query_map(
-                [i64::try_from(limit).unwrap_or(i64::MAX)],
-                row_to_asset_record,
-            )
-            .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))
+        self.with_conn("get_pending_metadata_rewrites", move |conn| {
+            let sql = format!(
+                "SELECT {ASSET_COLUMNS} FROM assets \
+                 WHERE metadata_write_failed_at IS NOT NULL \
+                   AND status = 'downloaded' \
+                   AND local_path IS NOT NULL \
+                 ORDER BY metadata_write_failed_at ASC \
+                 LIMIT ?1"
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
+            let rows = stmt
+                .query_map(
+                    [i64::try_from(limit).unwrap_or(i64::MAX)],
+                    row_to_asset_record,
+                )
+                .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))
+        })
+        .await
     }
 
     async fn get_metadata_retry_markers(&self) -> Result<HashSet<(String, String)>, StateError> {
-        let conn = self.acquire_lock("get_metadata_retry_markers")?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, version_size FROM assets \
-                 WHERE metadata_write_failed_at IS NOT NULL",
-            )
-            .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
-        let mut markers: HashSet<(String, String)> = HashSet::new();
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
-        for row in rows {
-            let key = row.map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
-            markers.insert(key);
-        }
-        Ok(markers)
+        self.with_conn("get_metadata_retry_markers", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, version_size FROM assets \
+                     WHERE metadata_write_failed_at IS NOT NULL",
+                )
+                .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
+            let mut markers: HashSet<(String, String)> = HashSet::new();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
+            for row in rows {
+                let key = row.map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
+                markers.insert(key);
+            }
+            Ok(markers)
+        })
+        .await
     }
 
     async fn update_metadata_hash(
@@ -1354,27 +1475,34 @@ impl StateDb for SqliteStateDb {
         version_size: &str,
         metadata_hash: &str,
     ) -> Result<(), StateError> {
-        let conn = self.acquire_lock("update_metadata_hash")?;
-        conn.execute(
-            "UPDATE assets SET metadata_hash = ?1 \
-             WHERE id = ?2 AND version_size = ?3",
-            rusqlite::params![metadata_hash, asset_id, version_size],
-        )
-        .map_err(|e| StateError::query("update_metadata_hash", e))?;
-        Ok(())
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        let metadata_hash = metadata_hash.to_owned();
+        self.with_conn("update_metadata_hash", move |conn| {
+            conn.execute(
+                "UPDATE assets SET metadata_hash = ?1 \
+                 WHERE id = ?2 AND version_size = ?3",
+                rusqlite::params![metadata_hash, asset_id, version_size],
+            )
+            .map_err(|e| StateError::query("update_metadata_hash", e))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
-        let conn = self.acquire_lock("has_downloaded_without_metadata_hash")?;
-        let exists: i64 = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
-                 AND metadata_hash IS NULL)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| StateError::query("has_downloaded_without_metadata_hash", e))?;
-        Ok(exists != 0)
+        self.with_conn("has_downloaded_without_metadata_hash", move |conn| {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
+                     AND metadata_hash IS NULL)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("has_downloaded_without_metadata_hash", e))?;
+            Ok(exists != 0)
+        })
+        .await
     }
 }
 
