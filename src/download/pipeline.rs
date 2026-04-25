@@ -1291,10 +1291,21 @@ where
         // Flush the accumulated last_seen_at updates in one transaction.
         // Running after the producer loop exits means we skip the fsync-
         // per-asset cost that dominated sync-start on mostly-synced
-        // libraries. last_seen_at is observational and only affects the
-        // stuck-pipeline promotion window via sync_started_at, so a
-        // deferred flush is safe for terminal-status rows (which is all
-        // touched_ids contains).
+        // libraries.
+        //
+        // touched_ids contains assets the consumer will not finalize this
+        // sync: trust-state fast-skips (line 1026, status='downloaded')
+        // and on-disk skips (line 1053, which the comment at the push
+        // site notes can include status='pending' rows carried over from
+        // a prior interrupted sync). Bumping their last_seen_at is a
+        // no-op for terminal rows and is load-bearing for stuck-pipeline
+        // recovery on pending rows: promote_pending_to_failed promotes
+        // any 'pending' row whose last_seen_at >= sync_started_at.
+        //
+        // If we lose this flush (e.g. process killed between the producer
+        // loop exiting and touch_last_seen_many returning), stuck-pipeline
+        // promotion is delayed by exactly one sync — the same row hits
+        // the same path next run and gets promoted then. No data loss.
         if let Some(db) = &producer_state_db {
             if !touched_ids.is_empty() {
                 let touched_count = touched_ids.len();
@@ -3569,6 +3580,90 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.pending, 1);
         assert_eq!(summary.failed, 0);
+    }
+
+    /// Producer-side regression for the deferred `touched_ids` flush.
+    ///
+    /// A pending row carried over from a prior interrupted sync, whose
+    /// new sync hits the on-disk-skip path (the `tasks.is_empty()`
+    /// branch at the producer's filter step), must end the sync as
+    /// `failed` -- the producer task pushes its id into `touched_ids`,
+    /// the deferred `touch_last_seen_many` flush bumps `last_seen_at`,
+    /// and `promote_pending_to_failed` then promotes it. This is
+    /// load-bearing for stuck-pipeline recovery.
+    ///
+    /// If a future refactor moves the flush behind a not-always-reached
+    /// path, or moves `touched_ids` writes off the producer's terminal
+    /// path, this test fails.
+    #[tokio::test]
+    async fn producer_flushes_touched_ids_so_pending_on_disk_skip_promotes() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::{SqliteStateDb, StateDb};
+        use crate::test_helpers::TestAssetRecord;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        fn carryover_asset() -> PhotoAsset {
+            TestPhotoAsset::new("STUCK")
+                .filename("stuck.jpg")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(1234)
+                .orig_url("http://127.0.0.1:1/stuck.jpg")
+                .orig_checksum("ck_stuck")
+                .build()
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+
+        let prior_seen_at = chrono::Utc::now().timestamp() - 86400;
+        let record = TestAssetRecord::new("STUCK")
+            .checksum("ck_stuck")
+            .filename("stuck.jpg")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.backdate_last_seen("STUCK", prior_seen_at);
+
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        // Pre-create the on-disk file at the path the producer will
+        // compute so `filter_asset_to_tasks` returns no tasks. Reuses
+        // `local_download_path` to stay tz-independent.
+        let asset = carryover_asset();
+        let target_path = crate::download::paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &asset.created().with_timezone(&chrono::Local),
+            "stuck.jpg",
+            None,
+        );
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&target_path, vec![0u8; 1234]).unwrap();
+
+        let client = reqwest::Client::new();
+        let sync_started_at = chrono::Utc::now().timestamp();
+        let stream1 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(carryover_asset())]);
+        stream_and_download_from_stream(&client, stream1, &config, 1, CancellationToken::new())
+            .await
+            .expect("sync must complete");
+
+        let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
+        assert_eq!(
+            promoted, 1,
+            "stuck pending row must be promoted by the deferred touched_ids flush"
+        );
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(&*failed[0].id, "STUCK");
     }
 
     // ── run_metadata_rewrites end-to-end ───────────────────────────────────
