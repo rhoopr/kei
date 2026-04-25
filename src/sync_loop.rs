@@ -1627,4 +1627,427 @@ mod tests {
             );
         }
     }
+
+    // CG-18: classifier sees through `Box<dyn Error + Send + Sync>` wrappers.
+    //
+    // anyhow lets callers wrap raw boxed errors via `anyhow::Error::from`
+    // when adapting third-party error returns. The downcast walk used by
+    // `is_session_error` must conclude "not a session error" for any error
+    // chain that was never an `ICloudError` — otherwise a future refactor
+    // through a boxed-error adapter could silently flip every config /
+    // network / state error into "burn an Apple SRP slot".
+    #[test]
+    fn is_session_error_through_boxed_error_returns_false() {
+        // A boxed error of a foreign type wrapped via anyhow::Error::from.
+        let boxed: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, "foreign"));
+        let e: anyhow::Error = anyhow::Error::from_boxed(boxed);
+        assert!(
+            !is_session_error(&e),
+            "boxed-error wrapper must not be classified as a session error"
+        );
+
+        // Also: anyhow::Error::msg(string) must be non-session — this is
+        // the most common path through our error pipeline (a `bail!` from
+        // a non-icloud module).
+        let plain = anyhow::anyhow!("config parse failed at line 7");
+        assert!(
+            !is_session_error(&plain),
+            "free-form anyhow::Error must not be classified as a session error"
+        );
+    }
+
+    // ── determine_sync_mode ──────────────────────────────────────────
+    //
+    // Sync-mode decision is the gatekeeper for the kei "user data is sacred"
+    // invariant: pick Full vs Incremental wrong and either (a) re-download
+    // the world (waste) or (b) skip previously-failed assets (silent loss).
+    // None of the four critical branches had a direct unit test before.
+
+    fn make_state_db() -> Arc<dyn state::StateDb> {
+        Arc::new(state::SqliteStateDb::open_in_memory().expect("open in-memory state DB"))
+    }
+
+    /// CG-1: `is_retry_failed=true` MUST force `SyncMode::Full` even when a
+    /// sync token is stored. A regression that picked Incremental during
+    /// retry-failed would silently skip the previously-failed assets the
+    /// user explicitly asked to retry — silent data loss.
+    #[tokio::test]
+    async fn determine_sync_mode_retry_failed_with_token_returns_full() {
+        let db = make_state_db();
+        let sync_token_key = "sync_token:PrimarySync";
+        // Pre-populate a stored token so we can verify it is ignored.
+        db.set_metadata(sync_token_key, "stored-token-abc")
+            .await
+            .expect("set token");
+
+        let mode = determine_sync_mode(
+            true,  // is_retry_failed
+            false, // no_incremental
+            1,
+            &Some(Arc::clone(&db)),
+            sync_token_key,
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "retry-failed must force Full, got {mode:?}"
+        );
+    }
+
+    /// CG-2: `--no-incremental` MUST force `SyncMode::Full`, ignoring any
+    /// stored token. The flag exists so a user can deliberately re-enumerate
+    /// (e.g. after a known incremental drift); silently downgrading would
+    /// betray that contract.
+    #[tokio::test]
+    async fn determine_sync_mode_no_incremental_overrides_stored_token() {
+        let db = make_state_db();
+        let sync_token_key = "sync_token:PrimarySync";
+        db.set_metadata(sync_token_key, "stored-token-xyz")
+            .await
+            .expect("set token");
+
+        let mode = determine_sync_mode(
+            false, // is_retry_failed
+            true,  // no_incremental
+            1,
+            &Some(Arc::clone(&db)),
+            sync_token_key,
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "--no-incremental must force Full, got {mode:?}"
+        );
+    }
+
+    /// CG-3: an empty stored token must fall back to Full. Production
+    /// guards on `!token.is_empty()`; if a refactor flipped that check the
+    /// caller would request `changes/zone` with empty token and silently
+    /// drop pending events.
+    #[tokio::test]
+    async fn determine_sync_mode_empty_stored_token_falls_back_to_full() {
+        let db = make_state_db();
+        let sync_token_key = "sync_token:PrimarySync";
+        // Empty-string token is the malformed case — should be ignored.
+        db.set_metadata(sync_token_key, "")
+            .await
+            .expect("set empty token");
+
+        let mode = determine_sync_mode(
+            false,
+            false,
+            1,
+            &Some(Arc::clone(&db)),
+            sync_token_key,
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "empty stored token must yield Full, got {mode:?}"
+        );
+
+        // And a present, non-empty token must trigger Incremental — pin the
+        // happy path here too so the empty-string check can't be dropped
+        // without breaking both assertions.
+        db.set_metadata(sync_token_key, "real-token")
+            .await
+            .expect("set real token");
+        let mode = determine_sync_mode(
+            false,
+            false,
+            1,
+            &Some(Arc::clone(&db)),
+            sync_token_key,
+            "PrimarySync",
+        )
+        .await;
+        assert!(
+            matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "real-token"),
+            "non-empty token must yield Incremental with that token, got {mode:?}"
+        );
+    }
+
+    /// CG-4: when the state DB read fails, fall back to Full rather than
+    /// propagating. The watch loop must keep going even if sqlite hiccups —
+    /// silently biasing toward Incremental on errors would mask data loss.
+    ///
+    /// We reach the failure surface by closing the underlying connection
+    /// out from under a real `SqliteStateDb`. Doing this against a plain
+    /// fail-everything stub would require implementing every method in the
+    /// (large) `StateDb` trait; instead we use the test-only failing impl
+    /// the pipeline tests already maintain. See the inline `FailingDb`.
+    #[tokio::test]
+    async fn determine_sync_mode_state_db_error_falls_back_to_full() {
+        use std::collections::{HashMap, HashSet};
+        use std::path::PathBuf;
+
+        // Minimal failing impl: only `get_metadata` is reachable from
+        // `determine_sync_mode`; every other method is unimplemented so
+        // any silent reroute lights up immediately.
+        struct FailingDb;
+
+        #[async_trait::async_trait]
+        impl state::StateDb for FailingDb {
+            #[cfg(test)]
+            async fn should_download(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn upsert_seen(
+                &self,
+                _: &state::types::AssetRecord,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_downloaded(
+                &self,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_failed(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed_sample(
+                &self,
+                _: u32,
+            ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_pending(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_summary(
+                &self,
+            ) -> Result<state::types::SyncSummary, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_page(
+                &self,
+                _: u64,
+                _: u32,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn complete_sync_run(
+                &self,
+                _: i64,
+                _: &state::types::SyncRunStats,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn begin_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn end_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn list_interrupted_enumerations(
+                &self,
+            ) -> Result<Vec<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_pending_to_failed(
+                &self,
+                _: i64,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_ids(
+                &self,
+            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_known_ids(&self) -> Result<HashSet<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_checksums(
+                &self,
+            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_attempt_counts(
+                &self,
+            ) -> Result<HashMap<String, u32>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_metadata(
+                &self,
+                _: &str,
+            ) -> Result<Option<String>, state::error::StateError> {
+                Err(state::error::StateError::LockPoisoned("simulated".into()))
+            }
+            async fn set_metadata(&self, _: &str, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn delete_metadata_by_prefix(
+                &self,
+                _: &str,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn touch_last_seen_many(
+                &self,
+                _: &[&str],
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn sample_downloaded_paths(
+                &self,
+                _: usize,
+            ) -> Result<Vec<PathBuf>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn add_asset_album(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_asset_albums(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_asset_people(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_soft_deleted(
+                &self,
+                _: &str,
+                _: Option<chrono::DateTime<chrono::Utc>>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn record_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_metadata_hashes(
+                &self,
+            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_metadata_retry_markers(
+                &self,
+            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_pending_metadata_rewrites(
+                &self,
+                _: usize,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn update_metadata_hash(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn clear_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn has_downloaded_without_metadata_hash(
+                &self,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+        }
+
+        let db: Arc<dyn state::StateDb> = Arc::new(FailingDb);
+
+        let mode = determine_sync_mode(
+            false,
+            false,
+            1,
+            &Some(db),
+            "sync_token:PrimarySync",
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "DB read error must fall back to Full, got {mode:?}"
+        );
+    }
+
+    /// Sanity: `state_db = None` (e.g. legacy run with no state path) must
+    /// still produce Full. The match-arm exists in production today; pin
+    /// it so a future refactor that drops the `else` branch tells us.
+    #[tokio::test]
+    async fn determine_sync_mode_no_state_db_returns_full() {
+        let mode = determine_sync_mode(
+            false,
+            false,
+            1,
+            &None,
+            "sync_token:PrimarySync",
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "no state DB must yield Full, got {mode:?}"
+        );
+    }
 }
