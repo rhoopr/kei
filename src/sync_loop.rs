@@ -25,7 +25,10 @@ use crate::retry;
 use crate::shutdown;
 use crate::state::{self, StateDb};
 use crate::systemd::SystemdNotifier;
-use crate::{available_disk_space, make_password_provider, PartialSyncError, PidFileGuard};
+use crate::{
+    available_disk_space, check_min_disk_space, make_password_provider, PartialSyncError,
+    PidFileGuard,
+};
 
 /// Per-library state: zone name, sync token key, and resolved album plan.
 struct LibraryState {
@@ -272,16 +275,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     })?;
     let _ = tokio::fs::remove_file(&probe).await;
 
-    // Abort if available disk space is too low.
+    // Abort if available disk space is too low. CG-20: see
+    // `check_min_disk_space` for the pure inner check.
     if let Some(avail) = available_disk_space(&config.directory) {
-        const MIN_FREE_BYTES: u64 = 1_073_741_824; // 1 GiB
-        if avail < MIN_FREE_BYTES {
-            let avail_mb = avail / (1024 * 1024);
-            anyhow::bail!(
-                "Insufficient disk space: only {avail_mb} MiB available in {} (minimum 1 GiB)",
-                config.directory.display()
-            );
-        }
+        check_min_disk_space(avail, &config.directory)?;
     }
 
     let cred_store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
