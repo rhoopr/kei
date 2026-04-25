@@ -413,7 +413,14 @@ async fn attempt_download<C: DownloadClient>(
     // Validate content looks like actual media, not an HTML error page.
     // Apple's CDN occasionally returns HTTP 200 with HTML (rate limit, CAPTCHA,
     // service unavailable) which would otherwise be saved as the final file.
-    if let Err(e) = validate_downloaded_content(part_path, download_path) {
+    let part_owned = part_path.to_path_buf();
+    let download_owned = download_path.to_path_buf();
+    let validation = tokio::task::spawn_blocking(move || {
+        validate_downloaded_content(&part_owned, &download_owned)
+    })
+    .await
+    .map_err(|e| DownloadError::Disk(Box::new(std::io::Error::other(e))))?;
+    if let Err(e) = validation {
         let _ = fs::remove_file(&part_path).await;
         return Err(e);
     }
@@ -472,7 +479,9 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
         let mut file = std::fs::File::open(&path)
             .with_context(|| format!("opening {} for SHA-256", path.display()))?;
         let mut sha256 = Sha256::new();
-        let mut buf = [0u8; 8192];
+        // 64 KiB reduces read() syscalls ~8x vs 8 KiB on multi-GB videos
+        // without meaningful RSS impact on the blocking pool.
+        let mut buf = [0u8; 65536];
         loop {
             use std::io::Read;
             let n = file
@@ -481,8 +490,10 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
             if n == 0 {
                 break;
             }
-            // `n` is bounded by buf.len() because read() returns bytes written.
-            #[allow(clippy::indexing_slicing)]
+            #[allow(
+                clippy::indexing_slicing,
+                reason = "`n` is bounded by buf.len() because read() returns bytes written"
+            )]
             sha256.update(&buf[..n]);
         }
         Ok(format!("{:x}", sha256.finalize()))
@@ -532,9 +543,11 @@ fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum>
 /// that e.g. a leading `\n<html>` still fails. These sentinels are never valid
 /// image/video starts — unlike the magic-byte checks further down, which are
 /// only warnings because exotic variants exist.
-// `pos` comes from `header.iter().position(...)` so `header[pos..]` is
-// in-bounds; the prefix slices below are guarded by explicit length checks.
-#[allow(clippy::indexing_slicing)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "`pos` comes from `header.iter().position(...)` so `header[pos..]` is \
+              in-bounds; the prefix slices below are guarded by explicit length checks"
+)]
 fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
     let trimmed = header
         .iter()
@@ -578,9 +591,11 @@ fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
 /// Photos pipeline commonly serves live-photo and HEVC videos in classic
 /// QuickTime format, whose first atom is padding (`wide`) or media data
 /// (`mdat`) rather than `ftyp`.
-// Each match arm slices `header` only after an `n >= N` length guard, where
-// `n == header.len()`. Clippy can't see the proof but every slice is bounded.
-#[allow(clippy::indexing_slicing)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "each match arm slices `header` only after an `n >= N` length guard where \
+              `n == header.len()`; clippy can't see the proof but every slice is bounded"
+)]
 fn classify_magic(ext: &str, header: &[u8]) -> Option<bool> {
     let n = header.len();
     match ext {
@@ -638,8 +653,10 @@ fn validate_downloaded_content(
         });
     }
 
-    // `n` is bytes read from `buf` so `n <= buf.len() == 16`.
-    #[allow(clippy::indexing_slicing)]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "`n` is bytes read from `buf` so `n <= buf.len() == 16`"
+    )]
     let header = &buf[..n];
 
     // Reject known-bad error-page sentinels regardless of extension. Apple's
@@ -659,8 +676,10 @@ fn validate_downloaded_content(
         .to_ascii_lowercase();
 
     if classify_magic(&ext, header) == Some(false) {
-        // `n.min(8)` caps the slice at `header.len()`.
-        #[allow(clippy::indexing_slicing)]
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "`n.min(8)` caps the slice at `header.len()`"
+        )]
         let preview = &header[..n.min(8)];
         tracing::warn!(
             path = %download_path.display(),

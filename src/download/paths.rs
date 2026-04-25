@@ -80,7 +80,7 @@ pub(crate) fn local_download_path(
     album_name: Option<&str>,
 ) -> PathBuf {
     local_download_dir(directory, folder_structure, created_date, album_name)
-        .join(clean_filename(filename))
+        .join(clean_filename(filename).as_ref())
 }
 
 /// Maximum filename length in bytes for common filesystems (ext4, APFS, NTFS).
@@ -90,20 +90,26 @@ const MAX_FILENAME_BYTES: usize = 255;
 /// filesystems (`/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`) and control
 /// characters (including NUL) with `_`. Truncates filenames exceeding 255
 /// bytes, preserving the file extension.
-pub(crate) fn clean_filename(filename: &str) -> String {
+///
+/// Returns `Cow::Borrowed` when no character replacement and no truncation
+/// is needed — the overwhelming common case for iCloud filenames — so the
+/// filter hot path avoids a fresh allocation per asset.
+pub(crate) fn clean_filename(filename: &str) -> std::borrow::Cow<'_, str> {
+    fn is_invalid(c: char) -> bool {
+        matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()
+    }
+
+    if filename.len() <= MAX_FILENAME_BYTES && !filename.contains(is_invalid) {
+        return std::borrow::Cow::Borrowed(filename);
+    }
+
     let cleaned: String = filename
         .chars()
-        .map(|c| {
-            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() {
-                '_'
-            } else {
-                c
-            }
-        })
+        .map(|c| if is_invalid(c) { '_' } else { c })
         .collect();
 
     if cleaned.len() <= MAX_FILENAME_BYTES {
-        return cleaned;
+        return std::borrow::Cow::Owned(cleaned);
     }
 
     // Preserve the extension (e.g. ".jpg") when truncating, but only if it
@@ -112,11 +118,11 @@ pub(crate) fn clean_filename(filename: &str) -> String {
         let ext = &cleaned[dot..];
         if ext.len() < MAX_FILENAME_BYTES {
             let stem_end = cleaned[..dot].floor_char_boundary(MAX_FILENAME_BYTES - ext.len());
-            return format!("{}{ext}", &cleaned[..stem_end]);
+            return std::borrow::Cow::Owned(format!("{}{ext}", &cleaned[..stem_end]));
         }
     }
 
-    cleaned[..cleaned.floor_char_boundary(MAX_FILENAME_BYTES)].to_string()
+    std::borrow::Cow::Owned(cleaned[..cleaned.floor_char_boundary(MAX_FILENAME_BYTES)].to_string())
 }
 
 /// Sanitize a path component (e.g. album name) to prevent path traversal
@@ -178,8 +184,14 @@ pub(crate) fn sanitize_path_component(name: &str) -> String {
 
 /// Remove non-ASCII (unicode) characters from a filename, keeping only
 /// ASCII characters.
-pub(crate) fn remove_unicode_chars(filename: &str) -> String {
-    filename.chars().filter(char::is_ascii).collect()
+///
+/// Returns `Cow::Borrowed` when the input is already all-ASCII (the common
+/// case for iCloud filenames) so callers avoid an allocation per asset.
+pub(crate) fn remove_unicode_chars(filename: &str) -> std::borrow::Cow<'_, str> {
+    if filename.is_ascii() {
+        return std::borrow::Cow::Borrowed(filename);
+    }
+    std::borrow::Cow::Owned(filename.chars().filter(char::is_ascii).collect())
 }
 
 /// Add a size-based deduplication suffix to a filename.
@@ -340,8 +352,10 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
     let hash = Sha256::digest(asset_id.as_bytes());
     let ext = item_type_extension(asset_type);
     let mut result = String::with_capacity(12 + 1 + ext.len());
-    // SHA-256 output is always 32 bytes; 6 is unconditionally in-bounds.
-    #[allow(clippy::indexing_slicing)]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "SHA-256 output is always 32 bytes; 6 is unconditionally in-bounds"
+    )]
     for &b in &hash[..6] {
         let _ = Write::write_fmt(&mut result, format_args!("{b:02x}"));
     }
@@ -359,10 +373,12 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
 ///
 /// This function strips any of these to produce a consistent `1.40.01PM` form,
 /// enabling matching between files created with different locale settings.
-// Every `bytes[i + k]` read below is preceded by an `i + k < len` check or a
-// `bytes[i] < 0x80` ASCII guard that makes `i + 1 <= len`. The UTF-8 fallback
-// slice `s[i..]` is valid because `i < len` and we land on a char boundary.
-#[allow(clippy::indexing_slicing)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "every `bytes[i + k]` read below is preceded by an `i + k < len` check or a \
+              `bytes[i] < 0x80` ASCII guard that makes `i + 1 <= len`; the UTF-8 fallback \
+              slice `s[i..]` is valid because `i < len` and we land on a char boundary"
+)]
 pub(crate) fn normalize_ampm(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -446,6 +462,7 @@ fn read_dir_entries(dir: &Path) -> FxHashMap<String, u64> {
 /// Async callers should pre-populate directories with `ensure_dir_async()` before
 /// entering tight sync loops (e.g. `filter_asset_to_tasks`), so that the sync
 /// lookup methods (`exists`, `file_size`, `find_ampm_variant`) never hit disk.
+#[derive(Debug)]
 pub(crate) struct DirCache {
     dirs: FxHashMap<PathBuf, FxHashMap<String, u64>>,
 }
@@ -542,9 +559,11 @@ impl DirCache {
         // self.dirs immutably, which the borrow checker cannot release
         // before the mutable entry() call below.
         if self.dirs.contains_key(dir) {
-            // contains_key() above proves `dir` is present; two-lookup dance
-            // avoids the borrow-checker complaint the comment describes.
-            #[allow(clippy::indexing_slicing)]
+            #[allow(
+                clippy::indexing_slicing,
+                reason = "contains_key() above proves `dir` is present; two-lookup dance \
+                          avoids the borrow-checker complaint the outer comment describes"
+            )]
             return &self.dirs[dir];
         }
         self.dirs

@@ -397,14 +397,24 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
     apply_to_xmp(&mut meta, write)?;
     let xmp_bytes = meta.to_string().into_bytes();
 
-    let new_bytes = heif::insert_xmp(&input, &xmp_bytes)
-        .with_context(|| format!("Inserting XMP into HEIC {}", path.display()))?;
-
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".meta-tmp");
     let tmp_path = path.with_file_name(&tmp_name);
-    std::fs::write(&tmp_path, &new_bytes)
-        .with_context(|| format!("Writing patched HEIC to {}", tmp_path.display()))?;
+
+    // Stream the rewrite straight to disk: the old Vec<u8> output from
+    // insert_xmp was one full-file-sized copy we didn't need.
+    {
+        let file = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("Creating {}", tmp_path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        heif::insert_xmp(&input, &xmp_bytes, &mut writer)
+            .with_context(|| format!("Inserting XMP into HEIC {}", path.display()))?;
+        writer
+            .into_inner()
+            .with_context(|| format!("Flushing patched HEIC to {}", tmp_path.display()))?
+            .sync_all()
+            .with_context(|| format!("fsync for {}", tmp_path.display()))?;
+    }
     let guard = TmpGuard::new(&tmp_path);
     std::fs::rename(&tmp_path, path)
         .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
@@ -426,8 +436,10 @@ fn build_xmp_packet(write: &MetadataWrite) -> Result<Vec<u8>> {
 /// EXIF stores datetimes as `"YYYY:MM:DD HH:MM:SS"`; XMP wants ISO 8601
 /// `"YYYY-MM-DDTHH:MM:SS"`. Best-effort conversion — on malformed input we
 /// return the original so XMP Toolkit can reject it with a clear error.
-// Indices 4, 7, 10 are provably in-bounds under the `bytes.len() == 19` guard.
-#[allow(clippy::indexing_slicing)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "indices 4, 7, 10 are provably in-bounds under the `bytes.len() == 19` guard"
+)]
 fn exif_datetime_to_iso(s: &str) -> String {
     let bytes = s.as_bytes();
     if bytes.len() == 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {

@@ -12,7 +12,7 @@ pub(crate) struct HealthStatus {
 }
 
 impl HealthStatus {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             last_sync_at: None,
             last_success_at: None,
@@ -21,7 +21,7 @@ impl HealthStatus {
         }
     }
 
-    pub fn record_success(&mut self) {
+    pub(crate) fn record_success(&mut self) {
         let now = Utc::now();
         self.last_sync_at = Some(now);
         self.last_success_at = Some(now);
@@ -29,7 +29,7 @@ impl HealthStatus {
         self.last_error = None;
     }
 
-    pub fn record_failure(&mut self, error: &str) {
+    pub(crate) fn record_failure(&mut self, error: &str) {
         self.last_sync_at = Some(Utc::now());
         self.consecutive_failures += 1;
         self.last_error = Some(error.to_string());
@@ -38,7 +38,7 @@ impl HealthStatus {
     /// Write health status to `health.json` in the given directory.
     /// Errors are logged but never propagated — health reporting must not
     /// interfere with the sync loop.
-    pub fn write(&self, dir: &Path) {
+    pub(crate) fn write(&self, dir: &Path) {
         let path = dir.join("health.json");
         match serde_json::to_string_pretty(self) {
             Ok(json) => {

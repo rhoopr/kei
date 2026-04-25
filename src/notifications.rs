@@ -4,6 +4,7 @@
 //! Used to notify users of 2FA expiry, sync completion, failures, etc.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Events that trigger notification scripts.
@@ -95,10 +96,19 @@ impl From<&crate::download::SyncStats> for SyncNotificationData {
 #[derive(Debug, Clone)]
 pub(crate) struct Notifier {
     script: Option<PathBuf>,
+    /// Bounds how many notification scripts can run concurrently. A
+    /// misbehaving or long-running script can't queue an unbounded
+    /// number of spawned tasks behind itself under load.
+    concurrency: Arc<tokio::sync::Semaphore>,
 }
 
 /// Timeout for notification scripts.
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on concurrent notification-script invocations. Events fire at
+/// sync-cycle boundaries (start/complete/failure/token-required), so
+/// 8 is plenty of headroom in watch mode while still bounding leaks.
+const NOTIFIER_MAX_INFLIGHT: usize = 8;
 
 impl Notifier {
     pub fn new(script: Option<PathBuf>) -> Self {
@@ -110,9 +120,15 @@ impl Notifier {
                 "--notification-script is unix-only (kei invokes scripts via /bin/sh). \
                  Ignoring the configured script on Windows."
             );
-            return Self { script: None };
+            return Self {
+                script: None,
+                concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
+            };
         }
-        Self { script }
+        Self {
+            script,
+            concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
+        }
     }
 
     /// Fire the notification script with the given event.
@@ -143,7 +159,12 @@ impl Notifier {
 
         tracing::debug!(event = event_str, "Firing notification script");
 
+        let concurrency = Arc::clone(&self.concurrency);
         tokio::spawn(async move {
+            let Ok(permit) = concurrency.acquire_owned().await else {
+                // Semaphore closed during shutdown — safe to skip.
+                return;
+            };
             match run_script(&script, event_str, &message, &username, data.as_ref()).await {
                 Ok(status) if status.success() => {
                     tracing::debug!(event = event_str, "Notification script completed");
@@ -163,6 +184,7 @@ impl Notifier {
                     );
                 }
             }
+            drop(permit);
         });
     }
 }
@@ -390,6 +412,80 @@ mod tests {
 
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert_eq!(output.trim(), "42|3|100|1500000|80");
+    }
+
+    /// Fire many more events than `NOTIFIER_MAX_INFLIGHT` at a script
+    /// that blocks on a release file, and confirm the semaphore caps
+    /// the number of scripts running at any one moment. Without the
+    /// `acquire_owned` wrap, all events would spawn `/bin/sh`
+    /// concurrently and the marker count would exceed the cap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notifier_semaphore_caps_concurrent_inflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter_dir = dir.path().join("inflight");
+        std::fs::create_dir_all(&counter_dir).unwrap();
+        let release = dir.path().join("release");
+
+        // Each script invocation creates a unique marker, polls until the
+        // release file exists, then removes the marker on exit.
+        let body = format!(
+            "#!/bin/sh\nmarker=\"{}/$$\"\n: > \"$marker\"\n\
+             while [ ! -f \"{}\" ]; do sleep 0.02; done\nrm -f \"$marker\"\n",
+            counter_dir.display(),
+            release.display(),
+        );
+        let script_path = write_test_script(dir.path(), "barrier.sh", body.as_bytes());
+
+        let notifier = Notifier::new(Some(script_path));
+        let n_events = NOTIFIER_MAX_INFLIGHT * 2;
+        for _ in 0..n_events {
+            notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
+        }
+
+        // Wait until the steady state is reached, then sample for a
+        // window to confirm the cap holds. `count_markers` is
+        // best-effort: if a marker is in the process of being created
+        // or removed, we may briefly miss it, but the maximum across
+        // many samples is a tight bound.
+        let count_markers = || {
+            std::fs::read_dir(&counter_dir)
+                .map(|it| it.flatten().count())
+                .unwrap_or(0)
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut max_concurrent = 0usize;
+        while tokio::time::Instant::now() < deadline {
+            max_concurrent = max_concurrent.max(count_markers());
+            if max_concurrent >= NOTIFIER_MAX_INFLIGHT {
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    max_concurrent = max_concurrent.max(count_markers());
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Release every blocked script so they can exit cleanly.
+        std::fs::write(&release, b"").unwrap();
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < cleanup_deadline {
+            if count_markers() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            max_concurrent >= 1,
+            "no scripts ever ran — test setup bug (script never created a marker)"
+        );
+        assert!(
+            max_concurrent <= NOTIFIER_MAX_INFLIGHT,
+            "semaphore did not cap concurrent scripts: max observed {max_concurrent}, cap is {NOTIFIER_MAX_INFLIGHT}",
+        );
     }
 
     #[cfg(unix)]

@@ -29,6 +29,7 @@ use filter::{
     NormalizedPath,
 };
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -179,8 +180,10 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
     let hash = hasher.finalize();
     let mut hex = String::with_capacity(16);
     // First 8 bytes is plenty for collision avoidance in this context.
-    // SHA-256 output is always 32 bytes; 8 is unconditionally in-bounds.
-    #[allow(clippy::indexing_slicing)]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "SHA-256 output is always 32 bytes; 8 is unconditionally in-bounds"
+    )]
     for &b in &hash[..8] {
         let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
     }
@@ -189,6 +192,7 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
 
 /// Fields shared between [`hash_download_config`] and [`compute_config_hash`]
 /// that affect path resolution and asset eligibility.
+#[derive(Debug)]
 struct SharedHashFields<'a> {
     directory: &'a std::path::Path,
     folder_structure: &'a str,
@@ -377,7 +381,10 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
 pub(crate) struct DownloadConfig {
-    pub(crate) directory: std::path::PathBuf,
+    /// Behind `Arc` so per-pass clones (`with_album_name`, `with_pass`,
+    /// `with_exclude_ids`) refcount-bump instead of deep-cloning the
+    /// PathBuf. Same pattern as `asset_groupings` and `exclude_asset_ids`.
+    pub(crate) directory: Arc<Path>,
     pub(crate) folder_structure: String,
     pub(crate) size: AssetVersionSize,
     pub(crate) skip_videos: bool,
@@ -414,9 +421,12 @@ pub(crate) struct DownloadConfig {
     pub(crate) force_size: bool,
     pub(crate) keep_unicode_in_filenames: bool,
     /// Compiled glob patterns for filename exclusion.
-    pub(crate) filename_exclude: Vec<glob::Pattern>,
+    ///
+    /// Behind `Arc<[_]>` so per-pass clones share one allocation
+    /// (significant with `-a all` over 100+ albums).
+    pub(crate) filename_exclude: Arc<[glob::Pattern]>,
     /// Temp file suffix for partial downloads (e.g. `.kei-tmp`).
-    pub(crate) temp_suffix: String,
+    pub(crate) temp_suffix: Arc<str>,
     /// State database for tracking download progress.
     pub(crate) state_db: Option<Arc<dyn StateDb>>,
     /// When true (retry-failed mode), only download assets already known to the
@@ -464,10 +474,10 @@ impl DownloadConfig {
         let folder_structure = paths::expand_album_token(&self.folder_structure, album_ref);
         Self {
             album_name: Some(name),
-            directory: self.directory.clone(),
+            directory: Arc::clone(&self.directory),
             folder_structure,
-            filename_exclude: self.filename_exclude.clone(),
-            temp_suffix: self.temp_suffix.clone(),
+            filename_exclude: Arc::clone(&self.filename_exclude),
+            temp_suffix: Arc::clone(&self.temp_suffix),
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
             exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
@@ -493,10 +503,10 @@ impl DownloadConfig {
     /// share a single config but the exclude set is lifted off the plan.
     fn with_exclude_ids(&self, exclude_ids: Arc<FxHashSet<String>>) -> Self {
         Self {
-            directory: self.directory.clone(),
+            directory: Arc::clone(&self.directory),
             folder_structure: self.folder_structure.clone(),
-            filename_exclude: self.filename_exclude.clone(),
-            temp_suffix: self.temp_suffix.clone(),
+            filename_exclude: Arc::clone(&self.filename_exclude),
+            temp_suffix: Arc::clone(&self.temp_suffix),
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
             album_name: self.album_name.clone(),
@@ -560,7 +570,7 @@ impl DownloadConfig {
     pub(super) fn test_default() -> Self {
         use rustc_hash::FxHashSet;
         Self {
-            directory: std::path::PathBuf::from("/nonexistent/download_filter_tests"),
+            directory: Arc::from(Path::new("/nonexistent/download_filter_tests")),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
@@ -592,8 +602,8 @@ impl DownloadConfig {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Vec::new(),
-            temp_suffix: ".kei-tmp".to_string(),
+            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
+            temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
             retry_only: false,
             max_download_attempts: 10,
@@ -606,40 +616,56 @@ impl DownloadConfig {
     }
 }
 
+/// Look up an owned `String` id in a shared `Arc<str>` interner,
+/// inserting a fresh `Arc` if absent. Returns the shared handle.
+///
+/// `Arc::from(String)` transfers the string's buffer into the `Arc<str>`
+/// without copying the bytes, so the miss path allocates no more than
+/// the baseline cost of a fresh handle.
+fn intern_id(interner: &mut FxHashSet<Arc<str>>, s: String) -> Arc<str> {
+    if let Some(existing) = interner.get(s.as_str()) {
+        return Arc::clone(existing);
+    }
+    let a: Arc<str> = Arc::from(s);
+    interner.insert(Arc::clone(&a));
+    a
+}
+
 /// Pre-loaded download state for O(1) skip decisions.
 ///
 /// Loaded once at sync start from the state database, this enables fast
 /// in-memory lookups instead of per-asset DB queries. For 100K+ asset
 /// libraries, this significantly reduces DB roundtrips.
 ///
-/// Uses a two-level map structure (`asset_id` -> `version_sizes`) to enable
-/// zero-allocation lookups via `&str` keys, avoiding the need to allocate
-/// `(String, String)` tuples for each lookup.
+/// Asset-id keys are `Arc<str>` rather than `Box<str>` so the same id
+/// allocation is shared across every map here (and with the producer's
+/// seen-ids / touched-ids sets). On a 100k-asset library this collapses
+/// ~4-6 independent `Box<str>` allocations per asset into one.
 #[derive(Debug, Default)]
 struct DownloadContext {
     /// Nested map: `asset_id` -> set of `version_sizes` that are already downloaded.
     /// Two-level structure enables O(1) borrowed lookups without allocation.
-    downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
+    downloaded_ids: FxHashMap<Arc<str>, FxHashSet<Box<str>>>,
     /// Nested map: `asset_id` -> (`version_size` -> checksum) for downloaded assets.
     /// Used to detect checksum changes (iCloud asset updated) without DB queries.
-    downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
+    downloaded_checksums: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>,
     /// Nested map: `asset_id` -> (`version_size` -> metadata_hash) for downloaded assets.
     /// Used to detect metadata-only changes (favorite toggle, keywords, GPS edit,
     /// etc.) when file bytes are unchanged but the provider has newer metadata.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
+    downloaded_metadata_hashes: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>,
     /// Nested map: `asset_id` -> set of `version_sizes` with a non-null
     /// `metadata_write_failed_at` from a prior sync. These always route to
     /// the metadata-rewrite path regardless of whether the hash changed.
     /// Two-level shape matches `downloaded_ids` for zero-allocation lookups.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    metadata_retry_markers: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
+    metadata_retry_markers: FxHashMap<Arc<str>, FxHashSet<Box<str>>>,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced.
-    known_ids: FxHashSet<Box<str>>,
+    known_ids: FxHashSet<Arc<str>>,
     /// Per-asset maximum download attempt count (from failed assets).
     /// Used to skip assets that have exceeded `max_download_attempts`.
-    attempt_counts: FxHashMap<Box<str>, u32>,
+    attempt_counts: FxHashMap<Arc<str>, u32>,
 }
 
 impl DownloadContext {
@@ -693,52 +719,66 @@ impl DownloadContext {
             known_ids_fut,
         );
 
-        let mut downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>> = FxHashMap::default();
+        // Shared interner so the same asset_id allocates exactly one
+        // `Arc<str>` across every map below (and is cheaply cloneable
+        // into each via Arc::clone). This collapses the former 4-6
+        // independent `String -> Box<str>` conversions per id into one.
+        //
+        // FxHashSet<Arc<str>> over FxHashMap<String, Arc<str>> so the
+        // interner doesn't keep a duplicate `String` alive for every
+        // id; `Arc::from(String)` transfers the String's buffer into
+        // the Arc without an extra copy.
+        let mut interner: FxHashSet<Arc<str>> = FxHashSet::default();
+
+        let mut downloaded_ids: FxHashMap<Arc<str>, FxHashSet<Box<str>>> = FxHashMap::default();
         for (asset_id, version_size) in ids {
+            let id = intern_id(&mut interner, asset_id);
             downloaded_ids
-                .entry(asset_id.into_boxed_str())
+                .entry(id)
                 .or_default()
                 .insert(version_size.into_boxed_str());
         }
 
-        let mut downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
+        let mut downloaded_checksums: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
         for ((asset_id, version_size), checksum) in checksums {
+            let id = intern_id(&mut interner, asset_id);
             downloaded_checksums
-                .entry(asset_id.into_boxed_str())
+                .entry(id)
                 .or_default()
                 .insert(version_size.into_boxed_str(), checksum.into_boxed_str());
         }
 
-        let mut downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
+        let mut downloaded_metadata_hashes: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
         for ((asset_id, version_size), metadata_hash) in hashes {
-            downloaded_metadata_hashes
-                .entry(asset_id.into_boxed_str())
-                .or_default()
-                .insert(
-                    version_size.into_boxed_str(),
-                    metadata_hash.into_boxed_str(),
-                );
+            let id = intern_id(&mut interner, asset_id);
+            downloaded_metadata_hashes.entry(id).or_default().insert(
+                version_size.into_boxed_str(),
+                metadata_hash.into_boxed_str(),
+            );
         }
 
         // Two-level shape matches downloaded_ids so lookups are O(1) with
         // borrowed keys instead of allocating a tuple per probe.
-        let mut metadata_retry_markers: FxHashMap<Box<str>, FxHashSet<Box<str>>> =
+        let mut metadata_retry_markers: FxHashMap<Arc<str>, FxHashSet<Box<str>>> =
             FxHashMap::default();
         for (id, vs) in markers {
+            let id = intern_id(&mut interner, id);
             metadata_retry_markers
-                .entry(id.into_boxed_str())
+                .entry(id)
                 .or_default()
                 .insert(vs.into_boxed_str());
         }
 
-        let known_ids: FxHashSet<Box<str>> =
-            known_ids.into_iter().map(String::into_boxed_str).collect();
-
-        let attempt_counts: FxHashMap<Box<str>, u32> = attempts
+        let known_ids: FxHashSet<Arc<str>> = known_ids
             .into_iter()
-            .map(|(id, count)| (id.into_boxed_str(), count))
+            .map(|id| intern_id(&mut interner, id))
+            .collect();
+
+        let attempt_counts: FxHashMap<Arc<str>, u32> = attempts
+            .into_iter()
+            .map(|(id, count)| (intern_id(&mut interner, id), count))
             .collect();
 
         Self {
@@ -882,9 +922,11 @@ async fn build_download_tasks(
     let mut dir_cache = paths::DirCache::new();
     for pass_result in pass_results {
         let (pass_index, assets) = pass_result?;
-        // pass_index comes from enumerate() over `passes`; pass_configs is
-        // built 1:1 from the same slice.
-        #[allow(clippy::indexing_slicing)]
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "pass_index comes from enumerate() over `passes`; pass_configs is \
+                      built 1:1 from the same slice"
+        )]
         let pass_config = &pass_configs[pass_index];
 
         for asset in &assets {
@@ -937,8 +979,8 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
         return;
     }
 
-    let suffix = config.temp_suffix.clone();
-    let dir = dir.clone();
+    let suffix = Arc::clone(&config.temp_suffix);
+    let dir: std::path::PathBuf = dir.to_path_buf();
     let cutoff_secs = cutoff.timestamp();
 
     let cleaned = tokio::task::spawn_blocking(move || {
@@ -953,7 +995,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(&suffix) {
+                    if name.ends_with(suffix.as_ref()) {
                         if let Ok(meta) = path.metadata() {
                             if let Ok(mtime) = meta.modified() {
                                 let mtime_secs = mtime
@@ -1478,9 +1520,11 @@ async fn download_photos_incremental(
     let pass_configs = build_pass_configs(passes, config);
 
     for (asset, pass_index) in &downloadable_assets {
-        // pass_index was assigned by the producer from the same `passes` slice
-        // that pass_configs was built from; indices are valid.
-        #[allow(clippy::indexing_slicing)]
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "pass_index was assigned by the producer from the same `passes` slice \
+                      that pass_configs was built from; indices are valid"
+        )]
         let effective_config = &pass_configs[*pass_index];
 
         if let Some(reason) = filter::is_asset_filtered(asset, effective_config) {
@@ -1538,7 +1582,7 @@ async fn download_photos_incremental(
                     task.size,
                     media_type,
                 )
-                .with_metadata(asset.metadata().clone());
+                .with_metadata_arc(asset.metadata_arc());
                 if let Err(e) = db.upsert_seen(&record).await {
                     tracing::warn!(
                         asset_id = %task.asset_id,
@@ -1628,7 +1672,7 @@ async fn download_photos_incremental(
         metadata: MetadataFlags::from(config.as_ref()),
         concurrency: config.concurrent_downloads,
         no_progress_bar: config.no_progress_bar,
-        temp_suffix: config.temp_suffix.clone(),
+        temp_suffix: Arc::clone(&config.temp_suffix),
         shutdown_token,
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1696,7 +1740,6 @@ mod tests {
     use super::*;
     use crate::icloud::photos::asset::ChangeEvent;
     use crate::test_helpers::TestPhotoAsset;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn test_config() -> DownloadConfig {
@@ -1715,9 +1758,9 @@ mod tests {
     #[test]
     fn test_hash_download_config_changes_on_directory() {
         let mut config1 = test_config();
-        config1.directory = PathBuf::from("/photos/a");
+        config1.directory = std::sync::Arc::from(std::path::Path::new("/photos/a"));
         let mut config2 = test_config();
-        config2.directory = PathBuf::from("/photos/b");
+        config2.directory = std::sync::Arc::from(std::path::Path::new("/photos/b"));
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -2134,14 +2177,14 @@ mod tests {
             password: Some(SecretString::from("x")),
             password_file: None,
             password_command: None,
-            directory: dl_config.directory.clone(),
+            directory: dl_config.directory.to_path_buf(),
             cookie_directory: std::path::PathBuf::from("/tmp"),
             folder_structure: dl_config.folder_structure.clone(),
             albums: crate::config::AlbumSelection::LibraryOnly,
             exclude_albums: vec![],
             filename_exclude: vec![],
             library: crate::config::LibrarySelection::Single("PrimarySync".into()),
-            temp_suffix: dl_config.temp_suffix.clone(),
+            temp_suffix: dl_config.temp_suffix.to_string(),
             skip_created_before: None,
             skip_created_after: None,
             pid_file: None,
@@ -2652,7 +2695,7 @@ mod tests {
     fn test_hash_changes_on_filename_exclude() {
         let config1 = test_config();
         let mut config2 = test_config();
-        config2.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config2.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -2691,8 +2734,8 @@ mod tests {
         {
             config.set_exif_datetime = true;
         }
-        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
-        config.temp_suffix = ".custom-tmp".to_string();
+        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
+        config.temp_suffix = std::sync::Arc::from(".custom-tmp");
         let derived = config.with_album_name(Arc::from("Test"));
         assert!(derived.skip_videos);
         assert!(derived.skip_photos);
@@ -2703,7 +2746,7 @@ mod tests {
         #[cfg(feature = "xmp")]
         assert!(derived.set_exif_datetime);
         assert_eq!(derived.filename_exclude.len(), 1);
-        assert_eq!(derived.temp_suffix, ".custom-tmp");
+        assert_eq!(&*derived.temp_suffix, ".custom-tmp");
         assert_eq!(derived.directory, config.directory);
     }
 
@@ -2776,7 +2819,7 @@ mod tests {
     #[test]
     fn golden_hash_download_config_non_defaults() {
         let mut config = test_config();
-        config.directory = PathBuf::from("/my/photos");
+        config.directory = std::sync::Arc::from(std::path::Path::new("/my/photos"));
         config.folder_structure = "{:%Y/%m}".to_string();
         config.size = AssetVersionSize::Medium;
         config.live_photo_size = AssetVersionSize::LiveMedium;
@@ -2799,10 +2842,10 @@ mod tests {
         config.skip_videos = true;
         config.skip_photos = false;
         config.live_photo_mode = LivePhotoMode::ImageOnly;
-        config.filename_exclude = vec![
+        config.filename_exclude = std::sync::Arc::from(vec![
             glob::Pattern::new("*.AAE").unwrap(),
             glob::Pattern::new("*.THM").unwrap(),
-        ];
+        ]);
         let hash = hash_download_config(&config);
         assert_eq!(
             hash, "e17212f54c74936b",

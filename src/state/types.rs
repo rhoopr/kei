@@ -1,6 +1,7 @@
 //! Types for the state tracking module.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -149,7 +150,9 @@ impl MediaType {
 #[derive(Debug, Clone, Default)]
 pub struct AssetMetadata {
     /// Provider that created this record ("icloud", "takeout", etc.).
-    pub source: Option<String>,
+    /// Uses `Arc<str>` so repeated source names share a single allocation
+    /// via the global string interner.
+    pub source: Option<Arc<str>>,
     /// Provider-native favorite/heart flag.
     pub is_favorite: bool,
     /// 1-5 star rating (providers with boolean favorites set 5).
@@ -208,34 +211,40 @@ impl AssetMetadata {
         let mut hasher = Sha256::new();
         let h = &mut hasher;
         hash_bool(h, "fav", self.is_favorite);
-        hash_opt(h, "rat", self.rating.map(|v| v.to_string()));
-        hash_opt(h, "lat", self.latitude.map(format_f64));
-        hash_opt(h, "lng", self.longitude.map(format_f64));
-        hash_opt(h, "alt", self.altitude.map(format_f64));
-        hash_opt(h, "ori", self.orientation.map(|v| v.to_string()));
-        hash_opt(h, "dur", self.duration_secs.map(format_f64));
-        hash_opt(h, "tzo", self.timezone_offset.map(|v| v.to_string()));
-        hash_opt(h, "w", self.width.map(|v| v.to_string()));
-        hash_opt(h, "hh", self.height.map(|v| v.to_string()));
-        hash_opt(h, "tit", self.title.clone());
-        hash_opt(h, "kw", self.keywords.clone());
-        hash_opt(h, "desc", self.description.clone());
-        hash_opt(h, "sub", self.media_subtype.clone());
-        hash_opt(h, "bur", self.burst_id.clone());
+        // Bind formatted values so their `&str` lives long enough to pass
+        // through `hash_opt`. The String-typed fields below go in directly
+        // as `&str` — no clone.
+        let rat = self.rating.map(|v| v.to_string());
+        let lat = self.latitude.map(format_f64);
+        let lng = self.longitude.map(format_f64);
+        let alt = self.altitude.map(format_f64);
+        let ori = self.orientation.map(|v| v.to_string());
+        let dur = self.duration_secs.map(format_f64);
+        let tzo = self.timezone_offset.map(|v| v.to_string());
+        let w = self.width.map(|v| v.to_string());
+        let hh = self.height.map(|v| v.to_string());
+        let m_mod = self.modified_at.map(|dt| dt.timestamp().to_string());
+        let delat = self.deleted_at.map(|dt| dt.timestamp().to_string());
+        hash_opt(h, "rat", rat.as_deref());
+        hash_opt(h, "lat", lat.as_deref());
+        hash_opt(h, "lng", lng.as_deref());
+        hash_opt(h, "alt", alt.as_deref());
+        hash_opt(h, "ori", ori.as_deref());
+        hash_opt(h, "dur", dur.as_deref());
+        hash_opt(h, "tzo", tzo.as_deref());
+        hash_opt(h, "w", w.as_deref());
+        hash_opt(h, "hh", hh.as_deref());
+        hash_opt(h, "tit", self.title.as_deref());
+        hash_opt(h, "kw", self.keywords.as_deref());
+        hash_opt(h, "desc", self.description.as_deref());
+        hash_opt(h, "sub", self.media_subtype.as_deref());
+        hash_opt(h, "bur", self.burst_id.as_deref());
         hash_bool(h, "hid", self.is_hidden);
         hash_bool(h, "arc", self.is_archived);
-        hash_opt(
-            h,
-            "mod",
-            self.modified_at.map(|dt| dt.timestamp().to_string()),
-        );
+        hash_opt(h, "mod", m_mod.as_deref());
         hash_bool(h, "del", self.is_deleted);
-        hash_opt(
-            h,
-            "delat",
-            self.deleted_at.map(|dt| dt.timestamp().to_string()),
-        );
-        hash_opt(h, "pd", self.provider_data.clone());
+        hash_opt(h, "delat", delat.as_deref());
+        hash_opt(h, "pd", self.provider_data.as_deref());
         let digest = hasher.finalize();
         data_encoding::HEXLOWER.encode(&digest)
     }
@@ -246,7 +255,7 @@ impl AssetMetadata {
     }
 }
 
-fn hash_opt(hasher: &mut sha2::Sha256, tag: &str, value: Option<String>) {
+fn hash_opt(hasher: &mut sha2::Sha256, tag: &str, value: Option<&str>) {
     use sha2::Digest;
     hasher.update(tag.as_bytes());
     hasher.update(b"|");
@@ -288,11 +297,11 @@ fn format_f64(v: f64) -> String {
 pub struct AssetRecord {
     // 8-byte aligned heap types
     /// iCloud asset ID (recordName).
-    pub id: String,
+    pub id: Box<str>,
     /// SHA256 checksum of the file.
-    pub checksum: String,
+    pub checksum: Box<str>,
     /// Original filename from iCloud.
-    pub filename: String,
+    pub filename: Box<str>,
     /// Local file path (if downloaded).
     pub local_path: Option<PathBuf>,
     /// Last error message (if failed).
@@ -328,7 +337,11 @@ pub struct AssetRecord {
     pub status: AssetStatus,
 
     /// Provider-agnostic metadata captured from the source (v5+).
-    pub metadata: AssetMetadata,
+    ///
+    /// Behind `Arc` so `PhotoAsset` → `AssetRecord` (the producer hot
+    /// loop) shares the same allocation instead of deep-cloning every
+    /// `Option<String>` field per asset.
+    pub metadata: Arc<AssetMetadata>,
 }
 
 impl AssetRecord {
@@ -344,9 +357,9 @@ impl AssetRecord {
         media_type: MediaType,
     ) -> Self {
         Self {
-            id,
-            checksum,
-            filename,
+            id: id.into_boxed_str(),
+            checksum: checksum.into_boxed_str(),
+            filename: filename.into_boxed_str(),
             local_path: None,
             last_error: None,
             local_checksum: None,
@@ -359,17 +372,38 @@ impl AssetRecord {
             version_size,
             media_type,
             status: AssetStatus::Pending,
-            metadata: AssetMetadata::default(),
+            metadata: Arc::new(AssetMetadata::default()),
         }
     }
 
     /// Attach metadata, populating `metadata_hash` if unset.
+    ///
+    /// Wraps the passed `AssetMetadata` in a fresh `Arc`. Prod code
+    /// uses [`Self::with_metadata_arc`] directly to reuse the
+    /// allocation that `PhotoAsset` already owns; this convenience
+    /// is only referenced from tests. Hash refresh happens inside
+    /// `with_metadata_arc` when the hash is absent.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_metadata(mut self, mut metadata: AssetMetadata) -> Self {
-        if metadata.metadata_hash.is_none() {
-            metadata.refresh_hash();
-        }
-        self.metadata = metadata;
+    pub fn with_metadata(self, metadata: AssetMetadata) -> Self {
+        self.with_metadata_arc(Arc::new(metadata))
+    }
+
+    /// Attach shared metadata, populating `metadata_hash` if unset.
+    ///
+    /// If the passed `Arc` has its hash already populated (the normal
+    /// case — `metadata::extract()` refreshes before returning), this
+    /// is a refcount bump. Missing hash triggers a single deep clone
+    /// via `Arc::unwrap_or_clone` + `refresh_hash`.
+    #[must_use]
+    pub fn with_metadata_arc(mut self, metadata: Arc<AssetMetadata>) -> Self {
+        self.metadata = if metadata.metadata_hash.is_some() {
+            metadata
+        } else {
+            let mut m = Arc::unwrap_or_clone(metadata);
+            m.refresh_hash();
+            Arc::new(m)
+        };
         self
     }
 }

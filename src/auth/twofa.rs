@@ -153,6 +153,7 @@ fn is_transient_auth_status(status: u16) -> bool {
 /// HTTP verb for the auth-layer retry helper; picks between `session.put`
 /// and `session.post` without forcing callers to write two near-identical
 /// retry loops.
+#[derive(Debug)]
 enum AuthMethod<'a> {
     Put,
     Post { body: &'a str },

@@ -8,26 +8,31 @@
 //! fields would be genuinely end-to-end encrypted, but `i_cdp_enabled` checks
 //! cause kei to bail on ADP accounts before these decoders are reached.
 
+use std::borrow::Cow;
 use std::io::Cursor;
 
 use base64::Engine;
 use plist::Value as PlistValue;
 use serde_json::Value;
 
-/// Read the `value` string from a `fieldEnc` JSON entry and base64-decode it.
+/// Read the `value` string from a `fieldEnc` JSON entry.
 ///
-/// Accepts both Apple variants: `type: "STRING"` (plain UTF-8 text in `value`)
-/// and `type: "ENCRYPTED_BYTES"` (base64-encoded bytes). For plist fields that
-/// the web API always serves as bytes, we fall through to base64 decode.
-fn decoded_bytes(entry: &Value) -> Option<Vec<u8>> {
+/// Accepts both Apple variants: `type: "STRING"` (plain UTF-8 text in
+/// `value`, returned borrowed) and `type: "ENCRYPTED_BYTES"` (base64-
+/// encoded bytes, returned owned after decode). Plist fields whose
+/// `value` is always base64 fall through to the ENCRYPTED_BYTES arm.
+fn decoded_bytes(entry: &Value) -> Option<Cow<'_, [u8]>> {
     let value = entry.get("value")?.as_str()?;
     let enc_type = entry
         .get("type")
         .and_then(|t| t.as_str())
         .unwrap_or("ENCRYPTED_BYTES");
     match enc_type {
-        "STRING" => Some(value.as_bytes().to_vec()),
-        "ENCRYPTED_BYTES" => base64::engine::general_purpose::STANDARD.decode(value).ok(),
+        "STRING" => Some(Cow::Borrowed(value.as_bytes())),
+        "ENCRYPTED_BYTES" => base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .ok()
+            .map(Cow::Owned),
         other => {
             tracing::warn!(enc_type = %other, "Unsupported Enc field type");
             None
@@ -36,13 +41,32 @@ fn decoded_bytes(entry: &Value) -> Option<Vec<u8>> {
 }
 
 /// Decode a UTF-8 `*Enc` string field (e.g. `captionEnc`, `extendedDescEnc`).
+///
+/// On the common `type: "STRING"` branch this avoids the
+/// `Vec<u8>` round-trip that `decoded_bytes()` performs.
 pub fn decode_string(fields: &Value, key: &str) -> Option<String> {
     let entry = fields.get(key)?;
     if entry.is_null() {
         return None;
     }
-    let bytes = decoded_bytes(entry)?;
-    String::from_utf8(bytes).ok()
+    let value = entry.get("value")?.as_str()?;
+    match entry
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("ENCRYPTED_BYTES")
+    {
+        "STRING" => Some(value.to_owned()),
+        "ENCRYPTED_BYTES" => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .ok()?;
+            String::from_utf8(bytes).ok()
+        }
+        other => {
+            tracing::warn!(enc_type = %other, "Unsupported Enc field type");
+            None
+        }
+    }
 }
 
 /// Decode `keywordsEnc`: base64 -> binary plist containing an array of strings.

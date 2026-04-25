@@ -27,13 +27,13 @@ const KEYRING_SERVICE: &str = "kei";
 /// Credential store that tries the OS keyring first, falling back to an
 /// AES-256-GCM encrypted file in the config directory.
 #[derive(Debug)]
-pub struct CredentialStore {
+pub(crate) struct CredentialStore {
     username: String,
     config_dir: PathBuf,
 }
 
 impl CredentialStore {
-    pub fn new(username: &str, config_dir: &Path) -> Self {
+    pub(crate) fn new(username: &str, config_dir: &Path) -> Self {
         Self {
             username: username.to_string(),
             config_dir: config_dir.to_path_buf(),
@@ -41,7 +41,7 @@ impl CredentialStore {
     }
 
     /// Store a password. Tries keyring first, falls back to encrypted file.
-    pub fn store(&self, password: &str) -> Result<()> {
+    pub(crate) fn store(&self, password: &str) -> Result<()> {
         match self.keyring_store(password) {
             Ok(()) => {
                 tracing::debug!(backend = "keyring", "Credential stored");
@@ -60,7 +60,7 @@ impl CredentialStore {
     }
 
     /// Retrieve a stored password. Tries keyring first, falls back to encrypted file.
-    pub fn retrieve(&self) -> Result<Option<SecretString>> {
+    pub(crate) fn retrieve(&self) -> Result<Option<SecretString>> {
         match self.keyring_retrieve() {
             Ok(Some(pw)) => {
                 tracing::debug!(backend = "keyring", "Credential retrieved");
@@ -82,7 +82,7 @@ impl CredentialStore {
     }
 
     /// Delete stored credentials from all backends.
-    pub fn delete(&self) -> Result<()> {
+    pub(crate) fn delete(&self) -> Result<()> {
         let mut deleted = false;
         if let Err(e) = self.keyring_delete() {
             tracing::debug!(error = %e, "Keyring delete failed or not found");
@@ -102,7 +102,7 @@ impl CredentialStore {
     }
 
     /// Check whether a credential exists in any backend (keyring or file).
-    pub fn has_credential(&self) -> bool {
+    pub(crate) fn has_credential(&self) -> bool {
         if self.keyring_retrieve().ok().flatten().is_some() {
             return true;
         }
@@ -110,7 +110,7 @@ impl CredentialStore {
     }
 
     /// Return the name of the currently active backend.
-    pub fn backend_name(&self) -> &'static str {
+    pub(crate) fn backend_name(&self) -> &'static str {
         if self
             .keyring_entry()
             .and_then(|e| e.get_password().map_err(Into::into))

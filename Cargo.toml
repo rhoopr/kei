@@ -29,7 +29,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 # HTTP
-reqwest = { version = "0.13", features = ["cookies", "json", "stream", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "json", "stream", "http2"] }
 bytes = "1"
 futures-util = "0.3"
 tokio-stream = "0.1"
@@ -56,7 +56,7 @@ secrecy = "0.10"
 aes-gcm = "0.10"
 
 # Dates
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 
 # Logging
 tracing = "0.1"

@@ -484,7 +484,7 @@ impl Session {
     /// pools. The existing cookie jar and session data are preserved so no
     /// re-authentication is needed. Used for 421 recovery where the issue is
     /// stale HTTP/2 connection routing, not invalid auth state.
-    pub fn reset_http_clients(&mut self) -> Result<()> {
+    pub(crate) fn reset_http_clients(&mut self) -> Result<()> {
         let (client, download_client) =
             build_clients(&self.cookie_jar, &self.home_endpoint, self.api_timeout)?;
         self.client = client;
@@ -494,7 +494,7 @@ impl Session {
 
     /// Release the exclusive file lock without dropping the Session.
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
-    pub fn release_lock(&self) -> Result<()> {
+    pub(crate) fn release_lock(&self) -> Result<()> {
         FileExt::unlock(&self.lock_file).context("Failed to release session lock file")
     }
 
@@ -502,7 +502,7 @@ impl Session {
     ///
     /// Returns `Err(AuthError::LockContention)` if another process acquired
     /// the lock in the interim (e.g. a concurrent `get-code` or `submit-code`).
-    pub fn reacquire_lock(&self) -> Result<()> {
+    pub(crate) fn reacquire_lock(&self) -> Result<()> {
         let acquired = self
             .lock_file
             .try_lock_exclusive()
@@ -694,21 +694,27 @@ impl Session {
         &self.home_endpoint
     }
 
-    /// Return a clone of the underlying HTTP client (with cookie jar attached).
+    /// Return a reference to the underlying HTTP client (with cookie jar
+    /// attached).
     ///
-    /// `reqwest::Client` is cheaply cloneable (backed by `Arc`), so this does
-    /// not duplicate connections or state.
-    pub fn http_client(&self) -> Client {
-        self.client.clone()
+    /// `reqwest::Client` is `Arc`-backed, so callers that need a handle
+    /// to move into a spawned task should `.clone()` — making the refcount
+    /// bump visible at the call site instead of hiding it behind the accessor.
+    pub(crate) fn http_client(&self) -> &Client {
+        &self.client
     }
 
-    /// Return a clone of the download-specific HTTP client.
+    /// Return a reference to the download-specific HTTP client.
     ///
     /// Unlike `http_client()`, this client has no total request timeout so
     /// large file transfers aren't killed mid-stream. It uses a 30s connect
     /// timeout and 120s read timeout for stall detection.
-    pub fn download_client(&self) -> Client {
-        self.download_client.clone()
+    ///
+    /// `reqwest::Client` is `Arc`-backed, so callers that need to move a
+    /// handle into a spawned task should `.clone()` — making the refcount
+    /// bump visible at the call site instead of hiding it behind the accessor.
+    pub(crate) fn download_client(&self) -> &Client {
+        &self.download_client
     }
 }
 

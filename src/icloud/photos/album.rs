@@ -180,14 +180,34 @@ impl PhotoAlbum {
 
     /// Convenience wrapper over `photo_stream()` that collects all assets
     /// into a `Vec`. Prefer `photo_stream()` when memory is a concern.
+    ///
+    /// Fetcher panics are surfaced as an `Err` so the caller cannot mistake
+    /// a truncated enumeration for a complete one. Propagating the real
+    /// panic payload back through `anyhow` isn't worth the ceremony — a
+    /// sentinel string is enough for the operator to know the enumeration
+    /// was incomplete and to correlate with the fetcher's prior
+    /// `tracing::error!` log line.
     pub async fn photos(&self, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
         use tokio_stream::StreamExt;
-        self.photo_stream(limit, None, 1)
-            .collect::<Result<Vec<_>, _>>()
-            .await
+        let (stream, panic_rx) = self.photo_stream(limit, None, 1);
+        let items = stream.collect::<Result<Vec<_>, _>>().await?;
+        if panic_rx.await.unwrap_or(false) {
+            anyhow::bail!(
+                "photo enumeration aborted: a fetcher task panicked; \
+                 results are incomplete, see earlier error log"
+            );
+        }
+        Ok(items)
     }
 
     /// Stream photos page-by-page without buffering the full album in memory.
+    ///
+    /// Returns the stream paired with a `oneshot::Receiver<bool>` that
+    /// yields `true` once every fetcher task has completed **iff any
+    /// fetcher panicked**. The caller should await the receiver
+    /// **after** the stream is exhausted and fail the enumeration if
+    /// the flag is set — otherwise a panicked fetcher presents as a
+    /// silently truncated stream (a "No silent failures" violation).
     ///
     /// When `total_count` is provided and `concurrency > 1`, the offset range
     /// is partitioned across multiple parallel fetcher tasks for faster
@@ -203,10 +223,14 @@ impl PhotoAlbum {
         limit: Option<u32>,
         total_count: Option<u64>,
         concurrency: usize,
-    ) -> PhotoStream {
+    ) -> (PhotoStream, tokio::sync::oneshot::Receiver<bool>) {
+        let (panic_tx, panic_rx) = tokio::sync::oneshot::channel();
         let (stream, handles) = self.photo_stream_inner(limit, total_count, concurrency, None);
-        tokio::spawn(await_fetcher_handles(handles));
-        stream
+        tokio::spawn(async move {
+            let panicked = await_fetcher_handles(handles).await;
+            let _ = panic_tx.send(panicked);
+        });
+        (stream, panic_rx)
     }
 
     /// Like [`photo_stream()`](Self::photo_stream), but also returns a
@@ -939,7 +963,7 @@ mod tests {
         // When total_count is None, should produce a stream (1 sequential fetcher).
         // We can't easily test the internal spawning, but we verify it doesn't panic.
         let album = make_album(100, None, default_zone());
-        let _stream = album.photo_stream(None, None, 10);
+        let (_stream, _panic_rx) = album.photo_stream(None, None, 10);
         // Stream is valid — the fetcher will fail since StubSession panics on call,
         // but that's fine; we're testing the setup path, not the fetch.
     }
@@ -948,7 +972,38 @@ mod tests {
     async fn test_photo_stream_small_recent_uses_single_fetcher() {
         // --recent 50 with page_size 100 → 1 page → 1 fetcher even with concurrency 10
         let album = make_album(100, None, default_zone());
-        let _stream = album.photo_stream(Some(50), Some(1000), 10);
+        let (_stream, _panic_rx) = album.photo_stream(Some(50), Some(1000), 10);
+    }
+
+    // StubSession::post does `unimplemented!("stub")` which panics when the
+    // fetcher hits the first page. Consuming the stream therefore causes the
+    // fetcher JoinHandle to finish with a panic; the monitor task should
+    // forward that through the oneshot as `true`.
+    #[tokio::test]
+    async fn photo_stream_surfaces_fetcher_panic_via_oneshot() {
+        use tokio_stream::StreamExt;
+        let album = make_album(100, None, default_zone());
+        let (stream, panic_rx) = album.photo_stream(None, None, 1);
+        tokio::pin!(stream);
+        // Drain whatever the stream yields before the fetcher dies.
+        while stream.next().await.is_some() {}
+        assert!(
+            panic_rx.await.unwrap_or(false),
+            "panic_rx must signal `true` when a fetcher panicked"
+        );
+    }
+
+    // The convenience `photos()` wrapper must not hand back a
+    // silently-truncated Vec when a fetcher panics.
+    #[tokio::test]
+    async fn photos_returns_err_when_fetcher_panics() {
+        let album = make_album(100, None, default_zone());
+        let result = album.photos(None).await;
+        assert!(
+            result.is_err(),
+            "photos() must surface fetcher panic as Err, got Ok({:?})",
+            result.ok().map(|v| v.len())
+        );
     }
 
     // --- photo_stream_with_token tests ---

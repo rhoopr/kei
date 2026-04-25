@@ -44,6 +44,7 @@ mod retry;
 mod setup;
 mod shutdown;
 mod state;
+mod string_interner;
 mod sync_loop;
 mod systemd;
 mod types;
@@ -192,14 +193,19 @@ pub(crate) fn available_disk_space(_path: &Path) -> Option<u64> {
 /// The source is evaluated lazily on each call — for `Command` and `File`
 /// sources, this re-executes/re-reads each time, supporting password rotation
 /// and keeping no password in memory between auth cycles.
-fn make_password_provider(source: password::PasswordSource) -> impl Fn() -> Option<SecretString> {
-    move || match source.resolve() {
+///
+/// The closure is wrapped in `Arc<dyn Fn + Send + Sync>` so the async auth
+/// path can dispatch invocations through `spawn_blocking` (see
+/// [`password::invoke_password_provider`]) instead of calling the
+/// blocking `resolve()` directly on a tokio worker.
+fn make_password_provider(source: password::PasswordSource) -> password::PasswordProvider {
+    std::sync::Arc::new(move || match source.resolve() {
         Ok(pw) => pw,
         Err(e) => {
             tracing::error!(error = %e, "Password source resolution failed");
             None
         }
-    }
+    })
 }
 
 /// Build a password provider from CLI password args, TOML config, and resolved auth fields.
@@ -211,7 +217,7 @@ fn make_provider_from_auth(
     username: &str,
     cookie_directory: &Path,
     toml: Option<&config::TomlConfig>,
-) -> impl Fn() -> Option<SecretString> {
+) -> password::PasswordProvider {
     let toml_auth = toml.and_then(|t| t.auth.as_ref());
     let password_command = config::resolve_password_command(pw, toml_auth);
     let password_file = config::resolve_password_file(pw, toml_auth);

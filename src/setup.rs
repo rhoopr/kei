@@ -15,6 +15,7 @@ use crate::types::{
 };
 
 /// Result of the setup wizard — either the user wants to sync now or just exit.
+#[derive(Debug)]
 pub(crate) enum SetupResult {
     /// User chose to sync now. Contains the config path and env file path.
     SyncNow {

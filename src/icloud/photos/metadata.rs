@@ -49,7 +49,7 @@ const PROVIDER_DATA_FIELDS: &[&str] = &[
 /// asset record; the master record is consulted as fallback.
 pub fn extract(master_fields: &Value, asset_fields: &Value) -> AssetMetadata {
     let mut meta = AssetMetadata {
-        source: Some(SOURCE.into()),
+        source: Some(crate::string_interner::intern(SOURCE)),
         ..AssetMetadata::default()
     };
 

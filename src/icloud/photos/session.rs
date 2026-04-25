@@ -45,17 +45,7 @@ impl PhotosSession for reqwest::Client {
         if status.is_client_error() || status.is_server_error() {
             let url = resp.url().to_string();
             let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
-            let resp_body = match resp.text().await {
-                Ok(body) => body,
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        url = %url,
-                        "CloudKit error-response body read failed; proceeding with empty body"
-                    );
-                    String::new()
-                }
-            };
+            let resp_body = read_bounded_error_body(resp, &url).await;
             if !resp_body.is_empty() {
                 // 421 bodies are the most diagnostic signal for distinguishing
                 // ADP-class from session-class misdirected requests (e.g. the
@@ -111,7 +101,7 @@ impl PhotosSession for crate::auth::SharedSession {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
-        let client = self.read().await.http_client();
+        let client = self.read().await.http_client().clone();
         PhotosSession::post(&client, url, body, headers).await
     }
 
@@ -146,6 +136,48 @@ pub(crate) struct HttpStatusError {
 /// and stack traces are occasionally much larger. Cap it so a degenerate
 /// response can't bloat the error path.
 const MAX_PRESERVED_BODY: usize = 1024;
+
+/// Read a CloudKit error-response body, capping at `MAX_PRESERVED_BODY`
+/// bytes plus a small UTF-8 grace margin. The full body can be megabytes
+/// (rate-limit HTML pages, stack traces) but the caller only ever keeps
+/// the first ~1 KiB for diagnostics, so streaming the first chunks is
+/// safer than materialising a 10 MB String we're about to throw away.
+async fn read_bounded_error_body(resp: reqwest::Response, url: &str) -> String {
+    use futures_util::StreamExt;
+    // A few extra bytes past the cap so `truncate_body` has room to land
+    // on a char boundary without re-fetching.
+    const CAP: usize = MAX_PRESERVED_BODY + 16;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let remaining = CAP.saturating_sub(buf.len());
+                if remaining == 0 {
+                    break;
+                }
+                let take = bytes.len().min(remaining);
+                #[allow(
+                    clippy::indexing_slicing,
+                    reason = "`take` is bounded above by `bytes.len()` via min()"
+                )]
+                buf.extend_from_slice(&bytes[..take]);
+                if buf.len() >= CAP {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    url = %url,
+                    "CloudKit error-response body read failed; proceeding with partial body"
+                );
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
 
 /// Shorten `body` to at most `MAX_PRESERVED_BODY` bytes without splitting
 /// a multi-byte UTF-8 character.
@@ -1172,6 +1204,40 @@ mod tests {
         assert!(
             result.is_err(),
             "200 with malformed JSON body must be reported as an error, not a silent empty parse"
+        );
+    }
+
+    /// `read_bounded_error_body` stops reading off the wire once it
+    /// has `MAX_PRESERVED_BODY + 16` bytes, even if the server sent
+    /// orders of magnitude more. A regression to `resp.text().await`
+    /// would buffer the full body and fail this assertion. The
+    /// existing `wiremock_oversized_body_is_truncated` test only
+    /// proves the *output* is clipped (because `truncate_body` runs
+    /// after the read), so it can't distinguish "streamed and stopped"
+    /// from "buffered and trimmed".
+    #[tokio::test]
+    async fn read_bounded_error_body_caps_at_max_plus_grace() {
+        let server = MockServer::start().await;
+        let huge = "x".repeat(64 * 1024);
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(&huge))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{}/records/query", server.uri()))
+            .body("{}")
+            .send()
+            .await
+            .expect("request");
+        assert!(resp.status().is_server_error());
+
+        let body = read_bounded_error_body(resp, "test").await;
+        assert!(
+            body.len() <= MAX_PRESERVED_BODY + 16,
+            "streaming cap breached: body.len() = {}, cap = {}",
+            body.len(),
+            MAX_PRESERVED_BODY + 16
         );
     }
 

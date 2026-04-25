@@ -42,6 +42,21 @@ struct LibraryState {
 /// data dir the next time it's used.
 const SHARED_LIBRARY_NOTICE_KEY: &str = "shared_library_notice_shown_v1";
 
+/// Classify whether an error from `init_photos_service` or
+/// `resolve_libraries` indicates a stale session / routing state that
+/// an SRP re-auth would fix.
+///
+/// Returns `true` for `ICloudError::SessionExpired` (CloudKit 401/403)
+/// and `ICloudError::MisdirectedRequest` (persistent 421 after pool
+/// reset) — the two classes that invalidate the cached session and
+/// trigger the reauth retry branch. Extracted as a free function so
+/// the classification is independently testable without spinning up
+/// a full sync cycle.
+fn is_session_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::icloud::error::ICloudError>()
+        .is_some_and(crate::icloud::error::ICloudError::is_session_error)
+}
+
 /// Given the user's library selection, the count of iCloud shared libraries
 /// on the account, and whether the notice has already fired, return the
 /// warning message to emit, or `None` if no notice is warranted.
@@ -366,10 +381,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // failure bails cleanly instead of looping under Docker's restart policy.
     let mut pending_auth = Some(auth_result);
     let mut retried_after_session_error = false;
-    let is_session_error = |e: &anyhow::Error| {
-        e.downcast_ref::<crate::icloud::error::ICloudError>()
-            .is_some_and(crate::icloud::error::ICloudError::is_session_error)
-    };
     let (shared_session, mut photos_service, libraries) = loop {
         #[allow(
             clippy::expect_used,
@@ -478,7 +489,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             tracing::debug!(count, "Reset failed assets to pending");
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to reset failed assets: {e}");
+                            tracing::warn!(error = %e, "Failed to reset failed assets");
                         }
                     }
                 }
@@ -538,12 +549,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             "Bandwidth limit enabled"
         );
     }
+    // Promote the String / Vec / PathBuf config fields to their Arc
+    // counterparts once, outside the per-library closure. Otherwise the
+    // CF-12 Arc-sharing win is half-defeated: each build_download_config
+    // call would re-allocate directory / filename_exclude / temp_suffix
+    // from scratch instead of refcount-bumping.
+    let cfg_directory: Arc<std::path::Path> = Arc::from(config.directory.as_path());
+    let cfg_filename_exclude: Arc<[glob::Pattern]> = Arc::from(config.filename_exclude.clone());
+    let cfg_temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
+
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
                                  asset_groupings: Arc<download::AssetGroupings>|
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
-            directory: config.directory.clone(),
+            directory: Arc::clone(&cfg_directory),
             folder_structure: config.folder_structure.clone(),
             size: config.size.into(),
             skip_videos: config.skip_videos,
@@ -575,8 +595,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             file_match_policy: config.file_match_policy,
             force_size: config.force_size,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,
-            filename_exclude: config.filename_exclude.clone(),
-            temp_suffix: config.temp_suffix.clone(),
+            filename_exclude: Arc::clone(&cfg_filename_exclude),
+            temp_suffix: Arc::clone(&cfg_temp_suffix),
             state_db: state_db.clone(),
             retry_only: is_retry_failed,
             max_download_attempts,
@@ -771,7 +791,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     failed_assets,
                     failed_assets_truncated,
                 };
-                if let Err(e) = crate::report::write_report(report_path, &report) {
+                if let Err(e) = crate::report::write_report(report_path, &report).await {
                     tracing::warn!(error = %e, path = %report_path.display(), "Failed to write JSON report");
                 }
             }
@@ -970,6 +990,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 }
 
 /// Outcome of a single sync cycle across all libraries.
+#[derive(Debug)]
 struct CycleResult {
     failed_count: usize,
     session_expired: bool,
@@ -984,7 +1005,7 @@ struct CycleResult {
 /// waiting for `kei login submit-code`.
 async fn reauth_with_srp(
     config: &config::Config,
-    password_provider: &dyn Fn() -> Option<SecretString>,
+    password_provider: &crate::password::PasswordProvider,
     notifier: &Notifier,
     live: Option<(auth::SharedSession, crate::icloud::photos::PhotosService)>,
 ) -> anyhow::Result<auth::AuthResult> {
@@ -1140,7 +1161,7 @@ async fn run_cycle(
             Arc::new(rustc_hash::FxHashSet::default()),
             asset_groupings,
         );
-        let download_client = shared_session.read().await.download_client();
+        let download_client = shared_session.read().await.download_client().clone();
         let sync_result = download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
@@ -1355,13 +1376,11 @@ async fn determine_sync_mode(
 }
 
 /// Re-validate the session after an idle sleep and re-acquire the lock.
-async fn reacquire_session<F>(
+async fn reacquire_session(
     shared_session: &auth::SharedSession,
     config: &config::Config,
-    password_provider: &F,
-) where
-    F: Fn() -> Option<SecretString>,
-{
+    password_provider: &crate::password::PasswordProvider,
+) {
     match attempt_reauth(
         shared_session,
         &config.cookie_directory,
@@ -1468,5 +1487,144 @@ mod tests {
     fn notice_suppressed_when_both_user_opted_out_and_already_notified() {
         // Belt-and-braces: every suppression condition stacks correctly.
         assert!(should_notify_shared_libraries(&config::LibrarySelection::All, 0, true).is_none());
+    }
+
+    // The run_sync reauth retry branch keys on whether an error from
+    // init_photos_service or resolve_libraries is a session error.
+    // Misclassifying either retries SRP on a non-session failure
+    // (burning an Apple rate-limit slot) or fails to retry on a real
+    // 401/421 (visible as an immediate Docker restart). Pin every
+    // variant so a future ICloudError refactor can't silently regress.
+
+    #[test]
+    fn is_session_error_true_for_cloudkit_401_403() {
+        let e: anyhow::Error =
+            crate::icloud::error::ICloudError::SessionExpired { status: 401 }.into();
+        assert!(is_session_error(&e), "401 must trigger reauth");
+
+        let e: anyhow::Error =
+            crate::icloud::error::ICloudError::SessionExpired { status: 403 }.into();
+        assert!(is_session_error(&e), "403 must trigger reauth");
+    }
+
+    #[test]
+    fn is_session_error_true_for_cloudkit_421() {
+        let e: anyhow::Error = crate::icloud::error::ICloudError::MisdirectedRequest.into();
+        assert!(
+            is_session_error(&e),
+            "persistent 421 must trigger reauth (stale routing state needs fresh SRP)"
+        );
+    }
+
+    #[test]
+    fn is_session_error_false_for_service_not_activated() {
+        // ADP / ZONE_NOT_FOUND is a permanent failure, not a session issue.
+        // Reauth would burn an Apple rate-limit slot for nothing.
+        let e: anyhow::Error = crate::icloud::error::ICloudError::ServiceNotActivated {
+            code: "ADP".into(),
+            reason: "Advanced Data Protection".into(),
+        }
+        .into();
+        assert!(!is_session_error(&e));
+    }
+
+    #[test]
+    fn is_session_error_false_for_connection_and_io() {
+        let e: anyhow::Error =
+            crate::icloud::error::ICloudError::Connection("DNS failure".into()).into();
+        assert!(!is_session_error(&e));
+
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "x");
+        let e: anyhow::Error = crate::icloud::error::ICloudError::from(io).into();
+        assert!(!is_session_error(&e));
+    }
+
+    #[test]
+    fn is_session_error_false_for_non_icloud_error() {
+        // Any other anyhow error (config parsing, state DB, etc.) must not
+        // be classified as a session error — that would trigger an
+        // inappropriate SRP cycle.
+        let e = anyhow::anyhow!("unrelated top-level error");
+        assert!(!is_session_error(&e));
+    }
+
+    #[test]
+    fn is_session_error_peers_through_context() {
+        // Real error chains are wrapped in .context() before hitting the
+        // retry branch. The classifier downcasts on the root cause, which
+        // anyhow exposes as downcast_ref — wrap here to pin the contract.
+        let root = crate::icloud::error::ICloudError::SessionExpired { status: 401 };
+        let e = anyhow::Error::from(root).context("while initializing photos service");
+        assert!(
+            is_session_error(&e),
+            "classifier must downcast through context wrappers"
+        );
+    }
+
+    /// Comprehensive classification table: every `ICloudError` variant plus
+    /// a generic anyhow error. Prevents silent regressions from future enum
+    /// additions — adding a new variant requires updating this table.
+    #[test]
+    fn is_session_error_classification_table() {
+        use crate::icloud::error::ICloudError;
+
+        // Variants that SHOULD trigger re-auth (session errors). Each entry
+        // is a (label, anyhow::Error) pair so downcast_ref inside
+        // is_session_error works correctly without needing Clone.
+        let session_errors: Vec<(&str, anyhow::Error)> = vec![
+            (
+                "SessionExpired-401",
+                ICloudError::SessionExpired { status: 401 }.into(),
+            ),
+            (
+                "SessionExpired-403",
+                ICloudError::SessionExpired { status: 403 }.into(),
+            ),
+            ("MisdirectedRequest", ICloudError::MisdirectedRequest.into()),
+        ];
+        for (label, e) in session_errors {
+            assert!(
+                is_session_error(&e),
+                "expected {label} to be a session error"
+            );
+        }
+
+        // Variants that must NOT trigger re-auth (non-session errors).
+        let non_session: Vec<(&str, anyhow::Error)> = vec![
+            (
+                "Connection",
+                ICloudError::Connection("DNS timeout".into()).into(),
+            ),
+            (
+                "ServiceNotActivated",
+                ICloudError::ServiceNotActivated {
+                    code: "ZONE_NOT_FOUND".into(),
+                    reason: "ADP".into(),
+                }
+                .into(),
+            ),
+            (
+                "Io",
+                ICloudError::from(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+                .into(),
+            ),
+            (
+                "Json",
+                ICloudError::from(
+                    serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+                )
+                .into(),
+            ),
+            ("non-ICloudError", anyhow::anyhow!("config parse error")),
+        ];
+        for (label, e) in non_session {
+            assert!(
+                !is_session_error(&e),
+                "expected {label} to NOT be a session error"
+            );
+        }
     }
 }

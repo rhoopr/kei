@@ -275,12 +275,15 @@ async fn tag_metadata_rewrites(
 /// Retry all pending state writes that failed during the download loop.
 ///
 /// Each write is attempted up to [`STATE_WRITE_MAX_RETRIES`] times with
-/// exponential backoff (200ms, 400ms, 800ms, 1.6s, 3.2s between attempts
-/// 1–5; attempt 6 fails immediately). SQLite lock contention is transient,
-/// so generous retries prevent files from ending up on disk but untracked
-/// in the state DB.
+/// exponential backoff in the millisecond range (200ms × 2^attempt plus
+/// small jitter to avoid thundering-herd when multiple writes contend
+/// on the same `SQLite` WAL). `RetryConfig::delay_for_retry` is built
+/// for seconds-scale HTTP retries; the state-write grain is finer so
+/// this loop keeps its own scaling.
+///
 /// Returns the number of writes that still failed after all retries.
 async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWrite]) -> usize {
+    use rand::RngExt;
     if pending.is_empty() {
         return 0;
     }
@@ -311,10 +314,9 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
                             error = %e,
                             "State write retry failed, will retry"
                         );
-                        tokio::time::sleep(Duration::from_millis(
-                            200 * u64::from(1u32 << (attempt - 1)),
-                        ))
-                        .await;
+                        let base_ms = 200 * u64::from(1u32 << (attempt - 1));
+                        let jitter_ms = rand::rng().random_range(0..base_ms.max(1) / 4);
+                        tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
                     } else {
                         tracing::error!(
                             asset_id = %write.asset_id,
@@ -605,7 +607,7 @@ pub(super) struct PassConfig<'a> {
     pub(super) metadata: MetadataFlags,
     pub(super) concurrency: usize,
     pub(super) no_progress_bar: bool,
-    pub(super) temp_suffix: String,
+    pub(super) temp_suffix: Arc<str>,
     pub(super) shutdown_token: CancellationToken,
     pub(super) state_db: Option<Arc<dyn StateDb>>,
     /// Accumulator for 429/503 observations during this pass. Counted per
@@ -908,6 +910,16 @@ where
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
         let mut seen_ids: FxHashSet<Arc<str>> = FxHashSet::default();
+        // Skipped-asset IDs accumulated across the producer run and
+        // flushed to the DB in a single transaction at the end. This
+        // collapses N UPDATE statements (one per fast-skip / on-disk
+        // skip) into one batched UPDATE so the producer loop doesn't
+        // serialize behind an fsync-per-asset under WAL mode.
+        //
+        // Vec is sufficient: every push is inside a branch predicated on
+        // `seen_ids.insert(asset.id_arc())` returning true, so IDs are
+        // already unique at this point.
+        let mut touched_ids: Vec<Arc<str>> = Vec::new();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
         let forecast_check = |size: u64| -> bool {
@@ -1010,10 +1022,8 @@ where
                                 &download_ctx,
                             )
                             .await;
-                            if let Some(db) = &producer_state_db {
-                                if let Err(e) = db.touch_last_seen(asset.id()).await {
-                                    tracing::debug!(error = %e, asset_id = asset.id(), "Failed to update last-seen timestamp");
-                                }
+                            if producer_state_db.is_some() {
+                                touched_ids.push(asset.id_arc());
                             }
                             skips.by_state += 1;
                             producer_pb.inc(1);
@@ -1039,10 +1049,8 @@ where
                             &download_ctx,
                         )
                         .await;
-                        if let Some(db) = &producer_state_db {
-                            if let Err(e) = db.touch_last_seen(asset.id()).await {
-                                tracing::debug!(error = %e, asset_id = asset.id(), "Failed to touch last_seen for on-disk asset");
-                            }
+                        if producer_state_db.is_some() {
+                            touched_ids.push(asset.id_arc());
                         }
                         skips.on_disk += 1;
                         producer_pb.inc(1);
@@ -1115,7 +1123,7 @@ where
                                     task.size,
                                     media_type,
                                 )
-                                .with_metadata(asset.metadata().clone());
+                                .with_metadata_arc(asset.metadata_arc());
                                 if let Err(e) = db.upsert_seen(&record).await {
                                     tracing::warn!(
                                         asset_id = %task.asset_id,
@@ -1280,10 +1288,33 @@ where
             });
         }
 
+        // Flush the accumulated last_seen_at updates in one transaction.
+        // Running after the producer loop exits means we skip the fsync-
+        // per-asset cost that dominated sync-start on mostly-synced
+        // libraries. last_seen_at is observational and only affects the
+        // stuck-pipeline promotion window via sync_started_at, so a
+        // deferred flush is safe for terminal-status rows (which is all
+        // touched_ids contains).
+        if let Some(db) = &producer_state_db {
+            if !touched_ids.is_empty() {
+                let touched_count = touched_ids.len();
+                let ids: Vec<&str> = touched_ids.iter().map(AsRef::as_ref).collect();
+                if let Err(e) = db.touch_last_seen_many(&ids).await {
+                    producer_pb.suspend(|| {
+                        tracing::warn!(
+                            error = %e,
+                            count = touched_count,
+                            "Failed to batch-update last_seen_at for skipped assets"
+                        );
+                    });
+                }
+            }
+        }
+
         skips
     });
 
-    let temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
+    let temp_suffix: Arc<str> = Arc::clone(&config.temp_suffix);
     let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let bandwidth_limiter = config.bandwidth_limiter.clone();
     let download_stream = ReceiverStream::new(task_rx)
@@ -1674,7 +1705,7 @@ pub(super) async fn build_download_outcome(
         metadata: MetadataFlags::from(config.as_ref()),
         concurrency: cleanup_concurrency,
         no_progress_bar: config.no_progress_bar,
-        temp_suffix: config.temp_suffix.clone(),
+        temp_suffix: Arc::clone(&config.temp_suffix),
         shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::clone(&phase2_rate_counter),
@@ -1771,15 +1802,11 @@ pub(super) async fn run_download_pass(
     let state_db = config.state_db.clone();
     let shutdown_token = config.shutdown_token.clone();
     let concurrency = config.concurrency;
-    let temp_suffix: Arc<str> = config.temp_suffix.into();
+    let temp_suffix: Arc<str> = config.temp_suffix;
     let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
 
-    type DownloadResult = (
-        DownloadTask,
-        Result<(bool, String, Option<String>, u64, u64)>,
-    );
-    let results: Vec<DownloadResult> = stream::iter(tasks)
+    let mut download_stream = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
@@ -1800,9 +1827,7 @@ pub(super) async fn run_download_pass(
                 (task, result)
             }
         })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
+        .buffer_unordered(concurrency);
 
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
@@ -1811,7 +1836,11 @@ pub(super) async fn run_download_pass(
     let mut bytes_downloaded_total: u64 = 0;
     let mut disk_bytes_total: u64 = 0;
 
-    for (task, result) in results {
+    // Stream results as each task completes so state writes and progress-bar
+    // updates fire per-item. Collecting first would freeze the progress bar
+    // until the last download finished and defer every mark_downloaded to
+    // the end of the pass — defeating the point of parallel cleanup.
+    while let Some((task, result)) = download_stream.next().await {
         match &result {
             Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
                 bytes_downloaded_total += bytes_dl;
@@ -2777,7 +2806,7 @@ mod tests {
                             metadata: MetadataFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
-                            temp_suffix: ".kei-tmp".to_string(),
+                            temp_suffix: std::sync::Arc::from(".kei-tmp"),
                             shutdown_token: token,
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2829,7 +2858,7 @@ mod tests {
                             metadata: MetadataFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
-                            temp_suffix: ".kei-tmp".to_string(),
+                            temp_suffix: std::sync::Arc::from(".kei-tmp"),
                             shutdown_token: token,
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2935,7 +2964,9 @@ mod tests {
     /// If variant order changes, `.max()` silently picks the wrong winner.
     #[test]
     fn test_asset_disposition_ordering() {
-        use AssetDisposition::*;
+        use AssetDisposition::{
+            AmpmVariant, Forwarded, OnDisk, RetryExhausted, RetryOnly, StateSkip, Unresolved,
+        };
         assert!(Forwarded > OnDisk);
         assert!(OnDisk > AmpmVariant);
         assert!(AmpmVariant > StateSkip);
@@ -3079,8 +3110,10 @@ mod tests {
         async fn delete_metadata_by_prefix(&self, _: &str) -> Result<u64, StateError> {
             unimplemented!()
         }
-        async fn touch_last_seen(&self, _: &str) -> Result<(), StateError> {
-            unimplemented!()
+        async fn touch_last_seen_many(&self, _: &[&str]) -> Result<(), StateError> {
+            // Unused in these tests; default no-op so they don't bump the
+            // pipeline's batch-flush path.
+            Ok(())
         }
         async fn sample_downloaded_paths(
             &self,
@@ -3305,7 +3338,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let config = Arc::new(DownloadConfig {
-            directory: dir.path().to_path_buf(),
+            directory: std::sync::Arc::from(dir.path()),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
@@ -3341,8 +3374,8 @@ mod tests {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Vec::new(),
-            temp_suffix: ".kei-tmp".to_string(),
+            filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
+            temp_suffix: std::sync::Arc::from(".kei-tmp"),
             state_db: None,
             retry_only: false,
             max_download_attempts: 10,
@@ -3392,7 +3425,9 @@ mod tests {
         use rustc_hash::FxHashSet;
 
         let config = Arc::new(DownloadConfig {
-            directory: PathBuf::from("/nonexistent/download_filter_tests"),
+            directory: std::sync::Arc::from(std::path::Path::new(
+                "/nonexistent/download_filter_tests",
+            )),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
@@ -3424,8 +3459,8 @@ mod tests {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Vec::new(),
-            temp_suffix: ".kei-tmp".to_string(),
+            filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
+            temp_suffix: std::sync::Arc::from(".kei-tmp"),
             state_db: None,
             retry_only: false,
             max_download_attempts: 10,
@@ -3498,7 +3533,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut config = DownloadConfig::test_default();
-        config.directory = dir.path().to_path_buf();
+        config.directory = std::sync::Arc::from(dir.path());
         config.skip_videos = true;
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
@@ -3512,7 +3547,7 @@ mod tests {
 
         let pending = db.get_pending().await.unwrap();
         assert_eq!(pending.len(), 1, "asset must remain the only pending row");
-        assert_eq!(pending[0].id, "GHOST");
+        assert_eq!(&*pending[0].id, "GHOST");
         assert_eq!(
             pending[0].last_seen_at.timestamp(),
             prior_seen_at,
@@ -3589,7 +3624,7 @@ mod tests {
         // Sanity: the rewrite pass sees our row.
         let pending = db.get_pending_metadata_rewrites(32).await.unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, "REWRITE_1");
+        assert_eq!(&*pending[0].id, "REWRITE_1");
 
         let flags = MetadataFlags {
             rating: true,

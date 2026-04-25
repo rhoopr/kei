@@ -10,6 +10,7 @@
 //! and remap every other `iloc` entry so the existing image data stays
 //! byte-for-byte identical in its new location after `meta` grows.
 
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
@@ -67,7 +68,8 @@ pub(crate) fn extract_xmp_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Surgically insert (or replace) the XMP `mime` item inside a HEIC file.
+/// Surgically insert (or replace) the XMP `mime` item inside a HEIC file,
+/// streaming the rewrite to `writer`.
 ///
 /// The HEIC container is ISO-BMFF — a sequence of top-level atoms. XMP lives
 /// inside the `meta` atom as an item with `item_type = "mime"` and
@@ -75,11 +77,17 @@ pub(crate) fn extract_xmp_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
 /// trailing `mdat` (construction_method 0, file-absolute offsets), so the
 /// encoded image bytes in the original `mdat` stay byte-for-byte identical
 /// even after `meta` grows.
-// meta_idx is produced by .position() over atoms; new_mdat_idx is
-// atoms.len() - 1 after a push; new_positions is built from the same atoms
-// vec. All indexing here is in-bounds by construction.
-#[allow(clippy::indexing_slicing)]
-pub(crate) fn insert_xmp(input: &[u8], xmp: &[u8]) -> Result<Vec<u8>> {
+///
+/// Writing to a `Write` (typically `BufWriter<File>`) rather than returning
+/// a `Vec<u8>` eliminates one full-file-sized allocation on the metadata-
+/// embed path — meaningful for large ProRAW HEICs under high concurrency.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "meta_idx comes from .position() over atoms; new_mdat_idx is atoms.len() - 1 \
+              after a push; new_positions is built from the same atoms vec; all indexing \
+              here is in-bounds by construction"
+)]
+pub(crate) fn insert_xmp<W: Write>(input: &[u8], xmp: &[u8], mut writer: W) -> Result<()> {
     // Record each top-level atom along with its original byte offset in the
     // input so we can rewrite file-absolute iloc entries correctly — the
     // existing iloc offsets point into the original mdat, and those offsets
@@ -227,20 +235,27 @@ pub(crate) fn insert_xmp(input: &[u8], xmp: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
-    let mut out = Vec::with_capacity(input.len() + xmp.len() + 512);
+    // mp4-atom's Encode requires BufMut (bytes), not Write; a reusable
+    // per-atom Vec caps in-memory output at one atom (the image mdat
+    // is typically the largest) rather than the full serialized file.
+    let mut atom_buf: Vec<u8> = Vec::new();
     for atom in &atoms {
-        atom.encode(&mut out)?;
+        atom_buf.clear();
+        atom.encode(&mut atom_buf)?;
+        writer.write_all(&atom_buf)?;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Walk existing iinf/iloc to find any previously-kei-appended XMP mdat.
 /// Criteria: an iinf entry flagged as `mime` + `application/rdf+xml`, its
 /// iloc entry references a range that lies entirely within a single trailing
 /// mdat atom, and no other iloc entry references into that atom.
-// Indexing by meta_idx (caller-validated) and by idx from atoms.iter().enumerate()
-// (with original_offsets built 1:1 alongside atoms in insert_xmp) is in-bounds.
-#[allow(clippy::indexing_slicing)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "meta_idx is caller-validated and idx comes from atoms.iter().enumerate() \
+              with original_offsets built 1:1 alongside atoms in insert_xmp"
+)]
 fn locate_stale_kei_mdat(
     atoms: &[Any],
     original_offsets: &[u64],

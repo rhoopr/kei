@@ -52,6 +52,7 @@ struct StatusLabels {
 /// Health snapshot read by the /healthz handler. The registry is immutable
 /// after construction so it lives directly on MetricsHandle behind an Arc,
 /// letting /metrics encode without taking the lock.
+#[derive(Debug)]
 struct Inner {
     health_snapshot: Option<HealthStatus>,
     /// Maximum age of `last_success_at` before /healthz returns 503. `None`

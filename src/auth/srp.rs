@@ -18,6 +18,7 @@ use crate::retry::parse_retry_after_header;
 
 /// Buffered HTTP response for SRP authentication steps.
 /// Decouples the SRP flow from `reqwest::Response` for testability.
+#[derive(Debug)]
 pub(crate) struct SrpResponse {
     pub(crate) status: u16,
     body: Vec<u8>,

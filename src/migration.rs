@@ -106,25 +106,32 @@ pub fn migrate_legacy_paths() -> Option<MigrationReport> {
 
 /// Copy a single file to a new location, creating parent directories.
 /// Returns `Ok(true)` if copied, `Ok(false)` if destination already exists.
-fn migrate_file(src: &Path, dst: &Path) -> std::io::Result<bool> {
+fn migrate_file(src: &Path, dst: &Path) -> anyhow::Result<bool> {
+    use anyhow::Context;
     if dst.exists() {
         return Ok(false);
     }
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory {}", parent.display()))?;
     }
-    std::fs::copy(src, dst)?;
+    std::fs::copy(src, dst)
+        .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
     Ok(true)
 }
 
 /// Copy all files (not subdirectories) from one directory to another.
 /// Skips files that already exist at the destination.
 /// Returns the number of files successfully copied.
-fn migrate_directory_contents(src_dir: &Path, dst_dir: &Path) -> std::io::Result<usize> {
-    std::fs::create_dir_all(dst_dir)?;
+fn migrate_directory_contents(src_dir: &Path, dst_dir: &Path) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    std::fs::create_dir_all(dst_dir)
+        .with_context(|| format!("creating destination directory {}", dst_dir.display()))?;
 
     let mut count = 0;
-    for entry in std::fs::read_dir(src_dir)? {
+    for entry in
+        std::fs::read_dir(src_dir).with_context(|| format!("reading {}", src_dir.display()))?
+    {
         let entry = entry?;
         let file_type = entry.file_type()?;
         if !file_type.is_file() {
@@ -134,7 +141,13 @@ fn migrate_directory_contents(src_dir: &Path, dst_dir: &Path) -> std::io::Result
         if dst_path.exists() {
             continue;
         }
-        std::fs::copy(entry.path(), &dst_path)?;
+        std::fs::copy(entry.path(), &dst_path).with_context(|| {
+            format!(
+                "copying {} to {}",
+                entry.path().display(),
+                dst_path.display()
+            )
+        })?;
         count += 1;
     }
     Ok(count)

@@ -50,9 +50,10 @@ pub struct PhotoAsset {
     // Heap types first
     record_name: Arc<str>,
     filename: Option<Box<str>>,
-    // Metadata boxed to keep PhotoAsset compact when metadata is large
-    // (keywords, provider_data JSON can be several hundred bytes).
-    asset_metadata: Box<AssetMetadata>,
+    // Metadata behind Arc so downstream consumers (AssetRecord, the
+    // pipeline's metadata-hash comparisons) can share the same
+    // allocation via refcount bumps. Immutable after construction.
+    asset_metadata: Arc<AssetMetadata>,
     // SmallVec with inline storage
     versions: VersionsMap,
     // f64 primitives
@@ -209,12 +210,12 @@ fn extract_versions(
                 continue;
             };
 
-        let asset_type: Box<str> = match fields
+        let asset_type: std::sync::Arc<str> = match fields
             .get(type_field)
             .and_then(|f| f.get("value"))
             .and_then(Value::as_str)
         {
-            Some(s) if !s.is_empty() => s.into(),
+            Some(s) if !s.is_empty() => crate::string_interner::intern(s),
             _ => {
                 tracing::warn!(
                     asset = %record_name,
@@ -283,7 +284,7 @@ impl PhotoAsset {
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
         let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
-        let asset_metadata = Box::new(metadata::extract(&master_fields, &asset_fields));
+        let asset_metadata = Arc::new(metadata::extract(&master_fields, &asset_fields));
         Self {
             record_name,
             filename,
@@ -315,7 +316,7 @@ impl PhotoAsset {
             &asset.fields,
             &master.record_name,
         );
-        let asset_metadata = Box::new(metadata::extract(&master.fields, &asset.fields));
+        let asset_metadata = Arc::new(metadata::extract(&master.fields, &asset.fields));
         Self {
             record_name: Arc::from(master.record_name),
             filename,
@@ -330,6 +331,14 @@ impl PhotoAsset {
     /// Provider-agnostic metadata extracted at construction time.
     pub fn metadata(&self) -> &AssetMetadata {
         &self.asset_metadata
+    }
+
+    /// Shared handle on the metadata. Consumers that persist the metadata
+    /// (state DB writes via `AssetRecord::with_metadata_arc`) clone the
+    /// `Arc` instead of deep-cloning every owned string.
+    #[must_use]
+    pub fn metadata_arc(&self) -> Arc<AssetMetadata> {
+        Arc::clone(&self.asset_metadata)
     }
 
     pub fn id(&self) -> &str {
@@ -594,7 +603,9 @@ impl DeltaRecordBuffer {
         reason: ChangeReason,
         events: &mut Vec<ChangeEvent>,
     ) {
-        let master_name: Box<str> = master_record.record_name.clone().into_boxed_str();
+        // Box::from(&str) copies only the bytes, without the String's Vec
+        // capacity slack that .clone().into_boxed_str() would drag along.
+        let master_name: Box<str> = Box::from(master_record.record_name.as_str());
         let asset = PhotoAsset::from_records(master_record, asset_record);
         events.push(ChangeEvent {
             record_name: master_name,

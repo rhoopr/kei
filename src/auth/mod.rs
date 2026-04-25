@@ -25,7 +25,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use uuid::Uuid;
 
 use self::endpoints::Endpoints;
@@ -73,7 +73,7 @@ impl std::fmt::Debug for AuthResult {
 pub async fn authenticate(
     cookie_dir: &Path,
     apple_id: &str,
-    password_provider: &dyn Fn() -> Option<SecretString>,
+    password_provider: &crate::password::PasswordProvider,
     domain: &str,
     client_id: Option<String>,
     timeout_secs: Option<u64>,
@@ -97,7 +97,7 @@ async fn authenticate_inner(
     mut session: Session,
     endpoints: &Endpoints,
     apple_id: &str,
-    password_provider: &dyn Fn() -> Option<SecretString>,
+    password_provider: &crate::password::PasswordProvider,
     domain: &str,
     client_id: Option<String>,
     code: Option<&str>,
@@ -234,9 +234,11 @@ async fn authenticate_inner(
     // cookies, and trust_token is preserved across the session (via
     // `strip_session_routing_state`) so 2FA is skipped in the common case.
     if data.is_none() {
-        let password = password_provider().ok_or_else(|| {
-            AuthError::FailedLogin("No password available (see error above for details)".into())
-        })?;
+        let password = crate::password::invoke_password_provider(password_provider)
+            .await
+            .ok_or_else(|| {
+                AuthError::FailedLogin("No password available (see error above for details)".into())
+            })?;
 
         tracing::debug!(apple_id = %apple_id, "Authenticating");
 
@@ -375,7 +377,7 @@ async fn authenticate_inner(
 pub async fn send_2fa_push(
     cookie_dir: &Path,
     apple_id: &str,
-    password_provider: &dyn Fn() -> Option<SecretString>,
+    password_provider: &crate::password::PasswordProvider,
     domain: &str,
 ) -> Result<()> {
     let endpoints = Endpoints::for_domain(domain)?;
@@ -459,9 +461,11 @@ pub async fn send_2fa_push(
     }
 
     if data.is_none() {
-        let password = password_provider().ok_or_else(|| {
-            AuthError::FailedLogin("No password available (see error above for details)".into())
-        })?;
+        let password = crate::password::invoke_password_provider(password_provider)
+            .await
+            .ok_or_else(|| {
+                AuthError::FailedLogin("No password available (see error above for details)".into())
+            })?;
         srp::authenticate_srp(
             &mut session,
             &endpoints,
