@@ -1214,28 +1214,8 @@ async fn run_cycle(
             );
         }
 
-        // Accumulate stats across libraries
-        cycle_stats.assets_seen += sync_result.stats.assets_seen;
-        cycle_stats.downloaded += sync_result.stats.downloaded;
-        cycle_stats.failed += sync_result.stats.failed;
-        cycle_stats.bytes_downloaded += sync_result.stats.bytes_downloaded;
-        cycle_stats.disk_bytes_written += sync_result.stats.disk_bytes_written;
-        cycle_stats.exif_failures += sync_result.stats.exif_failures;
-        cycle_stats.state_write_failures += sync_result.stats.state_write_failures;
-        cycle_stats.enumeration_errors += sync_result.stats.enumeration_errors;
-        cycle_stats.elapsed_secs += sync_result.stats.elapsed_secs;
-        cycle_stats.interrupted = cycle_stats.interrupted || sync_result.stats.interrupted;
-        cycle_stats.skipped.by_state += sync_result.stats.skipped.by_state;
-        cycle_stats.skipped.on_disk += sync_result.stats.skipped.on_disk;
-        cycle_stats.skipped.by_media_type += sync_result.stats.skipped.by_media_type;
-        cycle_stats.skipped.by_date_range += sync_result.stats.skipped.by_date_range;
-        cycle_stats.skipped.by_live_photo += sync_result.stats.skipped.by_live_photo;
-        cycle_stats.skipped.by_filename += sync_result.stats.skipped.by_filename;
-        cycle_stats.skipped.by_excluded_album += sync_result.stats.skipped.by_excluded_album;
-        cycle_stats.skipped.ampm_variant += sync_result.stats.skipped.ampm_variant;
-        cycle_stats.skipped.duplicates += sync_result.stats.skipped.duplicates;
-        cycle_stats.skipped.retry_exhausted += sync_result.stats.skipped.retry_exhausted;
-        cycle_stats.skipped.retry_only += sync_result.stats.skipped.retry_only;
+        // Accumulate stats across libraries. CG-15.
+        cycle_stats.accumulate(&sync_result.stats);
 
         match sync_result.outcome {
             download::DownloadOutcome::Success => {}
