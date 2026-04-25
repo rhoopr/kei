@@ -25,7 +25,10 @@ use crate::retry;
 use crate::shutdown;
 use crate::state::{self, StateDb};
 use crate::systemd::SystemdNotifier;
-use crate::{available_disk_space, make_password_provider, PartialSyncError, PidFileGuard};
+use crate::{
+    available_disk_space, check_min_disk_space, make_password_provider, PartialSyncError,
+    PidFileGuard,
+};
 
 /// Per-library state: zone name, sync token key, and resolved album plan.
 struct LibraryState {
@@ -272,16 +275,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     })?;
     let _ = tokio::fs::remove_file(&probe).await;
 
-    // Abort if available disk space is too low.
+    // Abort if available disk space is too low. CG-20: see
+    // `check_min_disk_space` for the pure inner check.
     if let Some(avail) = available_disk_space(&config.directory) {
-        const MIN_FREE_BYTES: u64 = 1_073_741_824; // 1 GiB
-        if avail < MIN_FREE_BYTES {
-            let avail_mb = avail / (1024 * 1024);
-            anyhow::bail!(
-                "Insufficient disk space: only {avail_mb} MiB available in {} (minimum 1 GiB)",
-                config.directory.display()
-            );
-        }
+        check_min_disk_space(avail, &config.directory)?;
     }
 
     let cred_store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
@@ -842,7 +839,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             &config.username,
                             None,
                         );
-                        if !is_watch_mode {
+                        if !should_wait_for_2fa(is_watch_mode, &e) {
                             return Err(e);
                         }
 
@@ -1061,6 +1058,48 @@ async fn reauth_with_srp(
     }
 }
 
+/// Decide whether the per-zone `sync_token` should be persisted to the state
+/// DB after a download pass.
+///
+/// The contract is "advance only on full success and not in dry-run":
+/// - On `PartialFailure`, a stored token would skip the failed assets on the
+///   next incremental sync (they'd never appear in the delta again -- silent
+///   data loss). CG-9.
+/// - On `SessionExpired`, the cycle aborts mid-stream; the token may be
+///   stale or only reflect a subset of the work.
+/// - In `--dry-run`, we promise to make no DB writes that survive the run
+///   (apart from the `sync_runs` ledger). Advancing the token here would
+///   silently break the next real sync. CG-21.
+///
+/// The returned bool is the gate: callers still check that `sync_token` is
+/// `Some(_)` and that a state DB is configured before persisting.
+pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_run: bool) -> bool {
+    matches!(outcome, download::DownloadOutcome::Success) && !dry_run
+}
+
+/// Decide whether the reauth path inside the sync loop should block on a
+/// 2FA prompt or surface the error to the caller.
+///
+/// In **watch mode** a 2FA-required error is recoverable: the loop notifies
+/// the user, parks `wait_and_retry_2fa`, and resumes once a code arrives.
+///
+/// In **one-shot mode** there is nothing to wait on -- the caller (a CI run,
+/// a cron, the systemd unit's first start) needs the error so it can exit
+/// non-zero and the operator can run `kei login get-code`. CG-19.
+///
+/// Note that the **entry-point** auth path (`run_sync`'s initial
+/// `auth::authenticate` call) intentionally does NOT use this predicate --
+/// it always parks on `wait_and_retry_2fa` because the user is presumed
+/// present at a terminal during the initial command. This helper exists
+/// because the *reauth* branch fires mid-cycle, by which point a one-shot
+/// caller has long since detached and there is no operator to type a code.
+pub(crate) fn should_wait_for_2fa(is_watch_mode: bool, err: &anyhow::Error) -> bool {
+    is_watch_mode
+        && err
+            .downcast_ref::<auth::error::AuthError>()
+            .is_some_and(auth::error::AuthError::is_two_factor_required)
+}
+
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
 async fn run_cycle(
     library_states: &[LibraryState],
@@ -1177,8 +1216,7 @@ async fn run_cycle(
         // Note: the token is stored after download_photos_with_sync returns, which
         // means all batch flushes are complete. A crash here means the token is
         // NOT advanced, so assets will replay on next sync (safe, not data loss).
-        let should_store_token =
-            matches!(sync_result.outcome, download::DownloadOutcome::Success) && !config.dry_run;
+        let should_store_token = should_store_sync_token(&sync_result.outcome, config.dry_run);
         if should_store_token {
             if let Some(token) = &sync_result.sync_token {
                 if let Some(db) = state_db {
@@ -1196,28 +1234,8 @@ async fn run_cycle(
             );
         }
 
-        // Accumulate stats across libraries
-        cycle_stats.assets_seen += sync_result.stats.assets_seen;
-        cycle_stats.downloaded += sync_result.stats.downloaded;
-        cycle_stats.failed += sync_result.stats.failed;
-        cycle_stats.bytes_downloaded += sync_result.stats.bytes_downloaded;
-        cycle_stats.disk_bytes_written += sync_result.stats.disk_bytes_written;
-        cycle_stats.exif_failures += sync_result.stats.exif_failures;
-        cycle_stats.state_write_failures += sync_result.stats.state_write_failures;
-        cycle_stats.enumeration_errors += sync_result.stats.enumeration_errors;
-        cycle_stats.elapsed_secs += sync_result.stats.elapsed_secs;
-        cycle_stats.interrupted = cycle_stats.interrupted || sync_result.stats.interrupted;
-        cycle_stats.skipped.by_state += sync_result.stats.skipped.by_state;
-        cycle_stats.skipped.on_disk += sync_result.stats.skipped.on_disk;
-        cycle_stats.skipped.by_media_type += sync_result.stats.skipped.by_media_type;
-        cycle_stats.skipped.by_date_range += sync_result.stats.skipped.by_date_range;
-        cycle_stats.skipped.by_live_photo += sync_result.stats.skipped.by_live_photo;
-        cycle_stats.skipped.by_filename += sync_result.stats.skipped.by_filename;
-        cycle_stats.skipped.by_excluded_album += sync_result.stats.skipped.by_excluded_album;
-        cycle_stats.skipped.ampm_variant += sync_result.stats.skipped.ampm_variant;
-        cycle_stats.skipped.duplicates += sync_result.stats.skipped.duplicates;
-        cycle_stats.skipped.retry_exhausted += sync_result.stats.skipped.retry_exhausted;
-        cycle_stats.skipped.retry_only += sync_result.stats.skipped.retry_only;
+        // Accumulate stats across libraries. CG-15.
+        cycle_stats.accumulate(&sync_result.stats);
 
         match sync_result.outcome {
             download::DownloadOutcome::Success => {}
@@ -1626,5 +1644,1263 @@ mod tests {
                 "expected {label} to NOT be a session error"
             );
         }
+    }
+
+    // CG-18: classifier sees through `Box<dyn Error + Send + Sync>` wrappers.
+    //
+    // anyhow lets callers wrap raw boxed errors via `anyhow::Error::from`
+    // when adapting third-party error returns. The downcast walk used by
+    // `is_session_error` must conclude "not a session error" for any error
+    // chain that was never an `ICloudError` — otherwise a future refactor
+    // through a boxed-error adapter could silently flip every config /
+    // network / state error into "burn an Apple SRP slot".
+    #[test]
+    fn is_session_error_through_boxed_error_returns_false() {
+        // A boxed error of a foreign type wrapped via anyhow::Error::from.
+        let boxed: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("foreign"));
+        let e: anyhow::Error = anyhow::Error::from_boxed(boxed);
+        assert!(
+            !is_session_error(&e),
+            "boxed-error wrapper must not be classified as a session error"
+        );
+
+        // Also: anyhow::Error::msg(string) must be non-session — this is
+        // the most common path through our error pipeline (a `bail!` from
+        // a non-icloud module).
+        let plain = anyhow::anyhow!("config parse failed at line 7");
+        assert!(
+            !is_session_error(&plain),
+            "free-form anyhow::Error must not be classified as a session error"
+        );
+    }
+
+    // ── determine_sync_mode ──────────────────────────────────────────
+    //
+    // Sync-mode decision is the gatekeeper for the kei "user data is sacred"
+    // invariant: pick Full vs Incremental wrong and either (a) re-download
+    // the world (waste) or (b) skip previously-failed assets (silent loss).
+    // None of the four critical branches had a direct unit test before.
+
+    fn make_state_db() -> Arc<dyn state::StateDb> {
+        Arc::new(state::SqliteStateDb::open_in_memory().expect("open in-memory state DB"))
+    }
+
+    /// CG-1: `is_retry_failed=true` MUST force `SyncMode::Full` even when a
+    /// sync token is stored. A regression that picked Incremental during
+    /// retry-failed would silently skip the previously-failed assets the
+    /// user explicitly asked to retry — silent data loss.
+    #[tokio::test]
+    async fn determine_sync_mode_retry_failed_with_token_returns_full() {
+        let db = make_state_db();
+        let sync_token_key = "sync_token:PrimarySync";
+        // Pre-populate a stored token so we can verify it is ignored.
+        db.set_metadata(sync_token_key, "stored-token-abc")
+            .await
+            .expect("set token");
+
+        let mode = determine_sync_mode(
+            true,  // is_retry_failed
+            false, // no_incremental
+            1,
+            &Some(Arc::clone(&db)),
+            sync_token_key,
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "retry-failed must force Full, got {mode:?}"
+        );
+    }
+
+    /// CG-2: `--no-incremental` MUST force `SyncMode::Full`, ignoring any
+    /// stored token. The flag exists so a user can deliberately re-enumerate
+    /// (e.g. after a known incremental drift); silently downgrading would
+    /// betray that contract.
+    #[tokio::test]
+    async fn determine_sync_mode_no_incremental_overrides_stored_token() {
+        let db = make_state_db();
+        let sync_token_key = "sync_token:PrimarySync";
+        db.set_metadata(sync_token_key, "stored-token-xyz")
+            .await
+            .expect("set token");
+
+        let mode = determine_sync_mode(
+            false, // is_retry_failed
+            true,  // no_incremental
+            1,
+            &Some(Arc::clone(&db)),
+            sync_token_key,
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "--no-incremental must force Full, got {mode:?}"
+        );
+    }
+
+    /// CG-3: an empty stored token must fall back to Full. Production
+    /// guards on `!token.is_empty()`; if a refactor flipped that check the
+    /// caller would request `changes/zone` with empty token and silently
+    /// drop pending events.
+    #[tokio::test]
+    async fn determine_sync_mode_empty_stored_token_falls_back_to_full() {
+        let db = make_state_db();
+        let sync_token_key = "sync_token:PrimarySync";
+        // Empty-string token is the malformed case — should be ignored.
+        db.set_metadata(sync_token_key, "")
+            .await
+            .expect("set empty token");
+
+        let mode = determine_sync_mode(
+            false,
+            false,
+            1,
+            &Some(Arc::clone(&db)),
+            sync_token_key,
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "empty stored token must yield Full, got {mode:?}"
+        );
+
+        // And a present, non-empty token must trigger Incremental — pin the
+        // happy path here too so the empty-string check can't be dropped
+        // without breaking both assertions.
+        db.set_metadata(sync_token_key, "real-token")
+            .await
+            .expect("set real token");
+        let mode = determine_sync_mode(
+            false,
+            false,
+            1,
+            &Some(Arc::clone(&db)),
+            sync_token_key,
+            "PrimarySync",
+        )
+        .await;
+        assert!(
+            matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "real-token"),
+            "non-empty token must yield Incremental with that token, got {mode:?}"
+        );
+    }
+
+    /// CG-4: when the state DB read fails, fall back to Full rather than
+    /// propagating. The watch loop must keep going even if sqlite hiccups —
+    /// silently biasing toward Incremental on errors would mask data loss.
+    ///
+    /// We reach the failure surface by closing the underlying connection
+    /// out from under a real `SqliteStateDb`. Doing this against a plain
+    /// fail-everything stub would require implementing every method in the
+    /// (large) `StateDb` trait; instead we use the test-only failing impl
+    /// the pipeline tests already maintain. See the inline `FailingDb`.
+    #[tokio::test]
+    async fn determine_sync_mode_state_db_error_falls_back_to_full() {
+        use std::collections::{HashMap, HashSet};
+        use std::path::PathBuf;
+
+        // Minimal failing impl: only `get_metadata` is reachable from
+        // `determine_sync_mode`; every other method is unimplemented so
+        // any silent reroute lights up immediately.
+        struct FailingDb;
+
+        #[async_trait::async_trait]
+        impl state::StateDb for FailingDb {
+            #[cfg(test)]
+            async fn should_download(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn upsert_seen(
+                &self,
+                _: &state::types::AssetRecord,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_downloaded(
+                &self,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_failed(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed_sample(
+                &self,
+                _: u32,
+            ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_pending(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_summary(
+                &self,
+            ) -> Result<state::types::SyncSummary, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_page(
+                &self,
+                _: u64,
+                _: u32,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn complete_sync_run(
+                &self,
+                _: i64,
+                _: &state::types::SyncRunStats,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn begin_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn end_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn list_interrupted_enumerations(
+                &self,
+            ) -> Result<Vec<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_pending_to_failed(
+                &self,
+                _: i64,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_ids(
+                &self,
+            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_known_ids(&self) -> Result<HashSet<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_checksums(
+                &self,
+            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_attempt_counts(
+                &self,
+            ) -> Result<HashMap<String, u32>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_metadata(
+                &self,
+                _: &str,
+            ) -> Result<Option<String>, state::error::StateError> {
+                Err(state::error::StateError::LockPoisoned("simulated".into()))
+            }
+            async fn set_metadata(&self, _: &str, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn delete_metadata_by_prefix(
+                &self,
+                _: &str,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn touch_last_seen_many(
+                &self,
+                _: &[&str],
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn sample_downloaded_paths(
+                &self,
+                _: usize,
+            ) -> Result<Vec<PathBuf>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn add_asset_album(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_asset_albums(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_asset_people(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_soft_deleted(
+                &self,
+                _: &str,
+                _: Option<chrono::DateTime<chrono::Utc>>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn record_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_metadata_hashes(
+                &self,
+            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_metadata_retry_markers(
+                &self,
+            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_pending_metadata_rewrites(
+                &self,
+                _: usize,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn update_metadata_hash(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn clear_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn has_downloaded_without_metadata_hash(
+                &self,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+        }
+
+        let db: Arc<dyn state::StateDb> = Arc::new(FailingDb);
+
+        let mode = determine_sync_mode(
+            false,
+            false,
+            1,
+            &Some(db),
+            "sync_token:PrimarySync",
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "DB read error must fall back to Full, got {mode:?}"
+        );
+    }
+
+    /// Sanity: `state_db = None` (e.g. legacy run with no state path) must
+    /// still produce Full. The match-arm exists in production today; pin
+    /// it so a future refactor that drops the `else` branch tells us.
+    #[tokio::test]
+    async fn determine_sync_mode_no_state_db_returns_full() {
+        let mode = determine_sync_mode(
+            false,
+            false,
+            1,
+            &None,
+            "sync_token:PrimarySync",
+            "PrimarySync",
+        )
+        .await;
+
+        assert!(
+            matches!(mode, download::SyncMode::Full),
+            "no state DB must yield Full, got {mode:?}"
+        );
+    }
+
+    // ── check_changes_database ───────────────────────────────────────
+    //
+    // Watch-mode wakes the sync loop on a fixed interval. The first thing
+    // each cycle does is hit the `changes/database` endpoint to ask Apple
+    // "anything actually changed?" If we mis-classify the response we
+    // either hammer Apple uselessly (no changes but proceeded) or silently
+    // skip a real delta (changes pending but skipped). Pin every branch.
+
+    /// Build a `LibraryState` that's just enough for `check_changes_database`.
+    /// The `plan` and `library` fields are unused by that function, so an
+    /// empty plan + a stub library is safe.
+    fn make_library_state(zone: &str, sync_token_key: &str) -> LibraryState {
+        let stub_session = Box::new(
+            crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({"records": []})),
+        );
+        LibraryState {
+            library: crate::icloud::photos::PhotoLibrary::new_stub(stub_session),
+            zone_name: zone.to_string(),
+            sync_token_key: sync_token_key.to_string(),
+            plan: crate::commands::AlbumPlan { passes: Vec::new() },
+        }
+    }
+
+    /// CG-5: `more_coming=true` with empty zones must NOT skip the cycle.
+    /// Production logic: `if zones.is_empty() && !more_coming { skip }`.
+    /// A regression that flipped the conjunction would silently skip every
+    /// page-bearing wakeup — silent loss of pending changes.
+    #[tokio::test]
+    async fn check_changes_database_more_coming_does_not_skip() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-2",
+            "moreComing": true,
+            "zones": []
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        // Pre-populate a stored sync token so the function actually
+        // makes the changes/database HTTP call (the `has_token` early
+        // return otherwise short-circuits).
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-1")
+            .await
+            .expect("set token");
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        let skip = check_changes_database(&Some(Arc::clone(&db)), &lib_state, &mut svc).await;
+
+        assert!(
+            !skip,
+            "more_coming=true must not skip the cycle (more pages pending)"
+        );
+        // db_sync_token should have been persisted so the next cycle
+        // continues paging from where we left off.
+        let stored = db
+            .get_metadata("db_sync_token")
+            .await
+            .expect("read db_sync_token")
+            .expect("token persisted");
+        assert_eq!(stored, "db-tok-2");
+    }
+
+    /// CG-6: empty zones + `more_coming=false` must return `skip=true`.
+    /// This is the optimistic short-circuit: Apple confirmed there are no
+    /// pending changes, so we save a full enumeration cycle. A regression
+    /// that flipped this branch would either burn a CloudKit query per
+    /// idle wakeup (cost) or silently skip a real cycle (loss).
+    #[tokio::test]
+    async fn check_changes_database_empty_zones_skips_cycle() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-3",
+            "moreComing": false,
+            "zones": []
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("set token");
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        let skip = check_changes_database(&Some(Arc::clone(&db)), &lib_state, &mut svc).await;
+
+        assert!(skip, "empty zones + more_coming=false must skip the cycle");
+        // The new db_sync_token must still be persisted even on skip:
+        // otherwise the next call re-asks from scratch and we'd get an
+        // unbounded list of all zones.
+        let stored = db
+            .get_metadata("db_sync_token")
+            .await
+            .expect("read db_sync_token")
+            .expect("token persisted on skip");
+        assert_eq!(stored, "db-tok-3");
+    }
+
+    /// Companion to CG-6: a non-empty zones list MUST NOT skip — even
+    /// when more_coming=false. This is the real-work path; pinning it
+    /// alongside the skip path catches a flipped branch in either
+    /// direction.
+    #[tokio::test]
+    async fn check_changes_database_zone_changes_present_does_not_skip() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-4",
+            "moreComing": false,
+            "zones": [
+                {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "ps-tok-new"}
+            ]
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("set token");
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        assert!(!skip, "zones-present response must not skip the cycle");
+    }
+
+    /// CG-6 corner: no stored sync token at all must return false (don't
+    /// skip) without making the HTTP call. Pinning this prevents a future
+    /// refactor that flipped the early return from silently consuming an
+    /// Apple call slot on bootstrap.
+    #[tokio::test]
+    async fn check_changes_database_no_stored_token_does_not_skip() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        // Empty DB — no `sync_token:PrimarySync` set.
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        assert!(!skip, "no stored token must skip-result false (continue)");
+    }
+
+    /// CG-7: a `set_metadata("db_sync_token", ...)` write failure must
+    /// NOT break the cycle. The current implementation logs a warning and
+    /// continues. A regression that propagated the error would crash watch
+    /// mode whenever a sqlite hiccup hit that single write.
+    #[tokio::test]
+    async fn check_changes_database_token_persist_failure_does_not_skip() {
+        use serde_json::json;
+        // StateDb that succeeds on get_metadata("sync_token:...") but
+        // fails on set_metadata("db_sync_token", ...) — the only write
+        // path inside `check_changes_database`.
+        struct PartiallyFailingDb {
+            inner: Arc<dyn state::StateDb>,
+        }
+
+        #[async_trait::async_trait]
+        impl state::StateDb for PartiallyFailingDb {
+            #[cfg(test)]
+            async fn should_download(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn upsert_seen(
+                &self,
+                _: &state::types::AssetRecord,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_downloaded(
+                &self,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_failed(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed_sample(
+                &self,
+                _: u32,
+            ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_pending(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_summary(
+                &self,
+            ) -> Result<state::types::SyncSummary, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_page(
+                &self,
+                _: u64,
+                _: u32,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn complete_sync_run(
+                &self,
+                _: i64,
+                _: &state::types::SyncRunStats,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn begin_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn end_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn list_interrupted_enumerations(
+                &self,
+            ) -> Result<Vec<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_pending_to_failed(
+                &self,
+                _: i64,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_ids(
+                &self,
+            ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_all_known_ids(
+                &self,
+            ) -> Result<std::collections::HashSet<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_checksums(
+                &self,
+            ) -> Result<std::collections::HashMap<(String, String), String>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_attempt_counts(
+                &self,
+            ) -> Result<std::collections::HashMap<String, u32>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_metadata(
+                &self,
+                key: &str,
+            ) -> Result<Option<String>, state::error::StateError> {
+                self.inner.get_metadata(key).await
+            }
+            async fn set_metadata(
+                &self,
+                key: &str,
+                _value: &str,
+            ) -> Result<(), state::error::StateError> {
+                if key == "db_sync_token" {
+                    Err(state::error::StateError::LockPoisoned(
+                        "simulated db_sync_token write failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            async fn delete_metadata_by_prefix(
+                &self,
+                _: &str,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn touch_last_seen_many(
+                &self,
+                _: &[&str],
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn sample_downloaded_paths(
+                &self,
+                _: usize,
+            ) -> Result<Vec<std::path::PathBuf>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn add_asset_album(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_asset_albums(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_asset_people(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_soft_deleted(
+                &self,
+                _: &str,
+                _: Option<chrono::DateTime<chrono::Utc>>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn record_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_metadata_hashes(
+                &self,
+            ) -> Result<std::collections::HashMap<(String, String), String>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_metadata_retry_markers(
+                &self,
+            ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_pending_metadata_rewrites(
+                &self,
+                _: usize,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn update_metadata_hash(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn clear_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn has_downloaded_without_metadata_hash(
+                &self,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+        }
+
+        // Inner DB has the stored sync token so the changes/database call
+        // is actually attempted.
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed token");
+        let db: Arc<dyn state::StateDb> = Arc::new(PartiallyFailingDb { inner });
+
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-bad-write",
+            "moreComing": false,
+            "zones": [
+                {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "ps-tok-new"}
+            ]
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        // The function logs the write failure and continues. zones non-empty
+        // means it must return false (don't skip).
+        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        assert!(
+            !skip,
+            "db_sync_token write failure must not propagate as a skip"
+        );
+    }
+
+    // ── preload_asset_groupings ──────────────────────────────────────
+    //
+    // CG-8: `preload_asset_groupings` must be best-effort: a hiccup
+    // loading people must NOT empty the albums map, and vice versa.
+    // XMP-sidecar runs read this struct; biasing the entire grouping
+    // empty would silently strip metadata from every downloaded photo.
+
+    /// CG-8: when `get_all_asset_albums` succeeds but
+    /// `get_all_asset_people` fails, the result still includes albums.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn preload_asset_groupings_partial_people_failure_keeps_albums() {
+        use std::collections::{HashMap, HashSet};
+
+        struct PartialDb {
+            inner: Arc<dyn state::StateDb>,
+        }
+
+        #[async_trait::async_trait]
+        impl state::StateDb for PartialDb {
+            #[cfg(test)]
+            async fn should_download(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn upsert_seen(
+                &self,
+                _: &state::types::AssetRecord,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_downloaded(
+                &self,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_failed(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed_sample(
+                &self,
+                _: u32,
+            ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_pending(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_summary(
+                &self,
+            ) -> Result<state::types::SyncSummary, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_page(
+                &self,
+                _: u64,
+                _: u32,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn complete_sync_run(
+                &self,
+                _: i64,
+                _: &state::types::SyncRunStats,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn begin_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn end_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn list_interrupted_enumerations(
+                &self,
+            ) -> Result<Vec<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_pending_to_failed(
+                &self,
+                _: i64,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_ids(
+                &self,
+            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_known_ids(&self) -> Result<HashSet<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_checksums(
+                &self,
+            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_attempt_counts(
+                &self,
+            ) -> Result<HashMap<String, u32>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_metadata(
+                &self,
+                _: &str,
+            ) -> Result<Option<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn set_metadata(&self, _: &str, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn delete_metadata_by_prefix(
+                &self,
+                _: &str,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn touch_last_seen_many(
+                &self,
+                _: &[&str],
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn sample_downloaded_paths(
+                &self,
+                _: usize,
+            ) -> Result<Vec<std::path::PathBuf>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn add_asset_album(
+                &self,
+                asset_id: &str,
+                album_name: &str,
+                source: &str,
+            ) -> Result<(), state::error::StateError> {
+                self.inner
+                    .add_asset_album(asset_id, album_name, source)
+                    .await
+            }
+            async fn get_all_asset_albums(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                self.inner.get_all_asset_albums().await
+            }
+            async fn get_all_asset_people(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                Err(state::error::StateError::LockPoisoned(
+                    "simulated people-table read failure".into(),
+                ))
+            }
+            async fn mark_soft_deleted(
+                &self,
+                _: &str,
+                _: Option<chrono::DateTime<chrono::Utc>>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn record_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_metadata_hashes(
+                &self,
+            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_metadata_retry_markers(
+                &self,
+            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_pending_metadata_rewrites(
+                &self,
+                _: usize,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn update_metadata_hash(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn clear_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn has_downloaded_without_metadata_hash(
+                &self,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+        }
+
+        // Seed the inner DB with two album memberships across two assets,
+        // so we can verify the surviving map is non-empty.
+        let inner = make_state_db();
+        inner
+            .add_asset_album("ASSET_A", "Vacation", "icloud")
+            .await
+            .expect("add album A");
+        inner
+            .add_asset_album("ASSET_B", "Family", "icloud")
+            .await
+            .expect("add album B");
+
+        let db: Option<Arc<dyn state::StateDb>> = Some(Arc::new(PartialDb { inner }));
+
+        let groupings = preload_asset_groupings(&db).await;
+        // Albums must survive intact.
+        assert_eq!(
+            groupings.albums.len(),
+            2,
+            "two assets with album memberships expected, got {}",
+            groupings.albums.len()
+        );
+        assert!(groupings.albums.contains_key("ASSET_A"));
+        assert!(groupings.albums.contains_key("ASSET_B"));
+        // People map is empty (the read failed) — but the function still
+        // returns Some groupings rather than panicking.
+        assert!(
+            groupings.people.is_empty(),
+            "people map should be empty when its read failed; got {} entries",
+            groupings.people.len()
+        );
+    }
+
+    /// Companion: `state_db = None` returns an empty grouping struct.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn preload_asset_groupings_no_db_returns_empty() {
+        let groupings = preload_asset_groupings(&None).await;
+        assert!(groupings.albums.is_empty());
+        assert!(groupings.people.is_empty());
+    }
+
+    // CG-9 / CG-21: `should_store_sync_token` is the single decision gate
+    // protecting the sync-token from being advanced after a partial sync or
+    // a dry run. Both situations would lose change events on the next
+    // incremental cycle ("user data is sacred"). The matrix below pins every
+    // (outcome, dry_run) combination so a future refactor can't relax the
+    // contract without a failing test.
+
+    /// CG-9: a partial download failure MUST NOT advance the stored sync
+    /// token. Otherwise the next incremental sync would skip past the
+    /// failed assets' change events and never retry them.
+    #[test]
+    fn sync_loop_partial_failure_does_not_advance_sync_token() {
+        let outcome = download::DownloadOutcome::PartialFailure { failed_count: 3 };
+        assert!(
+            !should_store_sync_token(&outcome, false),
+            "PartialFailure must NOT advance the sync token, even outside dry-run"
+        );
+        // dry_run=true cannot rescue a partial failure either.
+        assert!(
+            !should_store_sync_token(&outcome, true),
+            "PartialFailure + dry_run must still NOT advance the sync token"
+        );
+    }
+
+    /// CG-9 companion: `SessionExpired` is also a non-success outcome and
+    /// MUST NOT advance the token. The cycle aborts mid-stream; the captured
+    /// token may only reflect a subset of the work.
+    #[test]
+    fn sync_loop_session_expired_does_not_advance_sync_token() {
+        let outcome = download::DownloadOutcome::SessionExpired {
+            auth_error_count: 5,
+        };
+        assert!(!should_store_sync_token(&outcome, false));
+        assert!(!should_store_sync_token(&outcome, true));
+    }
+
+    /// CG-21: in `--dry-run`, even a fully-successful pass MUST NOT advance
+    /// the token. Dry-run promises no DB writes that affect the next real
+    /// sync; advancing the token would silently break the next incremental.
+    #[test]
+    fn sync_loop_dry_run_does_not_advance_sync_token() {
+        let outcome = download::DownloadOutcome::Success;
+        assert!(
+            !should_store_sync_token(&outcome, true),
+            "dry_run must NOT advance the sync token even on Success"
+        );
+    }
+
+    /// Positive control: only the (Success, dry_run=false) combination
+    /// advances the token. Pinning this branch prevents a future refactor
+    /// from accidentally inverting the predicate.
+    #[test]
+    fn sync_loop_full_success_outside_dry_run_advances_sync_token() {
+        let outcome = download::DownloadOutcome::Success;
+        assert!(
+            should_store_sync_token(&outcome, false),
+            "(Success, dry_run=false) is the ONLY combination that should advance the token"
+        );
+    }
+
+    // CG-19: `should_wait_for_2fa` decides whether the reauth-time 2FA
+    // branch parks the loop on a code prompt or surfaces the error. In
+    // one-shot mode there is no operator at the keyboard; the error MUST
+    // bubble up so cron / systemd / CI exits non-zero.
+
+    /// CG-19: a 2FA-required error in one-shot (`is_watch_mode = false`)
+    /// MUST NOT cause the helper to return `true`. The caller will then
+    /// surface the error to the user instead of blocking forever on a
+    /// 2FA prompt that no one is watching.
+    #[test]
+    fn run_sync_2fa_required_in_one_shot_returns_error() {
+        let err: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
+        assert!(
+            !should_wait_for_2fa(false, &err),
+            "one-shot + 2FA-required must surface the error, not park on a prompt"
+        );
+    }
+
+    /// CG-19 companion: in watch mode the same error is recoverable;
+    /// the helper returns `true` so the loop can park.
+    #[test]
+    fn run_sync_2fa_required_in_watch_mode_waits() {
+        let err: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
+        assert!(
+            should_wait_for_2fa(true, &err),
+            "watch + 2FA-required must wait on a code"
+        );
+    }
+
+    /// Negative control: any non-2FA error MUST surface in both modes.
+    /// Otherwise the loop could silently swallow a real failure (e.g.
+    /// `FailedLogin`) by treating it as "wait for a code that won't come".
+    #[test]
+    fn run_sync_non_2fa_error_never_waits() {
+        let err: anyhow::Error = auth::error::AuthError::FailedLogin("bad password".into()).into();
+        assert!(
+            !should_wait_for_2fa(false, &err),
+            "one-shot + non-2FA must surface"
+        );
+        assert!(
+            !should_wait_for_2fa(true, &err),
+            "watch + non-2FA must surface; do not park on a code that will never arrive"
+        );
+    }
+
+    /// Negative control: a non-AuthError (e.g. an arbitrary anyhow error
+    /// with no downcast target) MUST NOT be treated as 2FA. Without this
+    /// guard the predicate could mis-park on transport errors.
+    #[test]
+    fn run_sync_non_auth_error_never_waits() {
+        let err: anyhow::Error = anyhow::anyhow!("network unreachable");
+        assert!(!should_wait_for_2fa(false, &err));
+        assert!(!should_wait_for_2fa(true, &err));
     }
 }

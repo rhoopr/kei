@@ -188,6 +188,29 @@ pub(crate) fn available_disk_space(_path: &Path) -> Option<u64> {
     None
 }
 
+/// Minimum free disk space (1 GiB) required before kei is allowed to start a
+/// sync. Below this, even a moderate-size video could push the filesystem
+/// past full mid-write (which is a kei-data-sacred risk: torn writes,
+/// truncated `.part` files, no clean rename target).
+pub(crate) const MIN_FREE_BYTES: u64 = 1_073_741_824;
+
+/// Bail when `available_bytes` is below [`MIN_FREE_BYTES`]. Pure / synchronous
+/// so it can be unit-tested without statvfs or a real filesystem. CG-20.
+///
+/// Production callers compute `available_bytes` from
+/// [`available_disk_space`] (or any future probe) and forward it here so the
+/// abort message is identical regardless of platform.
+pub(crate) fn check_min_disk_space(available_bytes: u64, directory: &Path) -> anyhow::Result<()> {
+    if available_bytes < MIN_FREE_BYTES {
+        let avail_mb = available_bytes / (1024 * 1024);
+        anyhow::bail!(
+            "Insufficient disk space: only {avail_mb} MiB available in {} (minimum 1 GiB)",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
 /// Build a password provider closure from a [`password::PasswordSource`].
 ///
 /// The source is evaluated lazily on each call — for `Command` and `File`
@@ -864,5 +887,55 @@ mod tests {
             token_clone.cancel();
         });
         assert_eq!(run_watch_loop(&shutdown_token, Some(3600)).await, 1);
+    }
+
+    /// CG-20: kei must abort BEFORE auth (and well before any download)
+    /// when the data directory has < 1 GiB free. A sync that fills the
+    /// disk mid-write leaves orphan `.part` files and a half-truncated
+    /// final file -- the worst-case for the "atomic writes" invariant.
+    ///
+    /// Parameterised over the entire span around the threshold:
+    ///   0 bytes               -> bail (extreme)
+    ///   1023 MiB              -> bail (just below 1 GiB)
+    ///   1 GiB exactly         -> ok (boundary is inclusive on the OK side)
+    ///   10 GiB                -> ok (well above)
+    #[test]
+    fn run_sync_low_disk_space_aborts_before_auth() {
+        let dir = std::path::Path::new("/tmp/claude/cg-20-disk");
+
+        // Below threshold: bail.
+        for &low in &[0u64, 1023 * 1024 * 1024] {
+            let r = check_min_disk_space(low, dir);
+            assert!(
+                r.is_err(),
+                "{low} bytes is below 1 GiB; check_min_disk_space must bail"
+            );
+            let msg = format!("{:#}", r.expect_err("expected Err"));
+            assert!(
+                msg.contains("Insufficient disk space"),
+                "error message must call out the disk-space reason; got: {msg}"
+            );
+            assert!(
+                msg.contains("minimum 1 GiB"),
+                "error message must state the minimum so operators know what to free; got: {msg}"
+            );
+        }
+
+        // At and above threshold: ok.
+        for &ok in &[MIN_FREE_BYTES, 10 * 1024 * 1024 * 1024] {
+            assert!(
+                check_min_disk_space(ok, dir).is_ok(),
+                "{ok} bytes is at or above 1 GiB; check_min_disk_space must succeed"
+            );
+        }
+    }
+
+    /// CG-20 boundary: confirm `MIN_FREE_BYTES` is exactly 1 GiB. A future
+    /// edit that nudges this constant changes operator-visible behavior;
+    /// pin the value so the change is intentional.
+    #[test]
+    fn check_min_disk_space_threshold_is_one_gib() {
+        assert_eq!(MIN_FREE_BYTES, 1_073_741_824);
+        assert_eq!(MIN_FREE_BYTES, 1024 * 1024 * 1024);
     }
 }
