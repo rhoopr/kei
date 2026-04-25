@@ -1806,11 +1806,7 @@ pub(super) async fn run_download_pass(
     let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
 
-    type DownloadResult = (
-        DownloadTask,
-        Result<(bool, String, Option<String>, u64, u64)>,
-    );
-    let results: Vec<DownloadResult> = stream::iter(tasks)
+    let mut download_stream = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
@@ -1831,9 +1827,7 @@ pub(super) async fn run_download_pass(
                 (task, result)
             }
         })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
+        .buffer_unordered(concurrency);
 
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
@@ -1842,7 +1836,11 @@ pub(super) async fn run_download_pass(
     let mut bytes_downloaded_total: u64 = 0;
     let mut disk_bytes_total: u64 = 0;
 
-    for (task, result) in results {
+    // Stream results as each task completes so state writes and progress-bar
+    // updates fire per-item. Collecting first would freeze the progress bar
+    // until the last download finished and defer every mark_downloaded to
+    // the end of the pass — defeating the point of parallel cleanup.
+    while let Some((task, result)) = download_stream.next().await {
         match &result {
             Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
                 bytes_downloaded_total += bytes_dl;
