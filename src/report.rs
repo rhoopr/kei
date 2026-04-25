@@ -188,17 +188,27 @@ pub(crate) fn sync_status_str(
 }
 
 /// Write a JSON report to the given path atomically.
-pub(crate) fn write_report(path: &Path, report: &SyncReport) -> anyhow::Result<()> {
+///
+/// Serialization runs synchronously (small — typically a few KB), but the
+/// filesystem write + rename are pushed to the blocking pool so this can
+/// be called from async contexts without stalling a tokio worker.
+pub(crate) async fn write_report(path: &Path, report: &SyncReport) -> anyhow::Result<()> {
+    use anyhow::Context;
     let json = serde_json::to_string_pretty(report)?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let temp_path = parent.join(format!(".kei-report-{}.tmp", std::process::id()));
 
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let temp_path = parent.join(format!(".kei-report-{}.tmp", std::process::id()));
+        std::fs::write(&temp_path, json.as_bytes())
+            .with_context(|| format!("writing report to {}", temp_path.display()))?;
+        atomic_install(&temp_path, &path)
+            .with_context(|| format!("installing report at {}", path.display()))?;
 
-    std::fs::write(&temp_path, json.as_bytes())?;
-    atomic_install(&temp_path, path)?;
-
-    tracing::debug!(path = %path.display(), "Wrote JSON report");
-    Ok(())
+        tracing::debug!(path = %path.display(), "Wrote JSON report");
+        Ok(())
+    })
+    .await?
 }
 
 #[cfg(test)]
@@ -463,8 +473,8 @@ mod tests {
         assert_eq!(parsed["failed_assets_truncated"], 847);
     }
 
-    #[test]
-    fn write_report_creates_valid_json_file() {
+    #[tokio::test]
+    async fn write_report_creates_valid_json_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.json");
 
@@ -500,7 +510,7 @@ mod tests {
             failed_assets_truncated: 0,
         };
 
-        write_report(&path, &report).expect("write_report");
+        write_report(&path, &report).await.expect("write_report");
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");

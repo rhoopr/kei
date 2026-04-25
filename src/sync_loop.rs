@@ -791,7 +791,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     failed_assets,
                     failed_assets_truncated,
                 };
-                if let Err(e) = crate::report::write_report(report_path, &report) {
+                if let Err(e) = crate::report::write_report(report_path, &report).await {
                     tracing::warn!(error = %e, path = %report_path.display(), "Failed to write JSON report");
                 }
             }

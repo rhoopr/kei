@@ -413,7 +413,14 @@ async fn attempt_download<C: DownloadClient>(
     // Validate content looks like actual media, not an HTML error page.
     // Apple's CDN occasionally returns HTTP 200 with HTML (rate limit, CAPTCHA,
     // service unavailable) which would otherwise be saved as the final file.
-    if let Err(e) = validate_downloaded_content(part_path, download_path) {
+    let part_owned = part_path.to_path_buf();
+    let download_owned = download_path.to_path_buf();
+    let validation = tokio::task::spawn_blocking(move || {
+        validate_downloaded_content(&part_owned, &download_owned)
+    })
+    .await
+    .map_err(|e| DownloadError::Disk(Box::new(std::io::Error::other(e))))?;
+    if let Err(e) = validation {
         let _ = fs::remove_file(&part_path).await;
         return Err(e);
     }

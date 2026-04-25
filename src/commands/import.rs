@@ -185,7 +185,7 @@ pub(crate) async fn run_import_existing(
                 None,
             );
 
-            let Ok(metadata) = std::fs::metadata(&expected_path) else {
+            let Ok(metadata) = tokio::fs::metadata(&expected_path).await else {
                 unmatched += 1;
                 continue;
             };
