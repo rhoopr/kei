@@ -3231,7 +3231,7 @@ mod tests {
         let after = crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.get();
 
         assert!(
-            after >= before + 1,
+            after > before,
             "counter should advance by at least 1 (other parallel tests may also \
              increment); got before={before} after={after}"
         );
