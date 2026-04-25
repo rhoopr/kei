@@ -442,4 +442,122 @@ mod tests {
         assert!(!is_heif_path(Path::new("/a/b.mov")));
         assert!(!is_heif_path(Path::new("/a/b")));
     }
+
+    // ── extract_xmp_bytes: malformed input must not panic, must return None ──
+    //
+    // The original suite only covered `is_heif_path`; the parser entry points
+    // (`extract_xmp_bytes`, `insert_xmp`) had no malformed-input regression.
+    // A regression that panicked on truncated bytes would crash the metadata
+    // worker on any partial download — silent data loss in the surrounding
+    // sync. These pin the "return None / bail" contract for the universe of
+    // garbage inputs the wild can produce.
+
+    #[test]
+    fn extract_xmp_bytes_empty_input_returns_none() {
+        // Zero bytes is the most basic malformed case.
+        assert!(extract_xmp_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn extract_xmp_bytes_random_bytes_returns_none() {
+        // Plausible-looking-but-not-HEIF blob: must not panic, must return
+        // None. The previous mp4_atom decode loop swallowed errors via
+        // `if let Ok(Some(...)) = ...`, but a future refactor that switched
+        // to `.unwrap()` would explode on this input.
+        let blob: Vec<u8> = (0..256_u16).map(|i| (i & 0xff) as u8).collect();
+        assert!(extract_xmp_bytes(&blob).is_none());
+    }
+
+    #[test]
+    fn extract_xmp_bytes_truncated_atom_header_returns_none() {
+        // 4 bytes is shorter than any valid ISO-BMFF box header (8 bytes).
+        // Decoder must not panic on the short read.
+        let bytes = [0x00, 0x00, 0x00, 0x18];
+        assert!(extract_xmp_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn extract_xmp_bytes_no_meta_box_returns_none() {
+        // A syntactically valid `ftyp` atom with no following `meta` — there
+        // is no XMP to find, so the function must return None without error.
+        // ftyp box: size=0x18 (24), kind=ftyp, major_brand=heic, minor_version=0,
+        // compatible_brands=[heic, mif1].
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&0x18_u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(b"mif1");
+        assert_eq!(bytes.len(), 0x18);
+        assert!(extract_xmp_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn extract_xmp_bytes_atom_with_oversized_length_field_returns_none() {
+        // size field claims 0xFFFFFFFF bytes (way past end of buffer). A
+        // robust parser must reject this, not allocate or read out of bounds.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&0xFFFF_FFFF_u32.to_be_bytes());
+        bytes.extend_from_slice(b"meta");
+        bytes.extend_from_slice(&[0; 16]); // payload tail (will be cut short)
+        assert!(extract_xmp_bytes(&bytes).is_none());
+    }
+
+    // ── insert_xmp: rejects inputs without a meta box ──
+    //
+    // The error path used to be implicit ("anyhow bail somewhere in the
+    // pipeline"); this pins it to the precise "HEIC has no meta box"
+    // message so a future refactor that drops or rewords the bail leaves
+    // a test failure rather than a silent regression.
+
+    #[test]
+    fn insert_xmp_returns_error_on_input_with_no_meta_box() {
+        // Same ftyp-only fixture as above — no meta box present.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&0x18_u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(b"mif1");
+
+        let mut out: Vec<u8> = Vec::new();
+        let result = insert_xmp(&bytes, b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>", &mut out);
+        let err = result.expect_err("insert_xmp must reject input without a meta box");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("meta box") || msg.contains("HEIC"),
+            "error message must name the missing structure; got: {msg}"
+        );
+        // Critical: nothing should have been written to the writer.
+        assert!(
+            out.is_empty(),
+            "no bytes should be flushed when input has no meta box; got {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn insert_xmp_returns_error_on_unparsable_tail() {
+        // ftyp box followed by 3 stray bytes that can't form a valid atom
+        // header. The parser must surface this via `bail!` rather than
+        // silently truncating output.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&0x18_u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(b"mif1");
+        // Tail: too short to be an atom header.
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        let mut out: Vec<u8> = Vec::new();
+        let result = insert_xmp(&bytes, b"<x/>", &mut out);
+        assert!(
+            result.is_err(),
+            "insert_xmp must surface parse errors on unparsable tail"
+        );
+    }
 }
