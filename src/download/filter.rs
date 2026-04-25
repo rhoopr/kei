@@ -2098,6 +2098,83 @@ mod tests {
         );
     }
 
+    /// CG-13: two assets whose filenames differ only in case (`IMG_0001.JPG`
+    /// vs `img_0001.jpg`) must NOT silently overwrite each other on a
+    /// case-insensitive filesystem. The collision detector must either
+    /// rename one with a disambiguation suffix or skip the duplicate; in
+    /// no case may both produce identical claimed paths (which would
+    /// cause one's bytes to clobber the other's at `rename` time —
+    /// silent data loss).
+    #[test]
+    fn filter_case_only_filename_collision_yields_distinct_claimed_paths() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.directory = std::sync::Arc::from(dir.path());
+
+        // Two assets, different IDs + different checksums (so they're
+        // genuinely distinct content), but filenames that differ only in
+        // case. On macOS / Windows these resolve to the same on-disk file.
+        let asset_a = TestPhotoAsset::new("CASE_ONE")
+            .filename("IMG_0001.JPG")
+            .orig_size(2048)
+            .orig_url("https://p01.icloud-content.com/photos/orig/a")
+            .orig_checksum("aaaa1111")
+            .build();
+
+        let asset_b = TestPhotoAsset::new("CASE_TWO")
+            .filename("img_0001.jpg")
+            .orig_size(4096)
+            .orig_url("https://p01.icloud-content.com/photos/orig/b")
+            .orig_checksum("bbbb2222")
+            .build();
+
+        let mut claimed_paths = FxHashMap::default();
+        let mut dir_cache = paths::DirCache::new();
+
+        let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
+        assert_eq!(tasks_a.len(), 1, "first asset should resolve to one task");
+        let path_a = tasks_a[0].download_path.clone();
+
+        let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
+        assert_eq!(
+            tasks_b.len(),
+            1,
+            "second asset should also resolve to one task"
+        );
+        let path_b = tasks_b[0].download_path.clone();
+
+        // Critical invariant: the on-disk paths must NOT case-insensitively
+        // match. NormalizedPath does the case-fold; pin its result here.
+        let np_a = NormalizedPath::new(path_a.clone());
+        let np_b = NormalizedPath::new(path_b.clone());
+        assert_ne!(
+            np_a,
+            np_b,
+            "case-only-collision filenames must produce case-folded-distinct \
+             paths to avoid silent overwrite. Got A={} B={}",
+            path_a.display(),
+            path_b.display()
+        );
+
+        // And the raw paths must also differ — the disambiguation must
+        // be present in at least the filename portion.
+        assert_ne!(
+            path_a,
+            path_b,
+            "case-only-collision filenames must produce literally-distinct \
+             paths (got A=B={})",
+            path_a.display()
+        );
+
+        // claimed_paths should now have both entries.
+        assert_eq!(
+            claimed_paths.len(),
+            2,
+            "claimed_paths must contain both case-distinct entries; got {}",
+            claimed_paths.len()
+        );
+    }
+
     /// A path pre-seeded into claimed_paths (as a startup load from the
     /// state DB's downloaded rows would do) must case-insensitively match
     /// an incoming asset's target and dedupe it — otherwise cross-batch

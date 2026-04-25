@@ -2044,6 +2044,104 @@ mod tests {
         assert_eq!(promoted, 0);
     }
 
+    /// CG-14: promotion is idempotent — once an orphan has been flipped to
+    /// `interrupted`, a second invocation must return 0 rows promoted and
+    /// must not re-touch the row. The current implementation guards via
+    /// `WHERE status = 'running'`, but no test pinned the second-call
+    /// behavior. A future refactor that broadened the WHERE clause (e.g.
+    /// `status != 'completed'`) would silently double-promote rows the
+    /// next time init runs.
+    #[tokio::test]
+    async fn promote_orphaned_sync_runs_idempotent_second_call_promotes_zero() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Three running rows; flush them once.
+        let a = db.start_sync_run().await.unwrap();
+        let b = db.start_sync_run().await.unwrap();
+        let c = db.start_sync_run().await.unwrap();
+        let first = db.promote_orphaned_sync_runs().await.unwrap();
+        assert_eq!(first, 3, "first call should flip all 3 running rows");
+
+        // Capture the post-promote interrupted timestamps so we can verify
+        // the second call doesn't re-touch them. Scope the lock guard so
+        // it never sits across an .await on the next line.
+        let (snap_a, snap_b, snap_c) = {
+            let conn = db.acquire_lock("snapshot_after_first_promote").unwrap();
+            let read_run = |id: i64| {
+                let (status, interrupted): (String, i32) = conn
+                    .query_row(
+                        "SELECT status, interrupted FROM sync_runs WHERE id = ?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                (status, interrupted)
+            };
+            (read_run(a), read_run(b), read_run(c))
+        };
+        assert_eq!(snap_a, ("interrupted".to_string(), 1));
+        assert_eq!(snap_b, ("interrupted".to_string(), 1));
+        assert_eq!(snap_c, ("interrupted".to_string(), 1));
+
+        // Second call must be a no-op.
+        let second = db.promote_orphaned_sync_runs().await.unwrap();
+        assert_eq!(
+            second, 0,
+            "second call must not re-promote already-interrupted rows"
+        );
+
+        // And no row's state changed.
+        let after_a: (String, i32) = {
+            let conn = db.acquire_lock("snapshot_after_second_promote").unwrap();
+            conn.query_row(
+                "SELECT status, interrupted FROM sync_runs WHERE id = ?1",
+                [a],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(after_a, ("interrupted".to_string(), 1));
+    }
+
+    /// CG-14 corollary: a freshly-completed `sync_runs` row in between
+    /// invocations must not be promoted. Pins the "WHERE status = 'running'"
+    /// invariant against churn — a misclassified completed run would
+    /// silently corrupt operator dashboards.
+    #[tokio::test]
+    async fn promote_orphaned_sync_runs_does_not_touch_completed_rows() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // First batch: one row, complete it cleanly.
+        let r1 = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            assets_seen: 1,
+            assets_downloaded: 1,
+            assets_failed: 0,
+            interrupted: false,
+        };
+        db.complete_sync_run(r1, &stats).await.unwrap();
+
+        // Second batch: another row, leave running.
+        let r2 = db.start_sync_run().await.unwrap();
+        let promoted = db.promote_orphaned_sync_runs().await.unwrap();
+        assert_eq!(promoted, 1, "only the running row should be promoted");
+
+        // r1 must still be complete.
+        let conn = db.acquire_lock("verify").unwrap();
+        let s1: String = conn
+            .query_row("SELECT status FROM sync_runs WHERE id = ?1", [r1], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(s1, "complete");
+        let s2: String = conn
+            .query_row("SELECT status FROM sync_runs WHERE id = ?1", [r2], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(s2, "interrupted");
+    }
+
     // ── enum_in_progress markers ───────────────────────────────────────────
 
     #[tokio::test]

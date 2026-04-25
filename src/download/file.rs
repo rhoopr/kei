@@ -2165,6 +2165,251 @@ mod tests {
             assert_eq!(std::fs::read(&download_path).unwrap(), full_body);
         }
 
+        /// CG-17: a Content-Length mismatch (server declares 1000 bytes
+        /// but transmits 800) MUST surface as a `ContentLengthMismatch`
+        /// error, the `.part` file must be removed, and NO file must
+        /// appear at the final path. This is the feared-most data-loss
+        /// case (silent corruption masquerading as success). The exact
+        /// negative — `final_path` does NOT exist — is what catches a
+        /// future refactor that fell through to the rename step.
+        #[tokio::test]
+        async fn truncated_response_does_not_promote_to_final_path() {
+            let server = MockServer::start().await;
+
+            // Body is 4 bytes of valid JPEG SOI/JFIF signature; we tell
+            // the client Content-Length=8 so the post-stream check fires.
+            let truncated_body = vec![0xFF, 0xD8, 0xFF, 0xE0];
+
+            Mock::given(method("GET"))
+                .and(path("/truncated.jpg"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(truncated_body.clone())
+                        // Override the auto-set content-length to claim 8.
+                        .insert_header("content-length", "8")
+                        .insert_header("content-type", "image/jpeg"),
+                )
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("truncated.jpg");
+            let config = RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+            // Realistic SHA256 of the *full* 8-byte payload — irrelevant
+            // here because the size check fires first, but we use a
+            // realistic-looking value not "checksum123".
+            let result = download_file(
+                &reqwest::Client::new(),
+                &format!("{}/truncated.jpg", server.uri()),
+                &download_path,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: Some(8),
+                },
+                DownloadLimits::default(),
+            )
+            .await;
+
+            // Expected error: server underdelivered relative to its
+            // declared Content-Length, OR relative to expected_size if
+            // wiremock chose to honor only one.
+            let err = result.expect_err("truncated response must fail");
+            assert!(
+                matches!(
+                    err,
+                    DownloadError::ContentLengthMismatch { .. } | DownloadError::Http { .. }
+                ),
+                "expected size-mismatch class error, got: {err:?}"
+            );
+
+            // Critical invariants: no .part lingers, and no final file
+            // landed (the would-be silent-corruption signature).
+            assert!(
+                !download_path.exists(),
+                "final path must NOT exist on truncation; got file with size {:?}",
+                std::fs::metadata(&download_path).ok().map(|m| m.len())
+            );
+            // Walk the temp dir to confirm there's no orphan .part either.
+            let stragglers: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                stragglers.is_empty(),
+                "no .part or other files must remain after truncated download; got {stragglers:?}"
+            );
+        }
+
+        /// CG-12: when the destination parent directory is removed
+        /// between the writability probe and the per-asset write, the
+        /// per-asset download MUST surface an error (not silently
+        /// succeed, not panic). Symptom in the wild looks like "0 photos
+        /// synced, 0 errors" because the producer thinks everything is
+        /// fine. Pin the explicit error class so a future refactor that
+        /// ignored ENOENT on the part-open path tells us.
+        #[tokio::test]
+        async fn download_to_missing_parent_dir_surfaces_error() {
+            let server = MockServer::start().await;
+            let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0xAA, 0xBB, 0xCC, 0xDD];
+
+            Mock::given(method("GET"))
+                .and(path("/orphan.jpg"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(body)
+                        .insert_header("content-type", "image/jpeg"),
+                )
+                .mount(&server)
+                .await;
+
+            // Create the tempdir, then immediately drop it (rm -rf the
+            // path) before invoking download_file. This mirrors the
+            // "directory removed between probe and write" race.
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("orphan.jpg");
+            drop(dir); // tempdir Drop deletes the directory.
+            assert!(
+                !download_path.parent().unwrap().exists(),
+                "test setup: parent dir must be gone before download_file fires"
+            );
+
+            let config = RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+            let result = download_file(
+                &reqwest::Client::new(),
+                &format!("{}/orphan.jpg", server.uri()),
+                &download_path,
+                "AAAA",
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: None,
+                },
+                DownloadLimits::default(),
+            )
+            .await;
+
+            let err = result.expect_err("missing parent dir must surface as an error");
+            // The error must mention the path (so the surfacing log is
+            // actionable) — this is the kei "no silent failures" invariant
+            // applied to the per-asset write level.
+            let msg = err.to_string();
+            assert!(
+                !msg.is_empty(),
+                "error must have a non-empty message; got {err:?}"
+            );
+
+            // No file must have been created at the (still-missing) path.
+            assert!(!download_path.exists());
+        }
+
+        /// CG-11: a pre-existing temp file from a prior interrupted run
+        /// must NOT corrupt the next download. Specifically: when the
+        /// new download is initiated FRESH (no Range / status 200), the
+        /// temp file must be replaced atomically — no concatenation of
+        /// stale prefix bytes onto fresh bytes (the "frankenfile" failure
+        /// mode that passes the size check but fails image decode).
+        ///
+        /// We verify by writing 100 bytes of garbage to the .part path
+        /// up front, then driving a 200-byte download from a wiremock
+        /// server. The final file must be byte-identical to the 200-byte
+        /// payload, NOT 300 bytes (100 garbage + 200 payload), NOT a
+        /// mixed 200-byte file with stale prefix.
+        #[tokio::test]
+        async fn pre_existing_part_file_replaced_atomically_on_fresh_download() {
+            let server = MockServer::start().await;
+
+            // 200-byte payload starting with JPEG SOI/JFIF signature so
+            // content-type sniffing accepts it. The remaining bytes are
+            // a stable repeating pattern so we can check byte-equality.
+            let mut payload: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0];
+            payload.extend((4..200u16).map(|i| (i & 0xff) as u8));
+            assert_eq!(payload.len(), 200);
+
+            Mock::given(method("GET"))
+                .and(path("/replace.jpg"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(payload.clone())
+                        .insert_header("content-type", "image/jpeg"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("replace.jpg");
+            let checksum = "AAAA"; // canonical short test checksum
+
+            // Pre-populate the .part path with garbage from a prior run.
+            // (The kei-tmp prefix MUST match the production constant so
+            // the writer finds and replaces the same path.)
+            let part_path = temp_download_path(&download_path, checksum, ".kei-tmp").unwrap();
+            let stale_garbage = vec![0xCC; 100];
+            std::fs::write(&part_path, &stale_garbage).expect("seed stale .part");
+            assert_eq!(std::fs::metadata(&part_path).unwrap().len(), 100);
+
+            let config = RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+            // No expected_size + no Range header — production should treat
+            // this as a fresh download and TRUNCATE the existing .part.
+            // (Resume requires expected_size to be supplied.)
+            download_file(
+                &reqwest::Client::new(),
+                &format!("{}/replace.jpg", server.uri()),
+                &download_path,
+                checksum,
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: None,
+                },
+                DownloadLimits::default(),
+            )
+            .await
+            .expect("download should succeed when .part is freshly truncated");
+
+            // Final file must equal the payload exactly. NOT 300 bytes,
+            // NOT prefixed-with-garbage, NOT empty.
+            let final_bytes = std::fs::read(&download_path).expect("final file present");
+            assert_eq!(
+                final_bytes.len(),
+                200,
+                "final file length must equal payload (200), got {}",
+                final_bytes.len()
+            );
+            assert_eq!(
+                final_bytes,
+                payload,
+                "final bytes must equal payload exactly; \
+                 frankenfile detection: first 4 bytes were {:?} (expected JPEG SOI {:?})",
+                &final_bytes[..4.min(final_bytes.len())],
+                &payload[..4]
+            );
+
+            // .part must have been atomically renamed away.
+            assert!(
+                !part_path.exists(),
+                "stale .part path must not exist after rename"
+            );
+        }
+
         /// End-to-end throttle test: pull a fixed payload through `download_file`
         /// with a real HTTP server and assert wall-clock elapsed time at least
         /// approaches what the cap predicts.

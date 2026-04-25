@@ -261,6 +261,30 @@ impl PhotosService {
 }
 
 #[cfg(test)]
+impl PhotosService {
+    /// Test-only constructor that bypasses [`Self::new`]'s indexing
+    /// check. Mirrors the `make_service` helper used by this module's
+    /// own tests, but visible to other crate-internal test modules so
+    /// they can drive `changes_database`, `fetch_*_libraries`, etc.
+    /// without spinning up real CloudKit traffic.
+    pub(crate) fn for_testing(
+        session: Box<dyn PhotosSession>,
+        params: HashMap<String, Value>,
+    ) -> Self {
+        let dummy_library = PhotoLibrary::new_stub(session.clone_box());
+        Self {
+            service_root: "https://p00-ckdatabasews.icloud.com".to_string(),
+            session,
+            params: Arc::new(params),
+            primary_library: dummy_library,
+            private_libraries: None,
+            shared_libraries: None,
+            retry_config: RetryConfig::default(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;

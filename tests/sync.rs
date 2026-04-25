@@ -1379,16 +1379,27 @@ fn sync_incremental_second_run_skips_download() {
 
 /// Verify `--watch-with-interval` drives multiple sync cycles within one run.
 ///
-/// Runs at the minimum interval (60 s) long enough to observe two cycle starts,
-/// then kills the process and counts the `sync_loop: Starting kei` markers.
+/// Runs at the minimum allowed interval (60 s, enforced by the CLI parser),
+/// streams stderr line-by-line on a background thread, and exits as soon as
+/// the second `Waiting before next cycle` marker is observed. Total wall
+/// time is bounded by a hard 150 s deadline so a stuck watch loop fails the
+/// test rather than hanging the suite.
+///
+/// Earlier revisions used `thread::sleep(135s)` then matched on a captured
+/// stderr blob; that pattern silently regressed if the interval was honored
+/// but the marker text changed (or vice versa) and burned the full window
+/// even on success. The streaming reader catches both without adding cost.
 #[test]
 #[ignore]
 fn sync_watch_runs_multiple_cycles() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
-        use std::io::Read;
+        use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Instant;
 
         let download_dir = tempdir().expect("tempdir");
         let bin = env!("CARGO_BIN_EXE_kei");
@@ -1416,23 +1427,66 @@ fn sync_watch_runs_multiple_cycles() {
             .spawn()
             .expect("spawn kei");
 
-        // First cycle runs at t=0, second at t=60, buffer for download time.
-        std::thread::sleep(Duration::from_secs(135));
-        let _ = child.kill();
+        // Stream stderr on a worker so the test can react as soon as the
+        // second cycle marker appears, instead of waiting for a fixed sleep.
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (tx, rx) = mpsc::channel::<String>();
+        let reader_handle = thread::spawn(move || {
+            let mut buffered = BufReader::new(stderr);
+            let mut accum = String::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match buffered.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        accum.push_str(&line);
+                        // Best effort: send each line. Drop on send failure
+                        // (test thread already exited, e.g. assertion fired).
+                        let _ = tx.send(line.clone());
+                    }
+                    Err(_) => break,
+                }
+            }
+            accum
+        });
 
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
+        // Watch the channel for 2 marker hits, bounded by 150 s wall time.
+        // 60 s * 2 cycles + buffer for one cycle of download work.
+        let deadline = Instant::now() + Duration::from_secs(150);
+        let mut markers = 0_usize;
+        let mut snippet = String::new();
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    snippet.push_str(&line);
+                    if strip_ansi(&line).contains("Waiting before next cycle") {
+                        markers += 1;
+                        if markers >= 2 {
+                            break;
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
-        let _ = child.wait();
 
-        // Each cycle logs "Waiting before next cycle" at the end; 2 cycles → 2 markers.
-        let clean = strip_ansi(&stderr);
-        let cycles = clean.matches("Waiting before next cycle").count();
+        let _ = child.kill();
+        let _ = child.wait();
+        // The reader thread will see EOF after kill and join cleanly.
+        let full_stderr = reader_handle.join().unwrap_or_default();
+
         assert!(
-            cycles >= 2,
-            "watch should drive at least 2 cycles, got {cycles}. stderr head: {}",
-            clean.chars().take(2000).collect::<String>()
+            markers >= 2,
+            "watch should drive at least 2 cycles, got {markers}. \
+             snippet: {}\n--- full stderr (first 2000 chars) ---\n{}",
+            strip_ansi(&snippet).chars().take(800).collect::<String>(),
+            strip_ansi(&full_stderr)
+                .chars()
+                .take(2000)
+                .collect::<String>()
         );
     });
 }

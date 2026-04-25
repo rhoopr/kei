@@ -107,6 +107,34 @@ pub struct SyncStats {
     pub rate_limited: usize,
 }
 
+impl SyncStats {
+    /// Add `other` into `self`, field by field. Used by the per-cycle loop in
+    /// `sync_loop::run_cycle` to fold each library's stats into a cycle-wide
+    /// total. CG-15.
+    ///
+    /// All numeric counters sum; `interrupted` ORs (any library being
+    /// interrupted means the cycle was interrupted); `skipped` delegates to
+    /// [`SkipBreakdown::accumulate`].
+    ///
+    /// Adding a new field to `SyncStats` requires updating this method too --
+    /// otherwise the new counter silently zeros out across multi-library
+    /// syncs.
+    pub fn accumulate(&mut self, other: &SyncStats) {
+        self.assets_seen += other.assets_seen;
+        self.downloaded += other.downloaded;
+        self.failed += other.failed;
+        self.skipped.accumulate(&other.skipped);
+        self.bytes_downloaded += other.bytes_downloaded;
+        self.disk_bytes_written += other.disk_bytes_written;
+        self.exif_failures += other.exif_failures;
+        self.state_write_failures += other.state_write_failures;
+        self.enumeration_errors += other.enumeration_errors;
+        self.elapsed_secs += other.elapsed_secs;
+        self.interrupted = self.interrupted || other.interrupted;
+        self.rate_limited += other.rate_limited;
+    }
+}
+
 /// Per-reason breakdown of skipped assets.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SkipBreakdown {
@@ -136,6 +164,22 @@ impl SkipBreakdown {
             + self.duplicates
             + self.retry_exhausted
             + self.retry_only
+    }
+
+    /// Add `other` into `self` field-by-field. Mirrors
+    /// [`SyncStats::accumulate`] for the nested skip breakdown.
+    pub fn accumulate(&mut self, other: &SkipBreakdown) {
+        self.by_state += other.by_state;
+        self.on_disk += other.on_disk;
+        self.by_media_type += other.by_media_type;
+        self.by_date_range += other.by_date_range;
+        self.by_live_photo += other.by_live_photo;
+        self.by_filename += other.by_filename;
+        self.by_excluded_album += other.by_excluded_album;
+        self.ampm_variant += other.ampm_variant;
+        self.duplicates += other.duplicates;
+        self.retry_exhausted += other.retry_exhausted;
+        self.retry_only += other.retry_only;
     }
 }
 
@@ -2995,5 +3039,140 @@ mod tests {
             !ctx.known_ids.contains("brand_new_asset"),
             "new asset should not be in known_ids in retry_only mode"
         );
+    }
+
+    /// CG-15: `SyncStats::accumulate` is the sole sum used to fold per-library
+    /// stats into a cycle-wide total. Pin every counter so a future refactor
+    /// (or a new field added without updating `accumulate`) cannot silently
+    /// drop one. Touches every numeric field plus `interrupted` plus the
+    /// nested `SkipBreakdown`.
+    ///
+    /// The earlier inline accumulator in `sync_loop::run_cycle` missed
+    /// `rate_limited` -- this test pins that field too so the bug cannot
+    /// regress.
+    #[test]
+    fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
+        let lib_a = SyncStats {
+            assets_seen: 10,
+            downloaded: 4,
+            failed: 1,
+            skipped: SkipBreakdown {
+                by_state: 2,
+                on_disk: 3,
+                by_media_type: 4,
+                by_date_range: 5,
+                by_live_photo: 6,
+                by_filename: 7,
+                by_excluded_album: 8,
+                ampm_variant: 9,
+                duplicates: 10,
+                retry_exhausted: 11,
+                retry_only: 12,
+            },
+            bytes_downloaded: 1_000,
+            disk_bytes_written: 900,
+            exif_failures: 1,
+            state_write_failures: 2,
+            enumeration_errors: 3,
+            elapsed_secs: 1.5,
+            interrupted: false,
+            rate_limited: 7,
+        };
+
+        let lib_b = SyncStats {
+            assets_seen: 20,
+            downloaded: 11,
+            failed: 2,
+            skipped: SkipBreakdown {
+                by_state: 1,
+                on_disk: 1,
+                by_media_type: 1,
+                by_date_range: 1,
+                by_live_photo: 1,
+                by_filename: 1,
+                by_excluded_album: 1,
+                ampm_variant: 1,
+                duplicates: 1,
+                retry_exhausted: 1,
+                retry_only: 1,
+            },
+            bytes_downloaded: 2_500,
+            disk_bytes_written: 2_400,
+            exif_failures: 4,
+            state_write_failures: 5,
+            enumeration_errors: 6,
+            elapsed_secs: 0.75,
+            interrupted: true,
+            rate_limited: 3,
+        };
+
+        let mut acc = SyncStats::default();
+        acc.accumulate(&lib_a);
+        acc.accumulate(&lib_b);
+
+        assert_eq!(acc.assets_seen, 30, "assets_seen must sum");
+        assert_eq!(acc.downloaded, 15, "downloaded must sum");
+        assert_eq!(acc.failed, 3, "failed must sum");
+        assert_eq!(acc.bytes_downloaded, 3_500, "bytes_downloaded must sum");
+        assert_eq!(acc.disk_bytes_written, 3_300, "disk_bytes_written must sum");
+        assert_eq!(acc.exif_failures, 5, "exif_failures must sum");
+        assert_eq!(acc.state_write_failures, 7, "state_write_failures must sum");
+        assert_eq!(acc.enumeration_errors, 9, "enumeration_errors must sum");
+        assert!(
+            (acc.elapsed_secs - 2.25).abs() < 1e-9,
+            "elapsed_secs must sum (got {})",
+            acc.elapsed_secs
+        );
+        assert!(
+            acc.interrupted,
+            "interrupted must OR -- any library interrupted -> cycle interrupted"
+        );
+        assert_eq!(
+            acc.rate_limited, 10,
+            "rate_limited must sum -- pre-fix the inline accumulator dropped this field"
+        );
+
+        assert_eq!(acc.skipped.by_state, 3);
+        assert_eq!(acc.skipped.on_disk, 4);
+        assert_eq!(acc.skipped.by_media_type, 5);
+        assert_eq!(acc.skipped.by_date_range, 6);
+        assert_eq!(acc.skipped.by_live_photo, 7);
+        assert_eq!(acc.skipped.by_filename, 8);
+        assert_eq!(acc.skipped.by_excluded_album, 9);
+        assert_eq!(acc.skipped.ampm_variant, 10);
+        assert_eq!(acc.skipped.duplicates, 11);
+        assert_eq!(acc.skipped.retry_exhausted, 12);
+        assert_eq!(acc.skipped.retry_only, 13);
+        assert_eq!(
+            acc.skipped.total(),
+            3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13,
+            "skip total must reflect summed breakdown"
+        );
+    }
+
+    /// Companion: accumulating into an empty `SyncStats` is a faithful copy
+    /// (the operation is the additive identity for the empty case).
+    #[test]
+    fn sync_stats_accumulate_into_empty_is_copy() {
+        let src = SyncStats {
+            assets_seen: 5,
+            downloaded: 2,
+            failed: 1,
+            skipped: SkipBreakdown {
+                duplicates: 7,
+                ..SkipBreakdown::default()
+            },
+            rate_limited: 4,
+            interrupted: true,
+            ..SyncStats::default()
+        };
+        let mut dst = SyncStats::default();
+        dst.accumulate(&src);
+        assert_eq!(dst.assets_seen, 5);
+        assert_eq!(dst.downloaded, 2);
+        assert_eq!(dst.failed, 1);
+        assert_eq!(dst.skipped.duplicates, 7);
+        assert_eq!(dst.rate_limited, 4);
+        assert!(dst.interrupted);
     }
 }

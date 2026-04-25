@@ -675,6 +675,43 @@ mod tests {
         assert_eq!(asset.filename(), None);
     }
 
+    /// CG-16: a `filenameEnc` value that decodes to the empty string must
+    /// yield `None`, not `Some("")`. Production routes filename-less assets
+    /// through the fingerprint fallback; an empty string would slip past
+    /// the `is_some()` check downstream and produce paths like
+    /// `2026-04-19/` (a directory) or `.JPG` (a hidden file). Pin both
+    /// the STRING and ENCRYPTED_BYTES variants — they hit the same
+    /// post-decode early-return.
+    #[test]
+    fn empty_filename_string_rejected_at_deser() {
+        let asset = make_asset(
+            json!({"fields": {"filenameEnc": {"value": "", "type": "STRING"}}}),
+            json!({}),
+        );
+        assert_eq!(
+            asset.filename(),
+            None,
+            "empty STRING filename must be treated as missing"
+        );
+    }
+
+    #[test]
+    fn empty_filename_encrypted_bytes_rejected_at_deser() {
+        use base64::Engine;
+        // Base64 of the empty string is the empty string.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"");
+        assert_eq!(encoded, "");
+        let asset = make_asset(
+            json!({"fields": {"filenameEnc": {"value": encoded, "type": "ENCRYPTED_BYTES"}}}),
+            json!({}),
+        );
+        assert_eq!(
+            asset.filename(),
+            None,
+            "empty ENCRYPTED_BYTES filename must be treated as missing"
+        );
+    }
+
     #[test]
     fn test_item_type_image() {
         let asset = make_asset(
