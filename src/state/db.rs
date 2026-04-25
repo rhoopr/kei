@@ -569,8 +569,9 @@ impl StateDb for SqliteStateDb {
             let metadata_hash: Option<&str> =
                 meta.metadata_hash.as_deref().or(computed_hash.as_deref());
 
-            conn.execute(
-                r"
+            let mut stmt = conn
+                .prepare_cached(
+                    r"
                 INSERT INTO assets (
                     id, version_size, checksum, filename, created_at, added_at,
                     size_bytes, media_type, status, last_seen_at,
@@ -615,41 +616,42 @@ impl StateDb for SqliteStateDb {
                     provider_data = excluded.provider_data,
                     metadata_hash = excluded.metadata_hash
                 ",
-                rusqlite::params![
-                    &record.id,
-                    record.version_size.as_str(),
-                    &record.checksum,
-                    &record.filename,
-                    record.created_at.timestamp(),
-                    record.added_at.map(|dt| dt.timestamp()),
-                    i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
-                    record.media_type.as_str(),
-                    last_seen_at,
-                    meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
-                    i64::from(meta.is_favorite),
-                    meta.rating.map(i64::from),
-                    meta.latitude,
-                    meta.longitude,
-                    meta.altitude,
-                    meta.orientation.map(i64::from),
-                    meta.duration_secs,
-                    meta.timezone_offset.map(i64::from),
-                    meta.width.map(i64::from),
-                    meta.height.map(i64::from),
-                    meta.title.as_deref(),
-                    meta.keywords.as_deref(),
-                    meta.description.as_deref(),
-                    meta.media_subtype.as_deref(),
-                    meta.burst_id.as_deref(),
-                    i64::from(meta.is_hidden),
-                    i64::from(meta.is_archived),
-                    meta.modified_at.map(|dt| dt.timestamp()),
-                    i64::from(meta.is_deleted),
-                    meta.deleted_at.map(|dt| dt.timestamp()),
-                    meta.provider_data.as_deref(),
-                    metadata_hash,
-                ],
-            )
+                )
+                .map_err(|e| StateError::query("upsert_seen::prepare", e))?;
+            stmt.execute(rusqlite::params![
+                &record.id,
+                record.version_size.as_str(),
+                &record.checksum,
+                &record.filename,
+                record.created_at.timestamp(),
+                record.added_at.map(|dt| dt.timestamp()),
+                i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
+                record.media_type.as_str(),
+                last_seen_at,
+                meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
+                i64::from(meta.is_favorite),
+                meta.rating.map(i64::from),
+                meta.latitude,
+                meta.longitude,
+                meta.altitude,
+                meta.orientation.map(i64::from),
+                meta.duration_secs,
+                meta.timezone_offset.map(i64::from),
+                meta.width.map(i64::from),
+                meta.height.map(i64::from),
+                meta.title.as_deref(),
+                meta.keywords.as_deref(),
+                meta.description.as_deref(),
+                meta.media_subtype.as_deref(),
+                meta.burst_id.as_deref(),
+                i64::from(meta.is_hidden),
+                i64::from(meta.is_archived),
+                meta.modified_at.map(|dt| dt.timestamp()),
+                i64::from(meta.is_deleted),
+                meta.deleted_at.map(|dt| dt.timestamp()),
+                meta.provider_data.as_deref(),
+                metadata_hash,
+            ])
             .map_err(|e| StateError::query("upsert_seen", e))?;
 
             Ok(())
@@ -1210,11 +1212,11 @@ impl StateDb for SqliteStateDb {
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
         let prefix = prefix.to_owned();
         self.with_conn("delete_metadata_by_prefix", move |conn| {
-            let deleted = conn
-                .execute(
-                    "DELETE FROM metadata WHERE key LIKE ?1",
-                    [format!("{prefix}%")],
-                )
+            let mut stmt = conn
+                .prepare_cached("DELETE FROM metadata WHERE key LIKE ?1")
+                .map_err(|e| StateError::query("delete_metadata_by_prefix::prepare", e))?;
+            let deleted = stmt
+                .execute([format!("{prefix}%")])
                 .map_err(|e| StateError::query("delete_metadata_by_prefix", e))?;
 
             Ok(deleted as u64)

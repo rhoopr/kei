@@ -275,12 +275,15 @@ async fn tag_metadata_rewrites(
 /// Retry all pending state writes that failed during the download loop.
 ///
 /// Each write is attempted up to [`STATE_WRITE_MAX_RETRIES`] times with
-/// exponential backoff (200ms, 400ms, 800ms, 1.6s, 3.2s between attempts
-/// 1–5; attempt 6 fails immediately). SQLite lock contention is transient,
-/// so generous retries prevent files from ending up on disk but untracked
-/// in the state DB.
+/// exponential backoff in the millisecond range (200ms × 2^attempt plus
+/// small jitter to avoid thundering-herd when multiple writes contend
+/// on the same `SQLite` WAL). `RetryConfig::delay_for_retry` is built
+/// for seconds-scale HTTP retries; the state-write grain is finer so
+/// this loop keeps its own scaling.
+///
 /// Returns the number of writes that still failed after all retries.
 async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWrite]) -> usize {
+    use rand::RngExt;
     if pending.is_empty() {
         return 0;
     }
@@ -311,10 +314,9 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
                             error = %e,
                             "State write retry failed, will retry"
                         );
-                        tokio::time::sleep(Duration::from_millis(
-                            200 * u64::from(1u32 << (attempt - 1)),
-                        ))
-                        .await;
+                        let base_ms = 200 * u64::from(1u32 << (attempt - 1));
+                        let jitter_ms = rand::rng().random_range(0..base_ms.max(1) / 4);
+                        tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
                     } else {
                         tracing::error!(
                             asset_id = %write.asset_id,
