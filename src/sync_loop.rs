@@ -1560,4 +1560,71 @@ mod tests {
             "classifier must downcast through context wrappers"
         );
     }
+
+    /// Comprehensive classification table: every `ICloudError` variant plus
+    /// a generic anyhow error. Prevents silent regressions from future enum
+    /// additions — adding a new variant requires updating this table.
+    #[test]
+    fn is_session_error_classification_table() {
+        use crate::icloud::error::ICloudError;
+
+        // Variants that SHOULD trigger re-auth (session errors). Each entry
+        // is a (label, anyhow::Error) pair so downcast_ref inside
+        // is_session_error works correctly without needing Clone.
+        let session_errors: Vec<(&str, anyhow::Error)> = vec![
+            (
+                "SessionExpired-401",
+                ICloudError::SessionExpired { status: 401 }.into(),
+            ),
+            (
+                "SessionExpired-403",
+                ICloudError::SessionExpired { status: 403 }.into(),
+            ),
+            ("MisdirectedRequest", ICloudError::MisdirectedRequest.into()),
+        ];
+        for (label, e) in session_errors {
+            assert!(
+                is_session_error(&e),
+                "expected {label} to be a session error"
+            );
+        }
+
+        // Variants that must NOT trigger re-auth (non-session errors).
+        let non_session: Vec<(&str, anyhow::Error)> = vec![
+            (
+                "Connection",
+                ICloudError::Connection("DNS timeout".into()).into(),
+            ),
+            (
+                "ServiceNotActivated",
+                ICloudError::ServiceNotActivated {
+                    code: "ZONE_NOT_FOUND".into(),
+                    reason: "ADP".into(),
+                }
+                .into(),
+            ),
+            (
+                "Io",
+                ICloudError::from(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+                .into(),
+            ),
+            (
+                "Json",
+                ICloudError::from(
+                    serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+                )
+                .into(),
+            ),
+            ("non-ICloudError", anyhow::anyhow!("config parse error")),
+        ];
+        for (label, e) in non_session {
+            assert!(
+                !is_session_error(&e),
+                "expected {label} to NOT be a session error"
+            );
+        }
+    }
 }

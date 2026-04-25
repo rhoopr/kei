@@ -958,6 +958,147 @@ mod tests {
         assert!(!is_misdirected_request(&err));
     }
 
+    // ── init_photos_service wiremock tests ────────────────────────────────
+    //
+    // These tests use a real `Session` (backed by a temp dir) + a wiremock
+    // server to exercise the 421 recovery path without hitting iCloud.
+    //
+    // Path exercised:
+    //   init_photos_service
+    //     └─ PhotosService::new
+    //          └─ PhotoLibrary::new
+    //               └─ retry_post → POST /database/1/.../private/records/query
+    //
+    // On 421 the function resets the HTTP pool and retries once.  A second 421
+    // surfaces MisdirectedRequest to the caller.
+
+    /// Build an `AuthResult` whose `ckdatabasews` URL points at `base_url`.
+    /// The `Session` is created against a unique temp dir so concurrent tests
+    /// don't fight over the same lock file.
+    async fn fake_auth_result(base_url: &str) -> auth::AuthResult {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = auth::session::Session::new(dir.path(), "test@example.com", base_url, None)
+            .await
+            .expect("Session::new");
+        // Keep the temp dir alive for the session's lifetime.
+        // We intentionally leak it here; the OS cleans it up on process exit
+        // and these are short-lived tests.
+        std::mem::forget(dir);
+        let data = auth::responses::AccountLoginResponse {
+            ds_info: None,
+            webservices: Some(auth::responses::Webservices {
+                ckdatabasews: Some(auth::responses::WebserviceEndpoint {
+                    url: base_url.to_owned(),
+                }),
+            }),
+            hsa_challenge_required: false,
+            hsa_trusted_browser: true,
+            domain_to_use: None,
+            has_error: false,
+            service_errors: vec![],
+            i_cdp_enabled: false,
+        };
+        auth::AuthResult {
+            session,
+            data,
+            requires_2fa: false,
+        }
+    }
+
+    /// A `RetryConfig` that never sleeps between attempts — keeps tests fast.
+    fn no_delay_retry() -> crate::retry::RetryConfig {
+        crate::retry::RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn init_photos_service_recovers_from_421() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // First call → 421; second call → 200 with a valid CheckIndexingState body.
+        let success_body = serde_json::json!({
+            "records": [{
+                "recordName": "CheckIndexingState",
+                "recordType": "CheckIndexingState",
+                "fields": {
+                    "state": {"value": "FINISHED", "type": "STRING"}
+                }
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/database/1/com\.apple\.photos\.cloud/production/private/records/query",
+            ))
+            .respond_with(ResponseTemplate::new(421))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/database/1/com\.apple\.photos\.cloud/production/private/records/query",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&success_body))
+            .mount(&mock_server)
+            .await;
+
+        let auth_result = fake_auth_result(&mock_server.uri()).await;
+        let result = init_photos_service(auth_result, no_delay_retry()).await;
+
+        assert!(
+            result.is_ok(),
+            "expected recovery from single 421, got: {:?}",
+            result.err()
+        );
+
+        // Verify the mock received exactly 2 requests (the retry happened).
+        let received = mock_server.received_requests().await.expect("requests");
+        assert_eq!(
+            received.len(),
+            2,
+            "expected exactly 2 requests (initial 421 + retry), got {}",
+            received.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn init_photos_service_fails_on_double_421() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/database/1/com\.apple\.photos\.cloud/production/private/records/query",
+            ))
+            .respond_with(ResponseTemplate::new(421))
+            .mount(&mock_server)
+            .await;
+
+        let auth_result = fake_auth_result(&mock_server.uri()).await;
+        let result = init_photos_service(auth_result, no_delay_retry()).await;
+
+        let err = result.expect_err("expected double-421 to return Err");
+        // The error must downcast to MisdirectedRequest so sync_loop can
+        // route it through the SRP re-auth path.
+        let icloud_err = err.downcast_ref::<crate::icloud::error::ICloudError>();
+        assert!(
+            matches!(
+                icloud_err,
+                Some(crate::icloud::error::ICloudError::MisdirectedRequest)
+            ),
+            "expected MisdirectedRequest on double-421, got: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn resolve_albums_same_album_in_both_yields_empty() {
         let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
