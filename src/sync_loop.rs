@@ -842,7 +842,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             &config.username,
                             None,
                         );
-                        if !is_watch_mode {
+                        if !should_wait_for_2fa(is_watch_mode, &e) {
                             return Err(e);
                         }
 
@@ -1078,6 +1078,27 @@ async fn reauth_with_srp(
 /// `Some(_)` and that a state DB is configured before persisting.
 pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_run: bool) -> bool {
     matches!(outcome, download::DownloadOutcome::Success) && !dry_run
+}
+
+/// Decide whether the reauth path inside the watch loop should block on a
+/// 2FA prompt or surface the error to the caller.
+///
+/// In **watch mode** a 2FA-required error is recoverable: the loop notifies
+/// the user, parks `wait_and_retry_2fa`, and resumes once a code arrives.
+///
+/// In **one-shot mode** there is nothing to wait on -- the caller (a CI run,
+/// a cron, the systemd unit's first start) needs the error so it can exit
+/// non-zero and the operator can run `kei login get-code`. CG-19.
+///
+/// Mirrors the predicate used at the entry-point auth path (`run_sync`'s
+/// initial `auth::authenticate` call already returns the error in non-watch
+/// mode); this helper documents the contract for the *reauth* branch where
+/// the same decision was previously inline.
+pub(crate) fn should_wait_for_2fa(is_watch_mode: bool, err: &anyhow::Error) -> bool {
+    is_watch_mode
+        && err
+            .downcast_ref::<auth::error::AuthError>()
+            .is_some_and(auth::error::AuthError::is_two_factor_required)
 }
 
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
@@ -2825,5 +2846,60 @@ mod tests {
             should_store_sync_token(&outcome, false),
             "(Success, dry_run=false) is the ONLY combination that should advance the token"
         );
+    }
+
+    // CG-19: `should_wait_for_2fa` decides whether the reauth-time 2FA
+    // branch parks the loop on a code prompt or surfaces the error. In
+    // one-shot mode there is no operator at the keyboard; the error MUST
+    // bubble up so cron / systemd / CI exits non-zero.
+
+    /// CG-19: a 2FA-required error in one-shot (`is_watch_mode = false`)
+    /// MUST NOT cause the helper to return `true`. The caller will then
+    /// surface the error to the user instead of blocking forever on a
+    /// 2FA prompt that no one is watching.
+    #[test]
+    fn run_sync_2fa_required_in_one_shot_returns_error() {
+        let err: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
+        assert!(
+            !should_wait_for_2fa(false, &err),
+            "one-shot + 2FA-required must surface the error, not park on a prompt"
+        );
+    }
+
+    /// CG-19 companion: in watch mode the same error is recoverable;
+    /// the helper returns `true` so the loop can park.
+    #[test]
+    fn run_sync_2fa_required_in_watch_mode_waits() {
+        let err: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
+        assert!(
+            should_wait_for_2fa(true, &err),
+            "watch + 2FA-required must wait on a code"
+        );
+    }
+
+    /// Negative control: any non-2FA error MUST surface in both modes.
+    /// Otherwise the loop could silently swallow a real failure (e.g.
+    /// `FailedLogin`) by treating it as "wait for a code that won't come".
+    #[test]
+    fn run_sync_non_2fa_error_never_waits() {
+        let err: anyhow::Error = auth::error::AuthError::FailedLogin("bad password".into()).into();
+        assert!(
+            !should_wait_for_2fa(false, &err),
+            "one-shot + non-2FA must surface"
+        );
+        assert!(
+            !should_wait_for_2fa(true, &err),
+            "watch + non-2FA must surface; do not park on a code that will never arrive"
+        );
+    }
+
+    /// Negative control: a non-AuthError (e.g. an arbitrary anyhow error
+    /// with no downcast target) MUST NOT be treated as 2FA. Without this
+    /// guard the predicate could mis-park on transport errors.
+    #[test]
+    fn run_sync_non_auth_error_never_waits() {
+        let err: anyhow::Error = anyhow::anyhow!("network unreachable");
+        assert!(!should_wait_for_2fa(false, &err));
+        assert!(!should_wait_for_2fa(true, &err));
     }
 }
