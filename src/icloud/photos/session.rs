@@ -45,17 +45,7 @@ impl PhotosSession for reqwest::Client {
         if status.is_client_error() || status.is_server_error() {
             let url = resp.url().to_string();
             let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
-            let resp_body = match resp.text().await {
-                Ok(body) => body,
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        url = %url,
-                        "CloudKit error-response body read failed; proceeding with empty body"
-                    );
-                    String::new()
-                }
-            };
+            let resp_body = read_bounded_error_body(resp, &url).await;
             if !resp_body.is_empty() {
                 // 421 bodies are the most diagnostic signal for distinguishing
                 // ADP-class from session-class misdirected requests (e.g. the
@@ -146,6 +136,48 @@ pub(crate) struct HttpStatusError {
 /// and stack traces are occasionally much larger. Cap it so a degenerate
 /// response can't bloat the error path.
 const MAX_PRESERVED_BODY: usize = 1024;
+
+/// Read a CloudKit error-response body, capping at `MAX_PRESERVED_BODY`
+/// bytes plus a small UTF-8 grace margin. The full body can be megabytes
+/// (rate-limit HTML pages, stack traces) but the caller only ever keeps
+/// the first ~1 KiB for diagnostics, so streaming the first chunks is
+/// safer than materialising a 10 MB String we're about to throw away.
+async fn read_bounded_error_body(resp: reqwest::Response, url: &str) -> String {
+    use futures_util::StreamExt;
+    // A few extra bytes past the cap so `truncate_body` has room to land
+    // on a char boundary without re-fetching.
+    const CAP: usize = MAX_PRESERVED_BODY + 16;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let remaining = CAP.saturating_sub(buf.len());
+                if remaining == 0 {
+                    break;
+                }
+                let take = bytes.len().min(remaining);
+                #[allow(
+                    clippy::indexing_slicing,
+                    reason = "`take` is bounded above by `bytes.len()` via min()"
+                )]
+                buf.extend_from_slice(&bytes[..take]);
+                if buf.len() >= CAP {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    url = %url,
+                    "CloudKit error-response body read failed; proceeding with partial body"
+                );
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
 
 /// Shorten `body` to at most `MAX_PRESERVED_BODY` bytes without splitting
 /// a multi-byte UTF-8 character.

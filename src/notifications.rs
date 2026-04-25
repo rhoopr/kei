@@ -4,6 +4,7 @@
 //! Used to notify users of 2FA expiry, sync completion, failures, etc.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Events that trigger notification scripts.
@@ -95,10 +96,19 @@ impl From<&crate::download::SyncStats> for SyncNotificationData {
 #[derive(Debug, Clone)]
 pub(crate) struct Notifier {
     script: Option<PathBuf>,
+    /// Bounds how many notification scripts can run concurrently. A
+    /// misbehaving or long-running script can't queue an unbounded
+    /// number of spawned tasks behind itself under load.
+    concurrency: Arc<tokio::sync::Semaphore>,
 }
 
 /// Timeout for notification scripts.
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on concurrent notification-script invocations. Events fire at
+/// sync-cycle boundaries (start/complete/failure/token-required), so
+/// 8 is plenty of headroom in watch mode while still bounding leaks.
+const NOTIFIER_MAX_INFLIGHT: usize = 8;
 
 impl Notifier {
     pub fn new(script: Option<PathBuf>) -> Self {
@@ -110,9 +120,15 @@ impl Notifier {
                 "--notification-script is unix-only (kei invokes scripts via /bin/sh). \
                  Ignoring the configured script on Windows."
             );
-            return Self { script: None };
+            return Self {
+                script: None,
+                concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
+            };
         }
-        Self { script }
+        Self {
+            script,
+            concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
+        }
     }
 
     /// Fire the notification script with the given event.
@@ -143,7 +159,12 @@ impl Notifier {
 
         tracing::debug!(event = event_str, "Firing notification script");
 
+        let concurrency = Arc::clone(&self.concurrency);
         tokio::spawn(async move {
+            let Ok(permit) = concurrency.acquire_owned().await else {
+                // Semaphore closed during shutdown — safe to skip.
+                return;
+            };
             match run_script(&script, event_str, &message, &username, data.as_ref()).await {
                 Ok(status) if status.success() => {
                     tracing::debug!(event = event_str, "Notification script completed");
@@ -163,6 +184,7 @@ impl Notifier {
                     );
                 }
             }
+            drop(permit);
         });
     }
 }
