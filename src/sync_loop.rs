@@ -1061,6 +1061,25 @@ async fn reauth_with_srp(
     }
 }
 
+/// Decide whether the per-zone `sync_token` should be persisted to the state
+/// DB after a download pass.
+///
+/// The contract is "advance only on full success and not in dry-run":
+/// - On `PartialFailure`, a stored token would skip the failed assets on the
+///   next incremental sync (they'd never appear in the delta again -- silent
+///   data loss). CG-9.
+/// - On `SessionExpired`, the cycle aborts mid-stream; the token may be
+///   stale or only reflect a subset of the work.
+/// - In `--dry-run`, we promise to make no DB writes that survive the run
+///   (apart from the `sync_runs` ledger). Advancing the token here would
+///   silently break the next real sync. CG-21.
+///
+/// The returned bool is the gate: callers still check that `sync_token` is
+/// `Some(_)` and that a state DB is configured before persisting.
+pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_run: bool) -> bool {
+    matches!(outcome, download::DownloadOutcome::Success) && !dry_run
+}
+
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
 async fn run_cycle(
     library_states: &[LibraryState],
@@ -1177,8 +1196,7 @@ async fn run_cycle(
         // Note: the token is stored after download_photos_with_sync returns, which
         // means all batch flushes are complete. A crash here means the token is
         // NOT advanced, so assets will replay on next sync (safe, not data loss).
-        let should_store_token =
-            matches!(sync_result.outcome, download::DownloadOutcome::Success) && !config.dry_run;
+        let should_store_token = should_store_sync_token(&sync_result.outcome, config.dry_run);
         if should_store_token {
             if let Some(token) = &sync_result.sync_token {
                 if let Some(db) = state_db {
@@ -2767,5 +2785,65 @@ mod tests {
         let groupings = preload_asset_groupings(&None).await;
         assert!(groupings.albums.is_empty());
         assert!(groupings.people.is_empty());
+    }
+
+    // CG-9 / CG-21: `should_store_sync_token` is the single decision gate
+    // protecting the sync-token from being advanced after a partial sync or
+    // a dry run. Both situations would lose change events on the next
+    // incremental cycle ("user data is sacred"). The matrix below pins every
+    // (outcome, dry_run) combination so a future refactor can't relax the
+    // contract without a failing test.
+
+    /// CG-9: a partial download failure MUST NOT advance the stored sync
+    /// token. Otherwise the next incremental sync would skip past the
+    /// failed assets' change events and never retry them.
+    #[test]
+    fn sync_loop_partial_failure_does_not_advance_sync_token() {
+        let outcome = download::DownloadOutcome::PartialFailure { failed_count: 3 };
+        assert!(
+            !should_store_sync_token(&outcome, false),
+            "PartialFailure must NOT advance the sync token, even outside dry-run"
+        );
+        // dry_run=true cannot rescue a partial failure either.
+        assert!(
+            !should_store_sync_token(&outcome, true),
+            "PartialFailure + dry_run must still NOT advance the sync token"
+        );
+    }
+
+    /// CG-9 companion: `SessionExpired` is also a non-success outcome and
+    /// MUST NOT advance the token. The cycle aborts mid-stream; the captured
+    /// token may only reflect a subset of the work.
+    #[test]
+    fn sync_loop_session_expired_does_not_advance_sync_token() {
+        let outcome = download::DownloadOutcome::SessionExpired {
+            auth_error_count: 5,
+        };
+        assert!(!should_store_sync_token(&outcome, false));
+        assert!(!should_store_sync_token(&outcome, true));
+    }
+
+    /// CG-21: in `--dry-run`, even a fully-successful pass MUST NOT advance
+    /// the token. Dry-run promises no DB writes that affect the next real
+    /// sync; advancing the token would silently break the next incremental.
+    #[test]
+    fn sync_loop_dry_run_does_not_advance_sync_token() {
+        let outcome = download::DownloadOutcome::Success;
+        assert!(
+            !should_store_sync_token(&outcome, true),
+            "dry_run must NOT advance the sync token even on Success"
+        );
+    }
+
+    /// Positive control: only the (Success, dry_run=false) combination
+    /// advances the token. Pinning this branch prevents a future refactor
+    /// from accidentally inverting the predicate.
+    #[test]
+    fn sync_loop_full_success_outside_dry_run_advances_sync_token() {
+        let outcome = download::DownloadOutcome::Success;
+        assert!(
+            should_store_sync_token(&outcome, false),
+            "(Success, dry_run=false) is the ONLY combination that should advance the token"
+        );
     }
 }
