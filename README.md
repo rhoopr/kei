@@ -56,6 +56,7 @@ Everything else lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CL
 - [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) - TOML file, env vars, precedence
 - [Docker](https://github.com/rhoopr/kei/wiki/Docker) - Compose files and headless 2FA
 - [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) - keyring, encrypted file, password files and commands
+- [Data integrity](docs/data-integrity.md) - atomic writes, verification layers, residual risks, `kei verify --checksums`
 - [Changelog](CHANGELOG.md)
 - [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - deep dive on CloudKit syncTokens
 
