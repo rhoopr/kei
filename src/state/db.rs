@@ -687,6 +687,7 @@ impl StateDb for SqliteStateDb {
                     version_size = %version_size,
                     "mark_downloaded matched 0 rows — asset may not have been recorded via upsert_seen"
                 );
+                crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.inc();
             }
 
             Ok(())
@@ -3205,6 +3206,35 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.downloaded, 0);
         assert_eq!(summary.total_assets, 0);
+    }
+
+    /// Robustness review NB-1 (2026-04-25): a `mark_downloaded` call
+    /// without a prior `upsert_seen` is self-healing in 1 cycle, but a
+    /// regression that increases the rate (producer-dispatch invariant
+    /// quietly broken) needs to be visible in /metrics rather than only
+    /// in logs. Pin the counter increment so the wiring can't be silently
+    /// dropped on a future refactor.
+    #[tokio::test]
+    async fn mark_downloaded_zero_rows_increments_metric_counter() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let before = crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.get();
+        db.mark_downloaded(
+            "NEVER_SEEN_FOR_METRIC",
+            "original",
+            Path::new("/tmp/never_metric.jpg"),
+            "abc123",
+            None,
+        )
+        .await
+        .expect("mark_downloaded on unknown row should succeed");
+        let after = crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.get();
+
+        assert!(
+            after >= before + 1,
+            "counter should advance by at least 1 (other parallel tests may also \
+             increment); got before={before} after={after}"
+        );
     }
 
     // ── Gap: mark_failed increments download_attempts cumulatively ────

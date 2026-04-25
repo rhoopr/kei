@@ -12,7 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use chrono::Utc;
 
@@ -32,6 +32,18 @@ use tokio_util::sync::CancellationToken;
 use crate::download::SyncStats;
 use crate::health::HealthStatus;
 use crate::state::types::SyncSummary;
+
+/// Cumulative count of `mark_downloaded` calls that matched 0 rows in the
+/// `assets` table — i.e. a download was promoted without a matching
+/// `upsert_seen` row, or the row was deleted between upsert and download.
+///
+/// State-DB code can't depend on `MetricsHandle` (which is built only in
+/// watch / metrics-port mode), so the counter lives here as a static and is
+/// registered from `MetricsHandle::new`. Increments from `SqliteStateDb`
+/// are no-ops without a registered handle; once the registry exists the
+/// /metrics scrape exposes the cumulative count under the
+/// `kei_state_mark_downloaded_zero_rows_total` series.
+pub(crate) static MARK_DOWNLOADED_ZERO_ROWS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
 // ── Label types ──────────────────────────────────────────────────────────────
 
@@ -221,6 +233,14 @@ impl MetricsHandle {
             "kei_db_summary_read_failures",
             "Total number of failed attempts to read the DB summary for metrics",
             db_summary_read_failures.clone(),
+        );
+
+        registry.register(
+            "kei_state_mark_downloaded_zero_rows",
+            "Total number of mark_downloaded calls that matched 0 rows in the assets table — \
+             a downloaded file with no matching upsert_seen row (asset deleted between upsert \
+             and download, or producer-dispatch invariant violated)",
+            MARK_DOWNLOADED_ZERO_ROWS.clone(),
         );
 
         Self {
@@ -749,6 +769,22 @@ mod tests {
         assert!(
             output.contains(r#"reason="retry_exhausted""#) && output.contains("1"),
             "retry_exhausted label missing:\n{output}"
+        );
+    }
+
+    /// Robustness review NB-1 (2026-04-25): the
+    /// `mark_downloaded_zero_rows` counter is registered into the global
+    /// registry by `MetricsHandle::new`, so a /metrics scrape should
+    /// surface the series even before the state DB has incremented it.
+    /// Pinning the rendered name guards the registration call (which is
+    /// easy to drop on a future refactor of `new`).
+    #[tokio::test]
+    async fn mark_downloaded_zero_rows_counter_is_registered() {
+        let handle = MetricsHandle::new(None);
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains("kei_state_mark_downloaded_zero_rows"),
+            "mark_downloaded_zero_rows series missing from /metrics:\n{output}"
         );
     }
 
