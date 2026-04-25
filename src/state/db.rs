@@ -2063,22 +2063,22 @@ mod tests {
         assert_eq!(first, 3, "first call should flip all 3 running rows");
 
         // Capture the post-promote interrupted timestamps so we can verify
-        // the second call doesn't re-touch them.
-        let conn = db.acquire_lock("snapshot_after_first_promote").unwrap();
-        let read_run = |id: i64| {
-            let (status, interrupted): (String, i32) = conn
-                .query_row(
-                    "SELECT status, interrupted FROM sync_runs WHERE id = ?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            (status, interrupted)
+        // the second call doesn't re-touch them. Scope the lock guard so
+        // it never sits across an .await on the next line.
+        let (snap_a, snap_b, snap_c) = {
+            let conn = db.acquire_lock("snapshot_after_first_promote").unwrap();
+            let read_run = |id: i64| {
+                let (status, interrupted): (String, i32) = conn
+                    .query_row(
+                        "SELECT status, interrupted FROM sync_runs WHERE id = ?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                (status, interrupted)
+            };
+            (read_run(a), read_run(b), read_run(c))
         };
-        let snap_a = read_run(a);
-        let snap_b = read_run(b);
-        let snap_c = read_run(c);
-        drop(conn);
         assert_eq!(snap_a, ("interrupted".to_string(), 1));
         assert_eq!(snap_b, ("interrupted".to_string(), 1));
         assert_eq!(snap_c, ("interrupted".to_string(), 1));
@@ -2091,14 +2091,15 @@ mod tests {
         );
 
         // And no row's state changed.
-        let conn = db.acquire_lock("snapshot_after_second_promote").unwrap();
-        let after_a: (String, i32) = conn
-            .query_row(
+        let after_a: (String, i32) = {
+            let conn = db.acquire_lock("snapshot_after_second_promote").unwrap();
+            conn.query_row(
                 "SELECT status, interrupted FROM sync_runs WHERE id = ?1",
                 [a],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap();
+            .unwrap()
+        };
         assert_eq!(after_a, ("interrupted".to_string(), 1));
     }
 
