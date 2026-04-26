@@ -209,20 +209,13 @@ release TARGET="":
         in_section { print }
     ' CHANGELOG.md | sed '/./,$!d' | awk 'NR==1 && /^$/ {next} {print}'
 
-# Create ../kei-NAME on branch BRANCH (default: NAME). Complements CLAUDE.md's worktree rule.
-wt NAME BRANCH="":
+# Create branch NAME off a freshly fetched origin/main (CLAUDE.md branch-from-fresh-main rule).
+branch NAME:
     #!/usr/bin/env bash
     set -euo pipefail
-    branch="{{BRANCH}}"
-    if [ -z "$branch" ]; then
-        branch="{{NAME}}"
+    git fetch origin main
+    if git show-ref --verify --quiet "refs/heads/{{NAME}}"; then
+        echo "branch '{{NAME}}' already exists locally" >&2
+        exit 1
     fi
-    if git show-ref --verify --quiet "refs/heads/$branch"; then
-        git worktree add "../kei-{{NAME}}" "$branch"
-    else
-        git worktree add "../kei-{{NAME}}" -b "$branch"
-    fi
-
-# Remove a worktree created with `just wt`.
-wt-rm NAME:
-    git worktree remove "../kei-{{NAME}}"
+    git switch -c "{{NAME}}" origin/main

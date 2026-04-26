@@ -57,8 +57,8 @@ kei_docker_image() {
     printf '%s' "${KEI_DOCKER_IMAGE:-kei:latest}"
 }
 
-# Base dir for per-suite scratch output. Under /tmp so the worktree stays
-# clean and parallel suites in different worktrees don't collide through
+# Base dir for per-suite scratch output. Under /tmp so the repo checkout
+# stays clean and parallel suite invocations don't collide through
 # repo-local paths.
 kei_scratch_base() {
     if [ -n "${KEI_TEST_SCRATCH_DIR:-}" ]; then
