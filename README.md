@@ -22,7 +22,7 @@
 ---
 
 > [!IMPORTANT]
-> v0.13 reshapes selection and folder-structure flags. `--exclude-album NAME` becomes `--album '!NAME'`. `--library` accepts multiple values. `kei sync` with no flags now runs per-album passes plus an unfiled pass. Legacy `{album}` in `--folder-structure` auto-migrates with a warning until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md).
+> v0.13 (next release) reshapes selection and folder-structure flags. `--exclude-album NAME` becomes `--album '!NAME'`. `--library` accepts multiple values. `kei sync` with no flags now runs per-album passes plus an unfiled pass. Legacy `{album}` in `--folder-structure` auto-migrates with a warning until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md).
 >
 > | Flag | Default |
 > |---|---|
