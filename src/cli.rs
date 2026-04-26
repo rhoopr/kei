@@ -226,6 +226,17 @@ pub struct SyncArgs {
     #[arg(long = "exclude-album", env = "KEI_EXCLUDE_ALBUM", value_delimiter = ',', value_parser = non_empty_string)]
     pub exclude_albums: Vec<String>,
 
+    /// Smart folder(s) to download. Repeatable; default empty (smart folders
+    /// are skipped unless opted in). Accepts the same value grammar as
+    /// `--album`: a name, the sentinel `all` (every smart folder except
+    /// Hidden / Recently Deleted), `all-with-sensitive` (include those two),
+    /// `none`, or `!name` to exclude. Apple's smart folders are: Favorites,
+    /// Videos, Selfies, Live Photos, Portrait, Long Exposure, Panoramas,
+    /// Screenshots, Bursts, Animated, Slo-mo, Time-lapse, Hidden,
+    /// Recently Deleted.
+    #[arg(long = "smart-folder", env = "KEI_SMART_FOLDER", value_parser = non_empty_string)]
+    pub smart_folders: Vec<String>,
+
     /// Exclude files matching glob pattern(s) (e.g. "*.AAE", "Screenshot*")
     #[arg(long = "filename-exclude", env = "KEI_FILENAME_EXCLUDE", value_delimiter = ',', value_parser = non_empty_string)]
     pub filename_exclude: Vec<String>,

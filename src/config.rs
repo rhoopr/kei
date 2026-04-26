@@ -271,10 +271,11 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
 }
 
 /// Translate the legacy `(AlbumSelection, exclude_albums, LibrarySelection,
-/// folder_structure)` tuple into the v0.13 [`Selection`]. Pure function so
-/// the truth table is testable without `Config::build`.
+/// folder_structure)` tuple plus the new `raw_smart_folders` raw list into
+/// the v0.13 [`Selection`]. Pure function so the truth table is testable
+/// without `Config::build`.
 ///
-/// Behaviour preserved:
+/// Behaviour preserved (legacy fields):
 /// - `AlbumSelection::LibraryOnly` (today's no-album-flag default) maps to
 ///   `AlbumSelector::None` + `unfiled = true`. The library is enumerated as
 ///   one stream because no album passes run, so unfiled fully covers it.
@@ -286,11 +287,15 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
 /// - `LibrarySelection::Single("PrimarySync")` → `primary = true`.
 /// - `LibrarySelection::Single(other)` → `named = {other}` (no primary).
 /// - `LibrarySelection::All` → `primary = true, shared_all = true`.
+///
+/// Smart folders have no legacy field; `raw_smart_folders` is parsed
+/// directly into a [`SmartFolderSelector`]. Empty list → `None`.
 pub(crate) fn derive_selection(
     albums: &AlbumSelection,
     exclude_albums: &[String],
     library: &LibrarySelection,
     folder_structure: &str,
+    raw_smart_folders: &[String],
 ) -> anyhow::Result<crate::selection::Selection> {
     // Build the raw album list as if the user had written it on the CLI.
     // Feeds through `build_selection` so the production path exercises every
@@ -337,7 +342,12 @@ pub(crate) fn derive_selection(
         AlbumSelection::Named(_) => false,
     };
 
-    crate::selection::build_selection(&raw_albums, &[], &raw_libraries, Some(unfiled))
+    crate::selection::build_selection(
+        &raw_albums,
+        raw_smart_folders,
+        &raw_libraries,
+        Some(unfiled),
+    )
 }
 
 /// Convert a raw `Vec<String>` (from CLI or TOML) into an [`AlbumSelection`],
@@ -1039,13 +1049,28 @@ impl Config {
         } else {
             sync.exclude_albums
         };
+        // Smart folders: CLI > TOML > empty. No legacy field — this is the
+        // first place the new flag's input flows into Config.
+        let raw_smart_folders: Vec<String> = if sync.smart_folders.is_empty() {
+            toml_filters
+                .and_then(|f| f.smart_folders.clone())
+                .unwrap_or_default()
+        } else {
+            sync.smart_folders
+        };
 
         // Derive the v0.13 [`Selection`] from the legacy `albums` /
         // `exclude_albums` / `library` fields so the new model is populated
         // even before the resolver consumes it. Behaviour-preserving: every
         // legacy state maps to a Selection that the new resolver (PR6) will
         // turn into the same passes.
-        let selection = derive_selection(&albums, &exclude_albums, &library, &folder_structure)?;
+        let selection = derive_selection(
+            &albums,
+            &exclude_albums,
+            &library,
+            &folder_structure,
+            &raw_smart_folders,
+        )?;
         let filename_exclude_strs = if sync.filename_exclude.is_empty() {
             toml_filters
                 .and_then(|f| f.filename_exclude.clone())
@@ -4955,6 +4980,95 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.exclude_albums, vec!["Hidden", "Trash"]);
+    }
+
+    #[test]
+    fn test_smart_folders_default_is_none() {
+        let cfg =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        assert_eq!(
+            cfg.selection.smart_folders,
+            crate::selection::SmartFolderSelector::None
+        );
+    }
+
+    #[test]
+    fn test_smart_folders_from_cli() {
+        let mut sync = default_sync();
+        sync.smart_folders = vec!["Favorites".to_string(), "!Hidden".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        match cfg.selection.smart_folders {
+            crate::selection::SmartFolderSelector::Named { included, excluded } => {
+                assert!(included.contains("Favorites"));
+                assert!(excluded.contains("Hidden"));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_smart_folders_all_sentinel() {
+        let mut sync = default_sync();
+        sync.smart_folders = vec!["all".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        match cfg.selection.smart_folders {
+            crate::selection::SmartFolderSelector::All {
+                include_sensitive,
+                excluded,
+            } => {
+                assert!(!include_sensitive);
+                assert!(excluded.is_empty());
+            }
+            other => panic!("expected All, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_smart_folders_from_toml() {
+        let toml_str =
+            "[filters]\nsmart_folders = [\"all-with-sensitive\", \"!Recently Deleted\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        match cfg.selection.smart_folders {
+            crate::selection::SmartFolderSelector::All {
+                include_sensitive,
+                excluded,
+            } => {
+                assert!(include_sensitive);
+                assert!(excluded.contains("Recently Deleted"));
+            }
+            other => panic!("expected All with sensitive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_smart_folders_cli_overrides_toml() {
+        let mut sync = default_sync();
+        sync.smart_folders = vec!["Favorites".to_string()];
+        let toml_str = "[filters]\nsmart_folders = [\"Videos\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        match cfg.selection.smart_folders {
+            crate::selection::SmartFolderSelector::Named { included, .. } => {
+                assert!(included.contains("Favorites"));
+                assert!(!included.contains("Videos"));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_smart_folders_invalid_combination_bails() {
+        let mut sync = default_sync();
+        sync.smart_folders = vec!["all".to_string(), "all-with-sensitive".to_string()];
+        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
     }
 
     #[test]

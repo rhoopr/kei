@@ -479,6 +479,23 @@ fn album_flag_accepts_multiple() {
         .success();
 }
 
+#[test]
+fn smart_folder_flag_accepts_multiple() {
+    common::cmd()
+        .args([
+            "sync",
+            "--smart-folder",
+            "Favorites",
+            "--smart-folder",
+            "all",
+            "--smart-folder",
+            "!Hidden",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
 // ── Default command (no subcommand = sync) ──────────────────────────────
 
 #[test]
