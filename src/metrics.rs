@@ -1176,6 +1176,10 @@ mod tests {
             body.contains("kei_sync_assets_seen_total"),
             "expected kei_sync_* counters in body:\n{body}"
         );
+        assert!(
+            body.contains("kei_state_mark_downloaded_zero_rows"),
+            "expected mark_downloaded_zero_rows series in body:\n{body}"
+        );
 
         let healthz_resp = client
             .get(format!("{base}/healthz"))
