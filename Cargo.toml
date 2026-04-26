@@ -1,6 +1,6 @@
 [package]
 name = "kei"
-version = "0.12.0"
+version = "0.12.1-dev"
 edition = "2021"
 # src/download/paths.rs calls str::floor_char_boundary, stabilized in 1.91.
 # Cargo refuses to build on older toolchains with a clean error naming this
