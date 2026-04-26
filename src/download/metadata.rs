@@ -44,8 +44,27 @@ pub(crate) struct ExifProbe {
     pub(crate) has_gps: bool,
 }
 
+/// Read the existing XMP / EXIF state of a media file.
+///
+/// Dispatch is content-based, mirroring [`apply_metadata`]: the first 12 bytes
+/// are inspected for an ISO-BMFF `ftyp` box with a HEIF-family brand. HEIF
+/// inputs get parsed via [`heif::extract_xmp_bytes`] + `s.parse::<XmpMeta>()`
+/// because XMP Toolkit ships no HEIF handler — it can parse an XMP packet,
+/// just not extract one from a HEIC container. Non-HEIF inputs go through the
+/// XMP Toolkit smart handler so JPEG/PNG/TIFF/MP4/MOV reconciled EXIF/IPTC is
+/// visible. On any read failure, we degrade silently to `ExifProbe::default()`
+/// (today's behavior); callers gate retries on the planned write being
+/// non-empty, so a false-negative probe is recoverable.
 pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
     ensure_initialized();
+    if is_heif_file(path) {
+        probe_exif_heif(path)
+    } else {
+        probe_exif_xmp_toolkit(path)
+    }
+}
+
+fn probe_exif_xmp_toolkit(path: &Path) -> Result<ExifProbe> {
     let mut file = XmpFile::new().context("creating XmpFile handle")?;
     if file
         .open_file(path, OpenFileOptions::default().for_read().only_xmp())
@@ -53,19 +72,46 @@ pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
     {
         return Ok(ExifProbe::default());
     }
-    let meta = match file.xmp() {
-        Some(m) => m,
-        None => return Ok(ExifProbe::default()),
+    let Some(meta) = file.xmp() else {
+        return Ok(ExifProbe::default());
     };
+    Ok(probe_from_meta(&meta))
+}
+
+fn probe_exif_heif(path: &Path) -> Result<ExifProbe> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "Failed to read HEIF for probe");
+            return Ok(ExifProbe::default());
+        }
+    };
+    let Some(xmp_bytes) = heif::extract_xmp_bytes(&bytes) else {
+        return Ok(ExifProbe::default());
+    };
+    let Ok(s) = std::str::from_utf8(&xmp_bytes) else {
+        tracing::warn!(path = %path.display(), "HEIF XMP packet is not UTF-8; treating as no probe");
+        return Ok(ExifProbe::default());
+    };
+    match s.parse::<XmpMeta>() {
+        Ok(meta) => Ok(probe_from_meta(&meta)),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "Failed to parse HEIF XMP packet");
+            Ok(ExifProbe::default())
+        }
+    }
+}
+
+fn probe_from_meta(meta: &XmpMeta) -> ExifProbe {
     let datetime_original = meta
         .property(xmp_ns::EXIF, "DateTimeOriginal")
         .map(|v| v.value);
     let has_gps = meta.contains_property(xmp_ns::EXIF, "GPSLatitude")
         || meta.contains_property(xmp_ns::EXIF, "GPSLongitude");
-    Ok(ExifProbe {
+    ExifProbe {
         datetime_original,
         has_gps,
-    })
+    }
 }
 
 /// GPS triple passed to [`apply_metadata`].
@@ -1136,6 +1182,148 @@ mod tests {
             }
         }
         None
+    }
+
+    // ── Regression: probe_exif HEIF dispatch (issue #272) ─────────────
+    //
+    // Pre-fix, `probe_exif` always routed through XMP Toolkit's
+    // `XmpFile::open_file`, which has no HEIF handler — every HEIC probe
+    // silently returned `ExifProbe::default()`. `plan_metadata_write`
+    // therefore couldn't honor the "field already present, skip" gate on
+    // any HEIC, so kei rewrote DateTimeOriginal/GPS on every iPhone HEIC
+    // even when the file already carried the same value. Content-sniff
+    // dispatch + XMP packet parsing fixes the read path symmetric with #271.
+    //
+    // These tests round-trip via `apply_metadata` rather than relying on
+    // the fixture having pre-existing EXIF, so they pin the read path
+    // independent of whatever XMP `tests/data/sample.heic` ships with.
+    #[test]
+    fn probe_exif_heic_reports_datetime_after_apply() {
+        let dir = test_tmp_dir("probe_heic_tests");
+        let path = fresh_heic(&dir, "probe_dt.heic");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC datetime write");
+        let probe = probe_exif(&path).expect("probe_exif must succeed on HEIC");
+        assert!(
+            probe.datetime_original.is_some(),
+            "probe must read DateTimeOriginal back from HEIC XMP, got {:?}",
+            probe.datetime_original,
+        );
+        assert!(
+            !probe.has_gps,
+            "probe must report no GPS when none was written"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn probe_exif_heic_reports_gps_after_apply() {
+        let dir = test_tmp_dir("probe_heic_tests");
+        let path = fresh_heic(&dir, "probe_gps.heic");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                gps: Some(GpsCoords {
+                    latitude: 37.7749,
+                    longitude: -122.4194,
+                    altitude: None,
+                }),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC GPS write");
+        let probe = probe_exif(&path).expect("probe_exif must succeed on HEIC");
+        assert!(
+            probe.has_gps,
+            "probe must report GPS present after writing GPS to HEIC"
+        );
+        assert!(
+            probe.datetime_original.is_none(),
+            "probe must report no datetime when none was written, got {:?}",
+            probe.datetime_original,
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn probe_exif_heic_with_no_xmp_returns_default() {
+        let dir = test_tmp_dir("probe_heic_tests");
+        let path = fresh_heic(&dir, "probe_empty.heic");
+        let probe = probe_exif(&path).expect("probe_exif must succeed on HEIC");
+        assert!(
+            probe.datetime_original.is_none(),
+            "fresh HEIC carries no XMP, datetime must be None"
+        );
+        assert!(
+            !probe.has_gps,
+            "fresh HEIC carries no XMP, has_gps must be false"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The metadata-rewrite pass calls `probe_exif` on the renamed final
+    /// `.HEIC` file, but the in-pipeline embed step calls it on the
+    /// `<base32>.kei-tmp` part file. Extension-based dispatch would route
+    /// the part file to XMP Toolkit and silently return `default()` —
+    /// recreating the bug for every first-pass HEIC. Content sniffing
+    /// covers both call sites; pin it.
+    #[test]
+    fn probe_exif_dispatches_heif_on_extension_less_part_file() {
+        let dir = test_tmp_dir("probe_heic_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC.kei-tmp");
+        fs::write(&path, SAMPLE_HEIC).unwrap();
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                gps: Some(GpsCoords {
+                    latitude: 1.0,
+                    longitude: 2.0,
+                    altitude: None,
+                }),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC metadata write on .kei-tmp");
+        let probe = probe_exif(&path).expect("probe_exif on .kei-tmp HEIC");
+        assert!(
+            probe.datetime_original.is_some(),
+            "probe must read DateTimeOriginal even when extension is `.kei-tmp`"
+        );
+        assert!(
+            probe.has_gps,
+            "probe must read GPS even when extension is `.kei-tmp`"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn probe_exif_jpeg_with_datetime_returns_value() {
+        // Non-HEIF branch must still go through XMP Toolkit and see the
+        // reconciled EXIF datetime — the refactor doesn't regress JPEG.
+        let dir = test_tmp_dir("probe_heic_tests");
+        let path = fresh_jpeg(&dir, "probe_jpeg_dt.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("JPEG datetime write");
+        let probe = probe_exif(&path).expect("probe_exif must succeed on JPEG");
+        assert!(
+            probe.datetime_original.is_some(),
+            "JPEG probe must keep returning DateTimeOriginal post-refactor",
+        );
+        fs::remove_file(&path).ok();
     }
 
     // ── Regression: dispatch must work on part-file paths (issue #269) ──
