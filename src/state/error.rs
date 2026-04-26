@@ -9,13 +9,11 @@ use thiserror::Error;
 pub enum StateError {
     /// Failed to create the parent directory for the database file.
     ///
-    /// On a fresh install the cookie/data directory may not exist yet
-    /// (commands like `import-existing`, `status`, `verify`, `reset`,
-    /// `reconcile` open the DB before any auth flow runs that would create
-    /// it). `SqliteStateDb::open` creates the parent directory so SQLite
-    /// doesn't fail with a generic "unable to open database file" — this
-    /// variant surfaces the underlying mkdir failure (e.g. permission
-    /// denied) distinctly from a SQLite open error.
+    /// `SqliteStateDb::open` creates the parent directory before opening
+    /// so SQLite doesn't fail with a generic "unable to open database
+    /// file" on a fresh install (issue #264). This variant surfaces the
+    /// underlying mkdir failure (e.g. permission denied) distinctly from
+    /// a SQLite-level open error.
     #[error("Failed to create parent directory {path}: {source}")]
     ParentDir {
         path: PathBuf,

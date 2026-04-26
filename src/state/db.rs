@@ -340,22 +340,18 @@ impl std::fmt::Debug for SqliteStateDb {
 impl SqliteStateDb {
     /// Open or create a database at the given path.
     ///
-    /// The parent directory is created if it doesn't exist. Several
-    /// subcommands (`import-existing`, `status`, `verify`, `reset`,
-    /// `reconcile`) open the DB before any auth flow runs, so on a fresh
-    /// install the cookie/data directory may not exist yet (issue #264).
+    /// Creates the parent directory if it doesn't exist; see
+    /// [`StateError::ParentDir`].
     pub async fn open(path: &Path) -> Result<Self, StateError> {
         let path = path.to_path_buf();
 
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await.map_err(|source| {
-                    StateError::ParentDir {
-                        path: parent.to_path_buf(),
-                        source,
-                    }
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|source| StateError::ParentDir {
+                    path: parent.to_path_buf(),
+                    source,
                 })?;
-            }
         }
 
         let path_clone = path.clone();
