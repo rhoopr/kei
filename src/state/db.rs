@@ -345,6 +345,9 @@ impl SqliteStateDb {
     pub async fn open(path: &Path) -> Result<Self, StateError> {
         let path = path.to_path_buf();
 
+        // create_dir_all is idempotent on an existing directory, so concurrent
+        // opens on the same path don't race here. SQLite's own file locking
+        // handles the open() race that follows.
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -3293,21 +3296,27 @@ mod tests {
 
         // Skip when running as root: 0o555 doesn't restrict root, so the
         // mkdir would succeed and the assertion below would falsely fail.
-        // SAFETY: geteuid is always safe to call.
+        // SAFETY: libc::geteuid() is a stateless POSIX FFI call with no
+        // preconditions, no side effects, and a uid_t return value; it cannot
+        // violate Rust memory safety.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
 
         let dir = test_dir();
         let readonly = dir.path().join("readonly");
-        fs::create_dir(&readonly).unwrap();
-        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555)).unwrap();
+        tokio::fs::create_dir(&readonly).await.unwrap();
+        tokio::fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
 
         let path = readonly.join("nested/state.db");
         let result = SqliteStateDb::open(&path).await;
 
         // Restore writable permissions so TempDir cleanup can remove it.
-        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::fs::set_permissions(&readonly, fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
 
         let err = result.expect_err("expected ParentDir error on read-only parent");
         match &err {
