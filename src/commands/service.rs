@@ -473,34 +473,8 @@ pub(crate) async fn resolve_passes(
     let selected_smart_names =
         pick_smart_folder_names(&selection.smart_folders, &album_map, &smart_names)?;
 
-    // Collect per-album asset IDs in parallel BEFORE moving the PhotoAlbums
-    // out of the map — PhotoAlbum is not Clone, and the unfiled exclusion
-    // set must cover every selected album's members.
-    let unfiled_exclude_ids = if selection.unfiled && !selected_album_names.is_empty() {
-        use futures_util::{StreamExt, TryStreamExt};
-        const EXCLUSION_FETCH_CONCURRENCY: usize = 8;
-        let per_album: Vec<rustc_hash::FxHashSet<String>> = futures_util::stream::iter(
-            selected_album_names
-                .iter()
-                .filter_map(|name| album_map.get(name.as_str()).map(|album| (name, album))),
-        )
-        .map(|(name, album)| async move {
-            tracing::debug!(
-                album = %name,
-                "Pre-fetching IDs for unfiled exclusion set"
-            );
-            let mut set = rustc_hash::FxHashSet::default();
-            collect_album_asset_ids(album, &mut set).await?;
-            anyhow::Ok(set)
-        })
-        .buffer_unordered(EXCLUSION_FETCH_CONCURRENCY)
-        .try_collect()
-        .await?;
-        let mut union = rustc_hash::FxHashSet::default();
-        for set in per_album {
-            union.extend(set);
-        }
-        union
+    let unfiled_exclude_ids = if selection.unfiled {
+        compute_unfiled_exclude_ids(&album_map, &selected_album_names).await?
     } else {
         rustc_hash::FxHashSet::default()
     };
@@ -509,34 +483,21 @@ pub(crate) async fn resolve_passes(
     let mut passes: Vec<AlbumPass> = Vec::new();
 
     // Stable, alphabetised pass order so logs and dry-run output don't
-    // jitter with HashMap iteration order. `pick_*` only returns names
-    // that were present in the map, so a `None` from `remove` would mean
-    // the map shifted under us — skip and log rather than panic.
-    let mut album_names_sorted = selected_album_names;
-    album_names_sorted.sort();
-    for name in album_names_sorted {
-        let Some(album) = album_map.remove(name.as_str()) else {
-            tracing::warn!(album = %name, "Selected album disappeared from map, skipping");
-            continue;
-        };
-        passes.push(AlbumPass {
-            album,
-            exclude_ids: std::sync::Arc::clone(&empty),
-        });
-    }
-
-    let mut smart_names_sorted = selected_smart_names;
-    smart_names_sorted.sort();
-    for name in smart_names_sorted {
-        let Some(album) = album_map.remove(name.as_str()) else {
-            tracing::warn!(smart_folder = %name, "Selected smart folder disappeared from map, skipping");
-            continue;
-        };
-        passes.push(AlbumPass {
-            album,
-            exclude_ids: std::sync::Arc::clone(&empty),
-        });
-    }
+    // jitter with HashMap iteration order.
+    drain_named_into_passes(
+        &mut album_map,
+        selected_album_names,
+        "album",
+        &empty,
+        &mut passes,
+    );
+    drain_named_into_passes(
+        &mut album_map,
+        selected_smart_names,
+        "smart_folder",
+        &empty,
+        &mut passes,
+    );
 
     if selection.unfiled {
         passes.push(AlbumPass {
@@ -614,7 +575,8 @@ fn pick_smart_folder_names(
     smart_names: &rustc_hash::FxHashSet<&'static str>,
 ) -> anyhow::Result<Vec<String>> {
     use crate::selection::SmartFolderSelector;
-    const SENSITIVE: [&str; 2] = ["Hidden", "Recently Deleted"];
+    let sensitive: rustc_hash::FxHashSet<&'static str> =
+        icloud::photos::smart_folders::sensitive_smart_folder_names().collect();
 
     match selector {
         SmartFolderSelector::None => Ok(Vec::new()),
@@ -623,14 +585,12 @@ fn pick_smart_folder_names(
             excluded,
         } => {
             for name in excluded {
-                if !smart_names.contains(name.as_str()) {
-                    tracing::warn!(smart_folder = %name, "Excluded smart folder is not an Apple smart folder, ignoring");
-                }
+                warn_excluded_not_a_smart_folder(name, smart_names);
             }
             Ok(album_map
                 .keys()
                 .filter(|name| smart_names.contains(name.as_str()))
-                .filter(|name| *include_sensitive || !SENSITIVE.contains(&name.as_str()))
+                .filter(|name| *include_sensitive || !sensitive.contains(name.as_str()))
                 .filter(|name| !excluded.contains(name.as_str()))
                 .cloned()
                 .collect())
@@ -658,12 +618,79 @@ fn pick_smart_folder_names(
                 }
             }
             for name in excluded {
-                if !smart_names.contains(name.as_str()) {
-                    tracing::warn!(smart_folder = %name, "Excluded smart folder is not an Apple smart folder, ignoring");
-                }
+                warn_excluded_not_a_smart_folder(name, smart_names);
             }
             Ok(chosen)
         }
+    }
+}
+
+fn warn_excluded_not_a_smart_folder(name: &str, smart_names: &rustc_hash::FxHashSet<&'static str>) {
+    if !smart_names.contains(name) {
+        tracing::warn!(
+            smart_folder = %name,
+            "Excluded smart folder is not an Apple smart folder, ignoring"
+        );
+    }
+}
+
+/// Fetch every selected album's member IDs in parallel. The PhotoAlbums
+/// stay borrowed in the map; callers move them into passes after this
+/// returns. Empty input → empty set, no fetches.
+async fn compute_unfiled_exclude_ids(
+    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    selected_album_names: &[String],
+) -> anyhow::Result<rustc_hash::FxHashSet<String>> {
+    use futures_util::{StreamExt, TryStreamExt};
+    const EXCLUSION_FETCH_CONCURRENCY: usize = 8;
+
+    if selected_album_names.is_empty() {
+        return Ok(rustc_hash::FxHashSet::default());
+    }
+
+    let per_album: Vec<rustc_hash::FxHashSet<String>> = futures_util::stream::iter(
+        selected_album_names
+            .iter()
+            .filter_map(|name| album_map.get(name.as_str()).map(|album| (name, album))),
+    )
+    .map(|(name, album)| async move {
+        tracing::debug!(album = %name, "Pre-fetching IDs for unfiled exclusion set");
+        let mut set = rustc_hash::FxHashSet::default();
+        collect_album_asset_ids(album, &mut set).await?;
+        anyhow::Ok(set)
+    })
+    .buffer_unordered(EXCLUSION_FETCH_CONCURRENCY)
+    .try_collect()
+    .await?;
+
+    let mut union = rustc_hash::FxHashSet::default();
+    for set in per_album {
+        union.extend(set);
+    }
+    Ok(union)
+}
+
+/// Move named entries out of `album_map` into `passes` in alphabetical
+/// order, sharing `empty_excludes` as the per-pass exclude set. A `None`
+/// from `remove` should be impossible (`pick_*` validates membership) but
+/// is logged + skipped to keep the resolver out of unwrap territory.
+fn drain_named_into_passes(
+    album_map: &mut std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    mut names: Vec<String>,
+    label: &'static str,
+    empty_excludes: &std::sync::Arc<rustc_hash::FxHashSet<String>>,
+    passes: &mut Vec<AlbumPass>,
+) {
+    names.sort();
+    for name in names {
+        let Some(album) = album_map.remove(name.as_str()) else {
+            tracing::warn!(category = label, name = %name, "Selected entry disappeared from map, skipping");
+            continue;
+        };
+        passes.push(AlbumPass {
+            album,
+            exclude_ids: std::sync::Arc::clone(empty_excludes),
+        });
     }
 }
 
@@ -988,52 +1015,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_passes_smart_folder_all_skips_sensitive_by_default() {
-        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
-        let library = stub_library(mock);
-        let sel = Selection {
-            albums: AlbumSelector::None,
-            smart_folders: SmartFolderSelector::All {
-                include_sensitive: false,
-                excluded: BTreeSet::new(),
-            },
-            libraries: crate::selection::LibrarySelector::default(),
-            unfiled: false,
-        };
+    async fn resolve_passes_smart_folder_all_sensitive_truth_table() {
+        for include_sensitive in [false, true] {
+            let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
+            let library = stub_library(mock);
+            let sel = Selection {
+                albums: AlbumSelector::None,
+                smart_folders: SmartFolderSelector::All {
+                    include_sensitive,
+                    excluded: BTreeSet::new(),
+                },
+                libraries: crate::selection::LibrarySelector::default(),
+                unfiled: false,
+            };
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
-        let names: BTreeSet<String> = plan
-            .passes
-            .iter()
-            .map(|p| p.album.name.to_string())
-            .collect();
-        assert!(!names.contains("Hidden"));
-        assert!(!names.contains("Recently Deleted"));
-        assert!(names.contains("Favorites"));
-    }
-
-    #[tokio::test]
-    async fn resolve_passes_smart_folder_all_with_sensitive_includes_hidden() {
-        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
-        let library = stub_library(mock);
-        let sel = Selection {
-            albums: AlbumSelector::None,
-            smart_folders: SmartFolderSelector::All {
-                include_sensitive: true,
-                excluded: BTreeSet::new(),
-            },
-            libraries: crate::selection::LibrarySelector::default(),
-            unfiled: false,
-        };
-
-        let plan = resolve_passes(&library, &sel).await.unwrap();
-        let names: BTreeSet<String> = plan
-            .passes
-            .iter()
-            .map(|p| p.album.name.to_string())
-            .collect();
-        assert!(names.contains("Hidden"));
-        assert!(names.contains("Recently Deleted"));
+            let plan = resolve_passes(&library, &sel).await.unwrap();
+            let names: BTreeSet<String> = plan
+                .passes
+                .iter()
+                .map(|p| p.album.name.to_string())
+                .collect();
+            assert!(names.contains("Favorites"), "non-sensitive always present");
+            assert_eq!(
+                names.contains("Hidden"),
+                include_sensitive,
+                "Hidden gated on include_sensitive={include_sensitive}"
+            );
+            assert_eq!(
+                names.contains("Recently Deleted"),
+                include_sensitive,
+                "Recently Deleted gated on include_sensitive={include_sensitive}"
+            );
+        }
     }
 
     #[tokio::test]
