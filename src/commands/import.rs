@@ -118,7 +118,8 @@ pub(crate) async fn run_import_existing(
 
     // Resolve library selection (CLI > TOML > default PrimarySync)
     let toml_filters = toml.and_then(|t| t.filters.as_ref());
-    let selection = config::resolve_library_selection(args.library, toml_filters);
+    let cli_libraries = args.library.into_iter().collect();
+    let selection = config::resolve_library_selection(cli_libraries, toml_filters)?;
     let libraries = resolve_libraries(&selection, &mut photos_service).await?;
 
     if !args.no_progress_bar {

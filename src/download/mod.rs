@@ -2682,7 +2682,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.library = Some("all".to_string());
+            s.libraries = vec!["all".to_string()];
         });
         assert_ne!(
             compute_config_hash(&a),

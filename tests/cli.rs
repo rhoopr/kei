@@ -497,6 +497,23 @@ fn smart_folder_flag_accepts_multiple() {
 }
 
 #[test]
+fn library_flag_accepts_repeatable_sentinels() {
+    common::cmd()
+        .args([
+            "sync",
+            "--library",
+            "primary",
+            "--library",
+            "shared",
+            "--library",
+            "!SharedSync-AAAA",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
 fn album_flag_accepts_inline_exclusion() {
     common::cmd()
         .args([

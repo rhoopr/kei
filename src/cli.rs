@@ -247,9 +247,15 @@ pub struct SyncArgs {
     #[arg(long = "filename-exclude", env = "KEI_FILENAME_EXCLUDE", value_delimiter = ',', value_parser = non_empty_string)]
     pub filename_exclude: Vec<String>,
 
-    /// Library to download (default: `PrimarySync`, use "all" for all libraries)
-    #[arg(long, env = "KEI_LIBRARY")]
-    pub library: Option<String>,
+    /// Library/libraries to download. Repeatable; default `primary` (the
+    /// PrimarySync zone). Accepts the same value grammar as `--album`: a
+    /// CloudKit zone name (e.g. `PrimarySync`, `SharedSync-A1B2C3D4`), the
+    /// sentinels `primary` / `shared` / `all` / `none`, or `!name` to
+    /// exclude. Friendly aliases (`shared:Owner Name`, truncated 8-char
+    /// SharedSync prefixes) are accepted but their CloudKit-side resolution
+    /// lands in a follow-up PR.
+    #[arg(long = "library", env = "KEI_LIBRARY", value_parser = non_empty_string)]
+    pub libraries: Vec<String>,
 
     /// Image size to download
     #[arg(long, env = "KEI_SIZE", value_enum)]
@@ -804,8 +810,8 @@ impl SyncArgs {
         if self.albums.is_empty() {
             self.albums.clone_from(&fallback.albums);
         }
-        if self.library.is_none() {
-            self.library.clone_from(&fallback.library);
+        if self.libraries.is_empty() {
+            self.libraries.clone_from(&fallback.libraries);
         }
         if self.size.is_none() {
             self.size = fallback.size;
@@ -963,7 +969,7 @@ impl Cli {
                 deprecation_warning("--list-albums", "kei list albums");
                 return Command::List {
                     password: self.password.clone(),
-                    library: self.sync.library.clone(),
+                    library: self.sync.libraries.first().cloned(),
                     what: ListCommand::Albums,
                 };
             }
@@ -971,7 +977,7 @@ impl Cli {
                 deprecation_warning("--list-libraries", "kei list libraries");
                 return Command::List {
                     password: self.password.clone(),
-                    library: self.sync.library.clone(),
+                    library: self.sync.libraries.first().cloned(),
                     what: ListCommand::Libraries,
                 };
             }
@@ -1050,7 +1056,7 @@ impl Cli {
                 deprecation_warning("--list-albums", "kei list albums");
                 Command::List {
                     password: password.clone(),
-                    library: sync.library.clone(),
+                    library: sync.libraries.first().cloned(),
                     what: ListCommand::Albums,
                 }
             }
@@ -1061,7 +1067,7 @@ impl Cli {
                 deprecation_warning("--list-libraries", "kei list libraries");
                 Command::List {
                     password: password.clone(),
-                    library: sync.library.clone(),
+                    library: sync.libraries.first().cloned(),
                     what: ListCommand::Libraries,
                 }
             }
@@ -1804,7 +1810,29 @@ mod tests {
         let mut args = base_args();
         args.extend(["--library", "SharedSync-ABCD1234"]);
         let cli = parse(&args);
-        assert_eq!(cli.sync.library.as_deref(), Some("SharedSync-ABCD1234"));
+        assert_eq!(cli.sync.libraries, vec!["SharedSync-ABCD1234".to_string()]);
+    }
+
+    #[test]
+    fn test_library_repeatable_with_sentinels() {
+        let mut args = base_args();
+        args.extend([
+            "--library",
+            "primary",
+            "--library",
+            "shared",
+            "--library",
+            "!SharedSync-ABCD1234",
+        ]);
+        let cli = parse(&args);
+        assert_eq!(
+            cli.sync.libraries,
+            vec![
+                "primary".to_string(),
+                "shared".to_string(),
+                "!SharedSync-ABCD1234".to_string(),
+            ]
+        );
     }
 
     #[test]

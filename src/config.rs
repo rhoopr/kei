@@ -185,19 +185,74 @@ pub enum LibrarySelection {
     All,
 }
 
-/// Resolve library selection from CLI flag > TOML config > default (`PrimarySync`).
+/// Resolve library selection from CLI > TOML > default (`primary`). The CLI
+/// list and the TOML `[filters].libraries` array share the v0.13 grammar
+/// (`primary` / `shared` / `all` / `none` / `!name` / raw zone names);
+/// `[filters].library` (singular) is a deprecated alias warned at use.
+///
+/// Until PR6 lands the multi-library resolver, the lowered legacy
+/// [`LibrarySelection`] only models "single library" or "every library", so
+/// shapes that need PR6 (e.g. `primary + shared` without `all`, multiple
+/// named zones, `--library` excludes against today's pipeline) bail with a
+/// pointer to the new flag surface.
 pub(crate) fn resolve_library_selection(
-    cli_library: Option<String>,
+    cli_libraries: Vec<String>,
     toml_filters: Option<&TomlFilters>,
-) -> LibrarySelection {
-    let library_str = cli_library
-        .or_else(|| toml_filters.and_then(|f| f.library.clone()))
-        .unwrap_or_else(|| "PrimarySync".to_string());
-    if library_str.eq_ignore_ascii_case("all") {
-        LibrarySelection::All
-    } else {
-        LibrarySelection::Single(library_str)
+) -> anyhow::Result<LibrarySelection> {
+    let toml_libraries = toml_filters.and_then(|f| f.libraries.clone());
+    let toml_library_singular = toml_filters.and_then(|f| f.library.clone());
+    if toml_library_singular.is_some() {
+        warn_deprecated(
+            "`[filters].library` (singular string)",
+            "`[filters].libraries = [\"name\"]` (array)",
+        );
     }
+    let toml_libraries_resolved = toml_libraries.or_else(|| toml_library_singular.map(|s| vec![s]));
+    let raw = resolve_vec(cli_libraries, toml_libraries_resolved);
+
+    let selector = crate::selection::parse_library_selector(&raw)?;
+
+    if !selector.excluded.is_empty() {
+        anyhow::bail!(
+            "`!name` library exclusions require the v0.13 multi-library resolver (tracked in PR6); \
+             pass an explicit `--library` allow-list for now"
+        );
+    }
+    if selector.named.len() > 1 {
+        anyhow::bail!(
+            "selecting multiple named libraries requires the v0.13 multi-library resolver (tracked in PR6); \
+             pass a single zone name or use `--library all`"
+        );
+    }
+    if selector.primary && (selector.shared_all || !selector.named.is_empty()) {
+        if selector.shared_all && selector.named.is_empty() {
+            return Ok(LibrarySelection::All);
+        }
+        anyhow::bail!(
+            "combining `--library primary` with shared zones requires the v0.13 multi-library resolver (tracked in PR6); \
+             pass `--library all` for every library or a single zone name"
+        );
+    }
+    if selector.shared_all && !selector.named.is_empty() {
+        anyhow::bail!(
+            "combining `--library shared` with named zones requires the v0.13 multi-library resolver (tracked in PR6); \
+             pass `--library all` for every library or a single zone name"
+        );
+    }
+
+    if selector.shared_all {
+        // `shared` alone has no legacy single-zone equivalent — primary is
+        // always part of today's "all libraries" sweep.
+        anyhow::bail!(
+            "`--library shared` (every shared zone, primary excluded) requires the v0.13 multi-library resolver (tracked in PR6); \
+             pass `--library all` for every library or a specific SharedSync zone name"
+        );
+    }
+    if let Some(name) = selector.named.into_iter().next() {
+        return Ok(LibrarySelection::Single(name));
+    }
+    // primary (default or explicit) → today's `--library PrimarySync`.
+    Ok(LibrarySelection::Single("PrimarySync".to_string()))
 }
 
 impl std::fmt::Display for LibrarySelection {
@@ -1064,7 +1119,7 @@ impl Config {
         );
 
         // Filters
-        let library = resolve_library_selection(sync.library, toml_filters);
+        let library = resolve_library_selection(sync.libraries, toml_filters)?;
         let toml_albums = toml_filters.and_then(|f| f.albums.clone());
         let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
         if toml_album_singular.is_some() {
@@ -2103,7 +2158,7 @@ mod tests {
 
         let mut sync = default_sync();
         sync.threads = Some(8);
-        sync.library = Some("PrimarySync".to_string());
+        sync.libraries = vec!["PrimarySync".to_string()];
 
         let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.threads_num, 8);
@@ -2116,7 +2171,7 @@ mod tests {
     #[test]
     fn test_library_all_value() {
         let mut sync = default_sync();
-        sync.library = Some("all".to_string());
+        sync.libraries = vec!["all".to_string()];
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
         assert_eq!(cfg.library, LibrarySelection::All);
     }
@@ -2124,7 +2179,7 @@ mod tests {
     #[test]
     fn test_library_all_case_insensitive() {
         let mut sync = default_sync();
-        sync.library = Some("ALL".to_string());
+        sync.libraries = vec!["ALL".to_string()];
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
         assert_eq!(cfg.library, LibrarySelection::All);
     }
@@ -5446,18 +5501,25 @@ mod tests {
 
     #[test]
     fn resolve_library_defaults_to_primary_sync() {
-        let result = resolve_library_selection(None, None);
+        let result = resolve_library_selection(vec![], None).unwrap();
+        assert_eq!(result, LibrarySelection::Single("PrimarySync".to_string()));
+    }
+
+    #[test]
+    fn resolve_library_primary_sentinel_maps_to_primary_sync() {
+        let result = resolve_library_selection(vec!["primary".to_string()], None).unwrap();
         assert_eq!(result, LibrarySelection::Single("PrimarySync".to_string()));
     }
 
     #[test]
     fn resolve_library_cli_overrides_toml() {
         let toml_filters = TomlFilters {
-            library: Some("SharedSync-FROM-TOML".to_string()),
+            libraries: Some(vec!["SharedSync-FROM-TOML".to_string()]),
             ..Default::default()
         };
         let result =
-            resolve_library_selection(Some("SharedSync-FROM-CLI".to_string()), Some(&toml_filters));
+            resolve_library_selection(vec!["SharedSync-FROM-CLI".to_string()], Some(&toml_filters))
+                .unwrap();
         assert_eq!(
             result,
             LibrarySelection::Single("SharedSync-FROM-CLI".to_string())
@@ -5465,12 +5527,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_library_falls_back_to_toml() {
+    fn resolve_library_falls_back_to_toml_array() {
         let toml_filters = TomlFilters {
-            library: Some("SharedSync-ABCD".to_string()),
+            libraries: Some(vec!["SharedSync-ABCD".to_string()]),
             ..Default::default()
         };
-        let result = resolve_library_selection(None, Some(&toml_filters));
+        let result = resolve_library_selection(vec![], Some(&toml_filters)).unwrap();
         assert_eq!(
             result,
             LibrarySelection::Single("SharedSync-ABCD".to_string())
@@ -5478,18 +5540,79 @@ mod tests {
     }
 
     #[test]
+    fn resolve_library_falls_back_to_deprecated_toml_singular() {
+        let toml_filters = TomlFilters {
+            library: Some("SharedSync-LEGACY".to_string()),
+            ..Default::default()
+        };
+        let result = resolve_library_selection(vec![], Some(&toml_filters)).unwrap();
+        assert_eq!(
+            result,
+            LibrarySelection::Single("SharedSync-LEGACY".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_library_toml_array_takes_precedence_over_singular() {
+        let toml_filters = TomlFilters {
+            library: Some("SharedSync-OLD".to_string()),
+            libraries: Some(vec!["SharedSync-NEW".to_string()]),
+            ..Default::default()
+        };
+        let result = resolve_library_selection(vec![], Some(&toml_filters)).unwrap();
+        assert_eq!(
+            result,
+            LibrarySelection::Single("SharedSync-NEW".to_string())
+        );
+    }
+
+    #[test]
     fn resolve_library_all_case_insensitive() {
-        assert_eq!(
-            resolve_library_selection(Some("ALL".to_string()), None),
-            LibrarySelection::All
+        for sentinel in ["ALL", "All", "all"] {
+            let result = resolve_library_selection(vec![sentinel.to_string()], None).unwrap();
+            assert_eq!(result, LibrarySelection::All, "sentinel: {sentinel}");
+        }
+    }
+
+    #[test]
+    fn resolve_library_shared_only_bails_until_pr6() {
+        let err = resolve_library_selection(vec!["shared".to_string()], None).unwrap_err();
+        assert!(
+            err.to_string().contains("multi-library resolver"),
+            "unexpected error: {err}"
         );
-        assert_eq!(
-            resolve_library_selection(Some("All".to_string()), None),
-            LibrarySelection::All
+    }
+
+    #[test]
+    fn resolve_library_multiple_named_bails_until_pr6() {
+        let err = resolve_library_selection(
+            vec!["SharedSync-AAAA".to_string(), "SharedSync-BBBB".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("multi-library resolver"),
+            "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_library_exclusion_bails_until_pr6() {
+        let err =
+            resolve_library_selection(vec!["!SharedSync-AAAA".to_string()], None).unwrap_err();
+        assert!(
+            err.to_string().contains("multi-library resolver"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_library_named_zone_passes_through() {
+        let result =
+            resolve_library_selection(vec!["SharedSync-ABCD1234".to_string()], None).unwrap();
         assert_eq!(
-            resolve_library_selection(Some("all".to_string()), None),
-            LibrarySelection::All
+            result,
+            LibrarySelection::Single("SharedSync-ABCD1234".to_string())
         );
     }
 
