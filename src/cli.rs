@@ -318,14 +318,14 @@ pub struct SyncArgs {
     /// Folder structure used by every album pass. Default `{album}` (flat
     /// per-album folders, no inherited date hierarchy). Set to e.g.
     /// `"{album}/%Y/%m/%d"` to add a date hierarchy inside each album
-    /// folder. Wired into the path renderer in a follow-up PR (#215).
+    /// folder. Tracking issue: #215.
     #[arg(long, env = "KEI_FOLDER_STRUCTURE_ALBUMS")]
     pub folder_structure_albums: Option<String>,
 
     /// Folder structure used by every smart-folder pass. Default
     /// `{smart-folder}` (flat per-smart-folder folders). Set to e.g.
-    /// `"{smart-folder}/%Y/%m/%d"` to add a date hierarchy. Wired into the
-    /// path renderer in a follow-up PR (#215).
+    /// `"{smart-folder}/%Y/%m/%d"` to add a date hierarchy. Tracking
+    /// issue: #215.
     #[arg(long, env = "KEI_FOLDER_STRUCTURE_SMART_FOLDERS")]
     pub folder_structure_smart_folders: Option<String>,
 

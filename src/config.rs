@@ -310,6 +310,13 @@ impl std::fmt::Display for AlbumSelection {
     }
 }
 
+/// Default template for album passes: a flat per-album folder. Users opt
+/// into a date hierarchy by passing `--folder-structure-albums "{album}/%Y..."`.
+pub(crate) const DEFAULT_FOLDER_STRUCTURE_ALBUMS: &str = "{album}";
+
+/// Default template for smart-folder passes: a flat per-smart-folder folder.
+pub(crate) const DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS: &str = "{smart-folder}";
+
 /// Reject `--folder-structure` values that place `{album}` somewhere other
 /// than the first path segment, or use it more than once. Both cases would
 /// make the "unfiled photos" fallback path shift other segments around
@@ -513,12 +520,9 @@ pub struct Config {
     pub directory: PathBuf,
     pub cookie_directory: PathBuf,
     pub folder_structure: String,
-    /// v0.13+ template for album passes (default `{album}`). Resolved here so
-    /// the new layout layer in PR8 has it ready; the legacy renderer ignores
-    /// it.
+    /// Template for album passes (default `{album}`).
     pub folder_structure_albums: String,
-    /// v0.13+ template for smart-folder passes (default `{smart-folder}`).
-    /// Resolved here so the new layout layer in PR8 has it ready.
+    /// Template for smart-folder passes (default `{smart-folder}`).
     pub folder_structure_smart_folders: String,
     pub albums: AlbumSelection,
     pub exclude_albums: Vec<String>,
@@ -994,37 +998,29 @@ impl Config {
         );
         validate_folder_structure(&folder_structure)?;
 
-        // v0.13+ per-category templates. Defaults are flat: album passes
-        // land at `{album}/file`, smart-folder passes at `{smart-folder}/file`
-        // (PR8 wires the renderer). Until then, an explicit value warns so
-        // users know the run still uses the legacy single template.
-        let folder_structure_albums_explicit = sync.folder_structure_albums.is_some()
-            || toml_dl.is_some_and(|d| d.folder_structure_albums.is_some());
-        let folder_structure_albums = resolve(
-            sync.folder_structure_albums,
-            toml_dl.and_then(|d| d.folder_structure_albums.clone()),
-            "{album}".to_string(),
-        );
-        if folder_structure_albums_explicit {
+        let folder_structure_albums_explicit = sync
+            .folder_structure_albums
+            .or_else(|| toml_dl.and_then(|d| d.folder_structure_albums.clone()));
+        if folder_structure_albums_explicit.is_some() {
             warn_selection_flag_unimplemented(
                 "`--folder-structure-albums` / `[download].folder_structure_albums`",
                 "use the legacy `--folder-structure` for album passes",
             );
         }
+        let folder_structure_albums = folder_structure_albums_explicit
+            .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string());
 
-        let folder_structure_smart_folders_explicit = sync.folder_structure_smart_folders.is_some()
-            || toml_dl.is_some_and(|d| d.folder_structure_smart_folders.is_some());
-        let folder_structure_smart_folders = resolve(
-            sync.folder_structure_smart_folders,
-            toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()),
-            "{smart-folder}".to_string(),
-        );
-        if folder_structure_smart_folders_explicit {
+        let folder_structure_smart_folders_explicit = sync
+            .folder_structure_smart_folders
+            .or_else(|| toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()));
+        if folder_structure_smart_folders_explicit.is_some() {
             warn_selection_flag_unimplemented(
                 "`--folder-structure-smart-folders` / `[download].folder_structure_smart_folders`",
                 "use the legacy `--folder-structure` for smart-folder passes",
             );
         }
+        let folder_structure_smart_folders = folder_structure_smart_folders_explicit
+            .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string());
         // Resolve bandwidth limit (CLI bytes/sec > TOML human-readable string > None).
         let bandwidth_limit: Option<u64> = if let Some(n) = sync.bandwidth_limit {
             Some(n)
@@ -1576,13 +1572,15 @@ impl Config {
                     Some(self.directory.display().to_string())
                 },
                 folder_structure: Some(self.folder_structure.clone()),
-                folder_structure_albums: if self.folder_structure_albums == "{album}" {
+                folder_structure_albums: if self.folder_structure_albums
+                    == DEFAULT_FOLDER_STRUCTURE_ALBUMS
+                {
                     None
                 } else {
                     Some(self.folder_structure_albums.clone())
                 },
                 folder_structure_smart_folders: if self.folder_structure_smart_folders
-                    == "{smart-folder}"
+                    == DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
                 {
                     None
                 } else {
@@ -5470,14 +5468,17 @@ mod tests {
     fn test_folder_structure_albums_default_is_album_token() {
         let cfg =
             Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
-        assert_eq!(cfg.folder_structure_albums, "{album}");
+        assert_eq!(cfg.folder_structure_albums, DEFAULT_FOLDER_STRUCTURE_ALBUMS);
     }
 
     #[test]
     fn test_folder_structure_smart_folders_default_is_smart_folder_token() {
         let cfg =
             Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
-        assert_eq!(cfg.folder_structure_smart_folders, "{smart-folder}");
+        assert_eq!(
+            cfg.folder_structure_smart_folders,
+            DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
+        );
     }
 
     #[test]
@@ -5535,7 +5536,7 @@ mod tests {
     }
 
     #[test]
-    fn test_folder_structure_albums_round_trips_default() {
+    fn test_folder_structure_per_category_round_trips_default() {
         let cfg =
             Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
         let toml = cfg.to_toml();
@@ -5555,7 +5556,7 @@ mod tests {
     }
 
     #[test]
-    fn test_folder_structure_albums_round_trips_custom() {
+    fn test_folder_structure_per_category_round_trips_custom() {
         let mut sync = default_sync();
         sync.folder_structure_albums = Some("{album}/%Y".to_string());
         sync.folder_structure_smart_folders = Some("{smart-folder}/%Y".to_string());

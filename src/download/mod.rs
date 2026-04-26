@@ -2224,8 +2224,9 @@ mod tests {
             directory: dl_config.directory.to_path_buf(),
             cookie_directory: std::path::PathBuf::from("/tmp"),
             folder_structure: dl_config.folder_structure.clone(),
-            folder_structure_albums: "{album}".to_string(),
-            folder_structure_smart_folders: "{smart-folder}".to_string(),
+            folder_structure_albums: crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+            folder_structure_smart_folders: crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
+                .to_string(),
             albums: crate::config::AlbumSelection::LibraryOnly,
             exclude_albums: vec![],
             filename_exclude: vec![],
