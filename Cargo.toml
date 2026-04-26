@@ -82,7 +82,13 @@ xmp_toolkit = { version = "1", optional = true }
 # ISO-BMFF (MP4 / HEIF / HEIC) atom parsing + encoding. HEIC's XMP packet
 # lives in a `mime`-type item inside the `meta` box; mp4-atom gives us the
 # box primitives to surgically insert it without decoding image data.
-mp4-atom = "0.10"
+#
+# Pinned to a git rev past PR #123 (which adds `uri ` infe-item support
+# needed for iOS 17+ HEICs that embed `tag:apple.com,2023:photos/<id>`
+# references — see kei #274). The fix is on `main` but unreleased; v0.11.0
+# is gated behind kixelated/mp4-atom#130. Switch back to a crates.io
+# version when 0.11.0 ships.
+mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "d1e9e923571cbbb42c049aec7f53cd70c6f3d8ff" }
 
 # Error handling
 anyhow = "1"

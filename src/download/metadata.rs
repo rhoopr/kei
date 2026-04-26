@@ -1175,6 +1175,77 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    // ── Regression: iOS 17+ HEICs with `uri ` infe items (issue #274) ──
+    //
+    // Apple started embedding `uri ` item-info entries (item_type="uri ",
+    // item_uri_type="tag:apple.com,2023:photos/<id>") in HEICs from iOS 17.
+    // The mp4-atom 0.10.1 release didn't read the trailing `item_uri_type`
+    // cstr, so its strict end-check rejected every such infe entry as
+    // `UnderDecode("infe")` — which surfaced to users as the metadata-embed
+    // pass failing on every iOS 17+ HEIC. The fix lives on mp4-atom's `main`
+    // (PR #123, 2026-01-26); kei pins past that commit. This test pins the
+    // round-trip so a future bump that drops the `uri ` decoder regresses
+    // visibly rather than reverting silently.
+
+    #[test]
+    fn apply_metadata_succeeds_on_heic_with_uri_infe_item() {
+        use mp4_atom::{Any, DecodeMaybe, Encode, FourCC, Iinf, ItemInfoEntry};
+
+        // Build a HEIC variant that carries a `uri ` infe entry by parsing
+        // the sample, injecting a synthetic Apple-style entry into iinf,
+        // and re-serializing. This produces bytes byte-shape-identical to
+        // what an iOS 17+ camera writes for the failing case.
+        let mut atoms: Vec<Any> = Vec::new();
+        let mut cursor: &[u8] = SAMPLE_HEIC;
+        while let Some(atom) = Any::decode_maybe(&mut cursor).expect("sample HEIC must parse") {
+            atoms.push(atom);
+        }
+        let meta = atoms
+            .iter_mut()
+            .find_map(|a| if let Any::Meta(m) = a { Some(m) } else { None })
+            .expect("sample HEIC has a meta box");
+        let iinf = meta
+            .get_mut::<Iinf>()
+            .expect("sample HEIC has an iinf inside meta");
+        iinf.item_infos.push(ItemInfoEntry {
+            item_id: 9999,
+            item_protection_index: 0,
+            item_type: Some(FourCC::new(b"uri ")),
+            item_name: "metadata".to_string(),
+            content_type: None,
+            content_encoding: None,
+            item_uri_type: Some("tag:apple.com,2023:photos/UNIT-TEST".to_string()),
+            item_not_in_presentation: false,
+        });
+        let mut bytes: Vec<u8> = Vec::new();
+        for atom in &atoms {
+            atom.encode(&mut bytes)
+                .expect("re-encode of synthetic uri-bearing HEIC must succeed");
+        }
+
+        let dir = test_tmp_dir("meta_heic_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("uri_infe.heic");
+        fs::write(&path, &bytes).unwrap();
+
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                rating: Some(3),
+                title: Some("UriItem".into()),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC metadata write must succeed on a file with a `uri ` infe item");
+
+        let xmp = extract_xmp_from_heic(&fs::read(&path).unwrap())
+            .expect("XMP must be embedded after round-tripping a uri-bearing HEIC");
+        let s = std::str::from_utf8(&xmp).unwrap();
+        assert!(s.contains("xmp:Rating"), "XMP missing rating");
+        assert!(s.contains("UriItem"), "XMP missing title");
+        fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn apply_metadata_dispatches_xmp_toolkit_on_extension_less_jpeg_part_file() {
         // Negative case: extension-less ≠ HEIF. A JPEG-bearing part file

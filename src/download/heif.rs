@@ -13,11 +13,45 @@
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::Result;
 use mp4_atom::{
     Any, DecodeMaybe, Encode, FourCC, Iinf, Iloc, ItemInfoEntry, ItemLocation, ItemLocationExtent,
     Mdat, Meta,
 };
+
+/// Typed failures from the HEIC writer. Each variant names the precise mode
+/// so call-site logging and any future fall-back logic can distinguish
+/// "file is truncated" from "kei's own re-encoder failed" from "this isn't
+/// a HEIC at all" — instead of grepping anyhow strings.
+///
+/// `Decode`/`Encode` wrap the underlying [`mp4_atom::Error`] so the original
+/// failure detail is preserved (`UnderDecode("infe")`, `OutOfBounds`, etc.)
+/// while kei adds the byte offset / atom kind context.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HeifError {
+    #[error("ISO-BMFF decode failed at byte offset {offset}/{total}: {source}")]
+    Decode {
+        offset: u64,
+        total: u64,
+        #[source]
+        source: mp4_atom::Error,
+    },
+
+    #[error("Unparsable trailing bytes at offset {offset}/{total} (file likely truncated)")]
+    UnparsableTail { offset: u64, total: u64 },
+
+    #[error("HEIC has no `meta` box at the top level ({input_len} bytes scanned)")]
+    MissingMeta { input_len: usize },
+
+    #[error("Failed to re-encode `{kind}` atom: {source}")]
+    Encode {
+        kind: FourCC,
+        #[source]
+        source: mp4_atom::Error,
+    },
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
 
 /// Whether this path's extension is HEIF / HEIC / HIF / AVIF — formats
 /// that XMP Toolkit's bundled handlers can't open, handled here instead.
@@ -127,34 +161,44 @@ pub(crate) fn extract_xmp_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
               after a push; new_positions is built from the same atoms vec; all indexing \
               here is in-bounds by construction"
 )]
-pub(crate) fn insert_xmp<W: Write>(input: &[u8], xmp: &[u8], mut writer: W) -> Result<()> {
+pub(crate) fn insert_xmp<W: Write>(
+    input: &[u8],
+    xmp: &[u8],
+    mut writer: W,
+) -> Result<(), HeifError> {
     // Record each top-level atom along with its original byte offset in the
     // input so we can rewrite file-absolute iloc entries correctly — the
     // existing iloc offsets point into the original mdat, and those offsets
     // must be updated so that after re-serialization they still land on the
     // same image bytes even though the meta box grew.
+    let total = input.len() as u64;
     let mut cursor: &[u8] = input;
     let mut atoms: Vec<Any> = Vec::new();
     let mut original_offsets: Vec<u64> = Vec::new();
     while !cursor.is_empty() {
-        let offset_before_atom = (input.len() - cursor.len()) as u64;
-        match Any::decode_maybe(&mut cursor)? {
+        let offset = total - cursor.len() as u64;
+        match Any::decode_maybe(&mut cursor).map_err(|source| HeifError::Decode {
+            offset,
+            total,
+            source,
+        })? {
             Some(a) => {
                 atoms.push(a);
-                original_offsets.push(offset_before_atom);
+                original_offsets.push(offset);
             }
-            None => anyhow::bail!(
-                "unparsable tail at offset {} of {}",
-                offset_before_atom,
-                input.len()
-            ),
+            None => {
+                return Err(HeifError::UnparsableTail { offset, total });
+            }
         }
     }
 
-    let meta_idx = atoms
-        .iter()
-        .position(|a| matches!(a, Any::Meta(_)))
-        .ok_or_else(|| anyhow::anyhow!("HEIC has no meta box"))?;
+    let meta_idx =
+        atoms
+            .iter()
+            .position(|a| matches!(a, Any::Meta(_)))
+            .ok_or(HeifError::MissingMeta {
+                input_len: input.len(),
+            })?;
 
     // Step 1: locate and drop the trailing mdat that a prior kei write
     // appended (if any) so we don't accumulate stale XMP payloads on
@@ -224,6 +268,7 @@ pub(crate) fn insert_xmp<W: Write>(input: &[u8], xmp: &[u8], mut writer: W) -> R
                 item_name: String::new(),
                 content_type: Some("application/rdf+xml".to_string()),
                 content_encoding: Some(String::new()),
+                item_uri_type: None,
                 item_not_in_presentation: false,
             },
         );
@@ -281,7 +326,9 @@ pub(crate) fn insert_xmp<W: Write>(input: &[u8], xmp: &[u8], mut writer: W) -> R
     let mut atom_buf: Vec<u8> = Vec::new();
     for atom in &atoms {
         atom_buf.clear();
-        atom.encode(&mut atom_buf)?;
+        let kind = atom.kind();
+        atom.encode(&mut atom_buf)
+            .map_err(|source| HeifError::Encode { kind, source })?;
         writer.write_all(&atom_buf)?;
     }
     Ok(())
@@ -603,16 +650,17 @@ mod tests {
         assert!(extract_xmp_bytes(&bytes).is_none());
     }
 
-    // ── insert_xmp: rejects inputs without a meta box ──
+    // ── insert_xmp: typed errors per failure mode ──
     //
-    // The error path used to be implicit ("anyhow bail somewhere in the
-    // pipeline"); this pins it to the precise "HEIC has no meta box"
-    // message so a future refactor that drops or rewords the bail leaves
-    // a test failure rather than a silent regression.
+    // Each pin asserts on a specific HeifError variant so a future refactor
+    // that drops or reclassifies a failure lands a test failure rather than
+    // a silent regression. Variant matching keeps the assertions stable
+    // across error-message rewording.
 
     #[test]
-    fn insert_xmp_returns_error_on_input_with_no_meta_box() {
-        // Same ftyp-only fixture as above — no meta box present.
+    fn insert_xmp_returns_missing_meta_on_input_with_no_meta_box() {
+        // ftyp-only fixture — syntactically valid ISO-BMFF, but no `meta`
+        // box, so HEIC surgery has nothing to operate on.
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend_from_slice(&0x18_u32.to_be_bytes());
         bytes.extend_from_slice(b"ftyp");
@@ -622,12 +670,11 @@ mod tests {
         bytes.extend_from_slice(b"mif1");
 
         let mut out: Vec<u8> = Vec::new();
-        let result = insert_xmp(&bytes, b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>", &mut out);
-        let err = result.expect_err("insert_xmp must reject input without a meta box");
-        let msg = err.to_string();
+        let err = insert_xmp(&bytes, b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>", &mut out)
+            .expect_err("insert_xmp must reject input without a meta box");
         assert!(
-            msg.contains("meta box") || msg.contains("HEIC"),
-            "error message must name the missing structure; got: {msg}"
+            matches!(err, HeifError::MissingMeta { input_len } if input_len == bytes.len()),
+            "expected MissingMeta with correct input_len, got: {err:?}",
         );
         // Critical: nothing should have been written to the writer.
         assert!(
@@ -638,10 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn insert_xmp_returns_error_on_unparsable_tail() {
+    fn insert_xmp_returns_unparsable_tail_on_short_trailing_bytes() {
         // ftyp box followed by 3 stray bytes that can't form a valid atom
-        // header. The parser must surface this via `bail!` rather than
-        // silently truncating output.
+        // header. The parser must surface this as UnparsableTail (truncation
+        // signal), not as a generic Decode error.
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend_from_slice(&0x18_u32.to_be_bytes());
         bytes.extend_from_slice(b"ftyp");
@@ -649,14 +696,24 @@ mod tests {
         bytes.extend_from_slice(&0_u32.to_be_bytes());
         bytes.extend_from_slice(b"heic");
         bytes.extend_from_slice(b"mif1");
-        // Tail: too short to be an atom header.
         bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let total = bytes.len() as u64;
 
         let mut out: Vec<u8> = Vec::new();
-        let result = insert_xmp(&bytes, b"<x/>", &mut out);
+        let err = insert_xmp(&bytes, b"<x/>", &mut out)
+            .expect_err("insert_xmp must surface parse errors on unparsable tail");
         assert!(
-            result.is_err(),
-            "insert_xmp must surface parse errors on unparsable tail"
+            matches!(err, HeifError::UnparsableTail { offset: 0x18, total: t } if t == total),
+            "expected UnparsableTail at offset 0x18 of {total}, got: {err:?}",
         );
+    }
+
+    #[test]
+    fn heif_error_io_variant_carries_underlying_io_error() {
+        // Sanity-check the Io variant — the writer used by insert_xmp is
+        // any std::io::Write, and io::Error must convert via From.
+        let io_err = std::io::Error::other("disk full");
+        let err: HeifError = io_err.into();
+        assert!(matches!(err, HeifError::Io(_)));
     }
 }
