@@ -21,6 +21,11 @@ use mp4_atom::{
 
 /// Whether this path's extension is HEIF / HEIC / HIF / AVIF — formats
 /// that XMP Toolkit's bundled handlers can't open, handled here instead.
+///
+/// Used for pre-download decisions where the file doesn't exist yet, so
+/// content sniffing isn't possible. For post-download dispatch on a file
+/// that may have a temp suffix shadowing its real extension (`.kei-tmp`),
+/// use [`is_heif_content`] instead.
 pub(crate) fn is_heif_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -29,6 +34,41 @@ pub(crate) fn is_heif_path(path: &Path) -> bool {
             matches!(lower.as_str(), "heic" | "heif" | "hif" | "avif")
         })
         .unwrap_or(false)
+}
+
+/// Whether `bytes` starts with an ISO-BMFF `ftyp` box whose major brand is
+/// in the HEIF family. Robust to part-file naming where the path extension
+/// has been replaced by a temp suffix — the byte signature is the only
+/// reliable way to dispatch HEIF vs the formats XMP Toolkit can sniff
+/// itself (JPEG/PNG/TIFF/MP4/MOV).
+///
+/// Brands per ISO/IEC 23008-12 §A.6 (HEIF) and AV1 Image File Format
+/// (`avif`/`avis`). Only the first 12 bytes are inspected: 4-byte size,
+/// `ftyp` fourCC, then 4-byte major brand.
+pub(crate) fn is_heif_content(bytes: &[u8]) -> bool {
+    let Some(box_type) = bytes.get(4..8) else {
+        return false;
+    };
+    if box_type != b"ftyp" {
+        return false;
+    }
+    let Some(brand) = bytes.get(8..12) else {
+        return false;
+    };
+    matches!(
+        brand,
+        b"heic"
+            | b"heix"
+            | b"heim"
+            | b"heis"
+            | b"hevc"
+            | b"hevm"
+            | b"hevs"
+            | b"mif1"
+            | b"msf1"
+            | b"avif"
+            | b"avis"
+    )
 }
 
 /// Locate the XMP packet bytes embedded in a HEIC file, if any. Returns the
@@ -441,6 +481,65 @@ mod tests {
         assert!(!is_heif_path(Path::new("/a/b.jpg")));
         assert!(!is_heif_path(Path::new("/a/b.mov")));
         assert!(!is_heif_path(Path::new("/a/b")));
+    }
+
+    /// Build a minimal ftyp prefix with the given major brand for tests.
+    fn ftyp_prefix(brand: &[u8; 4]) -> Vec<u8> {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&0x18_u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(brand);
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(b"mif1");
+        bytes.extend_from_slice(b"heic");
+        bytes
+    }
+
+    #[test]
+    fn is_heif_content_accepts_all_known_brands() {
+        for brand in [
+            b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevm", b"hevs", b"mif1", b"msf1",
+            b"avif", b"avis",
+        ] {
+            assert!(
+                is_heif_content(&ftyp_prefix(brand)),
+                "expected brand {:?} to be HEIF",
+                std::str::from_utf8(brand).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn is_heif_content_rejects_non_heif_iso_bmff() {
+        // mp4/mov: ftyp present but brand is not in the HEIF family.
+        for brand in [b"mp42", b"isom", b"qt  ", b"M4V "] {
+            assert!(
+                !is_heif_content(&ftyp_prefix(brand)),
+                "expected brand {:?} to NOT be HEIF",
+                std::str::from_utf8(brand).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn is_heif_content_rejects_jpeg_magic() {
+        // SOI + APP0 prefix; bytes 4..8 are not "ftyp".
+        let bytes = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+        ];
+        assert!(!is_heif_content(&bytes));
+    }
+
+    #[test]
+    fn is_heif_content_rejects_short_or_empty_input() {
+        assert!(!is_heif_content(&[]));
+        assert!(!is_heif_content(&[0; 11]));
+    }
+
+    #[test]
+    fn is_heif_content_rejects_garbage_with_no_ftyp() {
+        let blob: Vec<u8> = (0..32_u8).collect();
+        assert!(!is_heif_content(&blob));
     }
 
     // ── extract_xmp_bytes: malformed input must not panic, must return None ──

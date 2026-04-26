@@ -118,14 +118,35 @@ impl MetadataWrite {
 /// Atomic: we copy the input to a sibling `.meta-tmp`, patch it in place,
 /// then rename over the target. A crash mid-write leaves the original
 /// untouched.
+///
+/// Dispatch is content-based: the first 12 bytes are inspected for an
+/// ISO-BMFF `ftyp` box with a HEIF-family brand. The download pipeline
+/// calls this on `.kei-tmp` part files where the path extension has been
+/// shadowed by the temp suffix; sniffing bytes makes that safe. Falls
+/// back to extension-based dispatch only when the read itself fails, so
+/// callers operating on a transient/unreadable file degrade to today's
+/// behavior rather than spuriously routing everything to XMP Toolkit.
 pub(crate) fn apply_metadata(path: &Path, write: &MetadataWrite) -> Result<()> {
     if write.is_empty() {
         return Ok(());
     }
-    if heif::is_heif_path(path) {
+    if is_heif_file(path) {
         apply_metadata_heif(path, write)
     } else {
         apply_metadata_xmp_toolkit(path, write)
+    }
+}
+
+/// Read the first 12 bytes of `path` and dispatch to [`heif::is_heif_content`].
+/// On read error, fall back to extension-based detection — preserves the
+/// pre-content-sniff behavior for any caller that hands us an unreadable
+/// path, rather than misclassifying every such call as non-HEIF.
+fn is_heif_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 12];
+    match std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) {
+        Ok(n) => heif::is_heif_content(head.get(..n).unwrap_or(&[])),
+        Err(_) => heif::is_heif_path(path),
     }
 }
 
@@ -1115,6 +1136,67 @@ mod tests {
             }
         }
         None
+    }
+
+    // ── Regression: dispatch must work on part-file paths (issue #269) ──
+    //
+    // The download pipeline writes metadata onto the `<base32>.kei-tmp`
+    // part file *before* the atomic rename to the final `.HEIC` name. A
+    // dispatch keyed off `path.extension()` saw `kei-tmp`, missed the
+    // HEIF branch, and routed HEIC bytes to XMP Toolkit, which has no
+    // HEIF handler — every first-pass HEIC metadata write logged "Failed
+    // to write metadata: Opening …kei-tmp.meta-tmp for XMP update" and
+    // set a retry marker, then the next sync's metadata-rewrite pass
+    // silently fixed it on the renamed file. Content sniffing eliminates
+    // the spurious failure on the first pass.
+
+    #[test]
+    fn apply_metadata_dispatches_heif_on_extension_less_part_file() {
+        let dir = test_tmp_dir("meta_heic_tests");
+        fs::create_dir_all(&dir).unwrap();
+        // Mimic the download part-file: base32-ish stem with `.kei-tmp`
+        // suffix shadowing the real `.heic` extension.
+        let path = dir.join("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.kei-tmp");
+        fs::write(&path, SAMPLE_HEIC).unwrap();
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                rating: Some(4),
+                title: Some("PartFile".into()),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC metadata write must succeed on .kei-tmp part file");
+        let xmp = extract_xmp_from_heic(&fs::read(&path).unwrap())
+            .expect("XMP must be embedded via the HEIF writer, not XMP Toolkit");
+        let s = std::str::from_utf8(&xmp).unwrap();
+        assert!(s.contains("xmp:Rating"), "XMP missing rating");
+        assert!(s.contains("PartFile"), "XMP missing title");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_dispatches_xmp_toolkit_on_extension_less_jpeg_part_file() {
+        // Negative case: extension-less ≠ HEIF. A JPEG-bearing part file
+        // must still route to XMP Toolkit and succeed.
+        let dir = test_tmp_dir("meta_tests");
+        let path = dir.join("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB.kei-tmp");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, minimal_jpeg()).unwrap();
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                rating: Some(2),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("JPEG metadata write must succeed on .kei-tmp part file");
+        let meta = read_meta(&path);
+        assert_eq!(
+            meta.property(xmp_ns::XMP, "Rating").map(|v| v.value),
+            Some("2".to_string()),
+        );
+        fs::remove_file(&path).ok();
     }
 
     // ── Sidecar + format-dispatch tests ────────────────────────────────
