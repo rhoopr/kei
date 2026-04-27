@@ -954,6 +954,7 @@ mod tests {
 /// internally so the lib's internal types stay `pub(crate)`. Don't add
 /// anything here that isn't strictly needed by a fuzz target.
 #[cfg(feature = "__fuzz_internals")]
+#[doc(hidden)]
 pub mod __fuzz {
     use serde_json::Value;
 
