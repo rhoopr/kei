@@ -681,6 +681,57 @@ mod tests {
         assert_eq!(truncate_library_zone(""), "");
     }
 
+    /// CG-2 (adversarial): two distinct SharedSync zones whose UUIDs
+    /// share the leading 8 hex chars produce the same truncated form.
+    /// The current implementation has no collision guard, so any
+    /// `{library}` token rendered for both would land at the same path
+    /// and silently overwrite ("transparent layer" / "no silent
+    /// failures" invariant). Pin the collision so any future bail at
+    /// resolve-libraries time can rely on this property.
+    #[test]
+    fn truncate_library_zone_collision_two_distinct_uuids_share_prefix() {
+        let zone_a = "SharedSync-A1B2C3D4-EEEE-7890-ABCD-EF1234567890";
+        let zone_b = "SharedSync-A1B2C3D4-FFFF-7890-ABCD-EF1234567890";
+        // Pre-condition: distinct full UUIDs.
+        assert_ne!(zone_a, zone_b);
+        // Pinned collision: identical truncated output.
+        assert_eq!(truncate_library_zone(zone_a), "SharedSync-A1B2C3D4");
+        assert_eq!(truncate_library_zone(zone_b), "SharedSync-A1B2C3D4");
+        assert_eq!(truncate_library_zone(zone_a), truncate_library_zone(zone_b));
+    }
+
+    /// CG-3 (adversarial, refined): `expand_named_token` with
+    /// `{library}` and an empty zone name must collapse to the empty
+    /// segment branch. Pin the **exact** resulting string so a
+    /// regression that silently inserts a literal `empty` token (or
+    /// reorders surrounding `/`) lands red. Behavior contract today:
+    /// `Some("")` is treated like `None` (the `.filter(|n| !n.is_empty())`
+    /// guard) so `{library}` is replaced with the empty string, leaving
+    /// adjacent slashes.
+    #[test]
+    fn expand_named_token_library_with_empty_zone_yields_explicit_segment() {
+        // Empty zone via Some("") — the defensive case for a CloudKit
+        // response that ever returns an empty zone name.
+        assert_eq!(
+            expand_named_token("{library}/%Y/%m", "{library}", Some("")),
+            "/%Y/%m",
+            "empty Some-zone must collapse the {{library}} segment to empty",
+        );
+        // None zone is the documented "no library context" case and
+        // must produce identical output (defensive symmetry).
+        assert_eq!(
+            expand_named_token("{library}/%Y/%m", "{library}", None),
+            "/%Y/%m",
+            "None zone must mirror Some(\"\") behavior",
+        );
+        // Embedded position: surrounding text is preserved verbatim.
+        assert_eq!(
+            expand_named_token("photos/{library}/by-date", "{library}", Some("")),
+            "photos//by-date",
+            "empty zone in mid-template must leave adjacent separators intact",
+        );
+    }
+
     #[test]
     fn test_clean_filename() {
         assert_eq!(clean_filename("photo:1.jpg"), "photo_1.jpg");

@@ -55,6 +55,15 @@ fn install_rate_limit_hook() {
 /// With session reuse (accountLogin fallback), most invocations avoid SRP,
 /// but spacing API calls is still polite. Default: 2 seconds. Override with
 /// `TEST_THROTTLE_SECS` env var (0 to disable).
+///
+/// NOTE: this is the **one** intentional `thread::sleep` in the suite —
+/// the test-review framework's "use `tokio::time::pause/advance` instead
+/// of `thread::sleep`" rule applies to in-test synchronization (waiting
+/// for a tokio task to make progress). Here the sleep is a wall-clock
+/// rate-limit guard against Apple's auth endpoints, which see real
+/// elapsed time and wouldn't be fooled by a paused tokio clock. Do not
+/// migrate to `tokio::time::sleep` without a concrete plan to keep the
+/// inter-test spacing visible to Apple.
 fn throttle() {
     static FIRST: AtomicBool = AtomicBool::new(true);
     if FIRST.swap(false, Ordering::SeqCst) {

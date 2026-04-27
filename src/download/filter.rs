@@ -2872,6 +2872,64 @@ mod tests {
         );
     }
 
+    // ── CG-6: post-rename pre-state-write idempotency ──────────────────
+    //
+    // After `rename_part_to_final` succeeds (file is on disk at the
+    // final path) but before `state_db.mark_downloaded()` commits, a
+    // SIGKILL leaves the file persisted with no asset row. The next
+    // sync must classify this as "already downloaded" via the
+    // filesystem check and skip — not re-download (bandwidth waste,
+    // extra Apple API calls, possible duplicate-named files) and not
+    // fail because the destination exists.
+    //
+    // The "filesystem check" is `resolve_download_path`'s on-disk
+    // probe, exercised here by composing a fresh `DirCache` (the
+    // post-restart state) plus the same asset config. Pre-existing
+    // tests like `test_filter_skips_existing_file` cover this for the
+    // happy path; this test names the crash-recovery scenario
+    // explicitly so a regression that ties skip-decision to a DB row
+    // (rather than the on-disk truth) lands red.
+    #[test]
+    fn pipeline_post_rename_pre_state_kill_recovers_idempotently() {
+        let dir = TempDir::new().unwrap();
+
+        let asset = TestPhotoAsset::new("ASSET_KILL")
+            .filename("IMG_KILL.JPG")
+            .orig_size(1000)
+            .orig_url("https://p01.icloud-content.com/kill")
+            .orig_checksum("ck_kill")
+            .build();
+
+        let mut config = test_config();
+        config.directory = std::sync::Arc::from(dir.path());
+
+        // Step 1: first filter pass yields one task at the canonical
+        // download path. (This is what the pre-kill sync did before
+        // crashing.)
+        let tasks_pre = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks_pre.len(), 1);
+        let final_path = tasks_pre[0].download_path.clone();
+
+        // Step 2: simulate the post-rename state — the file lives on
+        // disk at the final path with the right size. The state DB
+        // does *not* know about it (we've thrown away the
+        // claimed_paths map and DirCache, mirroring a fresh process
+        // restart).
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        fs::write(&final_path, vec![0u8; 1000]).unwrap();
+
+        // Step 3: re-run filter against the same asset. Crash recovery
+        // must skip without re-emitting a task, even though no DB row
+        // backs the file.
+        let tasks_post = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks_post.is_empty(),
+            "post-kill rerun must skip via on-disk detection \
+             (file exists at {final_path:?} with matching size); \
+             got tasks: {tasks_post:?}",
+        );
+    }
+
     // ── Gap: VideoOnly mode emits only MOV, no primary image ─────────
 
     #[test]

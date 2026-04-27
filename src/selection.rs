@@ -873,4 +873,190 @@ mod tests {
         assert!(s.libraries.shared_all);
         assert!(s.unfiled);
     }
+
+    // ── Round-trip via to_raw() ────────────────────────────────────────
+    //
+    // CG-1, CG-1b, CG-1c: serialization round-trips.
+    //
+    // `to_raw()` is consumed by `report.rs`, `Config::to_toml()`, and
+    // `download/mod.rs::compute_config_hash()`. A swapped `included`/
+    // `excluded` order or a missing `format!("!{n}")` prefix would land
+    // green if we only round-trip the all-sentinel case (the most common
+    // fixture). Pin the named-with-excluded variants so a regression in
+    // either prefix or ordering surfaces.
+
+    #[test]
+    fn selection_album_to_raw_round_trips_named_with_excludes() {
+        // Arrange
+        let original = AlbumSelector::Named {
+            included: set(&["Vacation", "Wedding"]),
+            excluded: set(&["Drafts", "Family"]),
+        };
+
+        // Act
+        let raw = original.to_raw();
+        let parsed = parse_album_selector(&raw, false).unwrap();
+
+        // Assert: round-trip is a fixed point. Also pin the on-the-wire
+        // shape so a future "!" prefix drop fails here even before the
+        // re-parse runs.
+        assert_eq!(parsed, original);
+        assert!(
+            raw.iter().any(|r| r == "!Drafts"),
+            "exclusion prefix '!' must survive serialization; got {raw:?}"
+        );
+        assert!(
+            raw.iter().any(|r| r == "!Family"),
+            "exclusion prefix '!' must survive serialization; got {raw:?}"
+        );
+    }
+
+    #[test]
+    fn selection_album_to_raw_round_trips_all_with_excludes() {
+        let original = AlbumSelector::All {
+            excluded: set(&["Family"]),
+        };
+        let raw = original.to_raw();
+        let parsed = parse_album_selector(&raw, false).unwrap();
+        assert_eq!(parsed, original);
+        assert_eq!(raw, vec!["all".to_string(), "!Family".to_string()]);
+    }
+
+    #[test]
+    fn selection_smart_folder_to_raw_round_trips_named_with_excludes() {
+        let original = SmartFolderSelector::Named {
+            included: set(&["Favorites", "Videos"]),
+            excluded: set(&["Hidden"]),
+        };
+        let raw = original.to_raw();
+        let parsed = parse_smart_folder_selector(&raw).unwrap();
+        assert_eq!(parsed, original);
+        assert!(raw.iter().any(|r| r == "!Hidden"));
+    }
+
+    #[test]
+    fn selection_smart_folder_to_raw_round_trips_all_with_sensitive() {
+        let original = SmartFolderSelector::All {
+            include_sensitive: true,
+            excluded: set(&["Recently Deleted"]),
+        };
+        let raw = original.to_raw();
+        let parsed = parse_smart_folder_selector(&raw).unwrap();
+        assert_eq!(parsed, original);
+        // The sensitive sentinel must survive verbatim.
+        assert!(
+            raw.iter().any(|r| r == "all-with-sensitive"),
+            "all-with-sensitive sentinel must serialize verbatim; got {raw:?}"
+        );
+    }
+
+    #[test]
+    fn selection_library_to_raw_round_trips_named_with_excludes() {
+        let original = LibrarySelector {
+            primary: true,
+            shared_all: false,
+            named: set(&["SharedSync-A1B2C3D4"]),
+            excluded: set(&["Foo"]),
+        };
+        let raw = original.to_raw();
+        let parsed = parse_library_selector(&raw).unwrap();
+        assert_eq!(parsed, original);
+        assert!(raw.iter().any(|r| r == "!Foo"));
+    }
+
+    #[test]
+    fn selection_library_all_with_exclusion_round_trips() {
+        // CG-1b: `LibrarySelector::to_raw()` collapses to `all` when both
+        // primary and shared_all are set with no named zones. A dropped
+        // exclusion under that branch would silently change which zones
+        // sync after a TOML round-trip.
+        let original = LibrarySelector {
+            primary: true,
+            shared_all: true,
+            named: BTreeSet::new(),
+            excluded: set(&["Foo"]),
+        };
+        let raw = original.to_raw();
+        let parsed = parse_library_selector(&raw).unwrap();
+        assert_eq!(parsed, original);
+        // Pin the wire shape so the `["all", "!Foo"]` collapsing branch
+        // can't silently drop the `all` sentinel or reorder.
+        assert_eq!(raw, vec!["all".to_string(), "!Foo".to_string()]);
+    }
+
+    #[test]
+    fn selection_full_round_trip_via_build_selection() {
+        // CG-1c: take a non-default `Selection`, run every field through
+        // `to_raw()`, feed back through `build_selection`, assert equal.
+        // A future refactor that drops one `to_raw()` branch (e.g.
+        // forgets `unfiled` because there's no `to_raw()` for it) lands
+        // green without this.
+        let original = Selection {
+            albums: AlbumSelector::All {
+                excluded: set(&["Family"]),
+            },
+            smart_folders: SmartFolderSelector::Named {
+                included: set(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            libraries: LibrarySelector {
+                primary: true,
+                shared_all: true,
+                named: BTreeSet::new(),
+                excluded: BTreeSet::new(),
+            },
+            unfiled: false,
+        };
+
+        let raw_albums = original.albums.to_raw();
+        let raw_smart = original.smart_folders.to_raw();
+        let raw_lib = original.libraries.to_raw();
+
+        let rebuilt =
+            build_selection(&raw_albums, &raw_smart, &raw_lib, Some(original.unfiled)).unwrap();
+        assert_eq!(rebuilt, original);
+    }
+
+    // ── Bare exclusion with default_to_all = false ────────────────────
+    //
+    // CG-9: `parse_album_selector(["!Family"], false)` is not directly
+    // tested. The implementation always returns `All { excluded }` for an
+    // exclusion-only input regardless of `default_to_all`; pin that so a
+    // future refactor that ties exclusions to `default_to_all` lands red.
+
+    #[test]
+    fn album_bare_exclusion_with_default_false_still_resolves_to_all() {
+        let r = parse_album_selector(&s(&["!Family"]), false).unwrap();
+        assert_eq!(
+            r,
+            AlbumSelector::All {
+                excluded: set(&["Family"]),
+            }
+        );
+    }
+
+    // ── Unicode-whitespace boundary on parse_library_selector ─────────
+    //
+    // 3g boundary (adversarial): `entry.trim()` strips ASCII whitespace
+    // but leaves Unicode whitespace like U+00A0 (NBSP) intact, so a
+    // stray-NBSP-only entry would slip through as a literal zone name
+    // and fail at the CloudKit boundary instead of at parse time.
+    // "No silent failures" mandates the parse-time bail; if this test
+    // fails, the production parser needs a `trim_matches(char::is_whitespace)`
+    // (or equivalent) to match the spec.
+
+    #[test]
+    fn parse_library_selector_rejects_unicode_whitespace_only_entry() {
+        // U+00A0 (NBSP) — a single-codepoint non-ASCII whitespace entry.
+        let r = parse_library_selector(&s(&["\u{00A0}"]));
+        assert!(
+            r.is_err(),
+            "single-NBSP entry must bail at parse time, got: {r:?}"
+        );
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("must not be empty") || msg.contains("empty"),
+            "error must name the empty-input cause; got: {msg}"
+        );
+    }
 }

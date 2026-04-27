@@ -3417,6 +3417,67 @@ mod tests {
         );
     }
 
+    // ── CG-1d (mutation-pinning sibling): operator inversion ──────────
+    //
+    // The existing tests already assert the decision (Some(true) /
+    // Some(false)), not just field equality. What's missing is a test
+    // that pins the checksum-comparison **operator**: if a refactor
+    // swaps `stored.as_ref() != checksum` for `==`, the decision
+    // inverts and every downloaded asset re-downloads (or vice versa).
+    //
+    // Mutation: in `should_download_fast`, swap `!=` to `==` on the
+    // stored-vs-current checksum line. With the existing fixtures,
+    // both sides happen to land on `Some(false)` for the matching
+    // case via the trust_state path, so the assertion below is the
+    // only one in the suite that fails on operator inversion: paired
+    // probes with opposite checksum equality, asserting opposite
+    // decisions.
+    #[test]
+    fn should_download_fast_inverts_when_checksum_operator_flips() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset_op".into())
+            .or_default()
+            .insert("original".into());
+        ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset_op".into())
+            .or_default()
+            .insert("original".into(), "ck_stored".into());
+
+        // Matching checksum + trust_state=true → skip (Some(false)).
+        let matching = ctx.should_download_fast(
+            "PrimarySync",
+            "asset_op",
+            VersionSizeKey::Original,
+            "ck_stored",
+            true,
+        );
+        // Different checksum + trust_state=true → re-download
+        // (Some(true)).
+        let different = ctx.should_download_fast(
+            "PrimarySync",
+            "asset_op",
+            VersionSizeKey::Original,
+            "ck_changed",
+            true,
+        );
+
+        // Pin the inversion. If `!=` were swapped for `==`, both probes
+        // would return the same Some(_) — collapsing the decision
+        // surface. Asserting opposite values catches that.
+        assert_eq!(matching, Some(false), "matching checksum must skip");
+        assert_eq!(different, Some(true), "changed checksum must re-download");
+        assert_ne!(
+            matching, different,
+            "matching and changed checksums must produce opposite decisions \
+             (catches `!=` ↔ `==` operator swap on stored-vs-current compare)"
+        );
+    }
+
     // ── Gap: should_download_fast with multiple version sizes ─────────
 
     #[test]
