@@ -482,7 +482,7 @@ struct LegacyAlbumTokenMigration {
 }
 
 /// Detect a legacy `{album}` token in `folder_structure` and split it across
-/// the new per-category templates so the path renderer (which now consumes
+/// the new per-category templates so the path renderer (which consumes
 /// `folder_structure_albums` for album passes) stays equivalent.
 ///
 /// - `{album}/<rest>` migrates to `folder_structure_albums = "{album}/<rest>"`,
@@ -516,20 +516,24 @@ fn auto_migrate_legacy_album_token(
         stripped.to_string()
     };
 
-    let new_base = if stripped == "{album}" {
-        "none".to_string()
-    } else if let Some(rest) = stripped.strip_prefix("{album}/") {
-        rest.to_string()
-    } else {
-        // `validate_folder_structure` enforces `{album}` as the first
-        // segment, so any other shape is a bug in the validator. Leave the
-        // template untouched rather than corrupting it; the warning still
-        // tells the user to migrate manually.
-        stripped.to_string()
-    };
+    // `validate_folder_structure` guarantees `{album}` is the leading
+    // segment when present, so the only shapes reaching here are exactly
+    // `{album}` (no remainder, base becomes `none`) and `{album}/<rest>`
+    // (lift the rest into the base). Falling through to `none` on any
+    // would-be-malformed input is the safe outcome: the unfiled pass gets
+    // no date hierarchy, but no unstripped `{album}` token leaks back
+    // into the renderer's base path.
+    let new_base = stripped
+        .strip_prefix("{album}/")
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::download::paths::NO_DATE_STRUCTURE.to_string());
 
+    // Single-quoted form so users can paste the suggestion straight into
+    // a POSIX shell. `{:?}` would emit Rust string escapes (\n, \u{...})
+    // which bash would mis-interpret; templates can't contain single
+    // quotes today (validated upstream).
     let suggestion =
-        format!("`--folder-structure {new_base:?} --folder-structure-albums {new_albums:?}`");
+        format!("`--folder-structure '{new_base}' --folder-structure-albums '{new_albums}'`");
     LegacyAlbumTokenMigration {
         folder_structure: new_base,
         folder_structure_albums: new_albums,
@@ -551,13 +555,12 @@ fn resolve_album_selection(
     if raw.is_empty() {
         // Bare `{album}` in the folder template implies "every album, plus an
         // unfiled pass" without the user having to also pass `--album all`.
-        // The new selection model defaults `--album` to `all`, so this
-        // implicit promotion is no longer needed; preserved for v0.13 with a
-        // deprecation warning, removed in v0.20.
+        // The selection model now defaults `--album` to `all`, so this
+        // implicit promotion is redundant; warn and remove later.
         if crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}") {
             warn_deprecated(
                 "implicit `--album all` from `{album}` in `--folder-structure`",
-                "an explicit `--album all` (the default in v0.13)",
+                "an explicit `--album all` (now the default)",
             );
             return Ok((AlbumSelection::All, Vec::new()));
         }
@@ -4818,7 +4821,10 @@ mod tests {
             DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
             false,
         );
-        assert_eq!(m.folder_structure, "none");
+        assert_eq!(
+            m.folder_structure,
+            crate::download::paths::NO_DATE_STRUCTURE
+        );
         assert_eq!(m.folder_structure_albums, "{album}");
     }
 
@@ -4856,7 +4862,10 @@ mod tests {
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{album}".to_string());
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "none");
+        assert_eq!(
+            cfg.folder_structure,
+            crate::download::paths::NO_DATE_STRUCTURE
+        );
         assert_eq!(cfg.folder_structure_albums, "{album}");
     }
 

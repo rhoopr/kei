@@ -6,6 +6,11 @@ use base64::Engine;
 use chrono::{DateTime, Local};
 use rustc_hash::FxHashMap;
 
+/// Sentinel folder-structure value that disables the date-based directory
+/// hierarchy entirely (files land directly in the download directory).
+/// Matched case-insensitively.
+pub(crate) const NO_DATE_STRUCTURE: &str = "none";
+
 /// Strip the legacy Python-style `{:%Y/%m/%d}` wrapper, returning the inner
 /// format string. Returns the input unchanged if the wrapper is absent.
 pub(crate) fn strip_python_wrapper(folder_structure: &str) -> &str {
@@ -59,7 +64,7 @@ pub(crate) fn local_download_dir(
     created_date: &DateTime<Local>,
     album_name: Option<&str>,
 ) -> PathBuf {
-    if folder_structure.eq_ignore_ascii_case("none") {
+    if folder_structure.eq_ignore_ascii_case(NO_DATE_STRUCTURE) {
         return directory.to_path_buf();
     }
 
