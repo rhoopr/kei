@@ -175,6 +175,7 @@ pub(super) const AUTH_ERROR_THRESHOLD: usize = 3;
 /// Accumulated during the download loop and retried in a final flush.
 #[derive(Debug)]
 struct PendingStateWrite {
+    library: Arc<str>,
     asset_id: Arc<str>,
     version_size: crate::state::VersionSizeKey,
     download_path: PathBuf,
@@ -198,18 +199,19 @@ const STATE_DB_UNWRITABLE_THRESHOLD: usize = 5;
 /// mark_downloaded call sites (streaming loop and cleanup pass).
 async fn update_metadata_marker(
     db: &dyn StateDb,
+    library: &str,
     asset_id: &str,
     version_size: &str,
     exif_ok: bool,
 ) {
     if exif_ok {
         let _ = db
-            .clear_metadata_write_failure(asset_id, version_size)
+            .clear_metadata_write_failure(library, asset_id, version_size)
             .await;
         return;
     }
     if let Err(e) = db
-        .record_metadata_write_failure(asset_id, version_size)
+        .record_metadata_write_failure(library, asset_id, version_size)
         .await
     {
         tracing::warn!(
@@ -240,7 +242,7 @@ async fn tag_metadata_rewrites(
     };
     let new_hash = asset.metadata().metadata_hash.as_deref();
     for &(vs, _) in candidates {
-        if !ctx.needs_metadata_rewrite(asset.id(), vs, new_hash) {
+        if !ctx.needs_metadata_rewrite(&config.library, asset.id(), vs, new_hash) {
             continue;
         }
         tracing::info!(
@@ -249,7 +251,7 @@ async fn tag_metadata_rewrites(
             "Metadata-only change detected; tagging for rewrite"
         );
         if let Err(e) = db
-            .record_metadata_write_failure(asset.id(), vs.as_str())
+            .record_metadata_write_failure(&config.library, asset.id(), vs.as_str())
             .await
         {
             tracing::warn!(
@@ -294,6 +296,7 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
         for attempt in 1..=STATE_WRITE_MAX_RETRIES {
             match db
                 .mark_downloaded(
+                    &write.library,
                     &write.asset_id,
                     write.version_size.as_str(),
                     &write.download_path,
@@ -504,14 +507,19 @@ async fn run_metadata_rewrites(
         if embed_ok && sidecar_ok {
             if let Some(new_hash) = record.metadata.metadata_hash.as_deref() {
                 if let Err(e) = db
-                    .update_metadata_hash(&record.id, version_size.as_str(), new_hash)
+                    .update_metadata_hash(
+                        &record.library,
+                        &record.id,
+                        version_size.as_str(),
+                        new_hash,
+                    )
                     .await
                 {
                     tracing::warn!(asset_id = %record.id, error = %e, "Failed to update metadata_hash");
                 }
             }
             if let Err(e) = db
-                .clear_metadata_write_failure(&record.id, version_size.as_str())
+                .clear_metadata_write_failure(&record.library, &record.id, version_size.as_str())
                 .await
             {
                 tracing::warn!(asset_id = %record.id, error = %e, "Failed to clear metadata rewrite marker");
@@ -615,6 +623,9 @@ pub(super) struct PassConfig<'a> {
     /// the rate-limit pressure warning.
     pub(super) rate_limit_counter: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) bandwidth_limiter: Option<super::BandwidthLimiter>,
+    /// CloudKit zone name scoping every state-DB key written by this pass.
+    /// Sourced from `DownloadConfig::library` at pass dispatch.
+    pub(super) library: Arc<str>,
 }
 
 impl std::fmt::Debug for PassConfig<'_> {
@@ -693,7 +704,13 @@ where
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
                                 matches!(
-                                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                                    download_ctx.should_download_fast(
+                                        &config.library,
+                                        asset.id(),
+                                        vs,
+                                        cs,
+                                        true
+                                    ),
                                     Some(false)
                                 )
                             })
@@ -882,6 +899,7 @@ where
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
     let mut bytes_downloaded_total: u64 = 0;
     let mut disk_bytes_total: u64 = 0;
+    let library: Arc<str> = Arc::clone(&config.library);
 
     let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
 
@@ -1004,7 +1022,13 @@ where
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
                                 matches!(
-                                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                                    download_ctx.should_download_fast(
+                                        &config.library,
+                                        asset.id(),
+                                        vs,
+                                        cs,
+                                        true
+                                    ),
                                     Some(false)
                                 )
                             })
@@ -1078,6 +1102,7 @@ where
                                         );
                                         if let Err(e) = db
                                             .mark_failed(
+                                                &config.library,
                                                 &task.asset_id,
                                                 task.version_size.as_str(),
                                                 &error,
@@ -1110,6 +1135,7 @@ where
                             if let Some(db) = &producer_state_db {
                                 let media_type = determine_media_type(task.version_size, &asset);
                                 let record = AssetRecord::new_pending(
+                                    config.library.to_string(),
                                     task.asset_id.to_string(),
                                     task.version_size,
                                     task.checksum.to_string(),
@@ -1151,6 +1177,7 @@ where
                                 }
 
                                 match download_ctx.should_download_fast(
+                                    &config.library,
                                     &task.asset_id,
                                     task.version_size,
                                     &task.checksum,
@@ -1310,7 +1337,7 @@ where
             if !touched_ids.is_empty() {
                 let touched_count = touched_ids.len();
                 let ids: Vec<&str> = touched_ids.iter().map(AsRef::as_ref).collect();
-                if let Err(e) = db.touch_last_seen_many(&ids).await {
+                if let Err(e) = db.touch_last_seen_many(&config.library, &ids).await {
                     producer_pb.suspend(|| {
                         tracing::warn!(
                             error = %e,
@@ -1387,6 +1414,7 @@ where
                 if let Some(db) = &state_db {
                     if let Err(e) = db
                         .mark_downloaded(
+                            &library,
                             &task.asset_id,
                             task.version_size.as_str(),
                             &task.download_path,
@@ -1403,6 +1431,7 @@ where
                             );
                         });
                         pending_state_writes.push(PendingStateWrite {
+                            library: Arc::clone(&library),
                             asset_id: task.asset_id.clone(),
                             version_size: task.version_size,
                             download_path: task.download_path.clone(),
@@ -1415,6 +1444,7 @@ where
                         // EXIF/XMP writer succeeded.
                         update_metadata_marker(
                             db.as_ref(),
+                            &library,
                             &task.asset_id,
                             task.version_size.as_str(),
                             exif_ok,
@@ -1456,7 +1486,12 @@ where
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) = db
-                        .mark_failed(&task.asset_id, task.version_size.as_str(), &e.to_string())
+                        .mark_failed(
+                            &library,
+                            &task.asset_id,
+                            task.version_size.as_str(),
+                            &e.to_string(),
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -1721,6 +1756,7 @@ pub(super) async fn build_download_outcome(
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::clone(&phase2_rate_counter),
         bandwidth_limiter: config.bandwidth_limiter.clone(),
+        library: Arc::clone(&config.library),
     };
     let pass_result = run_download_pass(pass_config, fresh_tasks).await;
 
@@ -1816,6 +1852,7 @@ pub(super) async fn run_download_pass(
     let temp_suffix: Arc<str> = config.temp_suffix;
     let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
+    let library: Arc<str> = Arc::clone(&config.library);
 
     let mut download_stream = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
@@ -1869,6 +1906,7 @@ pub(super) async fn run_download_pass(
                 if let Some(db) = &state_db {
                     if let Err(e) = db
                         .mark_downloaded(
+                            &library,
                             &task.asset_id,
                             task.version_size.as_str(),
                             &task.download_path,
@@ -1885,6 +1923,7 @@ pub(super) async fn run_download_pass(
                             );
                         });
                         pending_state_writes.push(PendingStateWrite {
+                            library: Arc::clone(&library),
                             asset_id: task.asset_id.clone(),
                             version_size: task.version_size,
                             download_path: task.download_path.clone(),
@@ -1894,6 +1933,7 @@ pub(super) async fn run_download_pass(
                     } else {
                         update_metadata_marker(
                             db.as_ref(),
+                            &library,
                             &task.asset_id,
                             task.version_size.as_str(),
                             *exif_ok,
@@ -1918,7 +1958,12 @@ pub(super) async fn run_download_pass(
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) = db
-                        .mark_failed(&task.asset_id, task.version_size.as_str(), &e.to_string())
+                        .mark_failed(
+                            &library,
+                            &task.asset_id,
+                            task.version_size.as_str(),
+                            &e.to_string(),
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -2822,6 +2867,7 @@ mod tests {
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                             bandwidth_limiter: None,
+                            library: std::sync::Arc::from("PrimarySync"),
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert!(result.failed.is_empty());
@@ -2874,6 +2920,7 @@ mod tests {
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                             bandwidth_limiter: None,
+                            library: std::sync::Arc::from("PrimarySync"),
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert_eq!(result.failed.len(), 1);
@@ -3022,6 +3069,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
+            _: &str,
             _: &Path,
         ) -> Result<bool, StateError> {
             unimplemented!()
@@ -3031,6 +3079,7 @@ mod tests {
         }
         async fn mark_downloaded(
             &self,
+            _: &str,
             _: &str,
             _: &str,
             _: &Path,
@@ -3046,7 +3095,7 @@ mod tests {
                 Ok(())
             }
         }
-        async fn mark_failed(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+        async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
             unimplemented!()
         }
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
@@ -3098,7 +3147,9 @@ mod tests {
         async fn promote_pending_to_failed(&self, _seen_since: i64) -> Result<u64, StateError> {
             Ok(0)
         }
-        async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
+        async fn get_downloaded_ids(
+            &self,
+        ) -> Result<HashSet<(String, String, String)>, StateError> {
             unimplemented!()
         }
         async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
@@ -3106,7 +3157,7 @@ mod tests {
         }
         async fn get_downloaded_checksums(
             &self,
-        ) -> Result<HashMap<(String, String), String>, StateError> {
+        ) -> Result<HashMap<(String, String, String), String>, StateError> {
             unimplemented!()
         }
         async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
@@ -3121,7 +3172,7 @@ mod tests {
         async fn delete_metadata_by_prefix(&self, _: &str) -> Result<u64, StateError> {
             unimplemented!()
         }
-        async fn touch_last_seen_many(&self, _: &[&str]) -> Result<(), StateError> {
+        async fn touch_last_seen_many(&self, _: &str, _: &[&str]) -> Result<(), StateError> {
             // Unused in these tests; default no-op so they don't bump the
             // pipeline's batch-flush path.
             Ok(())
@@ -3144,27 +3195,38 @@ mod tests {
         async fn mark_soft_deleted(
             &self,
             _: &str,
+            _: &str,
             _: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<(), StateError> {
             Ok(())
         }
-        async fn mark_hidden_at_source(&self, _: &str) -> Result<(), StateError> {
+        async fn mark_hidden_at_source(&self, _: &str, _: &str) -> Result<(), StateError> {
             Ok(())
         }
-        async fn record_metadata_write_failure(&self, _: &str, _: &str) -> Result<(), StateError> {
+        async fn record_metadata_write_failure(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
             Ok(())
         }
-        async fn clear_metadata_write_failure(&self, _: &str, _: &str) -> Result<(), StateError> {
+        async fn clear_metadata_write_failure(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
             Ok(())
         }
         async fn get_downloaded_metadata_hashes(
             &self,
-        ) -> Result<HashMap<(String, String), String>, StateError> {
+        ) -> Result<HashMap<(String, String, String), String>, StateError> {
             Ok(HashMap::new())
         }
         async fn get_metadata_retry_markers(
             &self,
-        ) -> Result<HashSet<(String, String)>, StateError> {
+        ) -> Result<HashSet<(String, String, String)>, StateError> {
             Ok(HashSet::new())
         }
         async fn get_pending_metadata_rewrites(
@@ -3173,7 +3235,13 @@ mod tests {
         ) -> Result<Vec<AssetRecord>, StateError> {
             Ok(Vec::new())
         }
-        async fn update_metadata_hash(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+        async fn update_metadata_hash(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
             Ok(())
         }
         async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
@@ -3193,6 +3261,7 @@ mod tests {
     async fn flush_pending_state_writes_succeeds_on_first_try() {
         let db = FailingStateDb::new(0);
         let pending = vec![PendingStateWrite {
+            library: "PrimarySync".into(),
             asset_id: "A1".into(),
             version_size: VersionSizeKey::Original,
             download_path: PathBuf::from("/tmp/claude/photo.jpg"),
@@ -3209,6 +3278,7 @@ mod tests {
         // Fail the first attempt, succeed on retry
         let db = FailingStateDb::new(1);
         let pending = vec![PendingStateWrite {
+            library: "PrimarySync".into(),
             asset_id: "A1".into(),
             version_size: VersionSizeKey::Original,
             download_path: PathBuf::from("/tmp/claude/photo.jpg"),
@@ -3225,6 +3295,7 @@ mod tests {
         // Fail all attempts — must exceed STATE_WRITE_MAX_RETRIES
         let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize);
         let pending = vec![PendingStateWrite {
+            library: "PrimarySync".into(),
             asset_id: "A1".into(),
             version_size: VersionSizeKey::Original,
             download_path: PathBuf::from("/tmp/claude/photo.jpg"),
@@ -3243,6 +3314,7 @@ mod tests {
         let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize + 1);
         let pending = vec![
             PendingStateWrite {
+                library: "PrimarySync".into(),
                 asset_id: "A1".into(),
                 version_size: VersionSizeKey::Original,
                 download_path: PathBuf::from("/tmp/claude/photo1.jpg"),
@@ -3250,6 +3322,7 @@ mod tests {
                 download_checksum: None,
             },
             PendingStateWrite {
+                library: "PrimarySync".into(),
                 asset_id: "A2".into(),
                 version_size: VersionSizeKey::Original,
                 download_path: PathBuf::from("/tmp/claude/photo2.jpg"),
@@ -3272,6 +3345,7 @@ mod tests {
         let db = FailingStateDb::new(2);
         let pending: Vec<PendingStateWrite> = (0..5)
             .map(|i| PendingStateWrite {
+                library: "PrimarySync".into(),
                 asset_id: format!("ASSET_{i}").into(),
                 version_size: VersionSizeKey::Original,
                 download_path: PathBuf::from(format!("/tmp/claude/photo_{i}.jpg")),
@@ -3399,6 +3473,7 @@ mod tests {
             exclude_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
+            library: std::sync::Arc::from("PrimarySync"),
         });
 
         let client = reqwest::Client::builder()
@@ -3488,6 +3563,7 @@ mod tests {
             exclude_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
+            library: std::sync::Arc::from("PrimarySync"),
         });
         let client = reqwest::Client::new();
         let shutdown_token = CancellationToken::new();
@@ -3538,6 +3614,7 @@ mod tests {
 
         let prior_seen_at = chrono::Utc::now().timestamp() - 86400;
         let record = AssetRecord::new_pending(
+            "PrimarySync".into(),
             "GHOST".into(),
             VersionSizeKey::Original,
             "ck_ghost".into(),
@@ -3717,10 +3794,17 @@ mod tests {
             .metadata(metadata)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("REWRITE_1", "original", &photo_path, "rewrite_ck", None)
-            .await
-            .unwrap();
-        db.record_metadata_write_failure("REWRITE_1", "original")
+        db.mark_downloaded(
+            "PrimarySync",
+            "REWRITE_1",
+            "original",
+            &photo_path,
+            "rewrite_ck",
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "REWRITE_1", "original")
             .await
             .unwrap();
 
@@ -3751,7 +3835,11 @@ mod tests {
         // to completion (not the seeded placeholder).
         let hashes = db.get_downloaded_metadata_hashes().await.unwrap();
         let new_hash = hashes
-            .get(&("REWRITE_1".to_string(), "original".to_string()))
+            .get(&(
+                "PrimarySync".to_string(),
+                "REWRITE_1".to_string(),
+                "original".to_string(),
+            ))
             .expect("row must remain in the downloaded set");
         assert_eq!(
             new_hash, &seeded_hash,
@@ -3797,6 +3885,7 @@ mod tests {
             .build();
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
+            "PrimarySync",
             "MISSING_FILE",
             "original",
             &vanished_path,
@@ -3805,7 +3894,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.record_metadata_write_failure("MISSING_FILE", "original")
+        db.record_metadata_write_failure("PrimarySync", "MISSING_FILE", "original")
             .await
             .unwrap();
 

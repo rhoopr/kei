@@ -38,6 +38,7 @@ const SCAN_PAGE_SIZE: u32 = 1000;
 
 #[derive(Debug)]
 struct MissingAsset {
+    library: Box<str>,
     id: Box<str>,
     version_size: VersionSizeKey,
     local_path: PathBuf,
@@ -70,6 +71,7 @@ async fn scan_missing(
 
         for asset in page {
             let crate::state::AssetRecord {
+                library,
                 id,
                 version_size,
                 local_path,
@@ -88,6 +90,7 @@ async fn scan_missing(
             }
 
             let record = MissingAsset {
+                library,
                 id,
                 version_size,
                 local_path,
@@ -168,7 +171,12 @@ pub(crate) async fn run_reconcile(
     if !args.dry_run {
         for m in &missing {
             match db
-                .mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
+                .mark_failed(
+                    &m.library,
+                    &m.id,
+                    m.version_size.as_str(),
+                    FILE_MISSING_REASON,
+                )
                 .await
             {
                 Ok(()) => marked_failed += 1,
@@ -236,9 +244,16 @@ mod tests {
             .size(100)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded(id, "original", path, &format!("ck_{id}"), None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            id,
+            "original",
+            path,
+            &format!("ck_{id}"),
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     async fn seed_missing(db: &SqliteStateDb, id: &str, path: &std::path::Path) {
@@ -267,9 +282,14 @@ mod tests {
         assert_eq!(&*missing[0].id, "MISSING_1");
 
         for m in &missing {
-            db.mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
-                .await
-                .unwrap();
+            db.mark_failed(
+                &m.library,
+                &m.id,
+                m.version_size.as_str(),
+                FILE_MISSING_REASON,
+            )
+            .await
+            .unwrap();
         }
 
         let failed = db.get_failed().await.unwrap();
@@ -324,9 +344,14 @@ mod tests {
         assert_eq!(missing.len(), total);
 
         for m in &missing {
-            db.mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
-                .await
-                .unwrap();
+            db.mark_failed(
+                &m.library,
+                &m.id,
+                m.version_size.as_str(),
+                FILE_MISSING_REASON,
+            )
+            .await
+            .unwrap();
         }
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.downloaded, 0);

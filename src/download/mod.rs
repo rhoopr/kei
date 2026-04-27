@@ -505,6 +505,11 @@ pub(crate) struct DownloadConfig {
     /// Album name for `{album}` token in folder_structure. Set per-album when
     /// processing albums individually.
     pub(crate) album_name: Option<Arc<str>>,
+    /// CloudKit zone name (e.g. "PrimarySync", "SharedSync-A1B2C3D4-...")
+    /// scoping every asset processed under this config. Threaded into
+    /// `AssetRecord.library` and every state-DB key so multi-library syncs
+    /// don't collide on the (id, version_size) pair across zones.
+    pub(crate) library: Arc<str>,
     /// Asset IDs to exclude (from `--exclude-album` without `--album`).
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
     /// Maximum download attempts per asset before giving up (0 = unlimited).
@@ -559,6 +564,7 @@ impl DownloadConfig {
             exclude_asset_ids: Arc::clone(&pass.exclude_ids),
             asset_groupings: Arc::clone(&self.asset_groupings),
             bandwidth_limiter: self.bandwidth_limiter.clone(),
+            library: Arc::clone(&self.library),
             ..*self
         }
     }
@@ -580,6 +586,7 @@ impl DownloadConfig {
             exclude_asset_ids: exclude_ids,
             asset_groupings: Arc::clone(&self.asset_groupings),
             bandwidth_limiter: self.bandwidth_limiter.clone(),
+            library: Arc::clone(&self.library),
             ..*self
         }
     }
@@ -688,6 +695,7 @@ impl DownloadConfig {
             exclude_asset_ids: std::sync::Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(AssetGroupings::default()),
             bandwidth_limiter: None,
+            library: Arc::from("PrimarySync"),
         }
     }
 }
@@ -717,30 +725,46 @@ fn intern_id(interner: &mut FxHashSet<Arc<str>>, s: String) -> Arc<str> {
 /// allocation is shared across every map here (and with the producer's
 /// seen-ids / touched-ids sets). On a 100k-asset library this collapses
 /// ~4-6 independent `Box<str>` allocations per asset into one.
+/// `library -> asset_id -> set of version_size` strings. Used by
+/// `DownloadContext::downloaded_ids` and `metadata_retry_markers`.
+type LibraryAssetVersionSet = FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashSet<Box<str>>>>;
+
+/// `library -> asset_id -> (version_size -> value)`. Used by
+/// `DownloadContext::downloaded_checksums` and
+/// `downloaded_metadata_hashes`.
+type LibraryAssetVersionValueMap =
+    FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>>;
+
 #[derive(Debug, Default)]
 struct DownloadContext {
-    /// Nested map: `asset_id` -> set of `version_sizes` that are already downloaded.
-    /// Two-level structure enables O(1) borrowed lookups without allocation.
-    downloaded_ids: FxHashMap<Arc<str>, FxHashSet<Box<str>>>,
-    /// Nested map: `asset_id` -> (`version_size` -> checksum) for downloaded assets.
-    /// Used to detect checksum changes (iCloud asset updated) without DB queries.
-    downloaded_checksums: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>,
-    /// Nested map: `asset_id` -> (`version_size` -> metadata_hash) for downloaded assets.
-    /// Used to detect metadata-only changes (favorite toggle, keywords, GPS edit,
-    /// etc.) when file bytes are unchanged but the provider has newer metadata.
+    /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
+    /// are already downloaded. Three-level shape so multi-library syncs
+    /// don't dedupe the same asset_id across zones (PR10 / schema v8).
+    /// All key levels use borrowed `&str` lookups for zero-allocation probes.
+    downloaded_ids: LibraryAssetVersionSet,
+    /// Nested map: `library` -> `asset_id` -> (`version_size` -> checksum).
+    /// Used to detect checksum changes (provider asset updated) without DB queries.
+    downloaded_checksums: LibraryAssetVersionValueMap,
+    /// Nested map: `library` -> `asset_id` -> (`version_size` -> metadata_hash).
+    /// Used to detect metadata-only changes (favorite toggle, keywords, GPS
+    /// edit, etc.) when file bytes are unchanged but the provider has newer
+    /// metadata.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    downloaded_metadata_hashes: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>,
-    /// Nested map: `asset_id` -> set of `version_sizes` with a non-null
-    /// `metadata_write_failed_at` from a prior sync. These always route to
-    /// the metadata-rewrite path regardless of whether the hash changed.
-    /// Two-level shape matches `downloaded_ids` for zero-allocation lookups.
+    downloaded_metadata_hashes: LibraryAssetVersionValueMap,
+    /// Nested map: `library` -> `asset_id` -> set of `version_sizes` with a
+    /// non-null `metadata_write_failed_at` from a prior sync. These always
+    /// route to the metadata-rewrite path regardless of whether the hash
+    /// changed.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    metadata_retry_markers: FxHashMap<Arc<str>, FxHashSet<Box<str>>>,
+    metadata_retry_markers: LibraryAssetVersionSet,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
-    /// to skip new assets that were never synced.
+    /// to skip new assets that were never synced. Library-blind: a known ID
+    /// is "known" regardless of which zone it belongs to.
     known_ids: FxHashSet<Arc<str>>,
     /// Per-asset maximum download attempt count (from failed assets).
     /// Used to skip assets that have exceeded `max_download_attempts`.
+    /// Library-blind: an asset shared across libraries shares its attempt
+    /// budget (mirrors how `get_attempt_counts` aggregates by id alone).
     attempt_counts: FxHashMap<Arc<str>, u32>,
 }
 
@@ -806,45 +830,55 @@ impl DownloadContext {
         // the Arc without an extra copy.
         let mut interner: FxHashSet<Arc<str>> = FxHashSet::default();
 
-        let mut downloaded_ids: FxHashMap<Arc<str>, FxHashSet<Box<str>>> = FxHashMap::default();
-        for (asset_id, version_size) in ids {
+        let mut downloaded_ids: LibraryAssetVersionSet = FxHashMap::default();
+        for (library, asset_id, version_size) in ids {
+            let lib = intern_id(&mut interner, library);
             let id = intern_id(&mut interner, asset_id);
             downloaded_ids
+                .entry(lib)
+                .or_default()
                 .entry(id)
                 .or_default()
                 .insert(version_size.into_boxed_str());
         }
 
-        let mut downloaded_checksums: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>> =
-            FxHashMap::default();
-        for ((asset_id, version_size), checksum) in checksums {
+        let mut downloaded_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
+        for ((library, asset_id, version_size), checksum) in checksums {
+            let lib = intern_id(&mut interner, library);
             let id = intern_id(&mut interner, asset_id);
             downloaded_checksums
+                .entry(lib)
+                .or_default()
                 .entry(id)
                 .or_default()
                 .insert(version_size.into_boxed_str(), checksum.into_boxed_str());
         }
 
-        let mut downloaded_metadata_hashes: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>> =
-            FxHashMap::default();
-        for ((asset_id, version_size), metadata_hash) in hashes {
+        let mut downloaded_metadata_hashes: LibraryAssetVersionValueMap = FxHashMap::default();
+        for ((library, asset_id, version_size), metadata_hash) in hashes {
+            let lib = intern_id(&mut interner, library);
             let id = intern_id(&mut interner, asset_id);
-            downloaded_metadata_hashes.entry(id).or_default().insert(
-                version_size.into_boxed_str(),
-                metadata_hash.into_boxed_str(),
-            );
-        }
-
-        // Two-level shape matches downloaded_ids so lookups are O(1) with
-        // borrowed keys instead of allocating a tuple per probe.
-        let mut metadata_retry_markers: FxHashMap<Arc<str>, FxHashSet<Box<str>>> =
-            FxHashMap::default();
-        for (id, vs) in markers {
-            let id = intern_id(&mut interner, id);
-            metadata_retry_markers
+            downloaded_metadata_hashes
+                .entry(lib)
+                .or_default()
                 .entry(id)
                 .or_default()
-                .insert(vs.into_boxed_str());
+                .insert(
+                    version_size.into_boxed_str(),
+                    metadata_hash.into_boxed_str(),
+                );
+        }
+
+        let mut metadata_retry_markers: LibraryAssetVersionSet = FxHashMap::default();
+        for (library, asset_id, version_size) in markers {
+            let lib = intern_id(&mut interner, library);
+            let id = intern_id(&mut interner, asset_id);
+            metadata_retry_markers
+                .entry(lib)
+                .or_default()
+                .entry(id)
+                .or_default()
+                .insert(version_size.into_boxed_str());
         }
 
         let known_ids: FxHashSet<Arc<str>> = known_ids
@@ -875,6 +909,7 @@ impl DownloadContext {
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     fn needs_metadata_rewrite(
         &self,
+        library: &str,
         asset_id: &str,
         version_size: VersionSizeKey,
         new_metadata_hash: Option<&str>,
@@ -882,7 +917,8 @@ impl DownloadContext {
         let vs_str = version_size.as_str();
         let has_retry_marker = self
             .metadata_retry_markers
-            .get(asset_id)
+            .get(library)
+            .and_then(|m| m.get(asset_id))
             .is_some_and(|vsset| vsset.contains(vs_str));
         if has_retry_marker {
             return true;
@@ -892,7 +928,8 @@ impl DownloadContext {
         };
         match self
             .downloaded_metadata_hashes
-            .get(asset_id)
+            .get(library)
+            .and_then(|m| m.get(asset_id))
             .and_then(|map| map.get(vs_str))
         {
             Some(stored) => stored.as_ref() != new_hash,
@@ -912,6 +949,7 @@ impl DownloadContext {
     /// Uses borrowed `&str` keys for zero-allocation lookups.
     fn should_download_fast(
         &self,
+        library: &str,
         asset_id: &str,
         version_size: VersionSizeKey,
         checksum: &str,
@@ -919,10 +957,11 @@ impl DownloadContext {
     ) -> Option<bool> {
         let version_size_str = version_size.as_str();
 
-        // Two-level lookup with borrowed keys — no allocation
+        // Three-level lookup with borrowed keys — no allocation
         let is_downloaded = self
             .downloaded_ids
-            .get(asset_id)
+            .get(library)
+            .and_then(|m| m.get(asset_id))
             .is_some_and(|versions| versions.contains(version_size_str));
 
         if !is_downloaded {
@@ -935,7 +974,8 @@ impl DownloadContext {
         // "no stored checksum" path, which pre-v3 rows fall into.
         let stored_checksum = self
             .downloaded_checksums
-            .get(asset_id)
+            .get(library)
+            .and_then(|m| m.get(asset_id))
             .and_then(|versions| versions.get(version_size_str));
         if let Some(stored) = stored_checksum {
             if stored.as_ref() != checksum {
@@ -1489,7 +1529,10 @@ async fn download_photos_incremental(
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
                     if let Some(db) = &config.state_db {
                         let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
-                        if let Err(e) = db.mark_soft_deleted(&event.record_name, deleted_at).await {
+                        if let Err(e) = db
+                            .mark_soft_deleted(&config.library, &event.record_name, deleted_at)
+                            .await
+                        {
                             tracing::warn!(
                                 record_name = %event.record_name,
                                 error = %e,
@@ -1506,7 +1549,10 @@ async fn download_photos_incremental(
                     // (sets is_deleted=1) — the row stays put so history and
                     // local_path remain queryable.
                     if let Some(db) = &config.state_db {
-                        if let Err(e) = db.mark_soft_deleted(&event.record_name, None).await {
+                        if let Err(e) = db
+                            .mark_soft_deleted(&config.library, &event.record_name, None)
+                            .await
+                        {
                             tracing::warn!(
                                 record_name = %event.record_name,
                                 error = %e,
@@ -1519,7 +1565,10 @@ async fn download_photos_incremental(
                     hidden_count += 1;
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
                     if let Some(db) = &config.state_db {
-                        if let Err(e) = db.mark_hidden_at_source(&event.record_name).await {
+                        if let Err(e) = db
+                            .mark_hidden_at_source(&config.library, &event.record_name)
+                            .await
+                        {
                             tracing::warn!(
                                 record_name = %event.record_name,
                                 error = %e,
@@ -1624,7 +1673,13 @@ async fn download_photos_incremental(
             if !candidates.is_empty()
                 && candidates.iter().all(|&(vs, cs)| {
                     matches!(
-                        download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                        download_ctx.should_download_fast(
+                            &effective_config.library,
+                            asset.id(),
+                            vs,
+                            cs,
+                            true
+                        ),
                         Some(false)
                     )
                 })
@@ -1645,6 +1700,7 @@ async fn download_photos_incremental(
             for task in &asset_tasks {
                 let media_type = determine_media_type(task.version_size, asset);
                 let record = AssetRecord::new_pending(
+                    config.library.to_string(),
                     task.asset_id.to_string(),
                     task.version_size,
                     task.checksum.to_string(),
@@ -1753,6 +1809,7 @@ async fn download_photos_incremental(
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         bandwidth_limiter: config.bandwidth_limiter.clone(),
+        library: Arc::clone(&config.library),
     };
     let pass_result = run_download_pass(pass_config, tasks).await;
 
@@ -1859,35 +1916,63 @@ mod tests {
     fn test_should_download_fast_trust_state_returns_false() {
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset1".into())
             .or_default()
             .insert("original".into());
         ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset1".into())
             .or_default()
             .insert("original".into(), "checksum_a".into());
 
         // trust_state=true: returns Some(false) for matching asset
         assert_eq!(
-            ctx.should_download_fast("asset1", VersionSizeKey::Original, "checksum_a", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset1",
+                VersionSizeKey::Original,
+                "checksum_a",
+                true
+            ),
             Some(false)
         );
 
         // trust_state=false: returns None (needs filesystem check)
         assert_eq!(
-            ctx.should_download_fast("asset1", VersionSizeKey::Original, "checksum_a", false),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset1",
+                VersionSizeKey::Original,
+                "checksum_a",
+                false
+            ),
             None
         );
 
         // Changed checksum: returns Some(true) regardless of trust_state
         assert_eq!(
-            ctx.should_download_fast("asset1", VersionSizeKey::Original, "checksum_b", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset1",
+                VersionSizeKey::Original,
+                "checksum_b",
+                true
+            ),
             Some(true)
         );
 
         // Unknown asset: returns Some(true)
         assert_eq!(
-            ctx.should_download_fast("unknown", VersionSizeKey::Original, "x", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "unknown",
+                VersionSizeKey::Original,
+                "x",
+                true
+            ),
             Some(true)
         );
     }
@@ -2331,11 +2416,23 @@ mod tests {
     fn test_should_download_fast_unknown_asset_returns_true() {
         let ctx = DownloadContext::default();
         assert_eq!(
-            ctx.should_download_fast("never_seen", VersionSizeKey::Original, "any_ck", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "never_seen",
+                VersionSizeKey::Original,
+                "any_ck",
+                true
+            ),
             Some(true)
         );
         assert_eq!(
-            ctx.should_download_fast("never_seen", VersionSizeKey::Original, "any_ck", false),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "never_seen",
+                VersionSizeKey::Original,
+                "any_ck",
+                false
+            ),
             Some(true)
         );
     }
@@ -2344,37 +2441,64 @@ mod tests {
     fn needs_metadata_rewrite_detects_hash_change() {
         let mut ctx = DownloadContext::default();
         ctx.downloaded_metadata_hashes
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_md".into())
             .or_default()
             .insert("original".into(), "hash-OLD".into());
 
         // Same hash -> no rewrite needed.
         assert!(!ctx.needs_metadata_rewrite(
+            "PrimarySync",
             "asset_md",
             VersionSizeKey::Original,
             Some("hash-OLD")
         ));
         // Different hash -> rewrite.
-        assert!(ctx.needs_metadata_rewrite("asset_md", VersionSizeKey::Original, Some("hash-NEW")));
+        assert!(ctx.needs_metadata_rewrite(
+            "PrimarySync",
+            "asset_md",
+            VersionSizeKey::Original,
+            Some("hash-NEW")
+        ));
         // Unknown new hash -> no rewrite (nothing to compare to).
-        assert!(!ctx.needs_metadata_rewrite("asset_md", VersionSizeKey::Original, None));
+        assert!(!ctx.needs_metadata_rewrite(
+            "PrimarySync",
+            "asset_md",
+            VersionSizeKey::Original,
+            None
+        ));
     }
 
     #[test]
     fn needs_metadata_rewrite_honors_retry_marker() {
         let mut ctx = DownloadContext::default();
         ctx.metadata_retry_markers
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_retry".into())
             .or_default()
             .insert("original".into());
         // No stored hash at all, but marker is set -> rewrite needed.
-        assert!(ctx.needs_metadata_rewrite("asset_retry", VersionSizeKey::Original, None));
+        assert!(ctx.needs_metadata_rewrite(
+            "PrimarySync",
+            "asset_retry",
+            VersionSizeKey::Original,
+            None
+        ));
         // Marker set -> rewrite even if hashes match.
         ctx.downloaded_metadata_hashes
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_retry".into())
             .or_default()
             .insert("original".into(), "h".into());
-        assert!(ctx.needs_metadata_rewrite("asset_retry", VersionSizeKey::Original, Some("h")));
+        assert!(ctx.needs_metadata_rewrite(
+            "PrimarySync",
+            "asset_retry",
+            VersionSizeKey::Original,
+            Some("h")
+        ));
     }
 
     #[test]
@@ -2384,6 +2508,7 @@ mod tests {
         // gets the provider state this tree has never recorded.
         let ctx = DownloadContext::default();
         assert!(ctx.needs_metadata_rewrite(
+            "PrimarySync",
             "asset_no_stored_hash",
             VersionSizeKey::Original,
             Some("new-hash")
@@ -2394,22 +2519,38 @@ mod tests {
     fn test_should_download_fast_downloaded_matching_checksum() {
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_x".into())
             .or_default()
             .insert("original".into());
         ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_x".into())
             .or_default()
             .insert("original".into(), "ck_match".into());
 
         // trust_state=true => hard skip
         assert_eq!(
-            ctx.should_download_fast("asset_x", VersionSizeKey::Original, "ck_match", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_x",
+                VersionSizeKey::Original,
+                "ck_match",
+                true
+            ),
             Some(false)
         );
         // trust_state=false => needs filesystem check
         assert_eq!(
-            ctx.should_download_fast("asset_x", VersionSizeKey::Original, "ck_match", false),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_x",
+                VersionSizeKey::Original,
+                "ck_match",
+                false
+            ),
             None
         );
     }
@@ -2418,21 +2559,37 @@ mod tests {
     fn test_should_download_fast_downloaded_changed_checksum() {
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_y".into())
             .or_default()
             .insert("original".into());
         ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_y".into())
             .or_default()
             .insert("original".into(), "old_ck".into());
 
         // Changed checksum => needs re-download regardless of trust_state
         assert_eq!(
-            ctx.should_download_fast("asset_y", VersionSizeKey::Original, "new_ck", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_y",
+                VersionSizeKey::Original,
+                "new_ck",
+                true
+            ),
             Some(true)
         );
         assert_eq!(
-            ctx.should_download_fast("asset_y", VersionSizeKey::Original, "new_ck", false),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_y",
+                VersionSizeKey::Original,
+                "new_ck",
+                false
+            ),
             Some(true)
         );
     }
@@ -2441,13 +2598,21 @@ mod tests {
     fn test_should_download_fast_different_version_size() {
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_z".into())
             .or_default()
             .insert("original".into());
 
         // Medium version not downloaded
         assert_eq!(
-            ctx.should_download_fast("asset_z", VersionSizeKey::Medium, "any_ck", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_z",
+                VersionSizeKey::Medium,
+                "any_ck",
+                true
+            ),
             Some(true)
         );
     }
@@ -2460,7 +2625,13 @@ mod tests {
 
         // A known asset that's not in downloaded_ids needs download
         assert_eq!(
-            ctx.should_download_fast("known_asset", VersionSizeKey::Original, "ck", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "known_asset",
+                VersionSizeKey::Original,
+                "ck",
+                true
+            ),
             Some(true)
         );
         // The known_ids set is used externally to decide whether to skip new assets;
@@ -2545,27 +2716,44 @@ mod tests {
         // empty, they match — should behave like a normal matching checksum.
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_empty_ck".into())
             .or_default()
             .insert("original".into());
         ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_empty_ck".into())
             .or_default()
             .insert("original".into(), "".into());
 
         // Empty matches empty → trust_state=true gives hard skip
         assert_eq!(
-            ctx.should_download_fast("asset_empty_ck", VersionSizeKey::Original, "", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_empty_ck",
+                VersionSizeKey::Original,
+                "",
+                true
+            ),
             Some(false)
         );
         // Empty matches empty → trust_state=false gives None (needs fs check)
         assert_eq!(
-            ctx.should_download_fast("asset_empty_ck", VersionSizeKey::Original, "", false),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_empty_ck",
+                VersionSizeKey::Original,
+                "",
+                false
+            ),
             None
         );
         // Non-empty vs empty stored → checksum changed, needs download
         assert_eq!(
             ctx.should_download_fast(
+                "PrimarySync",
                 "asset_empty_ck",
                 VersionSizeKey::Original,
                 "abc123def456",
@@ -2584,13 +2772,21 @@ mod tests {
         // because the absence of a stored checksum means "nothing to compare".
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_no_ck".into())
             .or_default()
             .insert("original".into());
         // No entry in downloaded_checksums
 
         assert_eq!(
-            ctx.should_download_fast("asset_no_ck", VersionSizeKey::Original, "any", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_no_ck",
+                VersionSizeKey::Original,
+                "any",
+                true
+            ),
             Some(false)
         );
     }
@@ -2600,12 +2796,20 @@ mod tests {
         // Same scenario but trust_state=false: needs filesystem check (None).
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_no_ck".into())
             .or_default()
             .insert("original".into());
 
         assert_eq!(
-            ctx.should_download_fast("asset_no_ck", VersionSizeKey::Original, "any", false),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_no_ck",
+                VersionSizeKey::Original,
+                "any",
+                false
+            ),
             None
         );
     }
@@ -3052,16 +3256,26 @@ mod tests {
         // was never downloaded.
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_multi".into())
             .or_default()
             .insert("original".into());
         ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("asset_multi".into())
             .or_default()
             .insert("original".into(), "ck_orig".into());
 
         assert_eq!(
-            ctx.should_download_fast("asset_multi", VersionSizeKey::Medium, "ck_med", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "asset_multi",
+                VersionSizeKey::Medium,
+                "ck_med",
+                true
+            ),
             Some(true),
             "Medium version not in downloaded set should need download"
         );
@@ -3074,35 +3288,56 @@ mod tests {
         // Both Original and LiveOriginal downloaded, each with own checksum.
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("live_asset".into())
             .or_default()
             .insert("original".into());
         ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("live_asset".into())
             .or_default()
             .insert("live_original".into());
         ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("live_asset".into())
             .or_default()
             .insert("original".into(), "ck_img".into());
         ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
             .entry("live_asset".into())
             .or_default()
             .insert("live_original".into(), "ck_mov".into());
 
         // Image: matching checksum, trusted
         assert_eq!(
-            ctx.should_download_fast("live_asset", VersionSizeKey::Original, "ck_img", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "live_asset",
+                VersionSizeKey::Original,
+                "ck_img",
+                true
+            ),
             Some(false)
         );
         // MOV: matching checksum, trusted
         assert_eq!(
-            ctx.should_download_fast("live_asset", VersionSizeKey::LiveOriginal, "ck_mov", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "live_asset",
+                VersionSizeKey::LiveOriginal,
+                "ck_mov",
+                true
+            ),
             Some(false)
         );
         // MOV: changed checksum -- re-download even though image is fine
         assert_eq!(
             ctx.should_download_fast(
+                "PrimarySync",
                 "live_asset",
                 VersionSizeKey::LiveOriginal,
                 "ck_mov_v2",
@@ -3123,7 +3358,13 @@ mod tests {
         // Known asset: should_download_fast returns Some(true) (it needs
         // download because it's not in downloaded_ids)
         assert_eq!(
-            ctx.should_download_fast("previously_synced", VersionSizeKey::Original, "ck", true),
+            ctx.should_download_fast(
+                "PrimarySync",
+                "previously_synced",
+                VersionSizeKey::Original,
+                "ck",
+                true
+            ),
             Some(true)
         );
         // The producer checks known_ids separately before forwarding:

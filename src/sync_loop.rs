@@ -560,13 +560,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
-                                 asset_groupings: Arc<download::AssetGroupings>|
+                                 asset_groupings: Arc<download::AssetGroupings>,
+                                 library: Arc<str>|
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
             directory: Arc::clone(&cfg_directory),
             folder_structure: config.folder_structure.clone(),
             folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),
             folder_structure_smart_folders: Arc::clone(&cfg_folder_structure_smart_folders),
+            library,
             size: config.size.into(),
             skip_videos: config.skip_videos,
             skip_photos: config.skip_photos,
@@ -631,6 +633,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             plan,
         });
     }
+    warn_if_multi_library_paths_commingle(
+        library_states.len(),
+        &config.folder_structure,
+        &config.folder_structure_albums,
+        &config.folder_structure_smart_folders,
+    );
     sd_notifier.notify_ready();
 
     // Spawn the HTTP server (/healthz + /metrics) only in watch mode.
@@ -1091,17 +1099,25 @@ pub(crate) fn should_wait_for_2fa(is_watch_mode: bool, err: &anyhow::Error) -> b
             .is_some_and(auth::error::AuthError::is_two_factor_required)
 }
 
+/// Closure shape used to derive a per-library `DownloadConfig` from the
+/// shared base config. Boxed dyn so `run_cycle` can accept a single
+/// reference instead of a generic parameter (avoids reuse-by-monomorphization
+/// blow-up in error messages).
+type BuildDownloadConfigFn<'a> = dyn Fn(
+        download::SyncMode,
+        Arc<rustc_hash::FxHashSet<String>>,
+        Arc<download::AssetGroupings>,
+        Arc<str>,
+    ) -> Arc<download::DownloadConfig>
+    + 'a;
+
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
 async fn run_cycle(
     library_states: &[LibraryState],
     config: &config::Config,
     state_db: &Option<Arc<dyn state::StateDb>>,
     is_retry_failed: bool,
-    build_download_config: &dyn Fn(
-        download::SyncMode,
-        Arc<rustc_hash::FxHashSet<String>>,
-        Arc<download::AssetGroupings>,
-    ) -> Arc<download::DownloadConfig>,
+    build_download_config: &BuildDownloadConfigFn<'_>,
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
 ) -> anyhow::Result<CycleResult> {
@@ -1190,6 +1206,7 @@ async fn run_cycle(
             sync_mode,
             Arc::new(rustc_hash::FxHashSet::default()),
             asset_groupings,
+            Arc::from(lib_state.zone_name.as_str()),
         );
         let download_client = shared_session.read().await.download_client().clone();
         let sync_result = download::download_photos_with_sync(
@@ -1339,6 +1356,38 @@ async fn check_changes_database(
             false
         }
     }
+}
+
+/// Warn at startup when multiple libraries are in scope but no template
+/// uses `{library}`. Without `{library}`, on-disk paths from PrimarySync and
+/// any SharedSync zone share one namespace; the v8 state DB still scopes
+/// rows per-zone, so two zones holding the same asset write to the same
+/// path and one will overwrite the other (last write wins). User picks
+/// separation by adding `{library}` to a template; we don't bail because
+/// the merge may be intentional.
+fn warn_if_multi_library_paths_commingle(
+    library_count: usize,
+    folder_structure: &str,
+    folder_structure_albums: &str,
+    folder_structure_smart_folders: &str,
+) {
+    if library_count < 2 {
+        return;
+    }
+    let any_uses_library_token = folder_structure.contains("{library}")
+        || folder_structure_albums.contains("{library}")
+        || folder_structure_smart_folders.contains("{library}");
+    if any_uses_library_token {
+        return;
+    }
+    tracing::warn!(
+        library_count,
+        "Multiple libraries in scope but no folder-structure template contains \
+         `{{library}}`; on-disk paths will commingle across zones and the same \
+         filename from two libraries may overwrite. Add `{{library}}` to one \
+         of --folder-structure / --folder-structure-albums / \
+         --folder-structure-smart-folders if you want per-library separation."
+    );
 }
 
 /// Determine the sync mode for a library: full enumeration or incremental.
@@ -1666,6 +1715,34 @@ mod tests {
         );
     }
 
+    // ── warn_if_multi_library_paths_commingle ────────────────────────
+
+    #[test]
+    fn warn_skipped_for_single_library() {
+        // Single library never warns regardless of templates.
+        warn_if_multi_library_paths_commingle(1, "%Y/%m/%d", "{album}", "{smart-folder}");
+        warn_if_multi_library_paths_commingle(0, "%Y/%m/%d", "{album}", "{smart-folder}");
+    }
+
+    #[test]
+    fn warn_skipped_when_any_template_uses_library_token() {
+        // {library} in any of the three templates suppresses the warning.
+        // Function returns unit on all branches; we exercise each branch
+        // for coverage rather than asserting on log lines.
+        warn_if_multi_library_paths_commingle(2, "{library}/%Y/%m/%d", "{album}", "{smart-folder}");
+        warn_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{library}/{album}", "{smart-folder}");
+        warn_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{album}", "{library}/{smart-folder}");
+    }
+
+    #[test]
+    fn warn_fires_for_multi_library_without_token() {
+        // No assertion on log output — Rust's tracing tests would need a
+        // subscriber. We still exercise the path so a future regression
+        // that panics on a None field-value or similar is caught.
+        warn_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{album}", "{smart-folder}");
+        warn_if_multi_library_paths_commingle(5, "none", "{album}", "{smart-folder}");
+    }
+
     // ── determine_sync_mode ──────────────────────────────────────────
     //
     // Sync-mode decision is the gatekeeper for the kei "user data is sacred"
@@ -1810,6 +1887,7 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
                 _: &std::path::Path,
             ) -> Result<bool, state::error::StateError> {
                 unimplemented!()
@@ -1824,6 +1902,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
+                _: &str,
                 _: &std::path::Path,
                 _: &str,
                 _: Option<&str>,
@@ -1832,6 +1911,7 @@ mod tests {
             }
             async fn mark_failed(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
                 _: &str,
@@ -1905,7 +1985,7 @@ mod tests {
             }
             async fn get_downloaded_ids(
                 &self,
-            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+            ) -> Result<HashSet<(String, String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_known_ids(&self) -> Result<HashSet<String>, state::error::StateError> {
@@ -1913,7 +1993,8 @@ mod tests {
             }
             async fn get_downloaded_checksums(
                 &self,
-            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+            ) -> Result<HashMap<(String, String, String), String>, state::error::StateError>
+            {
                 unimplemented!()
             }
             async fn get_attempt_counts(
@@ -1938,6 +2019,7 @@ mod tests {
             }
             async fn touch_last_seen_many(
                 &self,
+                _: &str,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
@@ -1969,15 +2051,21 @@ mod tests {
             async fn mark_soft_deleted(
                 &self,
                 _: &str,
+                _: &str,
                 _: Option<chrono::DateTime<chrono::Utc>>,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
-            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+            async fn mark_hidden_at_source(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn record_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -1985,12 +2073,13 @@ mod tests {
             }
             async fn get_downloaded_metadata_hashes(
                 &self,
-            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+            ) -> Result<HashMap<(String, String, String), String>, state::error::StateError>
+            {
                 unimplemented!()
             }
             async fn get_metadata_retry_markers(
                 &self,
-            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+            ) -> Result<HashSet<(String, String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_pending_metadata_rewrites(
@@ -2004,11 +2093,13 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn clear_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2237,6 +2328,7 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
                 _: &std::path::Path,
             ) -> Result<bool, state::error::StateError> {
                 unimplemented!()
@@ -2251,6 +2343,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
+                _: &str,
                 _: &std::path::Path,
                 _: &str,
                 _: Option<&str>,
@@ -2259,6 +2352,7 @@ mod tests {
             }
             async fn mark_failed(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
                 _: &str,
@@ -2332,7 +2426,7 @@ mod tests {
             }
             async fn get_downloaded_ids(
                 &self,
-            ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError>
+            ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError>
             {
                 unimplemented!()
             }
@@ -2343,8 +2437,10 @@ mod tests {
             }
             async fn get_downloaded_checksums(
                 &self,
-            ) -> Result<std::collections::HashMap<(String, String), String>, state::error::StateError>
-            {
+            ) -> Result<
+                std::collections::HashMap<(String, String, String), String>,
+                state::error::StateError,
+            > {
                 unimplemented!()
             }
             async fn get_attempt_counts(
@@ -2380,6 +2476,7 @@ mod tests {
             }
             async fn touch_last_seen_many(
                 &self,
+                _: &str,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
@@ -2411,15 +2508,21 @@ mod tests {
             async fn mark_soft_deleted(
                 &self,
                 _: &str,
+                _: &str,
                 _: Option<chrono::DateTime<chrono::Utc>>,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
-            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+            async fn mark_hidden_at_source(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn record_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2427,13 +2530,15 @@ mod tests {
             }
             async fn get_downloaded_metadata_hashes(
                 &self,
-            ) -> Result<std::collections::HashMap<(String, String), String>, state::error::StateError>
-            {
+            ) -> Result<
+                std::collections::HashMap<(String, String, String), String>,
+                state::error::StateError,
+            > {
                 unimplemented!()
             }
             async fn get_metadata_retry_markers(
                 &self,
-            ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError>
+            ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError>
             {
                 unimplemented!()
             }
@@ -2448,11 +2553,13 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn clear_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2523,6 +2630,7 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
                 _: &std::path::Path,
             ) -> Result<bool, state::error::StateError> {
                 unimplemented!()
@@ -2537,6 +2645,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
+                _: &str,
                 _: &std::path::Path,
                 _: &str,
                 _: Option<&str>,
@@ -2545,6 +2654,7 @@ mod tests {
             }
             async fn mark_failed(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
                 _: &str,
@@ -2618,7 +2728,7 @@ mod tests {
             }
             async fn get_downloaded_ids(
                 &self,
-            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+            ) -> Result<HashSet<(String, String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_known_ids(&self) -> Result<HashSet<String>, state::error::StateError> {
@@ -2626,7 +2736,8 @@ mod tests {
             }
             async fn get_downloaded_checksums(
                 &self,
-            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+            ) -> Result<HashMap<(String, String, String), String>, state::error::StateError>
+            {
                 unimplemented!()
             }
             async fn get_attempt_counts(
@@ -2651,6 +2762,7 @@ mod tests {
             }
             async fn touch_last_seen_many(
                 &self,
+                _: &str,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
@@ -2686,15 +2798,21 @@ mod tests {
             async fn mark_soft_deleted(
                 &self,
                 _: &str,
+                _: &str,
                 _: Option<chrono::DateTime<chrono::Utc>>,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
-            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+            async fn mark_hidden_at_source(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn record_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2702,12 +2820,13 @@ mod tests {
             }
             async fn get_downloaded_metadata_hashes(
                 &self,
-            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+            ) -> Result<HashMap<(String, String, String), String>, state::error::StateError>
+            {
                 unimplemented!()
             }
             async fn get_metadata_retry_markers(
                 &self,
-            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+            ) -> Result<HashSet<(String, String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_pending_metadata_rewrites(
@@ -2721,11 +2840,13 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn clear_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {

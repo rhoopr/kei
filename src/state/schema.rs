@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 7;
+pub(crate) const SCHEMA_VERSION: i32 = 8;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -154,6 +154,94 @@ CREATE INDEX IF NOT EXISTS idx_assets_metadata_hash
     ON assets (metadata_hash) WHERE status = 'downloaded';
 ";
 
+/// V8 recreate-table migration: change PK from (id, version_size) to
+/// (library, id, version_size). SQLite cannot ALTER PRIMARY KEY in place,
+/// so we copy into a fresh table, drop, and rename.
+///
+/// `assets_v8` is left over only on a mid-migration crash; the SAVEPOINT
+/// wrapper in `migrate()` rolls it back. The leading `DROP TABLE IF EXISTS`
+/// is belt-and-braces in case a prior migration attempt landed outside the
+/// savepoint somehow.
+const SCHEMA_V8: &str = r"
+DROP TABLE IF EXISTS assets_v8;
+
+CREATE TABLE assets_v8 (
+    library TEXT NOT NULL,
+    id TEXT NOT NULL,
+    version_size TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    added_at INTEGER,
+    size_bytes INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    downloaded_at INTEGER,
+    local_path TEXT,
+    last_seen_at INTEGER NOT NULL,
+    download_attempts INTEGER DEFAULT 0,
+    last_error TEXT,
+    local_checksum TEXT,
+    download_checksum TEXT,
+    source TEXT NOT NULL DEFAULT 'icloud',
+    is_favorite INTEGER NOT NULL DEFAULT 0,
+    rating INTEGER,
+    latitude REAL,
+    longitude REAL,
+    altitude REAL,
+    orientation INTEGER,
+    duration_secs REAL,
+    timezone_offset INTEGER,
+    width INTEGER,
+    height INTEGER,
+    title TEXT,
+    keywords TEXT,
+    description TEXT,
+    media_subtype TEXT,
+    burst_id TEXT,
+    is_hidden INTEGER NOT NULL DEFAULT 0,
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    modified_at INTEGER,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    deleted_at INTEGER,
+    provider_data TEXT,
+    metadata_hash TEXT,
+    metadata_write_failed_at INTEGER,
+    PRIMARY KEY (library, id, version_size)
+);
+
+INSERT INTO assets_v8 (
+    library, id, version_size, checksum, filename,
+    created_at, added_at, size_bytes, media_type, status,
+    downloaded_at, local_path, last_seen_at, download_attempts, last_error,
+    local_checksum, download_checksum,
+    source, is_favorite, rating, latitude, longitude, altitude,
+    orientation, duration_secs, timezone_offset, width, height,
+    title, keywords, description, media_subtype, burst_id,
+    is_hidden, is_archived, modified_at, is_deleted, deleted_at,
+    provider_data, metadata_hash, metadata_write_failed_at
+)
+SELECT
+    'PrimarySync', id, version_size, checksum, filename,
+    created_at, added_at, size_bytes, media_type, status,
+    downloaded_at, local_path, last_seen_at, download_attempts, last_error,
+    local_checksum, download_checksum,
+    source, is_favorite, rating, latitude, longitude, altitude,
+    orientation, duration_secs, timezone_offset, width, height,
+    title, keywords, description, media_subtype, burst_id,
+    is_hidden, is_archived, modified_at, is_deleted, deleted_at,
+    provider_data, metadata_hash, metadata_write_failed_at
+FROM assets;
+
+DROP TABLE assets;
+ALTER TABLE assets_v8 RENAME TO assets;
+
+CREATE INDEX idx_assets_status ON assets(status);
+CREATE INDEX idx_assets_local_path ON assets(local_path);
+CREATE INDEX idx_assets_checksum ON assets(checksum);
+CREATE INDEX idx_assets_metadata_hash ON assets (metadata_hash) WHERE status = 'downloaded';
+";
+
 /// Check whether a column exists on a table using `PRAGMA table_info`.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StateError> {
     let mut stmt = conn
@@ -238,6 +326,21 @@ fn migrate_to_version(
                      END",
                     [],
                 )?;
+            }
+        }
+        8 => {
+            // Per-zone scope on the assets PK. Pre-v8 PK was
+            // (id, version_size); post-v8 PK is (library, id, version_size)
+            // so the same asset ID across multiple SharedSync zones can no
+            // longer collide in the state DB. Pre-existing rows are
+            // backfilled with library='PrimarySync' — the safe assumption
+            // since most installs only have the primary zone. Users who
+            // already had shared libraries in their data dir before v8 will
+            // see fresh rows under those zone names appear on the next
+            // sync; the misattributed PrimarySync rows survive so no
+            // downloaded file is ever orphaned from state.
+            if !column_exists(conn, "assets", "library")? {
+                conn.execute_batch(SCHEMA_V8)?;
             }
         }
         other => {
@@ -468,9 +571,10 @@ mod tests {
 
         // Verify data survives migration: insert a row using all columns
         conn.execute(
-            "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, \
-             media_type, last_seen_at, local_checksum, download_checksum) \
-             VALUES ('test', 'original', 'ck', 'photo.jpg', 0, 100, 'photo', 0, 'local', 'dl')",
+            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, \
+             size_bytes, media_type, last_seen_at, local_checksum, download_checksum) \
+             VALUES ('PrimarySync', 'test', 'original', 'ck', 'photo.jpg', 0, 100, 'photo', 0, \
+             'local', 'dl')",
             [],
         )
         .unwrap();
@@ -535,10 +639,12 @@ mod tests {
 
         // Database should be fully usable (insert + query round-trip)
         conn.execute(
-            "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, media_type, last_seen_at) \
-             VALUES ('test', 'original', 'ck', 'photo.jpg', 0, 100, 'photo', 0)",
+            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, \
+             size_bytes, media_type, last_seen_at) \
+             VALUES ('PrimarySync', 'test', 'original', 'ck', 'photo.jpg', 0, 100, 'photo', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
             .unwrap();
@@ -770,5 +876,202 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         assert!(conn.prepare("SELECT status FROM sync_runs LIMIT 0").is_ok());
+    }
+
+    // ── v8 per-zone PK migration ──────────────────────────────────────
+
+    /// Build a v7 schema by hand (every prior ALTER applied) so v8 tests can
+    /// seed pre-v8 rows and observe what the recreate-table dance does.
+    fn build_v7_schema(conn: &Connection) {
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        for (col, decl) in V5_ASSET_COLUMNS {
+            conn.execute_batch(&format!("ALTER TABLE assets ADD COLUMN {col} {decl};"))
+                .unwrap();
+        }
+        conn.execute_batch(SCHEMA_V5_TABLES).unwrap();
+        conn.execute_batch("ALTER TABLE assets ADD COLUMN metadata_write_failed_at INTEGER;")
+            .unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sync_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'running';",
+        )
+        .unwrap();
+        set_schema_version(conn, 7).unwrap();
+    }
+
+    #[test]
+    fn test_v8_fresh_db_has_library_column_and_pk() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Library column exists.
+        assert!(conn.prepare("SELECT library FROM assets LIMIT 0").is_ok());
+
+        // Composite PK enforces (library, id, version_size). Distinct
+        // libraries with the same (id, version_size) coexist.
+        conn.execute(
+            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, \
+             size_bytes, media_type, last_seen_at) \
+             VALUES ('PrimarySync', 'A', 'original', 'ck1', 'a.jpg', 0, 1, 'photo', 0), \
+             ('SharedSync-XYZ', 'A', 'original', 'ck2', 'a.jpg', 0, 1, 'photo', 0)",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Same (library, id, version_size) twice must conflict.
+        let dup = conn.execute(
+            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, \
+             size_bytes, media_type, last_seen_at) \
+             VALUES ('PrimarySync', 'A', 'original', 'ck3', 'a.jpg', 0, 1, 'photo', 0)",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "PRIMARY KEY (library, id, version_size) must reject duplicate triple"
+        );
+    }
+
+    #[test]
+    fn test_v8_backfills_existing_rows_to_primarysync() {
+        let conn = Connection::open_in_memory().unwrap();
+        build_v7_schema(&conn);
+
+        // Seed two rows under the pre-v8 (id, version_size) PK with all
+        // pre-v8 columns populated so we can verify they survive verbatim.
+        conn.execute(
+            "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, \
+             media_type, last_seen_at, status, downloaded_at, local_path, local_checksum, \
+             download_checksum, source, is_favorite, rating, latitude, longitude, altitude, \
+             orientation, duration_secs, timezone_offset, width, height, title, keywords, \
+             description, media_subtype, burst_id, is_hidden, is_archived, modified_at, \
+             is_deleted, deleted_at, provider_data, metadata_hash, metadata_write_failed_at) \
+             VALUES \
+             ('LEGACY_1', 'original', 'ck1', 'a.jpg', 100, 500, 'photo', 200, 'downloaded', \
+             150, '/x/a.jpg', 'lck1', 'dck1', 'icloud', 1, 5, 37.0, -122.0, 30.0, 1, NULL, \
+             -28800, 4032, 3024, 't', 'k', 'd', 'photo', 'b', 0, 0, 95, 0, NULL, '{}', 'h1', NULL), \
+             ('LEGACY_2', 'medium', 'ck2', 'b.jpg', 110, 600, 'video', 210, 'pending', \
+             NULL, NULL, NULL, NULL, 'icloud', 0, NULL, NULL, NULL, NULL, NULL, 12.5, NULL, \
+             1920, 1080, NULL, NULL, NULL, NULL, NULL, 0, 1, NULL, 0, NULL, NULL, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Both rows survived under library='PrimarySync', metadata intact.
+        let rows: Vec<(String, String, String, String, String, i64)> = conn
+            .prepare(
+                "SELECT library, id, version_size, checksum, filename, size_bytes \
+                      FROM assets ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            (
+                "PrimarySync".to_string(),
+                "LEGACY_1".to_string(),
+                "original".to_string(),
+                "ck1".to_string(),
+                "a.jpg".to_string(),
+                500
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "PrimarySync".to_string(),
+                "LEGACY_2".to_string(),
+                "medium".to_string(),
+                "ck2".to_string(),
+                "b.jpg".to_string(),
+                600
+            )
+        );
+
+        // Spot-check a few non-key columns made the trip.
+        let (status, lp, mh): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, local_path, metadata_hash FROM assets WHERE id = 'LEGACY_1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "downloaded");
+        assert_eq!(lp.as_deref(), Some("/x/a.jpg"));
+        assert_eq!(mh.as_deref(), Some("h1"));
+    }
+
+    #[test]
+    fn test_v8_indexes_recreated() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND tbl_name='assets' AND name LIKE 'idx_assets_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // status, local_path, checksum, metadata_hash — all four must be
+        // present after the table-recreate dance.
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn test_v8_idempotent_after_partial_recovery() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Fresh DB lands at SCHEMA_VERSION (v8). Re-running migrate must
+        // be a no-op — column_exists guard skips the recreate-table.
+        migrate(&conn).unwrap();
+        let v_before = get_schema_version(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), v_before);
+    }
+
+    #[test]
+    fn test_v8_leftover_assets_v8_table_does_not_block_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        build_v7_schema(&conn);
+        // Simulate a prior interrupted attempt that left assets_v8 behind
+        // (e.g. process killed mid-DDL outside the SAVEPOINT, somehow).
+        conn.execute_batch(
+            "CREATE TABLE assets_v8 (library TEXT NOT NULL, id TEXT NOT NULL, \
+             version_size TEXT NOT NULL, PRIMARY KEY (library, id, version_size));",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        // assets_v8 should be gone (renamed to assets).
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='assets_v8'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0);
     }
 }
