@@ -522,14 +522,34 @@ pub(crate) struct DownloadConfig {
 }
 
 impl DownloadConfig {
-    /// True when `--folder-structure` contains the `{album}` token.
+    /// True when passes can produce divergent paths and need per-pass config
+    /// expansion (`with_pass`) plus path-aware skip checks rather than the
+    /// legacy DB-only fast skip + merged-stream optimisation.
+    ///
+    /// On v0.12 this only fired when `--folder-structure` contained `{album}`.
+    /// v0.13 splits the template into per-category fields
+    /// (`folder_structure`, `folder_structure_albums`,
+    /// `folder_structure_smart_folders`), each defaulting to a string that
+    /// expands a per-pass token (`{album}` / `{smart-folder}`), so divergence
+    /// is now the common case. The merged-stream branch in
+    /// `download_photos_full_with_token` skips `with_pass` and would otherwise
+    /// drop every pass through the unfiled template, silently losing the
+    /// per-category album/smart-folder folder structure that v0.13 documents.
     ///
     /// Only meaningful on the *base* config. A per-pass config produced by
-    /// `with_album_name` / `with_pass` has already had the token expanded
-    /// out of `folder_structure`, so this would always return false there.
-    /// Per-pass code paths should check `album_name.is_some()` instead.
-    pub(crate) fn uses_album_expansion(&self) -> bool {
-        self.folder_structure.contains("{album}")
+    /// `with_album_name` / `with_pass` has had per-pass tokens expanded out
+    /// of `folder_structure`, but the per-category fields stay cloned from
+    /// the base so this still reports the base verdict; per-pass code paths
+    /// should check `album_name.is_some()` instead.
+    pub(crate) fn requires_per_pass_paths(&self) -> bool {
+        let any_token = |s: &str| {
+            s.contains("{album}") || s.contains("{smart-folder}") || s.contains("{library}")
+        };
+        any_token(&self.folder_structure)
+            || any_token(&self.folder_structure_albums)
+            || any_token(&self.folder_structure_smart_folders)
+            || self.folder_structure_albums.as_ref() != self.folder_structure.as_str()
+            || self.folder_structure_smart_folders.as_ref() != self.folder_structure.as_str()
     }
 
     /// Clone this config for a single download pass: pick the per-category
@@ -1197,7 +1217,7 @@ pub async fn download_photos_with_sync(
         // per-asset album-membership info on the change events, we can't
         // route assets to the correct album folder — full enumeration uses
         // the album-scoped `photo_stream_with_token` and stays correct.
-        SyncMode::Incremental { .. } if config.uses_album_expansion() => {
+        SyncMode::Incremental { .. } if config.requires_per_pass_paths() => {
             tracing::debug!(
                 "`{{album}}` folder template requires full enumeration for correct \
                  per-album routing, skipping incremental"
@@ -1310,7 +1330,7 @@ async fn download_photos_full_with_token(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let uses_album_token = config.uses_album_expansion();
+    let needs_per_pass = config.requires_per_pass_paths();
 
     // Mark every unique zone as in-progress so an interrupted full
     // enumeration leaves a trail the next startup can surface to the
@@ -1350,7 +1370,7 @@ async fn download_photos_full_with_token(
     // copy per album folder. Non-{album} plans have a uniform exclude set
     // across passes (LibraryOnly: 1 pass; Named/All-without-{album}: every
     // pass has empty excludes) so streams merge for maximum concurrency.
-    let (streaming_result, token_receivers) = if uses_album_token {
+    let (streaming_result, token_receivers) = if needs_per_pass {
         let pass_configs = build_pass_configs(passes, config);
         let mut combined_result = StreamingResult::default();
         let mut token_receivers = Vec::with_capacity(passes.len());
@@ -1502,7 +1522,7 @@ async fn download_photos_incremental(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let uses_album_token = config.uses_album_expansion();
+    let needs_per_pass = config.requires_per_pass_paths();
 
     // Each asset is paired with its source pass index so both `{album}`
     // expansion and per-pass exclusion (notably, the unfiled pass's set
@@ -1677,7 +1697,7 @@ async fn download_photos_incremental(
         // multiple album folders; a DB-only skip would leave later copies
         // missing from disk. Fall through to the path-aware filesystem
         // check in that case.
-        if !uses_album_token {
+        if !needs_per_pass {
             let candidates = extract_skip_candidates(asset, effective_config);
             if !candidates.is_empty()
                 && candidates.iter().all(|&(vs, cs)| {
@@ -2992,6 +3012,68 @@ mod tests {
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
+    }
+
+    // ── requires_per_pass_paths predicate ──────────────────────────
+
+    #[test]
+    fn requires_per_pass_paths_fires_on_v013_defaults() {
+        // v0.13 defaults: base = "{:%Y/%m/%d}", folder_structure_albums =
+        // "{album}", folder_structure_smart_folders = "{smart-folder}". The
+        // per-category templates carry per-pass tokens, so every run with
+        // album or smart-folder passes needs per-pass config expansion.
+        // Returning false here is the regression that silently routed every
+        // album-pass photo through the unfiled `%Y/%m/%d` template.
+        let config = test_config();
+        assert!(config.requires_per_pass_paths());
+    }
+
+    #[test]
+    fn requires_per_pass_paths_fires_on_legacy_album_in_base() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        config.folder_structure_albums = Arc::from("{album}/%Y");
+        config.folder_structure_smart_folders = Arc::from("{album}/%Y");
+        assert!(config.requires_per_pass_paths());
+    }
+
+    #[test]
+    fn requires_per_pass_paths_fires_on_smart_folder_token() {
+        let mut config = test_config();
+        config.folder_structure = "%Y/%m/%d".to_string();
+        config.folder_structure_albums = Arc::from("%Y/%m/%d");
+        config.folder_structure_smart_folders = Arc::from("{smart-folder}");
+        assert!(config.requires_per_pass_paths());
+    }
+
+    #[test]
+    fn requires_per_pass_paths_fires_on_library_token() {
+        let mut config = test_config();
+        config.folder_structure = "{library}/%Y".to_string();
+        config.folder_structure_albums = Arc::from("{library}/%Y");
+        config.folder_structure_smart_folders = Arc::from("{library}/%Y");
+        assert!(config.requires_per_pass_paths());
+    }
+
+    #[test]
+    fn requires_per_pass_paths_fires_on_per_category_template_diverging_from_base() {
+        let mut config = test_config();
+        config.folder_structure = "%Y/%m/%d".to_string();
+        config.folder_structure_albums = Arc::from("MyAlbums/%Y/%m");
+        config.folder_structure_smart_folders = Arc::from("%Y/%m/%d");
+        assert!(config.requires_per_pass_paths());
+    }
+
+    #[test]
+    fn requires_per_pass_paths_false_when_all_templates_are_identical_literals() {
+        // Pure-literal, identical across all three fields, no per-pass token:
+        // every pass produces the same path, so the merged-stream branch is
+        // safe and the predicate returns false.
+        let mut config = test_config();
+        config.folder_structure = "%Y/%m/%d".to_string();
+        config.folder_structure_albums = Arc::from("%Y/%m/%d");
+        config.folder_structure_smart_folders = Arc::from("%Y/%m/%d");
+        assert!(!config.requires_per_pass_paths());
     }
 
     // ── with_pass per-kind template selection ─────────────────────
