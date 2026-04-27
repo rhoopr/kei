@@ -550,7 +550,13 @@ impl DownloadConfig {
         };
         let name = &pass.album.name;
         let name_ref = Some(name.as_ref()).filter(|n: &&str| !n.is_empty());
-        let folder_structure = paths::expand_named_token(template, pass.kind.token(), name_ref);
+        let category_expanded = paths::expand_named_token(template, pass.kind.token(), name_ref);
+        // Apply `{library}` last with the path-friendly truncated zone name,
+        // so callers see `SharedSync-A1B2C3D4/...` instead of the full UUID.
+        // The state-DB key still uses the full `self.library` string.
+        let library_for_path = paths::truncate_library_zone(&self.library);
+        let folder_structure =
+            paths::expand_named_token(&category_expanded, "{library}", Some(library_for_path));
         Self {
             album_name: Some(Arc::clone(name)),
             directory: Arc::clone(&self.directory),
@@ -3062,6 +3068,55 @@ mod tests {
         let derived = config.with_pass(&make_pass(PassKind::Album, "My/Album"));
         // Path separators in album names must be sanitised before substitution.
         assert!(!derived.folder_structure.starts_with("My/Album"));
+    }
+
+    #[test]
+    fn test_with_pass_expands_library_token_with_truncation() {
+        use crate::commands::PassKind;
+        let mut config = test_config();
+        config.folder_structure_albums = Arc::from("{library}/{album}/%Y");
+        config.library = Arc::from("SharedSync-A1B2C3D4-E5F6-7890-ABCD-EF1234567890");
+        let derived = config.with_pass(&make_pass(PassKind::Album, "Vacation"));
+        assert_eq!(
+            derived.folder_structure, "SharedSync-A1B2C3D4/Vacation/%Y",
+            "shared-zone UUIDs must truncate to 8 chars in path output"
+        );
+    }
+
+    #[test]
+    fn test_with_pass_library_token_passthrough_for_primary() {
+        use crate::commands::PassKind;
+        let mut config = test_config();
+        config.folder_structure = "{library}/%Y/%m/%d".to_string();
+        // Default `library` is "PrimarySync" via `test_default`.
+        let derived = config.with_pass(&make_pass(PassKind::Unfiled, ""));
+        assert_eq!(derived.folder_structure, "PrimarySync/%Y/%m/%d");
+    }
+
+    #[test]
+    fn test_with_pass_library_token_in_smart_folder_template() {
+        use crate::commands::PassKind;
+        let mut config = test_config();
+        config.folder_structure_smart_folders = Arc::from("{library}/{smart-folder}");
+        config.library = Arc::from("SharedSync-DEADBEEF-aaaa-bbbb-cccc-dddddddddddd");
+        let derived = config.with_pass(&make_pass(PassKind::SmartFolder, "Favorites"));
+        assert_eq!(derived.folder_structure, "SharedSync-DEADBEEF/Favorites");
+    }
+
+    #[test]
+    fn test_with_pass_state_db_library_uses_full_zone_name() {
+        // Path rendering truncates the zone for readability, but the
+        // state-DB key (DownloadConfig.library) keeps the full zone name
+        // verbatim so two zones whose 8-char prefixes happen to collide
+        // still get distinct PKs in the assets table.
+        use crate::commands::PassKind;
+        let mut config = test_config();
+        config.library = Arc::from("SharedSync-A1B2C3D4-E5F6-7890-ABCD-EF1234567890");
+        let derived = config.with_pass(&make_pass(PassKind::Album, "Trip"));
+        assert_eq!(
+            &*derived.library,
+            "SharedSync-A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+        );
     }
 
     #[test]

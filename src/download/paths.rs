@@ -52,6 +52,34 @@ pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str
     expand_named_token(folder_structure, "{album}", album_name)
 }
 
+/// Path-friendly form of a CloudKit zone name. Returns the input unchanged
+/// for the primary library (`PrimarySync`) and any non-shared zone, and
+/// truncates `SharedSync-<UUID>` to `SharedSync-<8 chars>` so on-disk
+/// folder names stay readable while remaining stable across reruns.
+///
+/// The 8-char suffix is the leading hex group of the UUID, which CloudKit
+/// emits deterministically — a copy-paste from the on-disk path back into
+/// `--library` resolves to the same zone.
+pub(crate) fn truncate_library_zone(zone_name: &str) -> &str {
+    const PREFIX: &str = "SharedSync-";
+    const KEEP: usize = 8;
+    let Some(rest) = zone_name.strip_prefix(PREFIX) else {
+        return zone_name;
+    };
+    if rest.len() <= KEEP {
+        return zone_name;
+    }
+    // CloudKit UUIDs are ASCII hex/dash, so an 8-byte slice is also an 8-char
+    // boundary. Defensive `is_char_boundary` check guards against a future
+    // schema change that introduces multibyte chars; on hit we drop back to
+    // the untruncated form rather than panic.
+    let cut = PREFIX.len() + KEEP;
+    if !zone_name.is_char_boundary(cut) {
+        return zone_name;
+    }
+    &zone_name[..cut]
+}
+
 /// Build the date-based parent directory for a photo asset (without filename).
 ///
 /// `folder_structure` is a strftime format string such as `"%Y/%m/%d"`. The
@@ -607,6 +635,35 @@ pub(crate) fn live_photo_mov_path_original(filename: &str) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn truncate_library_zone_passes_through_primary() {
+        assert_eq!(truncate_library_zone("PrimarySync"), "PrimarySync");
+    }
+
+    #[test]
+    fn truncate_library_zone_keeps_first_eight_chars_of_shared_uuid() {
+        assert_eq!(
+            truncate_library_zone("SharedSync-A1B2C3D4-E5F6-7890-ABCD-EF1234567890"),
+            "SharedSync-A1B2C3D4"
+        );
+    }
+
+    #[test]
+    fn truncate_library_zone_passes_through_short_shared_name() {
+        // Below the 8-char threshold — return verbatim rather than partial.
+        assert_eq!(truncate_library_zone("SharedSync-ABC"), "SharedSync-ABC");
+        assert_eq!(
+            truncate_library_zone("SharedSync-ABCDEFGH"),
+            "SharedSync-ABCDEFGH"
+        );
+    }
+
+    #[test]
+    fn truncate_library_zone_passes_through_unknown_prefix() {
+        assert_eq!(truncate_library_zone("CMMLibrary-XYZ"), "CMMLibrary-XYZ");
+        assert_eq!(truncate_library_zone(""), "");
+    }
 
     #[test]
     fn test_clean_filename() {

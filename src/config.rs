@@ -321,6 +321,9 @@ pub(crate) const DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS: &str = "{smart-folder}"
 /// than the first path segment, or use it more than once. Both cases would
 /// make the "unfiled photos" fallback path shift other segments around
 /// unpredictably when `{album}` collapses to an empty string.
+///
+/// Runs *before* the legacy-`{album}` auto-migration so the migration helper
+/// can rely on the placement guarantee when lifting the segment out.
 fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
     let stripped = crate::download::paths::strip_python_wrapper(folder_structure);
     let count = stripped.matches("{album}").count();
@@ -337,6 +340,118 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
             "'{{album}}' must be the first path segment of --folder-structure; got \"{folder_structure}\""
         );
     }
+    Ok(())
+}
+
+/// Which folder-structure flag a template was supplied via. Drives the
+/// per-template token rules: each kind allows exactly one category token
+/// (`{album}` for albums, `{smart-folder}` for smart folders, none for the
+/// unfiled base) and `{library}` is allowed in all three.
+#[derive(Debug, Clone, Copy)]
+enum TemplateKind {
+    /// `--folder-structure-albums`.
+    Albums,
+    /// `--folder-structure-smart-folders`.
+    SmartFolders,
+    /// `--folder-structure` (unfiled / library-wide). Auto-migration of a
+    /// legacy `{album}` token has already run by the time this kind is
+    /// validated, so the unfiled template should carry no category tokens.
+    Unfiled,
+}
+
+impl TemplateKind {
+    fn flag_name(self) -> &'static str {
+        match self {
+            Self::Albums => "--folder-structure-albums",
+            Self::SmartFolders => "--folder-structure-smart-folders",
+            Self::Unfiled => "--folder-structure",
+        }
+    }
+
+    /// The category token (if any) that this template scope owns. Used for
+    /// placement rules and for rejecting category tokens in the unfiled
+    /// template.
+    fn category_token(self) -> Option<&'static str> {
+        match self {
+            Self::Albums => Some("{album}"),
+            Self::SmartFolders => Some("{smart-folder}"),
+            Self::Unfiled => None,
+        }
+    }
+}
+
+/// Cross-template token & placement validator. Enforces, for the post-PR11
+/// surface:
+///
+/// - `{album}` is only valid in `--folder-structure-albums`; same for
+///   `{smart-folder}` and `--folder-structure-smart-folders`. The opposite
+///   token in either category template, or *any* category token in the
+///   unfiled template, bails with a pointer to the right flag.
+/// - Single occurrence of every token ({album}, {smart-folder}, {library}).
+/// - `{library}`, when present, must be the leading path segment.
+/// - When `{library}` and the category token coexist, the category token
+///   must immediately follow `{library}` (i.e. the second segment).
+///
+/// Bails at startup so misconfiguration surfaces before the first download.
+fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyhow::Result<()> {
+    let stripped = crate::download::paths::strip_python_wrapper(folder_structure);
+    let flag = kind.flag_name();
+
+    // Reject category tokens that don't belong here.
+    let category = kind.category_token();
+    for (token, owner) in [
+        ("{album}", "--folder-structure-albums"),
+        ("{smart-folder}", "--folder-structure-smart-folders"),
+    ] {
+        if Some(token) == category {
+            continue;
+        }
+        if stripped.contains(token) {
+            anyhow::bail!(
+                "'{token}' is not valid in {flag}; move it to {owner} (template was \"{folder_structure}\")"
+            );
+        }
+    }
+
+    // Single-occurrence checks for every token that *is* allowed here.
+    let mut tokens_to_count: Vec<&str> = vec!["{library}"];
+    if let Some(cat) = category {
+        tokens_to_count.push(cat);
+    }
+    for token in &tokens_to_count {
+        let count = stripped.matches(token).count();
+        if count > 1 {
+            anyhow::bail!(
+                "'{token}' may only appear once in {flag}; got {count} occurrences in \"{folder_structure}\""
+            );
+        }
+    }
+
+    // Placement rules. Build the list of tokens we need to check positions
+    // for and verify the segment ordering.
+    let segments: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
+    let has_library = stripped.contains("{library}");
+    let has_category = category.is_some_and(|c| stripped.contains(c));
+
+    if has_library && segments.first() != Some(&"{library}") {
+        anyhow::bail!(
+            "'{{library}}' must be the first path segment of {flag}; got \"{folder_structure}\""
+        );
+    }
+    if let Some(cat) = category {
+        if has_category {
+            let expected_index = if has_library { 1 } else { 0 };
+            if segments.get(expected_index) != Some(&cat) {
+                let position = if has_library {
+                    "must immediately follow '{library}'"
+                } else {
+                    "must be the first path segment"
+                };
+                anyhow::bail!("'{cat}' {position} of {flag}; got \"{folder_structure}\"");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1297,6 +1412,17 @@ impl Config {
         }
         let folder_structure = migration.folder_structure;
         let folder_structure_albums = migration.folder_structure_albums;
+
+        // Validate every template's tokens after auto-migration so a user
+        // who pasted `{smart-folder}` into `--folder-structure-albums`, or
+        // put `{library}` in the wrong segment position, gets a clear bail
+        // before the first download. The unfiled template runs through too
+        // even though `{album}` should have been migrated out — anything
+        // left there (e.g. `{smart-folder}`) is still a configuration bug.
+        validate_template_tokens(&folder_structure, TemplateKind::Unfiled)?;
+        validate_template_tokens(&folder_structure_albums, TemplateKind::Albums)?;
+        validate_template_tokens(&folder_structure_smart_folders, TemplateKind::SmartFolders)?;
+
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
         // Resolve live photo mode: --live-photo-mode > --skip-live-photos > TOML photos > TOML filters compat
@@ -2013,6 +2139,106 @@ mod tests {
     use super::*;
     use crate::cli::SyncArgs;
 
+    // ── validate_template_tokens ─────────────────────────────────────
+
+    #[test]
+    fn validate_template_tokens_accepts_default_per_category_templates() {
+        validate_template_tokens("%Y/%m/%d", TemplateKind::Unfiled).unwrap();
+        validate_template_tokens("{album}", TemplateKind::Albums).unwrap();
+        validate_template_tokens("{smart-folder}", TemplateKind::SmartFolders).unwrap();
+    }
+
+    #[test]
+    fn validate_template_tokens_accepts_library_prefix_in_every_kind() {
+        validate_template_tokens("{library}/%Y/%m/%d", TemplateKind::Unfiled).unwrap();
+        validate_template_tokens("{library}/{album}/%Y", TemplateKind::Albums).unwrap();
+        validate_template_tokens("{library}/{smart-folder}", TemplateKind::SmartFolders).unwrap();
+        // `{library}` standalone is fine (single-segment template).
+        validate_template_tokens("{library}", TemplateKind::Unfiled).unwrap();
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_misplaced_library_token() {
+        let err = validate_template_tokens("%Y/{library}/%m", TemplateKind::Unfiled).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'{library}' must be the first path segment"),
+            "{err}"
+        );
+        let err =
+            validate_template_tokens("{album}/{library}/%Y", TemplateKind::Albums).unwrap_err();
+        assert!(
+            err.to_string().contains("'{library}' must be the first"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_album_token_outside_album_template() {
+        let err = validate_template_tokens("{album}/%Y", TemplateKind::Unfiled).unwrap_err();
+        assert!(
+            err.to_string().contains("--folder-structure-albums"),
+            "{err}"
+        );
+
+        let err = validate_template_tokens("{album}", TemplateKind::SmartFolders).unwrap_err();
+        assert!(
+            err.to_string().contains("--folder-structure-albums"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_smart_folder_token_outside_smart_folders_template() {
+        let err = validate_template_tokens("{smart-folder}", TemplateKind::Unfiled).unwrap_err();
+        assert!(
+            err.to_string().contains("--folder-structure-smart-folders"),
+            "{err}"
+        );
+        let err = validate_template_tokens("{smart-folder}", TemplateKind::Albums).unwrap_err();
+        assert!(
+            err.to_string().contains("--folder-structure-smart-folders"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_duplicate_tokens() {
+        let err = validate_template_tokens("{library}/{library}/{album}", TemplateKind::Albums)
+            .unwrap_err();
+        assert!(err.to_string().contains("only appear once"), "{err}");
+
+        let err = validate_template_tokens("{album}/{album}", TemplateKind::Albums).unwrap_err();
+        assert!(err.to_string().contains("only appear once"), "{err}");
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_category_after_extra_segments() {
+        // `{library}/%Y/{album}` puts `{album}` in segment 3, but the rule
+        // is "immediately following `{library}`" — segment 2.
+        let err =
+            validate_template_tokens("{library}/%Y/{album}", TemplateKind::Albums).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must immediately follow '{library}'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_template_tokens_accepts_strftime_after_category_token() {
+        // Date hierarchy *inside* the album folder is fine.
+        validate_template_tokens("{album}/%Y/%m/%d", TemplateKind::Albums).unwrap();
+        validate_template_tokens("{library}/{smart-folder}/%Y", TemplateKind::SmartFolders)
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_template_tokens_handles_python_wrapper() {
+        validate_template_tokens("{:%Y/%m/%d}", TemplateKind::Unfiled).unwrap();
+        validate_template_tokens("{:{album}/%Y}", TemplateKind::Albums).unwrap();
+    }
+
     #[test]
     fn test_expand_tilde_with_home() {
         let result = expand_tilde("~/Documents");
@@ -2446,6 +2672,41 @@ mod tests {
             assert_eq!(cfg.bandwidth_limit, case.want_limit, "{}", case.name);
             assert_eq!(cfg.threads_num, case.want_threads, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn build_bails_when_album_token_appears_in_smart_folders_template() {
+        let mut sync = default_sync();
+        sync.folder_structure_smart_folders = Some("{album}/%Y".to_string());
+        let err = Config::build(&default_globals(), default_password(), sync, None)
+            .expect_err("`{album}` in --folder-structure-smart-folders must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--folder-structure-smart-folders")
+                && msg.contains("--folder-structure-albums"),
+            "error should name both flags: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_bails_when_library_token_misplaced() {
+        let mut sync = default_sync();
+        sync.folder_structure_albums = Some("{album}/{library}".to_string());
+        let err = Config::build(&default_globals(), default_password(), sync, None)
+            .expect_err("`{library}` not as first segment must bail");
+        assert!(
+            err.to_string().contains("'{library}' must be the first"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_accepts_library_album_pair_in_albums_template() {
+        let mut sync = default_sync();
+        sync.folder_structure_albums = Some("{library}/{album}/%Y".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None)
+            .expect("`{library}/{album}/...` is a valid albums template");
+        assert_eq!(cfg.folder_structure_albums, "{library}/{album}/%Y");
     }
 
     #[test]
