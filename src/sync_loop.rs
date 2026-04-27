@@ -38,6 +38,15 @@ struct LibraryState {
     /// Ordered list of download passes. Each pass carries its own
     /// exclude-asset-ids set. See [`crate::commands::AlbumPlan`].
     plan: crate::commands::AlbumPlan,
+    /// True when `resolve_passes` failed at the end of the prior cycle and
+    /// the plan above is the previous cycle's stale snapshot. Album
+    /// membership data captured under a stale plan can route assets to the
+    /// wrong pass (e.g. an asset added to a newly-created album shows up in
+    /// the unfiled pass), so any cycle that consumes a stale plan must not
+    /// advance the sync token for any zone -- doing so would skip the
+    /// change events those assets generated and leave `asset_albums`
+    /// permanently incomplete (CF-1).
+    plan_is_stale: bool,
 }
 
 /// State-DB metadata key for the first-sync shared-library notice. Bumping
@@ -635,6 +644,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             zone_name,
             sync_token_key,
             plan,
+            plan_is_stale: false,
         });
     }
     bail_if_multi_library_paths_commingle(
@@ -943,10 +953,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 match resolve_passes(&lib_state.library, &config.selection).await {
                     Ok(refreshed) => {
                         lib_state.plan = refreshed;
+                        lib_state.plan_is_stale = false;
                         consecutive_album_refresh_failures = 0;
                     }
                     Err(e) => {
                         consecutive_album_refresh_failures += 1;
+                        // Mark the plan stale so the NEXT cycle's token
+                        // storage gate can suppress advancement. CF-1.
+                        lib_state.plan_is_stale = true;
                         if consecutive_album_refresh_failures >= 3 {
                             tracing::error!(
                                 zone = %lib_state.zone_name,
@@ -1080,6 +1094,23 @@ pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_r
     matches!(outcome, download::DownloadOutcome::Success) && !dry_run
 }
 
+/// Cycle-level gate that combines the per-library outcome check with the
+/// cross-library "any plan is stale" override.
+///
+/// CF-1: if any library entered the cycle with a reused plan (the prior
+/// album refresh failed), suppress sync-token advancement for every library
+/// in the cycle. A stale plan can route assets created or moved between
+/// cycles to the wrong pass; advancing the token would skip the change
+/// events that would surface those assets correctly on the next refresh,
+/// leaving `asset_albums` permanently incomplete.
+pub(crate) fn should_store_sync_token_for_cycle(
+    outcome: &download::DownloadOutcome,
+    dry_run: bool,
+    cycle_has_stale_plan: bool,
+) -> bool {
+    should_store_sync_token(outcome, dry_run) && !cycle_has_stale_plan
+}
+
 /// Decide whether the reauth path inside the sync loop should block on a
 /// 2FA prompt or surface the error to the caller.
 ///
@@ -1128,6 +1159,21 @@ async fn run_cycle(
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
+
+    // CF-1: if ANY library entered the cycle with a stale plan (the prior
+    // album refresh failed and the previous plan is being reused), suppress
+    // sync-token advancement for every library in this cycle. A reused plan
+    // can route assets created or moved between cycles to the wrong pass and
+    // produce silently incomplete `asset_albums` data; without this gate the
+    // change events for those assets sit behind the advanced token and
+    // never replay.
+    let cycle_has_stale_plan = library_states.iter().any(|s| s.plan_is_stale);
+    if cycle_has_stale_plan {
+        tracing::warn!(
+            "One or more libraries are running on a stale album plan; sync \
+             token will not advance this cycle"
+        );
+    }
 
     for lib_state in library_states {
         if shutdown_token.is_cancelled() {
@@ -1228,7 +1274,11 @@ async fn run_cycle(
         // Note: the token is stored after download_photos_with_sync returns, which
         // means all batch flushes are complete. A crash here means the token is
         // NOT advanced, so assets will replay on next sync (safe, not data loss).
-        let should_store_token = should_store_sync_token(&sync_result.outcome, config.dry_run);
+        let should_store_token = should_store_sync_token_for_cycle(
+            &sync_result.outcome,
+            config.dry_run,
+            cycle_has_stale_plan,
+        );
         if should_store_token {
             if let Some(token) = &sync_result.sync_token {
                 if let Some(db) = state_db {
@@ -2222,6 +2272,7 @@ mod tests {
             zone_name: zone.to_string(),
             sync_token_key: sync_token_key.to_string(),
             plan: crate::commands::AlbumPlan { passes: Vec::new() },
+            plan_is_stale: false,
         }
     }
 
@@ -3010,6 +3061,44 @@ mod tests {
             should_store_sync_token(&outcome, false),
             "(Success, dry_run=false) is the ONLY combination that should advance the token"
         );
+    }
+
+    /// CF-1 (2026-04-27): a cycle that consumed a stale plan from a prior
+    /// failed `resolve_passes` MUST NOT advance the sync token even when the
+    /// per-library outcome is `Success`. A reused plan can route assets to
+    /// the wrong pass; advancing the token would skip the change events
+    /// that would surface the corrected membership on the next cycle.
+    #[test]
+    fn sync_loop_stale_plan_blocks_sync_token_advance_even_on_success() {
+        let outcome = download::DownloadOutcome::Success;
+        // Baseline: without a stale plan, Success advances the token.
+        assert!(should_store_sync_token_for_cycle(&outcome, false, false));
+        // With a stale plan: even Success must NOT advance the token.
+        assert!(
+            !should_store_sync_token_for_cycle(&outcome, false, true),
+            "stale-plan flag must veto token advancement on Success"
+        );
+    }
+
+    /// CF-1 companion: dry_run and PartialFailure already block; pinning
+    /// the matrix so a future refactor can't silently change the AND/OR
+    /// shape of the gate.
+    #[test]
+    fn sync_loop_stale_plan_combines_with_existing_gates() {
+        let success = download::DownloadOutcome::Success;
+        let partial = download::DownloadOutcome::PartialFailure { failed_count: 1 };
+
+        // PartialFailure: blocked regardless of stale-plan flag.
+        assert!(!should_store_sync_token_for_cycle(&partial, false, false));
+        assert!(!should_store_sync_token_for_cycle(&partial, false, true));
+
+        // Dry-run: blocked regardless of stale-plan flag.
+        assert!(!should_store_sync_token_for_cycle(&success, true, false));
+        assert!(!should_store_sync_token_for_cycle(&success, true, true));
+
+        // Only (Success, dry_run=false, stale=false) advances.
+        assert!(should_store_sync_token_for_cycle(&success, false, false));
+        assert!(!should_store_sync_token_for_cycle(&success, false, true));
     }
 
     // CG-19: `should_wait_for_2fa` decides whether the reauth-time 2FA
