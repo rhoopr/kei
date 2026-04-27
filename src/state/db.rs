@@ -760,12 +760,13 @@ impl StateDb for SqliteStateDb {
                 .map_err(|e| StateError::query("mark_failed", e))?;
 
             if rows == 0 {
-                tracing::warn!(
+                tracing::error!(
                     id = %id,
                     version_size = %version_size,
                     "mark_failed matched 0 rows; caller must upsert_seen before mark_failed \
                      (producer-dispatch invariant). Failure not persisted"
                 );
+                crate::metrics::MARK_FAILED_ZERO_ROWS.inc();
             }
 
             Ok(())
@@ -3726,6 +3727,45 @@ mod tests {
             "counter should advance by at least 1 (other parallel tests may also \
              increment); got before={before} after={after}"
         );
+    }
+
+    /// CF-4 (2026-04-27): a `mark_failed` call without a prior `upsert_seen`
+    /// is a producer-dispatch invariant violation. The function preserves
+    /// the documented contract (returns Ok with 0 rows affected; does NOT
+    /// error) so callers don't crash on a buggy code path, but the failure
+    /// must be loud: an `error!` log AND an incremented metric counter so
+    /// /metrics scraping surfaces the regression. Mirrors the
+    /// `mark_downloaded_zero_rows_increments_metric_counter` test above.
+    #[tokio::test]
+    async fn mark_failed_zero_rows_increments_metric_counter_and_returns_ok() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let before = crate::metrics::MARK_FAILED_ZERO_ROWS.get();
+        let result = db
+            .mark_failed(
+                "PrimarySync",
+                "NEVER_SEEN_FOR_FAILED_METRIC",
+                "original",
+                "simulated transient error",
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "mark_failed on unknown row must NOT error -- the caller treats \
+             0-row updates as a soft contract per the docs (got {result:?})"
+        );
+        let after = crate::metrics::MARK_FAILED_ZERO_ROWS.get();
+
+        assert!(
+            after > before,
+            "MARK_FAILED_ZERO_ROWS must advance by at least 1 (parallel tests \
+             may also increment); got before={before} after={after}"
+        );
+
+        // The asset must NOT have been inserted as a side effect.
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.total_assets, 0);
     }
 
     // ── Gap: mark_failed increments download_attempts cumulatively ────
