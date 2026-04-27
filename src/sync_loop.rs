@@ -554,6 +554,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let cfg_directory: Arc<std::path::Path> = Arc::from(config.directory.as_path());
     let cfg_filename_exclude: Arc<[glob::Pattern]> = Arc::from(config.filename_exclude.clone());
     let cfg_temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
+    let cfg_folder_structure_albums: Arc<str> = Arc::from(config.folder_structure_albums.as_str());
+    let cfg_folder_structure_smart_folders: Arc<str> =
+        Arc::from(config.folder_structure_smart_folders.as_str());
 
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
@@ -562,8 +565,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         Arc::new(download::DownloadConfig {
             directory: Arc::clone(&cfg_directory),
             folder_structure: config.folder_structure.clone(),
-            folder_structure_albums: config.folder_structure_albums.clone(),
-            folder_structure_smart_folders: config.folder_structure_smart_folders.clone(),
+            folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),
+            folder_structure_smart_folders: Arc::clone(&cfg_folder_structure_smart_folders),
             size: config.size.into(),
             skip_videos: config.skip_videos,
             skip_photos: config.skip_photos,

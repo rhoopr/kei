@@ -40,9 +40,9 @@ pub(crate) fn expand_named_token(
 }
 
 /// Expand the `{album}` token in a folder structure format string. Thin
-/// wrapper around [`expand_named_token`] for the legacy single-template
-/// path renderer; per-category callers (PR8) use `expand_named_token`
-/// directly with the appropriate token.
+/// wrapper around [`expand_named_token`] kept for callers outside the
+/// per-pass renderer (e.g. `local_download_dir`'s legacy single-template
+/// path).
 pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str>) -> String {
     expand_named_token(folder_structure, "{album}", album_name)
 }

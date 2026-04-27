@@ -830,27 +830,33 @@ impl std::fmt::Display for PhotoAlbum {
     }
 }
 
+/// Panic-on-call `PhotosSession` for tests that inspect a `PhotoAlbum` by
+/// name/metadata only. Any actual network call is a test bug.
+#[cfg(test)]
+pub(crate) struct StubSession;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl PhotosSession for StubSession {
+    async fn post(
+        &self,
+        _url: &str,
+        _body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        unimplemented!("stub")
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(StubSession)
+    }
+}
+
 #[cfg(test)]
 impl PhotoAlbum {
     /// Construct a `PhotoAlbum` with the given name for cross-module unit
-    /// tests. Wires a stub session that panics on any network call, so the
-    /// album is only safe to inspect by name / metadata.
+    /// tests. Wires [`StubSession`], so the album is only safe to inspect by
+    /// name/metadata - any network call panics.
     pub(crate) fn stub_for_test(name: Arc<str>) -> Self {
-        struct StubSession;
-        #[async_trait::async_trait]
-        impl PhotosSession for StubSession {
-            async fn post(
-                &self,
-                _url: &str,
-                _body: String,
-                _headers: &[(&str, &str)],
-            ) -> anyhow::Result<Value> {
-                unimplemented!("stub")
-            }
-            fn clone_box(&self) -> Box<dyn PhotosSession> {
-                Box::new(StubSession)
-            }
-        }
         Self::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
@@ -873,23 +879,6 @@ mod tests {
     use super::*;
     use crate::test_helpers::MockPhotosSession;
     use serde_json::json;
-
-    struct StubSession;
-
-    #[async_trait::async_trait]
-    impl PhotosSession for StubSession {
-        async fn post(
-            &self,
-            _url: &str,
-            _body: String,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<Value> {
-            unimplemented!("stub")
-        }
-        fn clone_box(&self) -> Box<dyn PhotosSession> {
-            Box::new(StubSession)
-        }
-    }
 
     fn make_album(
         page_size: usize,

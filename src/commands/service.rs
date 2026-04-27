@@ -359,15 +359,28 @@ pub(crate) async fn resolve_libraries(
     }
 }
 
-/// Category of a download pass. Selects which folder-structure template the
-/// renderer applies (`folder_structure_albums` / `_smart_folders` /
-/// `folder_structure`) and which token (`{album}` / `{smart-folder}`) is
-/// expanded in it.
+/// Category of a download pass: a named user album, an Apple-defined smart
+/// folder, or the library-wide unfiled pseudo-pass. Drives template/token
+/// selection in the path renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PassKind {
     Album,
     SmartFolder,
     Unfiled,
+}
+
+impl PassKind {
+    /// Folder-structure token expanded for this pass kind. The unfiled pass
+    /// reuses `{album}` so existing configs with `--folder-structure
+    /// "{album}/..."` still produce the same on-disk tree (the token
+    /// collapses to an empty segment when the unfiled pass runs with the
+    /// library-wide pseudo-album's empty name).
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Album | Self::Unfiled => "{album}",
+            Self::SmartFolder => "{smart-folder}",
+        }
+    }
 }
 
 /// One pass through a specific album (or the library-wide pseudo-album).
@@ -1269,11 +1282,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_passes_tags_each_pass_with_correct_kind() {
-        // The renderer (PR8 in download/mod.rs::with_pass) routes per-category
-        // template selection on `pass.kind`, so the resolver must tag each
-        // pass: album → Album, smart-folder → SmartFolder, library-wide
-        // unfiled → Unfiled. Drift here silently misroutes passes to the
-        // wrong template.
+        // The renderer routes per-category template selection on
+        // `pass.kind`, so the resolver must tag each pass correctly. Drift
+        // here silently misroutes passes to the wrong template.
         let mock = MockPhotosSession::new()
             .ok(serde_json::json!({"records": [folder_record("FOLDER_1", "Vacation")]}))
             .ok(album_count_response(0))
