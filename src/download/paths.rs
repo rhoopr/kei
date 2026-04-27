@@ -74,6 +74,10 @@ pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str
 /// The 8-char suffix is the leading hex group of the UUID, which CloudKit
 /// emits deterministically — a copy-paste from the on-disk path back into
 /// `--library` resolves to the same zone.
+///
+/// Output is NOT sanitized — callers that stitch the return value into a
+/// filesystem path must run it through [`sanitize_path_component`] (or
+/// reach it via [`expand_named_token`], which does so automatically).
 pub(crate) fn truncate_library_zone(zone_name: &str) -> &str {
     const PREFIX: &str = "SharedSync-";
     const KEEP: usize = 8;

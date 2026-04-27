@@ -637,12 +637,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             plan,
         });
     }
-    warn_if_multi_library_paths_commingle(
+    bail_if_multi_library_paths_commingle(
         library_states.len(),
         &config.folder_structure,
         &config.folder_structure_albums,
         &config.folder_structure_smart_folders,
-    );
+    )?;
     sd_notifier.notify_ready();
 
     // Spawn the HTTP server (/healthz + /metrics) only in watch mode.
@@ -1362,35 +1362,29 @@ async fn check_changes_database(
     }
 }
 
-/// Warn at startup when multiple libraries are in scope but no template
-/// uses `{library}`. Without `{library}`, on-disk paths from PrimarySync and
-/// any SharedSync zone share one namespace; the v8 state DB still scopes
-/// rows per-zone, so two zones holding the same asset write to the same
-/// path and one will overwrite the other (last write wins). User picks
-/// separation by adding `{library}` to a template; we don't bail because
-/// the merge may be intentional.
-fn warn_if_multi_library_paths_commingle(
+/// Bail when multi-library sync would let same-named assets from different
+/// zones overwrite each other on disk. The state DB is per-zone via the v8
+/// PK, but the filesystem isn't unless a template includes `{library}`.
+fn bail_if_multi_library_paths_commingle(
     library_count: usize,
     folder_structure: &str,
     folder_structure_albums: &str,
     folder_structure_smart_folders: &str,
-) {
+) -> anyhow::Result<()> {
     if library_count < 2 {
-        return;
+        return Ok(());
     }
     let any_uses_library_token = folder_structure.contains("{library}")
         || folder_structure_albums.contains("{library}")
         || folder_structure_smart_folders.contains("{library}");
     if any_uses_library_token {
-        return;
+        return Ok(());
     }
-    tracing::warn!(
-        library_count,
-        "Multiple libraries in scope but no folder-structure template contains \
-         `{{library}}`; on-disk paths will commingle across zones and the same \
-         filename from two libraries may overwrite. Add `{{library}}` to one \
-         of --folder-structure / --folder-structure-albums / \
-         --folder-structure-smart-folders if you want per-library separation."
+    anyhow::bail!(
+        "{library_count} libraries selected but no template contains `{{library}}`; \
+         add `{{library}}` to one of --folder-structure / --folder-structure-albums / \
+         --folder-structure-smart-folders, or use --library primary to disable \
+         multi-library sync."
     );
 }
 
@@ -1726,28 +1720,78 @@ mod tests {
         );
     }
 
-    // ── warn_if_multi_library_paths_commingle ────────────────────────
+    // ── bail_if_multi_library_paths_commingle ────────────────────────
     //
-    // The function returns `()` and only side-effects via `tracing::warn!`,
-    // which has no observable effect in unit tests without a subscriber.
-    // This smoke test exercises every branch (single-library short-circuit,
-    // `{library}` in any of the three templates, multi-library without
-    // token) so a future regression that panics gets caught even without
-    // log capture.
+    // Multi-library sync without a `{library}` token would let same-named
+    // assets from different zones overwrite each other on disk. The bail
+    // is the gatekeeper for that data-loss path; these tests pin every
+    // branch (single-library short-circuit, `{library}` in any of the
+    // three templates, multi-library without token).
+
     #[test]
-    fn warn_if_multi_library_paths_commingle_exercises_every_branch() {
-        // Single-library short-circuit (no warn, no work).
-        warn_if_multi_library_paths_commingle(0, "%Y/%m/%d", "{album}", "{smart-folder}");
-        warn_if_multi_library_paths_commingle(1, "%Y/%m/%d", "{album}", "{smart-folder}");
+    fn bail_if_multi_library_paths_commingle_short_circuits_under_two_libraries() {
+        // Zero or one library never trips the check, regardless of templates.
+        assert!(
+            bail_if_multi_library_paths_commingle(0, "%Y/%m/%d", "{album}", "{smart-folder}")
+                .is_ok()
+        );
+        assert!(
+            bail_if_multi_library_paths_commingle(1, "%Y/%m/%d", "{album}", "{smart-folder}")
+                .is_ok()
+        );
+    }
 
-        // `{library}` in any of the three templates suppresses the warn.
-        warn_if_multi_library_paths_commingle(2, "{library}/%Y/%m/%d", "{album}", "{smart-folder}");
-        warn_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{library}/{album}", "{smart-folder}");
-        warn_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{album}", "{library}/{smart-folder}");
+    #[test]
+    fn bail_if_multi_library_paths_commingle_accepts_library_token_in_any_template() {
+        assert!(bail_if_multi_library_paths_commingle(
+            2,
+            "{library}/%Y/%m/%d",
+            "{album}",
+            "{smart-folder}"
+        )
+        .is_ok());
+        assert!(bail_if_multi_library_paths_commingle(
+            2,
+            "%Y/%m/%d",
+            "{library}/{album}",
+            "{smart-folder}"
+        )
+        .is_ok());
+        assert!(bail_if_multi_library_paths_commingle(
+            2,
+            "%Y/%m/%d",
+            "{album}",
+            "{library}/{smart-folder}"
+        )
+        .is_ok());
+    }
 
-        // Multi-library without `{library}` triggers the warn path.
-        warn_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{album}", "{smart-folder}");
-        warn_if_multi_library_paths_commingle(5, "none", "{album}", "{smart-folder}");
+    #[test]
+    fn bail_if_multi_library_paths_commingle_bails_without_library_token() {
+        let err = bail_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{album}", "{smart-folder}")
+            .expect_err("multi-library without `{library}` must bail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("2 libraries selected"),
+            "error must report library count; got: {msg}"
+        );
+        assert!(
+            msg.contains("{library}"),
+            "error must mention the missing token; got: {msg}"
+        );
+        assert!(
+            msg.contains("--folder-structure-albums"),
+            "error must point at the user-facing flag; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bail_if_multi_library_paths_commingle_bails_with_none_folder_structure_too() {
+        // `none` (date hierarchy disabled) is the worst-case commingle:
+        // every asset lands directly in the download dir.
+        let err = bail_if_multi_library_paths_commingle(5, "none", "{album}", "{smart-folder}")
+            .expect_err("multi-library + `none` template must still bail");
+        assert!(format!("{err}").contains("5 libraries selected"));
     }
 
     // ── determine_sync_mode ──────────────────────────────────────────

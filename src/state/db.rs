@@ -4626,4 +4626,66 @@ mod tests {
             "the asset that wasn't enumerated this sync must not appear in the failed set"
         );
     }
+
+    /// Read-side counterpart to `upsert_seen_keeps_distinct_rows_per_library`
+    /// and `mark_failed_is_library_scoped`: those tests already pin the write
+    /// side, this one pins that the bulk-loader queries used by the download
+    /// hot path (`get_downloaded_checksums`, `sample_downloaded_paths`)
+    /// surface per-zone rows without collapsing them on the shared
+    /// `(id, version_size)` pair the v8 PK split was created to disambiguate.
+    #[tokio::test]
+    async fn multi_library_read_queries_scope_per_zone() {
+        let dir = test_dir();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        const ID: &str = "SHARED_ID";
+        const PRIMARY: &str = "PrimarySync";
+        const SHARED: &str = "SharedSync-A1B2C3D4";
+
+        for (library, ck) in [(PRIMARY, "ck_primary"), (SHARED, "ck_shared")] {
+            let record = TestAssetRecord::new(ID)
+                .library(library)
+                .checksum(ck)
+                .filename("photo.jpg")
+                .size(1000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        let primary_path = dir.path().join(PRIMARY).join("photo.jpg");
+        let shared_path = dir.path().join(SHARED).join("photo.jpg");
+        for path in [&primary_path, &shared_path] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"x").unwrap();
+        }
+        db.mark_downloaded(PRIMARY, ID, "original", &primary_path, "lh_primary", None)
+            .await
+            .unwrap();
+        db.mark_downloaded(SHARED, ID, "original", &shared_path, "lh_shared", None)
+            .await
+            .unwrap();
+
+        let checksums = db.get_downloaded_checksums().await.unwrap();
+        let triple = |lib: &str| (lib.to_string(), ID.to_string(), "original".to_string());
+        assert_eq!(
+            checksums.get(&triple(PRIMARY)),
+            Some(&"ck_primary".to_string())
+        );
+        assert_eq!(
+            checksums.get(&triple(SHARED)),
+            Some(&"ck_shared".to_string())
+        );
+
+        // local_path is per-row; if mark_downloaded had clobbered the column
+        // on a shared (id, version_size) we'd leak one of the on-disk files.
+        let paths = db.sample_downloaded_paths(10).await.unwrap();
+        assert!(
+            paths.contains(&primary_path),
+            "primary path missing: {paths:?}"
+        );
+        assert!(
+            paths.contains(&shared_path),
+            "shared path missing: {paths:?}"
+        );
+    }
 }

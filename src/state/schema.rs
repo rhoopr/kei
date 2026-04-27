@@ -236,10 +236,10 @@ FROM assets;
 DROP TABLE assets;
 ALTER TABLE assets_v8 RENAME TO assets;
 
-CREATE INDEX idx_assets_status ON assets(status);
-CREATE INDEX idx_assets_local_path ON assets(local_path);
-CREATE INDEX idx_assets_checksum ON assets(checksum);
-CREATE INDEX idx_assets_metadata_hash ON assets (metadata_hash) WHERE status = 'downloaded';
+CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
+CREATE INDEX IF NOT EXISTS idx_assets_local_path ON assets(local_path);
+CREATE INDEX IF NOT EXISTS idx_assets_checksum ON assets(checksum);
+CREATE INDEX IF NOT EXISTS idx_assets_metadata_hash ON assets (metadata_hash) WHERE status = 'downloaded';
 ";
 
 /// Check whether a column exists on a table using `PRAGMA table_info`.
@@ -332,13 +332,10 @@ fn migrate_to_version(
             // Per-zone scope on the assets PK. Pre-v8 PK was
             // (id, version_size); post-v8 PK is (library, id, version_size)
             // so the same asset ID across multiple SharedSync zones can no
-            // longer collide in the state DB. Pre-existing rows are
-            // backfilled with library='PrimarySync' — the safe assumption
-            // since most installs only have the primary zone. Users who
-            // already had shared libraries in their data dir before v8 will
-            // see fresh rows under those zone names appear on the next
-            // sync; the misattributed PrimarySync rows survive so no
-            // downloaded file is ever orphaned from state.
+            // longer collide in the state DB. Pre-v8 kei only ever wrote
+            // PrimarySync data (no library column existed and no call path
+            // took a zone parameter), so backfilling every surviving row
+            // with library='PrimarySync' is exact, not approximate.
             if !column_exists(conn, "assets", "library")? {
                 conn.execute_batch(SCHEMA_V8)?;
             }
