@@ -1602,15 +1602,21 @@ fn sync_recovers_deleted_file() {
         assert!(!victim.exists(), "victim deleted");
 
         // Re-sync: full enumeration so the filter can notice the missing file.
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        // Captured output is included in the assertion below so an intermittent
+        // skip-where-recovery-was-expected leaves a usable trail (data-sacred
+        // invariant: a silent skip here means kei "loses" the file).
+        let assert = album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .env("RUST_LOG", "kei=debug")
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
 
         assert!(
             victim.exists(),
-            "deleted file should be re-downloaded: {}",
-            victim.display()
+            "deleted file should be re-downloaded: {}\n--- post-sync walkdir ---\n{:#?}\n--- kei stderr ---\n{stderr}",
+            victim.display(),
+            common::walkdir(download_dir.path()),
         );
         let after_size = std::fs::metadata(&victim).unwrap().len();
         assert_eq!(
@@ -1655,10 +1661,16 @@ fn sync_truncated_file_does_not_cause_data_loss() {
             .expect("set_len 0");
         assert_eq!(std::fs::metadata(&victim).unwrap().len(), 0);
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        // Captured output is included in the assertion below so an
+        // intermittent skip-where-recovery-was-expected leaves a usable
+        // trail (data-sacred invariant: zero-byte file must not mask the
+        // real photo).
+        let assert = album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .env("RUST_LOG", "kei=debug")
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
 
         // The correctly-sized photo must exist somewhere under the same folder
         // (either overwriting the zero-byte file or as a size-suffixed sibling).
@@ -1668,8 +1680,8 @@ fn sync_truncated_file_does_not_cause_data_loss() {
             .collect();
         assert!(
             !candidates.is_empty(),
-            "after re-sync, the correctly-sized photo must be on disk somewhere in {:?}",
-            parent
+            "after re-sync, the correctly-sized photo must be on disk somewhere in {parent:?} (expected {expected_size} bytes)\n--- post-sync walkdir ---\n{:#?}\n--- kei stderr ---\n{stderr}",
+            common::walkdir(&parent),
         );
         let recovered = std::fs::read(&candidates[0]).unwrap();
         assert_eq!(
