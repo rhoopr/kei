@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Fuzz harnesses for 10 parser entry points.** New `fuzz/` directory with cargo-fuzz targets covering CloudKit JSON deserializers, auth responses (SRP init, account login, 2FA challenge), TOML config, the `*Enc` field decoders, path sanitization, HEIF atom walking, the HEIF XMP probe pipeline, Adobe XMP Toolkit (run via FFI so ASan can see C++ memory bugs), `PhotoAsset::from_records`, and the state enum `from_str` parsers. Checked-in seeds under `fuzz/seeds/` include two OOM regression repros for an upstream `mp4-atom` bug that kei calls synchronously during the EXIF probe. `just fuzz run TARGET` replays them on every invocation.
+
+### Changed
+
+- **kei now compiles as a library plus a thin binary shim.** `src/main.rs` is a 7-line entry point that calls `kei::main_inner()`; the module tree moved verbatim into `src/lib.rs`. Behavior is identical: `cargo install kei`, the docker image, and `cargo run` all build and run the same binary. The crate has a lib target now, which lets the in-tree fuzz harnesses depend on it directly instead of re-inlining source files via `#[path]`. A new `__fuzz_internals` Cargo feature gates `pub mod __fuzz` containing wrappers around `pub(crate)` parser entry points; default builds don't include it.
+- **Live recovery tests now print kei's stderr on failure.** `sync_recovers_deleted_file` and `sync_truncated_file_does_not_cause_data_loss` previously panicked with just "deleted file should be re-downloaded" or "correctly-sized photo must be on disk". kei had exited 0, so `assert().success()` discarded stderr before the disk-state check ran, leaving nothing actionable when the tests failed intermittently. Both now run with `RUST_LOG=kei=debug` and include the captured stderr plus a post-sync walkdir in the panic message.
+
+---
+
 ## [0.12.0] - 2026-04-26
 
 ### Added

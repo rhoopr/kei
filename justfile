@@ -11,7 +11,7 @@ _default:
 gate:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --bin kei --test cli --test behavioral
+    cargo test --lib --test cli --test behavioral
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
     cargo audit
@@ -37,7 +37,7 @@ test MODE="":
             cargo test --all-features
             ;;
         fast)
-            cargo test --bin kei --test cli --test behavioral
+            cargo test --lib --test cli --test behavioral
             ;;
         live)
             _live_env
@@ -88,7 +88,7 @@ cov MODE="" BASE="main":
             # same profile data as the offline ones. The final `report`
             # call prints the merged summary.
             cargo llvm-cov clean --workspace
-            cargo llvm-cov --no-report --bin kei
+            cargo llvm-cov --no-report --lib
             cargo llvm-cov --no-report --test cli
             cargo llvm-cov --no-report --test behavioral
             cargo llvm-cov --no-report --test sync -- --include-ignored --test-threads=1
@@ -208,6 +208,54 @@ release TARGET="":
         /^## \[/ { in_section = ($0 ~ "^## \\[" ver "\\]"); next }
         in_section { print }
     ' CHANGELOG.md | sed '/./,$!d' | awk 'NR==1 && /^$/ {next} {print}'
+
+# Fuzz: list | build | run TARGET [SECONDS]. Requires nightly + cargo-fuzz; install with `rustup install nightly && cargo install cargo-fuzz`.
+fuzz MODE="list" *ARGS="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        echo "cargo-fuzz not installed. Run: cargo install cargo-fuzz" >&2
+        exit 1
+    fi
+    if ! rustup toolchain list | grep -q '^nightly'; then
+        echo "nightly toolchain not installed. Run: rustup install nightly" >&2
+        exit 1
+    fi
+    case "{{MODE}}" in
+        list)
+            cargo +nightly fuzz list
+            ;;
+        build)
+            cargo +nightly fuzz build
+            ;;
+        run)
+            args=({{ARGS}})
+            target="${args[0]:-}"
+            seconds="${args[1]:-60}"
+            if [ -z "$target" ]; then
+                echo "usage: just fuzz run TARGET [SECONDS]" >&2
+                cargo +nightly fuzz list
+                exit 2
+            fi
+            # libfuzzer treats the FIRST corpus dir as input/output (it
+            # writes new coverage-improving inputs there) and any later dirs
+            # as read-only auxiliary corpora. Pass fuzz/corpus/<target>
+            # first so libfuzzer's auto-saved finds land there, and
+            # fuzz/seeds/<target> second so checked-in regression inputs
+            # replay every run without getting clobbered by autogen entries.
+            mkdir -p "fuzz/corpus/$target"
+            extra=()
+            if [ -d "fuzz/seeds/$target" ]; then
+                extra+=("fuzz/seeds/$target")
+            fi
+            cargo +nightly fuzz run "$target" "fuzz/corpus/$target" "${extra[@]}" -- -max_total_time="$seconds"
+            ;;
+        *)
+            echo "Unknown mode: {{MODE}}" >&2
+            echo "Modes: list | build | run TARGET [SECONDS]" >&2
+            exit 1
+            ;;
+    esac
 
 # Create branch NAME off a freshly fetched origin/main (CLAUDE.md branch-from-fresh-main rule).
 branch NAME:

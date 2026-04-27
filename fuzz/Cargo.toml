@@ -1,0 +1,95 @@
+[package]
+name = "kei-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Fuzz harnesses depend on the kei lib through the `__fuzz_internals`
+# feature, which exposes a `kei::__fuzz` module of `pub fn` wrappers around
+# the parsers we want to drive. The internal types stay `pub(crate)`; the
+# wrappers take/return only externally-nameable types (bytes, strings,
+# `serde_json::Value`).
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kei = { path = "..", features = ["__fuzz_internals"] }
+
+# Used directly by harnesses for synthesizing `serde_json::Value` shapes,
+# base64 wrapping, and the standalone `xmp_packet` target that talks to
+# `xmp_toolkit` without going through kei.
+serde_json = "1"
+base64 = "0.22"
+xmp_toolkit = "1"
+
+[[bin]]
+name = "cloudkit_json"
+path = "fuzz_targets/cloudkit_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "enc_decoders"
+path = "fuzz_targets/enc_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "paths_sanitization"
+path = "fuzz_targets/paths_sanitization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "heif_atoms"
+path = "fuzz_targets/heif_atoms.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xmp_packet"
+path = "fuzz_targets/xmp_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "heif_xmp_probe"
+path = "fuzz_targets/heif_xmp_probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "toml_config"
+path = "fuzz_targets/toml_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_responses"
+path = "fuzz_targets/auth_responses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "photo_asset_from_record"
+path = "fuzz_targets/photo_asset_from_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_enums_from_str"
+path = "fuzz_targets/state_enums_from_str.rs"
+test = false
+doc = false
+bench = false

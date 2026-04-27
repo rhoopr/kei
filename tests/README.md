@@ -58,6 +58,12 @@ cargo test --test sync --test state_auth -- --ignored --test-threads=1
 ./tests/shell/concurrency.sh
 ```
 
+## Fuzzing
+
+Coverage-guided fuzz harnesses live under `fuzz/`, not `tests/`. They're
+opt-in (nightly + cargo-fuzz), excluded from `just gate`, and run via
+`just fuzz`. See [`fuzz/README.md`](../fuzz/README.md).
+
 ## Setup for live tests
 
 1. Fill `.env` at the repo root (gitignored):

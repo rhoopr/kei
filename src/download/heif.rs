@@ -172,10 +172,20 @@ fn extract_xmp_from_meta(file_bytes: &[u8], meta_body: &[u8]) -> Option<Vec<u8>>
             return None;
         }
         let body = cursor.get(..sz)?;
-        if h.kind == FourCC::new(b"iinf") {
-            iinf = Iinf::decode_body(&mut &body[..]).ok();
-        } else if h.kind == FourCC::new(b"iloc") {
-            iloc = Iloc::decode_body(&mut &body[..]).ok();
+        // Defense-in-depth cap on the bytes handed to the typed decoders:
+        // HEIC iinf/iloc are KB-scale in real-world files. If a future
+        // mp4-atom audit turns up the same `Vec::with_capacity(<attacker
+        // count>)` pattern in `ItemInfoEntry::decode_body` or
+        // `ItemLocation::decode_body` that bit `parse_vorbis_comment`
+        // (kixelated/mp4-atom#154), this guard shorts the OOM before the
+        // decoder ever sees the body.
+        const MAX_META_SUBBOX_BYTES: usize = 8 * 1024 * 1024;
+        if body.len() <= MAX_META_SUBBOX_BYTES {
+            if h.kind == FourCC::new(b"iinf") {
+                iinf = Iinf::decode_body(&mut &body[..]).ok();
+            } else if h.kind == FourCC::new(b"iloc") {
+                iloc = Iloc::decode_body(&mut &body[..]).ok();
+            }
         }
         cursor.advance(sz);
     }
