@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+Selection and folder-structure flag redesign. `--exclude-album` becomes `--album '!NAME'`. New `--smart-folder` and `--unfiled` per-category flags. `--library` now repeatable. Per-category `--folder-structure-{albums,smart-folders}` templates with their own defaults. Multi-library scope with `{library}` in any template. State DB schema migrates to v8 (per-zone primary key) on first sync. Old shapes keep working with deprecation warnings until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md). ([#215])
+
+### Added
+
+- **`--smart-folder NAME` flag for selecting Apple smart folders.** Repeatable. Accepts a literal name (`Favorites`, `Hidden`), bare sentinels (`all`, `all-with-sensitive`, `none`), or `!literal` exclusions. Default is `none` so existing setups don't gain extra passes. `all` excludes Hidden and Recently Deleted (mirroring iOS Photos UX); `all-with-sensitive` includes them. The TOML key is `[filters].smart_folders`. ([#215])
+- **`--unfiled` boolean flag for the unfiled-pass toggle.** `--unfiled` (or `--unfiled true`) opts in; `--unfiled false` disables. Default is `true`, so unfiled photos land at `--folder-structure` even when album passes also run. To restrict to album passes only, pass `--unfiled false` explicitly. The TOML key is `[filters].unfiled`. The `{album}`-in-template-implies-unfiled smart default is gone; layout no longer drives selection. ([#215])
+- **`--library NAME` is now repeatable and accepts new sentinels.** Pass multiple `--library` flags to scope a sync across libraries; bare sentinels `primary` (PrimarySync), `shared` (every SharedSync zone), and `all` (every library) work everywhere a name does. Friendly aliases `shared:Owner Name` resolve from CloudKit metadata at startup and bail with "ambiguous owner" if two shares match. The truncated 8-char form (`SharedSync-A1B2C3D4`) round-trips between paths and the flag. The TOML key `[filters].libraries` takes the array form. ([#215])
+- **`--folder-structure-albums` and `--folder-structure-smart-folders` per-category templates.** Album passes default to `{album}` (flat), smart-folder passes to `{smart-folder}` (flat). The base `--folder-structure` (default `%Y/%m/%d`) now drives only the unfiled pass. Add date hierarchy inside album folders explicitly with `--folder-structure-albums '{album}/%Y/%m/%d'`. The auto-migration of legacy `{album}` in `--folder-structure` produces exactly that shape when the legacy template carried a date suffix. Both new flags map to TOML keys `[download].folder_structure_albums` and `[download].folder_structure_smart_folders`. ([#215])
+- **`{library}` token in folder-structure templates.** Renders as `PrimarySync` or a truncated raw zone name (`SharedSync-A1B2C3D4`) so users running multi-library syncs can keep paths separate. Allowed in any template; must be the first path segment; single occurrence. Combined with `{album}` or `{smart-folder}`, the order is always `{library}/{album}/...`. The truncated form is what the flag accepts back, so a path segment can be copied directly into `--library`. ([#215])
+- **Per-zone primary key in the state DB (schema v8).** The `assets` table now keys on `(library, id, version_size)` so an asset present in both PrimarySync and a shared library tracks two distinct rows instead of silently sharing one. Existing rows backfill to `library = "PrimarySync"` on first sync after upgrade -- accounts that were already syncing only the primary library see no behavior change. Users who had shared libraries pre-v8 may have a small set of misattributed rows from the backfill; the next sync creates correct per-zone rows alongside, and a future `kei reconcile --rezone` will sweep the leftovers. ([#215])
+- **Multi-library commingle warning at startup.** When more than one library is in scope and none of the active templates includes `{library}`, kei warns that paths share a namespace and the state DB will dedup cross-library matches by ID. Informational; the run continues. Users who want intentional merge see the warning and ignore it; users who wanted separation get pointed at `{library}`. ([#215])
+
+### Changed
+
+- **`kei sync` with no flags now enumerates each user album and runs an unfiled pass.** Previously it ran one library-wide stream. The internal change is real (more API calls, per-album knowledge); the visible change is the on-disk tree shape only when `--folder-structure-albums` is non-default -- the default `{album}` template gives flat per-album folders, while unfiled photos still land at `%Y/%m/%d/`. Aligns the no-flags experience with woutervanwijk's #215 ask without requiring opt-in configuration. ([#215])
+- **`--folder-structure` now drives only the unfiled pass.** Album passes consume `--folder-structure-albums`; smart-folder passes consume `--folder-structure-smart-folders`. The legacy `{album}`-in-base auto-migrates with a warning (split across the two new templates) so existing configs keep working through v0.19. Removed in v0.20. ([#215])
+- **`--library` now matches album names across every library in scope.** `--album Family` resolves to an album named "Family" in every selected library. To get distinct paths per library, add `{library}` to the relevant template; otherwise paths commingle and the state DB dedups by asset ID (same rule the multi-library warning surfaces at startup). ([#215])
+
+### Deprecated
+
+- **`--exclude-album NAME` CLI flag and `KEI_EXCLUDE_ALBUM` env var.** Use `--album '!NAME'` (the new inline-exclusion grammar). Bare `!Foo` operates on the category default (`all` for albums), so `--album '!Family'` means "every album except Family". Both forms still work and log a deprecation warning; removed in v0.20.0. ([#215])
+- **`{album}` in `--folder-structure` (CLI / TOML / `KEI_FOLDER_STRUCTURE` env).** Use `--folder-structure-albums "{album}/..."` and keep `--folder-structure` for the unfiled pass. kei auto-migrates at startup: `{album}/%Y/%m/%d` lifts into `folder_structure_albums` and the base template strips the prefix. A one-line warning prints with the equivalent new-flag pair so the suggestion is paste-ready. Removed in v0.20.0. ([#215])
+- **`[filters].album` (singular string) TOML key.** Use `[filters].albums = ["name"]` (array). Round-trips through the same selector grammar so `--album` and the array form are interchangeable. Removed in v0.20.0. ([#215])
+- **`[filters].exclude_albums` TOML key.** Merge into `[filters].albums` as `"!name"` entries. The new selector grammar validates contradictions (`"Foo"` and `"!Foo"` together) in one place. Removed in v0.20.0. ([#215])
+- **`[filters].library` (single-string) TOML key.** Use `[filters].libraries = ["name"]` (array). Removed in v0.20.0. ([#215])
+- **Implicit `--album all` from `{album}` token in template.** v0.12 promoted the legacy template-driven shape to "every album" when `--album` was unset; v0.13's new `--album all` default makes the promotion redundant. The compat path still fires but logs a deprecation warning. Removed in v0.20.0. ([#215])
+
+---
+
 ## [0.12.0] - 2026-04-26
 
 ### Added
