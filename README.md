@@ -2,21 +2,27 @@
   <img src="assets/logo.png" alt="kei logo" width="200">
 </p>
 
-<h1 align="center">kei: photo sync engine</h1>
+<h1 align="center">kei: media sync engine</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Rust_MSRV-1.91%2B-dea584?logo=rust" alt="Rust MSRV 1.91+">
+  Sync your cloud photos and videos to local storage. Fast, resumable, runs unattended.<br><br>
+  <a href="https://github.com/rhoopr/kei/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/Rust_MSRV-1.91%2B-dea584?logo=rust" alt="Rust MSRV 1.91+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
   <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a>
   <a href="https://github.com/rhoopr/kei/actions/workflows/docker.yml"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/docker.yml?branch=main&label=build&logo=github" alt="Build"></a>
-  <br>
   <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/downloads/rhoopr/kei/total?logo=github&label=downloads" alt="Downloads"></a>
   <a href="https://github.com/rhoopr/homebrew-kei"><img src="https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew" alt="Homebrew"></a>
-  <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
-</p>
+  <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a></p>
+
+- Parallel downloads with incremental sync (seconds on large libraries after the first run)
+- Resumable transfers verified by size and content hash
+- Watch mode, systemd integration, headless 2FA, Docker-ready
+- iCloud Photos supported today. Google Takeout and Immich next.
+
+---
 
 > [!IMPORTANT]
-> v0.13 reshapes selection and folder-structure flags. `--exclude-album NAME` becomes `--album '!NAME'`. `--library` accepts multiple values. `kei sync` with no flags now runs per-album passes plus an unfiled pass. Legacy `{album}` in `--folder-structure` auto-migrates with a warning until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md).
+> v0.13 (next release) reshapes selection and folder-structure flags. `--exclude-album NAME` becomes `--album '!NAME'`. `--library` accepts multiple values. `kei sync` with no flags now runs per-album passes plus an unfiled pass. Legacy `{album}` in `--folder-structure` auto-migrates with a warning until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md).
 >
 > | Flag | Default |
 > |---|---|
@@ -28,16 +34,10 @@
 > | `--folder-structure-albums` | `{album}` |
 > | `--folder-structure-smart-folders` | `{smart-folder}` |
 
-Sync your cloud photos to local storage. Fast, resumable, single binary, runs unattended.
-
-- Parallel downloads with incremental sync (seconds on large libraries after the first run)
-- Resumable transfers verified by size and content hash
-- Watch mode, systemd integration, headless 2FA, Docker-ready
-
-iCloud Photos is supported today. Google Takeout and Immich are next.
-
 > [!TIP]
-> Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) maps every flag and shows how to pick up where you left off without re-downloading.
+> Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) shows how to `kei sync` without re-downloading.
+
+---
 
 ## Install
 
@@ -51,6 +51,8 @@ Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](http
 > [!IMPORTANT]
 > kei can't access your photos if Advanced Data Protection is on. Turn ADP off and enable "Access iCloud Data on the Web" in your Apple ID settings. Details: [Authentication wiki](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
 
+---
+
 ## Quick start
 
 ```sh
@@ -61,9 +63,11 @@ You'll be prompted for your password, then asked to approve 2FA on a trusted dev
 
 For a guided walkthrough, run `kei config setup` instead.
 
+---
+
 ## Docs
 
-Everything else lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CLI reference, filtering and folder templates, watch mode, Docker Compose, credentials, troubleshooting, and more.
+Everything lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CLI reference, filtering and folder templates, watch mode, Docker Compose, credentials, troubleshooting, and more.
 
 - [Commands](https://github.com/rhoopr/kei/wiki/Home#commands) - `sync`, `login`, `list`, `password`, `config`, `reset`, `status`, `verify`, `import-existing`
 - [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) - TOML file, env vars, precedence
@@ -71,6 +75,8 @@ Everything else lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CL
 - [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) - keyring, encrypted file, password files and commands
 - [Changelog](CHANGELOG.md)
 - [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - deep dive on CloudKit syncTokens
+
+---
 
 ## Contributing
 
