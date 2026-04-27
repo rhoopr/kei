@@ -20,6 +20,9 @@ path = "src/main.rs"
 # XMP packet serializer lives in xmp_toolkit.
 default = ["xmp"]
 xmp = ["dep:xmp_toolkit"]
+# Re-exports parser entry points for cargo-fuzz harnesses (`fuzz/`).
+# Off by default; production builds never see the `kei::__fuzz` module.
+__fuzz_internals = []
 
 [dependencies]
 # CLI

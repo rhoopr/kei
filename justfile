@@ -11,7 +11,7 @@ _default:
 gate:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --bin kei --test cli --test behavioral
+    cargo test --lib --test cli --test behavioral
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
     cargo audit
@@ -37,7 +37,7 @@ test MODE="":
             cargo test --all-features
             ;;
         fast)
-            cargo test --bin kei --test cli --test behavioral
+            cargo test --lib --test cli --test behavioral
             ;;
         live)
             _live_env
@@ -88,7 +88,7 @@ cov MODE="" BASE="main":
             # same profile data as the offline ones. The final `report`
             # call prints the merged summary.
             cargo llvm-cov clean --workspace
-            cargo llvm-cov --no-report --bin kei
+            cargo llvm-cov --no-report --lib
             cargo llvm-cov --no-report --test cli
             cargo llvm-cov --no-report --test behavioral
             cargo llvm-cov --no-report --test sync -- --include-ignored --test-threads=1
