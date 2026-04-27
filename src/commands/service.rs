@@ -441,7 +441,7 @@ async fn collect_album_asset_ids(
 }
 
 /// Static set of Apple-defined smart-folder names. Looked up by name on
-/// the same map [`PhotoLibrary::albums`] returns; used to split user albums
+/// the same map `PhotoLibrary::albums` returns; used to split user albums
 /// vs smart folders for the v0.13 selection model.
 fn smart_folder_name_set() -> rustc_hash::FxHashSet<&'static str> {
     icloud::photos::smart_folders::smart_folders()

@@ -504,8 +504,8 @@ fn warn_deprecated(old: &str, replacement: &str) {
 
 /// Translate the legacy `(AlbumSelection, exclude_albums, LibrarySelection,
 /// folder_structure)` tuple plus the new `raw_smart_folders` raw list into
-/// the v0.13 [`Selection`]. Pure function so the truth table is testable
-/// without `Config::build`.
+/// the v0.13 [`crate::selection::Selection`]. Pure function so the truth
+/// table is testable without `Config::build`.
 ///
 /// Behaviour preserved (legacy fields):
 /// - `AlbumSelection::LibraryOnly` (today's no-album-flag default) maps to
@@ -521,7 +521,8 @@ fn warn_deprecated(old: &str, replacement: &str) {
 /// - `LibrarySelection::All` → `primary = true, shared_all = true`.
 ///
 /// Smart folders have no legacy field; `raw_smart_folders` is parsed
-/// directly into a [`SmartFolderSelector`]. Empty list → `None`.
+/// directly into a [`crate::selection::SmartFolderSelector`]. Empty list →
+/// `None`.
 ///
 /// `unfiled_override` is `Some(b)` when the user passed `--unfiled` (or set
 /// `[filters].unfiled` in TOML) and `None` otherwise. When `None`, unfiled is

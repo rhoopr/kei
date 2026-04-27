@@ -8,9 +8,9 @@
 //! before we open a network connection.
 //!
 //! The four-category bundle is [`Selection`], stored on
-//! [`crate::config::Config`]. The [`crate::commands::service`] resolver
-//! consumes a `Selection` plus the live album/library map and emits concrete
-//! sync passes.
+//! [`crate::config::Config`]. The `commands::service` resolver consumes a
+//! `Selection` plus the live album/library map and emits concrete sync
+//! passes.
 //!
 //! See `.scratch/specs/selection-flags.md` for the design rationale.
 

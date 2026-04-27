@@ -533,9 +533,9 @@ impl DownloadConfig {
     }
 
     /// Clone this config for a single download pass: pick the per-category
-    /// template (`folder_structure_albums` for [`PassKind::Album`],
-    /// `folder_structure_smart_folders` for [`PassKind::SmartFolder`],
-    /// `folder_structure` for [`PassKind::Unfiled`]), pre-expand the matching
+    /// template (`folder_structure_albums` for `PassKind::Album`,
+    /// `folder_structure_smart_folders` for `PassKind::SmartFolder`,
+    /// `folder_structure` for `PassKind::Unfiled`), pre-expand the matching
     /// token (`{album}` / `{smart-folder}`), and pin the pass's exclude-ids
     /// set in one clone.
     ///
