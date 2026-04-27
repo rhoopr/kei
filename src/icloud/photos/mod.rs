@@ -16,7 +16,7 @@ pub mod types;
 pub use album::PhotoAlbum;
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
-pub(crate) use library::PRIMARY_ZONE_NAME;
+pub(crate) use library::{is_shared_zone, PRIMARY_ZONE_NAME};
 pub use session::{PhotosSession, SyncTokenError};
 
 use std::collections::HashMap;

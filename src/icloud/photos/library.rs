@@ -16,6 +16,17 @@ use crate::icloud::error::ICloudError;
 /// value for the v8 schema migration, and as the default scope for
 /// commands that operate library-blind (e.g. `import-existing`).
 pub(crate) const PRIMARY_ZONE_NAME: &str = "PrimarySync";
+
+/// Prefix CloudKit uses for every shared-library zone name. Centralised so
+/// `--library` matching, the `{library}` truncation rule, and stub-library
+/// constructors all classify zones the same way.
+pub(crate) const SHARED_ZONE_PREFIX: &str = "SharedSync-";
+
+/// True when `zone_name` is a CloudKit shared library (every name beginning
+/// with [`SHARED_ZONE_PREFIX`]).
+pub(crate) fn is_shared_zone(zone_name: &str) -> bool {
+    zone_name.starts_with(SHARED_ZONE_PREFIX)
+}
 use crate::retry::RetryConfig;
 
 // Apple's sentinel folder IDs — these are containers, not real albums.
@@ -347,7 +358,7 @@ impl PhotoLibrary {
             params: Arc::new(HashMap::new()),
             session,
             zone_id: Arc::new(json!({"zoneName": zone_name})),
-            library_type: Arc::from(if zone_name.starts_with("SharedSync-") {
+            library_type: Arc::from(if is_shared_zone(zone_name) {
                 "shared"
             } else {
                 "private"

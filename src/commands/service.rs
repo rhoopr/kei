@@ -374,13 +374,12 @@ pub(crate) async fn resolve_libraries(
     let mut named_hits: std::collections::HashSet<&str> =
         std::collections::HashSet::with_capacity(selector.named.len());
     let mut chosen: Vec<icloud::photos::PhotoLibrary> = Vec::new();
-    let mut seen_zones: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for lib in &all {
         let zone = lib.zone_name();
         let truncated = truncate_library_zone(zone);
         let is_primary = zone == crate::icloud::photos::PRIMARY_ZONE_NAME;
-        let is_shared = zone.starts_with("SharedSync-");
+        let is_shared = crate::icloud::photos::is_shared_zone(zone);
 
         let included = (selector.primary && is_primary)
             || (selector.shared_all && is_shared)
@@ -404,9 +403,9 @@ pub(crate) async fn resolve_libraries(
             continue;
         }
 
-        if seen_zones.insert(zone.to_string()) {
-            chosen.push(lib.clone());
-        }
+        // `all_libraries()` returns disjoint sets (primary, private minus
+        // PrimarySync, shared) so no cross-source dedup is needed here.
+        chosen.push(lib.clone());
     }
 
     if let Some(missed) = selector
