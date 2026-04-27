@@ -3890,6 +3890,31 @@ fn migration_no_warning_when_no_album_token() {
         .stderr(predicate::str::contains("`{album}` in `--folder-structure`").not());
 }
 
+/// `--smart-folder Favorites` no longer prints the pre-PR6 "not yet wired
+/// into the sync pipeline" disclaimer. The flag executes end-to-end via
+/// `Selection -> resolve_passes -> AlbumPlan`; a stale warning at startup
+/// would mislead users into thinking their config is a no-op.
+#[test]
+fn smart_folder_flag_does_not_print_unwired_warning() {
+    sync_cmd_for_validation()
+        .args(["--smart-folder", "Favorites", "--only-print-filenames"])
+        .assert()
+        .stderr(predicate::str::contains("not yet wired").not())
+        .stderr(predicate::str::contains("not download smart folders").not());
+}
+
+/// `--unfiled false` no longer prints the pre-PR6 "not yet wired" disclaimer.
+/// The flag flows into `Selection.unfiled` and gates both the unfiled pass
+/// and the cross-album exclusion-set pre-fetch in `resolve_passes`.
+#[test]
+fn unfiled_flag_does_not_print_unwired_warning() {
+    sync_cmd_for_validation()
+        .args(["--unfiled", "false", "--only-print-filenames"])
+        .assert()
+        .stderr(predicate::str::contains("not yet wired").not())
+        .stderr(predicate::str::contains("legacy unfiled-pass rules").not());
+}
+
 #[test]
 fn config_show_emits_per_category_templates_from_toml() {
     let (stdout, _) = run_config_show(

@@ -392,11 +392,10 @@ fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyho
     Ok(())
 }
 
-/// Today's truth table for whether the unfiled pass runs, derived from the
-/// legacy `(albums, folder_structure)` tuple. Replaced by `Selection.unfiled`
-/// once PR6 lands the new resolver; until then both `Config::build` (to detect
-/// divergence from `--unfiled`) and `derive_selection` (to fill the default)
-/// need the same answer.
+/// Default for `Selection.unfiled` when the user did not pass `--unfiled`
+/// explicitly: derived from the legacy `(albums, folder_structure)` tuple
+/// so existing configs keep their pre-v0.13 pass set. `--unfiled` always
+/// wins when supplied.
 fn legacy_unfiled_default(albums: &AlbumSelection, folder_structure: &str) -> bool {
     let template_has_album =
         crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}");
@@ -404,22 +403,6 @@ fn legacy_unfiled_default(albums: &AlbumSelection, folder_structure: &str) -> bo
         AlbumSelection::LibraryOnly => true,
         AlbumSelection::All => template_has_album,
         AlbumSelection::Named(_) => false,
-    }
-}
-
-/// Stderr warning for v0.13 selection flags that are parsed but not yet
-/// consumed by the sync pipeline (PR6 wires them in). `flag_pair` is the
-/// `` `--cli` / `[toml]` `` rendering; `effect` describes the run's actual
-/// behaviour so users see the divergence from their explicit value.
-fn warn_selection_flag_unimplemented(flag_pair: &str, effect: &str) {
-    #[allow(
-        clippy::print_stderr,
-        reason = "runs during config load, before tracing subscriber is installed"
-    )]
-    {
-        eprintln!(
-            "warning: {flag_pair} is recognised but not yet wired into the sync pipeline; this run will {effect}. Tracking issue: #215."
-        );
     }
 }
 
@@ -578,9 +561,9 @@ fn auto_migrate_legacy_album_token(
 /// exclusions and `all`/`none` sentinels) into the legacy
 /// `(AlbumSelection, exclude_albums)` pair. Validates the new v0.13 grammar
 /// (contradictions, sentinel rules) by routing through
-/// [`crate::selection::parse_album_selector`], then lowers the result back
-/// into the legacy shape so the unchanged sync pipeline keeps working until
-/// PR6 swaps in the new resolver.
+/// [`crate::selection::parse_album_selector`], then lowers back into the
+/// legacy shape that `compute_config_hash` and `report.rs` still consume.
+/// Pass execution itself runs off `Selection.albums` via `resolve_passes`.
 fn resolve_album_selection(
     raw: Vec<String>,
     folder_structure: &str,
@@ -1304,10 +1287,11 @@ impl Config {
             merged_raw.push(format!("!{name}"));
         }
         let (albums, parsed_excludes) = resolve_album_selection(merged_raw, &folder_structure)?;
-        // Until PR6, the legacy pipeline reads `Config.exclude_albums`. Prefer
-        // the deprecated list when the user actually supplied it (exact legacy
+        // `compute_config_hash` and `report.rs` still read `Config.exclude_albums`
+        // for token invalidation and run reporting respectively. Prefer the
+        // deprecated list when the user actually supplied it (exact legacy
         // behaviour); otherwise surface inline `!name` excludes so the new
-        // grammar still drives the legacy path.
+        // grammar feeds both surfaces consistently.
         let exclude_albums = if legacy_excludes_supplied {
             exclude_albums
         } else {
@@ -1363,34 +1347,15 @@ impl Config {
             sync.smart_folders,
             toml_filters.and_then(|f| f.smart_folders.clone()),
         );
-        // PR2-PR9 selection flags are parsed into `selection` before the new
-        // resolver lands in PR6, so warn whenever an explicit value would not
-        // match the legacy pipeline's behaviour.
-        if !raw_smart_folders.is_empty() {
-            warn_selection_flag_unimplemented(
-                "`--smart-folder` / `[filters].smart_folders`",
-                "not download smart folders",
-            );
-        }
 
         let unfiled_override = sync
             .unfiled
             .or_else(|| toml_filters.and_then(|f| f.unfiled));
-        if let Some(explicit) = unfiled_override {
-            let legacy = legacy_unfiled_default(&albums, &folder_structure);
-            if explicit != legacy {
-                warn_selection_flag_unimplemented(
-                    "`--unfiled` / `[filters].unfiled`",
-                    &format!("use the legacy unfiled-pass rules (unfiled = {legacy})"),
-                );
-            }
-        }
 
-        // Derive the v0.13 [`Selection`] from the legacy `albums` /
-        // `exclude_albums` / `library` fields so the new model is populated
-        // even before the resolver consumes it. Behaviour-preserving: every
-        // legacy state maps to a Selection that the new resolver (PR6) will
-        // turn into the same passes.
+        // Build the v0.13 [`Selection`] that the new resolver (`resolve_passes`)
+        // consumes. The legacy `albums` / `exclude_albums` fields stay on
+        // Config for the sync-token invalidation hash and the report.json
+        // emission; the Selection is the source of truth for pass execution.
         let selection = derive_selection(
             &albums,
             &exclude_albums,
