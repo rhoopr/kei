@@ -200,7 +200,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .data_dir
         .clone()
         .or_else(|| globals.cookie_directory.clone());
-    let mut config = config::Config::build(globals, pw, sync, toml_config)?;
+    let mut config = config::Config::build(globals, &pw, sync, toml_config.as_ref())?;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the
@@ -708,7 +708,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // Only used for single-library mode; multi-library skips this optimization.
         let skip_cycle = match library_states.as_slice() {
             [only] if is_watch_mode && !config.no_incremental => {
-                check_changes_database(&state_db, only, &mut photos_service).await
+                check_changes_database(state_db.as_ref(), only, &mut photos_service).await
             }
             _ => false,
         };
@@ -736,7 +736,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             let cycle_result = run_cycle(
                 &library_states,
                 &config,
-                &state_db,
+                state_db.as_ref(),
                 is_retry_failed,
                 &build_download_config,
                 &shared_session,
@@ -1260,7 +1260,7 @@ type BuildDownloadConfigFn<'a> = dyn Fn(
 async fn run_cycle(
     library_states: &[LibraryState],
     config: &config::Config,
-    state_db: &Option<Arc<dyn state::StateDb>>,
+    state_db: Option<&Arc<dyn state::StateDb>>,
     is_retry_failed: bool,
     build_download_config: &BuildDownloadConfigFn<'_>,
     shared_session: &auth::SharedSession,
@@ -1440,7 +1440,7 @@ async fn run_cycle(
 /// filter phase can enrich payloads without per-asset DB hits.
 #[cfg(feature = "xmp")]
 async fn preload_asset_groupings(
-    state_db: &Option<Arc<dyn state::StateDb>>,
+    state_db: Option<&Arc<dyn state::StateDb>>,
 ) -> Arc<download::AssetGroupings> {
     let Some(db) = state_db else {
         return Arc::new(download::AssetGroupings::default());
@@ -1468,7 +1468,7 @@ async fn preload_asset_groupings(
 }
 
 async fn check_changes_database(
-    state_db: &Option<Arc<dyn state::StateDb>>,
+    state_db: Option<&Arc<dyn state::StateDb>>,
     lib_state: &LibraryState,
     photos_service: &mut crate::icloud::photos::PhotosService,
 ) -> bool {
@@ -1553,7 +1553,7 @@ async fn determine_sync_mode(
     is_retry_failed: bool,
     no_incremental: bool,
     library_count: usize,
-    state_db: &Option<Arc<dyn state::StateDb>>,
+    state_db: Option<&Arc<dyn state::StateDb>>,
     sync_token_key: &str,
     zone_name: &str,
 ) -> download::SyncMode {
@@ -1982,7 +1982,7 @@ mod tests {
             true,  // is_retry_failed
             false, // no_incremental
             1,
-            &Some(Arc::clone(&db)),
+            Some(&db),
             sync_token_key,
             "PrimarySync",
         )
@@ -2010,7 +2010,7 @@ mod tests {
             false, // is_retry_failed
             true,  // no_incremental
             1,
-            &Some(Arc::clone(&db)),
+            Some(&db),
             sync_token_key,
             "PrimarySync",
         )
@@ -2035,15 +2035,8 @@ mod tests {
             .await
             .expect("set empty token");
 
-        let mode = determine_sync_mode(
-            false,
-            false,
-            1,
-            &Some(Arc::clone(&db)),
-            sync_token_key,
-            "PrimarySync",
-        )
-        .await;
+        let mode =
+            determine_sync_mode(false, false, 1, Some(&db), sync_token_key, "PrimarySync").await;
 
         assert!(
             matches!(mode, download::SyncMode::Full),
@@ -2056,15 +2049,8 @@ mod tests {
         db.set_metadata(sync_token_key, "real-token")
             .await
             .expect("set real token");
-        let mode = determine_sync_mode(
-            false,
-            false,
-            1,
-            &Some(Arc::clone(&db)),
-            sync_token_key,
-            "PrimarySync",
-        )
-        .await;
+        let mode =
+            determine_sync_mode(false, false, 1, Some(&db), sync_token_key, "PrimarySync").await;
         assert!(
             matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "real-token"),
             "non-empty token must yield Incremental with that token, got {mode:?}"
@@ -2329,7 +2315,7 @@ mod tests {
             false,
             false,
             1,
-            &Some(db),
+            Some(&db),
             "sync_token:PrimarySync",
             "PrimarySync",
         )
@@ -2350,7 +2336,7 @@ mod tests {
             false,
             false,
             1,
-            &None,
+            None,
             "sync_token:PrimarySync",
             "PrimarySync",
         )
@@ -2413,7 +2399,7 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(&Some(Arc::clone(&db)), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(&db), &lib_state, &mut svc).await;
 
         assert!(
             !skip,
@@ -2454,7 +2440,7 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(&Some(Arc::clone(&db)), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(&db), &lib_state, &mut svc).await;
 
         assert!(skip, "empty zones + more_coming=false must skip the cycle");
         // The new db_sync_token must still be persisted even on skip:
@@ -2494,7 +2480,7 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(&db), &lib_state, &mut svc).await;
         assert!(!skip, "zones-present response must not skip the cycle");
     }
 
@@ -2514,7 +2500,7 @@ mod tests {
         let db: Arc<dyn state::StateDb> = make_state_db();
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(&db), &lib_state, &mut svc).await;
         assert!(!skip, "no stored token must skip-result false (continue)");
     }
 
@@ -2809,7 +2795,7 @@ mod tests {
 
         // The function logs the write failure and continues. zones non-empty
         // means it must return false (don't skip).
-        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(&db), &lib_state, &mut svc).await;
         assert!(
             !skip,
             "db_sync_token write failure must not propagate as a skip"
@@ -3085,7 +3071,7 @@ mod tests {
 
         let db: Option<Arc<dyn state::StateDb>> = Some(Arc::new(PartialDb { inner }));
 
-        let groupings = preload_asset_groupings(&db).await;
+        let groupings = preload_asset_groupings(db.as_ref()).await;
         // Albums must survive intact.
         assert_eq!(
             groupings.albums.len(),
@@ -3108,7 +3094,7 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn preload_asset_groupings_no_db_returns_empty() {
-        let groupings = preload_asset_groupings(&None).await;
+        let groupings = preload_asset_groupings(None).await;
         assert!(groupings.albums.is_empty());
         assert!(groupings.people.is_empty());
     }

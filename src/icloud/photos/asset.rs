@@ -297,7 +297,7 @@ impl PhotoAsset {
     }
 
     /// Construct from typed `Record` structs (used by album pagination).
-    pub fn from_records(master: super::cloudkit::Record, asset: super::cloudkit::Record) -> Self {
+    pub fn from_records(master: super::cloudkit::Record, asset: &super::cloudkit::Record) -> Self {
         let filename = decode_filename(&master.fields).map(String::into_boxed_str);
         let item_type_val = Some(resolve_item_type(&master.fields, filename.as_deref()));
         let asset_date_ms = asset
@@ -606,7 +606,7 @@ impl DeltaRecordBuffer {
         // Box::from(&str) copies only the bytes, without the String's Vec
         // capacity slack that .clone().into_boxed_str() would drag along.
         let master_name: Box<str> = Box::from(master_record.record_name.as_str());
-        let asset = PhotoAsset::from_records(master_record, asset_record);
+        let asset = PhotoAsset::from_records(master_record, &asset_record);
         events.push(ChangeEvent {
             record_name: master_name,
             record_type: Some("CPLMaster".into()),
@@ -859,7 +859,7 @@ mod tests {
             deleted: None,
         };
 
-        let asset = PhotoAsset::from_records(master, asset_rec);
+        let asset = PhotoAsset::from_records(master, &asset_rec);
         assert_eq!(asset.id(), "MASTER_1");
         assert_eq!(asset.filename(), Some("vacation.jpg"));
         assert_eq!(asset.item_type(), Some(AssetItemType::Image));
@@ -972,7 +972,7 @@ mod tests {
             deleted: None,
         };
 
-        let asset = PhotoAsset::from_records(master, asset_rec);
+        let asset = PhotoAsset::from_records(master, &asset_rec);
         assert_eq!(asset.id(), "M2");
         assert_eq!(asset.filename(), None);
     }
@@ -1754,7 +1754,7 @@ mod tests {
             deleted: None,
         };
 
-        let asset = PhotoAsset::from_records(master, asset_rec);
+        let asset = PhotoAsset::from_records(master, &asset_rec);
         assert_eq!(asset.id(), "M_PARTIAL");
         assert_eq!(asset.filename(), None);
         assert!(asset.versions().is_empty());

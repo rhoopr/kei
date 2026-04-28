@@ -77,10 +77,10 @@ pub(crate) fn determine_media_type(
 pub(super) struct NormalizedPath(Box<str>);
 
 impl NormalizedPath {
-    /// Create a new normalized path from an owned `PathBuf`.
+    /// Create a new normalized path from a borrowed `Path`.
     /// For lookup operations, prefer `normalize()` to avoid `PathBuf` cloning.
-    pub(super) fn new(path: PathBuf) -> Self {
-        Self(Self::normalize(&path).into_owned().into_boxed_str())
+    pub(super) fn new(path: &Path) -> Self {
+        Self(Self::normalize(path).into_owned().into_boxed_str())
     }
 
     /// Normalize a path reference for map lookups.
@@ -759,7 +759,7 @@ pub(super) fn filter_asset_to_tasks(
             }
         }
         if let Some(path) = final_path {
-            claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
+            claimed_paths.insert(NormalizedPath::new(&path), version.size);
             tasks.push(DownloadTask {
                 url: version.url.clone(),
                 download_path: path,
@@ -838,7 +838,7 @@ pub(super) fn filter_asset_to_tasks(
             };
 
             if let Some(path) = final_mov_path {
-                claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
+                claimed_paths.insert(NormalizedPath::new(&path), live_version.size);
                 tasks.push(DownloadTask {
                     url: live_version.url.clone(),
                     download_path: path,
@@ -1941,7 +1941,7 @@ mod tests {
     fn test_normalized_path_lowercases_on_case_insensitive() {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            let np = NormalizedPath::new(PathBuf::from("Foo.JPG"));
+            let np = NormalizedPath::new(&PathBuf::from("Foo.JPG"));
             assert_eq!(&*np.0, "foo.jpg");
         }
     }
@@ -1950,14 +1950,14 @@ mod tests {
     fn test_normalized_path_case_equality() {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
-            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            let a = NormalizedPath::new(&PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(&PathBuf::from("/photos/img.jpg"));
             assert_eq!(a, b);
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
-            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            let a = NormalizedPath::new(&PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(&PathBuf::from("/photos/img.jpg"));
             assert_ne!(a, b);
         }
     }
@@ -1966,7 +1966,7 @@ mod tests {
     fn test_normalized_path_borrow_for_hashmap_lookup() {
         use std::collections::HashMap;
         let mut map: HashMap<NormalizedPath, u64> = HashMap::new();
-        map.insert(NormalizedPath::new(PathBuf::from("test.jpg")), 42);
+        map.insert(NormalizedPath::new(&PathBuf::from("test.jpg")), 42);
         let key = NormalizedPath::normalize(std::path::Path::new("test.jpg"));
         assert_eq!(map.get(key.as_ref()), Some(&42));
     }
@@ -1975,7 +1975,7 @@ mod tests {
 
     #[test]
     fn test_normalized_path_new_stores_normalized_form() {
-        let np = NormalizedPath::new(PathBuf::from("/photos/2025/01/IMG_0001.JPG"));
+        let np = NormalizedPath::new(&PathBuf::from("/photos/2025/01/IMG_0001.JPG"));
         // On macOS/Windows the stored form should be lowercase
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert_eq!(&*np.0, "/photos/2025/01/img_0001.jpg");
@@ -1999,7 +1999,7 @@ mod tests {
         // Insert with one case, look up with another — must find on macOS/Windows
         use std::collections::HashMap;
         let mut map: HashMap<NormalizedPath, u64> = HashMap::new();
-        map.insert(NormalizedPath::new(PathBuf::from("IMG_0001.JPG")), 100);
+        map.insert(NormalizedPath::new(&PathBuf::from("IMG_0001.JPG")), 100);
         let lookup_key = NormalizedPath::normalize(Path::new("img_0001.jpg"));
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert_eq!(map.get(lookup_key.as_ref()), Some(&100));
@@ -2014,7 +2014,7 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let path = PathBuf::from("Test/Photo.JPG");
-        let np = NormalizedPath::new(path.clone());
+        let np = NormalizedPath::new(&path);
         let normalized_str = NormalizedPath::normalize(&path);
 
         let mut h1 = DefaultHasher::new();
@@ -2036,9 +2036,9 @@ mod tests {
 
     #[test]
     fn test_normalized_path_case_different_paths_equal_on_case_insensitive() {
-        let upper = NormalizedPath::new(PathBuf::from("PHOTO.HEIC"));
-        let lower = NormalizedPath::new(PathBuf::from("photo.heic"));
-        let mixed = NormalizedPath::new(PathBuf::from("Photo.Heic"));
+        let upper = NormalizedPath::new(&PathBuf::from("PHOTO.HEIC"));
+        let lower = NormalizedPath::new(&PathBuf::from("photo.heic"));
+        let mixed = NormalizedPath::new(&PathBuf::from("Photo.Heic"));
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             assert_eq!(upper, lower);
@@ -2145,8 +2145,8 @@ mod tests {
 
         // Critical invariant: the on-disk paths must NOT case-insensitively
         // match. NormalizedPath does the case-fold; pin its result here.
-        let np_a = NormalizedPath::new(path_a.clone());
-        let np_b = NormalizedPath::new(path_b.clone());
+        let np_a = NormalizedPath::new(&path_a);
+        let np_b = NormalizedPath::new(&path_b);
         assert_ne!(
             np_a,
             np_b,
@@ -2198,7 +2198,7 @@ mod tests {
         let downloaded_path = first_tasks[0].download_path.clone();
 
         let mut claimed_paths = FxHashMap::default();
-        claimed_paths.insert(NormalizedPath::new(downloaded_path.clone()), 1000);
+        claimed_paths.insert(NormalizedPath::new(&downloaded_path), 1000);
 
         let mut dir_cache = paths::DirCache::new();
         let second_tasks =

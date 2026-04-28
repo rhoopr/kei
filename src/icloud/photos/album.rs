@@ -678,7 +678,7 @@ impl PhotoAlbum {
                             let master_id = master_id.to_string();
                             // Try to pair with a buffered master from a previous page
                             if let Some(master) = pending_masters.remove(&master_id) {
-                                let asset = PhotoAsset::from_records(master, rec);
+                                let asset = PhotoAsset::from_records(master, &rec);
                                 if tx.send(Ok(asset)).await.is_err() {
                                     return;
                                 }
@@ -718,7 +718,7 @@ impl PhotoAlbum {
                         }
                     }
                     if let Some(asset_rec) = page_assets.remove(&master.record_name) {
-                        let asset = PhotoAsset::from_records(master, asset_rec);
+                        let asset = PhotoAsset::from_records(master, &asset_rec);
                         if tx.send(Ok(asset)).await.is_err() {
                             return;
                         }
@@ -1405,7 +1405,7 @@ mod tests {
 
     /// Build a canned `ChangesZoneResponse` JSON with the given records,
     /// syncToken, and moreComing flag.
-    fn canned_changes_page(records: Vec<Value>, sync_token: &str, more_coming: bool) -> Value {
+    fn canned_changes_page(records: &[Value], sync_token: &str, more_coming: bool) -> Value {
         json!({
             "zones": [{
                 "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
@@ -1465,7 +1465,7 @@ mod tests {
             changes_master("master-1"),
             changes_asset("asset-1", "master-1"),
         ];
-        let mock = MockPhotosSession::new().ok(canned_changes_page(records, "token-final", false));
+        let mock = MockPhotosSession::new().ok(canned_changes_page(&records, "token-final", false));
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
@@ -1498,8 +1498,8 @@ mod tests {
             changes_asset("asset-2", "master-2"),
         ];
         let mock = MockPhotosSession::new()
-            .ok(canned_changes_page(page1_records, "token-page1", true))
-            .ok(canned_changes_page(page2_records, "token-page2", false));
+            .ok(canned_changes_page(&page1_records, "token-page1", true))
+            .ok(canned_changes_page(&page2_records, "token-page2", false));
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
@@ -1529,8 +1529,8 @@ mod tests {
             changes_asset("asset-1", "master-1"),
         ];
         let mock = MockPhotosSession::new()
-            .ok(canned_changes_page(vec![], "token-empty", true))
-            .ok(canned_changes_page(page2_records, "token-final", false));
+            .ok(canned_changes_page(&[], "token-empty", true))
+            .ok(canned_changes_page(&page2_records, "token-final", false));
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
@@ -1636,8 +1636,8 @@ mod tests {
         ];
         // Pages 1-2 succeed, page 3 returns a zone error
         let mock = MockPhotosSession::new()
-            .ok(canned_changes_page(page1_records, "token-page1", true))
-            .ok(canned_changes_page(page2_records, "token-page2", true))
+            .ok(canned_changes_page(&page1_records, "token-page1", true))
+            .ok(canned_changes_page(&page2_records, "token-page2", true))
             .ok(json!({
                 "zones": [{
                     "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
@@ -1685,7 +1685,7 @@ mod tests {
             "recordChangeTag": "ct-del"
         })];
         let mock =
-            MockPhotosSession::new().ok(canned_changes_page(records, "token-after-delete", false));
+            MockPhotosSession::new().ok(canned_changes_page(&records, "token-after-delete", false));
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-before");

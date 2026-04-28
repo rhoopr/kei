@@ -58,7 +58,7 @@ pub(crate) struct ExifProbe {
 pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
     ensure_initialized();
     if is_heif_file(path) {
-        probe_exif_heif(path)
+        Ok(probe_exif_heif(path))
     } else {
         probe_exif_xmp_toolkit(path)
     }
@@ -78,26 +78,26 @@ fn probe_exif_xmp_toolkit(path: &Path) -> Result<ExifProbe> {
     Ok(probe_from_meta(&meta))
 }
 
-fn probe_exif_heif(path: &Path) -> Result<ExifProbe> {
+fn probe_exif_heif(path: &Path) -> ExifProbe {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "Failed to read HEIF for probe");
-            return Ok(ExifProbe::default());
+            return ExifProbe::default();
         }
     };
     let Some(xmp_bytes) = heif::extract_xmp_bytes(&bytes) else {
-        return Ok(ExifProbe::default());
+        return ExifProbe::default();
     };
     let Ok(s) = std::str::from_utf8(&xmp_bytes) else {
         tracing::warn!(path = %path.display(), "HEIF XMP packet is not UTF-8; treating as no probe");
-        return Ok(ExifProbe::default());
+        return ExifProbe::default();
     };
     match s.parse::<XmpMeta>() {
-        Ok(meta) => Ok(probe_from_meta(&meta)),
+        Ok(meta) => probe_from_meta(&meta),
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "Failed to parse HEIF XMP packet");
-            Ok(ExifProbe::default())
+            ExifProbe::default()
         }
     }
 }

@@ -1014,7 +1014,7 @@ pub mod __fuzz {
         let Ok(asset) = serde_json::from_value::<Record>(asset) else {
             return;
         };
-        let _ = PhotoAsset::from_records(master, asset);
+        let _ = PhotoAsset::from_records(master, &asset);
     }
 
     /// Run the path-component sanitizers over an arbitrary `&str`. Splits

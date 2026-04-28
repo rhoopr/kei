@@ -571,7 +571,7 @@ fn auto_migrate_legacy_album_token(
 /// legacy shape that `compute_config_hash` and `report.rs` still consume.
 /// Pass execution itself runs off `Selection.albums` via `resolve_passes`.
 fn resolve_album_selection(
-    raw: Vec<String>,
+    raw: &[String],
     folder_structure: &str,
 ) -> anyhow::Result<(AlbumSelection, Vec<String>)> {
     if raw.is_empty() {
@@ -589,7 +589,7 @@ fn resolve_album_selection(
         return Ok((AlbumSelection::LibraryOnly, Vec::new()));
     }
 
-    let selector = crate::selection::parse_album_selector(&raw, true)?;
+    let selector = crate::selection::parse_album_selector(raw, true)?;
     Ok(match selector {
         crate::selection::AlbumSelector::None => (AlbumSelection::LibraryOnly, Vec::new()),
         crate::selection::AlbumSelector::All { excluded } => {
@@ -957,11 +957,11 @@ impl Config {
     /// Resolution order: CLI > TOML > hardcoded default.
     pub fn build(
         globals: &GlobalArgs,
-        pw: crate::cli::PasswordArgs,
+        pw: &crate::cli::PasswordArgs,
         sync: crate::cli::SyncArgs,
-        toml: Option<TomlConfig>,
+        toml: Option<&TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let toml_auth = toml.as_ref().and_then(|t| t.auth.as_ref());
+        let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
         // `[auth].password` is no longer accepted. Plaintext passwords in config
         // files are a standing security risk; kei ships a credential store
@@ -975,10 +975,9 @@ impl Config {
             );
         }
 
-        let (username, password_str, domain, cookie_directory) =
-            resolve_auth(globals, &pw, toml.as_ref());
-        let password_file = resolve_password_file(&pw, toml_auth);
-        let password_command = resolve_password_command(&pw, toml_auth);
+        let (username, password_str, domain, cookie_directory) = resolve_auth(globals, pw, toml);
+        let password_file = resolve_password_file(pw, toml_auth);
+        let password_command = resolve_password_command(pw, toml_auth);
         let save_password = sync.save_password;
 
         // `--password-command` / `[auth] password_command` is Unix-only: the
@@ -998,7 +997,6 @@ impl Config {
         // catches the CLI case; this catches empty strings from TOML).
         if globals.username.is_some()
             || toml
-                .as_ref()
                 .and_then(|t| t.auth.as_ref()?.username.as_ref())
                 .is_some()
         {
@@ -1054,13 +1052,13 @@ impl Config {
             )
         })?;
 
-        let toml_dl = toml.as_ref().and_then(|t| t.download.as_ref());
+        let toml_dl = toml.and_then(|t| t.download.as_ref());
         let toml_retry = toml_dl.and_then(|d| d.retry.as_ref());
-        let toml_filters = toml.as_ref().and_then(|t| t.filters.as_ref());
-        let toml_photos = toml.as_ref().and_then(|t| t.photos.as_ref());
-        let toml_watch = toml.as_ref().and_then(|t| t.watch.as_ref());
-        let toml_metrics = toml.as_ref().and_then(|t| t.metrics.as_ref());
-        let toml_server = toml.as_ref().and_then(|t| t.server.as_ref());
+        let toml_filters = toml.and_then(|t| t.filters.as_ref());
+        let toml_photos = toml.and_then(|t| t.photos.as_ref());
+        let toml_watch = toml.and_then(|t| t.watch.as_ref());
+        let toml_metrics = toml.and_then(|t| t.metrics.as_ref());
+        let toml_server = toml.and_then(|t| t.server.as_ref());
 
         // Download
         //
@@ -1297,7 +1295,7 @@ impl Config {
         for name in &exclude_albums {
             merged_raw.push(format!("!{name}"));
         }
-        let (albums, parsed_excludes) = resolve_album_selection(merged_raw, &folder_structure)?;
+        let (albums, parsed_excludes) = resolve_album_selection(&merged_raw, &folder_structure)?;
         // `compute_config_hash` and `report.rs` still read `Config.exclude_albums`
         // for token invalidation and run reporting respectively. Prefer the
         // deprecated list when the user actually supplied it (exact legacy
@@ -1505,14 +1503,14 @@ impl Config {
             .filter(|n| *n > 0);
 
         // Notifications
-        let toml_notif = toml.as_ref().and_then(|t| t.notifications.as_ref());
+        let toml_notif = toml.and_then(|t| t.notifications.as_ref());
         let notification_script = sync
             .notification_script
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
 
         // JSON report: CLI > [report] json TOML > none.
-        let toml_report = toml.as_ref().and_then(|t| t.report.as_ref());
+        let toml_report = toml.and_then(|t| t.report.as_ref());
         let report_json = sync.report_json.or_else(|| {
             toml_report
                 .and_then(|r| r.json.as_deref())
@@ -2368,8 +2366,13 @@ mod tests {
 
     #[test]
     fn test_build_defaults_no_toml() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(cfg.username, "u@example.com");
         assert_eq!(cfg.threads_num, 10);
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
@@ -2397,9 +2400,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.threads_num, 4);
@@ -2425,7 +2428,8 @@ mod tests {
         sync.threads = Some(8);
         sync.libraries = vec!["PrimarySync".to_string()];
 
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.threads_num, 8);
         assert_eq!(
             cfg.selection.libraries.to_raw(),
@@ -2437,7 +2441,7 @@ mod tests {
     fn test_library_all_value() {
         let mut sync = default_sync();
         sync.libraries = vec!["all".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.selection.libraries.to_raw(), vec!["all".to_string()]);
     }
 
@@ -2445,7 +2449,7 @@ mod tests {
     fn test_library_all_case_insensitive() {
         let mut sync = default_sync();
         sync.libraries = vec!["ALL".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.selection.libraries.to_raw(), vec!["all".to_string()]);
     }
 
@@ -2458,9 +2462,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.selection.libraries.to_raw(), vec!["all".to_string()]);
@@ -2468,8 +2472,13 @@ mod tests {
 
     #[test]
     fn test_build_hardcoded_default_when_both_absent() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(cfg.threads_num, 10);
         assert!(matches!(cfg.align_raw, RawTreatmentPolicy::Unchanged));
     }
@@ -2559,7 +2568,7 @@ mod tests {
             let mut sync = default_sync();
             sync.bandwidth_limit = case.cli;
             sync.threads_num = case.toml_cli_threads;
-            let cfg = Config::build(&default_globals(), default_password(), sync, toml)
+            let cfg = Config::build(&default_globals(), &default_password(), sync, toml.as_ref())
                 .unwrap_or_else(|e| panic!("{}: build failed: {e}", case.name));
             assert_eq!(cfg.bandwidth_limit, case.want_limit, "{}", case.name);
             assert_eq!(cfg.threads_num, case.want_threads, "{}", case.name);
@@ -2570,7 +2579,7 @@ mod tests {
     fn build_bails_when_album_token_appears_in_smart_folders_template() {
         let mut sync = default_sync();
         sync.folder_structure_smart_folders = Some("{album}/%Y".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .expect_err("`{album}` in --folder-structure-smart-folders must bail");
         let msg = err.to_string();
         assert!(
@@ -2584,7 +2593,7 @@ mod tests {
     fn build_bails_when_library_token_misplaced() {
         let mut sync = default_sync();
         sync.folder_structure_albums = Some("{album}/{library}".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .expect_err("`{library}` not as first segment must bail");
         assert!(
             err.to_string().contains("'{library}' must be the first"),
@@ -2596,7 +2605,7 @@ mod tests {
     fn build_accepts_library_album_pair_in_albums_template() {
         let mut sync = default_sync();
         sync.folder_structure_albums = Some("{library}/{album}/%Y".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None)
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None)
             .expect("`{library}/{album}/...` is a valid albums template");
         assert_eq!(cfg.folder_structure_albums, "{library}/{album}/%Y");
     }
@@ -2610,9 +2619,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .expect_err("invalid bandwidth_limit should fail build");
         assert!(
@@ -2634,9 +2643,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.set_exif_datetime);
@@ -2654,9 +2663,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.embed_xmp);
@@ -2673,7 +2682,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.embed_xmp = Some(false);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(
             !cfg.embed_xmp,
             "--embed-xmp=false must override TOML embed_xmp = true"
@@ -2683,8 +2693,13 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[test]
     fn test_embed_xmp_default_false_when_unset() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert!(!cfg.embed_xmp);
         assert!(!cfg.xmp_sidecar);
     }
@@ -2698,7 +2713,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.skip_videos = Some(true);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(cfg.skip_videos);
     }
 
@@ -2711,7 +2727,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.skip_videos = Some(false);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(
             !cfg.skip_videos,
             "CLI --skip-videos false should override TOML true"
@@ -2727,9 +2744,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -2747,9 +2764,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -2767,9 +2784,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -2788,7 +2805,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.username = None; // Simulate no CLI username
-        let cfg = Config::build(&globals, pw, default_sync(), Some(toml)).unwrap();
+        let cfg = Config::build(&globals, &pw, default_sync(), Some(&toml)).unwrap();
         assert_eq!(cfg.username, "toml@example.com");
     }
 
@@ -2801,9 +2818,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.username, "u@example.com");
@@ -2818,9 +2835,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(
@@ -2838,7 +2855,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.albums = vec!["Screenshots".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(
             cfg.albums,
             AlbumSelection::Named(vec!["Screenshots".to_string()])
@@ -2855,9 +2873,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.watch_with_interval, Some(1800));
@@ -2876,9 +2894,9 @@ mod tests {
             let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
             let result = Config::build(
                 &default_globals(),
-                default_password(),
+                &default_password(),
                 default_sync(),
-                Some(toml),
+                Some(&toml),
             );
             assert!(result.is_err(), "interval {interval} should be rejected");
             assert!(
@@ -2897,9 +2915,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -2917,9 +2935,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err(), "TOML delay > 3600 must be rejected");
         let msg = result.unwrap_err().to_string();
@@ -2938,9 +2956,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err(), "TOML max_retries > 100 must be rejected");
         let msg = result.unwrap_err().to_string();
@@ -2960,9 +2978,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .expect("max_retries=100, delay=3600 must be accepted");
         assert_eq!(cfg.max_retries, 100);
@@ -2979,7 +2997,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.username = None;
-        let result = Config::build(&globals, pw, default_sync(), Some(toml));
+        let result = Config::build(&globals, &pw, default_sync(), Some(&toml));
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("username"),
@@ -2996,9 +3014,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3025,9 +3043,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -3050,7 +3068,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut pw = default_password();
         pw.password = Some("cli-pw".to_string());
-        let result = Config::build(&default_globals(), pw, default_sync(), Some(toml));
+        let result = Config::build(&default_globals(), &pw, default_sync(), Some(&toml));
         assert!(result.is_err());
     }
 
@@ -3078,9 +3096,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not supported on Windows"), "{err}");
@@ -3092,7 +3110,7 @@ mod tests {
     fn test_build_download_dir_from_cli() {
         let mut sync = default_sync();
         sync.download_dir = Some("/photos/new".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/new"));
     }
 
@@ -3102,7 +3120,7 @@ mod tests {
         // and not asserted here (tested via integration test in tests/cli.rs).
         let mut sync = default_sync();
         sync.directory = Some("/photos/legacy".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/legacy"));
     }
 
@@ -3113,7 +3131,7 @@ mod tests {
         let mut sync = default_sync();
         sync.download_dir = Some("/photos/new".to_string());
         sync.directory = Some("/photos/old".to_string());
-        let result = Config::build(&default_globals(), default_password(), sync, None);
+        let result = Config::build(&default_globals(), &default_password(), sync, None);
         let err = result.unwrap_err().to_string();
         assert!(err.contains("--download-dir"), "{err}");
         assert!(err.contains("--directory"), "{err}");
@@ -3129,7 +3147,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.download_dir = Some("/photos/cli".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/cli"));
     }
 
@@ -3142,7 +3161,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.directory = Some("/photos/cli-legacy".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/cli-legacy"));
     }
 
@@ -3157,9 +3177,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/via-toml"));
@@ -3175,7 +3195,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.cookie_directory = Some(path.to_string_lossy().to_string());
-        let result = Config::build(&globals, pw, default_sync(), None);
+        let result = Config::build(&globals, &pw, default_sync(), None);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("cookie directory"),
@@ -3189,7 +3209,7 @@ mod tests {
         let pw = default_password();
         // Use a path with a null byte which is invalid on all platforms
         globals.cookie_directory = Some("\0invalid/cookies".to_string());
-        let result = Config::build(&globals, pw, default_sync(), None);
+        let result = Config::build(&globals, &pw, default_sync(), None);
         assert!(result.is_err());
     }
 
@@ -3203,9 +3223,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.skip_created_before.is_some());
@@ -3539,9 +3559,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let config = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(config.http_port, 9090);
@@ -3561,9 +3581,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let config = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(config.http_port, 9090);
@@ -3583,15 +3603,20 @@ mod tests {
         let mut sync = default_sync();
         sync.http_port = Some(8080);
         let config =
-            Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(config.http_port, 8080);
     }
 
     #[test]
     fn test_default_http_port() {
         // Without any explicit config, http_port should be 9090.
-        let config =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(config.http_port, 9090);
     }
 
@@ -3599,8 +3624,13 @@ mod tests {
     fn test_default_http_bind_is_all_interfaces() {
         // The historical default. Kept so Docker's `-p 9090:9090` works out
         // of the box without an extra flag.
-        let config =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             config.http_bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
@@ -3616,9 +3646,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let config = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(
@@ -3637,7 +3667,7 @@ mod tests {
         let mut sync = default_sync();
         sync.http_bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let config =
-            Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(
             config.http_bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -3653,9 +3683,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let config = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(
@@ -3673,9 +3703,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .expect_err("invalid IP in [server] bind must error at build time");
         let msg = format!("{err}");
@@ -3769,8 +3799,13 @@ mod tests {
 
     #[test]
     fn test_build_all_defaults_no_toml_exhaustive() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         // Auth
         assert_eq!(cfg.username, "u@example.com");
         assert!(cfg.password.is_none());
@@ -3833,7 +3868,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.domain = Some(Domain::Com);
-        let cfg = Config::build(&globals, pw, default_sync(), Some(toml)).unwrap();
+        let cfg = Config::build(&globals, &pw, default_sync(), Some(&toml)).unwrap();
         assert!(matches!(cfg.domain, Domain::Com));
     }
 
@@ -3846,9 +3881,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(cfg.domain, Domain::Cn));
@@ -3869,7 +3904,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.cookie_directory = Some(cli_path.to_string_lossy().to_string());
-        let cfg = Config::build(&globals, pw, default_sync(), Some(toml)).unwrap();
+        let cfg = Config::build(&globals, &pw, default_sync(), Some(&toml)).unwrap();
         assert_eq!(cfg.cookie_directory, cli_path);
     }
 
@@ -3881,9 +3916,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.cookie_directory, toml_path);
@@ -3898,9 +3933,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.cookie_directory, home.join(&unique));
@@ -3916,9 +3951,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         if let Some(home) = dirs::home_dir() {
@@ -3935,7 +3970,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
     }
 
@@ -3948,7 +3984,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.temp_suffix = Some(".cli-tmp".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.temp_suffix, ".cli-tmp");
     }
 
@@ -3961,9 +3998,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.temp_suffix, ".downloading");
@@ -3978,7 +4015,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.max_retries = Some(10);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.max_retries, 10);
     }
 
@@ -3991,7 +4029,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.retry_delay = Some(30);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.retry_delay_secs, 30);
     }
 
@@ -4004,9 +4043,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.retry_delay_secs, 15);
@@ -4021,7 +4060,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.size = Some(VersionSize::Medium);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(cfg.size, VersionSize::Medium));
     }
 
@@ -4034,9 +4074,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(cfg.size, VersionSize::Thumb));
@@ -4051,7 +4091,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.live_photo_size = Some(LivePhotoSize::Medium);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Medium));
     }
 
@@ -4064,9 +4105,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Thumb));
@@ -4076,7 +4117,7 @@ mod tests {
     fn test_build_live_photo_size_defaults_to_adjusted_when_size_adjusted() {
         let mut sync = default_sync();
         sync.size = Some(VersionSize::Adjusted);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Adjusted));
     }
 
@@ -4085,7 +4126,7 @@ mod tests {
         let mut sync = default_sync();
         sync.size = Some(VersionSize::Adjusted);
         sync.live_photo_size = Some(LivePhotoSize::Original);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Original));
     }
 
@@ -4098,7 +4139,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.live_photo_mov_filename_policy = Some(LivePhotoMovFilenamePolicy::Suffix);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
@@ -4114,9 +4156,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(
@@ -4134,7 +4176,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.align_raw = Some(RawTreatmentPolicy::PreferAlternative);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(
             cfg.align_raw,
             RawTreatmentPolicy::PreferAlternative
@@ -4150,7 +4193,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.file_match_policy = Some(FileMatchPolicy::NameSizeDedupWithSuffix);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(
             cfg.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
@@ -4166,9 +4210,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(cfg.file_match_policy, FileMatchPolicy::NameId7));
@@ -4202,9 +4246,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.set_exif_datetime);
@@ -4230,7 +4274,7 @@ mod tests {
         sync.force_size = Some(true);
         sync.keep_unicode_in_filenames = Some(true);
         sync.notify_systemd = Some(true);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
@@ -4251,9 +4295,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(!cfg.skip_videos);
@@ -4271,7 +4315,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.watch_with_interval = Some(600);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(600));
     }
 
@@ -4284,7 +4329,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.pid_file = Some(PathBuf::from("/cli/pid"));
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.pid_file, Some(PathBuf::from("/cli/pid")));
     }
 
@@ -4299,9 +4345,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(
@@ -4319,7 +4365,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.notification_script = Some("/cli/notify.sh".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(
             cfg.notification_script,
             Some(PathBuf::from("/cli/notify.sh"))
@@ -4328,8 +4375,13 @@ mod tests {
 
     #[test]
     fn test_build_notification_script_none_by_default() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert!(cfg.notification_script.is_none());
     }
 
@@ -4342,9 +4394,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.report_json, Some(PathBuf::from("/toml/run.json")));
@@ -4359,14 +4411,20 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.report_json = Some(PathBuf::from("/cli/run.json"));
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.report_json, Some(PathBuf::from("/cli/run.json")));
     }
 
     #[test]
     fn test_build_report_json_none_by_default() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert!(cfg.report_json.is_none());
     }
 
@@ -4394,7 +4452,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.recent, Some(100));
     }
 
@@ -4407,9 +4466,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.recent, Some(500));
@@ -4426,7 +4485,8 @@ mod tests {
         let mut sync = default_sync();
         sync.skip_created_before = Some("2023-06-01".to_string());
         sync.skip_created_after = Some("2024-06-01".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         let before = cfg.skip_created_before.unwrap();
         assert_eq!(
             before.date_naive(),
@@ -4448,9 +4508,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         let before = cfg.skip_created_before.unwrap();
@@ -4467,9 +4527,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
     }
@@ -4525,9 +4585,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         // default_auth username overrides toml
@@ -4674,9 +4734,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
@@ -4684,8 +4744,13 @@ mod tests {
 
     #[test]
     fn test_build_albums_no_toml_no_cli() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
     }
 
@@ -4705,7 +4770,7 @@ mod tests {
     fn test_build_album_all_maps_to_all_variant() {
         let mut sync = default_sync();
         sync.albums = vec!["all".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
     }
 
@@ -4714,7 +4779,7 @@ mod tests {
         for raw in ["all", "ALL", "All", "aLL"] {
             let mut sync = default_sync();
             sync.albums = vec![raw.to_string()];
-            let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+            let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
             assert_eq!(
                 cfg.albums,
                 AlbumSelection::All,
@@ -4727,7 +4792,7 @@ mod tests {
     fn test_build_album_all_mixed_with_names_errors() {
         let mut sync = default_sync();
         sync.albums = vec!["all".to_string(), "Vacation".to_string()];
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("'--album all' cannot be combined with literal album names"),
@@ -4744,9 +4809,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
@@ -4757,7 +4822,7 @@ mod tests {
         // No -a passed, but {album} in folder_structure -> implicit All.
         let mut sync = default_sync();
         sync.folder_structure = Some("{album}/%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
     }
 
@@ -4766,7 +4831,7 @@ mod tests {
         // No -a, no {album} -> LibraryOnly (today's default).
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
     }
 
@@ -4774,7 +4839,7 @@ mod tests {
     fn test_build_album_named_preserved() {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string(), "Trip".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         // Names are normalised through the v0.13 selector grammar, which uses
         // a BTreeSet for deterministic ordering — alphabetical, regardless of
         // CLI input order.
@@ -4790,7 +4855,7 @@ mod tests {
         // Family" via the new grammar; no `--album all` needed.
         let mut sync = default_sync();
         sync.albums = vec!["!Family".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
         assert_eq!(cfg.exclude_albums, vec!["Family".to_string()]);
     }
@@ -4799,7 +4864,7 @@ mod tests {
     fn test_build_album_all_with_inline_exclude() {
         let mut sync = default_sync();
         sync.albums = vec!["all".to_string(), "!Family".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
         assert_eq!(cfg.exclude_albums, vec!["Family".to_string()]);
     }
@@ -4808,7 +4873,7 @@ mod tests {
     fn test_build_album_named_with_inline_exclude() {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string(), "!Family".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(
             cfg.albums,
             AlbumSelection::Named(vec!["Vacation".to_string()])
@@ -4820,7 +4885,7 @@ mod tests {
     fn test_build_album_none_sentinel_maps_to_library_only() {
         let mut sync = default_sync();
         sync.albums = vec!["none".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
     }
 
@@ -4828,7 +4893,7 @@ mod tests {
     fn test_build_album_contradiction_bails() {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string(), "!Vacation".to_string()];
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string().contains("cannot both include and exclude"),
             "unexpected error: {err}"
@@ -4839,7 +4904,7 @@ mod tests {
     fn test_build_album_none_mixed_with_names_bails() {
         let mut sync = default_sync();
         sync.albums = vec!["none".to_string(), "Vacation".to_string()];
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("'--album none' cannot be combined"),
@@ -4854,7 +4919,7 @@ mod tests {
         let mut sync = default_sync();
         sync.albums = vec!["all".to_string()];
         sync.exclude_albums = vec!["Family".to_string(), "Hidden".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
         assert_eq!(cfg.exclude_albums, vec!["Family", "Hidden"]);
     }
@@ -4864,9 +4929,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str("[filters]\nalbum = \"Vacation\"\n").unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(
@@ -4881,9 +4946,9 @@ mod tests {
             toml::from_str("[filters]\nalbum = \"Singular\"\nalbums = [\"Array\"]\n").unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.albums, AlbumSelection::Named(vec!["Array".to_string()]));
@@ -4895,7 +4960,7 @@ mod tests {
     fn test_build_album_token_rejected_mid_path() {
         let mut sync = default_sync();
         sync.folder_structure = Some("Photos/{album}/%Y".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("'{album}' must be the first path segment"),
@@ -4907,7 +4972,7 @@ mod tests {
     fn test_build_album_token_rejected_after_date() {
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/{album}/%m".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("'{album}' must be the first path segment"),
@@ -4919,7 +4984,7 @@ mod tests {
     fn test_build_album_token_rejected_as_trailing() {
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/{album}".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(err.to_string().contains("must be the first path segment"));
     }
 
@@ -4927,7 +4992,7 @@ mod tests {
     fn test_build_album_token_rejected_duplicate() {
         let mut sync = default_sync();
         sync.folder_structure = Some("{album}/%Y/{album}".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string().contains("may only appear once"),
             "unexpected error: {err}"
@@ -5001,7 +5066,7 @@ mod tests {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{album}/%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure, "%Y/%m");
         assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
     }
@@ -5014,7 +5079,7 @@ mod tests {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{album}".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(
             cfg.folder_structure,
             crate::download::paths::NO_DATE_STRUCTURE
@@ -5030,7 +5095,7 @@ mod tests {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{:{album}/%Y/%m}".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure, "%Y/%m");
         assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
     }
@@ -5045,7 +5110,7 @@ mod tests {
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{album}/%Y".to_string());
         sync.folder_structure_albums = Some("{album}/explicit".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure, "%Y");
         assert_eq!(cfg.folder_structure_albums, "{album}/explicit");
     }
@@ -5056,7 +5121,7 @@ mod tests {
         // both fields keep their resolved values.
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure, "%Y/%m");
         assert_eq!(cfg.folder_structure_albums, "{album}");
     }
@@ -5070,7 +5135,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.directory = Some("/cli/photos".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/cli/photos"));
     }
 
@@ -5080,7 +5146,7 @@ mod tests {
     fn test_build_passthrough_flags() {
         let mut sync = default_sync();
         sync.dry_run = true;
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.dry_run);
     }
 
@@ -5088,21 +5154,21 @@ mod tests {
     fn test_folder_structure_valid_tokens_accepted() {
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d".to_string());
-        assert!(Config::build(&default_globals(), default_password(), sync, None).is_ok());
+        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
     }
 
     #[test]
     fn test_folder_structure_all_tokens_accepted() {
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d/%H/%M/%S".to_string());
-        assert!(Config::build(&default_globals(), default_password(), sync, None).is_ok());
+        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
     }
 
     #[test]
     fn test_folder_structure_none_bypasses_validation() {
         let mut sync = default_sync();
         sync.folder_structure = Some("none".to_string());
-        assert!(Config::build(&default_globals(), default_password(), sync, None).is_ok());
+        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
     }
 
     #[test]
@@ -5110,7 +5176,7 @@ mod tests {
         // Full strftime support: %B (month name), %X (locale time), etc. are valid
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%B/%d".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure, "%Y/%B/%d");
     }
 
@@ -5118,15 +5184,20 @@ mod tests {
     fn test_folder_structure_wrapped_format_accepted() {
         let mut sync = default_sync();
         sync.folder_structure = Some("{:%Y/%m/%d}".to_string());
-        assert!(Config::build(&default_globals(), default_password(), sync, None).is_ok());
+        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
     }
 
     // ── to_toml() tests ─────────────────────────────────────────────
 
     #[test]
     fn test_to_toml_roundtrip_preserves_username() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
             toml.auth.as_ref().unwrap().username.as_deref(),
@@ -5139,15 +5210,20 @@ mod tests {
         let globals = default_globals();
         let mut pw = default_password();
         pw.password = Some("secret123".to_string());
-        let cfg = Config::build(&globals, pw, default_sync(), None).unwrap();
+        let cfg = Config::build(&globals, &pw, default_sync(), None).unwrap();
         let toml = cfg.to_toml();
         assert!(toml.auth.as_ref().unwrap().password.is_none());
     }
 
     #[test]
     fn test_to_toml_omits_default_values() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         // Default domain (com) should be omitted
         assert!(toml.auth.as_ref().unwrap().domain.is_none());
@@ -5164,7 +5240,7 @@ mod tests {
         globals.domain = Some(crate::types::Domain::Cn);
         let mut sync = default_sync();
         sync.size = Some(crate::types::VersionSize::Medium);
-        let cfg = Config::build(&globals, pw, sync, None).unwrap();
+        let cfg = Config::build(&globals, &pw, sync, None).unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
             toml.auth.as_ref().unwrap().domain,
@@ -5178,8 +5254,13 @@ mod tests {
 
     #[test]
     fn test_to_toml_serializes_to_valid_toml() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml_cfg = cfg.to_toml();
         let serialized = toml::to_string_pretty(&toml_cfg).unwrap();
         // Should be parseable back
@@ -5192,7 +5273,7 @@ mod tests {
         sync.recent = Some(crate::cli::RecentLimit::Count(50));
         sync.skip_created_before = Some("2025-01-01".to_string());
         sync.skip_created_after = Some("2025-12-31".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let filters = toml.filters.as_ref().unwrap();
         assert!(filters.recent.is_none());
@@ -5204,7 +5285,7 @@ mod tests {
     fn test_to_toml_roundtrip_exclude_albums() {
         let mut sync = default_sync();
         sync.exclude_albums = vec!["Hidden".to_string(), "Trash".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let filters = toml.filters.as_ref().unwrap();
         assert_eq!(
@@ -5217,7 +5298,7 @@ mod tests {
     fn test_to_toml_roundtrip_filename_exclude() {
         let mut sync = default_sync();
         sync.filename_exclude = vec!["*.AAE".to_string(), "Screenshot*".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let filters = toml.filters.as_ref().unwrap();
         assert_eq!(
@@ -5237,7 +5318,7 @@ mod tests {
     fn test_to_toml_roundtrip_live_photo_mode() {
         let mut sync = default_sync();
         sync.live_photo_mode = Some(crate::types::LivePhotoMode::ImageOnly);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
             toml.photos.as_ref().unwrap().live_photo_mode,
@@ -5254,16 +5335,26 @@ mod tests {
 
     #[test]
     fn test_to_toml_empty_exclude_albums_omitted() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         assert!(toml.filters.as_ref().unwrap().exclude_albums.is_none());
     }
 
     #[test]
     fn test_to_toml_default_live_photo_mode_omitted() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         assert!(toml.photos.as_ref().unwrap().live_photo_mode.is_none());
     }
@@ -5272,7 +5363,7 @@ mod tests {
     fn test_to_toml_roundtrip_bandwidth_limit() {
         let mut sync = default_sync();
         sync.bandwidth_limit = Some(5_000_000);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let serialized = cfg.to_toml();
         assert_eq!(
             serialized
@@ -5286,9 +5377,9 @@ mod tests {
 
         let reparsed = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(serialized),
+            Some(&serialized),
         )
         .unwrap();
         assert_eq!(reparsed.bandwidth_limit, Some(5_000_000));
@@ -5296,8 +5387,13 @@ mod tests {
 
     #[test]
     fn test_to_toml_bandwidth_limit_none_omitted() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         assert!(toml.download.as_ref().unwrap().bandwidth_limit.is_none());
     }
@@ -5316,9 +5412,9 @@ mod tests {
         let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Skip);
@@ -5336,9 +5432,9 @@ mod tests {
         let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Both);
@@ -5359,9 +5455,9 @@ mod tests {
         let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::ImageOnly);
@@ -5492,7 +5588,7 @@ mod tests {
         if let Some(d) = directory {
             sync.directory = Some(d.to_string());
         }
-        Config::build(&globals, pw_args, sync, None).unwrap()
+        Config::build(&globals, &pw_args, sync, None).unwrap()
     }
 
     #[test]
@@ -5554,7 +5650,7 @@ mod tests {
         globals.domain = Some(crate::types::Domain::Cn);
         let mut sync = default_sync();
         sync.directory = Some("/photos".to_string());
-        let config = Config::build(&globals, pw, sync, None).unwrap();
+        let config = Config::build(&globals, &pw, sync, None).unwrap();
 
         persist_first_run_config(&config_path, &config, Some("/data")).unwrap();
 
@@ -5590,7 +5686,8 @@ mod tests {
         sync.live_photo_mode = Some(LivePhotoMode::ImageOnly);
         let toml_str = "[photos]\nlive_photo_mode = \"skip\"\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::ImageOnly);
     }
 
@@ -5600,9 +5697,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
@@ -5614,9 +5711,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
@@ -5627,7 +5724,7 @@ mod tests {
     fn test_filename_exclude_invalid_glob_rejected() {
         let mut sync = default_sync();
         sync.filename_exclude = vec!["[invalid".to_string()];
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(err
             .to_string()
             .contains("invalid --filename-exclude pattern"));
@@ -5639,9 +5736,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.exclude_albums, vec!["Hidden", "Trash"]);
@@ -5685,13 +5782,18 @@ mod tests {
         let mut sync = default_sync();
         sync.smart_folders = cli.iter().map(|s| (*s).to_string()).collect();
         let toml = toml_str.map(|s| toml::from_str::<TomlConfig>(s).unwrap());
-        Config::build(&default_globals(), default_password(), sync, toml).unwrap()
+        Config::build(&default_globals(), &default_password(), sync, toml.as_ref()).unwrap()
     }
 
     #[test]
     fn test_smart_folders_default_is_none() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             cfg.selection.smart_folders,
             crate::selection::SmartFolderSelector::None
@@ -5738,7 +5840,7 @@ mod tests {
     fn test_smart_folders_invalid_combination_bails() {
         let mut sync = default_sync();
         sync.smart_folders = vec!["all".to_string(), "all-with-sensitive".to_string()];
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"));
     }
 
@@ -5746,7 +5848,7 @@ mod tests {
         let mut sync = default_sync();
         sync.unfiled = cli;
         let toml = toml_str.map(|s| toml::from_str::<TomlConfig>(s).unwrap());
-        Config::build(&default_globals(), default_password(), sync, toml).unwrap()
+        Config::build(&default_globals(), &default_password(), sync, toml.as_ref()).unwrap()
     }
 
     #[test]
@@ -5762,7 +5864,7 @@ mod tests {
     fn test_unfiled_default_with_named_albums_is_false() {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(
             !cfg.selection.unfiled,
             "named-album default should preserve legacy unfiled = false"
@@ -5786,7 +5888,7 @@ mod tests {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.unfiled = Some(true);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(
             cfg.selection.unfiled,
             "explicit --unfiled true should win over the named-album legacy default of false"
@@ -5807,15 +5909,25 @@ mod tests {
 
     #[test]
     fn test_folder_structure_albums_default_is_album_token() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(cfg.folder_structure_albums, DEFAULT_FOLDER_STRUCTURE_ALBUMS);
     }
 
     #[test]
     fn test_folder_structure_smart_folders_default_is_smart_folder_token() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             cfg.folder_structure_smart_folders,
             DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
@@ -5826,7 +5938,7 @@ mod tests {
     fn test_folder_structure_albums_from_cli() {
         let mut sync = default_sync();
         sync.folder_structure_albums = Some("{album}/%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
     }
 
@@ -5834,7 +5946,7 @@ mod tests {
     fn test_folder_structure_smart_folders_from_cli() {
         let mut sync = default_sync();
         sync.folder_structure_smart_folders = Some("{smart-folder}/%Y".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure_smart_folders, "{smart-folder}/%Y");
     }
 
@@ -5844,9 +5956,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.folder_structure_albums, "{album}/%Y");
@@ -5858,9 +5970,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.folder_structure_smart_folders, "{smart-folder}/%Y");
@@ -5872,14 +5984,20 @@ mod tests {
         sync.folder_structure_albums = Some("{album}/cli".to_string());
         let toml_str = "[download]\nfolder_structure_albums = \"{album}/toml\"\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.folder_structure_albums, "{album}/cli");
     }
 
     #[test]
     fn test_folder_structure_per_category_round_trips_default() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         // Default value is suppressed on round-trip so config dumps stay clean.
         assert!(toml
@@ -5901,7 +6019,7 @@ mod tests {
         let mut sync = default_sync();
         sync.folder_structure_albums = Some("{album}/%Y".to_string());
         sync.folder_structure_smart_folders = Some("{smart-folder}/%Y".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let dl = toml.download.unwrap();
         assert_eq!(dl.folder_structure_albums.as_deref(), Some("{album}/%Y"));
@@ -5917,7 +6035,7 @@ mod tests {
         let mut sync = default_sync();
         sync.skip_created_before = Some("2025-06-01".to_string());
         sync.skip_created_after = Some("2025-01-01".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None);
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None);
         assert!(
             cfg.is_ok(),
             "Contradictory date filters should warn, not error"
@@ -5932,7 +6050,8 @@ mod tests {
         sync.exclude_albums = vec!["CLI_Album".to_string()];
         let toml_str = "[filters]\nexclude_albums = [\"TOML_Album\"]\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.exclude_albums, vec!["CLI_Album"]);
     }
 
@@ -5942,9 +6061,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.exclude_albums, vec!["TOML_Album"]);
@@ -5956,7 +6075,8 @@ mod tests {
         sync.filename_exclude = vec!["*.AAE".to_string()];
         let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
         assert_eq!(patterns, vec!["*.AAE"]);
     }
@@ -5967,9 +6087,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
@@ -6162,7 +6282,7 @@ mod tests {
         // 4..=6 bucket from the smart table (10s).
         let mut sync = default_sync();
         sync.max_retries = Some(5);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.retry_delay_secs, 10);
     }
 
@@ -6170,7 +6290,7 @@ mod tests {
     fn test_build_retry_delay_smart_default_patient_bucket() {
         let mut sync = default_sync();
         sync.max_retries = Some(10);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.retry_delay_secs, 30);
     }
 
@@ -6178,7 +6298,7 @@ mod tests {
     fn test_build_retry_delay_smart_default_fail_fast_bucket() {
         let mut sync = default_sync();
         sync.max_retries = Some(1);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.retry_delay_secs, 2);
     }
 
@@ -6190,7 +6310,7 @@ mod tests {
         let mut sync = default_sync();
         sync.max_retries = Some(3);
         sync.retry_delay = Some(42);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.retry_delay_secs, 42);
     }
 
@@ -6203,9 +6323,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.retry_delay_secs, 77);
@@ -6217,7 +6337,7 @@ mod tests {
         // `delay = 5` back out because it's redundant (and deprecated).
         let mut sync = default_sync();
         sync.max_retries = Some(3);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
         assert_eq!(retry.max_retries, Some(3));
@@ -6232,7 +6352,7 @@ mod tests {
         let mut sync = default_sync();
         sync.max_retries = Some(3);
         sync.retry_delay = Some(20);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
         assert_eq!(retry.delay, Some(20));
@@ -6244,7 +6364,7 @@ mod tests {
     fn test_build_threads_cli_canonical() {
         let mut sync = default_sync();
         sync.threads = Some(7);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.threads_num, 7);
     }
 
@@ -6252,7 +6372,7 @@ mod tests {
     fn test_build_legacy_threads_num_still_works() {
         let mut sync = default_sync();
         sync.threads_num = Some(12);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.threads_num, 12);
     }
 
@@ -6261,7 +6381,7 @@ mod tests {
         let mut sync = default_sync();
         sync.threads = Some(4);
         sync.threads_num = Some(8);
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--threads"), "{err}");
@@ -6280,9 +6400,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap_err()
         .to_string();
@@ -6300,7 +6420,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.threads = Some(20);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.threads_num, 20);
     }
 
@@ -6315,7 +6436,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.threads_num = Some(20);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.threads_num, 20);
     }
 
@@ -6328,9 +6450,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.threads_num, 16);
@@ -6342,7 +6464,7 @@ mod tests {
     fn test_build_recent_count_populates_recent_field() {
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.recent, Some(100));
         assert!(
             cfg.skip_created_before.is_none(),
@@ -6354,7 +6476,7 @@ mod tests {
     fn test_build_recent_days_populates_skip_created_before() {
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Days(30));
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(
             cfg.recent.is_none(),
             "Days form must not populate recent (count-only field)"
@@ -6380,7 +6502,7 @@ mod tests {
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Days(30));
         sync.skip_created_before = Some("2024-01-01".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--recent 30d"), "{err}");
@@ -6395,7 +6517,7 @@ mod tests {
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Count(100));
         sync.skip_created_before = Some("2024-01-01".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.recent, Some(100));
         assert!(cfg.skip_created_before.is_some());
     }
@@ -6409,9 +6531,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.recent.is_none());
@@ -6427,9 +6549,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.recent, Some(250));
@@ -6445,7 +6567,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Days(7));
-        let err = Config::build(&default_globals(), default_password(), sync, Some(toml))
+        let err = Config::build(&default_globals(), &default_password(), sync, Some(&toml))
             .unwrap_err()
             .to_string();
         assert!(err.contains("--recent 7d"), "{err}");
@@ -6461,7 +6583,7 @@ mod tests {
         sync.skip_videos = Some(true);
         sync.skip_photos = Some(true);
         sync.live_photo_mode = Some(LivePhotoMode::Skip);
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -6486,7 +6608,7 @@ mod tests {
         sync.skip_videos = Some(true);
         sync.skip_photos = Some(true);
         sync.live_photo_mode = Some(LivePhotoMode::ImageOnly);
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("would download nothing"), "{err}");
@@ -6502,7 +6624,7 @@ mod tests {
         sync.skip_videos = Some(true);
         sync.skip_photos = Some(true);
         sync.live_photo_mode = Some(LivePhotoMode::VideoOnly);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.skip_videos);
         assert!(cfg.skip_photos);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
@@ -6517,7 +6639,7 @@ mod tests {
         sync.skip_videos = Some(true);
         sync.skip_photos = Some(true);
         sync.live_photo_mode = Some(LivePhotoMode::Both);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
     }
 
@@ -6525,7 +6647,7 @@ mod tests {
     fn test_build_skip_videos_alone_ok() {
         let mut sync = default_sync();
         sync.skip_videos = Some(true);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.skip_videos);
         assert!(!cfg.skip_photos);
     }
@@ -6534,7 +6656,7 @@ mod tests {
     fn test_build_skip_photos_alone_ok() {
         let mut sync = default_sync();
         sync.skip_photos = Some(true);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.skip_photos);
         assert!(!cfg.skip_videos);
     }
@@ -6552,9 +6674,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap_err()
         .to_string();

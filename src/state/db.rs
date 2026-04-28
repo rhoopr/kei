@@ -482,7 +482,7 @@ impl SqliteStateDb {
 /// Drain a rusqlite row iterator into `Vec<T>`, dropping parse failures but
 /// logging each at `debug!` and summarising the drop count at `warn!` so a
 /// corrupted row never silently disappears from a bulk loader.
-fn collect_rows_with_warn<T, I>(rows: I, label: &'static str) -> Result<Vec<T>, StateError>
+fn collect_rows_with_warn<T, I>(rows: I, label: &'static str) -> Vec<T>
 where
     I: Iterator<Item = rusqlite::Result<T>>,
 {
@@ -500,7 +500,7 @@ where
     if dropped > 0 {
         tracing::warn!(dropped, "{label}: dropped rows with parse errors");
     }
-    Ok(out)
+    out
 }
 
 #[async_trait]
@@ -1320,7 +1320,7 @@ impl StateDb for SqliteStateDb {
                     Ok(PathBuf::from(p))
                 })
                 .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
-            collect_rows_with_warn(rows, "sample_downloaded_paths")
+            Ok(collect_rows_with_warn(rows, "sample_downloaded_paths"))
         })
         .await
     }
@@ -1356,7 +1356,7 @@ impl StateDb for SqliteStateDb {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|e| StateError::query("get_all_asset_albums", e))?;
-            collect_rows_with_warn(rows, "get_all_asset_albums")
+            Ok(collect_rows_with_warn(rows, "get_all_asset_albums"))
         })
         .await
     }
@@ -1371,7 +1371,7 @@ impl StateDb for SqliteStateDb {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|e| StateError::query("get_all_asset_people", e))?;
-            collect_rows_with_warn(rows, "get_all_asset_people")
+            Ok(collect_rows_with_warn(rows, "get_all_asset_people"))
         })
         .await
     }

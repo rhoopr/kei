@@ -3067,7 +3067,7 @@ mod tests {
             ..SyncArgs::default()
         };
         overrides(&mut sync);
-        crate::config::Config::build(&globals, crate::cli::PasswordArgs::default(), sync, None)
+        crate::config::Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
             .expect("Config::build should succeed")
     }
 
