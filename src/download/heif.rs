@@ -182,9 +182,31 @@ fn extract_xmp_from_meta(file_bytes: &[u8], meta_body: &[u8]) -> Option<Vec<u8>>
         const MAX_META_SUBBOX_BYTES: usize = 8 * 1024 * 1024;
         if body.len() <= MAX_META_SUBBOX_BYTES {
             if h.kind == FourCC::new(b"iinf") {
-                iinf = Iinf::decode_body(&mut &body[..]).ok();
+                match Iinf::decode_body(&mut &body[..]) {
+                    Ok(parsed) => iinf = Some(parsed),
+                    Err(e) => {
+                        tracing::warn!(
+                            box_kind = "iinf",
+                            body_len = body.len(),
+                            error = %e,
+                            "HEIC iinf decode failed; treating XMP as absent so write \
+                             path can re-embed without trusting a malformed item map"
+                        );
+                    }
+                }
             } else if h.kind == FourCC::new(b"iloc") {
-                iloc = Iloc::decode_body(&mut &body[..]).ok();
+                match Iloc::decode_body(&mut &body[..]) {
+                    Ok(parsed) => iloc = Some(parsed),
+                    Err(e) => {
+                        tracing::warn!(
+                            box_kind = "iloc",
+                            body_len = body.len(),
+                            error = %e,
+                            "HEIC iloc decode failed; treating XMP as absent so write \
+                             path can re-embed without trusting a malformed location map"
+                        );
+                    }
+                }
             }
         }
         cursor.advance(sz);
@@ -537,7 +559,13 @@ fn remap_point(file_offset: u64, ranges: &[(u64, u64, u64)]) -> Option<u64> {
 
 fn encoded_size(atom: &Any) -> u64 {
     let mut sink = Vec::new();
-    atom.encode(&mut sink).ok();
+    if let Err(e) = atom.encode(&mut sink) {
+        tracing::warn!(
+            error = %e,
+            "encoded_size: atom re-encode failed; size estimate may be wrong, \
+             downstream offset remap will skip this atom"
+        );
+    }
     sink.len() as u64
 }
 
@@ -793,6 +821,50 @@ mod tests {
 
         // Must return None instead of allocating gigabytes.
         assert!(extract_xmp_bytes(&meta_box).is_none());
+    }
+
+    /// CG-14: a malformed iinf inside an otherwise-walkable meta box
+    /// previously surfaced as a silent None — indistinguishable from
+    /// "no XMP present". A structurally broken HEIC must now log a
+    /// warn so the operator (and an integration test) can tell why
+    /// XMP wasn't found.
+    #[tracing_test::traced_test]
+    #[test]
+    fn extract_xmp_bytes_logs_warn_on_iinf_decode_failure() {
+        // Build a meta box with a valid hdlr followed by an iinf box
+        // whose body is a 1-byte truncated payload — Iinf::decode_body
+        // requires at least version+flags+entry_count which is 6 bytes.
+        let mut hdlr: Vec<u8> = Vec::new();
+        hdlr.extend_from_slice(&0x21_u32.to_be_bytes());
+        hdlr.extend_from_slice(b"hdlr");
+        hdlr.extend_from_slice(&[0; 4]);
+        hdlr.extend_from_slice(&[0; 4]);
+        hdlr.extend_from_slice(b"pict");
+        hdlr.extend_from_slice(&[0; 12]);
+        hdlr.push(0);
+
+        let mut iinf: Vec<u8> = Vec::new();
+        iinf.extend_from_slice(&0x09_u32.to_be_bytes()); // size = 9 (header 8 + body 1)
+        iinf.extend_from_slice(b"iinf");
+        iinf.push(0); // 1-byte body — too short for version+flags+count
+
+        let mut meta_body: Vec<u8> = Vec::new();
+        meta_body.extend_from_slice(&[0; 4]);
+        meta_body.extend_from_slice(&hdlr);
+        meta_body.extend_from_slice(&iinf);
+
+        let mut meta_box: Vec<u8> = Vec::new();
+        let total = (8 + meta_body.len()) as u32;
+        meta_box.extend_from_slice(&total.to_be_bytes());
+        meta_box.extend_from_slice(b"meta");
+        meta_box.extend_from_slice(&meta_body);
+
+        assert!(extract_xmp_bytes(&meta_box).is_none());
+        assert!(
+            logs_contain("HEIC iinf decode failed"),
+            "warn must fire on malformed iinf"
+        );
+        assert!(logs_contain("box_kind=\"iinf\""));
     }
 
     // ── insert_xmp: typed errors per failure mode ──
