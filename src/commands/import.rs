@@ -12,7 +12,7 @@ use crate::download;
 use crate::retry;
 use crate::state;
 use crate::state::StateDb;
-use crate::types::AssetVersionSize;
+use crate::types::{AssetVersionSize, FileMatchPolicy};
 
 use super::service::{init_photos_service, resolve_libraries};
 
@@ -66,6 +66,12 @@ pub(crate) async fn run_import_existing(
         .keep_unicode_in_filenames
         .or_else(|| toml_photos.and_then(|p| p.keep_unicode_in_filenames))
         .unwrap_or(false);
+
+    // Resolve file_match_policy from TOML (default: NameSizeDedupWithSuffix to
+    // match sync's default).
+    let file_match_policy = toml_photos
+        .and_then(|p| p.file_match_policy)
+        .unwrap_or(FileMatchPolicy::NameSizeDedupWithSuffix);
 
     // import-existing walks files on disk, not iCloud creation dates, so the
     // `--recent Nd` form has no meaning here. Count form only.
@@ -175,8 +181,18 @@ pub(crate) async fn run_import_existing(
             let Some(version) = asset.get_version(AssetVersionSize::Original) else {
                 continue;
             };
-            let filename =
+            let filename_mapped =
                 download::paths::map_filename_extension(&base_filename, &version.asset_type);
+            // Apply file_match_policy — name-id7 bakes the asset ID suffix into
+            // the filename (e.g. IMG_4726.HEIC → IMG_4726_QVNKc1d.HEIC) so the
+            // matcher can find files that were originally downloaded by icloudpd
+            // or by kei sync with the same policy.
+            let filename = match file_match_policy {
+                FileMatchPolicy::NameId7 => {
+                    download::paths::apply_name_id7(&filename_mapped, asset.id())
+                }
+                FileMatchPolicy::NameSizeDedupWithSuffix => filename_mapped,
+            };
             let expected_path = download::paths::local_download_path(
                 &directory,
                 &folder_structure,
