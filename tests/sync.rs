@@ -530,7 +530,10 @@ fn sync_name_id7_appends_asset_id() {
     });
 }
 
-/// --folder-structure %Y should place files in year-only directories (e.g., 2024/file.jpg).
+/// `--folder-structure-albums %Y` should place files from an album pass in
+/// year-only directories (e.g., 2024/file.jpg). Album passes use the
+/// per-category template introduced in v0.13; bare `--folder-structure` only
+/// governs the unfiled pass.
 #[test]
 #[ignore]
 fn sync_custom_folder_structure() {
@@ -540,7 +543,7 @@ fn sync_custom_folder_structure() {
         let download_dir = tempdir().expect("tempdir");
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--folder-structure", "%Y"])
+            .args(["--folder-structure-albums", "%Y"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
