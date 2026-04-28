@@ -191,6 +191,11 @@ pub(super) struct StreamingResult {
     /// Count of 429/503 observations during Phase 1 downloads (per retry
     /// attempt, not per unique task). Feeds SyncStats.rate_limited.
     pub(super) rate_limit_observations: usize,
+    /// NB-4: `true` when the producer reached the natural end of the API
+    /// stream (so the `enum_in_progress:<zone>` marker can be cleared even
+    /// when downstream downloads partially failed). `false` when the
+    /// producer aborted via shutdown, channel-close, or panic.
+    pub(super) enumeration_complete: bool,
 }
 
 /// Threshold of auth errors before aborting the download pass for re-authentication.
@@ -785,8 +790,10 @@ where
         let mut enum_errors = 0usize;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
+        let mut shutdown_break = false;
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
+                shutdown_break = true;
                 break;
             }
             match result {
@@ -839,6 +846,9 @@ where
         }
         return Ok(StreamingResult {
             enumeration_errors: enum_errors,
+            // NB-4: same gate as dry-run — `--only-print-filenames` drains
+            // the API stream and can clear the marker on a clean exit.
+            enumeration_complete: !shutdown_break,
             ..StreamingResult::default()
         });
     }
@@ -849,9 +859,11 @@ where
         let mut enum_errors = 0usize;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
+        let mut shutdown_break = false;
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, stopping dry run");
+                shutdown_break = true;
                 break;
             }
             match result {
@@ -876,6 +888,10 @@ where
         return Ok(StreamingResult {
             downloaded: count,
             enumeration_errors: enum_errors,
+            // NB-4: dry-run still drains the API stream; mirror the
+            // non-dry-run gate so the enum_in_progress marker can be
+            // cleared on a clean dry-run.
+            enumeration_complete: !shutdown_break,
             ..StreamingResult::default()
         });
     }
@@ -1013,6 +1029,14 @@ where
     let assets_seen_producer = Arc::clone(&assets_seen);
     let enum_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let enum_errors_producer = Arc::clone(&enum_errors);
+    // NB-4: signal whether the producer reached the natural end of the API
+    // stream. Used by the caller to decide whether to clear the
+    // `enum_in_progress:<zone>` marker. `true` only when the producer's
+    // outer `while let Some(...)` loop exited because the stream returned
+    // `None` (stream exhausted) AND no shutdown was triggered. Channel-close
+    // early returns and shutdown breaks both leave it `false`.
+    let enumeration_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let enumeration_complete_producer = Arc::clone(&enumeration_complete);
 
     // Batch-size forecast: snapshot free space at enumeration start and
     // track bytes queued to consumers. Emit a one-time warn at 90% and
@@ -1437,6 +1461,16 @@ where
             }
         }
 
+        // NB-4: at this point the outer `while let Some(...)` loop has
+        // exited via stream-exhaustion (None) or via the in-loop shutdown
+        // `break`. Channel-close early returns bypass this code path
+        // entirely. Mark enumeration complete only when shutdown wasn't
+        // the trigger so the cycle's `enum_in_progress:<zone>` marker is
+        // cleared even when downstream downloads partially failed.
+        if !producer_shutdown.is_cancelled() {
+            enumeration_complete_producer.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let total_skipped = skips.total();
         if total_skipped > 0 {
             // NB-1: single tracing event, runs once after the producer loop
@@ -1749,6 +1783,14 @@ where
         ));
     }
 
+    // NB-4: a panicked producer never reached the post-loop "enumeration
+    // complete" assignment, so the flag stays `false` even if the bail
+    // path above was suppressed. `producer_panicked` is checked above,
+    // but if a future change ever returns Ok despite a panic, the flag
+    // here protects the `enum_in_progress` marker.
+    let enumeration_complete_flag =
+        !producer_panicked && enumeration_complete.load(std::sync::atomic::Ordering::Relaxed);
+
     Ok(StreamingResult {
         downloaded,
         exif_failures,
@@ -1761,6 +1803,7 @@ where
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
         rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
+        enumeration_complete: enumeration_complete_flag,
     })
 }
 

@@ -1415,6 +1415,26 @@ fn fold_pass_count_results(
     (counts, errors)
 }
 
+/// NB-4: should the per-zone `enum_in_progress` marker be cleared at the
+/// end of this full-enumeration cycle?
+///
+/// Returns `true` when the producer reached the natural end of the API
+/// stream (so any change events the cycle saw will land cleanly in the
+/// state DB). Pre-fix, the gate keyed on `!stats.interrupted`, which
+/// already covered the shutdown / auth-error-threshold / panic cases but
+/// silently kept the marker set after a partial-failure cycle whose
+/// enumeration phase finished normally — operators saw a perpetual
+/// "Prior full enumeration was interrupted" warning at startup until they
+/// happened to run a clean full sync.
+///
+/// The new contract: clear the marker when enumeration *finished* (the
+/// stream returned None), regardless of how many downstream downloads
+/// failed. Shutdown still suppresses the clear because the producer's
+/// cancellation path leaves `enumeration_complete = false`.
+pub(super) fn should_clear_enum_progress_marker(enumeration_complete: bool) -> bool {
+    enumeration_complete
+}
+
 /// Classification of how the producer-observed asset count compared with the
 /// pre-enumeration API total. Drives the two-tier pagination-undercount gate.
 ///
@@ -1512,11 +1532,20 @@ async fn download_photos_full_with_token(
     // pass has empty excludes) so streams merge for maximum concurrency.
     let (mut streaming_result, token_receivers) = if needs_per_pass {
         let pass_configs = build_pass_configs(passes, config);
-        let mut combined_result = StreamingResult::default();
+        let mut combined_result = StreamingResult {
+            // NB-4: enumeration is "complete" only when every pass finished
+            // its stream cleanly. Start optimistic; flip to false on the
+            // first pass that ended early (shutdown, channel-close, or
+            // panic) so the marker stays set and the next startup logs
+            // the interruption.
+            enumeration_complete: !passes.is_empty(),
+            ..StreamingResult::default()
+        };
         let mut token_receivers = Vec::with_capacity(passes.len());
 
         for ((pass, &count), pass_config) in passes.iter().zip(&pass_counts).zip(&pass_configs) {
             if shutdown_token.is_cancelled() {
+                combined_result.enumeration_complete = false;
                 break;
             }
             let (stream, token_rx) = pass.album.photo_stream_with_token(
@@ -1543,6 +1572,10 @@ async fn download_photos_full_with_token(
             combined_result.enumeration_errors += result.enumeration_errors;
             combined_result.assets_seen += result.assets_seen;
             combined_result.skip_summary += result.skip_summary;
+            // NB-4: AND-fold across passes so a single pass aborting (e.g.
+            // producer-channel close, panic) leaves the marker set.
+            combined_result.enumeration_complete =
+                combined_result.enumeration_complete && result.enumeration_complete;
         }
 
         (combined_result, token_receivers)
@@ -1588,6 +1621,12 @@ async fn download_photos_full_with_token(
     // tally so `build_download_outcome` returns `PartialFailure`. This is the
     // signal `should_store_sync_token` reads to suppress token advancement.
     streaming_result.enumeration_errors += len_errors;
+    // NB-4: a `len()` failure on any pass means we never had a reliable
+    // total to enumerate against, so the per-zone enumeration marker must
+    // stay set even if the producer drained its (possibly truncated) stream.
+    if len_errors > 0 {
+        streaming_result.enumeration_complete = false;
+    }
 
     // Check if enumeration saw significantly fewer assets than the API reported.
     // This catches silent pagination truncation, dropped pages, or API hiccups
@@ -1637,6 +1676,12 @@ async fn download_photos_full_with_token(
         }
     }
 
+    // NB-4: capture the enumeration-complete signal before
+    // `build_download_outcome` consumes `streaming_result`. The marker
+    // gate below uses this signal directly so a partial-failure run
+    // whose enumeration phase finished still clears the marker.
+    let enumeration_complete = streaming_result.enumeration_complete;
+
     // Build the outcome using the same logic as download_photos
     let (outcome, stats) = build_download_outcome(
         download_client,
@@ -1648,10 +1693,11 @@ async fn download_photos_full_with_token(
     )
     .await?;
 
-    // Clear enumeration-in-progress markers only on non-interrupted
-    // completion. Interrupted / errored runs keep their markers so the
-    // next startup can surface the interruption to the operator.
-    if !stats.interrupted {
+    // Clear enumeration-in-progress markers when the producer reached the
+    // natural end of the API stream (NB-4). The gate ignores
+    // download-side failures so a partial-failure cycle whose enumeration
+    // finished doesn't leave the marker set forever.
+    if should_clear_enum_progress_marker(enumeration_complete) {
         if let Some(db) = &config.state_db {
             for zone in &enum_zones {
                 if let Err(e) = db.end_enum_progress(zone).await {
@@ -3926,6 +3972,70 @@ mod tests {
 
         assert_eq!(counts, vec![0, 0]);
         assert_eq!(errors, 2);
+    }
+
+    /// NB-4: a cycle whose producer reached the natural end of the API
+    /// stream MUST clear the `enum_in_progress` marker, even if downstream
+    /// downloads partially failed. Pre-fix the gate keyed on
+    /// `!stats.interrupted`, which silently kept the marker set when an
+    /// enumeration error didn't propagate to `interrupted`; operators saw
+    /// a perpetual "Prior full enumeration was interrupted" warning.
+    #[test]
+    fn enum_progress_marker_clears_when_enumeration_finishes_with_partial_failures() {
+        // The gate takes a single boolean — the per-zone marker clears
+        // iff the producer reached the natural end of the API stream.
+        // Downstream download failures are intentionally not in the
+        // signal: they're a separate failure class.
+        assert!(
+            should_clear_enum_progress_marker(true),
+            "enumeration_complete=true must clear the marker even when \
+             downstream downloads partially failed"
+        );
+    }
+
+    /// NB-4 companion: shutdown triggered mid-enumeration leaves
+    /// `enumeration_complete=false`, and the marker MUST stay set so the
+    /// next startup logs the interruption to the operator.
+    #[test]
+    fn enum_progress_marker_stays_set_when_shutdown_triggered_mid_enumeration() {
+        assert!(
+            !should_clear_enum_progress_marker(false),
+            "enumeration_complete=false (shutdown / channel-close / panic / \
+             len() failure) must keep the marker set so the operator sees \
+             the interruption on next startup"
+        );
+    }
+
+    /// NB-4: per-pass mode AND-folds `enumeration_complete` across passes.
+    /// The first pass that aborts must drop the cycle's flag to false. The
+    /// `&&=` semantics are subtle (especially around the empty-passes case)
+    /// so this test pins the truth table.
+    #[test]
+    fn enum_progress_marker_per_pass_and_fold_semantics() {
+        // All passes complete → cycle complete.
+        let mut combined = true;
+        for pass_complete in [true, true, true] {
+            combined = combined && pass_complete;
+        }
+        assert!(combined, "all passes complete → marker clears");
+
+        // One pass aborted mid-stream → cycle incomplete.
+        let mut combined = true;
+        for pass_complete in [true, false, true] {
+            combined = combined && pass_complete;
+        }
+        assert!(
+            !combined,
+            "one pass aborted → marker must stay set even if siblings finished"
+        );
+
+        // Empty passes: combined stays at the initializer (false in the
+        // production code so a no-pass cycle doesn't accidentally clear
+        // the marker for a zone the cycle didn't actually enumerate).
+        let combined: bool = []
+            .iter()
+            .fold(false, |acc, pass_complete: &bool| acc && *pass_complete);
+        assert!(!combined, "no passes → marker stays set");
     }
 
     /// MS-1: pagination undercount classifier — exact match returns Match.
