@@ -663,7 +663,7 @@ mod tests {
         // 12 bytes of JPEG SOI + FFD8FFE0 + JFIF header — definitely not HEIF.
         fs::write(
             &path,
-            &[
+            [
                 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01,
             ],
         )
