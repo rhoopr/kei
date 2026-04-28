@@ -652,6 +652,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         &config.folder_structure,
         &config.folder_structure_albums,
         &config.folder_structure_smart_folders,
+        &config.selection,
     )?;
     sd_notifier.notify_ready();
 
@@ -1525,26 +1526,60 @@ async fn check_changes_database(
 /// Bail when multi-library sync would let same-named assets from different
 /// zones overwrite each other on disk. The state DB is per-zone via the v8
 /// PK, but the filesystem isn't unless a template includes `{library}`.
+///
+/// The check is per-pass-kind: each *active* template (one whose pass kind
+/// will actually run under the current Selection) must contain `{library}`.
+/// Template strings whose pass is disabled (e.g. `folder_structure_smart_folders`
+/// when `--smart-folder none`) don't render any path so they don't need
+/// `{library}` to keep the sync safe. Without this active-pass awareness the
+/// guard accepted `{library}` in *any* template even when only the
+/// `{library}`-less templates would actually run, silently overwriting
+/// between zones in the active pass.
 fn bail_if_multi_library_paths_commingle(
     library_count: usize,
     folder_structure: &str,
     folder_structure_albums: &str,
     folder_structure_smart_folders: &str,
+    selection: &crate::selection::Selection,
 ) -> anyhow::Result<()> {
+    use crate::selection::{AlbumSelector, SmartFolderSelector};
+
     if library_count < 2 {
         return Ok(());
     }
-    let any_uses_library_token = folder_structure.contains("{library}")
-        || folder_structure_albums.contains("{library}")
-        || folder_structure_smart_folders.contains("{library}");
-    if any_uses_library_token {
+
+    let unfiled_active = selection.unfiled;
+    let album_active = !matches!(selection.albums, AlbumSelector::None);
+    let smart_folder_active = !matches!(selection.smart_folders, SmartFolderSelector::None);
+
+    // All passes disabled — resolve_passes returns an empty plan, no path
+    // ever renders, multi-library can't commingle.
+    if !unfiled_active && !album_active && !smart_folder_active {
+        return Ok(());
+    }
+
+    // Each active pass kind reads a different template. Bail when any
+    // active template lacks `{library}` — that's the pass that would
+    // overwrite. Inactive templates are ignored entirely.
+    let mut missing: Vec<&str> = Vec::new();
+    if unfiled_active && !folder_structure.contains("{library}") {
+        missing.push("--folder-structure");
+    }
+    if album_active && !folder_structure_albums.contains("{library}") {
+        missing.push("--folder-structure-albums");
+    }
+    if smart_folder_active && !folder_structure_smart_folders.contains("{library}") {
+        missing.push("--folder-structure-smart-folders");
+    }
+    if missing.is_empty() {
         return Ok(());
     }
     anyhow::bail!(
-        "{library_count} libraries selected but no template contains `{{library}}`; \
-         add `{{library}}` to one of --folder-structure / --folder-structure-albums / \
-         --folder-structure-smart-folders, or use --library primary to disable \
-         multi-library sync."
+        "{library_count} libraries selected but the active template(s) [{flags}] \
+         don't contain `{{library}}`; add `{{library}}` to each, or narrow \
+         `--library` / `--album` / `--smart-folder` / `--unfiled` so only one \
+         library or one pass kind runs.",
+        flags = missing.join(", ")
     );
 }
 
@@ -1888,48 +1923,174 @@ mod tests {
     // branch (single-library short-circuit, `{library}` in any of the
     // three templates, multi-library without token).
 
+    /// Build a Selection that activates every pass kind. The default
+    /// `LibrarySelector` is fine — the guard reads only `albums`,
+    /// `smart_folders`, `unfiled` from the Selection.
+    fn selection_all_passes_active() -> crate::selection::Selection {
+        use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+        Selection {
+            albums: AlbumSelector::All {
+                excluded: std::collections::BTreeSet::new(),
+            },
+            smart_folders: SmartFolderSelector::All {
+                include_sensitive: false,
+                excluded: std::collections::BTreeSet::new(),
+            },
+            libraries: LibrarySelector::default(),
+            unfiled: true,
+        }
+    }
+
+    /// Build a Selection that activates only the unfiled pass.
+    fn selection_unfiled_only() -> crate::selection::Selection {
+        use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+        Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::None,
+            libraries: LibrarySelector::default(),
+            unfiled: true,
+        }
+    }
+
     #[test]
     fn bail_if_multi_library_paths_commingle_short_circuits_under_two_libraries() {
-        // Zero or one library never trips the check, regardless of templates.
+        // Zero or one library never trips the check, regardless of templates
+        // or which passes are active.
+        let sel = selection_all_passes_active();
+        assert!(bail_if_multi_library_paths_commingle(
+            0,
+            "%Y/%m/%d",
+            "{album}",
+            "{smart-folder}",
+            &sel
+        )
+        .is_ok());
+        assert!(bail_if_multi_library_paths_commingle(
+            1,
+            "%Y/%m/%d",
+            "{album}",
+            "{smart-folder}",
+            &sel
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn bail_if_multi_library_paths_commingle_accepts_library_token_in_active_template_only() {
+        // CG-7 contract rewrite: when every active template carries
+        // `{library}`, multi-library is safe. Inactive templates are
+        // irrelevant — their pass kind doesn't run.
+        let all = selection_all_passes_active();
         assert!(
-            bail_if_multi_library_paths_commingle(0, "%Y/%m/%d", "{album}", "{smart-folder}")
-                .is_ok()
+            bail_if_multi_library_paths_commingle(
+                2,
+                "{library}/%Y/%m/%d",
+                "{library}/{album}",
+                "{library}/{smart-folder}",
+                &all
+            )
+            .is_ok(),
+            "every active template carries `{{library}}` - no commingle risk"
         );
+
+        // When only the unfiled pass is active, the unfiled template is
+        // the only one that needs `{library}`. The album / smart-folder
+        // templates can be anything because no pass reads them.
+        let unfiled = selection_unfiled_only();
         assert!(
-            bail_if_multi_library_paths_commingle(1, "%Y/%m/%d", "{album}", "{smart-folder}")
-                .is_ok()
+            bail_if_multi_library_paths_commingle(
+                2,
+                "{library}/%Y/%m/%d",
+                "{album}",
+                "{smart-folder}",
+                &unfiled
+            )
+            .is_ok(),
+            "only unfiled active and its template has `{{library}}`"
         );
     }
 
     #[test]
-    fn bail_if_multi_library_paths_commingle_accepts_library_token_in_any_template() {
-        assert!(bail_if_multi_library_paths_commingle(
-            2,
-            "{library}/%Y/%m/%d",
-            "{album}",
-            "{smart-folder}"
-        )
-        .is_ok());
-        assert!(bail_if_multi_library_paths_commingle(
+    fn bail_if_multi_library_paths_commingle_requires_library_token_per_active_pass() {
+        // CG-6 contract: if any *active* pass has a template missing
+        // `{library}`, multi-library sync silently overwrites within
+        // that pass between zones. Pre-fix the guard accepted the token
+        // in any template — even when only the `{library}`-less
+        // templates were the active ones — so this scenario landed green.
+        //
+        // Scenario: --folder-structure-albums '{library}/{album}' (token
+        // present, active) + --folder-structure-smart-folders
+        // '{smart-folder}' (no token, also active because --smart-folder
+        // all) + --unfiled false (inactive). Pre-fix: "any template has
+        // `{library}`" - sync proceeds, smart-folder paths from two
+        // libraries collide. Post-fix: smart-folder pass active, its
+        // template lacks `{library}`, bail.
+        use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+        let sel = Selection {
+            albums: AlbumSelector::All {
+                excluded: std::collections::BTreeSet::new(),
+            },
+            smart_folders: SmartFolderSelector::All {
+                include_sensitive: false,
+                excluded: std::collections::BTreeSet::new(),
+            },
+            libraries: LibrarySelector::default(),
+            unfiled: false,
+        };
+        let err = bail_if_multi_library_paths_commingle(
             2,
             "%Y/%m/%d",
             "{library}/{album}",
-            "{smart-folder}"
+            "{smart-folder}",
+            &sel,
         )
-        .is_ok());
-        assert!(bail_if_multi_library_paths_commingle(
-            2,
-            "%Y/%m/%d",
-            "{album}",
-            "{library}/{smart-folder}"
-        )
-        .is_ok());
+        .expect_err(
+            "active smart-folder pass with `{library}`-less template must bail \
+             even when albums template has `{library}`",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--folder-structure-smart-folders"),
+            "bail must name the offending flag; got: {msg}"
+        );
+        assert!(
+            !msg.contains("--folder-structure-albums"),
+            "bail must NOT name the album flag (its template is fine); got: {msg}"
+        );
+        assert!(
+            !msg.contains("--folder-structure,"),
+            "bail must NOT name --folder-structure (unfiled is inactive); got: {msg}"
+        );
+
+        // Negative: same templates but smart-folder pass disabled. No
+        // active pass lacks `{library}`, so sync proceeds.
+        let sel_no_smart = Selection {
+            albums: AlbumSelector::All {
+                excluded: std::collections::BTreeSet::new(),
+            },
+            smart_folders: SmartFolderSelector::None,
+            libraries: LibrarySelector::default(),
+            unfiled: false,
+        };
+        assert!(
+            bail_if_multi_library_paths_commingle(
+                2,
+                "%Y/%m/%d",
+                "{library}/{album}",
+                "{smart-folder}",
+                &sel_no_smart
+            )
+            .is_ok(),
+            "smart-folder inactive - its `{{library}}`-less template is irrelevant"
+        );
     }
 
     #[test]
     fn bail_if_multi_library_paths_commingle_bails_without_library_token() {
-        let err = bail_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{album}", "{smart-folder}")
-            .expect_err("multi-library without `{library}` must bail");
+        let sel = selection_all_passes_active();
+        let err =
+            bail_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{album}", "{smart-folder}", &sel)
+                .expect_err("multi-library without `{library}` in any active template must bail");
         let msg = format!("{err}");
         assert!(
             msg.contains("2 libraries selected"),
@@ -1949,9 +2110,31 @@ mod tests {
     fn bail_if_multi_library_paths_commingle_bails_with_none_folder_structure_too() {
         // `none` (date hierarchy disabled) is the worst-case commingle:
         // every asset lands directly in the download dir.
-        let err = bail_if_multi_library_paths_commingle(5, "none", "{album}", "{smart-folder}")
-            .expect_err("multi-library + `none` template must still bail");
+        let sel = selection_all_passes_active();
+        let err =
+            bail_if_multi_library_paths_commingle(5, "none", "{album}", "{smart-folder}", &sel)
+                .expect_err("multi-library + `none` template must still bail");
         assert!(format!("{err}").contains("5 libraries selected"));
+    }
+
+    #[test]
+    fn bail_if_multi_library_paths_commingle_short_circuits_when_no_passes_active() {
+        // --album none + --smart-folder none + --unfiled false: every
+        // pass is disabled, resolve_passes returns an empty plan, no
+        // path is ever rendered, so multi-library can't commingle even
+        // without `{library}` in any template.
+        use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::None,
+            libraries: LibrarySelector::default(),
+            unfiled: false,
+        };
+        assert!(
+            bail_if_multi_library_paths_commingle(3, "%Y/%m/%d", "{album}", "{smart-folder}", &sel)
+                .is_ok(),
+            "no active passes - guard must not bail"
+        );
     }
 
     // ── determine_sync_mode ──────────────────────────────────────────
