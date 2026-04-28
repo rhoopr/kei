@@ -698,7 +698,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn pid_is_alive_self() {
-        assert!(pid_is_alive(std::process::id() as i32));
+        assert!(pid_is_alive(std::process::id().cast_signed()));
     }
 
     #[test]
@@ -830,8 +830,8 @@ mod tests {
             cycles += 1;
             if let Some(interval) = watch_with_interval {
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
-                    _ = shutdown_token.cancelled() => { break; }
+                    () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                    () = shutdown_token.cancelled() => { break; }
                 }
             } else {
                 break;

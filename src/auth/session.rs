@@ -40,10 +40,12 @@ const MAX_SANITIZED_USERNAME_LEN: usize = 64;
 /// Truncates to [`MAX_SANITIZED_USERNAME_LEN`] with a hash suffix if too long,
 /// preventing OS "File name too long" errors.
 pub fn sanitize_username(username: &str) -> String {
-    let sanitized: String = username
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
+    let mut sanitized = String::with_capacity(username.len());
+    sanitized.extend(
+        username
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_'),
+    );
     if sanitized.len() <= MAX_SANITIZED_USERNAME_LEN {
         sanitized
     } else {
