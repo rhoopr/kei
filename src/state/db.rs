@@ -767,6 +767,13 @@ impl StateDb for SqliteStateDb {
                      (producer-dispatch invariant). Failure not persisted"
                 );
                 crate::metrics::MARK_FAILED_ZERO_ROWS.inc();
+                return Err(StateError::Invariant {
+                    operation: "mark_failed",
+                    detail: format!(
+                        "library={library} id={id} version_size={version_size} \
+                         not present; upsert_seen must run before mark_failed"
+                    ),
+                });
             }
 
             Ok(())
@@ -3729,31 +3736,35 @@ mod tests {
         );
     }
 
-    /// A `mark_failed` call without a prior `upsert_seen`
-    /// is a producer-dispatch invariant violation. The function preserves
-    /// the documented contract (returns Ok with 0 rows affected; does NOT
-    /// error) so callers don't crash on a buggy code path, but the failure
-    /// must be loud: an `error!` log AND an incremented metric counter so
-    /// /metrics scraping surfaces the regression. Mirrors the
-    /// `mark_downloaded_zero_rows_increments_metric_counter` test above.
+    /// A `mark_failed` call without a prior `upsert_seen` is a
+    /// producer-dispatch invariant violation. Surface it as a typed
+    /// `StateError::Invariant` so callers can't silently treat the
+    /// failure as persisted, while still incrementing the metric for
+    /// observability.
     #[tokio::test]
-    async fn mark_failed_zero_rows_increments_metric_counter_and_returns_ok() {
+    async fn mark_failed_zero_rows_returns_invariant_and_increments_metric() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         let before = crate::metrics::MARK_FAILED_ZERO_ROWS.get();
-        let result = db
+        let err = db
             .mark_failed(
                 "PrimarySync",
                 "NEVER_SEEN_FOR_FAILED_METRIC",
                 "original",
                 "simulated transient error",
             )
-            .await;
-        assert!(
-            result.is_ok(),
-            "mark_failed on unknown row must NOT error -- the caller treats \
-             0-row updates as a soft contract per the docs (got {result:?})"
-        );
+            .await
+            .expect_err("mark_failed on unknown row must surface as Invariant");
+        match &err {
+            StateError::Invariant { operation, detail } => {
+                assert_eq!(*operation, "mark_failed");
+                assert!(
+                    detail.contains("NEVER_SEEN_FOR_FAILED_METRIC"),
+                    "detail must include the asset id; got: {detail}"
+                );
+            }
+            other => panic!("expected StateError::Invariant, got {other:?}"),
+        }
         let after = crate::metrics::MARK_FAILED_ZERO_ROWS.get();
 
         assert!(
