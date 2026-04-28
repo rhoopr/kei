@@ -770,6 +770,106 @@ fn import_existing_accepts_no_progress_bar() {
         .stdout(predicate::str::contains("--no-progress-bar"));
 }
 
+// ── import-existing path-derivation flags ───────────────────────────────
+//
+// import-existing must accept every flag that affects sync's output paths,
+// or files synced under those settings will silently fail to match. Each of
+// these mirrors a sync flag and was added to close that gap.
+
+#[test]
+fn import_existing_file_match_policy_flag() {
+    for input in ["name-size-dedup-with-suffix", "name-id7"] {
+        common::cmd()
+            .args([
+                "import-existing",
+                "--download-dir",
+                "/tmp",
+                "--file-match-policy",
+                input,
+                "--help",
+            ])
+            .assert()
+            .success();
+    }
+    common::cmd()
+        .args([
+            "import-existing",
+            "--download-dir",
+            "/tmp",
+            "--file-match-policy",
+            "bogus",
+            "--help",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn import_existing_size_flag() {
+    for input in ["original", "medium", "thumb", "adjusted", "alternative"] {
+        common::cmd()
+            .args([
+                "import-existing",
+                "--download-dir",
+                "/tmp",
+                "--size",
+                input,
+                "--help",
+            ])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn import_existing_live_photo_flags() {
+    common::cmd()
+        .args([
+            "import-existing",
+            "--download-dir",
+            "/tmp",
+            "--live-photo-mode",
+            "video-only",
+            "--live-photo-size",
+            "medium",
+            "--live-photo-mov-filename-policy",
+            "original",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn import_existing_align_raw_and_force_size_flags() {
+    common::cmd()
+        .args([
+            "import-existing",
+            "--download-dir",
+            "/tmp",
+            "--align-raw",
+            "original",
+            "--force-size",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn import_existing_keep_unicode_flag_takes_env() {
+    common::cmd()
+        .args([
+            "import-existing",
+            "--download-dir",
+            "/tmp",
+            "--keep-unicode-in-filenames",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
 // ── exit codes ────────────────────────────────────────────────────────
 
 /// Exit code 0 for --help.

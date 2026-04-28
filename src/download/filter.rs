@@ -23,7 +23,7 @@ use super::DownloadConfig;
 
 /// Reason an asset was filtered out during content/metadata filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FilterReason {
+pub(crate) enum FilterReason {
     ExcludedAlbum,
     MediaType,
     LivePhoto,
@@ -307,7 +307,7 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
 ///
 /// Callers must invoke this before `extract_skip_candidates` or
 /// `filter_asset_to_tasks` to avoid redundant evaluation.
-pub(super) fn is_asset_filtered(
+pub(crate) fn is_asset_filtered(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> Option<FilterReason> {
@@ -406,6 +406,149 @@ pub(super) fn extract_skip_candidates<'a>(
                 VersionSizeKey::from(effective_live_size),
                 v.checksum.as_ref(),
             ));
+        }
+    }
+
+    result
+}
+
+/// One file sync would write for an asset, with the metadata `import-existing`
+/// needs to match it against the local filesystem.
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedAssetPath {
+    /// Absolute path the file would land at, before any collision/dedup suffix.
+    pub(crate) path: PathBuf,
+    /// Byte size iCloud reports for this version. Used as the strict-match key.
+    pub(crate) size: u64,
+    /// iCloud-side checksum (CloudKit format, not SHA256).
+    pub(crate) checksum: Box<str>,
+    /// Which version this is (Original, LiveOriginal, Medium, ...). Drives the
+    /// state-DB row key and `MediaType` classification.
+    pub(crate) version_size: VersionSizeKey,
+}
+
+/// Compute the file paths sync would produce for an asset under the given
+/// config, without doing collision resolution or disk I/O.
+///
+/// Returns up to two entries: the primary version and an optional live-photo
+/// MOV companion. Returns empty when the asset has no version sync would
+/// download (e.g. `force_size` set + size unavailable, or a live-photo
+/// image-only/skip mode with no primary).
+///
+/// Caller must invoke [`is_asset_filtered`] first to apply content/date
+/// filters; this function only handles version selection + filename derivation.
+///
+/// Used by `import-existing` to find files on disk; sync's
+/// [`filter_asset_to_tasks`] is the source of truth and adds collision
+/// resolution + DownloadTask wiring on top of the same derivation chain.
+pub(crate) fn expected_paths_for(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> SmallVec<[ExpectedAssetPath; 2]> {
+    let is_live_photo = asset.is_live_photo();
+
+    let fallback_filename;
+    let raw_filename = if let Some(f) = asset.filename() {
+        f
+    } else {
+        let asset_type = asset
+            .versions()
+            .first()
+            .map_or("", |(_, v)| v.asset_type.as_ref());
+        fallback_filename = paths::generate_fingerprint_filename(asset.id(), asset_type);
+        &fallback_filename
+    };
+    let base_filename: String = if config.keep_unicode_in_filenames {
+        raw_filename.to_string()
+    } else {
+        paths::remove_unicode_chars(raw_filename).into_owned()
+    };
+
+    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+    let versions = apply_raw_policy(asset.versions(), config.align_raw);
+    let mut result = SmallVec::new();
+    let mut effective_primary_filename: Option<String> = None;
+
+    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
+        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    };
+
+    let (primary, effective_size) = match version_with_fallback(
+        &get_version,
+        config.size,
+        AssetVersionSize::Original,
+        config.force_size,
+    ) {
+        Some((v, s)) => (Some(v), s),
+        None => (None, config.size),
+    };
+    let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
+
+    if let Some(version) = primary.filter(|_| !skip_primary) {
+        let mapped = paths::map_filename_extension(&base_filename, &version.asset_type);
+        let sized = match effective_size {
+            AssetVersionSize::Medium => paths::insert_suffix(&mapped, "medium"),
+            AssetVersionSize::Thumb => paths::insert_suffix(&mapped, "thumb"),
+            _ => mapped,
+        };
+        let filename = match config.file_match_policy {
+            FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized, asset.id()),
+            FileMatchPolicy::NameSizeDedupWithSuffix => sized,
+        };
+        let path = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &created_local,
+            &filename,
+            config.album_name.as_deref(),
+        );
+        effective_primary_filename = Some(filename);
+        result.push(ExpectedAssetPath {
+            path,
+            size: version.size,
+            checksum: version.checksum.clone(),
+            version_size: VersionSizeKey::from(effective_size),
+        });
+    }
+
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Both | LivePhotoMode::VideoOnly
+    ) && asset.item_type() == Some(AssetItemType::Image)
+    {
+        let live = version_with_fallback(
+            &get_version,
+            config.live_photo_size,
+            AssetVersionSize::LiveOriginal,
+            config.force_size,
+        );
+        if let Some((live_version, effective_live_size)) = live {
+            let live_base = match config.file_match_policy {
+                FileMatchPolicy::NameId7 => paths::apply_name_id7(&base_filename, asset.id()),
+                FileMatchPolicy::NameSizeDedupWithSuffix => effective_primary_filename
+                    .as_deref()
+                    .unwrap_or(&base_filename)
+                    .to_string(),
+            };
+            let mov_filename = match config.live_photo_mov_filename_policy {
+                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
+                LivePhotoMovFilenamePolicy::Original => {
+                    paths::live_photo_mov_path_original(&live_base)
+                }
+            };
+            let mov_path = paths::local_download_path(
+                &config.directory,
+                &config.folder_structure,
+                &created_local,
+                &mov_filename,
+                config.album_name.as_deref(),
+            );
+            result.push(ExpectedAssetPath {
+                path: mov_path,
+                size: live_version.size,
+                checksum: live_version.checksum.clone(),
+                version_size: VersionSizeKey::from(effective_live_size),
+            });
         }
     }
 
@@ -894,6 +1037,195 @@ mod tests {
         assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "abc123");
         assert_eq!(tasks[0].size, 1000);
+    }
+
+    // ── expected_paths_for tests ────────────────────────────────────────
+    //
+    // These cover `import-existing`'s view of sync's filename derivation:
+    // file_match_policy, size suffix, live photo MOV companion, raw alignment,
+    // force_size, keep_unicode. Sync's `filter_asset_to_tasks` is the source
+    // of truth; collision/dedup-suffix handling is intentionally NOT replayed
+    // here (callers don't have claimed_paths state to consult).
+
+    #[test]
+    fn expected_paths_default_returns_one_original_path() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].size, 1000);
+        assert_eq!(&*paths[0].checksum, "abc123");
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert!(
+            paths[0].path.to_string_lossy().ends_with("IMG_0001.JPG"),
+            "expected ...IMG_0001.JPG, got {}",
+            paths[0].path.display()
+        );
+    }
+
+    #[test]
+    fn expected_paths_apply_name_id7_suffix_to_primary() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("IMG_0001_") && name.ends_with(".JPG"),
+            "expected IMG_0001_<id7>.JPG, got {name}"
+        );
+        assert_ne!(name, "IMG_0001.JPG", "id7 suffix not applied");
+    }
+
+    #[test]
+    fn expected_paths_live_photo_yields_primary_and_mov() {
+        let asset = TestPhotoAsset::new("LIVE_1")
+            .filename("IMG_2000.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert_eq!(paths[1].version_size, VersionSizeKey::LiveOriginal);
+        assert_eq!(paths[1].size, 3000);
+        assert!(
+            paths[1]
+                .path
+                .to_string_lossy()
+                .ends_with("IMG_2000_HEVC.MOV"),
+            "expected ...IMG_2000_HEVC.MOV, got {}",
+            paths[1].path.display()
+        );
+    }
+
+    #[test]
+    fn expected_paths_video_only_skips_primary() {
+        let asset = TestPhotoAsset::new("LIVE_2")
+            .filename("IMG_2001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::LiveOriginal);
+    }
+
+    #[test]
+    fn expected_paths_image_only_skips_mov() {
+        let asset = TestPhotoAsset::new("LIVE_3")
+            .filename("IMG_2002.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn expected_paths_skip_mode_returns_primary_only() {
+        let asset = TestPhotoAsset::new("LIVE_4")
+            .filename("IMG_2003.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn expected_paths_force_size_missing_returns_empty() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = true;
+        let paths = expected_paths_for(&asset, &config);
+        assert!(
+            paths.is_empty(),
+            "force_size + missing size should yield no paths, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_size_fallback_to_original_when_force_size_off() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = false;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains("-medium"),
+            "fallback to Original should not carry medium suffix, got {name}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_live_photo_with_name_id7_applies_suffix_to_both() {
+        let asset = TestPhotoAsset::new("LIVE_5")
+            .filename("IMG_3000.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        let primary = paths[0].path.file_name().unwrap().to_string_lossy();
+        let mov = paths[1].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            primary.starts_with("IMG_3000_") && primary.ends_with(".HEIC"),
+            "primary missing id7 suffix: {primary}"
+        );
+        assert!(
+            mov.starts_with("IMG_3000_") && mov.ends_with("_HEVC.MOV"),
+            "MOV companion missing id7 suffix: {mov}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_no_versions_returns_empty() {
+        // Build a minimal asset with no resOriginalRes — all version lookups
+        // fail, expected_paths_for returns empty (caller skips).
+        let master = json!({
+            "recordName": "EMPTY_1",
+            "fields": {
+                "filenameEnc": {"value": "x.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+            },
+        });
+        let asset_record = json!({
+            "fields": {"assetDate": {"value": 1736899200000.0_f64}},
+        });
+        let asset = PhotoAsset::new(master, asset_record);
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert!(paths.is_empty());
     }
 
     #[test]
