@@ -433,6 +433,19 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
         hasher.update(entry.as_bytes());
         hasher.update(b"\0");
     }
+    // Smart-folder + unfiled selectors drive which CloudKit zones/views are
+    // enumerated; toggling them changes the eligible asset set, so the
+    // per-zone sync token must be invalidated. Without these fields a
+    // `--smart-folder none` → `--smart-folder all` (or `--unfiled false` →
+    // default true) change reuses a stale enumeration cursor and the next
+    // cycle silently misses every newly-eligible asset.
+    for entry in config.selection.smart_folders.to_raw() {
+        hasher.update(b"smart_folder:");
+        hasher.update(entry.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(b"unfiled:");
+    hasher.update([u8::from(config.selection.unfiled)]);
     finalize_hash(hasher)
 }
 
@@ -3139,6 +3152,46 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_config_hash_different_smart_folders() {
+        // Toggling --smart-folder between modes (none → all, or
+        // adding a named folder) changes which assets are eligible. If
+        // this isn't reflected in the config hash, the next cycle reuses
+        // the per-zone sync token whose enumeration boundary was computed
+        // under the old selection — newly-eligible smart-folder assets
+        // are silently skipped.
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.smart_folders = vec!["Favorites".to_string()];
+        });
+        assert_ne!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "changing --smart-folder must change the config hash so the \
+             stored sync token is invalidated"
+        );
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_unfiled() {
+        // Same silent-miss vector for the unfiled selector: --unfiled true
+        // (default) → false changes whether the unfiled pass runs at all.
+        // A regression that omits this from the hash leaves a stale token
+        // pointing past assets the previous cycle would have caught.
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.unfiled = Some(false);
+        });
+        assert_ne!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "changing --unfiled must change the config hash so the \
+             stored sync token is invalidated"
+        );
+    }
+
+    #[test]
     fn test_compute_config_hash_different_library() {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
@@ -3530,7 +3583,7 @@ mod tests {
         let config = build_config_with(tmp.path(), "/photos", |_| {});
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "a8fe0a9169180cf3",
+            hash, "aeb5bd16aec44dc6",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3544,7 +3597,41 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "8e5fd4f4c01b7252",
+            hash, "17970c39a2088aa1",
+            "compute_config_hash golden hash changed -- this will invalidate sync tokens"
+        );
+    }
+
+    #[test]
+    fn golden_compute_config_hash_with_smart_folders() {
+        // Drift detection for the smart-folder branch of the hash. Pairs
+        // with `test_compute_config_hash_different_smart_folders`: the
+        // `_different_*` test catches missing-field regressions, this
+        // test catches accidental field-format changes.
+        let tmp = TempDir::new().unwrap();
+        let config = build_config_with(tmp.path(), "/photos", |s| {
+            s.smart_folders = vec!["Favorites".to_string(), "Videos".to_string()];
+        });
+        let hash = compute_config_hash(&config);
+        assert_eq!(
+            hash, "83355ac76044cebf",
+            "compute_config_hash golden hash changed -- this will invalidate sync tokens"
+        );
+    }
+
+    #[test]
+    fn golden_compute_config_hash_with_unfiled_false() {
+        // Drift detection for the unfiled branch of the hash. The
+        // `unfiled = true` default is implicit in `golden_..._defaults`;
+        // this pin covers the explicit-false case so a regression
+        // collapsing the two branches is caught.
+        let tmp = TempDir::new().unwrap();
+        let config = build_config_with(tmp.path(), "/photos", |s| {
+            s.unfiled = Some(false);
+        });
+        let hash = compute_config_hash(&config);
+        assert_eq!(
+            hash, "1e0fc1c46a9d0aca",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
