@@ -675,7 +675,7 @@ mod tests {
         assert_eq!(asset.filename(), None);
     }
 
-    /// CG-16: a `filenameEnc` value that decodes to the empty string must
+    /// A `filenameEnc` value that decodes to the empty string must
     /// yield `None`, not `Some("")`. Production routes filename-less assets
     /// through the fingerprint fallback; an empty string would slip past
     /// the `is_some()` check downstream and produce paths like

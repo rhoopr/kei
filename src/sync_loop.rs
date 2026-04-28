@@ -283,8 +283,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     })?;
     let _ = tokio::fs::remove_file(&probe).await;
 
-    // Abort if available disk space is too low. CG-20: see
-    // `check_min_disk_space` for the pure inner check.
+    // Abort if available disk space is too low. See `check_min_disk_space`
+    // for the pure inner check.
     if let Some(avail) = available_disk_space(&config.directory) {
         check_min_disk_space(avail, &config.directory)?;
     }
@@ -561,7 +561,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
     // Promote the String / Vec / PathBuf config fields to their Arc
     // counterparts once, outside the per-library closure. Otherwise the
-    // CF-12 Arc-sharing win is half-defeated: each build_download_config
+    // Arc-sharing win is half-defeated: each build_download_config
     // call would re-allocate directory / filename_exclude / temp_suffix
     // from scratch instead of refcount-bumping.
     let cfg_directory: Arc<std::path::Path> = Arc::from(config.directory.as_path());
@@ -1406,7 +1406,7 @@ async fn run_cycle(
             );
         }
 
-        // Accumulate stats across libraries. CG-15.
+        // Accumulate stats across libraries.
         cycle_stats.accumulate(&sync_result.stats);
 
         match sync_result.outcome {
@@ -1851,7 +1851,7 @@ mod tests {
         }
     }
 
-    // CG-18: classifier sees through `Box<dyn Error + Send + Sync>` wrappers.
+    // Classifier sees through `Box<dyn Error + Send + Sync>` wrappers.
     //
     // anyhow lets callers wrap raw boxed errors via `anyhow::Error::from`
     // when adapting third-party error returns. The downcast walk used by

@@ -110,7 +110,7 @@ pub struct SyncStats {
 impl SyncStats {
     /// Add `other` into `self`, field by field. Used by the per-cycle loop in
     /// `sync_loop::run_cycle` to fold each library's stats into a cycle-wide
-    /// total. CG-15.
+    /// total.
     ///
     /// All numeric counters sum; `interrupted` ORs (any library being
     /// interrupted means the cycle was interrupted); `skipped` delegates to
@@ -3766,7 +3766,7 @@ mod tests {
         );
     }
 
-    /// CG-15: `SyncStats::accumulate` is the sole sum used to fold per-library
+    /// `SyncStats::accumulate` is the sole sum used to fold per-library
     /// stats into a cycle-wide total. Pin every counter so a future refactor
     /// (or a new field added without updating `accumulate`) cannot silently
     /// drop one. Touches every numeric field plus `interrupted` plus the

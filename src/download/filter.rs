@@ -2098,7 +2098,7 @@ mod tests {
         );
     }
 
-    /// CG-13: two assets whose filenames differ only in case (`IMG_0001.JPG`
+    /// Two assets whose filenames differ only in case (`IMG_0001.JPG`
     /// vs `img_0001.jpg`) must NOT silently overwrite each other on a
     /// case-insensitive filesystem. The collision detector must either
     /// rename one with a disambiguation suffix or skip the duplicate; in

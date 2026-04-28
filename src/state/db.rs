@@ -2242,7 +2242,7 @@ mod tests {
         assert_eq!(promoted, 0);
     }
 
-    /// CG-14: promotion is idempotent — once an orphan has been flipped to
+    /// Promotion is idempotent — once an orphan has been flipped to
     /// `interrupted`, a second invocation must return 0 rows promoted and
     /// must not re-touch the row. The current implementation guards via
     /// `WHERE status = 'running'`, but no test pinned the second-call
@@ -2301,7 +2301,7 @@ mod tests {
         assert_eq!(after_a, ("interrupted".to_string(), 1));
     }
 
-    /// CG-14 corollary: a freshly-completed `sync_runs` row in between
+    /// Corollary to the idempotency test: a freshly-completed `sync_runs` row in between
     /// invocations must not be promoted. Pins the "WHERE status = 'running'"
     /// invariant against churn — a misclassified completed run would
     /// silently corrupt operator dashboards.
