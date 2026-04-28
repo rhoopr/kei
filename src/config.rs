@@ -649,7 +649,7 @@ pub struct Config {
     pub retry_delay_secs: u64,
     /// Periodic reconciliation interval (cycles between full local-vs-state
     /// walks). `None` or `Some(0)` disables the walk so the daemon's
-    /// behaviour matches pre-MS-4. See [`TomlWatch::reconcile_every_n_cycles`]
+    /// behaviour matches the pre-reconcile defaults. See [`TomlWatch::reconcile_every_n_cycles`]
     /// for the rationale.
     pub reconcile_every_n_cycles: Option<u64>,
 

@@ -400,7 +400,7 @@ async fn attempt_download<C: DownloadClient>(
     }
 
     // Defense-in-depth: log when neither size indicator is available.
-    // Post-download checksum verification (CF-1) catches actual corruption,
+    // Post-download checksum verification catches actual corruption,
     // but this warning helps diagnose transfer anomalies.
     if expected_size.is_none() && content_length.is_none() {
         tracing::warn!(
@@ -815,7 +815,7 @@ mod tests {
         assert_eq!(temp.file_name().unwrap().to_str().unwrap(), ".kei-tmp");
     }
 
-    /// Robustness regression for CF-1 (2026-04-25 review). Apple does
+    /// Robustness regression for downloaded-byte verification. Apple does
     /// not publish a content hash for assets, so kei cannot verify
     /// downloaded bytes against a server-side digest. Instead it stores
     /// the SHA-256 of what landed on disk in `local_checksum` and surfaces

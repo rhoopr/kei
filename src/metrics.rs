@@ -790,8 +790,7 @@ mod tests {
         );
     }
 
-    /// Robustness review NB-1 (2026-04-25): the
-    /// `mark_downloaded_zero_rows` counter is registered into the global
+    /// The `mark_downloaded_zero_rows` counter is registered into the global
     /// registry by `MetricsHandle::new`, so a /metrics scrape should
     /// surface the series even before the state DB has incremented it.
     /// Pinning the rendered name guards the registration call (which is

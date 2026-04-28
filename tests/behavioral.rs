@@ -174,7 +174,7 @@ fn insert_asset(
     .unwrap();
 }
 
-/// CG-5 / TI-1: pin the helper schema version against the binary's
+/// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
 /// `state::schema::SCHEMA_VERSION` (currently 8). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
@@ -3995,7 +3995,7 @@ fn unfiled_flag_does_not_print_unwired_warning() {
         .stderr(predicate::str::contains("legacy unfiled-pass rules").not());
 }
 
-/// CG-8: every per-category selection flag composed in a single
+/// Every per-category selection flag composed in a single
 /// invocation must validate end-to-end through the
 /// `Cli -> Config -> Selection` pipeline. Per-category unit tests in
 /// `selection.rs` cover each parser in isolation, but the binary-level

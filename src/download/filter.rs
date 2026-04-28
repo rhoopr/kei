@@ -2872,7 +2872,7 @@ mod tests {
         );
     }
 
-    // ── CG-6: post-rename pre-state-write idempotency ──────────────────
+    // ── Post-rename pre-state-write idempotency ──────────────────
     //
     // After `rename_part_to_final` succeeds (file is on disk at the
     // final path) but before `state_db.mark_downloaded()` commits, a

@@ -39,7 +39,7 @@ enum BatchForecast {
     Bail,
 }
 
-/// MS-5: re-snapshot the free-disk probe every this many bytes queued. The
+/// Re-snapshot the free-disk probe every this many bytes queued. The
 /// producer caches `initial_free` at enumeration start so per-task probes
 /// don't hammer `statvfs` on every asset, but a long sync can run for hours
 /// while another process fills the FS. Without periodic refresh the bail
@@ -76,7 +76,7 @@ fn batch_forecast_decision(
     (BatchForecast::Continue, total)
 }
 
-/// MS-5: decide whether the producer should re-snapshot free disk space on
+/// Decide whether the producer should re-snapshot free disk space on
 /// this `forecast_check` call.
 ///
 /// `total` is the cumulative queued-bytes value just returned by
@@ -191,7 +191,7 @@ pub(super) struct StreamingResult {
     /// Count of 429/503 observations during Phase 1 downloads (per retry
     /// attempt, not per unique task). Feeds SyncStats.rate_limited.
     pub(super) rate_limit_observations: usize,
-    /// NB-4: `true` when the producer reached the natural end of the API
+    /// `true` when the producer reached the natural end of the API
     /// stream (so the `enum_in_progress:<zone>` marker can be cleared even
     /// when downstream downloads partially failed). `false` when the
     /// producer aborted via shutdown, channel-close, or panic.
@@ -218,7 +218,7 @@ struct PendingStateWrite {
 const STATE_WRITE_MAX_RETRIES: u32 = 6;
 const _: () = assert!(STATE_WRITE_MAX_RETRIES <= 32, "shift overflow in backoff");
 
-/// NB-2: bounded retry attempts for `add_asset_album`. SQLite-busy under WAL
+/// Bounded retry attempts for `add_asset_album`. SQLite-busy under WAL
 /// contention is the dominant transient failure; three attempts at
 /// 200ms / 400ms / 800ms cover the common case while staying short enough
 /// that a wedged DB doesn't stall the producer indefinitely. After the
@@ -227,18 +227,21 @@ const _: () = assert!(STATE_WRITE_MAX_RETRIES <= 32, "shift overflow in backoff"
 /// enumeration.
 const ADD_ASSET_ALBUM_MAX_RETRIES: u32 = 3;
 
-/// NB-2: insert an asset/album row with a bounded inline retry loop. The
+/// Insert an asset/album row with a bounded inline retry loop. The
 /// underlying call is `INSERT OR IGNORE` so retries are idempotent. Returns
 /// the final result so the caller can log on persistent failure.
 ///
-/// The retry shape mirrors `flush_pending_state_writes` (200ms × 2^attempt)
-/// rather than introducing a new primitive.
+/// The retry shape mirrors `flush_pending_state_writes` (200ms × 2^attempt
+/// plus 0..base/4 jitter) rather than introducing a new primitive. The
+/// jitter spreads simultaneous retries from concurrent producers so they
+/// don't re-collide on the same SQLite lock.
 pub(super) async fn add_asset_album_with_retry(
     db: &dyn StateDb,
     asset_id: &str,
     album_name: &str,
     source: &str,
 ) -> Result<(), crate::state::error::StateError> {
+    use rand::RngExt;
     let mut last_err: Option<crate::state::error::StateError> = None;
     for attempt in 1..=ADD_ASSET_ALBUM_MAX_RETRIES {
         match db.add_asset_album(asset_id, album_name, source).await {
@@ -253,7 +256,8 @@ pub(super) async fn add_asset_album_with_retry(
                         "add_asset_album retry"
                     );
                     let base_ms = 200u64 * u64::from(1u32 << (attempt - 1));
-                    tokio::time::sleep(Duration::from_millis(base_ms)).await;
+                    let jitter_ms = rand::rng().random_range(0..base_ms.max(1) / 4);
+                    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
                 }
                 last_err = Some(e);
             }
@@ -747,7 +751,7 @@ pub(super) struct PassResult {
 /// `Path::exists()` form pauses the executor for seconds on slow
 /// filesystems (NFS, SMB). Treats stat errors as "missing" so a
 /// transient permissions error correctly flips trust-state off rather
-/// than passing through the trust gate (CF-5).
+/// than passing through the trust gate.
 async fn sample_missing_paths(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
     let mut missing = Vec::new();
     for p in paths {
@@ -846,7 +850,7 @@ where
         }
         return Ok(StreamingResult {
             enumeration_errors: enum_errors,
-            // NB-4: same gate as dry-run — `--only-print-filenames` drains
+            // Same gate as dry-run — `--only-print-filenames` drains
             // the API stream and can clear the marker on a clean exit.
             enumeration_complete: !shutdown_break,
             ..StreamingResult::default()
@@ -888,7 +892,7 @@ where
         return Ok(StreamingResult {
             downloaded: count,
             enumeration_errors: enum_errors,
-            // NB-4: dry-run still drains the API stream; mirror the
+            // Dry-run still drains the API stream; mirror the
             // non-dry-run gate so the enum_in_progress marker can be
             // cleared on a clean dry-run.
             enumeration_complete: !shutdown_break,
@@ -954,7 +958,6 @@ where
                     // paths) doesn't block the async runtime thread on slow
                     // filesystems (NFS, SMB). Mirrors the metadata-rewrite
                     // worker (see comment at the `try_exists` call ~line 401).
-                    // CF-5.
                     let missing = sample_missing_paths(&paths).await;
                     if !missing.is_empty() {
                         tracing::warn!(
@@ -1029,7 +1032,7 @@ where
     let assets_seen_producer = Arc::clone(&assets_seen);
     let enum_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let enum_errors_producer = Arc::clone(&enum_errors);
-    // NB-4: signal whether the producer reached the natural end of the API
+    // Signal whether the producer reached the natural end of the API
     // stream. Used by the caller to decide whether to clear the
     // `enum_in_progress:<zone>` marker. `true` only when the producer's
     // outer `while let Some(...)` loop exited because the stream returned
@@ -1043,7 +1046,7 @@ where
     // cancel the sync at 100%. This catches the "batch much larger than
     // free space" case early, before downloads run the disk dry mid-stream.
     //
-    // MS-5: a multi-hour sync can have its FS filled by an unrelated process
+    // A multi-hour sync can have its FS filled by an unrelated process
     // mid-run. Refresh `initial_free` every FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES
     // queued so the bail decision rides on fresher data. Per-task rechecks
     // against a shrinking denominator would fire noisy false-positives as
@@ -1074,7 +1077,7 @@ where
         let mut touched_ids: Vec<Arc<str>> = Vec::new();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
-        // MS-5: free-space probe lives in an `AtomicU64` (sentinel
+        // Free-space probe lives in an `AtomicU64` (sentinel
         // `u64::MAX` = "no probe available") so the producer task can
         // refresh it every FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES queued
         // without breaking `Send`. The producer is a single task, so atomic
@@ -1452,7 +1455,7 @@ where
                 }
                 Err(e) => {
                     enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // NB-1: single-line `tracing::error!` doesn't need the
+                    // Single-line `tracing::error!` doesn't need the
                     // progress bar suspended; the bar redraws cleanly after
                     // a one-line emit and the suspend was just paying a
                     // hot-loop cost for no observable benefit.
@@ -1461,7 +1464,7 @@ where
             }
         }
 
-        // NB-4: at this point the outer `while let Some(...)` loop has
+        // At this point the outer `while let Some(...)` loop has
         // exited via stream-exhaustion (None) or via the in-loop shutdown
         // `break`. Channel-close early returns bypass this code path
         // entirely. Mark enumeration complete only when shutdown wasn't
@@ -1473,7 +1476,7 @@ where
 
         let total_skipped = skips.total();
         if total_skipped > 0 {
-            // NB-1: single tracing event, runs once after the producer loop
+            // Single tracing event, runs once after the producer loop
             // exits — no suspend needed.
             tracing::debug!(
                 state = skips.by_state,
@@ -1498,7 +1501,7 @@ where
         let skipped_unique = (total_skipped - skips.duplicates) as u64;
         let accounted = skipped_unique + assets_forwarded;
         if accounted != seen {
-            // NB-1: single tracing event; no suspend.
+            // Single tracing event; no suspend.
             tracing::warn!(
                 assets_seen = seen,
                 accounted,
@@ -1783,7 +1786,7 @@ where
         ));
     }
 
-    // NB-4: a panicked producer never reached the post-loop "enumeration
+    // A panicked producer never reached the post-loop "enumeration
     // complete" assignment, so the flag stays `false` even if the bail
     // path above was suppressed. `producer_panicked` is checked above,
     // but if a future change ever returns Ok despite a panic, the flag
@@ -2744,9 +2747,9 @@ mod tests {
         assert_eq!(total, 500);
     }
 
-    // ── MS-5: free-space re-snapshot cadence ───────────────────────────────
+    // ── Free-space re-snapshot cadence ───────────────────────────────
 
-    /// MS-5: a re-snapshot is required once the running queued total has
+    /// A re-snapshot is required once the running queued total has
     /// crossed `interval` bytes past the last snapshot point. Pinning the
     /// happy path so a future tweak doesn't regress to the stale-snapshot
     /// behaviour the fix was added to repair.
@@ -2762,7 +2765,7 @@ mod tests {
         assert!(should_resnapshot_free_space(interval * 2, 0, interval));
     }
 
-    /// MS-5: when the interval is 0 the helper must return `false` for any
+    /// When the interval is 0 the helper must return `false` for any
     /// total. Guards against accidentally turning the cadence into "every
     /// call" if a constant is ever zeroed out.
     #[test]
@@ -2775,7 +2778,7 @@ mod tests {
         }
     }
 
-    /// MS-5: drives the helper through a sequence where the simulated free
+    /// Drives the helper through a sequence where the simulated free
     /// space drops between snapshots and asserts the bail decision picks up
     /// the fresher snapshot. Pre-fix, the bail rode on the stale 1 TiB
     /// snapshot and never fired even though the FS had only 1 GiB left.
@@ -2812,7 +2815,7 @@ mod tests {
         assert!(total > refreshed_free, "queued total dwarfs refreshed free");
     }
 
-    // ── NB-2: add_asset_album retry tests ─────────────────────────────────
+    // ── add_asset_album retry tests ─────────────────────────────────
 
     /// StateDb stub whose `add_asset_album` returns `LockPoisoned` for the
     /// first `fail_first` calls, then succeeds. Tracks total call count so
@@ -3027,7 +3030,7 @@ mod tests {
         }
     }
 
-    /// NB-2: a single transient `LockPoisoned` from `add_asset_album` must
+    /// A single transient `LockPoisoned` from `add_asset_album` must
     /// be retried so the album-membership row lands. Pre-fix this caller
     /// logged at `warn!` and dropped the row, leaving downstream consumers
     /// (EXIF keywords, Immich albums) with incomplete data until the next
@@ -3053,7 +3056,7 @@ mod tests {
         );
     }
 
-    /// NB-2: when failures persist beyond the retry cap, the error must
+    /// When failures persist beyond the retry cap, the error must
     /// surface so the caller can log at `warn!` (existing behaviour) — a
     /// genuinely-wedged DB shouldn't be silently retried forever.
     #[tokio::test]
@@ -3076,7 +3079,7 @@ mod tests {
         );
     }
 
-    /// NB-2: a first-call success must not pay the retry cost. Pinning so
+    /// A first-call success must not pay the retry cost. Pinning so
     /// the retry loop doesn't accidentally turn into "retry on every call".
     #[tokio::test]
     async fn add_asset_album_retry_no_op_on_first_success() {
@@ -3942,7 +3945,7 @@ mod tests {
         assert_eq!(seen_ids.len(), 2, "only 2 unique IDs should be tracked");
     }
 
-    /// NB-1: When a CancellationToken fires during a download pass with
+    /// When a CancellationToken fires during a download pass with
     /// concurrent tasks, the function must return promptly (well within the
     /// Docker stop_grace_period) rather than blocking on the remaining stream.
     #[tokio::test]
@@ -4463,7 +4466,7 @@ mod tests {
         );
     }
 
-    /// CF-5 (2026-04-27): the trust-state sample-check moved off the
+    /// The trust-state sample-check moved off the
     /// blocking `Path::exists` onto `tokio::fs::try_exists`. Pin the helper:
     /// existing paths are not in the missing set, non-existent paths are.
     #[tokio::test]
@@ -4487,7 +4490,7 @@ mod tests {
         assert_eq!(missing, vec![absent], "only the absent path should surface");
     }
 
-    /// CF-5: an all-empty input yields an empty output (no false positives
+    /// An all-empty input yields an empty output (no false positives
     /// when the sample query returns no rows).
     #[tokio::test]
     async fn sample_missing_paths_empty_input_yields_empty_output() {
@@ -4495,7 +4498,7 @@ mod tests {
         assert!(missing.is_empty());
     }
 
-    /// CF-5: every path absent → every path returned. Pins the inverse of
+    /// Every path absent → every path returned. Pins the inverse of
     /// the happy path so the iteration shape can't drift.
     #[tokio::test]
     async fn sample_missing_paths_all_absent_returns_full_input() {

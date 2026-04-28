@@ -1101,7 +1101,7 @@ async fn build_download_tasks(
 /// filters `ChangeEvent`s to downloadable assets, and feeds them through
 /// the existing download pipeline. Falls back to `SyncMode::Full` if the
 /// token is invalid or expired.
-/// MS-6: minimum age (seconds) a `.part` file must have before
+/// Minimum age (seconds) a `.part` file must have before
 /// `cleanup_orphan_part_files` will remove it, regardless of whether the
 /// file is older than `last_sync_completed`. Defends against the
 /// multi-process race where a *different* kei instance (different data dir,
@@ -1119,11 +1119,11 @@ const PART_FILE_RECENT_GRACE_SECS: i64 = 10 * 60;
 /// Walk a tree rooted at `root`, removing files whose name ends with
 /// `suffix` and whose mtime is older than `cutoff_secs`. Files whose
 /// mtime is within the last `recent_grace_secs` of `now_secs` are spared
-/// regardless of `cutoff_secs` (MS-6). Returns the count of removed files.
+/// regardless of `cutoff_secs`. Returns the count of removed files.
 /// A `read_dir` failure on any subdirectory logs a `warn!` and skips that
 /// subtree -- the original code swallowed the error silently, leaving
 /// operators without a breadcrumb when transient FS hiccups (e.g. an
-/// unmount mid-walk) prevented cleanup (CF-3).
+/// unmount mid-walk) prevented cleanup.
 fn walk_and_remove_orphan_parts(
     root: std::path::PathBuf,
     suffix: &str,
@@ -1149,36 +1149,36 @@ fn walk_and_remove_orphan_parts(
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(suffix) {
-                    if let Ok(meta) = path.metadata() {
-                        if let Ok(mtime) = meta.modified() {
-                            let mtime_secs = mtime
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(0);
-                            // MS-6: spare freshly-touched .parts even when
-                            // they predate `last_sync_completed`. Another
-                            // kei process targeting the same download dir
-                            // (different data dir) might be actively
-                            // resuming this file; deleting it mid-retry
-                            // would force a restart-from-zero next attempt.
-                            //
-                            // `recent_grace_secs <= 0` disables the gate
-                            // (for tests that exercise the cutoff branch
-                            // in isolation; production always passes the
-                            // PART_FILE_RECENT_GRACE_SECS constant).
-                            let is_recently_touched = recent_grace_secs > 0
-                                && mtime_secs > now_secs.saturating_sub(recent_grace_secs);
-                            if !is_recently_touched
-                                && mtime_secs < cutoff_secs
-                                && std::fs::remove_file(&path).is_ok()
-                            {
-                                cleaned += 1;
-                            }
-                        }
-                    }
-                }
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(suffix) {
+                continue;
+            }
+            let Ok(meta) = path.metadata() else { continue };
+            let Ok(mtime) = meta.modified() else { continue };
+            let mtime_secs = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // Spare freshly-touched .parts even when they predate
+            // `last_sync_completed`. Another kei process targeting the same
+            // download dir (different data dir) might be actively resuming
+            // this file; deleting it mid-retry would force a
+            // restart-from-zero next attempt.
+            //
+            // `recent_grace_secs <= 0` disables the gate (for tests that
+            // exercise the cutoff branch in isolation; production always
+            // passes the PART_FILE_RECENT_GRACE_SECS constant).
+            let is_recently_touched =
+                recent_grace_secs > 0 && mtime_secs > now_secs.saturating_sub(recent_grace_secs);
+            if is_recently_touched || mtime_secs >= cutoff_secs {
+                continue;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                cleaned += 1;
             }
         }
     }
@@ -1415,26 +1415,6 @@ fn fold_pass_count_results(
     (counts, errors)
 }
 
-/// NB-4: should the per-zone `enum_in_progress` marker be cleared at the
-/// end of this full-enumeration cycle?
-///
-/// Returns `true` when the producer reached the natural end of the API
-/// stream (so any change events the cycle saw will land cleanly in the
-/// state DB). Pre-fix, the gate keyed on `!stats.interrupted`, which
-/// already covered the shutdown / auth-error-threshold / panic cases but
-/// silently kept the marker set after a partial-failure cycle whose
-/// enumeration phase finished normally — operators saw a perpetual
-/// "Prior full enumeration was interrupted" warning at startup until they
-/// happened to run a clean full sync.
-///
-/// The new contract: clear the marker when enumeration *finished* (the
-/// stream returned None), regardless of how many downstream downloads
-/// failed. Shutdown still suppresses the clear because the producer's
-/// cancellation path leaves `enumeration_complete = false`.
-pub(super) fn should_clear_enum_progress_marker(enumeration_complete: bool) -> bool {
-    enumeration_complete
-}
-
 /// Classification of how the producer-observed asset count compared with the
 /// pre-enumeration API total. Drives the two-tier pagination-undercount gate.
 ///
@@ -1533,7 +1513,7 @@ async fn download_photos_full_with_token(
     let (mut streaming_result, token_receivers) = if needs_per_pass {
         let pass_configs = build_pass_configs(passes, config);
         let mut combined_result = StreamingResult {
-            // NB-4: enumeration is "complete" only when every pass finished
+            // Enumeration is "complete" only when every pass finished
             // its stream cleanly. Start optimistic; flip to false on the
             // first pass that ended early (shutdown, channel-close, or
             // panic) so the marker stays set and the next startup logs
@@ -1572,7 +1552,7 @@ async fn download_photos_full_with_token(
             combined_result.enumeration_errors += result.enumeration_errors;
             combined_result.assets_seen += result.assets_seen;
             combined_result.skip_summary += result.skip_summary;
-            // NB-4: AND-fold across passes so a single pass aborting (e.g.
+            // AND-fold across passes so a single pass aborting (e.g.
             // producer-channel close, panic) leaves the marker set.
             combined_result.enumeration_complete =
                 combined_result.enumeration_complete && result.enumeration_complete;
@@ -1621,7 +1601,7 @@ async fn download_photos_full_with_token(
     // tally so `build_download_outcome` returns `PartialFailure`. This is the
     // signal `should_store_sync_token` reads to suppress token advancement.
     streaming_result.enumeration_errors += len_errors;
-    // NB-4: a `len()` failure on any pass means we never had a reliable
+    // A `len()` failure on any pass means we never had a reliable
     // total to enumerate against, so the per-zone enumeration marker must
     // stay set even if the producer drained its (possibly truncated) stream.
     if len_errors > 0 {
@@ -1676,7 +1656,7 @@ async fn download_photos_full_with_token(
         }
     }
 
-    // NB-4: capture the enumeration-complete signal before
+    // Capture the enumeration-complete signal before
     // `build_download_outcome` consumes `streaming_result`. The marker
     // gate below uses this signal directly so a partial-failure run
     // whose enumeration phase finished still clears the marker.
@@ -1694,10 +1674,12 @@ async fn download_photos_full_with_token(
     .await?;
 
     // Clear enumeration-in-progress markers when the producer reached the
-    // natural end of the API stream (NB-4). The gate ignores
-    // download-side failures so a partial-failure cycle whose enumeration
-    // finished doesn't leave the marker set forever.
-    if should_clear_enum_progress_marker(enumeration_complete) {
+    // natural end of the API stream. The gate ignores download-side
+    // failures so a partial-failure cycle whose enumeration finished
+    // doesn't leave the marker set forever. Shutdown still suppresses the
+    // clear because the producer's cancellation path leaves
+    // `enumeration_complete = false`.
+    if enumeration_complete {
         if let Some(db) = &config.state_db {
             for zone in &enum_zones {
                 if let Err(e) = db.end_enum_progress(zone).await {
@@ -3629,7 +3611,7 @@ mod tests {
         );
     }
 
-    // ── CG-1d (mutation-pinning sibling): operator inversion ──────────
+    // ── Mutation-pinning sibling: operator inversion ──────────
     //
     // The existing tests already assert the decision (Some(true) /
     // Some(false)), not just field equality. What's missing is a test
@@ -3893,7 +3875,7 @@ mod tests {
         );
     }
 
-    /// ADV-1 (2026-04-27): a transient `pass.album.len()` failure must not
+    /// A transient `pass.album.len()` failure must not
     /// reduce to a 0-count that silently advances the sync token. Folding
     /// the per-pass results must surface the failure as an error count so
     /// downstream gates can suppress token advancement.
@@ -3974,39 +3956,7 @@ mod tests {
         assert_eq!(errors, 2);
     }
 
-    /// NB-4: a cycle whose producer reached the natural end of the API
-    /// stream MUST clear the `enum_in_progress` marker, even if downstream
-    /// downloads partially failed. Pre-fix the gate keyed on
-    /// `!stats.interrupted`, which silently kept the marker set when an
-    /// enumeration error didn't propagate to `interrupted`; operators saw
-    /// a perpetual "Prior full enumeration was interrupted" warning.
-    #[test]
-    fn enum_progress_marker_clears_when_enumeration_finishes_with_partial_failures() {
-        // The gate takes a single boolean — the per-zone marker clears
-        // iff the producer reached the natural end of the API stream.
-        // Downstream download failures are intentionally not in the
-        // signal: they're a separate failure class.
-        assert!(
-            should_clear_enum_progress_marker(true),
-            "enumeration_complete=true must clear the marker even when \
-             downstream downloads partially failed"
-        );
-    }
-
-    /// NB-4 companion: shutdown triggered mid-enumeration leaves
-    /// `enumeration_complete=false`, and the marker MUST stay set so the
-    /// next startup logs the interruption to the operator.
-    #[test]
-    fn enum_progress_marker_stays_set_when_shutdown_triggered_mid_enumeration() {
-        assert!(
-            !should_clear_enum_progress_marker(false),
-            "enumeration_complete=false (shutdown / channel-close / panic / \
-             len() failure) must keep the marker set so the operator sees \
-             the interruption on next startup"
-        );
-    }
-
-    /// NB-4: per-pass mode AND-folds `enumeration_complete` across passes.
+    /// Per-pass mode AND-folds `enumeration_complete` across passes.
     /// The first pass that aborts must drop the cycle's flag to false. The
     /// `&&=` semantics are subtle (especially around the empty-passes case)
     /// so this test pins the truth table.
@@ -4038,7 +3988,7 @@ mod tests {
         assert!(!combined, "no passes → marker stays set");
     }
 
-    /// MS-1: pagination undercount classifier — exact match returns Match.
+    /// Pagination undercount classifier — exact match returns Match.
     /// Token must advance silently when the producer saw at least as many
     /// assets as the API reported.
     #[test]
@@ -4047,7 +3997,7 @@ mod tests {
         assert_eq!(decision, PaginationShortfall::Match);
     }
 
-    /// MS-1: a 1% undercount (within 5% tolerance) classifies as
+    /// A 1% undercount (within 5% tolerance) classifies as
     /// `WithinTolerance` so the caller emits a `warn!` but still advances the
     /// sync token. This is the visible-but-non-blocking layer that closes the
     /// pre-existing 4%-silent-drop gap (the prior gate fired only at >=5%).
@@ -4063,7 +4013,7 @@ mod tests {
         );
     }
 
-    /// MS-1: a 4% undercount (still within 5% tolerance) classifies as
+    /// A 4% undercount (still within 5% tolerance) classifies as
     /// `WithinTolerance`. Pre-fix this slipped through silently with no log;
     /// post-fix the `warn!` makes the drift visible before it grows past 5%.
     #[test]
@@ -4076,7 +4026,7 @@ mod tests {
         );
     }
 
-    /// MS-1: a 6% undercount crosses the 5% threshold and must `Suppress` so
+    /// A 6% undercount crosses the 5% threshold and must `Suppress` so
     /// the sync token is held back, forcing full re-enumeration on the next
     /// run rather than skipping the missing change events forever.
     #[test]
@@ -4087,7 +4037,7 @@ mod tests {
         assert_eq!(decision, PaginationShortfall::Suppress);
     }
 
-    /// MS-1: boundary case at exactly 5% shortfall. `total * 95 / 100 = 950`,
+    /// Boundary case at exactly 5% shortfall. `total * 95 / 100 = 950`,
     /// and seen == 950 is NOT below the threshold, so it stays in
     /// `WithinTolerance` (the gate is strict less-than). Pinning this so a
     /// future tweak to the threshold math doesn't flip the boundary silently.
@@ -4100,7 +4050,7 @@ mod tests {
         );
     }
 
-    /// CF-3 (2026-04-27): the orphan-part walk must remove .part files older
+    /// The orphan-part walk must remove .part files older
     /// than the cutoff and leave non-matching files alone. To avoid
     /// depending on a third-party mtime crate, drive the cutoff itself: a
     /// cutoff far in the future treats every just-created file as "older",
@@ -4122,7 +4072,7 @@ mod tests {
         File::create(&unrelated).unwrap().write_all(b"x").unwrap();
 
         // Cutoff far in the future -> the just-created .part is "older".
-        // `now=0, recent_grace=0` disables the MS-6 grace check so this test
+        // `now=0, recent_grace=0` disables the recent-grace check so this test
         // continues to exercise the cutoff-only behaviour.
         let future = i64::MAX / 2;
         let cleaned = walk_and_remove_orphan_parts(dir.path().to_path_buf(), ".part", future, 0, 0);
@@ -4137,7 +4087,7 @@ mod tests {
         assert!(part.exists());
     }
 
-    /// CF-3: a directory the process cannot read must NOT panic the walk
+    /// A directory the process cannot read must NOT panic the walk
     /// and MUST NOT abort it. With the fix in place the walk emits a
     /// `warn!` for the failed `read_dir` and continues; pre-fix it
     /// silently swallowed the error and produced no log breadcrumb. We
@@ -4182,13 +4132,13 @@ mod tests {
         assert!(!part.exists());
     }
 
-    /// MS-6: a `.part` file whose mtime is within `recent_grace_secs` of
+    /// A `.part` file whose mtime is within `recent_grace_secs` of
     /// `now_secs` must be spared even when the cutoff says it's older than
     /// `last_sync_completed`. Defends against the multi-process race where
     /// a different kei instance is actively resuming a `.part` between
     /// retries.
     ///
-    /// Drives the cutoff parameter directly (CF-3 pattern) to avoid taking
+    /// Drives the cutoff parameter directly to avoid taking
     /// a runtime dependency on a filetime crate.
     #[test]
     fn walk_and_remove_orphan_parts_spares_recently_touched_files() {
@@ -4254,7 +4204,7 @@ mod tests {
         assert!(!old_part.exists());
     }
 
-    /// MS-6: when the cutoff says "delete" but only one of two `.part`
+    /// When the cutoff says "delete" but only one of two `.part`
     /// files is in the recent-grace window, the test fixture mimics the
     /// task-spec setup: one mtime ~now, one mtime far in the past. Drive
     /// the times via the `now_secs` and `cutoff_secs` parameters since

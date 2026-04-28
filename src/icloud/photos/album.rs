@@ -1244,7 +1244,7 @@ mod tests {
 
     // --- pagination edge case tests ---
 
-    /// CF-1: When a page returns only CPLAsset records (no CPLMaster), the
+    /// When a page returns only CPLAsset records (no CPLMaster), the
     /// fetcher must advance the offset and continue to subsequent pages
     /// instead of terminating prematurely.
     #[tokio::test]
@@ -1327,7 +1327,7 @@ mod tests {
         );
     }
 
-    /// Robustness regression for CF-2 (2026-04-25 review): a contiguous
+    /// Robustness regression for empty-page-run truncation: a contiguous
     /// run of fully-deleted records aligned to the page boundary used to
     /// truncate enumeration after 2 empty probes, leaving real assets
     /// past the run silently absent. With `MAX_EMPTY_PAGE_PROBES = 5`,

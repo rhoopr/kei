@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(truncate_library_zone(""), "");
     }
 
-    /// CG-2 (adversarial): two distinct SharedSync zones whose UUIDs
+    /// Adversarial: two distinct SharedSync zones whose UUIDs
     /// share the leading 8 hex chars produce the same truncated form.
     /// The current implementation has no collision guard, so any
     /// `{library}` token rendered for both would land at the same path
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(truncate_library_zone(zone_a), truncate_library_zone(zone_b));
     }
 
-    /// CG-3 (adversarial, refined): `expand_named_token` with
+    /// Adversarial, refined: `expand_named_token` with
     /// `{library}` and an empty zone name must collapse to the empty
     /// segment branch. Pin the **exact** resulting string so a
     /// regression that silently inserts a literal `empty` token (or

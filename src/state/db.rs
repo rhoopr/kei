@@ -3699,7 +3699,7 @@ mod tests {
         assert_eq!(summary.total_assets, 0);
     }
 
-    /// Robustness review NB-1 (2026-04-25): a `mark_downloaded` call
+    /// A `mark_downloaded` call
     /// without a prior `upsert_seen` is self-healing in 1 cycle, but a
     /// regression that increases the rate (producer-dispatch invariant
     /// quietly broken) needs to be visible in /metrics rather than only
@@ -3729,7 +3729,7 @@ mod tests {
         );
     }
 
-    /// CF-4 (2026-04-27): a `mark_failed` call without a prior `upsert_seen`
+    /// A `mark_failed` call without a prior `upsert_seen`
     /// is a producer-dispatch invariant violation. The function preserves
     /// the documented contract (returns Ok with 0 rows affected; does NOT
     /// error) so callers don't crash on a buggy code path, but the failure

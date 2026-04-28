@@ -876,7 +876,7 @@ mod tests {
 
     // ── Round-trip via to_raw() ────────────────────────────────────────
     //
-    // CG-1, CG-1b, CG-1c: serialization round-trips.
+    // Serialization round-trips.
     //
     // `to_raw()` is consumed by `report.rs`, `Config::to_toml()`, and
     // `download/mod.rs::compute_config_hash()`. A swapped `included`/
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn selection_library_all_with_exclusion_round_trips() {
-        // CG-1b: `LibrarySelector::to_raw()` collapses to `all` when both
+        // `LibrarySelector::to_raw()` collapses to `all` when both
         // primary and shared_all are set with no named zones. A dropped
         // exclusion under that branch would silently change which zones
         // sync after a TOML round-trip.
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn selection_full_round_trip_via_build_selection() {
-        // CG-1c: take a non-default `Selection`, run every field through
+        // Take a non-default `Selection`, run every field through
         // `to_raw()`, feed back through `build_selection`, assert equal.
         // A future refactor that drops one `to_raw()` branch (e.g.
         // forgets `unfiled` because there's no `to_raw()` for it) lands
@@ -1019,7 +1019,7 @@ mod tests {
 
     // ── Bare exclusion with default_to_all = false ────────────────────
     //
-    // CG-9: `parse_album_selector(["!Family"], false)` is not directly
+    // `parse_album_selector(["!Family"], false)` is not directly
     // tested. The implementation always returns `All { excluded }` for an
     // exclusion-only input regardless of `default_to_all`; pin that so a
     // future refactor that ties exclusions to `default_to_all` lands red.

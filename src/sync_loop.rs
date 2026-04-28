@@ -45,7 +45,7 @@ struct LibraryState {
     /// the unfiled pass), so any cycle that consumes a stale plan must not
     /// advance the sync token for any zone -- doing so would skip the
     /// change events those assets generated and leave `asset_albums`
-    /// permanently incomplete (CF-1).
+    /// permanently incomplete.
     plan_is_stale: bool,
 }
 
@@ -678,7 +678,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     let mut health = health::HealthStatus::new();
     let mut consecutive_album_refresh_failures = 0u32;
-    // 1-based cycle counter for periodic-reconcile cadence (MS-4). Logged at
+    // 1-based cycle counter for periodic-reconcile cadence. Logged at
     // cycle start so an operator chasing missed reconciliation runs has a
     // breadcrumb. Cycle 1 is the first iteration of this loop, cycle 2 is the
     // first re-entry under `--watch`, etc.
@@ -935,7 +935,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
         }
 
-        // MS-4: periodic local-vs-state reconciliation. Read-only walk that
+        // Periodic local-vs-state reconciliation. Read-only walk that
         // surfaces missing files via `tracing::warn!`. State rows are NEVER
         // mutated here -- the manual `kei reconcile` subcommand still owns
         // the failed-status transition. Long-running daemons drift between
@@ -992,7 +992,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     Err(e) => {
                         consecutive_album_refresh_failures += 1;
                         // Mark the plan stale so the NEXT cycle's token
-                        // storage gate can suppress advancement. CF-1.
+                        // storage gate can suppress advancement.
                         lib_state.plan_is_stale = true;
                         if consecutive_album_refresh_failures >= 3 {
                             tracing::error!(
@@ -1114,12 +1114,12 @@ async fn reauth_with_srp(
 /// The contract is "advance only on full success and not in dry-run":
 /// - On `PartialFailure`, a stored token would skip the failed assets on the
 ///   next incremental sync (they'd never appear in the delta again -- silent
-///   data loss). CG-9.
+///   data loss).
 /// - On `SessionExpired`, the cycle aborts mid-stream; the token may be
 ///   stale or only reflect a subset of the work.
 /// - In `--dry-run`, we promise to make no DB writes that survive the run
 ///   (apart from the `sync_runs` ledger). Advancing the token here would
-///   silently break the next real sync. CG-21.
+///   silently break the next real sync.
 ///
 /// The returned bool is the gate: callers still check that `sync_token` is
 /// `Some(_)` and that a state DB is configured before persisting.
@@ -1130,7 +1130,7 @@ pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_r
 /// Cycle-level gate that combines the per-library outcome check with the
 /// cross-library "any plan is stale" override.
 ///
-/// CF-1: if any library entered the cycle with a reused plan (the prior
+/// If any library entered the cycle with a reused plan (the prior
 /// album refresh failed), suppress sync-token advancement for every library
 /// in the cycle. A stale plan can route assets created or moved between
 /// cycles to the wrong pass; advancing the token would skip the change
@@ -1144,7 +1144,7 @@ pub(crate) fn should_store_sync_token_for_cycle(
     should_store_sync_token(outcome, dry_run) && !cycle_has_stale_plan
 }
 
-/// MS-4: walk every `downloaded` row in the state DB and warn when the
+/// Walk every `downloaded` row in the state DB and warn when the
 /// recorded `local_path` is missing on disk. Read-only — no rows are mutated
 /// (the manual `kei reconcile` CLI still owns the `downloaded -> failed`
 /// transition). Triggered on a fixed cadence by the watch loop; surfaces
@@ -1202,7 +1202,7 @@ async fn run_periodic_reconcile(db: &dyn state::StateDb, cycle_index: u64) {
     }
 }
 
-/// MS-4: should this watch cycle run a periodic local-vs-state reconciliation?
+/// Should this watch cycle run a periodic local-vs-state reconciliation?
 ///
 /// Returns `true` for the very first cycle whose 1-based index is a multiple
 /// of `every_n` (e.g. `every_n = 24` fires on cycle 24, 48, ...). The first
@@ -1229,7 +1229,7 @@ pub(crate) fn should_reconcile_this_cycle(cycle_index: u64, every_n: Option<u64>
 ///
 /// In **one-shot mode** there is nothing to wait on -- the caller (a CI run,
 /// a cron, the systemd unit's first start) needs the error so it can exit
-/// non-zero and the operator can run `kei login get-code`. CG-19.
+/// non-zero and the operator can run `kei login get-code`.
 ///
 /// Note that the **entry-point** auth path (`run_sync`'s initial
 /// `auth::authenticate` call) intentionally does NOT use this predicate --
@@ -1270,7 +1270,7 @@ async fn run_cycle(
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
 
-    // CF-1: if ANY library entered the cycle with a stale plan (the prior
+    // If ANY library entered the cycle with a stale plan (the prior
     // album refresh failed and the previous plan is being reused), suppress
     // sync-token advancement for every library in this cycle. A reused plan
     // can route assets created or moved between cycles to the wrong pass and
@@ -1965,7 +1965,7 @@ mod tests {
         Arc::new(state::SqliteStateDb::open_in_memory().expect("open in-memory state DB"))
     }
 
-    /// CG-1: `is_retry_failed=true` MUST force `SyncMode::Full` even when a
+    /// `is_retry_failed=true` MUST force `SyncMode::Full` even when a
     /// sync token is stored. A regression that picked Incremental during
     /// retry-failed would silently skip the previously-failed assets the
     /// user explicitly asked to retry — silent data loss.
@@ -1994,7 +1994,7 @@ mod tests {
         );
     }
 
-    /// CG-2: `--no-incremental` MUST force `SyncMode::Full`, ignoring any
+    /// `--no-incremental` MUST force `SyncMode::Full`, ignoring any
     /// stored token. The flag exists so a user can deliberately re-enumerate
     /// (e.g. after a known incremental drift); silently downgrading would
     /// betray that contract.
@@ -2022,7 +2022,7 @@ mod tests {
         );
     }
 
-    /// CG-3: an empty stored token must fall back to Full. Production
+    /// An empty stored token must fall back to Full. Production
     /// guards on `!token.is_empty()`; if a refactor flipped that check the
     /// caller would request `changes/zone` with empty token and silently
     /// drop pending events.
@@ -2071,7 +2071,7 @@ mod tests {
         );
     }
 
-    /// CG-4: when the state DB read fails, fall back to Full rather than
+    /// When the state DB read fails, fall back to Full rather than
     /// propagating. The watch loop must keep going even if sqlite hiccups —
     /// silently biasing toward Incremental on errors would mask data loss.
     ///
@@ -2386,7 +2386,7 @@ mod tests {
         }
     }
 
-    /// CG-5: `more_coming=true` with empty zones must NOT skip the cycle.
+    /// `more_coming=true` with empty zones must NOT skip the cycle.
     /// Production logic: `if zones.is_empty() && !more_coming { skip }`.
     /// A regression that flipped the conjunction would silently skip every
     /// page-bearing wakeup — silent loss of pending changes.
@@ -2429,7 +2429,7 @@ mod tests {
         assert_eq!(stored, "db-tok-2");
     }
 
-    /// CG-6: empty zones + `more_coming=false` must return `skip=true`.
+    /// Empty zones + `more_coming=false` must return `skip=true`.
     /// This is the optimistic short-circuit: Apple confirmed there are no
     /// pending changes, so we save a full enumeration cycle. A regression
     /// that flipped this branch would either burn a CloudKit query per
@@ -2468,7 +2468,7 @@ mod tests {
         assert_eq!(stored, "db-tok-3");
     }
 
-    /// Companion to CG-6: a non-empty zones list MUST NOT skip — even
+    /// A non-empty zones list MUST NOT skip — even
     /// when more_coming=false. This is the real-work path; pinning it
     /// alongside the skip path catches a flipped branch in either
     /// direction.
@@ -2498,7 +2498,7 @@ mod tests {
         assert!(!skip, "zones-present response must not skip the cycle");
     }
 
-    /// CG-6 corner: no stored sync token at all must return false (don't
+    /// No stored sync token at all must return false (don't
     /// skip) without making the HTTP call. Pinning this prevents a future
     /// refactor that flipped the early return from silently consuming an
     /// Apple call slot on bootstrap.
@@ -2518,7 +2518,7 @@ mod tests {
         assert!(!skip, "no stored token must skip-result false (continue)");
     }
 
-    /// CG-7: a `set_metadata("db_sync_token", ...)` write failure must
+    /// A `set_metadata("db_sync_token", ...)` write failure must
     /// NOT break the cycle. The current implementation logs a warning and
     /// continues. A regression that propagated the error would crash watch
     /// mode whenever a sqlite hiccup hit that single write.
@@ -2818,12 +2818,12 @@ mod tests {
 
     // ── preload_asset_groupings ──────────────────────────────────────
     //
-    // CG-8: `preload_asset_groupings` must be best-effort: a hiccup
+    // `preload_asset_groupings` must be best-effort: a hiccup
     // loading people must NOT empty the albums map, and vice versa.
     // XMP-sidecar runs read this struct; biasing the entire grouping
     // empty would silently strip metadata from every downloaded photo.
 
-    /// CG-8: when `get_all_asset_albums` succeeds but
+    /// When `get_all_asset_albums` succeeds but
     /// `get_all_asset_people` fails, the result still includes albums.
     #[cfg(feature = "xmp")]
     #[tokio::test]
@@ -3113,14 +3113,14 @@ mod tests {
         assert!(groupings.people.is_empty());
     }
 
-    // CG-9 / CG-21: `should_store_sync_token` is the single decision gate
+    // `should_store_sync_token` is the single decision gate
     // protecting the sync-token from being advanced after a partial sync or
     // a dry run. Both situations would lose change events on the next
     // incremental cycle ("user data is sacred"). The matrix below pins every
     // (outcome, dry_run) combination so a future refactor can't relax the
     // contract without a failing test.
 
-    /// CG-9: a partial download failure MUST NOT advance the stored sync
+    /// A partial download failure MUST NOT advance the stored sync
     /// token. Otherwise the next incremental sync would skip past the
     /// failed assets' change events and never retry them.
     #[test]
@@ -3137,7 +3137,7 @@ mod tests {
         );
     }
 
-    /// CG-9 companion: `SessionExpired` is also a non-success outcome and
+    /// `SessionExpired` is also a non-success outcome and
     /// MUST NOT advance the token. The cycle aborts mid-stream; the captured
     /// token may only reflect a subset of the work.
     #[test]
@@ -3149,7 +3149,7 @@ mod tests {
         assert!(!should_store_sync_token(&outcome, true));
     }
 
-    /// CG-21: in `--dry-run`, even a fully-successful pass MUST NOT advance
+    /// In `--dry-run`, even a fully-successful pass MUST NOT advance
     /// the token. Dry-run promises no DB writes that affect the next real
     /// sync; advancing the token would silently break the next incremental.
     #[test]
@@ -3173,7 +3173,7 @@ mod tests {
         );
     }
 
-    /// CF-1 (2026-04-27): a cycle that consumed a stale plan from a prior
+    /// A cycle that consumed a stale plan from a prior
     /// failed `resolve_passes` MUST NOT advance the sync token even when the
     /// per-library outcome is `Success`. A reused plan can route assets to
     /// the wrong pass; advancing the token would skip the change events
@@ -3190,7 +3190,7 @@ mod tests {
         );
     }
 
-    /// CF-1 companion: dry_run and PartialFailure already block; pinning
+    /// Stale-plan companion: dry_run and PartialFailure already block; pinning
     /// the matrix so a future refactor can't silently change the AND/OR
     /// shape of the gate.
     #[test]
@@ -3211,12 +3211,12 @@ mod tests {
         assert!(!should_store_sync_token_for_cycle(&success, false, true));
     }
 
-    // MS-4: periodic reconciliation cadence. The watch loop calls
+    // Periodic reconciliation cadence. The watch loop calls
     // `should_reconcile_this_cycle` once per cycle to decide whether to walk
     // the state DB and warn on missing local files. Tests pin the cadence
     // so a future refactor can't silently disable the schedule.
 
-    /// MS-4: when `every_n` is `None`, the predicate must NEVER fire — this
+    /// When `every_n` is `None`, the predicate must NEVER fire — this
     /// is the default-disabled behaviour for daemons that don't opt into
     /// periodic reconciliation.
     #[test]
@@ -3229,7 +3229,7 @@ mod tests {
         }
     }
 
-    /// MS-4: `Some(0)` is treated identically to `None` — the config
+    /// `Some(0)` is treated identically to `None` — the config
     /// resolver also filters this case, but the predicate is the load-bearing
     /// gate so we pin both spellings here.
     #[test]
@@ -3242,7 +3242,7 @@ mod tests {
         }
     }
 
-    /// MS-4: the first firing must be at cycle == every_n, NOT cycle 0 or
+    /// The first firing must be at cycle == every_n, NOT cycle 0 or
     /// cycle 1. A freshly-started daemon must run at least one full sync
     /// before burning startup time on a state-DB walk.
     #[test]
@@ -3266,7 +3266,7 @@ mod tests {
         );
     }
 
-    /// MS-4: subsequent firings must repeat at every multiple of `every_n`.
+    /// Subsequent firings must repeat at every multiple of `every_n`.
     /// Pinning a few cycles past the first firing guards against an
     /// off-by-one that lets the cadence drift over a long run.
     #[test]
@@ -3286,7 +3286,7 @@ mod tests {
         }
     }
 
-    /// MS-4: `every_n=1` makes every cycle trigger reconciliation. Allowed
+    /// `every_n=1` makes every cycle trigger reconciliation. Allowed
     /// (chatty but not a bug) and pinned because users debugging a drift
     /// suspicion are likely to set it to 1 temporarily.
     #[test]
@@ -3301,12 +3301,12 @@ mod tests {
         assert!(!should_reconcile_this_cycle(0, Some(1)));
     }
 
-    // CG-19: `should_wait_for_2fa` decides whether the reauth-time 2FA
+    // `should_wait_for_2fa` decides whether the reauth-time 2FA
     // branch parks the loop on a code prompt or surfaces the error. In
     // one-shot mode there is no operator at the keyboard; the error MUST
     // bubble up so cron / systemd / CI exits non-zero.
 
-    /// CG-19: a 2FA-required error in one-shot (`is_watch_mode = false`)
+    /// A 2FA-required error in one-shot (`is_watch_mode = false`)
     /// MUST NOT cause the helper to return `true`. The caller will then
     /// surface the error to the user instead of blocking forever on a
     /// 2FA prompt that no one is watching.
@@ -3319,7 +3319,7 @@ mod tests {
         );
     }
 
-    /// CG-19 companion: in watch mode the same error is recoverable;
+    /// In watch mode the same error is recoverable;
     /// the helper returns `true` so the loop can park.
     #[test]
     fn run_sync_2fa_required_in_watch_mode_waits() {
