@@ -234,6 +234,7 @@ pub(super) async fn add_asset_album_with_retry(
     album_name: &str,
     source: &str,
 ) -> Result<(), crate::state::error::StateError> {
+    let mut last_err: Option<crate::state::error::StateError> = None;
     for attempt in 1..=ADD_ASSET_ALBUM_MAX_RETRIES {
         match db.add_asset_album(asset_id, album_name, source).await {
             Ok(()) => return Ok(()),
@@ -248,16 +249,26 @@ pub(super) async fn add_asset_album_with_retry(
                     );
                     let base_ms = 200u64 * u64::from(1u32 << (attempt - 1));
                     tokio::time::sleep(Duration::from_millis(base_ms)).await;
-                } else {
-                    return Err(e);
                 }
+                last_err = Some(e);
             }
         }
     }
-    // Unreachable because the loop returns on every iteration once `attempt`
-    // hits the cap, but the borrow checker doesn't know that.
-    unreachable!("add_asset_album_with_retry exited the retry loop without returning")
+    // ADD_ASSET_ALBUM_MAX_RETRIES is `>= 1` (compile-time-checked below) so
+    // `last_err` is always populated when the loop exits. The fallback to
+    // `LockPoisoned` is a defensive landing the type system can't otherwise
+    // statically rule out.
+    Err(last_err.unwrap_or_else(|| {
+        crate::state::error::StateError::LockPoisoned(
+            "add_asset_album_with_retry: no attempts ran".into(),
+        )
+    }))
 }
+
+const _: () = assert!(
+    ADD_ASSET_ALBUM_MAX_RETRIES >= 1,
+    "ADD_ASSET_ALBUM_MAX_RETRIES must be at least 1; otherwise the retry helper never calls the DB"
+);
 
 /// Minimum pending-queue size at which a 100% flush failure rate is treated
 /// as "state DB unwritable" rather than a transient lock race. Five is large
