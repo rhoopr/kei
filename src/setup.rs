@@ -657,6 +657,10 @@ fn generate_toml(answers: &SetupAnswers) -> String {
     // so wrap the `?`-propagating body in an IIFE and unwrap once at the
     // boundary instead of polluting the public signature with a dead error
     // channel.
+    #[allow(
+        clippy::expect_used,
+        reason = "fmt::Write for String is infallible; the IIFE only carries `?` so writeln! calls compile cleanly"
+    )]
     (|| -> Result<String, std::fmt::Error> {
         let mut out = String::with_capacity(2048);
 
