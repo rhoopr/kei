@@ -675,11 +675,9 @@ bitflags::bitflags! {
 impl MetadataFlags {
     /// Set of flags that drive the `.part`-and-modify-before-rename flow.
     /// Sidecar writes happen after the rename so `XMP_SIDECAR` is excluded.
-    const EMBED_MASK: Self = Self::DATETIME
-        .union(Self::RATING)
-        .union(Self::GPS)
-        .union(Self::DESCRIPTION)
-        .union(Self::EMBED_XMP);
+    /// Derived as `all() \ XMP_SIDECAR` so any future embed-style flag
+    /// added to this type is automatically picked up.
+    const EMBED_MASK: Self = Self::all().difference(Self::XMP_SIDECAR);
 
     /// Whether any flag needs the downloaded bytes to stay as a `.part` file
     /// for in-place XMP editing before the atomic rename.
@@ -2263,19 +2261,21 @@ fn plan_sidecar_write(
     payload: &MetadataPayload,
     created_local: &chrono::DateTime<chrono::Local>,
 ) -> super::metadata::MetadataWrite {
-    super::metadata::MetadataWrite {
+    let mut write = super::metadata::MetadataWrite {
         datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
         rating: payload.rating,
         gps: gps_from_payload(payload),
-        title: payload.title.clone(),
-        description: payload.description.clone(),
-        keywords: payload.keywords.clone(),
-        people: payload.people.clone(),
         is_hidden: payload.is_hidden,
         is_archived: payload.is_archived,
-        media_subtype: payload.media_subtype.clone(),
-        burst_id: payload.burst_id.clone(),
-    }
+        ..super::metadata::MetadataWrite::default()
+    };
+    write.title.clone_from(&payload.title);
+    write.description.clone_from(&payload.description);
+    write.keywords.clone_from(&payload.keywords);
+    write.people.clone_from(&payload.people);
+    write.media_subtype.clone_from(&payload.media_subtype);
+    write.burst_id.clone_from(&payload.burst_id);
+    write
 }
 
 /// Plan the embed-path write. Per-tag gates:
@@ -2284,7 +2284,7 @@ fn plan_sidecar_write(
 ///   existing value (probe gate preserves camera-supplied data).
 /// - **rating / description**: flag gate only — iCloud is the source of truth.
 /// - **XMP-only fields** (title, keywords, people, hidden/archived,
-///   media_subtype, burst_id): gated on `embed_xmp`.
+///   media_subtype, burst_id): gated on the `EMBED_XMP` flag.
 #[cfg(feature = "xmp")]
 fn plan_metadata_write(
     flags: MetadataFlags,
