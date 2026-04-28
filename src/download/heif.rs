@@ -127,10 +127,7 @@ pub(crate) fn is_heif_content(bytes: &[u8]) -> bool {
 /// function avoids the problem regardless of when that lands by only
 /// invoking the iinf / iloc decoders we actually need.
 pub(crate) fn extract_xmp_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
-    match extract_xmp_strict(bytes) {
-        Ok(opt) => opt,
-        Err(_) => None,
-    }
+    extract_xmp_strict(bytes).unwrap_or_default()
 }
 
 /// Strict variant of [`extract_xmp_bytes`] that distinguishes "no XMP item
