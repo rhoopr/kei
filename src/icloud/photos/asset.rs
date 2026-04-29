@@ -389,7 +389,8 @@ impl PhotoAsset {
         &self.versions
     }
 
-    /// Get a specific version by size key.
+    /// Get a specific version by size key. Test-only convenience.
+    #[cfg(test)]
     pub fn get_version(&self, key: AssetVersionSize) -> Option<&AssetVersion> {
         self.versions
             .iter()

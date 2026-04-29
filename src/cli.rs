@@ -491,12 +491,37 @@ pub struct ImportArgs {
     pub folder_structure: Option<String>,
 
     /// Keep Unicode in filenames (must match what was used during sync)
-    #[arg(long)]
+    #[arg(long, env = "KEI_KEEP_UNICODE_IN_FILENAMES", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub keep_unicode_in_filenames: Option<bool>,
 
     /// File matching and dedup policy (must match what was used during sync)
     #[arg(long, env = "KEI_FILE_MATCH_POLICY", value_enum)]
     pub file_match_policy: Option<FileMatchPolicy>,
+
+    /// Image size to import (must match what was used during sync). Default: original.
+    #[arg(long, env = "KEI_SIZE", value_enum)]
+    pub size: Option<VersionSize>,
+
+    /// Live photo handling: both, image-only, video-only, skip
+    /// (must match what was used during sync)
+    #[arg(long, env = "KEI_LIVE_PHOTO_MODE", value_enum)]
+    pub live_photo_mode: Option<LivePhotoMode>,
+
+    /// Live photo video size (must match what was used during sync)
+    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum)]
+    pub live_photo_size: Option<LivePhotoSize>,
+
+    /// Live photo MOV filename policy (must match what was used during sync)
+    #[arg(long, env = "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY", value_enum)]
+    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
+
+    /// RAW treatment policy (must match what was used during sync)
+    #[arg(long, env = "KEI_ALIGN_RAW", value_enum)]
+    pub align_raw: Option<RawTreatmentPolicy>,
+
+    /// Only check the requested size (don't fall back to original)
+    #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub force_size: Option<bool>,
 
     /// Number of recent photos to check (`--recent 100`). The `--recent Nd`
     /// days form is only supported in `sync`; import-existing errors on use.

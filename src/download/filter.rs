@@ -23,7 +23,7 @@ use super::DownloadConfig;
 
 /// Reason an asset was filtered out during content/metadata filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FilterReason {
+pub(crate) enum FilterReason {
     ExcludedAlbum,
     MediaType,
     LivePhoto,
@@ -307,7 +307,7 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
 ///
 /// Callers must invoke this before `extract_skip_candidates` or
 /// `filter_asset_to_tasks` to avoid redundant evaluation.
-pub(super) fn is_asset_filtered(
+pub(crate) fn is_asset_filtered(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> Option<FilterReason> {
@@ -406,6 +406,157 @@ pub(super) fn extract_skip_candidates<'a>(
                 VersionSizeKey::from(effective_live_size),
                 v.checksum.as_ref(),
             ));
+        }
+    }
+
+    result
+}
+
+/// One file sync would write for an asset, with the metadata `import-existing`
+/// needs to match it against the local filesystem.
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedAssetPath {
+    /// Absolute path the file would land at, before any collision/dedup suffix.
+    pub(crate) path: PathBuf,
+    /// Byte size iCloud reports for this version. Used as the strict-match key.
+    pub(crate) size: u64,
+    /// iCloud-side checksum (CloudKit format, not SHA256).
+    pub(crate) checksum: Box<str>,
+    /// Which version this is (Original, LiveOriginal, Medium, ...). Drives the
+    /// state-DB row key and `MediaType` classification.
+    pub(crate) version_size: VersionSizeKey,
+}
+
+/// Compute the file paths sync would produce for an asset under the given
+/// config, without doing collision resolution or disk I/O.
+///
+/// Returns up to two entries: the primary version and an optional live-photo
+/// MOV companion. Returns empty when the asset has no version sync would
+/// download (e.g. `force_size` set + size unavailable, or a live-photo
+/// image-only/skip mode with no primary).
+///
+/// Caller must invoke [`is_asset_filtered`] first to apply content/date
+/// filters; this function only handles version selection + filename derivation.
+///
+/// Used by `import-existing` to find files on disk; sync's
+/// [`filter_asset_to_tasks`] is the source of truth and adds collision
+/// resolution + DownloadTask wiring on top of the same derivation chain.
+pub(crate) fn expected_paths_for(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> SmallVec<[ExpectedAssetPath; 2]> {
+    let is_live_photo = asset.is_live_photo();
+
+    let fallback_filename;
+    let raw_filename = if let Some(f) = asset.filename() {
+        f
+    } else {
+        let asset_type = asset
+            .versions()
+            .first()
+            .map_or("", |(_, v)| v.asset_type.as_ref());
+        fallback_filename = paths::generate_fingerprint_filename(asset.id(), asset_type);
+        &fallback_filename
+    };
+    let base_filename: String = if config.keep_unicode_in_filenames {
+        raw_filename.to_string()
+    } else {
+        paths::remove_unicode_chars(raw_filename).into_owned()
+    };
+
+    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+    let versions = apply_raw_policy(asset.versions(), config.align_raw);
+    let mut result = SmallVec::new();
+    let mut effective_primary_filename: Option<String> = None;
+
+    // LivePhotoMode::Skip drops the live photo entirely (image + MOV) per the
+    // type's contract; emitting a primary path would make import-existing scan
+    // for a file sync never wrote and report it unmatched. Bail before version
+    // selection so the result stays empty for the live-photo case.
+    if config.live_photo_mode == LivePhotoMode::Skip && is_live_photo {
+        return result;
+    }
+
+    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
+        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    };
+
+    let (primary, effective_size) = match version_with_fallback(
+        &get_version,
+        config.size,
+        AssetVersionSize::Original,
+        config.force_size,
+    ) {
+        Some((v, s)) => (Some(v), s),
+        None => (None, config.size),
+    };
+    let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
+
+    if let Some(version) = primary.filter(|_| !skip_primary) {
+        let mapped = paths::map_filename_extension(&base_filename, &version.asset_type);
+        let sized = match effective_size {
+            AssetVersionSize::Medium => paths::insert_suffix(&mapped, "medium"),
+            AssetVersionSize::Thumb => paths::insert_suffix(&mapped, "thumb"),
+            _ => mapped,
+        };
+        let filename = match config.file_match_policy {
+            FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized, asset.id()),
+            FileMatchPolicy::NameSizeDedupWithSuffix => sized,
+        };
+        let path = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &created_local,
+            &filename,
+            config.album_name.as_deref(),
+        );
+        effective_primary_filename = Some(filename);
+        result.push(ExpectedAssetPath {
+            path,
+            size: version.size,
+            checksum: version.checksum.clone(),
+            version_size: VersionSizeKey::from(effective_size),
+        });
+    }
+
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Both | LivePhotoMode::VideoOnly
+    ) && asset.item_type() == Some(AssetItemType::Image)
+    {
+        let live = version_with_fallback(
+            &get_version,
+            config.live_photo_size,
+            AssetVersionSize::LiveOriginal,
+            config.force_size,
+        );
+        if let Some((live_version, effective_live_size)) = live {
+            let live_base = match config.file_match_policy {
+                FileMatchPolicy::NameId7 => paths::apply_name_id7(&base_filename, asset.id()),
+                FileMatchPolicy::NameSizeDedupWithSuffix => effective_primary_filename
+                    .as_deref()
+                    .unwrap_or(&base_filename)
+                    .to_string(),
+            };
+            let mov_filename = match config.live_photo_mov_filename_policy {
+                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
+                LivePhotoMovFilenamePolicy::Original => {
+                    paths::live_photo_mov_path_original(&live_base)
+                }
+            };
+            let mov_path = paths::local_download_path(
+                &config.directory,
+                &config.folder_structure,
+                &created_local,
+                &mov_filename,
+                config.album_name.as_deref(),
+            );
+            result.push(ExpectedAssetPath {
+                path: mov_path,
+                size: live_version.size,
+                checksum: live_version.checksum.clone(),
+                version_size: VersionSizeKey::from(effective_live_size),
+            });
         }
     }
 
@@ -894,6 +1045,579 @@ mod tests {
         assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "abc123");
         assert_eq!(tasks[0].size, 1000);
+    }
+
+    // ── expected_paths_for tests ────────────────────────────────────────
+    //
+    // These cover `import-existing`'s view of sync's filename derivation:
+    // file_match_policy, size suffix, live photo MOV companion, raw alignment,
+    // force_size, keep_unicode. Sync's `filter_asset_to_tasks` is the source
+    // of truth; collision/dedup-suffix handling is intentionally NOT replayed
+    // here (callers don't have claimed_paths state to consult).
+
+    #[test]
+    fn expected_paths_default_returns_one_original_path() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].size, 1000);
+        assert_eq!(&*paths[0].checksum, "abc123");
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert!(
+            paths[0].path.to_string_lossy().ends_with("IMG_0001.JPG"),
+            "expected ...IMG_0001.JPG, got {}",
+            paths[0].path.display()
+        );
+    }
+
+    #[test]
+    fn expected_paths_apply_name_id7_suffix_to_primary() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("IMG_0001_") && name.ends_with(".JPG"),
+            "expected IMG_0001_<id7>.JPG, got {name}"
+        );
+        assert_ne!(name, "IMG_0001.JPG", "id7 suffix not applied");
+    }
+
+    #[test]
+    fn expected_paths_live_photo_yields_primary_and_mov() {
+        let asset = TestPhotoAsset::new("LIVE_1")
+            .filename("IMG_2000.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert_eq!(paths[1].version_size, VersionSizeKey::LiveOriginal);
+        assert_eq!(paths[1].size, 3000);
+        assert!(
+            paths[1]
+                .path
+                .to_string_lossy()
+                .ends_with("IMG_2000_HEVC.MOV"),
+            "expected ...IMG_2000_HEVC.MOV, got {}",
+            paths[1].path.display()
+        );
+    }
+
+    #[test]
+    fn expected_paths_video_only_skips_primary() {
+        let asset = TestPhotoAsset::new("LIVE_2")
+            .filename("IMG_2001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::LiveOriginal);
+    }
+
+    #[test]
+    fn expected_paths_image_only_skips_mov() {
+        let asset = TestPhotoAsset::new("LIVE_3")
+            .filename("IMG_2002.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+    }
+
+    /// `LivePhotoMode::Skip` is documented as "skip live photos entirely (both
+    /// image and MOV)." A live-photo asset under Skip must yield no paths so
+    /// import-existing doesn't scan for files sync never wrote.
+    #[test]
+    fn expected_paths_skip_mode_emits_nothing_for_live_photo() {
+        let asset = TestPhotoAsset::new("LIVE_4")
+            .filename("IMG_2003.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let paths = expected_paths_for(&asset, &config);
+        assert!(
+            paths.is_empty(),
+            "Skip + live photo must drop the asset, got {paths:?}"
+        );
+    }
+
+    /// Skip applies only to live photos: a non-live asset under Skip still
+    /// produces its primary path.
+    #[test]
+    fn expected_paths_skip_mode_keeps_non_live_primary() {
+        let asset = TestPhotoAsset::new("STILL_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn expected_paths_force_size_missing_returns_empty() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = true;
+        let paths = expected_paths_for(&asset, &config);
+        assert!(
+            paths.is_empty(),
+            "force_size + missing size should yield no paths, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_size_fallback_to_original_when_force_size_off() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = false;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains("-medium"),
+            "fallback to Original should not carry medium suffix, got {name}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_live_photo_with_name_id7_applies_suffix_to_both() {
+        let asset = TestPhotoAsset::new("LIVE_5")
+            .filename("IMG_3000.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        let primary = paths[0].path.file_name().unwrap().to_string_lossy();
+        let mov = paths[1].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            primary.starts_with("IMG_3000_") && primary.ends_with(".HEIC"),
+            "primary missing id7 suffix: {primary}"
+        );
+        assert!(
+            mov.starts_with("IMG_3000_") && mov.ends_with("_HEVC.MOV"),
+            "MOV companion missing id7 suffix: {mov}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_no_versions_returns_empty() {
+        // Build a minimal asset with no resOriginalRes — all version lookups
+        // fail, expected_paths_for returns empty (caller skips).
+        let master = json!({
+            "recordName": "EMPTY_1",
+            "fields": {
+                "filenameEnc": {"value": "x.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+            },
+        });
+        let asset_record = json!({
+            "fields": {"assetDate": {"value": 1736899200000.0_f64}},
+        });
+        let asset = PhotoAsset::new(master, asset_record);
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert!(paths.is_empty());
+    }
+
+    // ── expected_paths_for / filter_asset_to_tasks parity ────────────────
+    //
+    // expected_paths_for is import-existing's view of where sync would have
+    // written each asset. filter_asset_to_tasks is sync's source of truth
+    // for the same derivation. They must agree on the bare path (before
+    // collision-suffix resolution) so import-existing scans the file sync
+    // actually produces. These tests pin parity across the configurations
+    // most likely to drift apart (file_match_policy, size variants, live
+    // photo modes, raw alignment).
+
+    fn assert_path_parity(
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        which: VersionSizeKey,
+        label: &str,
+    ) {
+        let want_live = matches!(which, VersionSizeKey::LiveOriginal);
+        let expected = expected_paths_for(asset, config);
+        let tasks = filter_asset_fresh(asset, config);
+        let exp = expected
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal) == want_live)
+            .map(|p| p.path.clone())
+            .unwrap_or_default();
+        let got = tasks
+            .iter()
+            .find(|t| matches!(t.version_size, VersionSizeKey::LiveOriginal) == want_live)
+            .map(|t| t.download_path.to_path_buf())
+            .unwrap_or_default();
+        assert_eq!(
+            exp, got,
+            "{label}: expected_paths_for path drifted from filter_asset_to_tasks"
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_default_config() {
+        let asset = TestPhotoAsset::new("PAR_1")
+            .filename("IMG_5001.JPG")
+            .build();
+        let config = test_config();
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "default");
+    }
+
+    #[test]
+    fn expected_paths_parity_name_id7() {
+        let asset = TestPhotoAsset::new("PAR_2")
+            .filename("IMG_5002.JPG")
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "NameId7");
+    }
+
+    #[test]
+    fn expected_paths_parity_size_medium_with_fallback() {
+        // size=Medium but no medium version available; both call sites
+        // must fall back to Original consistently (force_size=false).
+        let asset = TestPhotoAsset::new("PAR_3")
+            .filename("IMG_5003.JPG")
+            .build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = false;
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "Medium fallback");
+    }
+
+    #[test]
+    fn expected_paths_parity_live_photo_both() {
+        let asset = TestPhotoAsset::new("PAR_4")
+            .filename("IMG_5004.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let config = test_config();
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "live both primary",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "live both mov",
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_live_photo_name_id7() {
+        let asset = TestPhotoAsset::new("PAR_5")
+            .filename("IMG_5005.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "live id7 primary",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "live id7 mov",
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_live_photo_video_only() {
+        // VideoOnly: primary path absent in both, MOV present in both.
+        let asset = TestPhotoAsset::new("PAR_6")
+            .filename("IMG_5006.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "video-only primary (absent)",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "video-only mov",
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_mov_filename_policy_original() {
+        // The non-default MOV filename policy is a known drift suspect:
+        // the live_photo_mov_path_original branch in expected_paths_for
+        // reuses a helper from paths.rs that filter_asset_to_tasks also
+        // calls; this pins them.
+        let asset = TestPhotoAsset::new("PAR_7")
+            .filename("IMG_5007.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mov_filename_policy = LivePhotoMovFilenamePolicy::Original;
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "mov policy=Original primary",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "mov policy=Original mov",
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_custom_album_in_folder_template() {
+        let asset = TestPhotoAsset::new("PAR_8")
+            .filename("IMG_5008.JPG")
+            .build();
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        config.album_name = Some(Arc::from("Vacation 2025"));
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "album in template",
+        );
+    }
+
+    // ── expected_paths_for negative-space coverage ───────────────────────
+    //
+    // The 11 happy-path expected_paths_* tests above leave a lot of input
+    // surface untested. These pin behavior on the filename / album-name
+    // edges most likely to surprise: non-ASCII when keep_unicode is on vs
+    // off, traversal-style names, names that vanish after sanitization,
+    // separators inside filenames, and weird album names.
+
+    #[test]
+    fn expected_paths_keeps_unicode_when_flag_set() {
+        let asset = TestPhotoAsset::new("UNI_1")
+            .filename("héllo_wörld.JPG")
+            .build();
+        let mut config = test_config();
+        config.keep_unicode_in_filenames = true;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains('é') && name.contains('ö'),
+            "keep_unicode=true should preserve non-ASCII, got {name}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_strips_unicode_when_flag_off() {
+        let asset = TestPhotoAsset::new("UNI_2")
+            .filename("héllo_wörld.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains('é') && !name.contains('ö') && name.contains("hllo_wrld"),
+            "keep_unicode=false should strip non-ASCII, got {name}"
+        );
+    }
+
+    /// Characterization test (current behavior, not desired behavior):
+    /// `日本語.jpg` with `keep_unicode_in_filenames=false` strips to a
+    /// dotfile-shaped `.JPG`. import-existing then scans for a literal
+    /// `.JPG` file, which is a hidden file on Unix and unlikely to
+    /// match anything sync wrote. The fingerprint-fallback only fires
+    /// when `filename()` returns `None`, not when the filename
+    /// degenerates after stripping. If a future change makes
+    /// `expected_paths_for` fall back to a fingerprint name in this
+    /// case, this test should be inverted; see TODO note.
+    // TODO: fall back to fingerprint name when post-strip filename is
+    // dotfile-only (`.<ext>`). Tracked separately from this test PR.
+    #[test]
+    fn expected_paths_filename_emptied_by_unicode_strip_characterization() {
+        let asset = TestPhotoAsset::new("UNI_3").filename("日本語.jpg").build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            name, ".JPG",
+            "current behavior: filename collapses to a dotfile after non-ASCII strip"
+        );
+    }
+
+    #[test]
+    fn expected_paths_keep_unicode_with_decomposed_form() {
+        // NFC "é" (U+00E9) vs NFD "e\u{0301}" — kei does no normalization,
+        // so both round-trip when keep_unicode=true. Pin that so a future
+        // unicode-normalization pass doesn't silently change matches.
+        let nfc = "ca\u{00e9}.JPG";
+        let nfd = "cae\u{0301}.JPG";
+        let mut config = test_config();
+        config.keep_unicode_in_filenames = true;
+        for (label, fname) in [("NFC", nfc), ("NFD", nfd)] {
+            let asset = TestPhotoAsset::new("UNI_4").filename(fname).build();
+            let paths = expected_paths_for(&asset, &config);
+            assert_eq!(paths.len(), 1, "{label}: expected one path");
+            let name = paths[0].path.file_name().unwrap().to_string_lossy();
+            assert_eq!(
+                name, fname,
+                "{label}: filename round-trip should be byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_paths_filename_with_path_separators_is_safe() {
+        // iCloud filenames shouldn't contain `/` but the wire format is
+        // a string, so a malformed asset could carry one. The path must
+        // still be confined to `directory` (no traversal out).
+        let asset = TestPhotoAsset::new("SEP_1")
+            .filename("evil/IMG.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let path_str = paths[0].path.to_string_lossy().into_owned();
+        // The directory prefix is stable; everything after must not
+        // re-introduce a `/IMG` segment that could escape into a sibling
+        // directory.
+        let dir_str = config.directory.to_string_lossy().into_owned();
+        assert!(
+            path_str.starts_with(&dir_str),
+            "path escaped directory: {path_str}"
+        );
+        let suffix = path_str.trim_start_matches(&*dir_str);
+        assert!(
+            !suffix.contains("/evil/") && !suffix.contains("evil/IMG.JPG"),
+            "raw `evil/IMG.JPG` survived sanitization: {suffix}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_filename_with_traversal_is_safe() {
+        // `../../etc/passwd.JPG` — the path-separator + traversal
+        // sequence has to land inside `directory`, not at /etc/passwd.
+        // Sanitization replaces `/` with `_`, so `..` substrings can
+        // survive *as part of one filename*, which is harmless. What
+        // must NOT happen: the path having extra segments that walk
+        // out of `directory`.
+        let asset = TestPhotoAsset::new("TRAV_1")
+            .filename("../../etc/passwd.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0].path;
+        assert!(
+            path.starts_with(&*config.directory),
+            "path escaped configured directory: {}",
+            path.display()
+        );
+        // Folder template is `%Y/%m/%d` (3 dated dirs) + 1 filename
+        // = 4 components past `directory`. Anything more means a
+        // traversal segment leaked into the path tree.
+        let suffix = path.strip_prefix(&*config.directory).unwrap();
+        assert_eq!(
+            suffix.components().count(),
+            4,
+            "extra path segments (traversal leak): {}",
+            suffix.display()
+        );
+        // And the literal `/etc/passwd` must not appear as part of a
+        // path component sequence.
+        let path_str = path.to_string_lossy();
+        assert!(
+            !path_str.contains("/etc/") && !path_str.contains("/passwd."),
+            "raw traversal segments survived in the path: {path_str}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_album_name_with_separators_sanitized() {
+        let asset = TestPhotoAsset::new("ALB_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.folder_structure = "{album}".to_string();
+        config.album_name = Some(Arc::from("evil/../escape"));
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let path_str = paths[0].path.to_string_lossy().into_owned();
+        assert!(
+            !path_str.contains("..") && !path_str.contains("/escape/"),
+            "album traversal survived: {path_str}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_filename_only_dots_and_spaces() {
+        // "  ...  " trims to empty — filename derivation has to produce
+        // *some* name, not a literal "" segment.
+        let asset = TestPhotoAsset::new("DOTS_1").filename("  ...  ").build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.is_empty() && !name.trim_matches(|c: char| c == '.' || c == ' ').is_empty(),
+            "filename must not collapse to a dots/spaces-only name, got {name:?}"
+        );
     }
 
     #[test]

@@ -14,6 +14,8 @@ pub(crate) mod smart_folders;
 pub mod types;
 
 pub use album::PhotoAlbum;
+#[cfg(test)]
+pub use album::PhotoAlbumConfig;
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
 pub use session::{PhotosSession, SyncTokenError};
