@@ -7,7 +7,10 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 _default:
     @just --list
 
-# Pre-push gate: fmt + clippy + offline tests + doc + audit + typos.
+# Pre-push gate: fmt + clippy + offline tests + doc + audit + typos +
+# round-trip property gate. The round-trip gate fails when this branch
+# adds/changes a serializer in src/ without a paired round-trip test;
+# see scripts/check-roundtrip-gate.sh for the detector and override.
 gate:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
@@ -16,6 +19,7 @@ gate:
     cargo fetch --locked
     cargo audit
     typos
+    bash scripts/check-roundtrip-gate.sh
 
 # Test dispatcher: offline | fast | live | concurrency | state | docker | PATTERN.
 test MODE="":
