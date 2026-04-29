@@ -150,6 +150,21 @@ happens:
   `src/commands/import.rs::wiremock_tests` -- live verifies real Apple
   CloudKit shapes work end-to-end; wiremock covers the policy matrix
   exhaustively.
+- **`src/commands/import/wiremock_tests/icloudpd_compat.rs`** - icloudpd
+  compat baseline. Each test stages an on-disk layout using fixture data
+  (filenames, folder structure, sizes) lifted verbatim from the
+  `icloud_photos_downloader` test suite, then runs kei's `import_assets`
+  loop and asserts every file matches. Acts as a regression guard against
+  layout divergence across kei refactors. Source mirroring:
+  `test_download_photos.py`, `test_download_photos_id.py`,
+  `test_download_live_photos.py`, `test_download_live_photos_id.py`,
+  `test_download_videos.py`, `test_folder_structure.py`. Runs as part of
+  `cargo test --lib` in `just test fast` and `just gate`. Includes
+  `dedup_size_suffix_collision`, which exercises the
+  `<stem>-<size><ext>` collision shape (icloudpd's filename-conflict
+  resolution): `import_assets` falls back to the size-suffixed path when
+  the bare name doesn't match, so libraries with collisions still
+  match cleanly.
 - **`shell/concurrency.sh`** - things that need `kill -9` mid-process,
   `chmod 555` on a target dir, direct sqlite3 assertions on the state
   DB mid-test. Hard to do cleanly from Rust.

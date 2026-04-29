@@ -38,6 +38,37 @@ impl std::ops::AddAssign for ImportStats {
     }
 }
 
+/// Find the on-disk path that satisfies the expected size, trying the
+/// primary path first and -- for `NameSizeDedupWithSuffix` policy -- the
+/// `<stem>-<size><ext>` collision shape as a fallback.
+///
+/// Returns `Some(path)` if a candidate file exists with size
+/// `expected_size`, `None` otherwise. Caller still re-stats; this is just
+/// the path picker.
+async fn resolve_match_path(
+    primary: &Path,
+    expected_size: u64,
+    policy: FileMatchPolicy,
+) -> Option<std::path::PathBuf> {
+    if let Ok(m) = tokio::fs::metadata(primary).await {
+        if m.len() == expected_size {
+            return Some(primary.to_path_buf());
+        }
+    }
+    if policy == FileMatchPolicy::NameSizeDedupWithSuffix {
+        let parent = primary.parent().unwrap_or(Path::new(""));
+        let fname = primary.file_name().and_then(|f| f.to_str())?;
+        let suffixed_fname = download::paths::add_dedup_suffix(fname, expected_size);
+        let suffixed = parent.join(suffixed_fname);
+        if let Ok(m) = tokio::fs::metadata(&suffixed).await {
+            if m.len() == expected_size {
+                return Some(suffixed);
+            }
+        }
+    }
+    None
+}
+
 /// Run the import-existing matching loop over a stream of `PhotoAsset`s.
 ///
 /// Splitting this out from [`run_import_existing`] lets tests (wiremock-based)
@@ -89,13 +120,37 @@ where
         }
 
         for ExpectedAssetPath {
-            path: expected_path,
+            path: primary_path,
             size: expected_size,
             checksum,
             version_size,
         } in expected
         {
+            // Resolve the on-disk path. For `NameSizeDedupWithSuffix`, when
+            // two iCloud assets share a filename, icloudpd renames the
+            // second's download to `<stem>-<size><ext>` (it detects this
+            // at download time by stat'ing the existing file). kei's
+            // `expected_paths_for` is single-asset and emits only the
+            // bare path -- so for libraries produced by icloudpd, the
+            // size-suffixed file would otherwise read as unmatched even
+            // though it's exactly what kei would also have written under
+            // the same collision. Try the suffix shape as a fallback.
+            let expected_path = match resolve_match_path(
+                &primary_path,
+                expected_size,
+                download_config.file_match_policy,
+            )
+            .await
+            {
+                Some(p) => p,
+                None => {
+                    stats.unmatched += 1;
+                    continue;
+                }
+            };
+            // Re-stat so the rest of the loop has the metadata it needs.
             let Ok(metadata) = tokio::fs::metadata(&expected_path).await else {
+                // Disappeared between probe and use; treat as unmatched.
                 stats.unmatched += 1;
                 continue;
             };
@@ -1379,4 +1434,12 @@ mod wiremock_tests {
         // skip_videos for image+movie classification.)
         assert_eq!(stats.matched, 0);
     }
+
+    // ── icloudpd compat baseline ──────────────────────────────────────
+    //
+    // Scenario-driven tests that stage on-disk layouts using icloudpd's
+    // path rules (taken from icloud_photos_downloader's own test suite
+    // fixture data) and verify kei's import-existing matches. Acts as a
+    // baseline against accidental layout divergence.
+    mod icloudpd_compat;
 }
