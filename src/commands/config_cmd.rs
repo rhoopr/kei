@@ -13,9 +13,9 @@ pub(crate) fn run_config_show(
 ) -> anyhow::Result<()> {
     let cfg = config::Config::build(
         globals,
-        cli::PasswordArgs::default(),
+        &cli::PasswordArgs::default(),
         cli::SyncArgs::default(),
-        toml.cloned(),
+        toml,
     )?;
     let toml_config = cfg.to_toml();
     let output = toml::to_string_pretty(&toml_config)

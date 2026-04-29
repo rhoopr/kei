@@ -218,7 +218,7 @@ mod tests {
         }
     }
 
-    /// CF-3 (2026-04-25 review): `fsync_parent_dir` returns `Ok(())` for an
+    /// `fsync_parent_dir` returns `Ok(())` for an
     /// extant directory on every supported platform. On Unix it actually
     /// opens and fsyncs the parent; on Windows it's a documented no-op. The
     /// test pins both platforms to "doesn't error" so a future regression
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
-    /// CF-3 happy-path coverage: a same-device install of a freshly written
+    /// Happy-path coverage: a same-device install of a freshly written
     /// src succeeds end-to-end with the new fsync calls in the chain.
     /// Regression guard if a future refactor drops the fsync of src or the
     /// parent fsync and breaks the call (e.g. by accidentally borrowing a

@@ -58,9 +58,12 @@ pub(crate) async fn run_list(
             }
         }
         cli::ListCommand::Albums => {
-            let selection =
-                config::resolve_library_selection(library, toml.and_then(|t| t.filters.as_ref()));
-            let libraries = resolve_libraries(&selection, &mut photos_service).await?;
+            let cli_libraries = library.into_iter().collect();
+            let selector = config::resolve_library_selector(
+                cli_libraries,
+                toml.and_then(|t| t.filters.as_ref()),
+            )?;
+            let libraries = resolve_libraries(&selector, &mut photos_service).await?;
             for library in &libraries {
                 println!("Library: {}", library.zone_name());
                 let albums = library.albums().await?;

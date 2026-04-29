@@ -117,12 +117,16 @@ DIR3=$(kei_scratch_dir partial-fail)
 kei_db_exec "DELETE FROM assets"
 
 # Force one of the test album's files to land in a read-only directory.
-# The album's default layout is YYYY/MM/DD/filename; making one date dir
-# read-only makes the write fail while the other dates succeed.
+# Album passes default to `{album}/` since the per-category template
+# refactor (PR #288), so we explicitly request a date hierarchy and
+# pre-create one date dir as read-only. GOPR0558.JPG in icloudpd-test
+# is dated 2019-11-09; making that path 555 makes its write fail while
+# the other dates succeed.
 mkdir -p "$DIR3/2019/11/09"
 chmod 555 "$DIR3/2019/11/09" "$DIR3/2019/11" "$DIR3/2019"
 
-kei_sync --directory "$DIR3" --no-incremental --threads-num 1
+kei_sync --directory "$DIR3" --no-incremental --threads-num 1 \
+    --folder-structure-albums "%Y/%m/%d"
 EC=$?
 echo "  Exit code: $EC"
 

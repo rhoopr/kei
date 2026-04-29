@@ -77,10 +77,10 @@ pub(crate) fn determine_media_type(
 pub(super) struct NormalizedPath(Box<str>);
 
 impl NormalizedPath {
-    /// Create a new normalized path from an owned `PathBuf`.
+    /// Create a new normalized path from a borrowed `Path`.
     /// For lookup operations, prefer `normalize()` to avoid `PathBuf` cloning.
-    pub(super) fn new(path: PathBuf) -> Self {
-        Self(Self::normalize(&path).into_owned().into_boxed_str())
+    pub(super) fn new(path: &Path) -> Self {
+        Self(Self::normalize(path).into_owned().into_boxed_str())
     }
 
     /// Normalize a path reference for map lookups.
@@ -759,7 +759,7 @@ pub(super) fn filter_asset_to_tasks(
             }
         }
         if let Some(path) = final_path {
-            claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
+            claimed_paths.insert(NormalizedPath::new(&path), version.size);
             tasks.push(DownloadTask {
                 url: version.url.clone(),
                 download_path: path,
@@ -838,7 +838,7 @@ pub(super) fn filter_asset_to_tasks(
             };
 
             if let Some(path) = final_mov_path {
-                claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
+                claimed_paths.insert(NormalizedPath::new(&path), live_version.size);
                 tasks.push(DownloadTask {
                     url: live_version.url.clone(),
                     download_path: path,
@@ -1941,7 +1941,7 @@ mod tests {
     fn test_normalized_path_lowercases_on_case_insensitive() {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            let np = NormalizedPath::new(PathBuf::from("Foo.JPG"));
+            let np = NormalizedPath::new(&PathBuf::from("Foo.JPG"));
             assert_eq!(&*np.0, "foo.jpg");
         }
     }
@@ -1950,14 +1950,14 @@ mod tests {
     fn test_normalized_path_case_equality() {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
-            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            let a = NormalizedPath::new(&PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(&PathBuf::from("/photos/img.jpg"));
             assert_eq!(a, b);
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
-            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            let a = NormalizedPath::new(&PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(&PathBuf::from("/photos/img.jpg"));
             assert_ne!(a, b);
         }
     }
@@ -1966,7 +1966,7 @@ mod tests {
     fn test_normalized_path_borrow_for_hashmap_lookup() {
         use std::collections::HashMap;
         let mut map: HashMap<NormalizedPath, u64> = HashMap::new();
-        map.insert(NormalizedPath::new(PathBuf::from("test.jpg")), 42);
+        map.insert(NormalizedPath::new(&PathBuf::from("test.jpg")), 42);
         let key = NormalizedPath::normalize(std::path::Path::new("test.jpg"));
         assert_eq!(map.get(key.as_ref()), Some(&42));
     }
@@ -1975,7 +1975,7 @@ mod tests {
 
     #[test]
     fn test_normalized_path_new_stores_normalized_form() {
-        let np = NormalizedPath::new(PathBuf::from("/photos/2025/01/IMG_0001.JPG"));
+        let np = NormalizedPath::new(&PathBuf::from("/photos/2025/01/IMG_0001.JPG"));
         // On macOS/Windows the stored form should be lowercase
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert_eq!(&*np.0, "/photos/2025/01/img_0001.jpg");
@@ -1999,7 +1999,7 @@ mod tests {
         // Insert with one case, look up with another — must find on macOS/Windows
         use std::collections::HashMap;
         let mut map: HashMap<NormalizedPath, u64> = HashMap::new();
-        map.insert(NormalizedPath::new(PathBuf::from("IMG_0001.JPG")), 100);
+        map.insert(NormalizedPath::new(&PathBuf::from("IMG_0001.JPG")), 100);
         let lookup_key = NormalizedPath::normalize(Path::new("img_0001.jpg"));
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert_eq!(map.get(lookup_key.as_ref()), Some(&100));
@@ -2014,7 +2014,7 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let path = PathBuf::from("Test/Photo.JPG");
-        let np = NormalizedPath::new(path.clone());
+        let np = NormalizedPath::new(&path);
         let normalized_str = NormalizedPath::normalize(&path);
 
         let mut h1 = DefaultHasher::new();
@@ -2036,9 +2036,9 @@ mod tests {
 
     #[test]
     fn test_normalized_path_case_different_paths_equal_on_case_insensitive() {
-        let upper = NormalizedPath::new(PathBuf::from("PHOTO.HEIC"));
-        let lower = NormalizedPath::new(PathBuf::from("photo.heic"));
-        let mixed = NormalizedPath::new(PathBuf::from("Photo.Heic"));
+        let upper = NormalizedPath::new(&PathBuf::from("PHOTO.HEIC"));
+        let lower = NormalizedPath::new(&PathBuf::from("photo.heic"));
+        let mixed = NormalizedPath::new(&PathBuf::from("Photo.Heic"));
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             assert_eq!(upper, lower);
@@ -2098,7 +2098,7 @@ mod tests {
         );
     }
 
-    /// CG-13: two assets whose filenames differ only in case (`IMG_0001.JPG`
+    /// Two assets whose filenames differ only in case (`IMG_0001.JPG`
     /// vs `img_0001.jpg`) must NOT silently overwrite each other on a
     /// case-insensitive filesystem. The collision detector must either
     /// rename one with a disambiguation suffix or skip the duplicate; in
@@ -2145,8 +2145,8 @@ mod tests {
 
         // Critical invariant: the on-disk paths must NOT case-insensitively
         // match. NormalizedPath does the case-fold; pin its result here.
-        let np_a = NormalizedPath::new(path_a.clone());
-        let np_b = NormalizedPath::new(path_b.clone());
+        let np_a = NormalizedPath::new(&path_a);
+        let np_b = NormalizedPath::new(&path_b);
         assert_ne!(
             np_a,
             np_b,
@@ -2198,7 +2198,7 @@ mod tests {
         let downloaded_path = first_tasks[0].download_path.clone();
 
         let mut claimed_paths = FxHashMap::default();
-        claimed_paths.insert(NormalizedPath::new(downloaded_path.clone()), 1000);
+        claimed_paths.insert(NormalizedPath::new(&downloaded_path), 1000);
 
         let mut dir_cache = paths::DirCache::new();
         let second_tasks =
@@ -2869,6 +2869,64 @@ mod tests {
         assert!(
             tasks.is_empty(),
             "NameId7 should skip when file exists, regardless of size"
+        );
+    }
+
+    // ── Post-rename pre-state-write idempotency ──────────────────
+    //
+    // After `rename_part_to_final` succeeds (file is on disk at the
+    // final path) but before `state_db.mark_downloaded()` commits, a
+    // SIGKILL leaves the file persisted with no asset row. The next
+    // sync must classify this as "already downloaded" via the
+    // filesystem check and skip — not re-download (bandwidth waste,
+    // extra Apple API calls, possible duplicate-named files) and not
+    // fail because the destination exists.
+    //
+    // The "filesystem check" is `resolve_download_path`'s on-disk
+    // probe, exercised here by composing a fresh `DirCache` (the
+    // post-restart state) plus the same asset config. Pre-existing
+    // tests like `test_filter_skips_existing_file` cover this for the
+    // happy path; this test names the crash-recovery scenario
+    // explicitly so a regression that ties skip-decision to a DB row
+    // (rather than the on-disk truth) lands red.
+    #[test]
+    fn pipeline_post_rename_pre_state_kill_recovers_idempotently() {
+        let dir = TempDir::new().unwrap();
+
+        let asset = TestPhotoAsset::new("ASSET_KILL")
+            .filename("IMG_KILL.JPG")
+            .orig_size(1000)
+            .orig_url("https://p01.icloud-content.com/kill")
+            .orig_checksum("ck_kill")
+            .build();
+
+        let mut config = test_config();
+        config.directory = std::sync::Arc::from(dir.path());
+
+        // Step 1: first filter pass yields one task at the canonical
+        // download path. (This is what the pre-kill sync did before
+        // crashing.)
+        let tasks_pre = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks_pre.len(), 1);
+        let final_path = tasks_pre[0].download_path.clone();
+
+        // Step 2: simulate the post-rename state — the file lives on
+        // disk at the final path with the right size. The state DB
+        // does *not* know about it (we've thrown away the
+        // claimed_paths map and DirCache, mirroring a fresh process
+        // restart).
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        fs::write(&final_path, vec![0u8; 1000]).unwrap();
+
+        // Step 3: re-run filter against the same asset. Crash recovery
+        // must skip without re-emitting a task, even though no DB row
+        // backs the file.
+        let tasks_post = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks_post.is_empty(),
+            "post-kill rerun must skip via on-disk detection \
+             (file exists at {final_path:?} with matching size); \
+             got tasks: {tasks_post:?}",
         );
     }
 

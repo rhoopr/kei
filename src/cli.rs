@@ -226,13 +226,34 @@ pub struct SyncArgs {
     #[arg(long = "exclude-album", env = "KEI_EXCLUDE_ALBUM", value_delimiter = ',', value_parser = non_empty_string)]
     pub exclude_albums: Vec<String>,
 
+    /// Smart folder(s) to download. Repeatable; default empty (smart folders
+    /// are skipped unless opted in). Accepts the same value grammar as
+    /// `--album`: a name, the sentinel `all` (every smart folder except
+    /// Hidden / Recently Deleted), `all-with-sensitive` (include those two),
+    /// `none`, or `!name` to exclude. Available names: Favorites, Videos,
+    /// Live, Panoramas, Screenshots, Bursts, Slo-mo, Time-lapse, Hidden,
+    /// Recently Deleted.
+    #[arg(long = "smart-folder", env = "KEI_SMART_FOLDER", value_parser = non_empty_string)]
+    pub smart_folders: Vec<String>,
+
+    /// Run a separate pass for photos not in any user album. Default: `true`.
+    /// Pass `--unfiled false` to skip the unfiled pass (e.g. when you only
+    /// want named album passes). Independent of `--album`: `--album Vacation`
+    /// still runs the unfiled pass unless this flag is explicitly disabled.
+    #[arg(long, env = "KEI_UNFILED", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub unfiled: Option<bool>,
+
     /// Exclude files matching glob pattern(s) (e.g. "*.AAE", "Screenshot*")
     #[arg(long = "filename-exclude", env = "KEI_FILENAME_EXCLUDE", value_delimiter = ',', value_parser = non_empty_string)]
     pub filename_exclude: Vec<String>,
 
-    /// Library to download (default: `PrimarySync`, use "all" for all libraries)
-    #[arg(long, env = "KEI_LIBRARY")]
-    pub library: Option<String>,
+    /// Library/libraries to download. Repeatable; default `primary` (the
+    /// PrimarySync zone). Accepts the same value grammar as `--album`: a
+    /// CloudKit zone name (full UUID or the truncated 8-char `SharedSync-`
+    /// prefix that `{library}` renders into paths), the sentinels
+    /// `primary` / `shared` / `all` / `none`, or `!name` to exclude.
+    #[arg(long = "library", env = "KEI_LIBRARY", value_parser = non_empty_string)]
+    pub libraries: Vec<String>,
 
     /// Image size to download
     #[arg(long, env = "KEI_SIZE", value_enum)]
@@ -291,6 +312,19 @@ pub struct SyncArgs {
     /// unfiled photos (where `{album}` collapses to empty).
     #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
+
+    /// Folder structure used by every album pass. Default `{album}` (flat
+    /// per-album folders, no inherited date hierarchy). Set to e.g.
+    /// `"{album}/%Y/%m/%d"` to add a date hierarchy inside each album
+    /// folder.
+    #[arg(long, env = "KEI_FOLDER_STRUCTURE_ALBUMS")]
+    pub folder_structure_albums: Option<String>,
+
+    /// Folder structure used by every smart-folder pass. Default
+    /// `{smart-folder}` (flat per-smart-folder folders). Set to e.g.
+    /// `"{smart-folder}/%Y/%m/%d"` to add a date hierarchy.
+    #[arg(long, env = "KEI_FOLDER_STRUCTURE_SMART_FOLDERS")]
+    pub folder_structure_smart_folders: Option<String>,
 
     /// Write `DateTimeOriginal` EXIF tag if missing
     #[cfg(feature = "xmp")]
@@ -787,8 +821,8 @@ impl SyncArgs {
         if self.albums.is_empty() {
             self.albums.clone_from(&fallback.albums);
         }
-        if self.library.is_none() {
-            self.library.clone_from(&fallback.library);
+        if self.libraries.is_empty() {
+            self.libraries.clone_from(&fallback.libraries);
         }
         if self.size.is_none() {
             self.size = fallback.size;
@@ -808,6 +842,9 @@ impl SyncArgs {
         if self.bandwidth_limit.is_none() {
             self.bandwidth_limit = fallback.bandwidth_limit;
         }
+        if self.unfiled.is_none() {
+            self.unfiled = fallback.unfiled;
+        }
         if self.skip_videos.is_none() {
             self.skip_videos = fallback.skip_videos;
         }
@@ -822,6 +859,14 @@ impl SyncArgs {
         }
         if self.folder_structure.is_none() {
             self.folder_structure.clone_from(&fallback.folder_structure);
+        }
+        if self.folder_structure_albums.is_none() {
+            self.folder_structure_albums
+                .clone_from(&fallback.folder_structure_albums);
+        }
+        if self.folder_structure_smart_folders.is_none() {
+            self.folder_structure_smart_folders
+                .clone_from(&fallback.folder_structure_smart_folders);
         }
         #[cfg(feature = "xmp")]
         {
@@ -943,7 +988,7 @@ impl Cli {
                 deprecation_warning("--list-albums", "kei list albums");
                 return Command::List {
                     password: self.password.clone(),
-                    library: self.sync.library.clone(),
+                    library: self.sync.libraries.first().cloned(),
                     what: ListCommand::Albums,
                 };
             }
@@ -951,7 +996,7 @@ impl Cli {
                 deprecation_warning("--list-libraries", "kei list libraries");
                 return Command::List {
                     password: self.password.clone(),
-                    library: self.sync.library.clone(),
+                    library: self.sync.libraries.first().cloned(),
                     what: ListCommand::Libraries,
                 };
             }
@@ -1030,7 +1075,7 @@ impl Cli {
                 deprecation_warning("--list-albums", "kei list albums");
                 Command::List {
                     password: password.clone(),
-                    library: sync.library.clone(),
+                    library: sync.libraries.first().cloned(),
                     what: ListCommand::Albums,
                 }
             }
@@ -1041,7 +1086,7 @@ impl Cli {
                 deprecation_warning("--list-libraries", "kei list libraries");
                 Command::List {
                     password: password.clone(),
-                    library: sync.library.clone(),
+                    library: sync.libraries.first().cloned(),
                     what: ListCommand::Libraries,
                 }
             }
@@ -1784,7 +1829,29 @@ mod tests {
         let mut args = base_args();
         args.extend(["--library", "SharedSync-ABCD1234"]);
         let cli = parse(&args);
-        assert_eq!(cli.sync.library.as_deref(), Some("SharedSync-ABCD1234"));
+        assert_eq!(cli.sync.libraries, vec!["SharedSync-ABCD1234".to_string()]);
+    }
+
+    #[test]
+    fn test_library_repeatable_with_sentinels() {
+        let mut args = base_args();
+        args.extend([
+            "--library",
+            "primary",
+            "--library",
+            "shared",
+            "--library",
+            "!SharedSync-ABCD1234",
+        ]);
+        let cli = parse(&args);
+        assert_eq!(
+            cli.sync.libraries,
+            vec![
+                "primary".to_string(),
+                "shared".to_string(),
+                "!SharedSync-ABCD1234".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1964,6 +2031,36 @@ mod tests {
         args.push("--skip-videos");
         let cli = parse(&args);
         assert_eq!(cli.sync.skip_videos, Some(true));
+    }
+
+    #[test]
+    fn test_unfiled_flag_default_none() {
+        let cli = parse(&base_args());
+        assert_eq!(cli.sync.unfiled, None);
+    }
+
+    #[test]
+    fn test_unfiled_flag_bare_true() {
+        let mut args = base_args();
+        args.push("--unfiled");
+        let cli = parse(&args);
+        assert_eq!(cli.sync.unfiled, Some(true));
+    }
+
+    #[test]
+    fn test_unfiled_flag_explicit_false() {
+        let mut args = base_args();
+        args.extend(["--unfiled", "false"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.unfiled, Some(false));
+    }
+
+    #[test]
+    fn test_unfiled_flag_explicit_true() {
+        let mut args = base_args();
+        args.extend(["--unfiled", "true"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.unfiled, Some(true));
     }
 
     #[test]

@@ -22,6 +22,7 @@
 
 use std::cell::Cell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::cli;
 use crate::config;
@@ -37,22 +38,23 @@ const FILE_MISSING_REASON: &str = "FILE_MISSING_AT_STARTUP";
 const SCAN_PAGE_SIZE: u32 = 1000;
 
 #[derive(Debug)]
-struct MissingAsset {
-    id: Box<str>,
-    version_size: VersionSizeKey,
-    local_path: PathBuf,
+pub(crate) struct MissingAsset {
+    pub(crate) library: Arc<str>,
+    pub(crate) id: Box<str>,
+    pub(crate) version_size: VersionSizeKey,
+    pub(crate) local_path: PathBuf,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct ScanCounts {
-    present: u64,
-    missing: u64,
-    no_path: u64,
+pub(crate) struct ScanCounts {
+    pub(crate) present: u64,
+    pub(crate) missing: u64,
+    pub(crate) no_path: u64,
 }
 
 /// Reads every page before any mutation so later `mark_failed` calls can't
 /// shift OFFSET pagination and skip rows.
-async fn scan_missing(
+pub(crate) async fn scan_missing(
     db: &dyn StateDb,
     mut report_missing: impl FnMut(&MissingAsset),
     mut report_no_path: impl FnMut(&str),
@@ -70,6 +72,7 @@ async fn scan_missing(
 
         for asset in page {
             let crate::state::AssetRecord {
+                library,
                 id,
                 version_size,
                 local_path,
@@ -88,6 +91,7 @@ async fn scan_missing(
             }
 
             let record = MissingAsset {
+                library,
                 id,
                 version_size,
                 local_path,
@@ -168,7 +172,12 @@ pub(crate) async fn run_reconcile(
     if !args.dry_run {
         for m in &missing {
             match db
-                .mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
+                .mark_failed(
+                    &m.library,
+                    &m.id,
+                    m.version_size.as_str(),
+                    FILE_MISSING_REASON,
+                )
                 .await
             {
                 Ok(()) => marked_failed += 1,
@@ -236,9 +245,16 @@ mod tests {
             .size(100)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded(id, "original", path, &format!("ck_{id}"), None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            id,
+            "original",
+            path,
+            &format!("ck_{id}"),
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     async fn seed_missing(db: &SqliteStateDb, id: &str, path: &std::path::Path) {
@@ -267,9 +283,14 @@ mod tests {
         assert_eq!(&*missing[0].id, "MISSING_1");
 
         for m in &missing {
-            db.mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
-                .await
-                .unwrap();
+            db.mark_failed(
+                &m.library,
+                &m.id,
+                m.version_size.as_str(),
+                FILE_MISSING_REASON,
+            )
+            .await
+            .unwrap();
         }
 
         let failed = db.get_failed().await.unwrap();
@@ -324,9 +345,14 @@ mod tests {
         assert_eq!(missing.len(), total);
 
         for m in &missing {
-            db.mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
-                .await
-                .unwrap();
+            db.mark_failed(
+                &m.library,
+                &m.id,
+                m.version_size.as_str(),
+                FILE_MISSING_REASON,
+            )
+            .await
+            .unwrap();
         }
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.downloaded, 0);

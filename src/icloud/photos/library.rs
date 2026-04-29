@@ -10,6 +10,23 @@ use super::queries::encode_params;
 use super::session::PhotosSession;
 use super::smart_folders::smart_folders;
 use crate::icloud::error::ICloudError;
+
+/// CloudKit zone name for the user's own (non-shared) library. Used as the
+/// fallback when a `zone_id` JSON object lacks `zoneName`, as the backfill
+/// value for the v8 schema migration, and as the default scope for
+/// commands that operate library-blind (e.g. `import-existing`).
+pub(crate) const PRIMARY_ZONE_NAME: &str = "PrimarySync";
+
+/// Prefix CloudKit uses for every shared-library zone name. Centralised so
+/// `--library` matching, the `{library}` truncation rule, and stub-library
+/// constructors all classify zones the same way.
+pub(crate) const SHARED_ZONE_PREFIX: &str = "SharedSync-";
+
+/// True when `zone_name` is a CloudKit shared library (every name beginning
+/// with [`SHARED_ZONE_PREFIX`]).
+pub(crate) fn is_shared_zone(zone_name: &str) -> bool {
+    zone_name.starts_with(SHARED_ZONE_PREFIX)
+}
 use crate::retry::RetryConfig;
 
 // Apple's sentinel folder IDs — these are containers, not real albums.
@@ -308,7 +325,7 @@ impl PhotoLibrary {
         self.zone_id
             .get("zoneName")
             .and_then(|v| v.as_str())
-            .unwrap_or("PrimarySync")
+            .unwrap_or(PRIMARY_ZONE_NAME)
     }
 
     /// Clone the session for a new album/library — preserves the shared
@@ -328,6 +345,24 @@ impl PhotoLibrary {
             session,
             zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
             library_type: Arc::from("private"),
+            retry_config: RetryConfig::default(),
+        }
+    }
+
+    /// Test-only constructor that pins a custom zone name on the stub.
+    /// Used by `resolve_libraries` tests that need distinct zones to
+    /// exercise selector matching.
+    pub(crate) fn new_stub_with_zone(session: Box<dyn PhotosSession>, zone_name: &str) -> Self {
+        Self {
+            service_endpoint: Arc::from("https://stub.example.com"),
+            params: Arc::new(HashMap::new()),
+            session,
+            zone_id: Arc::new(json!({"zoneName": zone_name})),
+            library_type: Arc::from(if is_shared_zone(zone_name) {
+                "shared"
+            } else {
+                "private"
+            }),
             retry_config: RetryConfig::default(),
         }
     }

@@ -16,6 +16,7 @@ pub mod types;
 pub use album::PhotoAlbum;
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
+pub(crate) use library::{is_shared_zone, PRIMARY_ZONE_NAME};
 pub use session::{PhotosSession, SyncTokenError};
 
 use std::collections::HashMap;
@@ -279,6 +280,26 @@ impl PhotosService {
             primary_library: dummy_library,
             private_libraries: None,
             shared_libraries: None,
+            retry_config: RetryConfig::default(),
+        }
+    }
+
+    /// Test-only constructor with pre-populated library maps. Lets
+    /// `resolve_libraries` tests exercise multi-library matching without
+    /// spinning up CloudKit fixtures for the lazy zone-listing endpoints.
+    pub(crate) fn for_testing_with_libraries(
+        session: Box<dyn PhotosSession>,
+        primary: PhotoLibrary,
+        private: HashMap<String, PhotoLibrary>,
+        shared: HashMap<String, PhotoLibrary>,
+    ) -> Self {
+        Self {
+            service_root: "https://p00-ckdatabasews.icloud.com".to_string(),
+            session,
+            params: Arc::new(HashMap::new()),
+            primary_library: primary,
+            private_libraries: Some(private),
+            shared_libraries: Some(shared),
             retry_config: RetryConfig::default(),
         }
     }

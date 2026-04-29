@@ -6,6 +6,25 @@ use base64::Engine;
 use chrono::{DateTime, Local};
 use rustc_hash::FxHashMap;
 
+/// Sentinel folder-structure value that disables the date-based directory
+/// hierarchy entirely (files land directly in the download directory).
+/// Matched case-insensitively.
+pub(crate) const NO_DATE_STRUCTURE: &str = "none";
+
+/// Token replaced with an album name in `--folder-structure-albums`
+/// templates (also accepted in legacy `--folder-structure` for backward
+/// compatibility; auto-migrated at config load).
+pub(crate) const TOKEN_ALBUM: &str = "{album}";
+
+/// Token replaced with a smart-folder name in
+/// `--folder-structure-smart-folders` templates.
+pub(crate) const TOKEN_SMART_FOLDER: &str = "{smart-folder}";
+
+/// Token replaced with the path-friendly zone name (see
+/// [`truncate_library_zone`]). Valid in any folder-structure template;
+/// must be the leading path segment when present.
+pub(crate) const TOKEN_LIBRARY: &str = "{library}";
+
 /// Strip the legacy Python-style `{:%Y/%m/%d}` wrapper, returning the inner
 /// format string. Returns the input unchanged if the wrapper is absent.
 pub(crate) fn strip_python_wrapper(folder_structure: &str) -> &str {
@@ -16,22 +35,65 @@ pub(crate) fn strip_python_wrapper(folder_structure: &str) -> &str {
     }
 }
 
-/// Expand the `{album}` token in a folder structure format string.
+/// Expand a named token (e.g. `{album}`, `{smart-folder}`) in a folder
+/// structure format string.
 ///
-/// Strips the Python-style wrapper, sanitizes the album name as a path
-/// component, escapes `%` for chrono strftime, and replaces `{album}`.
+/// Strips the Python-style wrapper, sanitizes `name` as a path component,
+/// escapes `%` for chrono strftime, and replaces every occurrence of `token`.
 /// Returns the original `folder_structure` (wrapper-stripped) unchanged if
-/// `{album}` is absent.
-pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str>) -> String {
+/// `token` is absent.
+pub(crate) fn expand_named_token(
+    folder_structure: &str,
+    token: &str,
+    name: Option<&str>,
+) -> String {
     let format_str = strip_python_wrapper(folder_structure);
-    if !format_str.contains("{album}") {
+    if !format_str.contains(token) {
         return format_str.to_string();
     }
-    let safe_name = album_name
+    let safe_name = name
         .filter(|n| !n.is_empty())
         .map(|n| sanitize_path_component(n).replace('%', "%%"))
         .unwrap_or_default();
-    format_str.replace("{album}", &safe_name)
+    format_str.replace(token, &safe_name)
+}
+
+/// Expand the `{album}` token in a folder structure format string. Thin
+/// wrapper around [`expand_named_token`] kept for callers outside the
+/// per-pass renderer (e.g. `local_download_dir`'s legacy single-template
+/// path).
+pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str>) -> String {
+    expand_named_token(folder_structure, "{album}", album_name)
+}
+
+/// Path-friendly form of a CloudKit zone name. Returns the input unchanged
+/// for the primary library (`PrimarySync`) and any non-shared zone, and
+/// truncates `SharedSync-<UUID>` to `SharedSync-<8 chars>` so on-disk
+/// folder names stay readable while remaining stable across reruns.
+///
+/// The 8-char suffix is the leading hex group of the UUID, which CloudKit
+/// emits deterministically — a copy-paste from the on-disk path back into
+/// `--library` resolves to the same zone.
+///
+/// Output is NOT sanitized — callers that stitch the return value into a
+/// filesystem path must run it through [`sanitize_path_component`] (or
+/// reach it via [`expand_named_token`], which does so automatically).
+pub(crate) fn truncate_library_zone(zone_name: &str) -> &str {
+    const PREFIX: &str = "SharedSync-";
+    const KEEP: usize = 8;
+    let Some(rest) = zone_name.strip_prefix(PREFIX) else {
+        return zone_name;
+    };
+    if rest.len() <= KEEP {
+        return zone_name;
+    }
+    let cut = PREFIX.len() + KEEP;
+    // Char-boundary guard: CloudKit UUIDs are ASCII hex/dash today; if
+    // that ever changes mid-codepoint, fall back to the full zone name.
+    if !zone_name.is_char_boundary(cut) {
+        return zone_name;
+    }
+    &zone_name[..cut]
 }
 
 /// Build the date-based parent directory for a photo asset (without filename).
@@ -46,7 +108,7 @@ pub(crate) fn local_download_dir(
     created_date: &DateTime<Local>,
     album_name: Option<&str>,
 ) -> PathBuf {
-    if folder_structure.eq_ignore_ascii_case("none") {
+    if folder_structure.eq_ignore_ascii_case(NO_DATE_STRUCTURE) {
         return directory.to_path_buf();
     }
 
@@ -97,6 +159,15 @@ const MAX_FILENAME_BYTES: usize = 255;
 pub(crate) fn clean_filename(filename: &str) -> std::borrow::Cow<'_, str> {
     fn is_invalid(c: char) -> bool {
         matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()
+    }
+
+    // Empty input would otherwise join onto the download directory as
+    // nothing, silently producing a path identical to the directory and
+    // colliding across every asset that hits this branch. Mirror
+    // sanitize_path_component's `_` sentinel so the path is visible and
+    // distinct.
+    if filename.is_empty() {
+        return std::borrow::Cow::Borrowed("_");
     }
 
     if filename.len() <= MAX_FILENAME_BYTES && !filename.contains(is_invalid) {
@@ -352,11 +423,7 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
     let hash = Sha256::digest(asset_id.as_bytes());
     let ext = item_type_extension(asset_type);
     let mut result = String::with_capacity(12 + 1 + ext.len());
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "SHA-256 output is always 32 bytes; 6 is unconditionally in-bounds"
-    )]
-    for &b in &hash[..6] {
+    for b in hash.iter().take(6) {
         let _ = Write::write_fmt(&mut result, format_args!("{b:02x}"));
     }
     result.push('.');
@@ -368,66 +435,31 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
 ///
 /// macOS uses various whitespace characters before AM/PM:
 /// - Regular space (U+0020): `1.40.01 PM`
+/// - No-break space (U+00A0): `1.40.01\u{00A0}PM`
 /// - Narrow no-break space (U+202F): `1.40.01\u{202F}PM`
 /// - No space: `1.40.01PM`
 ///
 /// This function strips any of these to produce a consistent `1.40.01PM` form,
 /// enabling matching between files created with different locale settings.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "every `bytes[i + k]` read below is preceded by an `i + k < len` check or a \
-              `bytes[i] < 0x80` ASCII guard that makes `i + 1 <= len`; the UTF-8 fallback \
-              slice `s[i..]` is valid because `i < len` and we land on a char boundary"
-)]
 pub(crate) fn normalize_ampm(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // Check for whitespace characters that may precede AM/PM:
-        // - Regular space (U+0020): 1 byte
-        // - No-break space (U+00A0): 2 bytes (0xC2, 0xA0)
-        // - Narrow no-break space (U+202F): 3 bytes (0xE2, 0x80, 0xAF)
-        let ws_len = if bytes[i] == b' ' {
-            1
-        } else if i + 1 < len && bytes[i] == 0xC2 && bytes[i + 1] == 0xA0 {
-            2 // U+00A0
-        } else if i + 2 < len && bytes[i] == 0xE2 && bytes[i + 1] == 0x80 && bytes[i + 2] == 0xAF {
-            3 // U+202F
-        } else {
-            0
-        };
-
-        if ws_len > 0 && i + ws_len + 1 < len {
-            let next = bytes[i + ws_len].to_ascii_uppercase();
-            let next2 = bytes[i + ws_len + 1].to_ascii_uppercase();
-            if (next == b'A' || next == b'P') && next2 == b'M' {
-                // Skip the whitespace, the AM/PM chars will be added on next iterations
-                i += ws_len;
-                continue;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        // If this char is a known AM/PM-prefix whitespace variant and the
+        // next two chars spell "AM" or "PM" (case-insensitive), drop the
+        // whitespace — the A/P + M will be appended on subsequent
+        // iterations as normal.
+        if matches!(c, ' ' | '\u{00A0}' | '\u{202F}') {
+            let mut lookahead = chars.clone();
+            if let (Some(c1), Some(c2)) = (lookahead.next(), lookahead.next()) {
+                let c1u = c1.to_ascii_uppercase();
+                let c2u = c2.to_ascii_uppercase();
+                if (c1u == 'A' || c1u == 'P') && c2u == 'M' {
+                    continue;
+                }
             }
         }
-
-        // Safe: we only skip known valid UTF-8 boundaries above
-        if bytes[i] < 0x80 {
-            result.push(bytes[i] as char);
-            i += 1;
-        } else {
-            // Multi-byte UTF-8: decode the char and advance past it
-            // Safe: i < len and bytes[i] >= 0x80 guarantees a multi-byte char starts here
-            #[allow(
-                clippy::expect_used,
-                reason = "i < len bound checked above; &str guarantees valid UTF-8 so chars().next() is Some"
-            )]
-            let ch = s[i..]
-                .chars()
-                .next()
-                .expect("i < len guarantees a char exists");
-            result.push(ch);
-            i += ch.len_utf8();
-        }
+        result.push(c);
     }
     result
 }
@@ -589,6 +621,86 @@ pub(crate) fn live_photo_mov_path_original(filename: &str) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn truncate_library_zone_passes_through_primary() {
+        assert_eq!(truncate_library_zone("PrimarySync"), "PrimarySync");
+    }
+
+    #[test]
+    fn truncate_library_zone_keeps_first_eight_chars_of_shared_uuid() {
+        assert_eq!(
+            truncate_library_zone("SharedSync-A1B2C3D4-E5F6-7890-ABCD-EF1234567890"),
+            "SharedSync-A1B2C3D4"
+        );
+    }
+
+    #[test]
+    fn truncate_library_zone_passes_through_short_shared_name() {
+        // Below the 8-char threshold — return verbatim rather than partial.
+        assert_eq!(truncate_library_zone("SharedSync-ABC"), "SharedSync-ABC");
+        assert_eq!(
+            truncate_library_zone("SharedSync-ABCDEFGH"),
+            "SharedSync-ABCDEFGH"
+        );
+    }
+
+    #[test]
+    fn truncate_library_zone_passes_through_unknown_prefix() {
+        assert_eq!(truncate_library_zone("CMMLibrary-XYZ"), "CMMLibrary-XYZ");
+        assert_eq!(truncate_library_zone(""), "");
+    }
+
+    /// Adversarial: two distinct SharedSync zones whose UUIDs
+    /// share the leading 8 hex chars produce the same truncated form.
+    /// The current implementation has no collision guard, so any
+    /// `{library}` token rendered for both would land at the same path
+    /// and silently overwrite ("transparent layer" / "no silent
+    /// failures" invariant). Pin the collision so any future bail at
+    /// resolve-libraries time can rely on this property.
+    #[test]
+    fn truncate_library_zone_collision_two_distinct_uuids_share_prefix() {
+        let zone_a = "SharedSync-A1B2C3D4-EEEE-7890-ABCD-EF1234567890";
+        let zone_b = "SharedSync-A1B2C3D4-FFFF-7890-ABCD-EF1234567890";
+        // Pre-condition: distinct full UUIDs.
+        assert_ne!(zone_a, zone_b);
+        // Pinned collision: identical truncated output.
+        assert_eq!(truncate_library_zone(zone_a), "SharedSync-A1B2C3D4");
+        assert_eq!(truncate_library_zone(zone_b), "SharedSync-A1B2C3D4");
+        assert_eq!(truncate_library_zone(zone_a), truncate_library_zone(zone_b));
+    }
+
+    /// Adversarial, refined: `expand_named_token` with
+    /// `{library}` and an empty zone name must collapse to the empty
+    /// segment branch. Pin the **exact** resulting string so a
+    /// regression that silently inserts a literal `empty` token (or
+    /// reorders surrounding `/`) lands red. Behavior contract today:
+    /// `Some("")` is treated like `None` (the `.filter(|n| !n.is_empty())`
+    /// guard) so `{library}` is replaced with the empty string, leaving
+    /// adjacent slashes.
+    #[test]
+    fn expand_named_token_library_with_empty_zone_yields_explicit_segment() {
+        // Empty zone via Some("") — the defensive case for a CloudKit
+        // response that ever returns an empty zone name.
+        assert_eq!(
+            expand_named_token("{library}/%Y/%m", "{library}", Some("")),
+            "/%Y/%m",
+            "empty Some-zone must collapse the {{library}} segment to empty",
+        );
+        // None zone is the documented "no library context" case and
+        // must produce identical output (defensive symmetry).
+        assert_eq!(
+            expand_named_token("{library}/%Y/%m", "{library}", None),
+            "/%Y/%m",
+            "None zone must mirror Some(\"\") behavior",
+        );
+        // Embedded position: surrounding text is preserved verbatim.
+        assert_eq!(
+            expand_named_token("photos/{library}/by-date", "{library}", Some("")),
+            "photos//by-date",
+            "empty zone in mid-template must leave adjacent separators intact",
+        );
+    }
 
     #[test]
     fn test_clean_filename() {
@@ -978,7 +1090,11 @@ mod tests {
 
     #[test]
     fn test_clean_filename_empty_string() {
-        assert_eq!(clean_filename(""), "");
+        // Empty filename is a degenerate API input that previously
+        // returned "" — joining onto the download directory then yielded
+        // the directory itself, silently colliding across assets. Mirror
+        // sanitize_path_component's `_` sentinel so it surfaces.
+        assert_eq!(clean_filename(""), "_");
     }
 
     #[test]
@@ -1364,6 +1480,35 @@ mod tests {
         // Trailing % in album name must not panic
         let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("50% Off"));
         assert!(result.to_str().unwrap().contains("50% Off"));
+    }
+
+    #[test]
+    fn test_expand_named_token_smart_folder() {
+        let result = expand_named_token("{smart-folder}/%Y", "{smart-folder}", Some("Favorites"));
+        assert_eq!(result, "Favorites/%Y");
+    }
+
+    #[test]
+    fn test_expand_named_token_unknown_token_left_alone() {
+        // Caller picked the wrong token: don't substitute, leave the template
+        // as-is so callers can detect the mismatch via the literal token.
+        let result = expand_named_token("{album}/%Y", "{smart-folder}", Some("Favorites"));
+        assert_eq!(result, "{album}/%Y");
+    }
+
+    #[test]
+    fn test_expand_named_token_sanitizes_smart_folder_name() {
+        // Smart-folder names come from a fixed Apple list today, but the
+        // sanitisation contract still applies so future custom names can't
+        // path-traverse.
+        let result = expand_named_token("{smart-folder}/%Y", "{smart-folder}", Some("../etc"));
+        assert!(!result.contains("../"));
+    }
+
+    #[test]
+    fn test_expand_named_token_empty_name_collapses() {
+        let result = expand_named_token("{smart-folder}/%Y", "{smart-folder}", Some(""));
+        assert_eq!(result, "/%Y");
     }
 
     #[test]

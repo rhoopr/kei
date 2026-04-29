@@ -106,6 +106,9 @@ fs4 = "0.13"
 # Glob pattern matching
 glob = "0.3"
 
+# Bit flags
+bitflags = "2"
+
 # Misc
 url = "2"
 dirs = "6"

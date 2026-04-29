@@ -41,6 +41,7 @@ mod notifications;
 mod password;
 mod report;
 mod retry;
+mod selection;
 mod setup;
 mod shutdown;
 mod state;
@@ -195,7 +196,7 @@ pub(crate) fn available_disk_space(_path: &Path) -> Option<u64> {
 pub(crate) const MIN_FREE_BYTES: u64 = 1_073_741_824;
 
 /// Bail when `available_bytes` is below [`MIN_FREE_BYTES`]. Pure / synchronous
-/// so it can be unit-tested without statvfs or a real filesystem. CG-20.
+/// so it can be unit-tested without statvfs or a real filesystem.
 ///
 /// Production callers compute `available_bytes` from
 /// [`available_disk_space`] (or any future probe) and forward it here so the
@@ -697,7 +698,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn pid_is_alive_self() {
-        assert!(pid_is_alive(std::process::id() as i32));
+        assert!(pid_is_alive(std::process::id().cast_signed()));
     }
 
     #[test]
@@ -829,8 +830,8 @@ mod tests {
             cycles += 1;
             if let Some(interval) = watch_with_interval {
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
-                    _ = shutdown_token.cancelled() => { break; }
+                    () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                    () = shutdown_token.cancelled() => { break; }
                 }
             } else {
                 break;
@@ -893,10 +894,10 @@ mod tests {
         assert_eq!(run_watch_loop(&shutdown_token, Some(3600)).await, 1);
     }
 
-    /// CG-20: kei must abort BEFORE auth (and well before any download)
-    /// when the data directory has < 1 GiB free. A sync that fills the
-    /// disk mid-write leaves orphan `.part` files and a half-truncated
-    /// final file -- the worst-case for the "atomic writes" invariant.
+    /// kei must abort BEFORE auth (and well before any download) when the
+    /// data directory has < 1 GiB free. A sync that fills the disk mid-write
+    /// leaves orphan `.part` files and a half-truncated final file -- the
+    /// worst-case for the "atomic writes" invariant.
     ///
     /// Parameterised over the entire span around the threshold:
     ///   0 bytes               -> bail (extreme)
@@ -934,7 +935,7 @@ mod tests {
         }
     }
 
-    /// CG-20 boundary: confirm `MIN_FREE_BYTES` is exactly 1 GiB. A future
+    /// Confirm `MIN_FREE_BYTES` is exactly 1 GiB. A future
     /// edit that nudges this constant changes operator-visible behavior;
     /// pin the value so the change is intentional.
     #[test]
@@ -1013,7 +1014,7 @@ pub mod __fuzz {
         let Ok(asset) = serde_json::from_value::<Record>(asset) else {
             return;
         };
-        let _ = PhotoAsset::from_records(master, asset);
+        let _ = PhotoAsset::from_records(master, &asset);
     }
 
     /// Run the path-component sanitizers over an arbitrary `&str`. Splits

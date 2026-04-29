@@ -3,7 +3,6 @@ use std::path::Path;
 use anyhow::Context;
 
 use crate::auth;
-use crate::config;
 use crate::icloud;
 use crate::retry;
 
@@ -340,21 +339,167 @@ pub(crate) fn build_photos_params(
     params
 }
 
-/// Resolve a `LibrarySelection` into concrete `PhotoLibrary` instances.
+/// Resolve a [`crate::selection::LibrarySelector`] into the concrete set of
+/// `PhotoLibrary` instances the sync loop iterates over. Walks every zone the
+/// account exposes (primary + private + shared), keeps the ones the
+/// `primary` / `shared_all` flags or the `named` set include, drops any that
+/// match `excluded`, and bails when a positive `named` entry resolves to
+/// nothing.
+///
+/// `named` and `excluded` entries match a zone by exact zone name (case
+/// insensitive) or by the truncated 8-char form
+/// (`paths::truncate_library_zone`) so the on-disk `{library}` segment can
+/// be copied straight back into `--library`.
 pub(crate) async fn resolve_libraries(
-    selection: &config::LibrarySelection,
+    selector: &crate::selection::LibrarySelector,
     photos_service: &mut icloud::photos::PhotosService,
 ) -> anyhow::Result<Vec<icloud::photos::PhotoLibrary>> {
-    match selection {
-        config::LibrarySelection::All => {
-            tracing::debug!("Using all available libraries");
-            photos_service.all_libraries().await
+    use crate::download::paths::truncate_library_zone;
+
+    // Fast path for the default `--library primary`: skip the private +
+    // shared library HTTP listings. Saves two requests per sync for the
+    // common single-library case.
+    if selector == &crate::selection::LibrarySelector::default() {
+        let lib = photos_service
+            .get_library(crate::icloud::photos::PRIMARY_ZONE_NAME)
+            .await?;
+        return Ok(vec![lib.clone()]);
+    }
+
+    let all = photos_service.all_libraries().await?;
+
+    // Track which selector entries actually matched so we can bail on a
+    // positive miss (the spec's "Album 'Vacatiom' not found" rule, applied to
+    // libraries). `named` only; `excluded` misses just warn.
+    let mut named_hits: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(selector.named.len());
+    let mut chosen: Vec<icloud::photos::PhotoLibrary> = Vec::new();
+
+    for lib in &all {
+        let zone = lib.zone_name();
+        let truncated = truncate_library_zone(zone);
+        let is_primary = zone == crate::icloud::photos::PRIMARY_ZONE_NAME;
+        let is_shared = crate::icloud::photos::is_shared_zone(zone);
+
+        let included = (selector.primary && is_primary)
+            || (selector.shared_all && is_shared)
+            || selector.named.iter().any(|entry| {
+                let hit = library_entry_matches_zone(entry, zone, truncated);
+                if hit {
+                    named_hits.insert(entry.as_str());
+                }
+                hit
+            });
+        if !included {
+            continue;
         }
-        config::LibrarySelection::Single(name) => {
-            if name != "PrimarySync" {
-                tracing::debug!(library = %name, "Using non-default library");
-            }
-            Ok(vec![photos_service.get_library(name).await?.clone()])
+
+        let excluded = selector.excluded.iter().any(|entry| {
+            (entry.eq_ignore_ascii_case("primary") && is_primary)
+                || (entry.eq_ignore_ascii_case("shared") && is_shared)
+                || library_entry_matches_zone(entry, zone, truncated)
+        });
+        if excluded {
+            continue;
+        }
+
+        // `all_libraries()` returns disjoint sets (primary, private minus
+        // PrimarySync, shared) so no cross-source dedup is needed here.
+        chosen.push(lib.clone());
+    }
+
+    if let Some(missed) = selector
+        .named
+        .iter()
+        .find(|n| !named_hits.contains(n.as_str()))
+    {
+        let known: Vec<&str> = all
+            .iter()
+            .map(icloud::photos::PhotoLibrary::zone_name)
+            .collect();
+        anyhow::bail!(
+            "--library '{missed}' not found. Available zones: {}. Run `kei list libraries` to see every zone with its truncated form.",
+            known.join(", ")
+        );
+    }
+
+    if chosen.is_empty() {
+        anyhow::bail!(
+            "--library resolved to zero libraries against this account; \
+             pass at least one of primary / shared / a zone name without \
+             excluding everything"
+        );
+    }
+
+    // Path collision guard. `truncate_library_zone` keeps the first 8 hex
+    // chars of `SharedSync-<UUID>`; CloudKit UUIDs are not guaranteed
+    // unique on that prefix, so two distinct shared zones can render to
+    // the same `{library}` path segment. If both land in the chosen set,
+    // multi-library sync silently overwrites one zone's bytes with the
+    // other's (state DB stays per-zone distinct under the v8 PK so the
+    // corruption is invisible). Bail with both full UUIDs and the
+    // truncated form so the user can pin a longer prefix via `--library
+    // SharedSync-<longer>`.
+    let mut by_truncated: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::with_capacity(chosen.len());
+    for lib in &chosen {
+        let zone = lib.zone_name();
+        by_truncated
+            .entry(truncate_library_zone(zone))
+            .or_default()
+            .push(zone);
+    }
+    if let Some((truncated, zones)) = by_truncated.iter().find(|(_, zones)| zones.len() > 1) {
+        let mut sorted = zones.clone();
+        sorted.sort_unstable();
+        anyhow::bail!(
+            "Multiple selected libraries collapse to the same `{{library}}` path \
+             segment `{truncated}`: [{full}]. The 8-char shared-library prefix \
+             collides; pin one of these zones via `--library <longer-prefix>` \
+             (use `kei list libraries` to see every zone with its truncated form).",
+            full = sorted.join(", "),
+        );
+    }
+
+    match chosen.as_slice() {
+        [only] if only.zone_name() != crate::icloud::photos::PRIMARY_ZONE_NAME => {
+            tracing::debug!(library = %only.zone_name(), "Using non-default library");
+        }
+        [_] => {} // primary-only logged in the fast path above
+        many => tracing::debug!(count = many.len(), "Using multiple libraries"),
+    }
+
+    Ok(chosen)
+}
+
+/// Match a `--library` entry (full zone name or truncated 8-char form)
+/// against a live zone, case-insensitive. The truncated form is what
+/// `{library}` renders into paths, so users can copy a path segment and
+/// paste it back into `--library`.
+fn library_entry_matches_zone(entry: &str, zone: &str, truncated: &str) -> bool {
+    entry.eq_ignore_ascii_case(zone) || entry.eq_ignore_ascii_case(truncated)
+}
+
+/// Category of a download pass: a named user album, an Apple-defined smart
+/// folder, or the library-wide unfiled pseudo-pass. Drives template/token
+/// selection in the path renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassKind {
+    Album,
+    SmartFolder,
+    Unfiled,
+}
+
+impl PassKind {
+    /// Folder-structure token expanded for this pass kind. The unfiled pass
+    /// reuses `{album}` so existing configs with `--folder-structure
+    /// "{album}/..."` still produce the same on-disk tree (the token
+    /// collapses to an empty segment when the unfiled pass runs with the
+    /// library-wide pseudo-album's empty name).
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Album | Self::Unfiled => "{album}",
+            Self::SmartFolder => "{smart-folder}",
         }
     }
 }
@@ -366,6 +511,7 @@ pub(crate) async fn resolve_libraries(
 /// album member (for the `-a all` + `{album}` unfiled pass) or with excluded
 /// albums' members (for `--exclude-album` without `--album`).
 pub(crate) struct AlbumPass {
+    pub kind: PassKind,
     pub album: icloud::photos::PhotoAlbum,
     pub exclude_ids: std::sync::Arc<rustc_hash::FxHashSet<String>>,
 }
@@ -379,6 +525,7 @@ pub(crate) struct AlbumPlan {
 impl std::fmt::Debug for AlbumPass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlbumPass")
+            .field("kind", &self.kind)
             .field("album_name", &self.album.name)
             .field("exclude_ids_len", &self.exclude_ids.len())
             .finish()
@@ -414,172 +561,307 @@ async fn collect_album_asset_ids(
     Ok(())
 }
 
-/// Resolve the full download plan for a library.
-///
-/// The returned [`AlbumPlan`] contains one or more passes, each paired with
-/// its own exclude-asset-ids set:
-///
-/// - [`config::AlbumSelection::LibraryOnly`] returns a single library-wide pass.
-///   `--exclude-album X` without `--album` populates the pass's exclude set
-///   with X's members so they don't leak through the library-wide stream.
-/// - [`config::AlbumSelection::Named`] returns one pass per matched album, minus
-///   anything in `exclude_albums`. Missing names are a hard error.
-/// - [`config::AlbumSelection::All`] returns one pass per discovered album (minus
-///   `exclude_albums`). When `{album}` is in `folder_structure`, an extra
-///   library-wide "unfiled" pass is appended; its exclude set is the union
-///   of every discovered album's members (including excluded ones — users
-///   explicitly asked to skip those, so they must not fall through to the
-///   unfiled pass either).
-///
-/// `folder_structure` is consulted only for `config::AlbumSelection::All`, to decide
-/// whether to add the unfiled pass.
-pub(crate) async fn resolve_albums(
-    library: &icloud::photos::PhotoLibrary,
-    selection: &config::AlbumSelection,
-    exclude_albums: &[String],
-    folder_structure: &str,
-) -> anyhow::Result<AlbumPlan> {
-    let empty = empty_exclude_ids();
+/// Static set of Apple-defined smart-folder names. Looked up by name on
+/// the same map `PhotoLibrary::albums` returns; used to split user albums
+/// vs smart folders for the v0.13 selection model.
+fn smart_folder_name_set() -> rustc_hash::FxHashSet<&'static str> {
+    icloud::photos::smart_folders::smart_folders()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
 
-    match selection {
-        config::AlbumSelection::LibraryOnly => {
-            if exclude_albums.is_empty() {
-                return Ok(AlbumPlan {
-                    passes: vec![AlbumPass {
-                        album: library.all(),
-                        exclude_ids: empty,
-                    }],
-                });
-            }
-            // Legacy: --exclude-album without --album. Pre-collect IDs so
-            // they're filtered from the library-wide stream.
-            let album_map = library.albums().await?;
-            let mut exclude_ids = rustc_hash::FxHashSet::default();
-            for name in exclude_albums {
-                if let Some(album) = album_map.get(name.as_str()) {
-                    tracing::debug!(album = name, "Pre-fetching excluded album asset IDs");
-                    collect_album_asset_ids(album, &mut exclude_ids).await?;
-                } else {
-                    tracing::warn!(album = name, "Excluded album not found, ignoring");
-                }
-            }
-            tracing::debug!(count = exclude_ids.len(), "Collected excluded asset IDs");
-            Ok(AlbumPlan {
-                passes: vec![AlbumPass {
-                    album: library.all(),
-                    exclude_ids: std::sync::Arc::new(exclude_ids),
-                }],
-            })
+/// Resolve the v0.13 [`crate::selection::Selection`] into concrete download
+/// passes for one library.
+///
+/// Per-category behaviour, mirroring the spec:
+///
+/// - `albums: None` → no album passes.
+/// - `albums: All { excluded }` → one pass per user album in the library
+///   except those listed in `excluded`. Missing exclusion names log a
+///   warning and are skipped; smart folders are filtered out (use
+///   `--smart-folder all` to opt in).
+/// - `albums: Named { included, excluded }` → one pass per name in
+///   `included`. Missing names bail at startup with the available album
+///   list. Names that are smart folders bail with a hint to use
+///   `--smart-folder` instead.
+/// - `smart_folders: None` → no smart-folder passes.
+/// - `smart_folders: All { include_sensitive, excluded }` → one pass per
+///   smart folder; Hidden / Recently Deleted are skipped unless
+///   `include_sensitive` is true. Missing exclusion names log a warning.
+/// - `smart_folders: Named { included, excluded }` → one pass per smart
+///   folder name; non-smart-folder names bail.
+/// - `unfiled: true` → an extra library-wide pass with `exclude_ids`
+///   covering every member of every selected album (the spec dedup
+///   invariant: an asset in a selected album must not also land at the
+///   unfiled path). Selected smart folders do not contribute to the
+///   exclusion set — smart-folder membership is orthogonal to album
+///   membership.
+///
+/// Album member IDs are fetched in parallel before the album map is
+/// consumed into passes; each `PhotoAlbum` is moved into exactly one pass.
+pub(crate) async fn resolve_passes(
+    library: &icloud::photos::PhotoLibrary,
+    selection: &crate::selection::Selection,
+) -> anyhow::Result<AlbumPlan> {
+    use crate::selection::{AlbumSelector, SmartFolderSelector};
+
+    let album_active = !matches!(selection.albums, AlbumSelector::None);
+    let smart_active = !matches!(selection.smart_folders, SmartFolderSelector::None);
+
+    if !album_active && !smart_active && !selection.unfiled {
+        return Ok(AlbumPlan { passes: Vec::new() });
+    }
+
+    let mut album_map = library.albums().await?;
+    let smart_names = smart_folder_name_set();
+
+    let selected_album_names = pick_album_names(&selection.albums, &album_map, &smart_names)?;
+    let selected_smart_names =
+        pick_smart_folder_names(&selection.smart_folders, &album_map, &smart_names)?;
+
+    let unfiled_exclude_ids = if selection.unfiled {
+        compute_unfiled_exclude_ids(&album_map, &selected_album_names).await?
+    } else {
+        rustc_hash::FxHashSet::default()
+    };
+
+    let empty = empty_exclude_ids();
+    let mut passes: Vec<AlbumPass> = Vec::new();
+
+    // Stable, alphabetised pass order so logs and dry-run output don't
+    // jitter with HashMap iteration order.
+    drain_named_into_passes(
+        &mut album_map,
+        selected_album_names,
+        PassKind::Album,
+        &empty,
+        &mut passes,
+    );
+    drain_named_into_passes(
+        &mut album_map,
+        selected_smart_names,
+        PassKind::SmartFolder,
+        &empty,
+        &mut passes,
+    );
+
+    if selection.unfiled {
+        passes.push(AlbumPass {
+            kind: PassKind::Unfiled,
+            album: library.all(),
+            exclude_ids: std::sync::Arc::new(unfiled_exclude_ids),
+        });
+    }
+
+    Ok(AlbumPlan { passes })
+}
+
+/// Pick the user-album names selected by `albums`. Bails on missing
+/// `Named` entries and on missing `excluded` entries (typo-only excludes
+/// would otherwise let the unintended album through silently).
+fn pick_album_names(
+    selector: &crate::selection::AlbumSelector,
+    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    smart_names: &rustc_hash::FxHashSet<&'static str>,
+) -> anyhow::Result<Vec<String>> {
+    use crate::selection::AlbumSelector;
+    match selector {
+        AlbumSelector::None => Ok(Vec::new()),
+        AlbumSelector::All { excluded } => {
+            bail_unknown_excluded_albums(excluded, album_map, smart_names)?;
+            Ok(album_map
+                .keys()
+                .filter(|name| {
+                    !smart_names.contains(name.as_str()) && !excluded.contains(name.as_str())
+                })
+                .cloned()
+                .collect())
         }
-        config::AlbumSelection::Named(names) => {
-            // Dedup names: passing the same album twice should collapse to
-            // a single pass, not error out after the first remove()
-            // drained the map.
-            let mut album_map = library.albums().await?;
-            let mut passes = Vec::new();
-            let mut seen = rustc_hash::FxHashSet::default();
-            for name in names {
-                if !seen.insert(name.as_str()) {
+        AlbumSelector::Named { included, excluded } => {
+            let mut chosen = Vec::with_capacity(included.len());
+            for name in included {
+                if smart_names.contains(name.as_str()) {
+                    anyhow::bail!(
+                        "'{name}' is a smart folder; pass `--smart-folder {name}` instead of `--album`"
+                    );
+                }
+                if excluded.contains(name) {
                     continue;
                 }
-                if exclude_albums.iter().any(|e| e == name) {
-                    tracing::debug!(album = name, "Album excluded by --exclude-album");
-                    continue;
-                }
-                if let Some(album) = album_map.remove(name.as_str()) {
-                    passes.push(AlbumPass {
-                        album,
-                        exclude_ids: std::sync::Arc::clone(&empty),
-                    });
+                if album_map.contains_key(name.as_str()) {
+                    chosen.push(name.clone());
                 } else {
-                    let available: Vec<&String> = album_map.keys().collect();
+                    let mut available: Vec<&String> = album_map
+                        .keys()
+                        .filter(|k| !smart_names.contains(k.as_str()))
+                        .collect();
+                    available.sort();
                     anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
                 }
             }
-            Ok(AlbumPlan { passes })
+            bail_unknown_excluded_albums(excluded, album_map, smart_names)?;
+            Ok(chosen)
         }
-        config::AlbumSelection::All => {
-            // Smart folders (Favorites, Recently Deleted, Hidden, etc.) are
-            // skipped: the feature request asked for user-created albums,
-            // and surfacing Apple's system folders as download targets
-            // creates confusing trees. Users who want one can still name
-            // it explicitly via `-a Favorites`.
-            let smart_folder_names: rustc_hash::FxHashSet<&'static str> =
-                icloud::photos::smart_folders::smart_folders()
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect();
-            let album_map: std::collections::HashMap<String, icloud::photos::PhotoAlbum> = library
-                .albums()
-                .await?
-                .into_iter()
-                .filter(|(name, _)| !smart_folder_names.contains(name.as_str()))
+    }
+}
+
+fn bail_unknown_excluded_albums(
+    excluded: &std::collections::BTreeSet<String>,
+    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    smart_names: &rustc_hash::FxHashSet<&'static str>,
+) -> anyhow::Result<()> {
+    for name in excluded {
+        if !album_map.contains_key(name.as_str()) {
+            let mut available: Vec<&String> = album_map
+                .keys()
+                .filter(|k| !smart_names.contains(k.as_str()))
                 .collect();
-            let has_album_token = folder_structure.contains("{album}");
+            available.sort();
+            anyhow::bail!("Excluded album '{name}' not found. Available albums: {available:?}");
+        }
+    }
+    Ok(())
+}
 
-            // Collect every user album's members (including --exclude-album
-            // ones) into the unfiled exclusion set before consuming the
-            // map. Excluded albums must contribute too, otherwise their
-            // photos would leak out through the library-wide unfiled pass.
-            // Fetched in parallel because this runs before the first byte
-            // is downloaded; for libraries with many albums the serial
-            // version added minutes of startup latency.
-            let mut in_any_album: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-            if has_album_token {
-                use futures_util::{StreamExt, TryStreamExt};
-                const EXCLUSION_FETCH_CONCURRENCY: usize = 8;
-                let per_album: Vec<rustc_hash::FxHashSet<String>> =
-                    futures_util::stream::iter(album_map.iter())
-                        .map(|(name, album)| async move {
-                            tracing::debug!(
-                                album = %name,
-                                "Pre-fetching IDs for unfiled exclusion set"
-                            );
-                            let mut set = rustc_hash::FxHashSet::default();
-                            collect_album_asset_ids(album, &mut set).await?;
-                            anyhow::Ok(set)
-                        })
-                        .buffer_unordered(EXCLUSION_FETCH_CONCURRENCY)
-                        .try_collect()
-                        .await?;
-                for set in per_album {
-                    in_any_album.extend(set);
-                }
+/// Pick the smart-folder names selected by `smart_folders`. Bails on
+/// `Named` entries that aren't smart folders; warns on missing
+/// `excluded` entries.
+fn pick_smart_folder_names(
+    selector: &crate::selection::SmartFolderSelector,
+    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    smart_names: &rustc_hash::FxHashSet<&'static str>,
+) -> anyhow::Result<Vec<String>> {
+    use crate::selection::SmartFolderSelector;
+    let sensitive: rustc_hash::FxHashSet<&'static str> =
+        icloud::photos::smart_folders::sensitive_smart_folder_names().collect();
+
+    match selector {
+        SmartFolderSelector::None => Ok(Vec::new()),
+        SmartFolderSelector::All {
+            include_sensitive,
+            excluded,
+        } => {
+            for name in excluded {
+                warn_excluded_not_a_smart_folder(name, smart_names);
             }
-
-            // Sort by name — HashMap iteration is non-deterministic and
-            // logs/dry-run output should be stable across runs.
-            let mut named_albums: Vec<(String, icloud::photos::PhotoAlbum)> =
-                album_map.into_iter().collect();
-            named_albums.sort_by(|a, b| a.0.cmp(&b.0));
-
-            let mut passes: Vec<AlbumPass> = Vec::new();
-            let mut excluded_count = 0usize;
-            for (name, album) in named_albums {
-                if exclude_albums.iter().any(|e| e == &name) {
-                    excluded_count += 1;
-                    tracing::debug!(album = %name, "Album excluded by --exclude-album");
+            Ok(album_map
+                .keys()
+                .filter(|name| smart_names.contains(name.as_str()))
+                .filter(|name| *include_sensitive || !sensitive.contains(name.as_str()))
+                .filter(|name| !excluded.contains(name.as_str()))
+                .cloned()
+                .collect())
+        }
+        SmartFolderSelector::Named { included, excluded } => {
+            let mut chosen = Vec::with_capacity(included.len());
+            for name in included {
+                if !smart_names.contains(name.as_str()) {
+                    let mut available: Vec<&str> = smart_names.iter().copied().collect();
+                    available.sort();
+                    anyhow::bail!(
+                        "'{name}' is not an Apple smart folder. Available: {available:?}"
+                    );
+                }
+                if excluded.contains(name) {
                     continue;
                 }
-                passes.push(AlbumPass {
-                    album,
-                    exclude_ids: std::sync::Arc::clone(&empty),
-                });
+                if album_map.contains_key(name.as_str()) {
+                    chosen.push(name.clone());
+                } else {
+                    tracing::warn!(
+                        smart_folder = %name,
+                        "Smart folder not present in this library, skipping"
+                    );
+                }
             }
-            tracing::info!(
-                count = passes.len(),
-                excluded = excluded_count,
-                unfiled_pass = has_album_token,
-                "Expanded '-a all' to every user-created album (smart folders skipped)"
-            );
-            if has_album_token {
-                passes.push(AlbumPass {
-                    album: library.all(),
-                    exclude_ids: std::sync::Arc::new(in_any_album),
-                });
+            for name in excluded {
+                warn_excluded_not_a_smart_folder(name, smart_names);
             }
-            Ok(AlbumPlan { passes })
+            Ok(chosen)
         }
+    }
+}
+
+fn warn_excluded_not_a_smart_folder(name: &str, smart_names: &rustc_hash::FxHashSet<&'static str>) {
+    if !smart_names.contains(name) {
+        tracing::warn!(
+            smart_folder = %name,
+            "Excluded smart folder is not an Apple smart folder, ignoring"
+        );
+    }
+}
+
+/// Fetch every selected album's member IDs in parallel. The PhotoAlbums
+/// stay borrowed in the map; callers move them into passes after this
+/// returns. Empty input → empty set, no fetches.
+async fn compute_unfiled_exclude_ids(
+    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    selected_album_names: &[String],
+) -> anyhow::Result<rustc_hash::FxHashSet<String>> {
+    use futures_util::{StreamExt, TryStreamExt};
+    const EXCLUSION_FETCH_CONCURRENCY: usize = 8;
+
+    if selected_album_names.is_empty() {
+        return Ok(rustc_hash::FxHashSet::default());
+    }
+
+    // Defensive: pick_album_names validated every name against album_map,
+    // so a miss here means the map mutated between checks. Bail loudly
+    // rather than silently shrinking the exclusion set, which would let
+    // already-filed assets re-download under --unfiled.
+    let mut tuples: Vec<(&String, &icloud::photos::PhotoAlbum)> =
+        Vec::with_capacity(selected_album_names.len());
+    for name in selected_album_names {
+        match album_map.get(name.as_str()) {
+            Some(album) => tuples.push((name, album)),
+            None => anyhow::bail!(
+                "Selected album '{name}' missing from library album map at \
+                 unfiled-exclusion time"
+            ),
+        }
+    }
+
+    let per_album: Vec<rustc_hash::FxHashSet<String>> = futures_util::stream::iter(tuples)
+        .map(|(name, album)| async move {
+            tracing::debug!(album = %name, "Pre-fetching IDs for unfiled exclusion set");
+            let mut set = rustc_hash::FxHashSet::default();
+            collect_album_asset_ids(album, &mut set).await?;
+            anyhow::Ok(set)
+        })
+        .buffer_unordered(EXCLUSION_FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    let mut union = rustc_hash::FxHashSet::default();
+    for set in per_album {
+        union.extend(set);
+    }
+    Ok(union)
+}
+
+/// Move named entries out of `album_map` into `passes` in alphabetical
+/// order, sharing `empty_excludes` as the per-pass exclude set. A `None`
+/// from `remove` should be impossible (`pick_*` validates membership) but
+/// is logged + skipped to keep the resolver out of unwrap territory.
+fn drain_named_into_passes(
+    album_map: &mut std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    mut names: Vec<String>,
+    kind: PassKind,
+    empty_excludes: &std::sync::Arc<rustc_hash::FxHashSet<String>>,
+    passes: &mut Vec<AlbumPass>,
+) {
+    names.sort();
+    for name in names {
+        let Some(album) = album_map.remove(name.as_str()) else {
+            tracing::warn!(category = ?kind, name = %name, "Selected entry disappeared from map, skipping");
+            continue;
+        };
+        passes.push(AlbumPass {
+            kind,
+            album,
+            exclude_ids: std::sync::Arc::clone(empty_excludes),
+        });
     }
 }
 
@@ -640,10 +922,12 @@ mod tests {
         );
     }
 
-    // ── resolve_albums tests ──────────────────────────────────────────
+    // ── resolve_passes tests ─────────────────────────────────────────
 
     use crate::icloud::photos::PhotoLibrary;
+    use crate::selection::{AlbumSelector, Selection, SmartFolderSelector};
     use crate::test_helpers::MockPhotosSession;
+    use std::collections::BTreeSet;
 
     /// Build a `PhotoLibrary` stub with a preconfigured mock session.
     fn stub_library(mock: MockPhotosSession) -> PhotoLibrary {
@@ -707,226 +991,307 @@ mod tests {
         })
     }
 
-    // Shortcut for building an AlbumSelection::Named from string literals.
-    fn named(names: &[&str]) -> config::AlbumSelection {
-        config::AlbumSelection::Named(names.iter().map(|s| (*s).to_string()).collect())
+    fn names(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn selection_with_albums(albums: AlbumSelector, unfiled: bool) -> Selection {
+        Selection {
+            albums,
+            smart_folders: SmartFolderSelector::None,
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled,
+        }
     }
 
     #[tokio::test]
-    async fn resolve_albums_no_album_no_exclude() {
-        let mock = MockPhotosSession::new();
-        let library = stub_library(mock);
-        let plan = resolve_albums(
-            &library,
-            &config::AlbumSelection::LibraryOnly,
-            &[],
-            "%Y/%m/%d",
-        )
-        .await
-        .unwrap();
-        assert_eq!(plan.passes.len(), 1, "should return library.all()");
-        assert!(plan.passes[0].exclude_ids.is_empty());
-    }
-
-    #[tokio::test]
-    async fn resolve_albums_exclude_not_found_warns() {
-        // fetch_folders returns no albums, but we exclude "Nonexistent"
+    async fn resolve_passes_unfiled_only_returns_library_wide_pass() {
+        // No albums or smart folders, but unfiled = true: a single library
+        // pass with no exclusion (today's `LibraryOnly` default).
         let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
         let library = stub_library(mock);
+        let sel = selection_with_albums(AlbumSelector::None, true);
 
-        let plan = resolve_albums(
-            &library,
-            &config::AlbumSelection::LibraryOnly,
-            &["Nonexistent".to_string()],
-            "%Y/%m/%d",
-        )
-        .await
-        .unwrap();
-        assert_eq!(plan.passes.len(), 1, "should return library.all()");
-        assert!(
-            plan.passes[0].exclude_ids.is_empty(),
-            "non-existent album produces no IDs"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_albums_explicit_album_found() {
-        // fetch_folders returns "Vacation" album
-        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
-            folder_record("FOLDER_1", "Vacation")
-        ]}));
-        let library = stub_library(mock);
-
-        let plan = resolve_albums(&library, &named(&["Vacation"]), &[], "%Y/%m/%d")
-            .await
-            .unwrap();
+        let plan = resolve_passes(&library, &sel).await.unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert!(plan.passes[0].exclude_ids.is_empty());
     }
 
     #[tokio::test]
-    async fn resolve_albums_explicit_album_not_found_errors() {
-        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
+    async fn resolve_passes_effective_empty_returns_no_passes() {
+        // None + None + unfiled=false → no work; sync_loop exits cleanly.
+        let mock = MockPhotosSession::new();
         let library = stub_library(mock);
+        let sel = selection_with_albums(AlbumSelector::None, false);
 
-        let result = resolve_albums(&library, &named(&["DoesNotExist"]), &[], "%Y/%m/%d").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        assert!(plan.passes.is_empty());
     }
 
     #[tokio::test]
-    async fn resolve_albums_dedups_duplicate_names() {
-        // `--album Vacation --album Vacation` should resolve to a single album,
-        // not error after the first instance drains the map.
+    async fn resolve_passes_named_album_found() {
         let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
             folder_record("FOLDER_1", "Vacation")
         ]}));
         let library = stub_library(mock);
+        let sel = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["Vacation"]),
+                excluded: BTreeSet::new(),
+            },
+            false,
+        );
 
-        let plan = resolve_albums(&library, &named(&["Vacation", "Vacation"]), &[], "%Y/%m/%d")
-            .await
-            .unwrap();
-        assert_eq!(plan.passes.len(), 1, "duplicate names dedup to 1");
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        assert_eq!(plan.passes.len(), 1);
+        assert!(plan.passes[0].exclude_ids.is_empty());
     }
 
     #[tokio::test]
-    async fn resolve_albums_explicit_album_with_exclusion() {
-        // Two albums: Vacation and Hidden. Exclude Hidden.
-        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
-            folder_record("FOLDER_1", "Vacation"),
-            folder_record("FOLDER_2", "Hidden")
-        ]}));
+    async fn resolve_passes_named_album_missing_bails() {
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
         let library = stub_library(mock);
+        let sel = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["DoesNotExist"]),
+                excluded: BTreeSet::new(),
+            },
+            false,
+        );
 
-        let plan = resolve_albums(
-            &library,
-            &named(&["Vacation", "Hidden"]),
-            &["Hidden".to_string()],
-            "%Y/%m/%d",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            plan.passes.len(),
-            1,
-            "Hidden should be excluded from matched albums"
-        );
-        assert!(
-            plan.passes[0].exclude_ids.is_empty(),
-            "explicit album path doesn't populate exclude IDs"
-        );
+        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        assert!(err.to_string().contains("not found"), "msg: {err}");
     }
 
     #[tokio::test]
-    async fn resolve_albums_exclude_without_album_collects_ids() {
-        // The mock session needs to handle:
-        // 1. fetch_folders → returns album "Hidden"
-        // 2. album.len() → returns count
-        // 3. photo_stream fetcher → returns one asset page
-        // 4. photo_stream fetcher 2nd call → returns empty (end of stream)
-        let mock = MockPhotosSession::new()
-            .ok(serde_json::json!({"records": [
-                folder_record("FOLDER_1", "Hidden")
-            ]}))
-            .ok(album_count_response(1))
-            .ok(asset_page("MASTER_1"))
-            .ok(serde_json::json!({"records": []}));
+    async fn resolve_passes_named_smart_folder_in_album_position_bails() {
+        // `--album Favorites` should redirect users to `--smart-folder`.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
         let library = stub_library(mock);
-
-        let plan = resolve_albums(
-            &library,
-            &config::AlbumSelection::LibraryOnly,
-            &["Hidden".to_string()],
-            "%Y/%m/%d",
-        )
-        .await
-        .unwrap();
-        assert_eq!(plan.passes.len(), 1, "should return library.all()");
-        assert!(
-            plan.passes[0].exclude_ids.contains("MASTER_1"),
-            "should contain the excluded asset ID"
+        let sel = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            false,
         );
+
+        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        assert!(err.to_string().contains("smart folder"), "msg: {err}");
     }
 
     #[tokio::test]
-    async fn resolve_albums_all_expands_to_every_album() {
+    async fn resolve_passes_all_albums_no_unfiled() {
         let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
             folder_record("FOLDER_1", "Vacation"),
             folder_record("FOLDER_2", "Summer Trip")
         ]}));
         let library = stub_library(mock);
-
-        let plan = resolve_albums(&library, &config::AlbumSelection::All, &[], "%Y/%m/%d")
-            .await
-            .unwrap();
-        assert_eq!(
-            plan.passes.len(),
-            2,
-            "every user-created album becomes a pass, no unfiled pass without {{album}}"
+        let sel = selection_with_albums(
+            AlbumSelector::All {
+                excluded: BTreeSet::new(),
+            },
+            false,
         );
-        for pass in &plan.passes {
-            assert!(
-                pass.exclude_ids.is_empty(),
-                "concrete album passes carry no exclusion"
-            );
+
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        assert_eq!(plan.passes.len(), 2);
+        for p in &plan.passes {
+            assert!(p.exclude_ids.is_empty());
         }
     }
 
     #[tokio::test]
-    async fn resolve_albums_all_with_album_token_adds_unfiled_pass() {
-        // fetch_folders returns one album; then len + stream mocks so the
-        // unfiled exclusion set is populated from that album's member.
+    async fn resolve_passes_all_albums_with_unfiled_excludes_member_ids() {
         let mock = MockPhotosSession::new()
             .ok(serde_json::json!({"records": [folder_record("FOLDER_1", "Vacation")]}))
             .ok(album_count_response(1))
             .ok(asset_page("MASTER_1"))
             .ok(serde_json::json!({"records": []}));
         let library = stub_library(mock);
+        let sel = selection_with_albums(
+            AlbumSelector::All {
+                excluded: BTreeSet::new(),
+            },
+            true,
+        );
 
-        let plan = resolve_albums(
-            &library,
-            &config::AlbumSelection::All,
-            &[],
-            "{album}/%Y/%m/%d",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            plan.passes.len(),
-            2,
-            "concrete album + unfiled pass when {{album}} is in template"
-        );
-        assert!(
-            plan.passes[0].exclude_ids.is_empty(),
-            "concrete pass carries no exclusion"
-        );
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        assert_eq!(plan.passes.len(), 2, "1 album pass + 1 unfiled pass");
+        assert!(plan.passes[0].exclude_ids.is_empty());
         assert!(
             plan.passes[1].exclude_ids.contains("MASTER_1"),
-            "unfiled pass excludes assets already in some album"
+            "unfiled pass excludes the album's member"
         );
     }
 
     #[tokio::test]
-    async fn resolve_albums_all_respects_exclude_albums() {
+    async fn resolve_passes_all_albums_respects_excluded_set() {
         let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
             folder_record("FOLDER_1", "Vacation"),
-            folder_record("FOLDER_2", "Hidden Trip")
+            folder_record("FOLDER_2", "Family")
         ]}));
         let library = stub_library(mock);
-
-        let plan = resolve_albums(
-            &library,
-            &config::AlbumSelection::All,
-            &["Hidden Trip".to_string()],
-            "%Y/%m/%d",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            plan.passes.len(),
-            1,
-            "Hidden Trip is filtered out of the concrete passes"
+        let sel = selection_with_albums(
+            AlbumSelector::All {
+                excluded: names(&["Family"]),
+            },
+            false,
         );
+
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        assert_eq!(plan.passes.len(), 1, "Family is filtered out");
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_smart_folder_named_creates_pass() {
+        // No user-created folders; smart folders are seeded by
+        // `library.albums()` so we don't need a network response for them.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
+        let library = stub_library(mock);
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::Named {
+                included: names(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: false,
+        };
+
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        assert_eq!(plan.passes.len(), 1);
+        assert_eq!(plan.passes[0].album.name.as_ref(), "Favorites");
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_smart_folder_named_unknown_bails() {
+        let mock = MockPhotosSession::new();
+        let library = stub_library(mock);
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::Named {
+                included: names(&["NotASmartFolder"]),
+                excluded: BTreeSet::new(),
+            },
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: false,
+        };
+
+        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not an Apple smart folder"),
+            "msg: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_smart_folder_all_sensitive_truth_table() {
+        for include_sensitive in [false, true] {
+            let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
+            let library = stub_library(mock);
+            let sel = Selection {
+                albums: AlbumSelector::None,
+                smart_folders: SmartFolderSelector::All {
+                    include_sensitive,
+                    excluded: BTreeSet::new(),
+                },
+                libraries: crate::selection::LibrarySelector::default(),
+                unfiled: false,
+            };
+
+            let plan = resolve_passes(&library, &sel).await.unwrap();
+            let names: BTreeSet<String> = plan
+                .passes
+                .iter()
+                .map(|p| p.album.name.to_string())
+                .collect();
+            assert!(names.contains("Favorites"), "non-sensitive always present");
+            assert_eq!(
+                names.contains("Hidden"),
+                include_sensitive,
+                "Hidden gated on include_sensitive={include_sensitive}"
+            );
+            assert_eq!(
+                names.contains("Recently Deleted"),
+                include_sensitive,
+                "Recently Deleted gated on include_sensitive={include_sensitive}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_unfiled_with_no_selected_albums_has_empty_exclusion() {
+        // None + unfiled=true → library-wide pass, no exclusions.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []}));
+        let library = stub_library(mock);
+        let sel = selection_with_albums(AlbumSelector::None, true);
+
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        assert_eq!(plan.passes.len(), 1);
+        assert!(plan.passes[0].exclude_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_all_albums_excluded_typo_bails() {
+        // CG-3: a typo in --album !X must surface the user's mistake. Silent
+        // warn lets a real album get included that the user meant to drop.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation"),
+            folder_record("FOLDER_2", "Family")
+        ]}));
+        let library = stub_library(mock);
+        let sel = selection_with_albums(
+            AlbumSelector::All {
+                excluded: names(&["Vacationn"]),
+            },
+            false,
+        );
+
+        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Vacationn") && msg.to_lowercase().contains("not found"),
+            "msg: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_named_albums_excluded_typo_bails() {
+        // CG-3 paired case: Named selector with a typo'd exclude.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation"),
+            folder_record("FOLDER_2", "Family")
+        ]}));
+        let library = stub_library(mock);
+        let sel = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["Vacation"]),
+                excluded: names(&["Vacationn"]),
+            },
+            false,
+        );
+
+        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Vacationn") && msg.to_lowercase().contains("not found"),
+            "msg: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_unfiled_exclude_ids_bails_on_missing_album() {
+        // CG-5 defensive: if a selected album is somehow missing from the
+        // library album map at exclusion time, surface it instead of
+        // silently producing an empty exclusion set (which would let
+        // already-filed assets re-download under --unfiled).
+        let album_map = std::collections::HashMap::new();
+        let selected = vec!["GhostAlbum".to_string()];
+        let err = compute_unfiled_exclude_ids(&album_map, &selected)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("GhostAlbum"), "msg: {err}");
     }
 
     // ── is_misdirected_request tests ──────────────────────────────────
@@ -1100,23 +1465,349 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_albums_same_album_in_both_yields_empty() {
+    async fn resolve_passes_named_with_inline_exclude_skips_album() {
+        // `--album Vacation --album '!Vacation'` would already bail in the
+        // selector parser, but if a programmer constructs that shape
+        // directly the resolver must still no-op the included entry.
         let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
             folder_record("FOLDER_1", "Vacation")
         ]}));
         let library = stub_library(mock);
+        let sel = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["Vacation"]),
+                excluded: names(&["Vacation"]),
+            },
+            false,
+        );
 
-        let plan = resolve_albums(
-            &library,
-            &named(&["Vacation"]),
-            &["Vacation".to_string()],
-            "%Y/%m/%d",
-        )
-        .await
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        assert!(plan.passes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_tags_each_pass_with_correct_kind() {
+        // The renderer routes per-category template selection on
+        // `pass.kind`, so the resolver must tag each pass correctly. Drift
+        // here silently misroutes passes to the wrong template.
+        let mock = MockPhotosSession::new()
+            .ok(serde_json::json!({"records": [folder_record("FOLDER_1", "Vacation")]}))
+            .ok(album_count_response(0))
+            .ok(serde_json::json!({"records": []}));
+        let library = stub_library(mock);
+        let sel = Selection {
+            albums: AlbumSelector::Named {
+                included: names(&["Vacation"]),
+                excluded: BTreeSet::new(),
+            },
+            smart_folders: SmartFolderSelector::Named {
+                included: names(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: true,
+        };
+
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let kinds: Vec<(String, PassKind)> = plan
+            .passes
+            .iter()
+            .map(|p| (p.album.name.to_string(), p.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("Vacation".to_string(), PassKind::Album),
+                ("Favorites".to_string(), PassKind::SmartFolder),
+                (library.all().name.to_string(), PassKind::Unfiled),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_threading_from_cli_input() {
+        // End-to-end thread of the v0.13 selection flags through the
+        // production parse layer: clap → Cli → Config::build → Selection
+        // → resolve_passes. The cli.rs help-shadow tests for these flags
+        // only exercise the parser; a regression that drops --smart-folder
+        // or flips --unfiled's default between Cli and Selection lands
+        // green there. This test is the one place that drives the runtime
+        // wiring and asserts on the resolved pass list.
+        use crate::cli::{Cli, Command, PasswordArgs};
+        use clap::Parser;
+
+        let cookie_dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from([
+            "kei",
+            "--username",
+            "u@example.com",
+            "--data-dir",
+            cookie_dir.path().to_str().unwrap(),
+            "sync",
+            "--album",
+            "all",
+            "--smart-folder",
+            "Favorites",
+            "--unfiled",
+            "false",
+            "--library",
+            "shared",
+        ])
         .unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let globals = crate::config::GlobalArgs::from_cli(&cli);
+        let cfg =
+            crate::config::Config::build(&globals, &PasswordArgs::default(), sync, None).unwrap();
+
+        // Sanity-check the cli → Selection wiring before pinning the pass list.
+        assert_eq!(cfg.selection.libraries.to_raw(), vec!["shared".to_string()]);
+        assert!(matches!(
+            cfg.selection.albums,
+            AlbumSelector::All { ref excluded } if excluded.is_empty()
+        ));
+        assert!(matches!(
+            cfg.selection.smart_folders,
+            SmartFolderSelector::Named { ref included, ref excluded }
+                if included.contains("Favorites") && excluded.is_empty()
+        ));
+        assert!(!cfg.selection.unfiled);
+
+        // Stub a library exposing one user album ("Vacation") plus the
+        // Favorites smart folder. resolve_passes only consumes the first
+        // response (`library.albums().await?`); subsequent .ok()s match
+        // the resolve_passes_tags_each_pass_with_correct_kind pattern.
+        let mock = MockPhotosSession::new()
+            .ok(serde_json::json!({"records": [folder_record("FOLDER_VAC", "Vacation")]}))
+            .ok(album_count_response(0))
+            .ok(serde_json::json!({"records": []}));
+        let library = stub_library(mock);
+
+        let plan = resolve_passes(&library, &cfg.selection).await.unwrap();
+        let pairs: Vec<(String, PassKind)> = plan
+            .passes
+            .iter()
+            .map(|p| (p.album.name.to_string(), p.kind))
+            .collect();
+        // --album all → 1 Album pass, --smart-folder Favorites → 1 SmartFolder
+        // pass, --unfiled false → 0 Unfiled passes.
+        assert_eq!(
+            pairs,
+            vec![
+                ("Vacation".to_string(), PassKind::Album),
+                ("Favorites".to_string(), PassKind::SmartFolder),
+            ],
+            "expected [Album(Vacation), SmartFolder(Favorites)] (no unfiled), got {pairs:?}"
+        );
+    }
+
+    // ── resolve_libraries tests ──────────────────────────────────────
+
+    /// Build a `PhotosService` with a stub primary library plus the named
+    /// shared zones. Bypasses CloudKit listing endpoints by pre-populating
+    /// the lazy library maps.
+    fn photos_service_with_zones(shared_zones: &[&str]) -> icloud::photos::PhotosService {
+        use crate::icloud::photos::PhotoLibrary;
+        use std::collections::HashMap;
+
+        let primary =
+            PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), "PrimarySync");
+        let mut shared = HashMap::new();
+        for zone in shared_zones {
+            shared.insert(
+                (*zone).to_string(),
+                PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), zone),
+            );
+        }
+        icloud::photos::PhotosService::for_testing_with_libraries(
+            Box::new(MockPhotosSession::new()),
+            primary,
+            HashMap::new(),
+            shared,
+        )
+    }
+
+    fn selector_from(raw: &[&str]) -> crate::selection::LibrarySelector {
+        let owned: Vec<String> = raw.iter().map(|s| (*s).to_string()).collect();
+        crate::selection::parse_library_selector(&owned).unwrap()
+    }
+
+    fn zone_names(libs: &[icloud::photos::PhotoLibrary]) -> Vec<&str> {
+        libs.iter()
+            .map(icloud::photos::PhotoLibrary::zone_name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_default_returns_primary_only() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = crate::selection::LibrarySelector::default();
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        assert_eq!(zone_names(&libs), vec!["PrimarySync"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_all_returns_every_zone() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["all"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["PrimarySync", "SharedSync-AAAA1111", "SharedSync-BBBB2222"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_shared_only_excludes_primary() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["shared"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(names, vec!["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_named_zone_returns_only_that_zone() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["SharedSync-AAAA1111"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        assert_eq!(zone_names(&libs), vec!["SharedSync-AAAA1111"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_named_zone_matches_truncated_form() {
+        let mut ps =
+            photos_service_with_zones(&["SharedSync-AAAA1111-2222-3333-4444-555555555555"]);
+        let sel = selector_from(&["SharedSync-AAAA1111"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        assert_eq!(
+            zone_names(&libs),
+            vec!["SharedSync-AAAA1111-2222-3333-4444-555555555555"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_primary_plus_named_returns_both() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["primary", "SharedSync-AAAA1111"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(names, vec!["PrimarySync", "SharedSync-AAAA1111"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_multiple_named_zones() {
+        let mut ps = photos_service_with_zones(&[
+            "SharedSync-AAAA1111",
+            "SharedSync-BBBB2222",
+            "SharedSync-CCCC3333",
+        ]);
+        let sel = selector_from(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(names, vec!["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_truncated_collision_bails() {
+        // CloudKit UUIDs are not guaranteed unique on the leading 8 hex
+        // characters that `truncate_library_zone` keeps. Two distinct
+        // shared zones whose UUIDs collide on that prefix render to the
+        // same `{library}` segment on disk; without a resolver-time bail,
+        // multi-library sync silently overwrites one zone's bytes with
+        // the other's. State DB stays per-zone-distinct under the v8 PK
+        // so the corruption is invisible until users notice missing
+        // files. The repo's own paths.rs unit test pins the prefix
+        // collision invariant; this test pins the bail that relies on it.
+        let mut ps = photos_service_with_zones(&[
+            "SharedSync-AAAA1111-EEEE-2222-3333-444444444444",
+            "SharedSync-AAAA1111-FFFF-5555-6666-777777777777",
+        ]);
+        let sel = selector_from(&["all"]);
+        let err = resolve_libraries(&sel, &mut ps)
+            .await
+            .expect_err("two zones sharing the 8-hex truncation prefix must bail");
+        let msg = err.to_string();
         assert!(
-            plan.passes.is_empty(),
-            "album present in both --album and --exclude-album should yield zero albums"
+            msg.contains("SharedSync-AAAA1111-EEEE-2222-3333-444444444444")
+                && msg.contains("SharedSync-AAAA1111-FFFF-5555-6666-777777777777"),
+            "bail must name both colliding full UUIDs so the user can pin a longer form; got: {msg}"
+        );
+        assert!(
+            msg.contains("SharedSync-AAAA1111"),
+            "bail must include the truncated form that's the collision point; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_truncated_collision_with_explicit_zone_does_not_bail() {
+        // The bail is only relevant when *both* colliding zones land in
+        // the chosen set. If the user pins one of them via a longer
+        // `--library SharedSync-AAAA1111-EEEE`, the other is excluded
+        // and the on-disk paths can't collide, so the resolver must not
+        // bail.
+        let mut ps = photos_service_with_zones(&[
+            "SharedSync-AAAA1111-EEEE-2222-3333-444444444444",
+            "SharedSync-AAAA1111-FFFF-5555-6666-777777777777",
+        ]);
+        let sel = selector_from(&["SharedSync-AAAA1111-EEEE-2222-3333-444444444444"]);
+        let libs = resolve_libraries(&sel, &mut ps)
+            .await
+            .expect("explicit single-zone selection must not trip the collision bail");
+        assert_eq!(
+            zone_names(&libs),
+            vec!["SharedSync-AAAA1111-EEEE-2222-3333-444444444444"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_exclusion_drops_named_zone() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["all", "!SharedSync-AAAA1111"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(names, vec!["PrimarySync", "SharedSync-BBBB2222"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_exclusion_via_shared_sentinel() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["all", "!shared"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        assert_eq!(zone_names(&libs), vec!["PrimarySync"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_named_miss_bails_with_helpful_error() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111"]);
+        let sel = selector_from(&["SharedSync-NOPE"]);
+        let err = resolve_libraries(&sel, &mut ps).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SharedSync-NOPE"),
+            "miss must name the input: {msg}"
+        );
+        assert!(
+            msg.contains("Available zones") || msg.contains("kei list libraries"),
+            "miss must point at discovery: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_zero_match_after_exclusion_bails() {
+        let mut ps = photos_service_with_zones(&[]);
+        let sel = selector_from(&["primary", "!primary"]);
+        let err = resolve_libraries(&sel, &mut ps).await.unwrap_err();
+        assert!(
+            err.to_string().contains("zero libraries"),
+            "unexpected error: {err}"
         );
     }
 }

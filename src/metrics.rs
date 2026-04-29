@@ -45,6 +45,15 @@ use crate::state::types::SyncSummary;
 /// `kei_state_mark_downloaded_zero_rows_total` series.
 pub(crate) static MARK_DOWNLOADED_ZERO_ROWS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// Cumulative count of `mark_failed` calls that matched 0 rows in the
+/// `assets` table — i.e. a failure was recorded against an asset that
+/// was never `upsert_seen`d. The producer-dispatch invariant promises
+/// the upsert always runs first, so a non-zero count here is an actionable
+/// invariant violation that needs investigation: the failure isn't
+/// persisted, so the asset will re-enumerate and re-fail next sync until
+/// the buggy call site is found. Mirrors `MARK_DOWNLOADED_ZERO_ROWS`.
+pub(crate) static MARK_FAILED_ZERO_ROWS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 // ── Label types ──────────────────────────────────────────────────────────────
 
 /// Label set for the `kei_sync_skipped_total` counter family.
@@ -241,6 +250,15 @@ impl MetricsHandle {
              a downloaded file with no matching upsert_seen row (asset deleted between upsert \
              and download, or producer-dispatch invariant violated)",
             MARK_DOWNLOADED_ZERO_ROWS.clone(),
+        );
+
+        registry.register(
+            "kei_state_mark_failed_zero_rows",
+            "Total number of mark_failed calls that matched 0 rows in the assets table — \
+             a failure recorded for an asset that was never upsert_seen'd \
+             (producer-dispatch invariant violated; failure not persisted so the \
+             asset will re-enumerate and re-fail next sync)",
+            MARK_FAILED_ZERO_ROWS.clone(),
         );
 
         Self {
@@ -772,8 +790,7 @@ mod tests {
         );
     }
 
-    /// Robustness review NB-1 (2026-04-25): the
-    /// `mark_downloaded_zero_rows` counter is registered into the global
+    /// The `mark_downloaded_zero_rows` counter is registered into the global
     /// registry by `MetricsHandle::new`, so a /metrics scrape should
     /// surface the series even before the state DB has incremented it.
     /// Pinning the rendered name guards the registration call (which is

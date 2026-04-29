@@ -3,7 +3,7 @@ mod import;
 mod list;
 mod login;
 mod password;
-mod reconcile;
+pub(crate) mod reconcile;
 mod reset;
 mod service;
 mod status;
@@ -17,8 +17,8 @@ pub(crate) use password::run_password;
 pub(crate) use reconcile::run_reconcile;
 pub(crate) use reset::{run_reset_state, run_reset_sync_token};
 pub(crate) use service::{
-    attempt_reauth, init_photos_service, resolve_albums, resolve_libraries, wait_and_retry_2fa,
-    AlbumPass, AlbumPlan, MAX_REAUTH_ATTEMPTS,
+    attempt_reauth, init_photos_service, resolve_libraries, resolve_passes, wait_and_retry_2fa,
+    AlbumPass, AlbumPlan, PassKind, MAX_REAUTH_ATTEMPTS,
 };
 pub(crate) use status::run_status;
 pub(crate) use verify::run_verify;

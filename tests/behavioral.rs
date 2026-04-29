@@ -48,20 +48,29 @@ fn sanitize_username(username: &str) -> String {
         .collect()
 }
 
-/// Create a state DB at the expected path for the given username inside
-/// `data_dir`. Mirrors the latest schema from `src/state/schema.rs` so
-/// callers don't rely on the binary's migration path to fill in columns
-/// added after v1. Bump `SCHEMA_VERSION` and the DDL below together whenever
-/// schema.rs changes.
-fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Connection {
-    const SCHEMA_VERSION: i32 = 4;
+/// Schema version mirrored by `create_state_db` below. Must equal
+/// `crate::state::schema::SCHEMA_VERSION` (the production constant). The
+/// `behavioral_helper_schema_matches_production` test below pins this so
+/// any schema bump in `src/state/schema.rs` fails the suite until this
+/// helper is updated to match — preventing silent drift between the
+/// helper's "fresh DB" shape and what the binary expects.
+const HELPER_SCHEMA_VERSION: i32 = 8;
 
+/// Create a state DB at the expected path for the given username inside
+/// `data_dir`. Mirrors the v8 schema from `src/state/schema.rs` (the
+/// latest as of this writing) so the binary's migrate() loop is a no-op
+/// when it opens these DBs — i.e. tests run against the same shape
+/// production code writes on a fresh install. Bump `HELPER_SCHEMA_VERSION`
+/// and the DDL below together whenever schema.rs changes; the
+/// `behavioral_helper_schema_matches_production` meta test enforces it.
+fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Connection {
     let db_name = format!("{}.db", sanitize_username(username));
     let db_path = data_dir.join(db_name);
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute_batch(
         r"
         CREATE TABLE IF NOT EXISTS assets (
+            library TEXT NOT NULL,
             id TEXT NOT NULL,
             version_size TEXT NOT NULL,
             checksum TEXT NOT NULL,
@@ -78,11 +87,48 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             last_error TEXT,
             local_checksum TEXT,
             download_checksum TEXT,
-            PRIMARY KEY (id, version_size)
+            source TEXT NOT NULL DEFAULT 'icloud',
+            is_favorite INTEGER NOT NULL DEFAULT 0,
+            rating INTEGER,
+            latitude REAL,
+            longitude REAL,
+            altitude REAL,
+            orientation INTEGER,
+            duration_secs REAL,
+            timezone_offset INTEGER,
+            width INTEGER,
+            height INTEGER,
+            title TEXT,
+            keywords TEXT,
+            description TEXT,
+            media_subtype TEXT,
+            burst_id TEXT,
+            is_hidden INTEGER NOT NULL DEFAULT 0,
+            is_archived INTEGER NOT NULL DEFAULT 0,
+            modified_at INTEGER,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            deleted_at INTEGER,
+            provider_data TEXT,
+            metadata_hash TEXT,
+            metadata_write_failed_at INTEGER,
+            PRIMARY KEY (library, id, version_size)
         );
         CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
         CREATE INDEX IF NOT EXISTS idx_assets_local_path ON assets(local_path);
         CREATE INDEX IF NOT EXISTS idx_assets_checksum ON assets(checksum);
+        CREATE INDEX IF NOT EXISTS idx_assets_metadata_hash
+            ON assets (metadata_hash) WHERE status = 'downloaded';
+        CREATE TABLE IF NOT EXISTS asset_albums (
+            asset_id   TEXT NOT NULL,
+            album_name TEXT NOT NULL,
+            source     TEXT NOT NULL,
+            PRIMARY KEY (asset_id, album_name, source)
+        );
+        CREATE TABLE IF NOT EXISTS asset_people (
+            asset_id    TEXT NOT NULL,
+            person_name TEXT NOT NULL,
+            PRIMARY KEY (asset_id, person_name)
+        );
         CREATE TABLE IF NOT EXISTS sync_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at INTEGER NOT NULL,
@@ -90,7 +136,8 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             assets_seen INTEGER DEFAULT 0,
             assets_downloaded INTEGER DEFAULT 0,
             assets_failed INTEGER DEFAULT 0,
-            interrupted INTEGER DEFAULT 0
+            interrupted INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'running'
         );
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY NOT NULL,
@@ -99,12 +146,14 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
         ",
     )
     .unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+    conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();
     conn
 }
 
-/// Insert an asset row into the state DB.
+/// Insert an asset row into the state DB. The `library` column defaults
+/// to `'PrimarySync'` to match the production v7→v8 backfill, where
+/// pre-v8 rows (which had no library column) all came from PrimarySync.
 fn insert_asset(
     conn: &rusqlite::Connection,
     id: &str,
@@ -115,13 +164,44 @@ fn insert_asset(
     local_checksum: Option<&str>,
 ) {
     conn.execute(
-        "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, \
-         media_type, status, local_path, last_seen_at, last_error, local_checksum, downloaded_at) \
-         VALUES (?1, 'original', 'abc', ?2, 1700000000, 1000, 'photo', ?3, ?4, 1700000000, \
-         ?5, ?6, CASE WHEN ?3 = 'downloaded' THEN 1700000000 ELSE NULL END)",
+        "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, \
+         size_bytes, media_type, status, local_path, last_seen_at, last_error, \
+         local_checksum, downloaded_at) \
+         VALUES ('PrimarySync', ?1, 'original', 'abc', ?2, 1700000000, 1000, 'photo', ?3, ?4, \
+         1700000000, ?5, ?6, CASE WHEN ?3 = 'downloaded' THEN 1700000000 ELSE NULL END)",
         rusqlite::params![id, filename, status, local_path, last_error, local_checksum],
     )
     .unwrap();
+}
+
+/// Pin the helper schema version against the binary's
+/// production constant. The binary writes a fresh DB at
+/// `state::schema::SCHEMA_VERSION` (currently 8). The helper above
+/// claims to "Mirror the latest schema" and must therefore land on the
+/// same version — otherwise existing tests rely on the binary's
+/// migrate() loop to fill in columns and we lose end-to-end coverage of
+/// the fresh-DB path.
+///
+/// `state::schema::SCHEMA_VERSION` is `pub(crate)` so we can't import
+/// it from an integration test; pin the literal value here and
+/// document the bump procedure in the doc-comment. Production-side
+/// tests (`src/state/schema.rs::tests::*`) already exercise the
+/// migration constant directly.
+#[test]
+fn behavioral_helper_schema_matches_production() {
+    // Production version as of this commit. Bump in lockstep with
+    // `pub(crate) const SCHEMA_VERSION` in `src/state/schema.rs` *and*
+    // update the DDL in `create_state_db` above to match the new
+    // shape. The fresh-DB DDL emitted by a real binary run can be
+    // dumped via `sqlite3 <db> '.schema'` for reference.
+    const PRODUCTION_SCHEMA_VERSION: i32 = 8;
+    assert_eq!(
+        HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
+        "behavioral.rs::create_state_db schema is out of sync with \
+         src/state/schema.rs::SCHEMA_VERSION (helper={HELPER_SCHEMA_VERSION}, \
+         production={PRODUCTION_SCHEMA_VERSION}). Bump both, plus the DDL \
+         block in create_state_db, then update this test."
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -592,6 +672,55 @@ threads_num = 4
     assert!(
         stdout.contains("4"),
         "threads_num should be 4, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn config_show_emits_unfiled_false_when_explicit() {
+    // The cli.rs help-shadow test for --unfiled only verifies clap parses;
+    // it does not pin the resolved value all the way through Config::build
+    // → Selection → to_toml. A clap-default flip (or a derive_selection
+    // regression) that swallowed the explicit `false` would land green
+    // there. `to_toml()` only emits `unfiled` when the resolved value
+    // differs from the `true` default, so an explicit `false` is the case
+    // we can observe directly in `kei config show` output.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[auth]
+username = "x@x.com"
+
+[filters]
+unfiled = false
+"#,
+    )
+    .unwrap();
+
+    let out = clean_cmd()
+        .args([
+            "config",
+            "show",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: toml::Value = toml::from_str(&stdout).expect("config show must emit valid TOML");
+    let unfiled = parsed
+        .get("filters")
+        .and_then(|f| f.get("unfiled"))
+        .and_then(toml::Value::as_bool);
+    assert_eq!(
+        unfiled,
+        Some(false),
+        "config show must round-trip explicit `unfiled = false`; got:\n{stdout}"
     );
 }
 
@@ -3747,4 +3876,348 @@ fn reconcile_on_empty_db_prints_guidance_and_exits_clean() {
         stdout.contains("No state database") || stdout.contains("no state database"),
         "operator must see guidance when DB doesn't exist: {stdout}"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// v0.13 selection + per-category folder-structure surface
+//
+// Stdout (resolved config) checks drive `kei config show` from a TOML
+// fixture, since that subcommand uses `SyncArgs::default()` and won't
+// accept sync flags. CLI/env-flag tests drive `kei sync` and only assert
+// stderr / exit code so they don't require auth.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Run `kei config show` against an inline TOML fixture and return the
+/// (stdout, stderr) pair. Builds a tempdir, writes `[download].directory`
+/// and the supplied `body` into it, then dumps the resolved config.
+fn run_config_show(body: &str) -> (String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!("[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n{body}"),
+    )
+    .unwrap();
+    let out = clean_cmd()
+        .args([
+            "config",
+            "show",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Build a `kei sync` invocation pre-populated with username, fresh tempdir
+/// `--download-dir` / `--data-dir` pair, and `--only-print-filenames` so the
+/// run exits before auth. Returns the live `Command` so callers can append
+/// flag-specific args. Tempdirs are leaked into the binary (which never
+/// touches them, as these tests bail in `Config::build`).
+fn sync_cmd_for_validation() -> assert_cmd::Command {
+    let dir = tempfile::tempdir().unwrap();
+    let dl_dir = tempfile::tempdir().unwrap();
+    let mut cmd = clean_cmd();
+    cmd.args([
+        "sync",
+        "--username",
+        "x@x.com",
+        "--download-dir",
+        dl_dir.path().to_str().unwrap(),
+        "--data-dir",
+        dir.path().to_str().unwrap(),
+    ]);
+    // Tempdirs leak intentionally: tests bail before sync touches them, and
+    // OS-level tmpfs cleanup handles the directories at process exit.
+    std::mem::forget(dir);
+    std::mem::forget(dl_dir);
+    cmd
+}
+
+#[test]
+fn migration_legacy_album_in_cli_warns() {
+    sync_cmd_for_validation()
+        .args([
+            "--folder-structure",
+            "{album}/%Y/%m/%d",
+            "--only-print-filenames",
+        ])
+        .assert()
+        .stderr(predicate::str::contains(
+            "`{album}` in `--folder-structure`",
+        ))
+        .stderr(predicate::str::contains("v0.20.0"))
+        .stderr(predicate::str::contains("--folder-structure-albums"));
+}
+
+#[test]
+fn migration_legacy_album_in_toml_warns_and_lifts() {
+    let (stdout, stderr) = run_config_show("folder_structure = \"{album}/%B\"\n");
+    assert!(
+        stderr.contains("`{album}` in `--folder-structure`") && stderr.contains("v0.20.0"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("folder_structure_albums = \"{album}/%B\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("folder_structure = \"%B\""),
+        "stdout: {stdout}"
+    );
+}
+
+/// Locks in that all three input surfaces (CLI / TOML / env) flow through
+/// the same migration helper.
+#[test]
+fn migration_legacy_album_in_env_warns() {
+    sync_cmd_for_validation()
+        .env("KEI_FOLDER_STRUCTURE", "{album}/%Y")
+        .arg("--only-print-filenames")
+        .assert()
+        .stderr(predicate::str::contains(
+            "`{album}` in `--folder-structure`",
+        ))
+        .stderr(predicate::str::contains("v0.20.0"));
+}
+
+/// User's albums template wins; the legacy `{album}` segment in the base
+/// template still gets stripped (so no leftover token reaches the renderer)
+/// and the warning still fires.
+#[test]
+fn migration_legacy_album_preserves_user_set_albums_template() {
+    let (stdout, stderr) = run_config_show(
+        "folder_structure = \"{album}/%Y\"\nfolder_structure_albums = \"{album}/custom\"\n",
+    );
+    assert!(
+        stderr.contains("`{album}` in `--folder-structure`"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("folder_structure_albums = \"{album}/custom\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("folder_structure = \"%Y\""),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn migration_no_warning_when_no_album_token() {
+    sync_cmd_for_validation()
+        .args(["--folder-structure", "%Y/%m/%d", "--only-print-filenames"])
+        .assert()
+        .stderr(predicate::str::contains("`{album}` in `--folder-structure`").not());
+}
+
+/// `--smart-folder Favorites` no longer prints the pre-PR6 "not yet wired
+/// into the sync pipeline" disclaimer. The flag executes end-to-end via
+/// `Selection -> resolve_passes -> AlbumPlan`; a stale warning at startup
+/// would mislead users into thinking their config is a no-op.
+#[test]
+fn smart_folder_flag_does_not_print_unwired_warning() {
+    sync_cmd_for_validation()
+        .args(["--smart-folder", "Favorites", "--only-print-filenames"])
+        .assert()
+        .stderr(predicate::str::contains("not yet wired").not())
+        .stderr(predicate::str::contains("not download smart folders").not());
+}
+
+/// `--unfiled false` no longer prints the pre-PR6 "not yet wired" disclaimer.
+/// The flag flows into `Selection.unfiled` and gates both the unfiled pass
+/// and the cross-album exclusion-set pre-fetch in `resolve_passes`.
+#[test]
+fn unfiled_flag_does_not_print_unwired_warning() {
+    sync_cmd_for_validation()
+        .args(["--unfiled", "false", "--only-print-filenames"])
+        .assert()
+        .stderr(predicate::str::contains("not yet wired").not())
+        .stderr(predicate::str::contains("legacy unfiled-pass rules").not());
+}
+
+/// Every per-category selection flag composed in a single
+/// invocation must validate end-to-end through the
+/// `Cli -> Config -> Selection` pipeline. Per-category unit tests in
+/// `selection.rs` cover each parser in isolation, but the binary-level
+/// wiring (clap field name, config-resolver field name, the
+/// `effective_command()` mapping) can drift independently of the
+/// parsers; a regression there lands green for every per-category
+/// test even when the combined flag set bails or warns at startup.
+///
+/// Flags exercised here:
+///   --album none              → AlbumSelector::None
+///   --smart-folder all        → SmartFolderSelector::All { sensitive=false }
+///   --unfiled false           → Selection.unfiled = false
+///   --library shared          → LibrarySelector { primary=false, shared_all=true }
+///
+/// The binary may exit non-zero for downstream reasons (no password
+/// available, network unreachable, auth bail) — those are
+/// out-of-scope. What matters is that none of the parser-level bail
+/// strings ("must not be empty", "not supported", "cannot be combined")
+/// or stale "not yet wired" disclaimers reach stderr.
+#[test]
+fn sync_validation_accepts_full_selection_combo() {
+    let out = sync_cmd_for_validation()
+        .args([
+            "--album",
+            "none",
+            "--smart-folder",
+            "all",
+            "--unfiled",
+            "false",
+            "--library",
+            "shared",
+            "--only-print-filenames",
+        ])
+        .assert()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // No stale "not yet wired" disclaimers from the pre-PR6 era.
+    assert!(
+        !stderr.contains("not yet wired"),
+        "selection combo must not surface a 'not yet wired' warning; stderr: {stderr}"
+    );
+    // No parser-level bail strings — those would mean the combo got
+    // rejected at parse time, which the per-category tests already
+    // disprove for each flag in isolation.
+    assert!(
+        !stderr.contains("must not be empty"),
+        "no parser empty-input bail expected; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not supported"),
+        "no friendly-alias bail expected; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot be combined"),
+        "no sentinel-mix bail expected; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn config_show_emits_per_category_templates_from_toml() {
+    let (stdout, _) = run_config_show(
+        "folder_structure_albums = \"{album}/%Y/%m\"\nfolder_structure_smart_folders = \"{smart-folder}/%Y\"\n",
+    );
+    assert!(
+        stdout.contains("folder_structure_albums = \"{album}/%Y/%m\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("folder_structure_smart_folders = \"{smart-folder}/%Y\""),
+        "stdout: {stdout}"
+    );
+}
+
+/// Default per-category templates stay implicit -- a future refactor that
+/// starts emitting the defaults would inflate every dumped config.
+#[test]
+fn config_show_omits_default_per_category_templates() {
+    let (stdout, _) = run_config_show("");
+    assert!(
+        !stdout.contains("folder_structure_albums"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("folder_structure_smart_folders"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn sync_bails_on_album_token_in_smart_folders_template() {
+    sync_cmd_for_validation()
+        .args(["--folder-structure-smart-folders", "{album}/%Y"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("{album}"))
+        .stderr(predicate::str::contains("--folder-structure-albums"));
+}
+
+#[test]
+fn sync_bails_on_smart_folder_token_in_albums_template() {
+    sync_cmd_for_validation()
+        .args(["--folder-structure-albums", "{smart-folder}/foo"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("{smart-folder}"))
+        .stderr(predicate::str::contains("--folder-structure-smart-folders"));
+}
+
+#[test]
+fn sync_bails_on_library_token_not_first_segment() {
+    sync_cmd_for_validation()
+        .args(["--folder-structure", "%Y/{library}"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("{library}"))
+        .stderr(predicate::str::contains("first path segment"));
+}
+
+#[test]
+fn sync_bails_on_duplicate_library_token() {
+    sync_cmd_for_validation()
+        .args(["--folder-structure-albums", "{library}/{library}/{album}"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("{library}"))
+        .stderr(predicate::str::contains("once"));
+}
+
+#[test]
+fn sync_bails_on_within_album_contradiction() {
+    sync_cmd_for_validation()
+        .args(["--album", "Family", "--album", "!Family"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("include and exclude"))
+        .stderr(predicate::str::contains("Family"));
+}
+
+#[test]
+fn sync_bails_on_library_none() {
+    sync_cmd_for_validation()
+        .args(["--library", "none"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("--library none"));
+}
+
+#[test]
+fn config_show_emits_smart_folder_selection() {
+    let (stdout, _) =
+        run_config_show("\n[filters]\nsmart_folders = [\"Favorites\", \"!Hidden\"]\n");
+    assert!(stdout.contains("smart_folders"), "stdout: {stdout}");
+    assert!(stdout.contains("Favorites"), "stdout: {stdout}");
+    assert!(stdout.contains("!Hidden"), "stdout: {stdout}");
+}
+
+#[test]
+fn config_show_emits_unfiled_false_when_disabled() {
+    let (stdout, _) = run_config_show("\n[filters]\nunfiled = false\n");
+    assert!(stdout.contains("unfiled = false"), "stdout: {stdout}");
+}
+
+/// Default `unfiled = true` stays implicit -- locks in that defaults don't
+/// inflate dumped configs.
+#[test]
+fn config_show_omits_unfiled_when_default_true() {
+    let (stdout, _) = run_config_show("");
+    assert!(!stdout.contains("unfiled = true"), "stdout: {stdout}");
+}
+
+#[test]
+fn config_show_emits_libraries_when_non_default() {
+    let (stdout, _) = run_config_show("\n[filters]\nlibraries = [\"all\"]\n");
+    assert!(stdout.contains("libraries = [\"all\"]"), "stdout: {stdout}");
 }

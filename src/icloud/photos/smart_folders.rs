@@ -11,6 +11,10 @@ pub(crate) struct FolderDef {
     pub(crate) obj_type: &'static str,
     pub(crate) list_type: &'static str,
     pub(crate) query_filter: Option<Arc<Value>>,
+    /// True for folders that the iOS Photos app gates behind a separate UI
+    /// (Hidden, Recently Deleted). The `--smart-folder all` sentinel skips
+    /// these unless the user explicitly asks for `all-with-sensitive`.
+    pub(crate) is_sensitive: bool,
 }
 
 pub(crate) fn smart_folder_filter(field: &str, value: &str) -> Value {
@@ -21,6 +25,16 @@ pub(crate) fn smart_folder_filter(field: &str, value: &str) -> Value {
     }])
 }
 
+/// Names of the smart folders that the iOS Photos app gates behind a
+/// separate UI. `--smart-folder all` skips these unless the user opts in
+/// via `--smart-folder all-with-sensitive`.
+pub(crate) fn sensitive_smart_folder_names() -> impl Iterator<Item = &'static str> {
+    smart_folders()
+        .into_iter()
+        .filter(|(_, def)| def.is_sensitive)
+        .map(|(name, _)| name)
+}
+
 pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
     vec![
         (
@@ -29,6 +43,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Timelapse",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "TIMELAPSE"))),
+                is_sensitive: false,
             },
         ),
         (
@@ -37,6 +52,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Video",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "VIDEO"))),
+                is_sensitive: false,
             },
         ),
         (
@@ -45,6 +61,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Slomo",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "SLOMO"))),
+                is_sensitive: false,
             },
         ),
         (
@@ -53,6 +70,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetBurstStackAssetByAssetDate",
                 list_type: "CPLBurstStackAssetAndMasterByAssetDate",
                 query_filter: None,
+                is_sensitive: false,
             },
         ),
         (
@@ -61,6 +79,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Favorite",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "FAVORITE"))),
+                is_sensitive: false,
             },
         ),
         (
@@ -69,6 +88,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Panorama",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "PANORAMA"))),
+                is_sensitive: false,
             },
         ),
         (
@@ -77,6 +97,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Screenshot",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "SCREENSHOT"))),
+                is_sensitive: false,
             },
         ),
         (
@@ -85,6 +106,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetInSmartAlbumByAssetDate:Live",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "LIVE"))),
+                is_sensitive: false,
             },
         ),
         (
@@ -93,6 +115,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetDeletedByExpungedDate",
                 list_type: "CPLAssetAndMasterDeletedByExpungedDate",
                 query_filter: None,
+                is_sensitive: true,
             },
         ),
         (
@@ -101,6 +124,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 obj_type: "CPLAssetHiddenByAssetDate",
                 list_type: "CPLAssetAndMasterHiddenByAssetDate",
                 query_filter: None,
+                is_sensitive: true,
             },
         ),
     ]

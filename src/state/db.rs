@@ -43,6 +43,7 @@ pub trait StateDb: Send + Sync {
     #[cfg(test)]
     async fn should_download(
         &self,
+        library: &str,
         id: &str,
         version_size: &str,
         checksum: &str,
@@ -69,6 +70,7 @@ pub trait StateDb: Send + Sync {
     /// Mark an asset as successfully downloaded.
     async fn mark_downloaded(
         &self,
+        library: &str,
         id: &str,
         version_size: &str,
         local_path: &Path,
@@ -79,6 +81,7 @@ pub trait StateDb: Send + Sync {
     /// Mark an asset as failed with an error message.
     async fn mark_failed(
         &self,
+        library: &str,
         id: &str,
         version_size: &str,
         error: &str,
@@ -169,7 +172,7 @@ pub trait StateDb: Send + Sync {
     /// Get all downloaded asset IDs as (id, `version_size`) pairs.
     ///
     /// Used at sync start to pre-load downloaded state for O(1) skip decisions.
-    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError>;
+    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
 
     /// Get all known asset IDs (any status: downloaded, pending, failed).
     ///
@@ -179,11 +182,12 @@ pub trait StateDb: Send + Sync {
 
     /// Get downloaded asset IDs with their checksums.
     ///
-    /// Returns a map of (id, `version_size`) -> checksum for downloaded assets.
-    /// Used to detect checksum changes without querying the DB per asset.
+    /// Returns a map of (library, id, `version_size`) -> checksum for
+    /// downloaded assets. Used to detect checksum changes without querying
+    /// the DB per asset.
     async fn get_downloaded_checksums(
         &self,
-    ) -> Result<HashMap<(String, String), String>, StateError>;
+    ) -> Result<HashMap<(String, String, String), String>, StateError>;
 
     /// Get per-asset maximum download attempt counts for failed assets.
     ///
@@ -208,7 +212,15 @@ pub trait StateDb: Send + Sync {
     /// (`downloaded` or `failed`); touching a `pending` row will cause
     /// `promote_pending_to_failed` to promote it to `failed` at sync end —
     /// see `upsert_seen` docs and issue #211.
-    async fn touch_last_seen_many(&self, asset_ids: &[&str]) -> Result<(), StateError>;
+    ///
+    /// `library` scopes the touch so that asset IDs shared across zones
+    /// don't get their last_seen_at bumped in a library that wasn't actually
+    /// re-enumerated this pass.
+    async fn touch_last_seen_many(
+        &self,
+        library: &str,
+        asset_ids: &[&str],
+    ) -> Result<(), StateError>;
 
     /// Sample up to `limit` local paths of downloaded assets.
     /// Used to spot-check that "downloaded" files still exist on disk.
@@ -238,19 +250,22 @@ pub trait StateDb: Send + Sync {
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError>;
 
-    /// Mark an asset as soft-deleted (all versions under `asset_id`).
+    /// Mark an asset as soft-deleted (all versions under `asset_id` in
+    /// `library`).
     ///
     /// Updates `is_deleted` and optional `deleted_at` timestamp. Does not
     /// remove the row so that history survives and consumers can still reach
-    /// the local file.
+    /// the local file. `library` scopes the update so a shared-library
+    /// deletion doesn't soft-delete the same asset ID in PrimarySync.
     async fn mark_soft_deleted(
         &self,
+        library: &str,
         asset_id: &str,
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<(), StateError>;
 
-    /// Mark an asset as hidden at source.
-    async fn mark_hidden_at_source(&self, asset_id: &str) -> Result<(), StateError>;
+    /// Mark an asset as hidden at source within `library`.
+    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError>;
 
     /// Record that a metadata write (EXIF embed or sidecar) failed for this
     /// asset-version pair after the bytes landed on disk. Sets
@@ -259,23 +274,26 @@ pub trait StateDb: Send + Sync {
     /// file checksum matches.
     async fn record_metadata_write_failure(
         &self,
+        library: &str,
         asset_id: &str,
         version_size: &str,
     ) -> Result<(), StateError>;
 
-    /// Pre-load every `(asset_id, version_size) -> metadata_hash` for
-    /// downloaded assets. Used at sync start to detect metadata-only changes
-    /// (file checksum matches but e.g. keywords / favorite / GPS drifted)
-    /// without a per-asset DB hit in the producer hot path.
+    /// Pre-load every `(library, asset_id, version_size) -> metadata_hash`
+    /// for downloaded assets. Used at sync start to detect metadata-only
+    /// changes (file checksum matches but e.g. keywords / favorite / GPS
+    /// drifted) without a per-asset DB hit in the producer hot path.
     async fn get_downloaded_metadata_hashes(
         &self,
-    ) -> Result<HashMap<(String, String), String>, StateError>;
+    ) -> Result<HashMap<(String, String, String), String>, StateError>;
 
-    /// Pre-load the set of `(asset_id, version_size)` pairs that have a
-    /// non-null `metadata_write_failed_at`. These need a metadata rewrite
-    /// on the next sync regardless of whether the provider reports a
-    /// hash change.
-    async fn get_metadata_retry_markers(&self) -> Result<HashSet<(String, String)>, StateError>;
+    /// Pre-load the set of `(library, asset_id, version_size)` triples that
+    /// have a non-null `metadata_write_failed_at`. These need a metadata
+    /// rewrite on the next sync regardless of whether the provider reports
+    /// a hash change.
+    async fn get_metadata_retry_markers(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError>;
 
     /// Fetch up to `limit` downloaded asset rows that carry a metadata
     /// rewrite marker AND have a local_path pointing at an on-disk file.
@@ -292,6 +310,7 @@ pub trait StateDb: Send + Sync {
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     async fn update_metadata_hash(
         &self,
+        library: &str,
         asset_id: &str,
         version_size: &str,
         metadata_hash: &str,
@@ -301,6 +320,7 @@ pub trait StateDb: Send + Sync {
     /// after a successful rewrite.
     async fn clear_metadata_write_failure(
         &self,
+        library: &str,
         asset_id: &str,
         version_size: &str,
     ) -> Result<(), StateError>;
@@ -462,7 +482,7 @@ impl SqliteStateDb {
 /// Drain a rusqlite row iterator into `Vec<T>`, dropping parse failures but
 /// logging each at `debug!` and summarising the drop count at `warn!` so a
 /// corrupted row never silently disappears from a bulk loader.
-fn collect_rows_with_warn<T, I>(rows: I, label: &'static str) -> Result<Vec<T>, StateError>
+fn collect_rows_with_warn<T, I>(rows: I, label: &'static str) -> Vec<T>
 where
     I: Iterator<Item = rusqlite::Result<T>>,
 {
@@ -480,7 +500,7 @@ where
     if dropped > 0 {
         tracing::warn!(dropped, "{label}: dropped rows with parse errors");
     }
-    Ok(out)
+    out
 }
 
 #[async_trait]
@@ -488,18 +508,21 @@ impl StateDb for SqliteStateDb {
     #[cfg(test)]
     async fn should_download(
         &self,
+        library: &str,
         id: &str,
         version_size: &str,
         checksum: &str,
         local_path: &Path,
     ) -> Result<bool, StateError> {
+        let library_owned = library.to_owned();
         let id_owned = id.to_owned();
         let version_size_owned = version_size.to_owned();
         let result: Option<(String, String, Option<String>)> = self
             .with_conn("should_download", move |conn| {
                 conn.query_row(
-                    "SELECT status, checksum, local_path FROM assets WHERE id = ?1 AND version_size = ?2",
-                    [&id_owned, &version_size_owned],
+                    "SELECT status, checksum, local_path FROM assets \
+                     WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+                    [&library_owned, &id_owned, &version_size_owned],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
@@ -579,7 +602,7 @@ impl StateDb for SqliteStateDb {
                 .prepare_cached(
                     r"
                 INSERT INTO assets (
-                    id, version_size, checksum, filename, created_at, added_at,
+                    library, id, version_size, checksum, filename, created_at, added_at,
                     size_bytes, media_type, status, last_seen_at,
                     source, is_favorite, rating, latitude, longitude, altitude,
                     orientation, duration_secs, timezone_offset, width, height,
@@ -587,10 +610,10 @@ impl StateDb for SqliteStateDb {
                     is_hidden, is_archived, modified_at, is_deleted, deleted_at,
                     provider_data, metadata_hash
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9,
-                        ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
-                ON CONFLICT(id, version_size) DO UPDATE SET
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10,
+                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                        ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                ON CONFLICT(library, id, version_size) DO UPDATE SET
                     checksum = excluded.checksum,
                     filename = excluded.filename,
                     created_at = excluded.created_at,
@@ -625,6 +648,7 @@ impl StateDb for SqliteStateDb {
                 )
                 .map_err(|e| StateError::query("upsert_seen::prepare", e))?;
             stmt.execute(rusqlite::params![
+                &record.library,
                 &record.id,
                 record.version_size.as_str(),
                 &record.checksum,
@@ -667,6 +691,7 @@ impl StateDb for SqliteStateDb {
 
     async fn mark_downloaded(
         &self,
+        library: &str,
         id: &str,
         version_size: &str,
         local_path: &Path,
@@ -674,6 +699,7 @@ impl StateDb for SqliteStateDb {
         download_checksum: Option<&str>,
     ) -> Result<(), StateError> {
         let downloaded_at = Utc::now().timestamp();
+        let library = library.to_owned();
         let id = id.to_owned();
         let version_size = version_size.to_owned();
         let local_path = local_path.to_path_buf();
@@ -685,12 +711,13 @@ impl StateDb for SqliteStateDb {
                 .execute(
                     "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
                      local_checksum = ?3, download_checksum = ?4, last_error = NULL \
-                     WHERE id = ?5 AND version_size = ?6",
+                     WHERE library = ?5 AND id = ?6 AND version_size = ?7",
                     rusqlite::params![
                         downloaded_at,
                         local_path.to_string_lossy(),
                         &local_checksum,
                         download_checksum.as_deref(),
+                        &library,
                         &id,
                         &version_size
                     ],
@@ -713,10 +740,12 @@ impl StateDb for SqliteStateDb {
 
     async fn mark_failed(
         &self,
+        library: &str,
         id: &str,
         version_size: &str,
         error: &str,
     ) -> Result<(), StateError> {
+        let library = library.to_owned();
         let id = id.to_owned();
         let version_size = version_size.to_owned();
         let error = error.to_owned();
@@ -725,18 +754,26 @@ impl StateDb for SqliteStateDb {
             let rows = conn
                 .execute(
                     "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, \
-                     last_error = ?1 WHERE id = ?2 AND version_size = ?3",
-                    rusqlite::params![&error, &id, &version_size],
+                     last_error = ?1 WHERE library = ?2 AND id = ?3 AND version_size = ?4",
+                    rusqlite::params![&error, &library, &id, &version_size],
                 )
                 .map_err(|e| StateError::query("mark_failed", e))?;
 
             if rows == 0 {
-                tracing::warn!(
+                tracing::error!(
                     id = %id,
                     version_size = %version_size,
                     "mark_failed matched 0 rows; caller must upsert_seen before mark_failed \
                      (producer-dispatch invariant). Failure not persisted"
                 );
+                crate::metrics::MARK_FAILED_ZERO_ROWS.inc();
+                return Err(StateError::Invariant {
+                    operation: "mark_failed",
+                    detail: format!(
+                        "library={library} id={id} version_size={version_size} \
+                         not present; upsert_seen must run before mark_failed"
+                    ),
+                });
             }
 
             Ok(())
@@ -1076,7 +1113,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
+    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
         self.with_conn("get_downloaded_ids", move |conn| {
             let count: i64 = conn
                 .query_row(
@@ -1088,13 +1125,19 @@ impl StateDb for SqliteStateDb {
             let count = usize::try_from(count).unwrap_or(0);
 
             let mut stmt = conn
-                .prepare_cached("SELECT id, version_size FROM assets WHERE status = 'downloaded'")
+                .prepare_cached(
+                    "SELECT library, id, version_size FROM assets WHERE status = 'downloaded'",
+                )
                 .map_err(|e| StateError::query("get_downloaded_ids", e))?;
 
             let mut ids = HashSet::with_capacity(count);
             let rows = stmt
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(|e| StateError::query("get_downloaded_ids", e))?;
             for row in rows {
@@ -1125,7 +1168,7 @@ impl StateDb for SqliteStateDb {
 
     async fn get_downloaded_checksums(
         &self,
-    ) -> Result<HashMap<(String, String), String>, StateError> {
+    ) -> Result<HashMap<(String, String, String), String>, StateError> {
         self.with_conn("get_downloaded_checksums", move |conn| {
             let count: i64 = conn
                 .query_row(
@@ -1138,7 +1181,8 @@ impl StateDb for SqliteStateDb {
 
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, version_size, checksum FROM assets WHERE status = 'downloaded'",
+                    "SELECT library, id, version_size, checksum FROM assets \
+                     WHERE status = 'downloaded'",
                 )
                 .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
 
@@ -1146,8 +1190,12 @@ impl StateDb for SqliteStateDb {
             let rows = stmt
                 .query_map([], |row| {
                     Ok((
-                        (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                        row.get::<_, String>(2)?,
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ),
+                        row.get::<_, String>(3)?,
                     ))
                 })
                 .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
@@ -1231,10 +1279,15 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn touch_last_seen_many(&self, asset_ids: &[&str]) -> Result<(), StateError> {
+    async fn touch_last_seen_many(
+        &self,
+        library: &str,
+        asset_ids: &[&str],
+    ) -> Result<(), StateError> {
         if asset_ids.is_empty() {
             return Ok(());
         }
+        let library = library.to_owned();
         let ids: Vec<String> = asset_ids.iter().map(|s| (*s).to_owned()).collect();
         self.with_conn_mut("touch_last_seen_many", move |conn| {
             let now = Utc::now().timestamp();
@@ -1243,10 +1296,12 @@ impl StateDb for SqliteStateDb {
                 .map_err(|e| StateError::query("touch_last_seen_many::begin", e))?;
             {
                 let mut stmt = tx
-                    .prepare_cached("UPDATE assets SET last_seen_at = ?1 WHERE id = ?2")
+                    .prepare_cached(
+                        "UPDATE assets SET last_seen_at = ?1 WHERE library = ?2 AND id = ?3",
+                    )
                     .map_err(|e| StateError::query("touch_last_seen_many::prepare", e))?;
                 for id in &ids {
-                    stmt.execute(rusqlite::params![now, id])
+                    stmt.execute(rusqlite::params![now, &library, id])
                         .map_err(|e| StateError::query("touch_last_seen_many::execute", e))?;
                 }
             }
@@ -1272,7 +1327,7 @@ impl StateDb for SqliteStateDb {
                     Ok(PathBuf::from(p))
                 })
                 .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
-            collect_rows_with_warn(rows, "sample_downloaded_paths")
+            Ok(collect_rows_with_warn(rows, "sample_downloaded_paths"))
         })
         .await
     }
@@ -1308,7 +1363,7 @@ impl StateDb for SqliteStateDb {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|e| StateError::query("get_all_asset_albums", e))?;
-            collect_rows_with_warn(rows, "get_all_asset_albums")
+            Ok(collect_rows_with_warn(rows, "get_all_asset_albums"))
         })
         .await
     }
@@ -1323,22 +1378,24 @@ impl StateDb for SqliteStateDb {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|e| StateError::query("get_all_asset_people", e))?;
-            collect_rows_with_warn(rows, "get_all_asset_people")
+            Ok(collect_rows_with_warn(rows, "get_all_asset_people"))
         })
         .await
     }
 
     async fn mark_soft_deleted(
         &self,
+        library: &str,
         asset_id: &str,
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<(), StateError> {
+        let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         self.with_conn("mark_soft_deleted", move |conn| {
             conn.execute(
                 "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
-                 WHERE id = ?2",
-                rusqlite::params![deleted_at.map(|dt| dt.timestamp()), asset_id],
+                 WHERE library = ?2 AND id = ?3",
+                rusqlite::params![deleted_at.map(|dt| dt.timestamp()), library, asset_id],
             )
             .map_err(|e| StateError::query("mark_soft_deleted", e))?;
             Ok(())
@@ -1346,12 +1403,13 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn mark_hidden_at_source(&self, asset_id: &str) -> Result<(), StateError> {
+    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
+        let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         self.with_conn("mark_hidden_at_source", move |conn| {
             conn.execute(
-                "UPDATE assets SET is_hidden = 1 WHERE id = ?1",
-                rusqlite::params![asset_id],
+                "UPDATE assets SET is_hidden = 1 WHERE library = ?1 AND id = ?2",
+                rusqlite::params![library, asset_id],
             )
             .map_err(|e| StateError::query("mark_hidden_at_source", e))?;
             Ok(())
@@ -1361,17 +1419,19 @@ impl StateDb for SqliteStateDb {
 
     async fn record_metadata_write_failure(
         &self,
+        library: &str,
         asset_id: &str,
         version_size: &str,
     ) -> Result<(), StateError> {
         let ts = Utc::now().timestamp();
+        let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         let version_size = version_size.to_owned();
         self.with_conn("record_metadata_write_failure", move |conn| {
             conn.execute(
                 "UPDATE assets SET metadata_write_failed_at = ?1 \
-                 WHERE id = ?2 AND version_size = ?3",
-                rusqlite::params![ts, asset_id, version_size],
+                 WHERE library = ?2 AND id = ?3 AND version_size = ?4",
+                rusqlite::params![ts, library, asset_id, version_size],
             )
             .map_err(|e| StateError::query("record_metadata_write_failure", e))?;
             Ok(())
@@ -1381,16 +1441,18 @@ impl StateDb for SqliteStateDb {
 
     async fn clear_metadata_write_failure(
         &self,
+        library: &str,
         asset_id: &str,
         version_size: &str,
     ) -> Result<(), StateError> {
+        let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         let version_size = version_size.to_owned();
         self.with_conn("clear_metadata_write_failure", move |conn| {
             conn.execute(
                 "UPDATE assets SET metadata_write_failed_at = NULL \
-                 WHERE id = ?1 AND version_size = ?2",
-                rusqlite::params![asset_id, version_size],
+                 WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+                rusqlite::params![library, asset_id, version_size],
             )
             .map_err(|e| StateError::query("clear_metadata_write_failure", e))?;
             Ok(())
@@ -1400,20 +1462,24 @@ impl StateDb for SqliteStateDb {
 
     async fn get_downloaded_metadata_hashes(
         &self,
-    ) -> Result<HashMap<(String, String), String>, StateError> {
+    ) -> Result<HashMap<(String, String, String), String>, StateError> {
         self.with_conn("get_downloaded_metadata_hashes", move |conn| {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, version_size, metadata_hash FROM assets \
+                    "SELECT library, id, version_size, metadata_hash FROM assets \
                      WHERE status = 'downloaded' AND metadata_hash IS NOT NULL",
                 )
                 .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
-            let mut hashes: HashMap<(String, String), String> = HashMap::new();
+            let mut hashes: HashMap<(String, String, String), String> = HashMap::new();
             let rows = stmt
                 .query_map([], |row| {
                     Ok((
-                        (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                        row.get::<_, String>(2)?,
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ),
+                        row.get::<_, String>(3)?,
                     ))
                 })
                 .map_err(|e| StateError::query("get_downloaded_metadata_hashes", e))?;
@@ -1455,18 +1521,24 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_metadata_retry_markers(&self) -> Result<HashSet<(String, String)>, StateError> {
+    async fn get_metadata_retry_markers(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
         self.with_conn("get_metadata_retry_markers", move |conn| {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, version_size FROM assets \
+                    "SELECT library, id, version_size FROM assets \
                      WHERE metadata_write_failed_at IS NOT NULL",
                 )
                 .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
-            let mut markers: HashSet<(String, String)> = HashSet::new();
+            let mut markers: HashSet<(String, String, String)> = HashSet::new();
             let rows = stmt
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
             for row in rows {
@@ -1480,18 +1552,20 @@ impl StateDb for SqliteStateDb {
 
     async fn update_metadata_hash(
         &self,
+        library: &str,
         asset_id: &str,
         version_size: &str,
         metadata_hash: &str,
     ) -> Result<(), StateError> {
+        let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         let version_size = version_size.to_owned();
         let metadata_hash = metadata_hash.to_owned();
         self.with_conn("update_metadata_hash", move |conn| {
             conn.execute(
                 "UPDATE assets SET metadata_hash = ?1 \
-                 WHERE id = ?2 AND version_size = ?3",
-                rusqlite::params![metadata_hash, asset_id, version_size],
+                 WHERE library = ?2 AND id = ?3 AND version_size = ?4",
+                rusqlite::params![metadata_hash, library, asset_id, version_size],
             )
             .map_err(|e| StateError::query("update_metadata_hash", e))?;
             Ok(())
@@ -1541,12 +1615,12 @@ const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
      source, is_favorite, rating, latitude, longitude, altitude, orientation, \
      duration_secs, timezone_offset, width, height, title, keywords, description, \
      media_subtype, burst_id, is_hidden, is_archived, modified_at, is_deleted, \
-     deleted_at, provider_data, metadata_hash";
+     deleted_at, provider_data, metadata_hash, library";
 
 /// Total number of columns in `ASSET_COLUMNS`. Validated by a unit test that
 /// asserts `row_to_asset_record` reads exactly this many indices (0..N).
 #[cfg(test)]
-const ASSET_COLUMN_COUNT: usize = 38;
+const ASSET_COLUMN_COUNT: usize = 39;
 
 /// Convert a database row to an `AssetRecord`.
 ///
@@ -1593,6 +1667,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
     let deleted_at_ts: Option<i64> = row.get(35)?;
     let provider_data: Option<String> = row.get(36)?;
     let metadata_hash: Option<String> = row.get(37)?;
+    let library: String = row.get(38)?;
 
     let metadata = AssetMetadata {
         source,
@@ -1621,6 +1696,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
     };
 
     Ok(AssetRecord {
+        library: Arc::from(library),
         id: id.into_boxed_str(),
         checksum: checksum.into_boxed_str(),
         filename: filename.into_boxed_str(),
@@ -1663,14 +1739,90 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = SqliteStateDb::open(&path).await.unwrap();
         assert!(path.exists());
-        assert_eq!(db.path(), path);
+        assert_eq!(path, db.path());
+    }
+
+    /// The same (id, version_size) under two different libraries must
+    /// coexist as distinct rows; without per-zone PK scope, the second
+    /// `upsert_seen` would UPDATE the first row in place and silently
+    /// drop the other zone's separate-asset state.
+    #[tokio::test]
+    async fn upsert_seen_keeps_distinct_rows_per_library() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let primary = TestAssetRecord::new("ASSET_X")
+            .library("PrimarySync")
+            .checksum("ck_primary")
+            .build();
+        let shared = TestAssetRecord::new("ASSET_X")
+            .library("SharedSync-A1B2C3D4")
+            .checksum("ck_shared")
+            .build();
+        db.upsert_seen(&primary).await.unwrap();
+        db.upsert_seen(&shared).await.unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 2);
+
+        // mark_downloaded for the primary row must not flip the shared row's status.
+        let dir = test_dir();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(&path, b"x").unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "ASSET_X",
+            "original",
+            &path,
+            "lck_primary",
+            None,
+        )
+        .await
+        .unwrap();
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 1);
+
+        // get_downloaded_ids returns the (library, id, version) triple
+        // so consumers can route per-library skip decisions correctly.
+        let ids = db.get_downloaded_ids().await.unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&(
+            "PrimarySync".to_string(),
+            "ASSET_X".to_string(),
+            "original".to_string(),
+        )));
+    }
+
+    /// `mark_failed` must scope to one zone; the other zone's row for
+    /// the same (id, version_size) keeps its prior status.
+    #[tokio::test]
+    async fn mark_failed_is_library_scoped() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for lib in ["PrimarySync", "SharedSync-AAAA"] {
+            let r = TestAssetRecord::new("DUP")
+                .library(lib)
+                .checksum(&format!("ck_{lib}"))
+                .build();
+            db.upsert_seen(&r).await.unwrap();
+        }
+        db.mark_failed("PrimarySync", "DUP", "original", "boom")
+            .await
+            .unwrap();
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.failed, 1, "only PrimarySync row was marked failed");
+        assert_eq!(summary.pending, 1, "SharedSync row stays pending");
     }
 
     #[tokio::test]
     async fn test_should_download_not_in_db() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let result = db
-            .should_download("ABC123", "original", "checksum", Path::new("/tmp/file.jpg"))
+            .should_download(
+                "PrimarySync",
+                "ABC123",
+                "original",
+                "checksum",
+                Path::new("/tmp/file.jpg"),
+            )
             .await
             .unwrap();
         assert!(result);
@@ -1687,6 +1839,7 @@ mod tests {
         // Pending assets should be downloaded
         let result = db
             .should_download(
+                "PrimarySync",
                 "ABC123",
                 "original",
                 "checksum123",
@@ -1708,13 +1861,26 @@ mod tests {
         let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("ABC123", "original", &file_path, "abc123hash", None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "ABC123",
+            "original",
+            &file_path,
+            "abc123hash",
+            None,
+        )
+        .await
+        .unwrap();
 
         // Downloaded asset with existing file should not be downloaded
         let result = db
-            .should_download("ABC123", "original", "checksum123", &file_path)
+            .should_download(
+                "PrimarySync",
+                "ABC123",
+                "original",
+                "checksum123",
+                &file_path,
+            )
             .await
             .unwrap();
         assert!(!result);
@@ -1728,6 +1894,7 @@ mod tests {
 
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
+            "PrimarySync",
             "ABC123",
             "original",
             Path::new("/nonexistent/file.jpg"),
@@ -1740,6 +1907,7 @@ mod tests {
         // Downloaded asset with missing file should be re-downloaded
         let result = db
             .should_download(
+                "PrimarySync",
                 "ABC123",
                 "original",
                 "checksum123",
@@ -1763,13 +1931,26 @@ mod tests {
             .build();
 
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("ABC123", "original", &file_path, "oldhash", None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "ABC123",
+            "original",
+            &file_path,
+            "oldhash",
+            None,
+        )
+        .await
+        .unwrap();
 
         // Different checksum should trigger re-download
         let result = db
-            .should_download("ABC123", "original", "new_checksum", &file_path)
+            .should_download(
+                "PrimarySync",
+                "ABC123",
+                "original",
+                "new_checksum",
+                &file_path,
+            )
             .await
             .unwrap();
         assert!(result);
@@ -1782,7 +1963,7 @@ mod tests {
         let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
-        db.mark_failed("ABC123", "original", "Connection timeout")
+        db.mark_failed("PrimarySync", "ABC123", "original", "Connection timeout")
             .await
             .unwrap();
 
@@ -1804,7 +1985,9 @@ mod tests {
                 .size(100)
                 .build();
             db.upsert_seen(&record).await.unwrap();
-            db.mark_failed(id, "original", "boom").await.unwrap();
+            db.mark_failed("PrimarySync", id, "original", "boom")
+                .await
+                .unwrap();
         }
 
         // Force a deterministic order by backdating.
@@ -1833,7 +2016,9 @@ mod tests {
                 .size(100)
                 .build();
             db.upsert_seen(&record).await.unwrap();
-            db.mark_failed(&id, "original", "boom").await.unwrap();
+            db.mark_failed("PrimarySync", &id, "original", "boom")
+                .await
+                .unwrap();
         }
         // Newest first: FAIL_4 > FAIL_3 > FAIL_2 ...
         for i in 0..5 {
@@ -1893,7 +2078,9 @@ mod tests {
         let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
-        db.mark_failed("ABC123", "original", "Error").await.unwrap();
+        db.mark_failed("PrimarySync", "ABC123", "original", "Error")
+            .await
+            .unwrap();
 
         let count = db.reset_failed().await.unwrap();
         assert_eq!(count, 1);
@@ -1927,6 +2114,7 @@ mod tests {
             let path = dir.path().join(format!("dl_photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
             db.mark_downloaded(
+                "PrimarySync",
                 &format!("DOWNLOADED_{}", i),
                 "original",
                 &path,
@@ -1943,7 +2131,7 @@ mod tests {
             .size(1000)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        db.mark_failed("FAILED_1", "original", "Error")
+        db.mark_failed("PrimarySync", "FAILED_1", "original", "Error")
             .await
             .unwrap();
 
@@ -2061,7 +2249,7 @@ mod tests {
         assert_eq!(promoted, 0);
     }
 
-    /// CG-14: promotion is idempotent — once an orphan has been flipped to
+    /// Promotion is idempotent — once an orphan has been flipped to
     /// `interrupted`, a second invocation must return 0 rows promoted and
     /// must not re-touch the row. The current implementation guards via
     /// `WHERE status = 'running'`, but no test pinned the second-call
@@ -2120,7 +2308,7 @@ mod tests {
         assert_eq!(after_a, ("interrupted".to_string(), 1));
     }
 
-    /// CG-14 corollary: a freshly-completed `sync_runs` row in between
+    /// Corollary to the idempotency test: a freshly-completed `sync_runs` row in between
     /// invocations must not be promoted. Pins the "WHERE status = 'running'"
     /// invariant against churn — a misclassified completed run would
     /// silently corrupt operator dashboards.
@@ -2277,16 +2465,29 @@ mod tests {
         let record = TestAssetRecord::new("ABC123").build();
 
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("ABC123", "original", &file_path, "abc123hash", None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "ABC123",
+            "original",
+            &file_path,
+            "abc123hash",
+            None,
+        )
+        .await
+        .unwrap();
 
         // Upsert again - should preserve downloaded status
         db.upsert_seen(&record).await.unwrap();
 
         // Should still be downloaded (file exists)
         let result = db
-            .should_download("ABC123", "original", "checksum123", &file_path)
+            .should_download(
+                "PrimarySync",
+                "ABC123",
+                "original",
+                "checksum123",
+                &file_path,
+            )
             .await
             .unwrap();
         assert!(!result);
@@ -2306,9 +2507,16 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
-            db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash", None)
-                .await
-                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &format!("DL_{}", i),
+                "original",
+                &path,
+                "hash",
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // Fetch all in one page
@@ -2341,9 +2549,16 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
-            db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash", None)
-                .await
-                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &format!("DL_{}", i),
+                "original",
+                &path,
+                "hash",
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // Add a pending asset (should not be in downloaded IDs)
@@ -2356,10 +2571,26 @@ mod tests {
 
         let ids = db.get_downloaded_ids().await.unwrap();
         assert_eq!(ids.len(), 3);
-        assert!(ids.contains(&("DL_0".to_string(), "original".to_string())));
-        assert!(ids.contains(&("DL_1".to_string(), "original".to_string())));
-        assert!(ids.contains(&("DL_2".to_string(), "original".to_string())));
-        assert!(!ids.contains(&("PENDING_1".to_string(), "original".to_string())));
+        assert!(ids.contains(&(
+            "PrimarySync".to_string(),
+            "DL_0".to_string(),
+            "original".to_string()
+        )));
+        assert!(ids.contains(&(
+            "PrimarySync".to_string(),
+            "DL_1".to_string(),
+            "original".to_string()
+        )));
+        assert!(ids.contains(&(
+            "PrimarySync".to_string(),
+            "DL_2".to_string(),
+            "original".to_string()
+        )));
+        assert!(!ids.contains(&(
+            "PrimarySync".to_string(),
+            "PENDING_1".to_string(),
+            "original".to_string()
+        )));
     }
 
     #[tokio::test]
@@ -2376,19 +2607,34 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
-            db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash", None)
-                .await
-                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &format!("DL_{}", i),
+                "original",
+                &path,
+                "hash",
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         let checksums = db.get_downloaded_checksums().await.unwrap();
         assert_eq!(checksums.len(), 2);
         assert_eq!(
-            checksums.get(&("DL_0".to_string(), "original".to_string())),
+            checksums.get(&(
+                "PrimarySync".to_string(),
+                "DL_0".to_string(),
+                "original".to_string()
+            )),
             Some(&"checksum_0".to_string())
         );
         assert_eq!(
-            checksums.get(&("DL_1".to_string(), "original".to_string())),
+            checksums.get(&(
+                "PrimarySync".to_string(),
+                "DL_1".to_string(),
+                "original".to_string()
+            )),
             Some(&"checksum_1".to_string())
         );
     }
@@ -2408,9 +2654,16 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("photo_{}.jpg", i));
             fs::write(&path, b"content").unwrap();
-            db.mark_downloaded(&format!("DL_{}", i), "original", &path, "hash", None)
-                .await
-                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &format!("DL_{}", i),
+                "original",
+                &path,
+                "hash",
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // Create a pending asset
@@ -2428,7 +2681,7 @@ mod tests {
             .size(1000)
             .build();
         db.upsert_seen(&failed).await.unwrap();
-        db.mark_failed("FAILED_1", "original", "test error")
+        db.mark_failed("PrimarySync", "FAILED_1", "original", "test error")
             .await
             .unwrap();
 
@@ -2462,7 +2715,7 @@ mod tests {
         let dir = test_dir();
         let path = dir.path().join("photo.jpg");
         fs::write(&path, b"content").unwrap();
-        db.mark_downloaded("DL_1", "original", &path, "hash", None)
+        db.mark_downloaded("PrimarySync", "DL_1", "original", &path, "hash", None)
             .await
             .unwrap();
 
@@ -2484,7 +2737,7 @@ mod tests {
         db.upsert_seen(&dl).await.unwrap();
         let path = dir.path().join("photo1.jpg");
         fs::write(&path, b"content").unwrap();
-        db.mark_downloaded("DL_1", "original", &path, "hash", None)
+        db.mark_downloaded("PrimarySync", "DL_1", "original", &path, "hash", None)
             .await
             .unwrap();
 
@@ -2495,7 +2748,7 @@ mod tests {
             .size(1000)
             .build();
         db.upsert_seen(&failed).await.unwrap();
-        db.mark_failed("FAIL_1", "original", "download error")
+        db.mark_failed("PrimarySync", "FAIL_1", "original", "download error")
             .await
             .unwrap();
 
@@ -2511,7 +2764,11 @@ mod tests {
 
         let downloaded = db.get_downloaded_ids().await.unwrap();
         assert_eq!(downloaded.len(), 1);
-        assert!(downloaded.contains(&("DL_1".to_string(), "original".to_string())));
+        assert!(downloaded.contains(&(
+            "PrimarySync".to_string(),
+            "DL_1".to_string(),
+            "original".to_string()
+        )));
     }
 
     #[tokio::test]
@@ -2593,7 +2850,9 @@ mod tests {
         };
 
         // Touch last_seen_at — should set it to now(), which is > backdated value
-        db.touch_last_seen_many(&["TOUCH_1"]).await.unwrap();
+        db.touch_last_seen_many("PrimarySync", &["TOUCH_1"])
+            .await
+            .unwrap();
 
         let updated_ts: i64 = {
             let conn = db.conn.lock().unwrap();
@@ -2636,7 +2895,9 @@ mod tests {
         // (ids above is just to document the slice shape.)
         let _ = ids;
 
-        db.touch_last_seen_many(&id_refs).await.unwrap();
+        db.touch_last_seen_many("PrimarySync", &id_refs)
+            .await
+            .unwrap();
 
         let conn = db.conn.lock().unwrap();
         let mut stmt = conn
@@ -2652,7 +2913,7 @@ mod tests {
     async fn touch_last_seen_many_empty_slice_is_noop() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         // No rows; no assertion about state needed — just verify Ok(()).
-        db.touch_last_seen_many(&[]).await.unwrap();
+        db.touch_last_seen_many("PrimarySync", &[]).await.unwrap();
     }
 
     #[tokio::test]
@@ -2666,8 +2927,8 @@ mod tests {
             conn.execute_batch("BEGIN").unwrap();
             let mut stmt = conn
                 .prepare(
-                    "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, media_type, status, downloaded_at, local_path, local_checksum, last_seen_at)
-                     VALUES (?1, 'original', ?2, ?3, ?4, ?5, 'photo', 'downloaded', ?4, ?6, ?2, ?4)",
+                    "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes, media_type, status, downloaded_at, local_path, local_checksum, last_seen_at)
+                     VALUES ('PrimarySync', ?1, 'original', ?2, ?3, ?4, ?5, 'photo', 'downloaded', ?4, ?6, ?2, ?4)",
                 )
                 .unwrap();
             let now = Utc::now().timestamp();
@@ -2717,8 +2978,8 @@ mod tests {
             let conn = db.conn.lock().unwrap();
             let now = Utc::now().timestamp();
             conn.execute(
-                "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at)
-                 VALUES ('AQvz7R8kP4', 'superHD', 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6abcd', 'IMG_4231.HEIC', ?1, 8294400, 'photo', 'pending', ?1)",
+                "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at)
+                 VALUES ('PrimarySync', 'AQvz7R8kP4', 'superHD', 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6abcd', 'IMG_4231.HEIC', ?1, 8294400, 'photo', 'pending', ?1)",
                 rusqlite::params![now],
             ).unwrap();
         }
@@ -2726,6 +2987,7 @@ mod tests {
         // Act: query should_download with the same unknown version_size
         let result = db
             .should_download(
+                "PrimarySync",
                 "AQvz7R8kP4",
                 "superHD",
                 "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6abcd",
@@ -2771,6 +3033,7 @@ mod tests {
         let path0 = dir.path().join("IMG_1000.JPG");
         fs::write(&path0, b"JPEG data").unwrap();
         db.mark_downloaded(
+            "PrimarySync",
             ids[0],
             "original",
             &path0,
@@ -2783,6 +3046,7 @@ mod tests {
         let path1 = dir.path().join("IMG_1001.JPG");
         fs::write(&path1, b"JPEG data 2").unwrap();
         db.mark_downloaded(
+            "PrimarySync",
             ids[1],
             "original",
             &path1,
@@ -2792,9 +3056,14 @@ mod tests {
         .await
         .unwrap();
 
-        db.mark_failed(ids[2], "original", "HTTP 503 Service Unavailable")
-            .await
-            .unwrap();
+        db.mark_failed(
+            "PrimarySync",
+            ids[2],
+            "original",
+            "HTTP 503 Service Unavailable",
+        )
+        .await
+        .unwrap();
 
         // Assert: counts reflect exact transitions
         let s2 = db.get_summary().await.unwrap();
@@ -2848,8 +3117,8 @@ mod tests {
             let conn = db.conn.lock().unwrap();
             let now = Utc::now().timestamp();
             conn.execute(
-                "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at)
-                 VALUES ('ABx7kQ9nR2', 'original', 'b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c', 'IMG_7892.HEIC', ?1, 6_291_456, 'photo', 'corrupted_junk', ?1)",
+                "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at)
+                 VALUES ('PrimarySync', 'ABx7kQ9nR2', 'original', 'b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c', 'IMG_7892.HEIC', ?1, 6_291_456, 'photo', 'corrupted_junk', ?1)",
                 rusqlite::params![now],
             ).unwrap();
         }
@@ -2859,6 +3128,7 @@ mod tests {
         // The unknown status falls back to Pending via AssetStatus::from_str -> unwrap_or(Pending).
         let needs_download = db
             .should_download(
+                "PrimarySync",
                 "ABx7kQ9nR2",
                 "original",
                 "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c",
@@ -2898,9 +3168,16 @@ mod tests {
 
             let path = dir.path().join(format!("photo_{i}.jpg"));
             fs::write(&path, b"jpeg data").unwrap();
-            db.mark_downloaded(&id, "original", &path, &format!("local_ck_{i}"), None)
-                .await
-                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &id,
+                "original",
+                &path,
+                &format!("local_ck_{i}"),
+                None,
+            )
+            .await
+            .unwrap();
 
             // Query immediately after each download
             let summary = db.get_summary().await.unwrap();
@@ -2975,9 +3252,16 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
             let path = dir.path().join(format!("IMG_{}.HEIC", 2000 + i));
             fs::write(&path, b"heic payload").unwrap();
-            db.mark_downloaded(&id, "original", &path, &format!("localhash{i}"), None)
-                .await
-                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &id,
+                "original",
+                &path,
+                &format!("localhash{i}"),
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // 3 pending (just upserted, never transitioned)
@@ -3006,9 +3290,14 @@ mod tests {
                 .media_type(MediaType::Video)
                 .build();
             db.upsert_seen(&record).await.unwrap();
-            db.mark_failed(&id, "original", &format!("HTTP 500 attempt {i}"))
-                .await
-                .unwrap();
+            db.mark_failed(
+                "PrimarySync",
+                &id,
+                "original",
+                &format!("HTTP 500 attempt {i}"),
+            )
+            .await
+            .unwrap();
         }
 
         // Pre-check
@@ -3049,9 +3338,16 @@ mod tests {
         db.upsert_seen(&record).await.unwrap();
         let path = dir.path().join("IMG_1000.HEIC");
         fs::write(&path, b"payload").unwrap();
-        db.mark_downloaded("ADwnloaded1", "original", &path, "localhash1", None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "ADwnloaded1",
+            "original",
+            &path,
+            "localhash1",
+            None,
+        )
+        .await
+        .unwrap();
 
         // 1 normal pending (attempts = 0, should be untouched)
         let record = TestAssetRecord::new("APending1")
@@ -3070,7 +3366,7 @@ mod tests {
         db.upsert_seen(&record).await.unwrap();
         // Simulate accumulated attempts by marking failed then resetting status to pending
         // but keeping attempts high (as the old bug would produce)
-        db.mark_failed("AStuck1", "original", "transient error")
+        db.mark_failed("PrimarySync", "AStuck1", "original", "transient error")
             .await
             .unwrap();
         // Manually set back to pending with attempts preserved (simulating the old bug)
@@ -3092,7 +3388,9 @@ mod tests {
                 .size(5000)
                 .build();
             db.upsert_seen(&record).await.unwrap();
-            db.mark_failed(&id, "original", "HTTP 500").await.unwrap();
+            db.mark_failed("PrimarySync", &id, "original", "HTTP 500")
+                .await
+                .unwrap();
         }
 
         let before = db.get_summary().await.unwrap();
@@ -3130,9 +3428,16 @@ mod tests {
         db.upsert_seen(&record).await.unwrap();
         let path = dir.path().join("IMG_1000.HEIC");
         fs::write(&path, b"payload").unwrap();
-        db.mark_downloaded("ADownloaded", "original", &path, "localhash", None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "ADownloaded",
+            "original",
+            &path,
+            "localhash",
+            None,
+        )
+        .await
+        .unwrap();
 
         // 2 pending dispatched this sync (should be promoted to failed)
         for i in 0..2 {
@@ -3152,7 +3457,7 @@ mod tests {
             .size(3000)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        db.mark_failed("AFailed", "original", "HTTP 500")
+        db.mark_failed("PrimarySync", "AFailed", "original", "HTTP 500")
             .await
             .unwrap();
 
@@ -3227,6 +3532,7 @@ mod tests {
                 let db = Arc::clone(&db);
                 tokio::spawn(async move {
                     db.mark_downloaded(
+                        "PrimarySync",
                         &format!("CONCURRENT_{i}"),
                         "original",
                         Path::new(&format!("/tmp/photo_{i}.jpg")),
@@ -3345,10 +3651,18 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
         }
 
-        db.mark_failed("A", "original", "error 1").await.unwrap();
-        db.mark_failed("A", "original", "error 2").await.unwrap();
-        db.mark_failed("A", "original", "error 3").await.unwrap();
-        db.mark_failed("B", "original", "error 1").await.unwrap();
+        db.mark_failed("PrimarySync", "A", "original", "error 1")
+            .await
+            .unwrap();
+        db.mark_failed("PrimarySync", "A", "original", "error 2")
+            .await
+            .unwrap();
+        db.mark_failed("PrimarySync", "A", "original", "error 3")
+            .await
+            .unwrap();
+        db.mark_failed("PrimarySync", "B", "original", "error 1")
+            .await
+            .unwrap();
 
         let counts = db.get_attempt_counts().await.unwrap();
         assert_eq!(counts.get("A"), Some(&3));
@@ -3373,6 +3687,7 @@ mod tests {
 
         let result = db
             .mark_downloaded(
+                "PrimarySync",
                 "NEVER_SEEN",
                 "original",
                 Path::new("/tmp/never.jpg"),
@@ -3391,7 +3706,7 @@ mod tests {
         assert_eq!(summary.total_assets, 0);
     }
 
-    /// Robustness review NB-1 (2026-04-25): a `mark_downloaded` call
+    /// A `mark_downloaded` call
     /// without a prior `upsert_seen` is self-healing in 1 cycle, but a
     /// regression that increases the rate (producer-dispatch invariant
     /// quietly broken) needs to be visible in /metrics rather than only
@@ -3403,6 +3718,7 @@ mod tests {
 
         let before = crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.get();
         db.mark_downloaded(
+            "PrimarySync",
             "NEVER_SEEN_FOR_METRIC",
             "original",
             Path::new("/tmp/never_metric.jpg"),
@@ -3420,6 +3736,49 @@ mod tests {
         );
     }
 
+    /// A `mark_failed` call without a prior `upsert_seen` is a
+    /// producer-dispatch invariant violation. Surface it as a typed
+    /// `StateError::Invariant` so callers can't silently treat the
+    /// failure as persisted, while still incrementing the metric for
+    /// observability.
+    #[tokio::test]
+    async fn mark_failed_zero_rows_returns_invariant_and_increments_metric() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let before = crate::metrics::MARK_FAILED_ZERO_ROWS.get();
+        let err = db
+            .mark_failed(
+                "PrimarySync",
+                "NEVER_SEEN_FOR_FAILED_METRIC",
+                "original",
+                "simulated transient error",
+            )
+            .await
+            .expect_err("mark_failed on unknown row must surface as Invariant");
+        match &err {
+            StateError::Invariant { operation, detail } => {
+                assert_eq!(*operation, "mark_failed");
+                assert!(
+                    detail.contains("NEVER_SEEN_FOR_FAILED_METRIC"),
+                    "detail must include the asset id; got: {detail}"
+                );
+            }
+            other => panic!("expected StateError::Invariant, got {other:?}"),
+        }
+        let after = crate::metrics::MARK_FAILED_ZERO_ROWS.get();
+
+        assert!(
+            after > before,
+            "MARK_FAILED_ZERO_ROWS must advance by at least 1 (parallel tests \
+             may also increment); got before={before} after={after}"
+        );
+
+        // The asset must NOT have been inserted as a side effect.
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.total_assets, 0);
+    }
+
     // ── Gap: mark_failed increments download_attempts cumulatively ────
 
     #[tokio::test]
@@ -3435,7 +3794,7 @@ mod tests {
 
         // Fail three times
         for i in 1..=3 {
-            db.mark_failed("RETRY_ME", "original", &format!("error {i}"))
+            db.mark_failed("PrimarySync", "RETRY_ME", "original", &format!("error {i}"))
                 .await
                 .unwrap();
         }
@@ -3567,7 +3926,7 @@ mod tests {
         let sync_started_at = chrono::Utc::now().timestamp();
 
         // Caller violates the contract: bumps last_seen_at on a pending row.
-        db.touch_last_seen_many(&["PENDING_CARRYOVER"])
+        db.touch_last_seen_many("PrimarySync", &["PENDING_CARRYOVER"])
             .await
             .unwrap();
 
@@ -3599,9 +3958,16 @@ mod tests {
             .size(7)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("PRESERVE", "original", &file_path, "hash_v1", None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "PRESERVE",
+            "original",
+            &file_path,
+            "hash_v1",
+            None,
+        )
+        .await
+        .unwrap();
 
         // Re-upsert with updated metadata (e.g., checksum changed in iCloud)
         let updated = TestAssetRecord::new("PRESERVE")
@@ -3636,6 +4002,7 @@ mod tests {
             .build();
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
+            "PrimarySync",
             "DL_CK",
             "original",
             Path::new("/photos/photo.jpg"),
@@ -3670,6 +4037,7 @@ mod tests {
                 .build();
             db.upsert_seen(&record).await.unwrap();
             db.mark_downloaded(
+                "PrimarySync",
                 &format!("SAMPLE_{i}"),
                 "original",
                 Path::new(&format!("/photos/photo_{i}.jpg")),
@@ -3907,7 +4275,9 @@ mod tests {
         db.upsert_seen(&orig).await.unwrap();
         db.upsert_seen(&med).await.unwrap();
         let when = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        db.mark_soft_deleted("DEL_1", Some(when)).await.unwrap();
+        db.mark_soft_deleted("PrimarySync", "DEL_1", Some(when))
+            .await
+            .unwrap();
 
         let pending = db.get_pending().await.unwrap();
         assert_eq!(pending.len(), 2);
@@ -3925,7 +4295,9 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let rec = TestAssetRecord::new("HID_1").build();
         db.upsert_seen(&rec).await.unwrap();
-        db.mark_hidden_at_source("HID_1").await.unwrap();
+        db.mark_hidden_at_source("PrimarySync", "HID_1")
+            .await
+            .unwrap();
         let pending = db.get_pending().await.unwrap();
         assert!(pending[0].metadata.is_hidden);
     }
@@ -3949,7 +4321,7 @@ mod tests {
         assert!(ts_initial.is_none());
 
         // Set the marker.
-        db.record_metadata_write_failure("MWF_1", "original")
+        db.record_metadata_write_failure("PrimarySync", "MWF_1", "original")
             .await
             .unwrap();
         let ts_after_set: Option<i64> = {
@@ -3967,7 +4339,7 @@ mod tests {
         );
 
         // Clear the marker after a successful retry.
-        db.clear_metadata_write_failure("MWF_1", "original")
+        db.clear_metadata_write_failure("PrimarySync", "MWF_1", "original")
             .await
             .unwrap();
         let ts_after_clear: Option<i64> = {
@@ -4004,9 +4376,16 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let rec = TestAssetRecord::new("D1").build();
         db.upsert_seen(&rec).await.unwrap();
-        db.mark_downloaded("D1", "original", Path::new("/a.jpg"), "h", None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "D1",
+            "original",
+            Path::new("/a.jpg"),
+            "h",
+            None,
+        )
+        .await
+        .unwrap();
         // Manually null the hash to simulate a pre-v5 row
         {
             let conn = db.acquire_lock("test").unwrap();
@@ -4086,6 +4465,7 @@ mod tests {
 
         let db = SqliteStateDb::open_in_memory().unwrap();
         let record = AssetRecord::new_pending(
+            Arc::from("PrimarySync"),
             photo.id().to_string(),
             VersionSizeKey::Original,
             "ck".to_string(),
@@ -4159,9 +4539,16 @@ mod tests {
                 .size(5)
                 .build();
             db.upsert_seen(&record).await.unwrap();
-            db.mark_downloaded("WAL_KEEPER", "original", &file_path, "localhash", None)
-                .await
-                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "WAL_KEEPER",
+                "original",
+                &file_path,
+                "localhash",
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // Step 2: open a raw rusqlite connection, begin an explicit
@@ -4191,7 +4578,7 @@ mod tests {
         let db = SqliteStateDb::open(&path).await.unwrap();
         let ids = db.get_downloaded_ids().await.unwrap();
         assert!(
-            ids.contains(&("WAL_KEEPER".into(), "original".into())),
+            ids.contains(&("PrimarySync".into(), "WAL_KEEPER".into(), "original".into())),
             "committed downloaded row must survive an adjacent uncommitted \
              transaction's rollback; got downloaded set: {ids:?}"
         );
@@ -4234,16 +4621,23 @@ mod tests {
             .size(11)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("KEEPER_1", "original", &file_path, "localhash", None)
-            .await
-            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "KEEPER_1",
+            "original",
+            &file_path,
+            "localhash",
+            None,
+        )
+        .await
+        .unwrap();
         let prior_sync_ts = chrono::Utc::now().timestamp() - 86_400;
         db.backdate_last_seen("KEEPER_1", prior_sync_ts);
 
         let summary_before = db.get_summary().await.unwrap();
         assert_eq!(summary_before.downloaded, 1);
         let ids_before = db.get_downloaded_ids().await.unwrap();
-        assert!(ids_before.contains(&("KEEPER_1".into(), "original".into())));
+        assert!(ids_before.contains(&("PrimarySync".into(), "KEEPER_1".into(), "original".into())));
 
         // Sync N+1 begins now. Producer enumerates zero assets (absent from
         // every page). Nothing calls upsert_seen for KEEPER_1. At sync end,
@@ -4268,7 +4662,7 @@ mod tests {
 
         let ids_after = db.get_downloaded_ids().await.unwrap();
         assert!(
-            ids_after.contains(&("KEEPER_1".into(), "original".into())),
+            ids_after.contains(&("PrimarySync".into(), "KEEPER_1".into(), "original".into())),
             "KEEPER_1 must remain in the downloaded set after a full sync that \
              didn't re-enumerate it"
         );
@@ -4281,6 +4675,68 @@ mod tests {
         assert!(
             failed.is_empty(),
             "the asset that wasn't enumerated this sync must not appear in the failed set"
+        );
+    }
+
+    /// Read-side counterpart to `upsert_seen_keeps_distinct_rows_per_library`
+    /// and `mark_failed_is_library_scoped`: those tests already pin the write
+    /// side, this one pins that the bulk-loader queries used by the download
+    /// hot path (`get_downloaded_checksums`, `sample_downloaded_paths`)
+    /// surface per-zone rows without collapsing them on the shared
+    /// `(id, version_size)` pair the v8 PK split was created to disambiguate.
+    #[tokio::test]
+    async fn multi_library_read_queries_scope_per_zone() {
+        let dir = test_dir();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        const ID: &str = "SHARED_ID";
+        const PRIMARY: &str = "PrimarySync";
+        const SHARED: &str = "SharedSync-A1B2C3D4";
+
+        for (library, ck) in [(PRIMARY, "ck_primary"), (SHARED, "ck_shared")] {
+            let record = TestAssetRecord::new(ID)
+                .library(library)
+                .checksum(ck)
+                .filename("photo.jpg")
+                .size(1000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        let primary_path = dir.path().join(PRIMARY).join("photo.jpg");
+        let shared_path = dir.path().join(SHARED).join("photo.jpg");
+        for path in [&primary_path, &shared_path] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"x").unwrap();
+        }
+        db.mark_downloaded(PRIMARY, ID, "original", &primary_path, "lh_primary", None)
+            .await
+            .unwrap();
+        db.mark_downloaded(SHARED, ID, "original", &shared_path, "lh_shared", None)
+            .await
+            .unwrap();
+
+        let checksums = db.get_downloaded_checksums().await.unwrap();
+        let triple = |lib: &str| (lib.to_string(), ID.to_string(), "original".to_string());
+        assert_eq!(
+            checksums.get(&triple(PRIMARY)),
+            Some(&"ck_primary".to_string())
+        );
+        assert_eq!(
+            checksums.get(&triple(SHARED)),
+            Some(&"ck_shared".to_string())
+        );
+
+        // local_path is per-row; if mark_downloaded had clobbered the column
+        // on a shared (id, version_size) we'd leak one of the on-disk files.
+        let paths = db.sample_downloaded_paths(10).await.unwrap();
+        assert!(
+            paths.contains(&primary_path),
+            "primary path missing: {paths:?}"
+        );
+        assert!(
+            paths.contains(&shared_path),
+            "shared path missing: {paths:?}"
         );
     }
 }

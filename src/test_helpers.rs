@@ -22,6 +22,7 @@ use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey}
 /// let record = TestAssetRecord::new("MY_ID").checksum("abc").size(5000).build();
 /// ```
 pub struct TestAssetRecord {
+    library: String,
     id: String,
     version_size: VersionSizeKey,
     checksum: String,
@@ -36,6 +37,7 @@ pub struct TestAssetRecord {
 impl TestAssetRecord {
     pub fn new(id: &str) -> Self {
         Self {
+            library: crate::icloud::photos::PRIMARY_ZONE_NAME.to_string(),
             id: id.to_string(),
             version_size: VersionSizeKey::Original,
             checksum: "checksum123".to_string(),
@@ -46,6 +48,11 @@ impl TestAssetRecord {
             media_type: MediaType::Photo,
             metadata: None,
         }
+    }
+
+    pub fn library(mut self, library: &str) -> Self {
+        self.library = library.to_string();
+        self
     }
 
     pub fn checksum(mut self, c: &str) -> Self {
@@ -90,6 +97,7 @@ impl TestAssetRecord {
 
     pub fn build(self) -> AssetRecord {
         let record = AssetRecord::new_pending(
+            std::sync::Arc::from(self.library),
             self.id,
             self.version_size,
             self.checksum,

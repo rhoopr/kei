@@ -145,10 +145,16 @@ kei_check_init() {
 }
 
 # Usage: kei_check "<label>" [<result>]
-# Result defaults to $? so `foo && bar; kei_check "baz"` works.
+# Result defaults to $? so `foo && bar; kei_check "baz"` works. Capturing
+# $? must be the FIRST statement in the function: any prior assignment
+# (e.g. `local label="$1"`) succeeds and clobbers $? to 0, which would
+# silently turn every implicit-$? assertion into PASS.
 kei_check() {
+    local result=$?
     local label="$1"
-    local result="${2:-$?}"
+    if [ "$#" -ge 2 ]; then
+        result="$2"
+    fi
     if [ "$result" -eq 0 ]; then
         echo "  PASS: $label"
         _KEI_PASS=$((_KEI_PASS + 1))

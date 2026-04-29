@@ -53,6 +53,11 @@ pub(crate) struct TomlAuth {
 pub(crate) struct TomlDownload {
     pub directory: Option<String>,
     pub folder_structure: Option<String>,
+    /// v0.13+ per-category template for album passes. Default `{album}`.
+    pub folder_structure_albums: Option<String>,
+    /// v0.13+ per-category template for smart-folder passes. Default
+    /// `{smart-folder}`.
+    pub folder_structure_smart_folders: Option<String>,
     pub threads: Option<u16>,
     pub threads_num: Option<u16>,
     pub bandwidth_limit: Option<String>,
@@ -83,8 +88,20 @@ pub(crate) struct TomlRetry {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlFilters {
+    /// Deprecated v0.13: use `libraries` (an array). Removed in v0.20.
     pub library: Option<String>,
+    /// v0.13+ replacement for `library`. Repeatable; accepts the same value
+    /// grammar as `--library` (`primary`, `shared`, `all`, raw zone names,
+    /// `!name` exclusions).
+    pub libraries: Option<Vec<String>>,
+    /// Deprecated v0.13: use `albums` (an array). Removed in v0.20.
+    pub album: Option<String>,
     pub albums: Option<Vec<String>>,
+    /// v0.13+ smart-folder selector. Same value grammar as `albums`.
+    pub smart_folders: Option<Vec<String>>,
+    /// v0.13+ unfiled-pass toggle. Default: `true`.
+    pub unfiled: Option<bool>,
+    /// Deprecated v0.13: use `albums` with `!name` entries. Removed in v0.20.
     pub exclude_albums: Option<Vec<String>>,
     pub filename_exclude: Option<Vec<String>>,
     pub skip_videos: Option<bool>,
@@ -114,6 +131,12 @@ pub(crate) struct TomlWatch {
     pub interval: Option<u64>,
     pub notify_systemd: Option<bool>,
     pub pid_file: Option<String>,
+    /// Run a full local-vs-state reconciliation walk every Nth watch cycle.
+    /// `None` or `0` disables the periodic walk (the manual `kei reconcile`
+    /// subcommand is unaffected). The walk is read-only: missing files are
+    /// reported via `tracing::warn!` and never auto-marked failed in the
+    /// state DB. The default is unset to preserve existing behaviour.
+    pub reconcile_every_n_cycles: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -164,37 +187,29 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
 
 // ── Application Config ──────────────────────────────────────────────
 
-/// Which library (or libraries) to sync.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LibrarySelection {
-    /// A single named library (e.g. "`PrimarySync`", "SharedSync-ABCD1234").
-    Single(String),
-    /// All available libraries (primary + private + shared).
-    All,
-}
-
-/// Resolve library selection from CLI flag > TOML config > default (`PrimarySync`).
-pub(crate) fn resolve_library_selection(
-    cli_library: Option<String>,
+/// Resolve `--library` from CLI > TOML > default (`primary`). The CLI list
+/// and the TOML `[filters].libraries` array share the v0.13 grammar
+/// (`primary` / `shared` / `all` / `none` / `!name` / raw zone names);
+/// `[filters].library` (singular) is a deprecated alias warned at use.
+///
+/// Returns the parsed [`crate::selection::LibrarySelector`]; the matching
+/// against live CloudKit zones happens in
+/// `commands::service::resolve_libraries`.
+pub(crate) fn resolve_library_selector(
+    cli_libraries: Vec<String>,
     toml_filters: Option<&TomlFilters>,
-) -> LibrarySelection {
-    let library_str = cli_library
-        .or_else(|| toml_filters.and_then(|f| f.library.clone()))
-        .unwrap_or_else(|| "PrimarySync".to_string());
-    if library_str.eq_ignore_ascii_case("all") {
-        LibrarySelection::All
-    } else {
-        LibrarySelection::Single(library_str)
+) -> anyhow::Result<crate::selection::LibrarySelector> {
+    let toml_libraries = toml_filters.and_then(|f| f.libraries.clone());
+    let toml_library_singular = toml_filters.and_then(|f| f.library.clone());
+    if toml_library_singular.is_some() {
+        warn_deprecated(
+            "`[filters].library` (singular string)",
+            "`[filters].libraries = [\"name\"]` (array)",
+        );
     }
-}
-
-impl std::fmt::Display for LibrarySelection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Single(name) => f.write_str(name),
-            Self::All => f.write_str("all"),
-        }
-    }
+    let toml_libraries_resolved = toml_libraries.or_else(|| toml_library_singular.map(|s| vec![s]));
+    let raw = resolve_vec(cli_libraries, toml_libraries_resolved);
+    crate::selection::parse_library_selector(&raw)
 }
 
 /// Which albums to sync.
@@ -237,10 +252,20 @@ impl std::fmt::Display for AlbumSelection {
     }
 }
 
+/// Default template for album passes: a flat per-album folder. Users opt
+/// into a date hierarchy by passing `--folder-structure-albums "{album}/%Y..."`.
+pub(crate) const DEFAULT_FOLDER_STRUCTURE_ALBUMS: &str = "{album}";
+
+/// Default template for smart-folder passes: a flat per-smart-folder folder.
+pub(crate) const DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS: &str = "{smart-folder}";
+
 /// Reject `--folder-structure` values that place `{album}` somewhere other
 /// than the first path segment, or use it more than once. Both cases would
 /// make the "unfiled photos" fallback path shift other segments around
 /// unpredictably when `{album}` collapses to an empty string.
+///
+/// Runs *before* the legacy-`{album}` auto-migration so the migration helper
+/// can rely on the placement guarantee when lifting the segment out.
 fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
     let stripped = crate::download::paths::strip_python_wrapper(folder_structure);
     let count = stripped.matches("{album}").count();
@@ -260,35 +285,321 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Convert a raw `Vec<String>` (from CLI or TOML) into an [`AlbumSelection`],
-/// enforcing that `-a all` is not mixed with specific album names.
-fn resolve_album_selection(
-    raw: Vec<String>,
-    folder_structure: &str,
-) -> anyhow::Result<AlbumSelection> {
-    let has_all = raw.iter().any(|s| s.eq_ignore_ascii_case("all"));
-    if has_all {
-        let non_all: Vec<&String> = raw
-            .iter()
-            .filter(|s| !s.eq_ignore_ascii_case("all"))
-            .collect();
-        anyhow::ensure!(
-            non_all.is_empty(),
-            "'-a all' cannot be combined with other album names; got {raw:?}. \
-             Pass either '-a all' alone or a list of specific names."
-        );
-        return Ok(AlbumSelection::All);
-    }
-    if raw.is_empty() {
-        // Smart default: bare `{album}` in the folder template implies
-        // "every album, plus an unfiled pass" without the user having to
-        // also pass `-a all`.
-        if crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}") {
-            return Ok(AlbumSelection::All);
+/// Which folder-structure flag a template was supplied via. Drives the
+/// per-template token rules: each kind allows exactly one category token
+/// (`{album}` for albums, `{smart-folder}` for smart folders, none for the
+/// unfiled base) and `{library}` is allowed in all three.
+///
+/// See also [`crate::commands::PassKind`], which classifies the same three
+/// categories at *render* time. The two enums look identical but encode
+/// different rules: `PassKind::Unfiled` reuses `{album}` as its render
+/// token (legacy compatibility), while `TemplateKind::Unfiled` *forbids*
+/// it (post-migration).
+#[derive(Debug, Clone, Copy)]
+enum TemplateKind {
+    /// `--folder-structure-albums`.
+    Albums,
+    /// `--folder-structure-smart-folders`.
+    SmartFolders,
+    /// `--folder-structure` (unfiled / library-wide). Auto-migration of a
+    /// legacy `{album}` token has already run by the time this kind is
+    /// validated, so the unfiled template should carry no category tokens.
+    Unfiled,
+}
+
+impl TemplateKind {
+    fn flag_name(self) -> &'static str {
+        match self {
+            Self::Albums => "--folder-structure-albums",
+            Self::SmartFolders => "--folder-structure-smart-folders",
+            Self::Unfiled => "--folder-structure",
         }
-        return Ok(AlbumSelection::LibraryOnly);
     }
-    Ok(AlbumSelection::Named(raw))
+
+    /// The category token (if any) that this template scope owns. Used for
+    /// placement rules and for rejecting category tokens in the unfiled
+    /// template.
+    fn category_token(self) -> Option<&'static str> {
+        use crate::download::paths::{TOKEN_ALBUM, TOKEN_SMART_FOLDER};
+        match self {
+            Self::Albums => Some(TOKEN_ALBUM),
+            Self::SmartFolders => Some(TOKEN_SMART_FOLDER),
+            Self::Unfiled => None,
+        }
+    }
+}
+
+/// Cross-template token & placement validator. Enforces:
+///
+/// - `{album}` is only valid in `--folder-structure-albums`; same for
+///   `{smart-folder}` and `--folder-structure-smart-folders`. The opposite
+///   token in either category template, or *any* category token in the
+///   unfiled template, bails with a pointer to the right flag.
+/// - Single occurrence of every token ({album}, {smart-folder}, {library}).
+/// - `{library}`, when present, must be the leading path segment.
+/// - When `{library}` and the category token coexist, the category token
+///   must immediately follow `{library}` (i.e. the second segment).
+///
+/// Bails at startup so misconfiguration surfaces before the first download.
+fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyhow::Result<()> {
+    use crate::download::paths::{TOKEN_ALBUM, TOKEN_LIBRARY, TOKEN_SMART_FOLDER};
+
+    let stripped = crate::download::paths::strip_python_wrapper(folder_structure);
+    let flag = kind.flag_name();
+    let category = kind.category_token();
+
+    // Reject category tokens that don't belong here.
+    for (token, owner) in [
+        (TOKEN_ALBUM, "--folder-structure-albums"),
+        (TOKEN_SMART_FOLDER, "--folder-structure-smart-folders"),
+    ] {
+        if Some(token) == category {
+            continue;
+        }
+        if stripped.contains(token) {
+            anyhow::bail!(
+                "'{token}' is not valid in {flag}; move it to {owner} (template was \"{folder_structure}\")"
+            );
+        }
+    }
+
+    // Single-occurrence checks for every token allowed in this kind.
+    // `{library}` is always allowed; the category token is only allowed in
+    // its owner kind.
+    for token in [Some(TOKEN_LIBRARY), category].into_iter().flatten() {
+        let count = stripped.matches(token).count();
+        if count > 1 {
+            anyhow::bail!(
+                "'{token}' may only appear once in {flag}; got {count} occurrences in \"{folder_structure}\""
+            );
+        }
+    }
+
+    let segments: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
+    let has_library = stripped.contains(TOKEN_LIBRARY);
+
+    if has_library && segments.first() != Some(&TOKEN_LIBRARY) {
+        anyhow::bail!(
+            "'{TOKEN_LIBRARY}' must be the first path segment of {flag}; got \"{folder_structure}\""
+        );
+    }
+    if let Some(cat) = category.filter(|c| stripped.contains(*c)) {
+        let expected_index = if has_library { 1 } else { 0 };
+        if segments.get(expected_index) != Some(&cat) {
+            let position = if has_library {
+                "must immediately follow '{library}'"
+            } else {
+                "must be the first path segment"
+            };
+            anyhow::bail!("'{cat}' {position} of {flag}; got \"{folder_structure}\"");
+        }
+    }
+
+    Ok(())
+}
+
+/// Default for `Selection.unfiled` when the user did not pass `--unfiled`
+/// explicitly: derived from the legacy `(albums, folder_structure)` tuple
+/// so existing configs keep their pre-v0.13 pass set. `--unfiled` always
+/// wins when supplied.
+fn legacy_unfiled_default(albums: &AlbumSelection, folder_structure: &str) -> bool {
+    let template_has_album =
+        crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}");
+    match albums {
+        AlbumSelection::LibraryOnly => true,
+        AlbumSelection::All => template_has_album,
+        AlbumSelection::Named(_) => false,
+    }
+}
+
+/// Stderr deprecation warning, scheduled for removal in v0.20.0. `old` is the
+/// surface being deprecated (e.g. `` `--exclude-album` ``); `replacement` is
+/// the suggested new form.
+fn warn_deprecated(old: &str, replacement: &str) {
+    #[allow(
+        clippy::print_stderr,
+        reason = "runs during config load, before tracing subscriber is installed"
+    )]
+    {
+        eprintln!(
+            "warning: {old} is deprecated and will be removed in v0.20.0; use {replacement} instead"
+        );
+    }
+}
+
+/// Translate the legacy `(AlbumSelection, exclude_albums, folder_structure)`
+/// tuple plus the parsed library/smart-folder selectors into the v0.13
+/// [`crate::selection::Selection`]. Pure function so the truth table is
+/// testable without `Config::build`.
+///
+/// Behaviour preserved for legacy album fields:
+/// - `AlbumSelection::LibraryOnly` (no-album-flag default) maps to
+///   `AlbumSelector::None`. The library is enumerated as one stream and the
+///   unfiled pass covers it.
+/// - `AlbumSelection::Named(v)` maps to `AlbumSelector::Named { v, exclude }`
+///   plus an unfiled pass only if `{album}` is in the template.
+/// - `AlbumSelection::All` maps to `AlbumSelector::All { exclude }` plus
+///   unfiled iff `{album}` appears in `--folder-structure`.
+///
+/// Library and smart-folder selectors are passed through directly — their
+/// new-grammar parsing already happened in `Config::build`.
+///
+/// `unfiled_override` is `Some(b)` when the user passed `--unfiled` (or set
+/// `[filters].unfiled` in TOML) and `None` otherwise. When `None`, unfiled
+/// is computed from the legacy `albums` + `folder_structure` truth table so
+/// existing configs keep their current pass set.
+pub(crate) fn derive_selection(
+    albums: &AlbumSelection,
+    exclude_albums: &[String],
+    library: &crate::selection::LibrarySelector,
+    folder_structure: &str,
+    raw_smart_folders: &[String],
+    unfiled_override: Option<bool>,
+) -> anyhow::Result<crate::selection::Selection> {
+    // Build the raw album list as if the user had written it on the CLI.
+    // Feeds through `parse_album_selector` so the production path exercises
+    // every sentinel/exclusion code path the tests cover.
+    //
+    // Edge case: legacy `LibraryOnly + exclude_albums` has no clean mapping
+    // in the new grammar (Selector::None doesn't take excludes; the new
+    // model expects `--album all '!Family'` for that intent). The legacy
+    // resolver still handles excludes for `LibraryOnly` correctly, so we
+    // drop them here from the Selection-side preview without changing
+    // observable behaviour.
+    let raw_albums: Vec<String> = match albums {
+        AlbumSelection::LibraryOnly => vec!["none".to_string()],
+        AlbumSelection::Named(names) => names
+            .iter()
+            .cloned()
+            .chain(exclude_albums.iter().map(|n| format!("!{n}")))
+            .collect(),
+        AlbumSelection::All => std::iter::once("all".to_string())
+            .chain(exclude_albums.iter().map(|n| format!("!{n}")))
+            .collect(),
+    };
+
+    let unfiled =
+        unfiled_override.unwrap_or_else(|| legacy_unfiled_default(albums, folder_structure));
+
+    Ok(crate::selection::Selection {
+        albums: crate::selection::parse_album_selector(&raw_albums, true)?,
+        smart_folders: crate::selection::parse_smart_folder_selector(raw_smart_folders)?,
+        libraries: library.clone(),
+        unfiled,
+    })
+}
+
+/// Outcome of [`auto_migrate_legacy_album_token`].
+#[derive(Debug, PartialEq, Eq)]
+struct LegacyAlbumTokenMigration {
+    /// Base template after stripping the `{album}` segment.
+    folder_structure: String,
+    /// Album-pass template - either lifted from the legacy single template
+    /// (when the user did not set `--folder-structure-albums`) or preserved
+    /// as supplied.
+    folder_structure_albums: String,
+    /// Equivalent CLI/TOML pair to suggest to the user in the deprecation
+    /// warning. `None` when nothing was migrated.
+    suggestion: Option<String>,
+}
+
+/// Detect a legacy `{album}` token in `folder_structure` and split it across
+/// the new per-category templates so the path renderer (which consumes
+/// `folder_structure_albums` for album passes) stays equivalent.
+///
+/// - `{album}/<rest>` migrates to `folder_structure_albums = "{album}/<rest>"`,
+///   `folder_structure = "<rest>"` (so the unfiled pass keeps its date
+///   hierarchy).
+/// - Bare `{album}` migrates to `folder_structure_albums = "{album}"`,
+///   `folder_structure = "none"` (the user explicitly opted out of any
+///   date hierarchy on either pass; "none" preserves that for unfiled).
+/// - When the user already set `folder_structure_albums`, the supplied
+///   value is preserved and only the base template is stripped.
+///
+/// Returns `suggestion: None` when the input has no `{album}` token, in
+/// which case the caller should not emit the deprecation warning.
+fn auto_migrate_legacy_album_token(
+    folder_structure: String,
+    folder_structure_albums: String,
+    folder_structure_albums_user_set: bool,
+) -> LegacyAlbumTokenMigration {
+    let stripped = crate::download::paths::strip_python_wrapper(&folder_structure);
+    if !stripped.contains("{album}") {
+        return LegacyAlbumTokenMigration {
+            folder_structure,
+            folder_structure_albums,
+            suggestion: None,
+        };
+    }
+
+    let new_albums = if folder_structure_albums_user_set {
+        folder_structure_albums
+    } else {
+        stripped.to_string()
+    };
+
+    // `validate_folder_structure` guarantees `{album}` is the leading
+    // segment when present, so the only shapes reaching here are exactly
+    // `{album}` (no remainder, base becomes `none`) and `{album}/<rest>`
+    // (lift the rest into the base). Falling through to `none` on any
+    // would-be-malformed input is the safe outcome: the unfiled pass gets
+    // no date hierarchy, but no unstripped `{album}` token leaks back
+    // into the renderer's base path.
+    let new_base = stripped
+        .strip_prefix("{album}/")
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::download::paths::NO_DATE_STRUCTURE.to_string());
+
+    // Single-quoted form so users can paste the suggestion straight into
+    // a POSIX shell. `{:?}` would emit Rust string escapes (\n, \u{...})
+    // which bash would mis-interpret; templates can't contain single
+    // quotes today (validated upstream).
+    let suggestion =
+        format!("`--folder-structure '{new_base}' --folder-structure-albums '{new_albums}'`");
+    LegacyAlbumTokenMigration {
+        folder_structure: new_base,
+        folder_structure_albums: new_albums,
+        suggestion: Some(suggestion),
+    }
+}
+
+/// Convert a raw `Vec<String>` (from CLI or TOML, with optional `!name`
+/// exclusions and `all`/`none` sentinels) into the legacy
+/// `(AlbumSelection, exclude_albums)` pair. Validates the new v0.13 grammar
+/// (contradictions, sentinel rules) by routing through
+/// [`crate::selection::parse_album_selector`], then lowers back into the
+/// legacy shape that `compute_config_hash` and `report.rs` still consume.
+/// Pass execution itself runs off `Selection.albums` via `resolve_passes`.
+fn resolve_album_selection(
+    raw: &[String],
+    folder_structure: &str,
+) -> anyhow::Result<(AlbumSelection, Vec<String>)> {
+    if raw.is_empty() {
+        // Bare `{album}` in the folder template implies "every album, plus an
+        // unfiled pass" without the user having to also pass `--album all`.
+        // The selection model now defaults `--album` to `all`, so this
+        // implicit promotion is redundant; warn and remove later.
+        if crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}") {
+            warn_deprecated(
+                "implicit `--album all` from `{album}` in `--folder-structure`",
+                "an explicit `--album all` (now the default)",
+            );
+            return Ok((AlbumSelection::All, Vec::new()));
+        }
+        return Ok((AlbumSelection::LibraryOnly, Vec::new()));
+    }
+
+    let selector = crate::selection::parse_album_selector(raw, true)?;
+    Ok(match selector {
+        crate::selection::AlbumSelector::None => (AlbumSelection::LibraryOnly, Vec::new()),
+        crate::selection::AlbumSelector::All { excluded } => {
+            (AlbumSelection::All, excluded.into_iter().collect())
+        }
+        crate::selection::AlbumSelector::Named { included, excluded } => (
+            AlbumSelection::Named(included.into_iter().collect()),
+            excluded.into_iter().collect(),
+        ),
+    })
 }
 
 /// Application configuration.
@@ -310,11 +621,19 @@ pub struct Config {
     pub directory: PathBuf,
     pub cookie_directory: PathBuf,
     pub folder_structure: String,
+    /// Template for album passes (default `{album}`).
+    pub folder_structure_albums: String,
+    /// Template for smart-folder passes (default `{smart-folder}`).
+    pub folder_structure_smart_folders: String,
     pub albums: AlbumSelection,
     pub exclude_albums: Vec<String>,
     pub filename_exclude: Vec<glob::Pattern>,
-    pub library: LibrarySelection,
     pub temp_suffix: String,
+    /// Per-category resolved [`Selection`](crate::selection::Selection). Built
+    /// alongside the legacy `albums` / `exclude_albums` / `library` fields and
+    /// preserves their semantics. v0.13: derived from those fields. Future
+    /// PRs migrate the resolver and the legacy fields are removed.
+    pub selection: crate::selection::Selection,
 
     // DateTime fields
     pub skip_created_before: Option<DateTime<Local>>,
@@ -328,6 +647,11 @@ pub struct Config {
     // 8-byte primitives
     pub watch_with_interval: Option<u64>,
     pub retry_delay_secs: u64,
+    /// Periodic reconciliation interval (cycles between full local-vs-state
+    /// walks). `None` or `Some(0)` disables the walk so the daemon's
+    /// behaviour matches the pre-reconcile defaults. See [`TomlWatch::reconcile_every_n_cycles`]
+    /// for the rationale.
+    pub reconcile_every_n_cycles: Option<u64>,
 
     // 4-byte primitives
     pub recent: Option<u32>,
@@ -434,6 +758,17 @@ fn resolve_ref<T: Clone>(cli: Option<&T>, toml: Option<&T>, default: T) -> T {
 /// override a TOML `true`.
 fn resolve_flag(cli_flag: Option<bool>, toml_val: Option<bool>) -> bool {
     cli_flag.or(toml_val).unwrap_or(false)
+}
+
+/// For repeatable Vec flags where empty CLI input means "no override":
+/// CLI value wins iff non-empty, else TOML, else empty. Mirrors how
+/// `clap` represents an absent repeatable flag (`Vec::new()`).
+fn resolve_vec(cli: Vec<String>, toml: Option<Vec<String>>) -> Vec<String> {
+    if cli.is_empty() {
+        toml.unwrap_or_default()
+    } else {
+        cli
+    }
 }
 
 /// Global CLI args needed by `resolve_auth` and `Config::build`.
@@ -622,11 +957,11 @@ impl Config {
     /// Resolution order: CLI > TOML > hardcoded default.
     pub fn build(
         globals: &GlobalArgs,
-        pw: crate::cli::PasswordArgs,
+        pw: &crate::cli::PasswordArgs,
         sync: crate::cli::SyncArgs,
-        toml: Option<TomlConfig>,
+        toml: Option<&TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let toml_auth = toml.as_ref().and_then(|t| t.auth.as_ref());
+        let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
         // `[auth].password` is no longer accepted. Plaintext passwords in config
         // files are a standing security risk; kei ships a credential store
@@ -640,10 +975,9 @@ impl Config {
             );
         }
 
-        let (username, password_str, domain, cookie_directory) =
-            resolve_auth(globals, &pw, toml.as_ref());
-        let password_file = resolve_password_file(&pw, toml_auth);
-        let password_command = resolve_password_command(&pw, toml_auth);
+        let (username, password_str, domain, cookie_directory) = resolve_auth(globals, pw, toml);
+        let password_file = resolve_password_file(pw, toml_auth);
+        let password_command = resolve_password_command(pw, toml_auth);
         let save_password = sync.save_password;
 
         // `--password-command` / `[auth] password_command` is Unix-only: the
@@ -663,7 +997,6 @@ impl Config {
         // catches the CLI case; this catches empty strings from TOML).
         if globals.username.is_some()
             || toml
-                .as_ref()
                 .and_then(|t| t.auth.as_ref()?.username.as_ref())
                 .is_some()
         {
@@ -719,13 +1052,13 @@ impl Config {
             )
         })?;
 
-        let toml_dl = toml.as_ref().and_then(|t| t.download.as_ref());
+        let toml_dl = toml.and_then(|t| t.download.as_ref());
         let toml_retry = toml_dl.and_then(|d| d.retry.as_ref());
-        let toml_filters = toml.as_ref().and_then(|t| t.filters.as_ref());
-        let toml_photos = toml.as_ref().and_then(|t| t.photos.as_ref());
-        let toml_watch = toml.as_ref().and_then(|t| t.watch.as_ref());
-        let toml_metrics = toml.as_ref().and_then(|t| t.metrics.as_ref());
-        let toml_server = toml.as_ref().and_then(|t| t.server.as_ref());
+        let toml_filters = toml.and_then(|t| t.filters.as_ref());
+        let toml_photos = toml.and_then(|t| t.photos.as_ref());
+        let toml_watch = toml.and_then(|t| t.watch.as_ref());
+        let toml_metrics = toml.and_then(|t| t.metrics.as_ref());
+        let toml_server = toml.and_then(|t| t.server.as_ref());
 
         // Download
         //
@@ -767,6 +1100,23 @@ impl Config {
             "%Y/%m/%d".to_string(),
         );
         validate_folder_structure(&folder_structure)?;
+
+        // Track whether the user explicitly supplied a per-category album
+        // template; the legacy `{album}` auto-migration below preserves a
+        // user-supplied value but lifts the legacy template into the new
+        // field when it is unset.
+        let folder_structure_albums_user_set = sync.folder_structure_albums.is_some()
+            || toml_dl.is_some_and(|d| d.folder_structure_albums.is_some());
+        let folder_structure_albums = resolve(
+            sync.folder_structure_albums,
+            toml_dl.and_then(|d| d.folder_structure_albums.clone()),
+            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+        );
+        let folder_structure_smart_folders = resolve(
+            sync.folder_structure_smart_folders,
+            toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()),
+            DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string(),
+        );
         // Resolve bandwidth limit (CLI bytes/sec > TOML human-readable string > None).
         let bandwidth_limit: Option<u64> = if let Some(n) = sync.bandwidth_limit {
             Some(n)
@@ -906,61 +1256,127 @@ impl Config {
         );
 
         // Filters
-        let library = resolve_library_selection(sync.library, toml_filters);
-        let raw_albums = if sync.albums.is_empty() {
-            toml_filters
-                .and_then(|f| f.albums.clone())
-                .unwrap_or_default()
+        let library_selector = resolve_library_selector(sync.libraries, toml_filters)?;
+        let toml_albums = toml_filters.and_then(|f| f.albums.clone());
+        let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
+        if toml_album_singular.is_some() {
+            warn_deprecated(
+                "`[filters].album` (singular string)",
+                "`[filters].albums = [\"name\"]` (array)",
+            );
+        }
+        // Lift the deprecated singular `album` key into the array form so the
+        // shared resolver only ever sees one shape. CLI takes precedence; TOML
+        // singular only applies when the array form is absent.
+        let toml_albums_resolved = toml_albums.or_else(|| toml_album_singular.map(|s| vec![s]));
+        let raw_albums = resolve_vec(sync.albums, toml_albums_resolved);
+
+        let toml_exclude_albums = toml_filters.and_then(|f| f.exclude_albums.clone());
+        let legacy_excludes_supplied = !sync.exclude_albums.is_empty()
+            || toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty());
+        if !sync.exclude_albums.is_empty() {
+            warn_deprecated(
+                "`--exclude-album` / `KEI_EXCLUDE_ALBUM`",
+                "`--album '!NAME'`",
+            );
+        }
+        if toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty()) {
+            warn_deprecated(
+                "`[filters].exclude_albums`",
+                "`!name` entries inside `[filters].albums`",
+            );
+        }
+        let exclude_albums = resolve_vec(sync.exclude_albums, toml_exclude_albums);
+        // Fold deprecated excludes into the raw album list as `!name` so the
+        // new selector grammar performs all validation (contradictions,
+        // sentinel rules) in one place. Legacy excludes also remain on
+        // `Config.exclude_albums` for the unchanged sync pipeline.
+        let mut merged_raw = raw_albums;
+        for name in &exclude_albums {
+            merged_raw.push(format!("!{name}"));
+        }
+        let (albums, parsed_excludes) = resolve_album_selection(&merged_raw, &folder_structure)?;
+        // `compute_config_hash` and `report.rs` still read `Config.exclude_albums`
+        // for token invalidation and run reporting respectively. Prefer the
+        // deprecated list when the user actually supplied it (exact legacy
+        // behaviour); otherwise surface inline `!name` excludes so the new
+        // grammar feeds both surfaces consistently.
+        let exclude_albums = if legacy_excludes_supplied {
+            exclude_albums
         } else {
-            sync.albums
+            parsed_excludes
         };
-        let albums = resolve_album_selection(raw_albums, &folder_structure)?;
+
+        // Auto-migrate legacy `{album}` in `--folder-structure` into the
+        // per-category templates the renderer now consumes. Runs after the
+        // album-selection resolver so the auto-`-a all`-from-token behaviour
+        // (also being deprecated) sees the original template before the
+        // token gets stripped from `folder_structure`.
+        let migration = auto_migrate_legacy_album_token(
+            folder_structure,
+            folder_structure_albums,
+            folder_structure_albums_user_set,
+        );
+        if let Some(ref suggestion) = migration.suggestion {
+            warn_deprecated("`{album}` in `--folder-structure`", suggestion);
+        }
+        let folder_structure = migration.folder_structure;
+        let folder_structure_albums = migration.folder_structure_albums;
+
+        // Runs after auto-migration so the unfiled template has no `{album}`
+        // left to reject; remaining bugs (e.g. `{smart-folder}` in albums)
+        // surface here before the first download.
+        validate_template_tokens(&folder_structure, TemplateKind::Unfiled)?;
+        validate_template_tokens(&folder_structure_albums, TemplateKind::Albums)?;
+        validate_template_tokens(&folder_structure_smart_folders, TemplateKind::SmartFolders)?;
+
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
         // Resolve live photo mode: --live-photo-mode > --skip-live-photos > TOML photos > TOML filters compat
         let live_photo_mode = if let Some(mode) = sync.live_photo_mode {
             mode
         } else if sync.skip_live_photos == Some(true) {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS` is deprecated and will be removed in v0.20.0, use `--live-photo-mode skip` instead"
-                );
-            }
+            warn_deprecated(
+                "`--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS`",
+                "`--live-photo-mode skip`",
+            );
             LivePhotoMode::Skip
         } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
             mode
         } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `[filters] skip_live_photos` is deprecated and will be removed in v0.20.0, use `[photos] live_photo_mode = \"skip\"` instead"
-                );
-            }
+            warn_deprecated(
+                "`[filters].skip_live_photos`",
+                "`[photos].live_photo_mode = \"skip\"`",
+            );
             LivePhotoMode::Skip
         } else {
             LivePhotoMode::Both
         };
-        let exclude_albums = if sync.exclude_albums.is_empty() {
-            toml_filters
-                .and_then(|f| f.exclude_albums.clone())
-                .unwrap_or_default()
-        } else {
-            sync.exclude_albums
-        };
-        let filename_exclude_strs = if sync.filename_exclude.is_empty() {
-            toml_filters
-                .and_then(|f| f.filename_exclude.clone())
-                .unwrap_or_default()
-        } else {
-            sync.filename_exclude
-        };
+        let raw_smart_folders = resolve_vec(
+            sync.smart_folders,
+            toml_filters.and_then(|f| f.smart_folders.clone()),
+        );
+
+        let unfiled_override = sync
+            .unfiled
+            .or_else(|| toml_filters.and_then(|f| f.unfiled));
+
+        // Build the v0.13 [`Selection`] that the new resolver (`resolve_passes`)
+        // consumes. The legacy `albums` / `exclude_albums` fields stay on
+        // Config for the sync-token invalidation hash and the report.json
+        // emission; the Selection is the source of truth for pass execution.
+        let selection = derive_selection(
+            &albums,
+            &exclude_albums,
+            &library_selector,
+            &folder_structure,
+            &raw_smart_folders,
+            unfiled_override,
+        )?;
+        let filename_exclude_strs = resolve_vec(
+            sync.filename_exclude,
+            toml_filters.and_then(|f| f.filename_exclude.clone()),
+        );
         // Compile glob patterns once during build
         let filename_exclude: Vec<glob::Pattern> = filename_exclude_strs
             .iter()
@@ -1079,16 +1495,22 @@ impl Config {
                 .and_then(|w| w.pid_file.as_ref())
                 .map(PathBuf::from)
         });
+        // [watch] reconcile_every_n_cycles is TOML-only (no CLI flag yet).
+        // Treat `Some(0)` and absence identically — both disable the walk.
+        // The watch loop also short-circuits when not in watch mode.
+        let reconcile_every_n_cycles = toml_watch
+            .and_then(|w| w.reconcile_every_n_cycles)
+            .filter(|n| *n > 0);
 
         // Notifications
-        let toml_notif = toml.as_ref().and_then(|t| t.notifications.as_ref());
+        let toml_notif = toml.and_then(|t| t.notifications.as_ref());
         let notification_script = sync
             .notification_script
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
 
         // JSON report: CLI > [report] json TOML > none.
-        let toml_report = toml.as_ref().and_then(|t| t.report.as_ref());
+        let toml_report = toml.and_then(|t| t.report.as_ref());
         let report_json = sync.report_json.or_else(|| {
             toml_report
                 .and_then(|r| r.json.as_deref())
@@ -1168,11 +1590,13 @@ impl Config {
             directory,
             cookie_directory,
             folder_structure,
+            folder_structure_albums,
+            folder_structure_smart_folders,
             albums,
             exclude_albums,
             filename_exclude,
-            library,
             temp_suffix,
+            selection,
             skip_created_before,
             skip_created_after,
             pid_file,
@@ -1182,6 +1606,7 @@ impl Config {
             http_bind,
             watch_with_interval,
             retry_delay_secs,
+            reconcile_every_n_cycles,
             recent,
             max_retries,
             bandwidth_limit,
@@ -1223,12 +1648,6 @@ impl Config {
     /// Only includes static fields suitable for persistence. Passwords are
     /// never included. Per-run flags (`dry_run`, `recent`, etc.) are omitted.
     pub(crate) fn to_toml(&self) -> TomlConfig {
-        let library_str = match &self.library {
-            LibrarySelection::Single(name) if name == "PrimarySync" => None,
-            LibrarySelection::Single(name) => Some(name.clone()),
-            LibrarySelection::All => Some("all".to_string()),
-        };
-
         TomlConfig {
             data_dir: None,  // derived from config path, not serialized unless explicit
             log_level: None, // only written if user explicitly set it
@@ -1255,6 +1674,20 @@ impl Config {
                     Some(self.directory.display().to_string())
                 },
                 folder_structure: Some(self.folder_structure.clone()),
+                folder_structure_albums: if self.folder_structure_albums
+                    == DEFAULT_FOLDER_STRUCTURE_ALBUMS
+                {
+                    None
+                } else {
+                    Some(self.folder_structure_albums.clone())
+                },
+                folder_structure_smart_folders: if self.folder_structure_smart_folders
+                    == DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
+                {
+                    None
+                } else {
+                    Some(self.folder_structure_smart_folders.clone())
+                },
                 threads: Some(self.threads_num),
                 threads_num: None, // deprecated, canonical spelling is `threads`
                 bandwidth_limit: self.bandwidth_limit.map(|n| n.to_string()),
@@ -1306,11 +1739,37 @@ impl Config {
                 }),
             }),
             filters: Some(TomlFilters {
-                library: library_str,
-                albums: match &self.albums {
-                    AlbumSelection::LibraryOnly => None,
-                    AlbumSelection::All => Some(vec!["all".to_string()]),
-                    AlbumSelection::Named(v) => Some(v.clone()),
+                library: None, // deprecated singular key never round-trips; new array form below
+                album: None, // emit only the array form; deprecated singular dropped on round-trip
+                libraries: {
+                    // Emit only when the user picked something other than
+                    // the default (primary). Default `[primary]` round-trips
+                    // implicitly so config dumps stay clean.
+                    let raw = self.selection.libraries.to_raw();
+                    if raw == vec!["primary".to_string()] {
+                        None
+                    } else {
+                        Some(raw)
+                    }
+                },
+                albums: {
+                    // Round-trip via the new selector so the same string
+                    // rendering used by `--album` echoes back into TOML.
+                    let raw = self.selection.albums.to_raw();
+                    if matches!(self.albums, AlbumSelection::LibraryOnly) {
+                        None
+                    } else {
+                        Some(raw)
+                    }
+                },
+                smart_folders: match &self.selection.smart_folders {
+                    crate::selection::SmartFolderSelector::None => None,
+                    other => Some(other.to_raw()),
+                },
+                unfiled: if self.selection.unfiled {
+                    None
+                } else {
+                    Some(false)
                 },
                 exclude_albums: if self.exclude_albums.is_empty() {
                     None
@@ -1379,6 +1838,7 @@ impl Config {
             watch: if self.watch_with_interval.is_some()
                 || self.notify_systemd
                 || self.pid_file.is_some()
+                || self.reconcile_every_n_cycles.is_some()
             {
                 Some(TomlWatch {
                     interval: self.watch_with_interval,
@@ -1388,6 +1848,7 @@ impl Config {
                         None
                     },
                     pid_file: self.pid_file.as_ref().map(|p| p.display().to_string()),
+                    reconcile_every_n_cycles: self.reconcile_every_n_cycles,
                 })
             } else {
                 None
@@ -1475,6 +1936,8 @@ pub(crate) fn persist_first_run_config(
         download: full.download.map(|d| TomlDownload {
             directory: d.directory,
             folder_structure: None,
+            folder_structure_albums: None,
+            folder_structure_smart_folders: None,
             threads: None,
             threads_num: None, // deprecated
             bandwidth_limit: None,
@@ -1565,6 +2028,106 @@ pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>>
 mod tests {
     use super::*;
     use crate::cli::SyncArgs;
+
+    // ── validate_template_tokens ─────────────────────────────────────
+
+    #[test]
+    fn validate_template_tokens_accepts_default_per_category_templates() {
+        validate_template_tokens("%Y/%m/%d", TemplateKind::Unfiled).unwrap();
+        validate_template_tokens("{album}", TemplateKind::Albums).unwrap();
+        validate_template_tokens("{smart-folder}", TemplateKind::SmartFolders).unwrap();
+    }
+
+    #[test]
+    fn validate_template_tokens_accepts_library_prefix_in_every_kind() {
+        validate_template_tokens("{library}/%Y/%m/%d", TemplateKind::Unfiled).unwrap();
+        validate_template_tokens("{library}/{album}/%Y", TemplateKind::Albums).unwrap();
+        validate_template_tokens("{library}/{smart-folder}", TemplateKind::SmartFolders).unwrap();
+        // `{library}` standalone is fine (single-segment template).
+        validate_template_tokens("{library}", TemplateKind::Unfiled).unwrap();
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_misplaced_library_token() {
+        let err = validate_template_tokens("%Y/{library}/%m", TemplateKind::Unfiled).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'{library}' must be the first path segment"),
+            "{err}"
+        );
+        let err =
+            validate_template_tokens("{album}/{library}/%Y", TemplateKind::Albums).unwrap_err();
+        assert!(
+            err.to_string().contains("'{library}' must be the first"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_album_token_outside_album_template() {
+        let err = validate_template_tokens("{album}/%Y", TemplateKind::Unfiled).unwrap_err();
+        assert!(
+            err.to_string().contains("--folder-structure-albums"),
+            "{err}"
+        );
+
+        let err = validate_template_tokens("{album}", TemplateKind::SmartFolders).unwrap_err();
+        assert!(
+            err.to_string().contains("--folder-structure-albums"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_smart_folder_token_outside_smart_folders_template() {
+        let err = validate_template_tokens("{smart-folder}", TemplateKind::Unfiled).unwrap_err();
+        assert!(
+            err.to_string().contains("--folder-structure-smart-folders"),
+            "{err}"
+        );
+        let err = validate_template_tokens("{smart-folder}", TemplateKind::Albums).unwrap_err();
+        assert!(
+            err.to_string().contains("--folder-structure-smart-folders"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_duplicate_tokens() {
+        let err = validate_template_tokens("{library}/{library}/{album}", TemplateKind::Albums)
+            .unwrap_err();
+        assert!(err.to_string().contains("only appear once"), "{err}");
+
+        let err = validate_template_tokens("{album}/{album}", TemplateKind::Albums).unwrap_err();
+        assert!(err.to_string().contains("only appear once"), "{err}");
+    }
+
+    #[test]
+    fn validate_template_tokens_rejects_category_after_extra_segments() {
+        // `{library}/%Y/{album}` puts `{album}` in segment 3, but the rule
+        // is "immediately following `{library}`" — segment 2.
+        let err =
+            validate_template_tokens("{library}/%Y/{album}", TemplateKind::Albums).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must immediately follow '{library}'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_template_tokens_accepts_strftime_after_category_token() {
+        // Date hierarchy *inside* the album folder is fine.
+        validate_template_tokens("{album}/%Y/%m/%d", TemplateKind::Albums).unwrap();
+        validate_template_tokens("{library}/{smart-folder}/%Y", TemplateKind::SmartFolders)
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_template_tokens_handles_python_wrapper() {
+        validate_template_tokens("{:%Y/%m/%d}", TemplateKind::Unfiled).unwrap();
+        validate_template_tokens("{:{album}/%Y}", TemplateKind::Albums).unwrap();
+    }
 
     #[test]
     fn test_expand_tilde_with_home() {
@@ -1803,14 +2366,19 @@ mod tests {
 
     #[test]
     fn test_build_defaults_no_toml() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(cfg.username, "u@example.com");
         assert_eq!(cfg.threads_num, 10);
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("PrimarySync".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["primary".to_string()]
         );
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.retry_delay_secs, 5);
@@ -1832,16 +2400,16 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.threads_num, 4);
         assert_eq!(cfg.folder_structure, "%Y-%m");
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("SharedSync-ABC".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["SharedSync-ABC".to_string()]
         );
     }
 
@@ -1858,30 +2426,31 @@ mod tests {
 
         let mut sync = default_sync();
         sync.threads = Some(8);
-        sync.library = Some("PrimarySync".to_string());
+        sync.libraries = vec!["PrimarySync".to_string()];
 
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.threads_num, 8);
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("PrimarySync".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["PrimarySync".to_string()]
         );
     }
 
     #[test]
     fn test_library_all_value() {
         let mut sync = default_sync();
-        sync.library = Some("all".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.library, LibrarySelection::All);
+        sync.libraries = vec!["all".to_string()];
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.selection.libraries.to_raw(), vec!["all".to_string()]);
     }
 
     #[test]
     fn test_library_all_case_insensitive() {
         let mut sync = default_sync();
-        sync.library = Some("ALL".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.library, LibrarySelection::All);
+        sync.libraries = vec!["ALL".to_string()];
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.selection.libraries.to_raw(), vec!["all".to_string()]);
     }
 
     #[test]
@@ -1893,18 +2462,69 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
-        assert_eq!(cfg.library, LibrarySelection::All);
+        assert_eq!(cfg.selection.libraries.to_raw(), vec!["all".to_string()]);
+    }
+
+    #[test]
+    fn config_build_unfiled_bare_flag_resolves_to_true() {
+        // Bare `--unfiled` (no value) sets `cli.sync.unfiled = Some(true)`
+        // via clap's `default_missing_value = "true"`. The cli.rs unit test
+        // pins the parse but the runtime path through Config::build is
+        // untested — a clap-default flip or a derive_selection regression
+        // that dropped the override would silently land. This test drives
+        // the parser through to the resolved Selection.
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["kei", "sync", "--unfiled"]).unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let mut globals = default_globals();
+        globals.username = Some("u@example.com".to_string());
+        let cfg = Config::build(&globals, &default_password(), sync, None).unwrap();
+        assert!(
+            cfg.selection.unfiled,
+            "bare --unfiled must resolve Selection.unfiled = true"
+        );
+    }
+
+    #[test]
+    fn config_build_unfiled_explicit_false_resolves_to_false() {
+        // Symmetric pin: explicit `--unfiled false` must override the
+        // `true` default. The legacy resolver also defaulted unfiled to
+        // true under most configurations, so a regression that swallowed
+        // the explicit `false` would not show up in any current test.
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["kei", "sync", "--unfiled", "false"]).unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let mut globals = default_globals();
+        globals.username = Some("u@example.com".to_string());
+        let cfg = Config::build(&globals, &default_password(), sync, None).unwrap();
+        assert!(
+            !cfg.selection.unfiled,
+            "explicit `--unfiled false` must resolve Selection.unfiled = false"
+        );
     }
 
     #[test]
     fn test_build_hardcoded_default_when_both_absent() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(cfg.threads_num, 10);
         assert!(matches!(cfg.align_raw, RawTreatmentPolicy::Unchanged));
     }
@@ -1994,11 +2614,46 @@ mod tests {
             let mut sync = default_sync();
             sync.bandwidth_limit = case.cli;
             sync.threads_num = case.toml_cli_threads;
-            let cfg = Config::build(&default_globals(), default_password(), sync, toml)
+            let cfg = Config::build(&default_globals(), &default_password(), sync, toml.as_ref())
                 .unwrap_or_else(|e| panic!("{}: build failed: {e}", case.name));
             assert_eq!(cfg.bandwidth_limit, case.want_limit, "{}", case.name);
             assert_eq!(cfg.threads_num, case.want_threads, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn build_bails_when_album_token_appears_in_smart_folders_template() {
+        let mut sync = default_sync();
+        sync.folder_structure_smart_folders = Some("{album}/%Y".to_string());
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
+            .expect_err("`{album}` in --folder-structure-smart-folders must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--folder-structure-smart-folders")
+                && msg.contains("--folder-structure-albums"),
+            "error should name both flags: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_bails_when_library_token_misplaced() {
+        let mut sync = default_sync();
+        sync.folder_structure_albums = Some("{album}/{library}".to_string());
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
+            .expect_err("`{library}` not as first segment must bail");
+        assert!(
+            err.to_string().contains("'{library}' must be the first"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_accepts_library_album_pair_in_albums_template() {
+        let mut sync = default_sync();
+        sync.folder_structure_albums = Some("{library}/{album}/%Y".to_string());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None)
+            .expect("`{library}/{album}/...` is a valid albums template");
+        assert_eq!(cfg.folder_structure_albums, "{library}/{album}/%Y");
     }
 
     #[test]
@@ -2010,9 +2665,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .expect_err("invalid bandwidth_limit should fail build");
         assert!(
@@ -2034,9 +2689,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.set_exif_datetime);
@@ -2054,9 +2709,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.embed_xmp);
@@ -2073,7 +2728,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.embed_xmp = Some(false);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(
             !cfg.embed_xmp,
             "--embed-xmp=false must override TOML embed_xmp = true"
@@ -2083,8 +2739,13 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[test]
     fn test_embed_xmp_default_false_when_unset() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert!(!cfg.embed_xmp);
         assert!(!cfg.xmp_sidecar);
     }
@@ -2098,7 +2759,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.skip_videos = Some(true);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(cfg.skip_videos);
     }
 
@@ -2111,7 +2773,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.skip_videos = Some(false);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(
             !cfg.skip_videos,
             "CLI --skip-videos false should override TOML true"
@@ -2127,9 +2790,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -2147,9 +2810,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -2167,9 +2830,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -2188,7 +2851,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.username = None; // Simulate no CLI username
-        let cfg = Config::build(&globals, pw, default_sync(), Some(toml)).unwrap();
+        let cfg = Config::build(&globals, &pw, default_sync(), Some(&toml)).unwrap();
         assert_eq!(cfg.username, "toml@example.com");
     }
 
@@ -2201,9 +2864,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.username, "u@example.com");
@@ -2218,9 +2881,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(
@@ -2238,7 +2901,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.albums = vec!["Screenshots".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(
             cfg.albums,
             AlbumSelection::Named(vec!["Screenshots".to_string()])
@@ -2255,9 +2919,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.watch_with_interval, Some(1800));
@@ -2276,9 +2940,9 @@ mod tests {
             let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
             let result = Config::build(
                 &default_globals(),
-                default_password(),
+                &default_password(),
                 default_sync(),
-                Some(toml),
+                Some(&toml),
             );
             assert!(result.is_err(), "interval {interval} should be rejected");
             assert!(
@@ -2297,9 +2961,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -2317,9 +2981,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err(), "TOML delay > 3600 must be rejected");
         let msg = result.unwrap_err().to_string();
@@ -2338,9 +3002,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err(), "TOML max_retries > 100 must be rejected");
         let msg = result.unwrap_err().to_string();
@@ -2360,9 +3024,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .expect("max_retries=100, delay=3600 must be accepted");
         assert_eq!(cfg.max_retries, 100);
@@ -2379,7 +3043,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.username = None;
-        let result = Config::build(&globals, pw, default_sync(), Some(toml));
+        let result = Config::build(&globals, &pw, default_sync(), Some(&toml));
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("username"),
@@ -2396,9 +3060,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -2425,9 +3089,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
         assert!(
@@ -2450,7 +3114,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut pw = default_password();
         pw.password = Some("cli-pw".to_string());
-        let result = Config::build(&default_globals(), pw, default_sync(), Some(toml));
+        let result = Config::build(&default_globals(), &pw, default_sync(), Some(&toml));
         assert!(result.is_err());
     }
 
@@ -2462,7 +3126,7 @@ mod tests {
         // punting the failure to the first auth attempt.
         let mut pw = default_password();
         pw.password_command = Some("echo anything".to_string());
-        let result = Config::build(&default_globals(), pw, default_sync(), None);
+        let result = Config::build(&default_globals(), &pw, default_sync(), None);
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not supported on Windows"), "{err}");
         assert!(err.contains("--password-file"), "{err}");
@@ -2478,9 +3142,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not supported on Windows"), "{err}");
@@ -2492,7 +3156,7 @@ mod tests {
     fn test_build_download_dir_from_cli() {
         let mut sync = default_sync();
         sync.download_dir = Some("/photos/new".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/new"));
     }
 
@@ -2502,7 +3166,7 @@ mod tests {
         // and not asserted here (tested via integration test in tests/cli.rs).
         let mut sync = default_sync();
         sync.directory = Some("/photos/legacy".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/legacy"));
     }
 
@@ -2513,7 +3177,7 @@ mod tests {
         let mut sync = default_sync();
         sync.download_dir = Some("/photos/new".to_string());
         sync.directory = Some("/photos/old".to_string());
-        let result = Config::build(&default_globals(), default_password(), sync, None);
+        let result = Config::build(&default_globals(), &default_password(), sync, None);
         let err = result.unwrap_err().to_string();
         assert!(err.contains("--download-dir"), "{err}");
         assert!(err.contains("--directory"), "{err}");
@@ -2529,7 +3193,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.download_dir = Some("/photos/cli".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/cli"));
     }
 
@@ -2542,7 +3207,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.directory = Some("/photos/cli-legacy".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/cli-legacy"));
     }
 
@@ -2557,9 +3223,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/via-toml"));
@@ -2575,7 +3241,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.cookie_directory = Some(path.to_string_lossy().to_string());
-        let result = Config::build(&globals, pw, default_sync(), None);
+        let result = Config::build(&globals, &pw, default_sync(), None);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("cookie directory"),
@@ -2589,7 +3255,7 @@ mod tests {
         let pw = default_password();
         // Use a path with a null byte which is invalid on all platforms
         globals.cookie_directory = Some("\0invalid/cookies".to_string());
-        let result = Config::build(&globals, pw, default_sync(), None);
+        let result = Config::build(&globals, &pw, default_sync(), None);
         assert!(result.is_err());
     }
 
@@ -2603,9 +3269,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.skip_created_before.is_some());
@@ -2939,9 +3605,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let config = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(config.http_port, 9090);
@@ -2961,9 +3627,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let config = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(config.http_port, 9090);
@@ -2983,15 +3649,20 @@ mod tests {
         let mut sync = default_sync();
         sync.http_port = Some(8080);
         let config =
-            Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(config.http_port, 8080);
     }
 
     #[test]
     fn test_default_http_port() {
         // Without any explicit config, http_port should be 9090.
-        let config =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(config.http_port, 9090);
     }
 
@@ -2999,8 +3670,13 @@ mod tests {
     fn test_default_http_bind_is_all_interfaces() {
         // The historical default. Kept so Docker's `-p 9090:9090` works out
         // of the box without an extra flag.
-        let config =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             config.http_bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
@@ -3016,9 +3692,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let config = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(
@@ -3037,7 +3713,7 @@ mod tests {
         let mut sync = default_sync();
         sync.http_bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let config =
-            Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(
             config.http_bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -3053,9 +3729,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let config = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(
@@ -3073,9 +3749,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .expect_err("invalid IP in [server] bind must error at build time");
         let msg = format!("{err}");
@@ -3169,8 +3845,13 @@ mod tests {
 
     #[test]
     fn test_build_all_defaults_no_toml_exhaustive() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         // Auth
         assert_eq!(cfg.username, "u@example.com");
         assert!(cfg.password.is_none());
@@ -3188,8 +3869,8 @@ mod tests {
         assert_eq!(cfg.retry_delay_secs, 5);
         // Filters
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("PrimarySync".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["primary".to_string()]
         );
         assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
         assert!(!cfg.skip_videos);
@@ -3233,7 +3914,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.domain = Some(Domain::Com);
-        let cfg = Config::build(&globals, pw, default_sync(), Some(toml)).unwrap();
+        let cfg = Config::build(&globals, &pw, default_sync(), Some(&toml)).unwrap();
         assert!(matches!(cfg.domain, Domain::Com));
     }
 
@@ -3246,9 +3927,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(cfg.domain, Domain::Cn));
@@ -3269,7 +3950,7 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.cookie_directory = Some(cli_path.to_string_lossy().to_string());
-        let cfg = Config::build(&globals, pw, default_sync(), Some(toml)).unwrap();
+        let cfg = Config::build(&globals, &pw, default_sync(), Some(&toml)).unwrap();
         assert_eq!(cfg.cookie_directory, cli_path);
     }
 
@@ -3281,9 +3962,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.cookie_directory, toml_path);
@@ -3298,9 +3979,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.cookie_directory, home.join(&unique));
@@ -3316,9 +3997,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         if let Some(home) = dirs::home_dir() {
@@ -3335,7 +4016,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
     }
 
@@ -3348,7 +4030,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.temp_suffix = Some(".cli-tmp".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.temp_suffix, ".cli-tmp");
     }
 
@@ -3361,9 +4044,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.temp_suffix, ".downloading");
@@ -3378,7 +4061,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.max_retries = Some(10);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.max_retries, 10);
     }
 
@@ -3391,7 +4075,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.retry_delay = Some(30);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.retry_delay_secs, 30);
     }
 
@@ -3404,9 +4089,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.retry_delay_secs, 15);
@@ -3421,7 +4106,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.size = Some(VersionSize::Medium);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(cfg.size, VersionSize::Medium));
     }
 
@@ -3434,9 +4120,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(cfg.size, VersionSize::Thumb));
@@ -3451,7 +4137,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.live_photo_size = Some(LivePhotoSize::Medium);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Medium));
     }
 
@@ -3464,9 +4151,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Thumb));
@@ -3476,7 +4163,7 @@ mod tests {
     fn test_build_live_photo_size_defaults_to_adjusted_when_size_adjusted() {
         let mut sync = default_sync();
         sync.size = Some(VersionSize::Adjusted);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Adjusted));
     }
 
@@ -3485,7 +4172,7 @@ mod tests {
         let mut sync = default_sync();
         sync.size = Some(VersionSize::Adjusted);
         sync.live_photo_size = Some(LivePhotoSize::Original);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Original));
     }
 
@@ -3498,7 +4185,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.live_photo_mov_filename_policy = Some(LivePhotoMovFilenamePolicy::Suffix);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
@@ -3514,9 +4202,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(
@@ -3534,7 +4222,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.align_raw = Some(RawTreatmentPolicy::PreferAlternative);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(
             cfg.align_raw,
             RawTreatmentPolicy::PreferAlternative
@@ -3550,7 +4239,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.file_match_policy = Some(FileMatchPolicy::NameSizeDedupWithSuffix);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(matches!(
             cfg.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
@@ -3566,9 +4256,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(matches!(cfg.file_match_policy, FileMatchPolicy::NameId7));
@@ -3602,9 +4292,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.set_exif_datetime);
@@ -3630,7 +4320,7 @@ mod tests {
         sync.force_size = Some(true);
         sync.keep_unicode_in_filenames = Some(true);
         sync.notify_systemd = Some(true);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
@@ -3651,9 +4341,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(!cfg.skip_videos);
@@ -3671,7 +4361,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.watch_with_interval = Some(600);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(600));
     }
 
@@ -3684,7 +4375,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.pid_file = Some(PathBuf::from("/cli/pid"));
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.pid_file, Some(PathBuf::from("/cli/pid")));
     }
 
@@ -3699,9 +4391,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(
@@ -3719,7 +4411,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.notification_script = Some("/cli/notify.sh".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(
             cfg.notification_script,
             Some(PathBuf::from("/cli/notify.sh"))
@@ -3728,8 +4421,13 @@ mod tests {
 
     #[test]
     fn test_build_notification_script_none_by_default() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert!(cfg.notification_script.is_none());
     }
 
@@ -3742,9 +4440,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.report_json, Some(PathBuf::from("/toml/run.json")));
@@ -3759,14 +4457,20 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.report_json = Some(PathBuf::from("/cli/run.json"));
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.report_json, Some(PathBuf::from("/cli/run.json")));
     }
 
     #[test]
     fn test_build_report_json_none_by_default() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert!(cfg.report_json.is_none());
     }
 
@@ -3794,7 +4498,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.recent, Some(100));
     }
 
@@ -3807,9 +4512,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.recent, Some(500));
@@ -3826,7 +4531,8 @@ mod tests {
         let mut sync = default_sync();
         sync.skip_created_before = Some("2023-06-01".to_string());
         sync.skip_created_after = Some("2024-06-01".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         let before = cfg.skip_created_before.unwrap();
         assert_eq!(
             before.date_naive(),
@@ -3848,9 +4554,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         let before = cfg.skip_created_before.unwrap();
@@ -3867,9 +4573,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         );
         assert!(result.is_err());
     }
@@ -3925,9 +4631,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         // default_auth username overrides toml
@@ -3944,8 +4650,8 @@ mod tests {
         assert_eq!(cfg.max_retries, 1);
         assert_eq!(cfg.retry_delay_secs, 2);
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("SharedSync-FULL".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["SharedSync-FULL".to_string()]
         );
         assert_eq!(
             cfg.albums,
@@ -4074,9 +4780,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
@@ -4084,8 +4790,13 @@ mod tests {
 
     #[test]
     fn test_build_albums_no_toml_no_cli() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
     }
 
@@ -4105,7 +4816,7 @@ mod tests {
     fn test_build_album_all_maps_to_all_variant() {
         let mut sync = default_sync();
         sync.albums = vec!["all".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
     }
 
@@ -4114,7 +4825,7 @@ mod tests {
         for raw in ["all", "ALL", "All", "aLL"] {
             let mut sync = default_sync();
             sync.albums = vec![raw.to_string()];
-            let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+            let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
             assert_eq!(
                 cfg.albums,
                 AlbumSelection::All,
@@ -4127,10 +4838,10 @@ mod tests {
     fn test_build_album_all_mixed_with_names_errors() {
         let mut sync = default_sync();
         sync.albums = vec!["all".to_string(), "Vacation".to_string()];
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("'-a all' cannot be combined"),
+            msg.contains("'--album all' cannot be combined with literal album names"),
             "unexpected error: {msg}"
         );
     }
@@ -4144,9 +4855,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
@@ -4157,7 +4868,7 @@ mod tests {
         // No -a passed, but {album} in folder_structure -> implicit All.
         let mut sync = default_sync();
         sync.folder_structure = Some("{album}/%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
     }
 
@@ -4166,7 +4877,7 @@ mod tests {
         // No -a, no {album} -> LibraryOnly (today's default).
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
     }
 
@@ -4174,11 +4885,119 @@ mod tests {
     fn test_build_album_named_preserved() {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string(), "Trip".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        // Names are normalised through the v0.13 selector grammar, which uses
+        // a BTreeSet for deterministic ordering — alphabetical, regardless of
+        // CLI input order.
         assert_eq!(
             cfg.albums,
-            AlbumSelection::Named(vec!["Vacation".to_string(), "Trip".to_string()])
+            AlbumSelection::Named(vec!["Trip".to_string(), "Vacation".to_string()])
         );
+    }
+
+    #[test]
+    fn test_build_album_inline_exclude_only_implies_all() {
+        // `--album '!Family'` with no positive value resolves to "all minus
+        // Family" via the new grammar; no `--album all` needed.
+        let mut sync = default_sync();
+        sync.albums = vec!["!Family".to_string()];
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert_eq!(cfg.exclude_albums, vec!["Family".to_string()]);
+    }
+
+    #[test]
+    fn test_build_album_all_with_inline_exclude() {
+        let mut sync = default_sync();
+        sync.albums = vec!["all".to_string(), "!Family".to_string()];
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert_eq!(cfg.exclude_albums, vec!["Family".to_string()]);
+    }
+
+    #[test]
+    fn test_build_album_named_with_inline_exclude() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string(), "!Family".to_string()];
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(
+            cfg.albums,
+            AlbumSelection::Named(vec!["Vacation".to_string()])
+        );
+        assert_eq!(cfg.exclude_albums, vec!["Family".to_string()]);
+    }
+
+    #[test]
+    fn test_build_album_none_sentinel_maps_to_library_only() {
+        let mut sync = default_sync();
+        sync.albums = vec!["none".to_string()];
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
+    }
+
+    #[test]
+    fn test_build_album_contradiction_bails() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string(), "!Vacation".to_string()];
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot both include and exclude"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_album_none_mixed_with_names_bails() {
+        let mut sync = default_sync();
+        sync.albums = vec!["none".to_string(), "Vacation".to_string()];
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'--album none' cannot be combined"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_exclude_album_cli_merges_into_excludes() {
+        // Deprecated --exclude-album still works: each entry feeds into the
+        // selector as `!name` so the legacy and new pipelines both observe it.
+        let mut sync = default_sync();
+        sync.albums = vec!["all".to_string()];
+        sync.exclude_albums = vec!["Family".to_string(), "Hidden".to_string()];
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert_eq!(cfg.exclude_albums, vec!["Family", "Hidden"]);
+    }
+
+    #[test]
+    fn test_build_toml_album_singular_lifted_into_array() {
+        let toml: TomlConfig = toml::from_str("[filters]\nalbum = \"Vacation\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.albums,
+            AlbumSelection::Named(vec!["Vacation".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_build_toml_albums_array_takes_precedence_over_singular() {
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nalbum = \"Singular\"\nalbums = [\"Array\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::Named(vec!["Array".to_string()]));
     }
 
     // ── folder_structure {album} placement validation ──────────────
@@ -4187,7 +5006,7 @@ mod tests {
     fn test_build_album_token_rejected_mid_path() {
         let mut sync = default_sync();
         sync.folder_structure = Some("Photos/{album}/%Y".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("'{album}' must be the first path segment"),
@@ -4199,7 +5018,7 @@ mod tests {
     fn test_build_album_token_rejected_after_date() {
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/{album}/%m".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("'{album}' must be the first path segment"),
@@ -4211,7 +5030,7 @@ mod tests {
     fn test_build_album_token_rejected_as_trailing() {
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/{album}".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(err.to_string().contains("must be the first path segment"));
     }
 
@@ -4219,7 +5038,7 @@ mod tests {
     fn test_build_album_token_rejected_duplicate() {
         let mut sync = default_sync();
         sync.folder_structure = Some("{album}/%Y/{album}".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string().contains("may only appear once"),
             "unexpected error: {err}"
@@ -4227,30 +5046,130 @@ mod tests {
     }
 
     #[test]
-    fn test_build_album_token_accepted_at_root() {
+    fn test_auto_migrate_no_token_passes_through() {
+        let m =
+            auto_migrate_legacy_album_token("%Y/%m/%d".to_string(), "{album}".to_string(), false);
+        assert_eq!(m.folder_structure, "%Y/%m/%d");
+        assert_eq!(m.folder_structure_albums, "{album}");
+        assert!(m.suggestion.is_none());
+    }
+
+    #[test]
+    fn test_auto_migrate_lifts_full_template_when_albums_unset() {
+        let m = auto_migrate_legacy_album_token(
+            "{album}/%Y/%m".to_string(),
+            "{album}".to_string(),
+            false,
+        );
+        assert_eq!(m.folder_structure, "%Y/%m");
+        assert_eq!(m.folder_structure_albums, "{album}/%Y/%m");
+        assert!(m.suggestion.is_some());
+    }
+
+    #[test]
+    fn test_auto_migrate_preserves_user_albums_template() {
+        let m = auto_migrate_legacy_album_token(
+            "{album}/%Y/%m".to_string(),
+            "{album}/custom".to_string(),
+            true,
+        );
+        assert_eq!(m.folder_structure, "%Y/%m");
+        assert_eq!(m.folder_structure_albums, "{album}/custom");
+        assert!(m.suggestion.is_some());
+    }
+
+    #[test]
+    fn test_auto_migrate_bare_album_token_uses_none_base() {
+        let m = auto_migrate_legacy_album_token(
+            "{album}".to_string(),
+            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+            false,
+        );
+        assert_eq!(
+            m.folder_structure,
+            crate::download::paths::NO_DATE_STRUCTURE
+        );
+        assert_eq!(m.folder_structure_albums, "{album}");
+    }
+
+    #[test]
+    fn test_auto_migrate_unwraps_python_wrapper() {
+        let m = auto_migrate_legacy_album_token(
+            "{:{album}/%Y/%m}".to_string(),
+            "{album}".to_string(),
+            false,
+        );
+        assert_eq!(m.folder_structure, "%Y/%m");
+        assert_eq!(m.folder_structure_albums, "{album}/%Y/%m");
+    }
+
+    #[test]
+    fn test_build_album_token_at_root_migrates() {
+        // Legacy `{album}/%Y/%m` is auto-migrated: the album-pass template
+        // gets the original (so album passes still produce `Vacation/2024/06`)
+        // and the base template loses `{album}/` so the unfiled pass keeps
+        // its date hierarchy.
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{album}/%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "{album}/%Y/%m");
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "%Y/%m");
+        assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
     }
 
     #[test]
-    fn test_build_album_token_accepted_alone() {
+    fn test_build_album_token_alone_migrates_to_none() {
+        // Bare `{album}` had no date hierarchy on either pass; the
+        // migration preserves that by setting the unfiled template to
+        // "none" rather than the new default "%Y/%m/%d".
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{album}".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "{album}");
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(
+            cfg.folder_structure,
+            crate::download::paths::NO_DATE_STRUCTURE
+        );
+        assert_eq!(cfg.folder_structure_albums, "{album}");
     }
 
     #[test]
-    fn test_build_album_token_accepted_within_python_wrapper() {
+    fn test_build_album_token_within_python_wrapper_migrates() {
+        // The legacy Python `{:...}` wrapper is unwrapped by the migration
+        // so the resulting templates render directly through chrono's
+        // strftime (no nested wrapper to confuse the parser).
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{:{album}/%Y/%m}".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "{:{album}/%Y/%m}");
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "%Y/%m");
+        assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
+    }
+
+    #[test]
+    fn test_build_album_token_preserves_user_set_albums_template() {
+        // When the user explicitly set `--folder-structure-albums`, the
+        // legacy template is stripped from the base but the supplied album
+        // template is preserved verbatim - users get the migration warning
+        // but their explicit value wins.
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string()];
+        sync.folder_structure = Some("{album}/%Y".to_string());
+        sync.folder_structure_albums = Some("{album}/explicit".to_string());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "%Y");
+        assert_eq!(cfg.folder_structure_albums, "{album}/explicit");
+    }
+
+    #[test]
+    fn test_build_no_album_token_no_migration() {
+        // Without `{album}` in the template there is nothing to migrate;
+        // both fields keep their resolved values.
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%m".to_string());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "%Y/%m");
+        assert_eq!(cfg.folder_structure_albums, "{album}");
     }
 
     #[test]
@@ -4262,7 +5181,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.directory = Some("/cli/photos".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/cli/photos"));
     }
 
@@ -4272,7 +5192,7 @@ mod tests {
     fn test_build_passthrough_flags() {
         let mut sync = default_sync();
         sync.dry_run = true;
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.dry_run);
     }
 
@@ -4280,21 +5200,21 @@ mod tests {
     fn test_folder_structure_valid_tokens_accepted() {
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d".to_string());
-        assert!(Config::build(&default_globals(), default_password(), sync, None).is_ok());
+        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
     }
 
     #[test]
     fn test_folder_structure_all_tokens_accepted() {
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d/%H/%M/%S".to_string());
-        assert!(Config::build(&default_globals(), default_password(), sync, None).is_ok());
+        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
     }
 
     #[test]
     fn test_folder_structure_none_bypasses_validation() {
         let mut sync = default_sync();
         sync.folder_structure = Some("none".to_string());
-        assert!(Config::build(&default_globals(), default_password(), sync, None).is_ok());
+        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
     }
 
     #[test]
@@ -4302,7 +5222,7 @@ mod tests {
         // Full strftime support: %B (month name), %X (locale time), etc. are valid
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%B/%d".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure, "%Y/%B/%d");
     }
 
@@ -4310,15 +5230,20 @@ mod tests {
     fn test_folder_structure_wrapped_format_accepted() {
         let mut sync = default_sync();
         sync.folder_structure = Some("{:%Y/%m/%d}".to_string());
-        assert!(Config::build(&default_globals(), default_password(), sync, None).is_ok());
+        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
     }
 
     // ── to_toml() tests ─────────────────────────────────────────────
 
     #[test]
     fn test_to_toml_roundtrip_preserves_username() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
             toml.auth.as_ref().unwrap().username.as_deref(),
@@ -4331,15 +5256,20 @@ mod tests {
         let globals = default_globals();
         let mut pw = default_password();
         pw.password = Some("secret123".to_string());
-        let cfg = Config::build(&globals, pw, default_sync(), None).unwrap();
+        let cfg = Config::build(&globals, &pw, default_sync(), None).unwrap();
         let toml = cfg.to_toml();
         assert!(toml.auth.as_ref().unwrap().password.is_none());
     }
 
     #[test]
     fn test_to_toml_omits_default_values() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         // Default domain (com) should be omitted
         assert!(toml.auth.as_ref().unwrap().domain.is_none());
@@ -4356,7 +5286,7 @@ mod tests {
         globals.domain = Some(crate::types::Domain::Cn);
         let mut sync = default_sync();
         sync.size = Some(crate::types::VersionSize::Medium);
-        let cfg = Config::build(&globals, pw, sync, None).unwrap();
+        let cfg = Config::build(&globals, &pw, sync, None).unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
             toml.auth.as_ref().unwrap().domain,
@@ -4370,8 +5300,13 @@ mod tests {
 
     #[test]
     fn test_to_toml_serializes_to_valid_toml() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml_cfg = cfg.to_toml();
         let serialized = toml::to_string_pretty(&toml_cfg).unwrap();
         // Should be parseable back
@@ -4384,7 +5319,7 @@ mod tests {
         sync.recent = Some(crate::cli::RecentLimit::Count(50));
         sync.skip_created_before = Some("2025-01-01".to_string());
         sync.skip_created_after = Some("2025-12-31".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let filters = toml.filters.as_ref().unwrap();
         assert!(filters.recent.is_none());
@@ -4396,7 +5331,7 @@ mod tests {
     fn test_to_toml_roundtrip_exclude_albums() {
         let mut sync = default_sync();
         sync.exclude_albums = vec!["Hidden".to_string(), "Trash".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let filters = toml.filters.as_ref().unwrap();
         assert_eq!(
@@ -4409,7 +5344,7 @@ mod tests {
     fn test_to_toml_roundtrip_filename_exclude() {
         let mut sync = default_sync();
         sync.filename_exclude = vec!["*.AAE".to_string(), "Screenshot*".to_string()];
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let filters = toml.filters.as_ref().unwrap();
         assert_eq!(
@@ -4429,7 +5364,7 @@ mod tests {
     fn test_to_toml_roundtrip_live_photo_mode() {
         let mut sync = default_sync();
         sync.live_photo_mode = Some(crate::types::LivePhotoMode::ImageOnly);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
             toml.photos.as_ref().unwrap().live_photo_mode,
@@ -4446,16 +5381,26 @@ mod tests {
 
     #[test]
     fn test_to_toml_empty_exclude_albums_omitted() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         assert!(toml.filters.as_ref().unwrap().exclude_albums.is_none());
     }
 
     #[test]
     fn test_to_toml_default_live_photo_mode_omitted() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         assert!(toml.photos.as_ref().unwrap().live_photo_mode.is_none());
     }
@@ -4464,7 +5409,7 @@ mod tests {
     fn test_to_toml_roundtrip_bandwidth_limit() {
         let mut sync = default_sync();
         sync.bandwidth_limit = Some(5_000_000);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let serialized = cfg.to_toml();
         assert_eq!(
             serialized
@@ -4478,9 +5423,9 @@ mod tests {
 
         let reparsed = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(serialized),
+            Some(&serialized),
         )
         .unwrap();
         assert_eq!(reparsed.bandwidth_limit, Some(5_000_000));
@@ -4488,8 +5433,13 @@ mod tests {
 
     #[test]
     fn test_to_toml_bandwidth_limit_none_omitted() {
-        let cfg =
-            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         assert!(toml.download.as_ref().unwrap().bandwidth_limit.is_none());
     }
@@ -4508,9 +5458,9 @@ mod tests {
         let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Skip);
@@ -4528,9 +5478,9 @@ mod tests {
         let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Both);
@@ -4551,9 +5501,9 @@ mod tests {
         let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::ImageOnly);
@@ -4684,7 +5634,7 @@ mod tests {
         if let Some(d) = directory {
             sync.directory = Some(d.to_string());
         }
-        Config::build(&globals, pw_args, sync, None).unwrap()
+        Config::build(&globals, &pw_args, sync, None).unwrap()
     }
 
     #[test]
@@ -4746,7 +5696,7 @@ mod tests {
         globals.domain = Some(crate::types::Domain::Cn);
         let mut sync = default_sync();
         sync.directory = Some("/photos".to_string());
-        let config = Config::build(&globals, pw, sync, None).unwrap();
+        let config = Config::build(&globals, &pw, sync, None).unwrap();
 
         persist_first_run_config(&config_path, &config, Some("/data")).unwrap();
 
@@ -4782,7 +5732,8 @@ mod tests {
         sync.live_photo_mode = Some(LivePhotoMode::ImageOnly);
         let toml_str = "[photos]\nlive_photo_mode = \"skip\"\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::ImageOnly);
     }
 
@@ -4792,9 +5743,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
@@ -4806,9 +5757,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
@@ -4819,7 +5770,7 @@ mod tests {
     fn test_filename_exclude_invalid_glob_rejected() {
         let mut sync = default_sync();
         sync.filename_exclude = vec!["[invalid".to_string()];
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(err
             .to_string()
             .contains("invalid --filename-exclude pattern"));
@@ -4831,12 +5782,297 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.exclude_albums, vec!["Hidden", "Trash"]);
+    }
+
+    fn assert_sf_named(
+        sel: &crate::selection::SmartFolderSelector,
+        want_in: &[&str],
+        want_ex: &[&str],
+    ) {
+        let crate::selection::SmartFolderSelector::Named { included, excluded } = sel else {
+            panic!("expected Named, got {sel:?}");
+        };
+        for n in want_in {
+            assert!(included.contains(*n), "missing include {n}");
+        }
+        for n in want_ex {
+            assert!(excluded.contains(*n), "missing exclude {n}");
+        }
+    }
+
+    fn assert_sf_all(
+        sel: &crate::selection::SmartFolderSelector,
+        sensitive: bool,
+        want_ex: &[&str],
+    ) {
+        let crate::selection::SmartFolderSelector::All {
+            include_sensitive,
+            excluded,
+        } = sel
+        else {
+            panic!("expected All, got {sel:?}");
+        };
+        assert_eq!(*include_sensitive, sensitive, "include_sensitive mismatch");
+        for n in want_ex {
+            assert!(excluded.contains(*n), "missing exclude {n}");
+        }
+    }
+
+    fn build_with_smart_folders(cli: Vec<&str>, toml_str: Option<&str>) -> Config {
+        let mut sync = default_sync();
+        sync.smart_folders = cli.iter().map(|s| (*s).to_string()).collect();
+        let toml = toml_str.map(|s| toml::from_str::<TomlConfig>(s).unwrap());
+        Config::build(&default_globals(), &default_password(), sync, toml.as_ref()).unwrap()
+    }
+
+    #[test]
+    fn test_smart_folders_default_is_none() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.selection.smart_folders,
+            crate::selection::SmartFolderSelector::None
+        );
+    }
+
+    #[test]
+    fn test_smart_folders_from_cli() {
+        let cfg = build_with_smart_folders(vec!["Favorites", "!Hidden"], None);
+        assert_sf_named(&cfg.selection.smart_folders, &["Favorites"], &["Hidden"]);
+    }
+
+    #[test]
+    fn test_smart_folders_all_sentinel() {
+        let cfg = build_with_smart_folders(vec!["all"], None);
+        assert_sf_all(&cfg.selection.smart_folders, false, &[]);
+    }
+
+    #[test]
+    fn test_smart_folders_from_toml() {
+        let cfg = build_with_smart_folders(
+            vec![],
+            Some("[filters]\nsmart_folders = [\"all-with-sensitive\", \"!Recently Deleted\"]\n"),
+        );
+        assert_sf_all(&cfg.selection.smart_folders, true, &["Recently Deleted"]);
+    }
+
+    #[test]
+    fn test_smart_folders_cli_overrides_toml() {
+        let cfg = build_with_smart_folders(
+            vec!["Favorites"],
+            Some("[filters]\nsmart_folders = [\"Videos\"]\n"),
+        );
+        let crate::selection::SmartFolderSelector::Named { included, .. } =
+            &cfg.selection.smart_folders
+        else {
+            panic!("expected Named, got {:?}", cfg.selection.smart_folders);
+        };
+        assert!(included.contains("Favorites"));
+        assert!(!included.contains("Videos"));
+    }
+
+    #[test]
+    fn test_smart_folders_invalid_combination_bails() {
+        let mut sync = default_sync();
+        sync.smart_folders = vec!["all".to_string(), "all-with-sensitive".to_string()];
+        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    fn build_with_unfiled(cli: Option<bool>, toml_str: Option<&str>) -> Config {
+        let mut sync = default_sync();
+        sync.unfiled = cli;
+        let toml = toml_str.map(|s| toml::from_str::<TomlConfig>(s).unwrap());
+        Config::build(&default_globals(), &default_password(), sync, toml.as_ref()).unwrap()
+    }
+
+    #[test]
+    fn test_unfiled_default_no_flags_is_true() {
+        let cfg = build_with_unfiled(None, None);
+        assert!(
+            cfg.selection.unfiled,
+            "default LibraryOnly should preserve legacy unfiled = true"
+        );
+    }
+
+    #[test]
+    fn test_unfiled_default_with_named_albums_is_false() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string()];
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert!(
+            !cfg.selection.unfiled,
+            "named-album default should preserve legacy unfiled = false"
+        );
+    }
+
+    #[test]
+    fn test_unfiled_cli_true_explicit() {
+        let cfg = build_with_unfiled(Some(true), None);
+        assert!(cfg.selection.unfiled);
+    }
+
+    #[test]
+    fn test_unfiled_cli_false_explicit() {
+        let cfg = build_with_unfiled(Some(false), None);
+        assert!(!cfg.selection.unfiled);
+    }
+
+    #[test]
+    fn test_unfiled_cli_overrides_named_album_legacy() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string()];
+        sync.unfiled = Some(true);
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert!(
+            cfg.selection.unfiled,
+            "explicit --unfiled true should win over the named-album legacy default of false"
+        );
+    }
+
+    #[test]
+    fn test_unfiled_from_toml() {
+        let cfg = build_with_unfiled(None, Some("[filters]\nunfiled = false\n"));
+        assert!(!cfg.selection.unfiled);
+    }
+
+    #[test]
+    fn test_unfiled_cli_overrides_toml() {
+        let cfg = build_with_unfiled(Some(true), Some("[filters]\nunfiled = false\n"));
+        assert!(cfg.selection.unfiled);
+    }
+
+    #[test]
+    fn test_folder_structure_albums_default_is_album_token() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.folder_structure_albums, DEFAULT_FOLDER_STRUCTURE_ALBUMS);
+    }
+
+    #[test]
+    fn test_folder_structure_smart_folders_default_is_smart_folder_token() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.folder_structure_smart_folders,
+            DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
+        );
+    }
+
+    #[test]
+    fn test_folder_structure_albums_from_cli() {
+        let mut sync = default_sync();
+        sync.folder_structure_albums = Some("{album}/%Y/%m".to_string());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
+    }
+
+    #[test]
+    fn test_folder_structure_smart_folders_from_cli() {
+        let mut sync = default_sync();
+        sync.folder_structure_smart_folders = Some("{smart-folder}/%Y".to_string());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure_smart_folders, "{smart-folder}/%Y");
+    }
+
+    #[test]
+    fn test_folder_structure_albums_from_toml() {
+        let toml_str = "[download]\nfolder_structure_albums = \"{album}/%Y\"\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.folder_structure_albums, "{album}/%Y");
+    }
+
+    #[test]
+    fn test_folder_structure_smart_folders_from_toml() {
+        let toml_str = "[download]\nfolder_structure_smart_folders = \"{smart-folder}/%Y\"\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.folder_structure_smart_folders, "{smart-folder}/%Y");
+    }
+
+    #[test]
+    fn test_folder_structure_albums_cli_overrides_toml() {
+        let mut sync = default_sync();
+        sync.folder_structure_albums = Some("{album}/cli".to_string());
+        let toml_str = "[download]\nfolder_structure_albums = \"{album}/toml\"\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert_eq!(cfg.folder_structure_albums, "{album}/cli");
+    }
+
+    #[test]
+    fn test_folder_structure_per_category_round_trips_default() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        let toml = cfg.to_toml();
+        // Default value is suppressed on round-trip so config dumps stay clean.
+        assert!(toml
+            .download
+            .as_ref()
+            .unwrap()
+            .folder_structure_albums
+            .is_none());
+        assert!(toml
+            .download
+            .as_ref()
+            .unwrap()
+            .folder_structure_smart_folders
+            .is_none());
+    }
+
+    #[test]
+    fn test_folder_structure_per_category_round_trips_custom() {
+        let mut sync = default_sync();
+        sync.folder_structure_albums = Some("{album}/%Y".to_string());
+        sync.folder_structure_smart_folders = Some("{smart-folder}/%Y".to_string());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let dl = toml.download.unwrap();
+        assert_eq!(dl.folder_structure_albums.as_deref(), Some("{album}/%Y"));
+        assert_eq!(
+            dl.folder_structure_smart_folders.as_deref(),
+            Some("{smart-folder}/%Y")
+        );
     }
 
     #[test]
@@ -4845,7 +6081,7 @@ mod tests {
         let mut sync = default_sync();
         sync.skip_created_before = Some("2025-06-01".to_string());
         sync.skip_created_after = Some("2025-01-01".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None);
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None);
         assert!(
             cfg.is_ok(),
             "Contradictory date filters should warn, not error"
@@ -4860,7 +6096,8 @@ mod tests {
         sync.exclude_albums = vec!["CLI_Album".to_string()];
         let toml_str = "[filters]\nexclude_albums = [\"TOML_Album\"]\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.exclude_albums, vec!["CLI_Album"]);
     }
 
@@ -4870,9 +6107,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.exclude_albums, vec!["TOML_Album"]);
@@ -4884,7 +6121,8 @@ mod tests {
         sync.filename_exclude = vec!["*.AAE".to_string()];
         let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
         assert_eq!(patterns, vec!["*.AAE"]);
     }
@@ -4895,9 +6133,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
@@ -4931,55 +6169,106 @@ mod tests {
         assert!(validate_directory(Path::new("/data/sync")).is_ok());
     }
 
-    // ── resolve_library_selection ──────────────────────────────────
+    // ── resolve_library_selector ───────────────────────────────────
 
     #[test]
-    fn resolve_library_defaults_to_primary_sync() {
-        let result = resolve_library_selection(None, None);
-        assert_eq!(result, LibrarySelection::Single("PrimarySync".to_string()));
+    fn resolve_library_defaults_to_primary_only() {
+        let sel = resolve_library_selector(vec![], None).unwrap();
+        assert_eq!(sel, crate::selection::LibrarySelector::default());
+        assert_eq!(sel.to_raw(), vec!["primary".to_string()]);
+    }
+
+    #[test]
+    fn resolve_library_primary_sentinel_round_trips() {
+        let sel = resolve_library_selector(vec!["primary".to_string()], None).unwrap();
+        assert!(sel.primary && !sel.shared_all && sel.named.is_empty());
     }
 
     #[test]
     fn resolve_library_cli_overrides_toml() {
         let toml_filters = TomlFilters {
-            library: Some("SharedSync-FROM-TOML".to_string()),
+            libraries: Some(vec!["SharedSync-FROM-TOML".to_string()]),
             ..Default::default()
         };
-        let result =
-            resolve_library_selection(Some("SharedSync-FROM-CLI".to_string()), Some(&toml_filters));
-        assert_eq!(
-            result,
-            LibrarySelection::Single("SharedSync-FROM-CLI".to_string())
-        );
+        let sel =
+            resolve_library_selector(vec!["SharedSync-FROM-CLI".to_string()], Some(&toml_filters))
+                .unwrap();
+        assert_eq!(sel.to_raw(), vec!["SharedSync-FROM-CLI".to_string()]);
     }
 
     #[test]
-    fn resolve_library_falls_back_to_toml() {
+    fn resolve_library_falls_back_to_toml_array() {
         let toml_filters = TomlFilters {
-            library: Some("SharedSync-ABCD".to_string()),
+            libraries: Some(vec!["SharedSync-ABCD".to_string()]),
             ..Default::default()
         };
-        let result = resolve_library_selection(None, Some(&toml_filters));
-        assert_eq!(
-            result,
-            LibrarySelection::Single("SharedSync-ABCD".to_string())
-        );
+        let sel = resolve_library_selector(vec![], Some(&toml_filters)).unwrap();
+        assert_eq!(sel.to_raw(), vec!["SharedSync-ABCD".to_string()]);
+    }
+
+    #[test]
+    fn resolve_library_falls_back_to_deprecated_toml_singular() {
+        let toml_filters = TomlFilters {
+            library: Some("SharedSync-LEGACY".to_string()),
+            ..Default::default()
+        };
+        let sel = resolve_library_selector(vec![], Some(&toml_filters)).unwrap();
+        assert_eq!(sel.to_raw(), vec!["SharedSync-LEGACY".to_string()]);
+    }
+
+    #[test]
+    fn resolve_library_toml_array_takes_precedence_over_singular() {
+        let toml_filters = TomlFilters {
+            library: Some("SharedSync-OLD".to_string()),
+            libraries: Some(vec!["SharedSync-NEW".to_string()]),
+            ..Default::default()
+        };
+        let sel = resolve_library_selector(vec![], Some(&toml_filters)).unwrap();
+        assert_eq!(sel.to_raw(), vec!["SharedSync-NEW".to_string()]);
     }
 
     #[test]
     fn resolve_library_all_case_insensitive() {
-        assert_eq!(
-            resolve_library_selection(Some("ALL".to_string()), None),
-            LibrarySelection::All
-        );
-        assert_eq!(
-            resolve_library_selection(Some("All".to_string()), None),
-            LibrarySelection::All
-        );
-        assert_eq!(
-            resolve_library_selection(Some("all".to_string()), None),
-            LibrarySelection::All
-        );
+        for sentinel in ["ALL", "All", "all"] {
+            let sel = resolve_library_selector(vec![sentinel.to_string()], None).unwrap();
+            assert_eq!(
+                sel.to_raw(),
+                vec!["all".to_string()],
+                "sentinel: {sentinel}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_library_shared_alone_keeps_shared_only() {
+        let sel = resolve_library_selector(vec!["shared".to_string()], None).unwrap();
+        assert!(!sel.primary, "primary must stay off for `shared` alone");
+        assert!(sel.shared_all);
+        assert!(sel.named.is_empty());
+    }
+
+    #[test]
+    fn resolve_library_multiple_named_keeps_both() {
+        let sel = resolve_library_selector(
+            vec!["SharedSync-AAAA".to_string(), "SharedSync-BBBB".to_string()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(sel.named.len(), 2);
+        assert!(!sel.primary);
+    }
+
+    #[test]
+    fn resolve_library_exclusion_keeps_exclusion() {
+        let sel = resolve_library_selector(vec!["!SharedSync-AAAA".to_string()], None).unwrap();
+        assert!(sel.primary, "bare exclusion must lift category default");
+        assert_eq!(sel.excluded.len(), 1);
+    }
+
+    #[test]
+    fn resolve_library_named_zone_passes_through() {
+        let sel = resolve_library_selector(vec!["SharedSync-ABCD1234".to_string()], None).unwrap();
+        assert_eq!(sel.to_raw(), vec!["SharedSync-ABCD1234".to_string()]);
     }
 
     // ── --notify-systemd auto-detect via NOTIFY_SOCKET ────────────────
@@ -5039,7 +6328,7 @@ mod tests {
         // 4..=6 bucket from the smart table (10s).
         let mut sync = default_sync();
         sync.max_retries = Some(5);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.retry_delay_secs, 10);
     }
 
@@ -5047,7 +6336,7 @@ mod tests {
     fn test_build_retry_delay_smart_default_patient_bucket() {
         let mut sync = default_sync();
         sync.max_retries = Some(10);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.retry_delay_secs, 30);
     }
 
@@ -5055,7 +6344,7 @@ mod tests {
     fn test_build_retry_delay_smart_default_fail_fast_bucket() {
         let mut sync = default_sync();
         sync.max_retries = Some(1);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.retry_delay_secs, 2);
     }
 
@@ -5067,7 +6356,7 @@ mod tests {
         let mut sync = default_sync();
         sync.max_retries = Some(3);
         sync.retry_delay = Some(42);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.retry_delay_secs, 42);
     }
 
@@ -5080,9 +6369,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.retry_delay_secs, 77);
@@ -5094,7 +6383,7 @@ mod tests {
         // `delay = 5` back out because it's redundant (and deprecated).
         let mut sync = default_sync();
         sync.max_retries = Some(3);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
         assert_eq!(retry.max_retries, Some(3));
@@ -5109,7 +6398,7 @@ mod tests {
         let mut sync = default_sync();
         sync.max_retries = Some(3);
         sync.retry_delay = Some(20);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
         assert_eq!(retry.delay, Some(20));
@@ -5121,7 +6410,7 @@ mod tests {
     fn test_build_threads_cli_canonical() {
         let mut sync = default_sync();
         sync.threads = Some(7);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.threads_num, 7);
     }
 
@@ -5129,7 +6418,7 @@ mod tests {
     fn test_build_legacy_threads_num_still_works() {
         let mut sync = default_sync();
         sync.threads_num = Some(12);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.threads_num, 12);
     }
 
@@ -5138,7 +6427,7 @@ mod tests {
         let mut sync = default_sync();
         sync.threads = Some(4);
         sync.threads_num = Some(8);
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--threads"), "{err}");
@@ -5157,9 +6446,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap_err()
         .to_string();
@@ -5177,7 +6466,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.threads = Some(20);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.threads_num, 20);
     }
 
@@ -5192,7 +6482,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.threads_num = Some(20);
-        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.threads_num, 20);
     }
 
@@ -5205,9 +6496,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.threads_num, 16);
@@ -5219,7 +6510,7 @@ mod tests {
     fn test_build_recent_count_populates_recent_field() {
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.recent, Some(100));
         assert!(
             cfg.skip_created_before.is_none(),
@@ -5231,7 +6522,7 @@ mod tests {
     fn test_build_recent_days_populates_skip_created_before() {
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Days(30));
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(
             cfg.recent.is_none(),
             "Days form must not populate recent (count-only field)"
@@ -5257,7 +6548,7 @@ mod tests {
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Days(30));
         sync.skip_created_before = Some("2024-01-01".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--recent 30d"), "{err}");
@@ -5272,7 +6563,7 @@ mod tests {
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Count(100));
         sync.skip_created_before = Some("2024-01-01".to_string());
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.recent, Some(100));
         assert!(cfg.skip_created_before.is_some());
     }
@@ -5286,9 +6577,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert!(cfg.recent.is_none());
@@ -5304,9 +6595,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap();
         assert_eq!(cfg.recent, Some(250));
@@ -5322,7 +6613,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.recent = Some(crate::cli::RecentLimit::Days(7));
-        let err = Config::build(&default_globals(), default_password(), sync, Some(toml))
+        let err = Config::build(&default_globals(), &default_password(), sync, Some(&toml))
             .unwrap_err()
             .to_string();
         assert!(err.contains("--recent 7d"), "{err}");
@@ -5338,7 +6629,7 @@ mod tests {
         sync.skip_videos = Some(true);
         sync.skip_photos = Some(true);
         sync.live_photo_mode = Some(LivePhotoMode::Skip);
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -5363,7 +6654,7 @@ mod tests {
         sync.skip_videos = Some(true);
         sync.skip_photos = Some(true);
         sync.live_photo_mode = Some(LivePhotoMode::ImageOnly);
-        let err = Config::build(&default_globals(), default_password(), sync, None)
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("would download nothing"), "{err}");
@@ -5379,7 +6670,7 @@ mod tests {
         sync.skip_videos = Some(true);
         sync.skip_photos = Some(true);
         sync.live_photo_mode = Some(LivePhotoMode::VideoOnly);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.skip_videos);
         assert!(cfg.skip_photos);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
@@ -5394,7 +6685,7 @@ mod tests {
         sync.skip_videos = Some(true);
         sync.skip_photos = Some(true);
         sync.live_photo_mode = Some(LivePhotoMode::Both);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
     }
 
@@ -5402,7 +6693,7 @@ mod tests {
     fn test_build_skip_videos_alone_ok() {
         let mut sync = default_sync();
         sync.skip_videos = Some(true);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.skip_videos);
         assert!(!cfg.skip_photos);
     }
@@ -5411,7 +6702,7 @@ mod tests {
     fn test_build_skip_photos_alone_ok() {
         let mut sync = default_sync();
         sync.skip_photos = Some(true);
-        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.skip_photos);
         assert!(!cfg.skip_videos);
     }
@@ -5429,9 +6720,9 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
             &default_globals(),
-            default_password(),
+            &default_password(),
             default_sync(),
-            Some(toml),
+            Some(&toml),
         )
         .unwrap_err()
         .to_string();

@@ -296,6 +296,12 @@ fn format_f64(v: f64) -> String {
 #[derive(Debug, Clone)]
 pub struct AssetRecord {
     // 8-byte aligned heap types
+    /// CloudKit zone name (e.g. "PrimarySync", "SharedSync-A1B2C3D4-...")
+    /// scoping this asset. Part of the v8+ primary key so the same asset ID
+    /// across multiple shared zones cannot collide. `Arc<str>` so the
+    /// per-pass `DownloadConfig.library` can be refcount-cloned into every
+    /// AssetRecord instead of allocating a fresh `Box<str>` per asset.
+    pub library: Arc<str>,
     /// iCloud asset ID (recordName).
     pub id: Box<str>,
     /// SHA256 checksum of the file.
@@ -346,7 +352,12 @@ pub struct AssetRecord {
 
 impl AssetRecord {
     /// Create a new pending asset record.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "this is the canonical constructor; every field is load-bearing"
+    )]
     pub fn new_pending(
+        library: Arc<str>,
         id: String,
         version_size: VersionSizeKey,
         checksum: String,
@@ -357,6 +368,7 @@ impl AssetRecord {
         media_type: MediaType,
     ) -> Self {
         Self {
+            library,
             id: id.into_boxed_str(),
             checksum: checksum.into_boxed_str(),
             filename: filename.into_boxed_str(),
@@ -542,6 +554,7 @@ mod tests {
     fn test_asset_record_new_pending() {
         let now = Utc::now();
         let record = AssetRecord::new_pending(
+            Arc::from("PrimarySync"),
             "ABC123".to_string(),
             VersionSizeKey::Original,
             "checksum123".to_string(),
@@ -561,12 +574,13 @@ mod tests {
 
     #[test]
     fn test_asset_record_size() {
-        // V5 added AssetMetadata (22 optional fields + 4 bools). Cap lifted
-        // accordingly. The hot-path skip decisions still use the pre-metadata
-        // fields; metadata is loaded separately.
+        // V5 added AssetMetadata (22 optional fields + 4 bools); v8 added
+        // a `library: Arc<str>` field (16 bytes). Cap lifted accordingly.
+        // The hot-path skip decisions still use the pre-metadata fields;
+        // metadata is loaded separately.
         assert!(
-            size_of::<AssetRecord>() <= 720,
-            "AssetRecord size {} exceeds 720 bytes",
+            size_of::<AssetRecord>() <= 736,
+            "AssetRecord size {} exceeds 736 bytes",
             size_of::<AssetRecord>()
         );
     }
@@ -635,6 +649,7 @@ mod tests {
     fn test_with_metadata_refreshes_hash_if_missing() {
         let now = Utc::now();
         let record = AssetRecord::new_pending(
+            Arc::from("PrimarySync"),
             "A".into(),
             VersionSizeKey::Original,
             "ck".into(),
@@ -655,6 +670,7 @@ mod tests {
     fn test_with_metadata_preserves_existing_hash() {
         let now = Utc::now();
         let record = AssetRecord::new_pending(
+            Arc::from("PrimarySync"),
             "A".into(),
             VersionSizeKey::Original,
             "ck".into(),
@@ -698,6 +714,7 @@ mod tests {
         let now = Utc::now();
         let added = now - chrono::Duration::hours(1);
         let record = AssetRecord::new_pending(
+            Arc::from("PrimarySync"),
             "XYZ".to_string(),
             VersionSizeKey::LiveOriginal,
             "ck".to_string(),

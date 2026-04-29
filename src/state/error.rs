@@ -50,6 +50,16 @@ pub enum StateError {
     /// The database schema version is newer than supported.
     #[error("Database schema version {found} is newer than supported version {expected}")]
     UnsupportedSchemaVersion { found: i32, expected: i32 },
+
+    /// A producer-dispatch invariant was violated — typically a write
+    /// path was reached without the corresponding `upsert_seen` having
+    /// run first. The asset row didn't exist, so the operation became a
+    /// no-op. Surface it loudly rather than silently swallow.
+    #[error("State invariant violated ({operation}): {detail}")]
+    Invariant {
+        operation: &'static str,
+        detail: String,
+    },
 }
 
 impl StateError {

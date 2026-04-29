@@ -15,6 +15,7 @@ use crate::state::StateDb;
 use crate::types::AssetVersionSize;
 
 use super::service::{init_photos_service, resolve_libraries};
+use crate::icloud::photos::PRIMARY_ZONE_NAME;
 
 /// This imports existing local files into the state database by:
 /// 1. Enumerating all iCloud assets via the photos API
@@ -116,10 +117,11 @@ pub(crate) async fn run_import_existing(
     let (_shared_session, mut photos_service) =
         init_photos_service(auth_result, retry::RetryConfig::default()).await?;
 
-    // Resolve library selection (CLI > TOML > default PrimarySync)
+    // Resolve library selection (CLI > TOML > default `primary`)
     let toml_filters = toml.and_then(|t| t.filters.as_ref());
-    let selection = config::resolve_library_selection(args.library, toml_filters);
-    let libraries = resolve_libraries(&selection, &mut photos_service).await?;
+    let cli_libraries = args.library.into_iter().collect();
+    let selector = config::resolve_library_selector(cli_libraries, toml_filters)?;
+    let libraries = resolve_libraries(&selector, &mut photos_service).await?;
 
     if !args.no_progress_bar {
         println!("Scanning iCloud assets and matching with local files...");
@@ -199,6 +201,7 @@ pub(crate) async fn run_import_existing(
             if !args.dry_run {
                 let media_type = download::determine_media_type(version_size, &asset);
                 let record = state::AssetRecord::new_pending(
+                    Arc::from(PRIMARY_ZONE_NAME),
                     asset.id().to_string(),
                     version_size,
                     version.checksum.to_string(),
@@ -223,6 +226,7 @@ pub(crate) async fn run_import_existing(
 
                 if let Err(e) = db
                     .mark_downloaded(
+                        PRIMARY_ZONE_NAME,
                         asset.id(),
                         version_size.as_str(),
                         &expected_path,

@@ -400,7 +400,7 @@ async fn attempt_download<C: DownloadClient>(
     }
 
     // Defense-in-depth: log when neither size indicator is available.
-    // Post-download checksum verification (CF-1) catches actual corruption,
+    // Post-download checksum verification catches actual corruption,
     // but this warning helps diagnose transfer anomalies.
     if expected_size.is_none() && content_length.is_none() {
         tracing::warn!(
@@ -815,7 +815,7 @@ mod tests {
         assert_eq!(temp.file_name().unwrap().to_str().unwrap(), ".kei-tmp");
     }
 
-    /// Robustness regression for CF-1 (2026-04-25 review). Apple does
+    /// Robustness regression for downloaded-byte verification. Apple does
     /// not publish a content hash for assets, so kei cannot verify
     /// downloaded bytes against a server-side digest. Instead it stores
     /// the SHA-256 of what landed on disk in `local_checksum` and surfaces
@@ -2204,7 +2204,7 @@ mod tests {
             assert_eq!(std::fs::read(&download_path).unwrap(), full_body);
         }
 
-        /// CG-17: a Content-Length mismatch (server declares 1000 bytes
+        /// A Content-Length mismatch (server declares 1000 bytes
         /// but transmits 800) MUST surface as a `ContentLengthMismatch`
         /// error, the `.part` file must be removed, and NO file must
         /// appear at the final path. This is the feared-most data-loss
@@ -2287,7 +2287,7 @@ mod tests {
             );
         }
 
-        /// CG-12: when the destination parent directory is removed
+        /// When the destination parent directory is removed
         /// between the writability probe and the per-asset write, the
         /// per-asset download MUST surface an error (not silently
         /// succeed, not panic). Symptom in the wild looks like "0 photos
@@ -2354,7 +2354,7 @@ mod tests {
             assert!(!download_path.exists());
         }
 
-        /// CG-11: a pre-existing temp file from a prior interrupted run
+        /// A pre-existing temp file from a prior interrupted run
         /// must NOT corrupt the next download. Specifically: when the
         /// new download is initiated FRESH (no Range / status 200), the
         /// temp file must be replaced atomically — no concatenation of

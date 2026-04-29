@@ -678,7 +678,7 @@ impl PhotoAlbum {
                             let master_id = master_id.to_string();
                             // Try to pair with a buffered master from a previous page
                             if let Some(master) = pending_masters.remove(&master_id) {
-                                let asset = PhotoAsset::from_records(master, rec);
+                                let asset = PhotoAsset::from_records(master, &rec);
                                 if tx.send(Ok(asset)).await.is_err() {
                                     return;
                                 }
@@ -718,7 +718,7 @@ impl PhotoAlbum {
                         }
                     }
                     if let Some(asset_rec) = page_assets.remove(&master.record_name) {
-                        let asset = PhotoAsset::from_records(master, asset_rec);
+                        let asset = PhotoAsset::from_records(master, &asset_rec);
                         if tx.send(Ok(asset)).await.is_err() {
                             return;
                         }
@@ -830,28 +830,55 @@ impl std::fmt::Display for PhotoAlbum {
     }
 }
 
+/// Panic-on-call `PhotosSession` for tests that inspect a `PhotoAlbum` by
+/// name/metadata only. Any actual network call is a test bug.
+#[cfg(test)]
+pub(crate) struct StubSession;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl PhotosSession for StubSession {
+    async fn post(
+        &self,
+        _url: &str,
+        _body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        unimplemented!("stub")
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(StubSession)
+    }
+}
+
+#[cfg(test)]
+impl PhotoAlbum {
+    /// Construct a `PhotoAlbum` with the given name for cross-module unit
+    /// tests. Wires [`StubSession`], so the album is only safe to inspect by
+    /// name/metadata - any network call panics.
+    pub(crate) fn stub_for_test(name: Arc<str>) -> Self {
+        Self::new(
+            PhotoAlbumConfig {
+                params: Arc::new(HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name,
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(serde_json::json!({"zoneName": "PrimarySync"})),
+                retry_config: RetryConfig::default(),
+            },
+            Box::new(StubSession),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_helpers::MockPhotosSession;
     use serde_json::json;
-
-    struct StubSession;
-
-    #[async_trait::async_trait]
-    impl PhotosSession for StubSession {
-        async fn post(
-            &self,
-            _url: &str,
-            _body: String,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<Value> {
-            unimplemented!("stub")
-        }
-        fn clone_box(&self) -> Box<dyn PhotosSession> {
-            Box::new(StubSession)
-        }
-    }
 
     fn make_album(
         page_size: usize,
@@ -1217,7 +1244,7 @@ mod tests {
 
     // --- pagination edge case tests ---
 
-    /// CF-1: When a page returns only CPLAsset records (no CPLMaster), the
+    /// When a page returns only CPLAsset records (no CPLMaster), the
     /// fetcher must advance the offset and continue to subsequent pages
     /// instead of terminating prematurely.
     #[tokio::test]
@@ -1300,7 +1327,7 @@ mod tests {
         );
     }
 
-    /// Robustness regression for CF-2 (2026-04-25 review): a contiguous
+    /// Robustness regression for empty-page-run truncation: a contiguous
     /// run of fully-deleted records aligned to the page boundary used to
     /// truncate enumeration after 2 empty probes, leaving real assets
     /// past the run silently absent. With `MAX_EMPTY_PAGE_PROBES = 5`,
@@ -1378,7 +1405,7 @@ mod tests {
 
     /// Build a canned `ChangesZoneResponse` JSON with the given records,
     /// syncToken, and moreComing flag.
-    fn canned_changes_page(records: Vec<Value>, sync_token: &str, more_coming: bool) -> Value {
+    fn canned_changes_page(records: &[Value], sync_token: &str, more_coming: bool) -> Value {
         json!({
             "zones": [{
                 "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
@@ -1438,7 +1465,7 @@ mod tests {
             changes_master("master-1"),
             changes_asset("asset-1", "master-1"),
         ];
-        let mock = MockPhotosSession::new().ok(canned_changes_page(records, "token-final", false));
+        let mock = MockPhotosSession::new().ok(canned_changes_page(&records, "token-final", false));
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
@@ -1471,8 +1498,8 @@ mod tests {
             changes_asset("asset-2", "master-2"),
         ];
         let mock = MockPhotosSession::new()
-            .ok(canned_changes_page(page1_records, "token-page1", true))
-            .ok(canned_changes_page(page2_records, "token-page2", false));
+            .ok(canned_changes_page(&page1_records, "token-page1", true))
+            .ok(canned_changes_page(&page2_records, "token-page2", false));
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
@@ -1502,8 +1529,8 @@ mod tests {
             changes_asset("asset-1", "master-1"),
         ];
         let mock = MockPhotosSession::new()
-            .ok(canned_changes_page(vec![], "token-empty", true))
-            .ok(canned_changes_page(page2_records, "token-final", false));
+            .ok(canned_changes_page(&[], "token-empty", true))
+            .ok(canned_changes_page(&page2_records, "token-final", false));
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
@@ -1609,8 +1636,8 @@ mod tests {
         ];
         // Pages 1-2 succeed, page 3 returns a zone error
         let mock = MockPhotosSession::new()
-            .ok(canned_changes_page(page1_records, "token-page1", true))
-            .ok(canned_changes_page(page2_records, "token-page2", true))
+            .ok(canned_changes_page(&page1_records, "token-page1", true))
+            .ok(canned_changes_page(&page2_records, "token-page2", true))
             .ok(json!({
                 "zones": [{
                     "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
@@ -1658,7 +1685,7 @@ mod tests {
             "recordChangeTag": "ct-del"
         })];
         let mock =
-            MockPhotosSession::new().ok(canned_changes_page(records, "token-after-delete", false));
+            MockPhotosSession::new().ok(canned_changes_page(&records, "token-after-delete", false));
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-before");

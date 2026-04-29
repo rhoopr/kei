@@ -122,7 +122,7 @@ impl RunOptions {
             live_photo_size: format!("{:?}", config.live_photo_size).to_lowercase(),
             file_match_policy: format!("{:?}", config.file_match_policy).to_lowercase(),
             albums: config.albums.to_vec(),
-            library: format!("{:?}", config.library).to_lowercase(),
+            library: config.selection.libraries.to_raw().join(","),
             skip_videos: config.skip_videos,
             skip_photos: config.skip_photos,
             #[cfg(feature = "xmp")]

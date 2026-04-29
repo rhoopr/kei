@@ -39,6 +39,17 @@ enum BatchForecast {
     Bail,
 }
 
+/// Re-snapshot the free-disk probe every this many bytes queued. The
+/// producer caches `initial_free` at enumeration start so per-task probes
+/// don't hammer `statvfs` on every asset, but a long sync can run for hours
+/// while another process fills the FS. Without periodic refresh the bail
+/// decision rides on a stale snapshot; downloads still fail loudly with
+/// ENOSPC, but the sync would have been cancelled earlier with up-to-date
+/// data. 10 GiB is small enough to catch a fast-filling FS quickly and
+/// large enough that the periodic stat call is cheap relative to bytes
+/// downloaded.
+pub(super) const FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 /// Classify the impact of adding `size` bytes to the running queued total
 /// against the free-space snapshot captured at enumeration start.
 ///
@@ -63,6 +74,21 @@ fn batch_forecast_decision(
         return (BatchForecast::Warn, total);
     }
     (BatchForecast::Continue, total)
+}
+
+/// Decide whether the producer should re-snapshot free disk space on
+/// this `forecast_check` call.
+///
+/// `total` is the cumulative queued-bytes value just returned by
+/// `batch_forecast_decision`; `last_snapshot_total` is the queued-bytes
+/// value at the previous re-snapshot (initially zero, since the first
+/// snapshot happens at enumeration start before any bytes are queued).
+/// Returns `true` when the gap is at or above `interval`.
+///
+/// Pure helper so the cadence is testable without spinning up the producer
+/// loop or touching the filesystem.
+fn should_resnapshot_free_space(total: u64, last_snapshot_total: u64, interval: u64) -> bool {
+    interval > 0 && total.saturating_sub(last_snapshot_total) >= interval
 }
 
 /// Per-asset outcome in the producer's task loop. Ordered by ascending
@@ -165,6 +191,11 @@ pub(super) struct StreamingResult {
     /// Count of 429/503 observations during Phase 1 downloads (per retry
     /// attempt, not per unique task). Feeds SyncStats.rate_limited.
     pub(super) rate_limit_observations: usize,
+    /// `true` when the producer reached the natural end of the API
+    /// stream (so the `enum_in_progress:<zone>` marker can be cleared even
+    /// when downstream downloads partially failed). `false` when the
+    /// producer aborted via shutdown, channel-close, or panic.
+    pub(super) enumeration_complete: bool,
 }
 
 /// Threshold of auth errors before aborting the download pass for re-authentication.
@@ -175,6 +206,7 @@ pub(super) const AUTH_ERROR_THRESHOLD: usize = 3;
 /// Accumulated during the download loop and retried in a final flush.
 #[derive(Debug)]
 struct PendingStateWrite {
+    library: Arc<str>,
     asset_id: Arc<str>,
     version_size: crate::state::VersionSizeKey,
     download_path: PathBuf,
@@ -185,6 +217,67 @@ struct PendingStateWrite {
 /// Maximum retry attempts for deferred state writes.
 const STATE_WRITE_MAX_RETRIES: u32 = 6;
 const _: () = assert!(STATE_WRITE_MAX_RETRIES <= 32, "shift overflow in backoff");
+
+/// Bounded retry attempts for `add_asset_album`. SQLite-busy under WAL
+/// contention is the dominant transient failure; three attempts at
+/// 200ms / 400ms / 800ms cover the common case while staying short enough
+/// that a wedged DB doesn't stall the producer indefinitely. After the
+/// retries are exhausted the call falls through to a `warn!` (preserving
+/// existing behaviour) and album membership self-heals on the next
+/// enumeration.
+const ADD_ASSET_ALBUM_MAX_RETRIES: u32 = 3;
+
+/// Insert an asset/album row with a bounded inline retry loop. The
+/// underlying call is `INSERT OR IGNORE` so retries are idempotent. Returns
+/// the final result so the caller can log on persistent failure.
+///
+/// The retry shape mirrors `flush_pending_state_writes` (200ms × 2^attempt
+/// plus 0..base/4 jitter) rather than introducing a new primitive. The
+/// jitter spreads simultaneous retries from concurrent producers so they
+/// don't re-collide on the same SQLite lock.
+pub(super) async fn add_asset_album_with_retry(
+    db: &dyn StateDb,
+    asset_id: &str,
+    album_name: &str,
+    source: &str,
+) -> Result<(), crate::state::error::StateError> {
+    use rand::RngExt;
+    let mut last_err: Option<crate::state::error::StateError> = None;
+    for attempt in 1..=ADD_ASSET_ALBUM_MAX_RETRIES {
+        match db.add_asset_album(asset_id, album_name, source).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt < ADD_ASSET_ALBUM_MAX_RETRIES {
+                    tracing::debug!(
+                        asset_id,
+                        album = album_name,
+                        attempt,
+                        error = %e,
+                        "add_asset_album retry"
+                    );
+                    let base_ms = 200u64 * u64::from(1u32 << (attempt - 1));
+                    let jitter_ms = rand::rng().random_range(0..base_ms.max(1) / 4);
+                    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    // ADD_ASSET_ALBUM_MAX_RETRIES is `>= 1` (compile-time-checked below) so
+    // `last_err` is always populated when the loop exits. The fallback to
+    // `LockPoisoned` is a defensive landing the type system can't otherwise
+    // statically rule out.
+    Err(last_err.unwrap_or_else(|| {
+        crate::state::error::StateError::LockPoisoned(
+            "add_asset_album_with_retry: no attempts ran".into(),
+        )
+    }))
+}
+
+const _: () = assert!(
+    ADD_ASSET_ALBUM_MAX_RETRIES >= 1,
+    "ADD_ASSET_ALBUM_MAX_RETRIES must be at least 1; otherwise the retry helper never calls the DB"
+);
 
 /// Minimum pending-queue size at which a 100% flush failure rate is treated
 /// as "state DB unwritable" rather than a transient lock race. Five is large
@@ -198,18 +291,29 @@ const STATE_DB_UNWRITABLE_THRESHOLD: usize = 5;
 /// mark_downloaded call sites (streaming loop and cleanup pass).
 async fn update_metadata_marker(
     db: &dyn StateDb,
+    library: &str,
     asset_id: &str,
     version_size: &str,
     exif_ok: bool,
 ) {
     if exif_ok {
-        let _ = db
-            .clear_metadata_write_failure(asset_id, version_size)
-            .await;
+        if let Err(e) = db
+            .clear_metadata_write_failure(library, asset_id, version_size)
+            .await
+        {
+            tracing::warn!(
+                library,
+                asset_id,
+                version_size,
+                error = %e,
+                "Could not clear metadata-write-failed marker; asset will be \
+                 re-rewritten on next sync"
+            );
+        }
         return;
     }
     if let Err(e) = db
-        .record_metadata_write_failure(asset_id, version_size)
+        .record_metadata_write_failure(library, asset_id, version_size)
         .await
     {
         tracing::warn!(
@@ -240,7 +344,7 @@ async fn tag_metadata_rewrites(
     };
     let new_hash = asset.metadata().metadata_hash.as_deref();
     for &(vs, _) in candidates {
-        if !ctx.needs_metadata_rewrite(asset.id(), vs, new_hash) {
+        if !ctx.needs_metadata_rewrite(&config.library, asset.id(), vs, new_hash) {
             continue;
         }
         tracing::info!(
@@ -249,7 +353,7 @@ async fn tag_metadata_rewrites(
             "Metadata-only change detected; tagging for rewrite"
         );
         if let Err(e) = db
-            .record_metadata_write_failure(asset.id(), vs.as_str())
+            .record_metadata_write_failure(&config.library, asset.id(), vs.as_str())
             .await
         {
             tracing::warn!(
@@ -294,6 +398,7 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
         for attempt in 1..=STATE_WRITE_MAX_RETRIES {
             match db
                 .mark_downloaded(
+                    &write.library,
                     &write.asset_id,
                     write.version_size.as_str(),
                     &write.download_path,
@@ -465,7 +570,7 @@ async fn run_metadata_rewrites(
                 true
             };
 
-        let sidecar_ok = if metadata_flags.xmp_sidecar {
+        let sidecar_ok = if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
             let sidecar_path = path.clone();
             let sidecar_payload = payload.clone();
             let sidecar_created = created_local;
@@ -504,14 +609,19 @@ async fn run_metadata_rewrites(
         if embed_ok && sidecar_ok {
             if let Some(new_hash) = record.metadata.metadata_hash.as_deref() {
                 if let Err(e) = db
-                    .update_metadata_hash(&record.id, version_size.as_str(), new_hash)
+                    .update_metadata_hash(
+                        &record.library,
+                        &record.id,
+                        version_size.as_str(),
+                        new_hash,
+                    )
                     .await
                 {
                     tracing::warn!(asset_id = %record.id, error = %e, "Failed to update metadata_hash");
                 }
             }
             if let Err(e) = db
-                .clear_metadata_write_failure(&record.id, version_size.as_str())
+                .clear_metadata_write_failure(&record.library, &record.id, version_size.as_str())
                 .await
             {
                 tracing::warn!(asset_id = %record.id, error = %e, "Failed to clear metadata rewrite marker");
@@ -552,51 +662,58 @@ fn create_progress_bar(
     pb
 }
 
-/// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
-/// flow; individual flags gate which fields get written in the XMP packet.
-///
-/// `embed_xmp` enables the XMP-only fields that have no native EXIF equivalent
-/// (title, keywords, people, hidden/archived, media subtype, burst id).
-/// `xmp_sidecar` is orthogonal — it writes a `.xmp` file next to the photo
-/// without touching the photo bytes.
-#[derive(Debug, Clone, Copy, Default)]
-#[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-pub(super) struct MetadataFlags {
-    pub(super) datetime: bool,
-    pub(super) rating: bool,
-    pub(super) gps: bool,
-    pub(super) description: bool,
-    pub(super) embed_xmp: bool,
-    pub(super) xmp_sidecar: bool,
+bitflags::bitflags! {
+    /// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
+    /// flow; individual flags gate which fields get written in the XMP packet.
+    ///
+    /// `EMBED_XMP` enables the XMP-only fields that have no native EXIF equivalent
+    /// (title, keywords, people, hidden/archived, media subtype, burst id).
+    /// `XMP_SIDECAR` is orthogonal — it writes a `.xmp` file next to the photo
+    /// without touching the photo bytes.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
+    pub(super) struct MetadataFlags: u8 {
+        const DATETIME    = 1 << 0;
+        const RATING      = 1 << 1;
+        const GPS         = 1 << 2;
+        const DESCRIPTION = 1 << 3;
+        const EMBED_XMP   = 1 << 4;
+        const XMP_SIDECAR = 1 << 5;
+    }
 }
 
 impl MetadataFlags {
+    /// Set of flags that drive the `.part`-and-modify-before-rename flow.
+    /// Sidecar writes happen after the rename so `XMP_SIDECAR` is excluded.
+    /// Derived as `all() \ XMP_SIDECAR` so any future embed-style flag
+    /// added to this type is automatically picked up.
+    const EMBED_MASK: Self = Self::all().difference(Self::XMP_SIDECAR);
+
     /// Whether any flag needs the downloaded bytes to stay as a `.part` file
-    /// for in-place XMP editing before the atomic rename. Sidecar writes
-    /// happen after the rename and don't need this, so they're excluded.
+    /// for in-place XMP editing before the atomic rename.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    pub(super) fn any_embed(&self) -> bool {
-        self.datetime || self.rating || self.gps || self.description || self.embed_xmp
+    pub(super) fn any_embed(self) -> bool {
+        self.intersects(Self::EMBED_MASK)
     }
 }
 
 impl From<&DownloadConfig> for MetadataFlags {
     #[cfg(feature = "xmp")]
     fn from(config: &DownloadConfig) -> Self {
-        Self {
-            datetime: config.set_exif_datetime,
-            rating: config.set_exif_rating,
-            gps: config.set_exif_gps,
-            description: config.set_exif_description,
-            embed_xmp: config.embed_xmp,
-            xmp_sidecar: config.xmp_sidecar,
-        }
+        let mut flags = Self::empty();
+        flags.set(Self::DATETIME, config.set_exif_datetime);
+        flags.set(Self::RATING, config.set_exif_rating);
+        flags.set(Self::GPS, config.set_exif_gps);
+        flags.set(Self::DESCRIPTION, config.set_exif_description);
+        flags.set(Self::EMBED_XMP, config.embed_xmp);
+        flags.set(Self::XMP_SIDECAR, config.xmp_sidecar);
+        flags
     }
 
     /// Build with every flag forced false when the `xmp` feature is off.
     #[cfg(not(feature = "xmp"))]
     fn from(_config: &DownloadConfig) -> Self {
-        Self::default()
+        Self::empty()
     }
 }
 
@@ -615,6 +732,9 @@ pub(super) struct PassConfig<'a> {
     /// the rate-limit pressure warning.
     pub(super) rate_limit_counter: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) bandwidth_limiter: Option<super::BandwidthLimiter>,
+    /// CloudKit zone name scoping every state-DB key written by this pass.
+    /// Sourced from `DownloadConfig::library` at pass dispatch.
+    pub(super) library: Arc<str>,
 }
 
 impl std::fmt::Debug for PassConfig<'_> {
@@ -639,6 +759,24 @@ pub(super) struct PassResult {
     pub(super) bytes_downloaded: u64,
     pub(super) disk_bytes_written: u64,
     pub(super) rate_limit_observations: usize,
+}
+
+/// Return the subset of `paths` that do not exist on disk.
+///
+/// Uses `tokio::fs::try_exists` so a sample of up to 500 paths can be
+/// stat'd without blocking the async runtime thread; the older
+/// `Path::exists()` form pauses the executor for seconds on slow
+/// filesystems (NFS, SMB). Treats stat errors as "missing" so a
+/// transient permissions error correctly flips trust-state off rather
+/// than passing through the trust gate.
+async fn sample_missing_paths(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut missing = Vec::new();
+    for p in paths {
+        if !tokio::fs::try_exists(p).await.unwrap_or(false) {
+            missing.push(p.clone());
+        }
+    }
+    missing
 }
 
 /// Streaming download pipeline that consumes a pre-built combined stream.
@@ -673,8 +811,10 @@ where
         let mut enum_errors = 0usize;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
+        let mut shutdown_break = false;
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
+                shutdown_break = true;
                 break;
             }
             match result {
@@ -693,7 +833,13 @@ where
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
                                 matches!(
-                                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                                    download_ctx.should_download_fast(
+                                        &config.library,
+                                        asset.id(),
+                                        vs,
+                                        cs,
+                                        true
+                                    ),
                                     Some(false)
                                 )
                             })
@@ -721,6 +867,9 @@ where
         }
         return Ok(StreamingResult {
             enumeration_errors: enum_errors,
+            // Same gate as dry-run — `--only-print-filenames` drains
+            // the API stream and can clear the marker on a clean exit.
+            enumeration_complete: !shutdown_break,
             ..StreamingResult::default()
         });
     }
@@ -731,9 +880,11 @@ where
         let mut enum_errors = 0usize;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
+        let mut shutdown_break = false;
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, stopping dry run");
+                shutdown_break = true;
                 break;
             }
             match result {
@@ -758,6 +909,10 @@ where
         return Ok(StreamingResult {
             downloaded: count,
             enumeration_errors: enum_errors,
+            // Dry-run still drains the API stream; mirror the
+            // non-dry-run gate so the enum_in_progress marker can be
+            // cleared on a clean dry-run.
+            enumeration_complete: !shutdown_break,
             ..StreamingResult::default()
         });
     }
@@ -816,7 +971,11 @@ where
                 .clamp(5, 500);
             match db.sample_downloaded_paths(sample_count).await {
                 Ok(paths) => {
-                    let missing: Vec<_> = paths.iter().filter(|p| !p.exists()).collect();
+                    // Stat via tokio::fs::try_exists so the sample (up to 500
+                    // paths) doesn't block the async runtime thread on slow
+                    // filesystems (NFS, SMB). Mirrors the metadata-rewrite
+                    // worker (see comment at the `try_exists` call ~line 401).
+                    let missing = sample_missing_paths(&paths).await;
                     if !missing.is_empty() {
                         tracing::warn!(
                             sampled = paths.len(),
@@ -882,6 +1041,7 @@ where
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
     let mut bytes_downloaded_total: u64 = 0;
     let mut disk_bytes_total: u64 = 0;
+    let library: Arc<str> = Arc::clone(&config.library);
 
     let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
 
@@ -889,15 +1049,27 @@ where
     let assets_seen_producer = Arc::clone(&assets_seen);
     let enum_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let enum_errors_producer = Arc::clone(&enum_errors);
+    // Signal whether the producer reached the natural end of the API
+    // stream. Used by the caller to decide whether to clear the
+    // `enum_in_progress:<zone>` marker. `true` only when the producer's
+    // outer `while let Some(...)` loop exited because the stream returned
+    // `None` (stream exhausted) AND no shutdown was triggered. Channel-close
+    // early returns and shutdown breaks both leave it `false`.
+    let enumeration_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let enumeration_complete_producer = Arc::clone(&enumeration_complete);
 
-    // Batch-size forecast: snapshot free space once at the start of
-    // enumeration and track bytes queued to consumers. Emit a one-time warn
-    // at 90% and cancel the sync at 100%. This catches the "batch much
-    // larger than free space" case early, before downloads run the disk dry
-    // mid-stream. We snapshot free space once so the threshold reflects
-    // "headroom at start" — per-task rechecks against a shrinking denominator
-    // would fire noisy false-positives as downloads consume the disk normally.
-    let initial_free = crate::available_disk_space(&config.directory);
+    // Batch-size forecast: snapshot free space at enumeration start and
+    // track bytes queued to consumers. Emit a one-time warn at 90% and
+    // cancel the sync at 100%. This catches the "batch much larger than
+    // free space" case early, before downloads run the disk dry mid-stream.
+    //
+    // A multi-hour sync can have its FS filled by an unrelated process
+    // mid-run. Refresh `initial_free` every FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES
+    // queued so the bail decision rides on fresher data. Per-task rechecks
+    // against a shrinking denominator would fire noisy false-positives as
+    // downloads naturally consume the disk; the 10 GiB cadence is a
+    // compromise between "stale" and "noisy".
+    let initial_free_at_start = crate::available_disk_space(&config.directory);
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -922,7 +1094,49 @@ where
         let mut touched_ids: Vec<Arc<str>> = Vec::new();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
+        // Free-space probe lives in an `AtomicU64` (sentinel
+        // `u64::MAX` = "no probe available") so the producer task can
+        // refresh it every FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES queued
+        // without breaking `Send`. The producer is a single task, so atomic
+        // ordering can stay Relaxed.
+        const FREE_PROBE_NONE_SENTINEL: u64 = u64::MAX;
+        let initial_free_atomic = std::sync::atomic::AtomicU64::new(
+            initial_free_at_start.unwrap_or(FREE_PROBE_NONE_SENTINEL),
+        );
+        let last_resnapshot_total = std::sync::atomic::AtomicU64::new(0);
+        let directory_for_resnapshot = config.directory.clone();
         let forecast_check = |size: u64| -> bool {
+            // Re-snapshot before classifying so the decision uses the
+            // freshest data on the boundary call.
+            let total_so_far = queued_bytes_producer.load(std::sync::atomic::Ordering::Relaxed);
+            if should_resnapshot_free_space(
+                total_so_far + size,
+                last_resnapshot_total.load(std::sync::atomic::Ordering::Relaxed),
+                FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES,
+            ) {
+                if let Some(refreshed) = crate::available_disk_space(&directory_for_resnapshot) {
+                    let prior = initial_free_atomic.load(std::sync::atomic::Ordering::Relaxed);
+                    initial_free_atomic.store(refreshed, std::sync::atomic::Ordering::Relaxed);
+                    last_resnapshot_total
+                        .store(total_so_far + size, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(
+                        prior_free_bytes = if prior == FREE_PROBE_NONE_SENTINEL {
+                            0
+                        } else {
+                            prior
+                        },
+                        refreshed_free_bytes = refreshed,
+                        queued_bytes = total_so_far + size,
+                        "Refreshed free-disk snapshot"
+                    );
+                }
+            }
+            let raw = initial_free_atomic.load(std::sync::atomic::Ordering::Relaxed);
+            let initial_free = if raw == FREE_PROBE_NONE_SENTINEL {
+                None
+            } else {
+                Some(raw)
+            };
             let (decision, total) = batch_forecast_decision(
                 size,
                 initial_free,
@@ -1004,7 +1218,13 @@ where
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
                                 matches!(
-                                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                                    download_ctx.should_download_fast(
+                                        &config.library,
+                                        asset.id(),
+                                        vs,
+                                        cs,
+                                        true
+                                    ),
                                     Some(false)
                                 )
                             })
@@ -1078,6 +1298,7 @@ where
                                         );
                                         if let Err(e) = db
                                             .mark_failed(
+                                                &config.library,
                                                 &task.asset_id,
                                                 task.version_size.as_str(),
                                                 &error,
@@ -1110,6 +1331,7 @@ where
                             if let Some(db) = &producer_state_db {
                                 let media_type = determine_media_type(task.version_size, &asset);
                                 let record = AssetRecord::new_pending(
+                                    Arc::clone(&config.library),
                                     task.asset_id.to_string(),
                                     task.version_size,
                                     task.checksum.to_string(),
@@ -1137,20 +1359,26 @@ where
                                 // the next incremental sync fills it in.
                                 if let Some(album) = config.album_name.as_deref() {
                                     if !album.is_empty() {
-                                        if let Err(e) =
-                                            db.add_asset_album(asset.id(), album, "icloud").await
+                                        if let Err(e) = add_asset_album_with_retry(
+                                            db.as_ref(),
+                                            asset.id(),
+                                            album,
+                                            "icloud",
+                                        )
+                                        .await
                                         {
                                             tracing::warn!(
                                                 asset_id = %asset.id(),
                                                 album = %album,
                                                 error = %e,
-                                                "Failed to record album membership"
+                                                "Failed to record album membership after retries"
                                             );
                                         }
                                     }
                                 }
 
                                 match download_ctx.should_download_fast(
+                                    &config.library,
                                     &task.asset_id,
                                     task.version_size,
                                     &task.checksum,
@@ -1244,30 +1472,44 @@ where
                 }
                 Err(e) => {
                     enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    producer_pb.suspend(|| tracing::error!(error = %e, "Error fetching asset"));
+                    // Single-line `tracing::error!` doesn't need the
+                    // progress bar suspended; the bar redraws cleanly after
+                    // a one-line emit and the suspend was just paying a
+                    // hot-loop cost for no observable benefit.
+                    tracing::error!(error = %e, "Error fetching asset");
                 }
             }
         }
 
+        // At this point the outer `while let Some(...)` loop has
+        // exited via stream-exhaustion (None) or via the in-loop shutdown
+        // `break`. Channel-close early returns bypass this code path
+        // entirely. Mark enumeration complete only when shutdown wasn't
+        // the trigger so the cycle's `enum_in_progress:<zone>` marker is
+        // cleared even when downstream downloads partially failed.
+        if !producer_shutdown.is_cancelled() {
+            enumeration_complete_producer.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let total_skipped = skips.total();
         if total_skipped > 0 {
-            producer_pb.suspend(|| {
-                tracing::debug!(
-                    state = skips.by_state,
-                    on_disk = skips.on_disk,
-                    ampm_variant = skips.ampm_variant,
-                    media_type = skips.by_media_type,
-                    date_range = skips.by_date_range,
-                    live_photo = skips.by_live_photo,
-                    filename = skips.by_filename,
-                    excluded_album = skips.by_excluded_album,
-                    duplicates = skips.duplicates,
-                    retry_exhausted = skips.retry_exhausted,
-                    retry_only = skips.retry_only,
-                    total = total_skipped,
-                    "Skipped assets"
-                );
-            });
+            // Single tracing event, runs once after the producer loop
+            // exits — no suspend needed.
+            tracing::debug!(
+                state = skips.by_state,
+                on_disk = skips.on_disk,
+                ampm_variant = skips.ampm_variant,
+                media_type = skips.by_media_type,
+                date_range = skips.by_date_range,
+                live_photo = skips.by_live_photo,
+                filename = skips.by_filename,
+                excluded_album = skips.by_excluded_album,
+                duplicates = skips.duplicates,
+                retry_exhausted = skips.retry_exhausted,
+                retry_only = skips.retry_only,
+                total = total_skipped,
+                "Skipped assets"
+            );
         }
 
         // Invariant: every unique asset must be either skipped or forwarded.
@@ -1276,16 +1518,15 @@ where
         let skipped_unique = (total_skipped - skips.duplicates) as u64;
         let accounted = skipped_unique + assets_forwarded;
         if accounted != seen {
-            producer_pb.suspend(|| {
-                tracing::warn!(
-                    assets_seen = seen,
-                    accounted,
-                    forwarded = assets_forwarded,
-                    skipped = skipped_unique,
-                    duplicates = skips.duplicates,
-                    "Asset accounting mismatch -- some assets may be untracked"
-                );
-            });
+            // Single tracing event; no suspend.
+            tracing::warn!(
+                assets_seen = seen,
+                accounted,
+                forwarded = assets_forwarded,
+                skipped = skipped_unique,
+                duplicates = skips.duplicates,
+                "Asset accounting mismatch -- some assets may be untracked"
+            );
         }
 
         // Flush the accumulated last_seen_at updates in one transaction.
@@ -1310,7 +1551,7 @@ where
             if !touched_ids.is_empty() {
                 let touched_count = touched_ids.len();
                 let ids: Vec<&str> = touched_ids.iter().map(AsRef::as_ref).collect();
-                if let Err(e) = db.touch_last_seen_many(&ids).await {
+                if let Err(e) = db.touch_last_seen_many(&config.library, &ids).await {
                     producer_pb.suspend(|| {
                         tracing::warn!(
                             error = %e,
@@ -1387,6 +1628,7 @@ where
                 if let Some(db) = &state_db {
                     if let Err(e) = db
                         .mark_downloaded(
+                            &library,
                             &task.asset_id,
                             task.version_size.as_str(),
                             &task.download_path,
@@ -1403,6 +1645,7 @@ where
                             );
                         });
                         pending_state_writes.push(PendingStateWrite {
+                            library: Arc::clone(&library),
                             asset_id: task.asset_id.clone(),
                             version_size: task.version_size,
                             download_path: task.download_path.clone(),
@@ -1415,6 +1658,7 @@ where
                         // EXIF/XMP writer succeeded.
                         update_metadata_marker(
                             db.as_ref(),
+                            &library,
                             &task.asset_id,
                             task.version_size.as_str(),
                             exif_ok,
@@ -1456,7 +1700,12 @@ where
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) = db
-                        .mark_failed(&task.asset_id, task.version_size.as_str(), &e.to_string())
+                        .mark_failed(
+                            &library,
+                            &task.asset_id,
+                            task.version_size.as_str(),
+                            &e.to_string(),
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -1528,7 +1777,7 @@ where
     #[cfg(feature = "xmp")]
     if let Some(db) = &state_db {
         let metadata_flags = MetadataFlags::from(config.as_ref());
-        if metadata_flags.any_embed() || metadata_flags.xmp_sidecar {
+        if metadata_flags.any_embed() || metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
             run_metadata_rewrites(db.as_ref(), metadata_flags, &shutdown_token).await;
         }
     }
@@ -1554,6 +1803,14 @@ where
         ));
     }
 
+    // A panicked producer never reached the post-loop "enumeration
+    // complete" assignment, so the flag stays `false` even if the bail
+    // path above was suppressed. `producer_panicked` is checked above,
+    // but if a future change ever returns Ok despite a panic, the flag
+    // here protects the `enum_in_progress` marker.
+    let enumeration_complete_flag =
+        !producer_panicked && enumeration_complete.load(std::sync::atomic::Ordering::Relaxed);
+
     Ok(StreamingResult {
         downloaded,
         exif_failures,
@@ -1566,6 +1823,7 @@ where
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
         rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
+        enumeration_complete: enumeration_complete_flag,
     })
 }
 
@@ -1721,6 +1979,7 @@ pub(super) async fn build_download_outcome(
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::clone(&phase2_rate_counter),
         bandwidth_limiter: config.bandwidth_limiter.clone(),
+        library: Arc::clone(&config.library),
     };
     let pass_result = run_download_pass(pass_config, fresh_tasks).await;
 
@@ -1816,6 +2075,7 @@ pub(super) async fn run_download_pass(
     let temp_suffix: Arc<str> = config.temp_suffix;
     let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
+    let library: Arc<str> = Arc::clone(&config.library);
 
     let mut download_stream = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
@@ -1869,6 +2129,7 @@ pub(super) async fn run_download_pass(
                 if let Some(db) = &state_db {
                     if let Err(e) = db
                         .mark_downloaded(
+                            &library,
                             &task.asset_id,
                             task.version_size.as_str(),
                             &task.download_path,
@@ -1885,6 +2146,7 @@ pub(super) async fn run_download_pass(
                             );
                         });
                         pending_state_writes.push(PendingStateWrite {
+                            library: Arc::clone(&library),
                             asset_id: task.asset_id.clone(),
                             version_size: task.version_size,
                             download_path: task.download_path.clone(),
@@ -1894,6 +2156,7 @@ pub(super) async fn run_download_pass(
                     } else {
                         update_metadata_marker(
                             db.as_ref(),
+                            &library,
                             &task.asset_id,
                             task.version_size.as_str(),
                             *exif_ok,
@@ -1918,7 +2181,12 @@ pub(super) async fn run_download_pass(
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) = db
-                        .mark_failed(&task.asset_id, task.version_size.as_str(), &e.to_string())
+                        .mark_failed(
+                            &library,
+                            &task.asset_id,
+                            task.version_size.as_str(),
+                            &e.to_string(),
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -2003,19 +2271,21 @@ fn plan_sidecar_write(
     payload: &MetadataPayload,
     created_local: &chrono::DateTime<chrono::Local>,
 ) -> super::metadata::MetadataWrite {
-    super::metadata::MetadataWrite {
+    let mut write = super::metadata::MetadataWrite {
         datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
         rating: payload.rating,
         gps: gps_from_payload(payload),
-        title: payload.title.clone(),
-        description: payload.description.clone(),
-        keywords: payload.keywords.clone(),
-        people: payload.people.clone(),
         is_hidden: payload.is_hidden,
         is_archived: payload.is_archived,
-        media_subtype: payload.media_subtype.clone(),
-        burst_id: payload.burst_id.clone(),
-    }
+        ..super::metadata::MetadataWrite::default()
+    };
+    write.title.clone_from(&payload.title);
+    write.description.clone_from(&payload.description);
+    write.keywords.clone_from(&payload.keywords);
+    write.people.clone_from(&payload.people);
+    write.media_subtype.clone_from(&payload.media_subtype);
+    write.burst_id.clone_from(&payload.burst_id);
+    write
 }
 
 /// Plan the embed-path write. Per-tag gates:
@@ -2024,7 +2294,7 @@ fn plan_sidecar_write(
 ///   existing value (probe gate preserves camera-supplied data).
 /// - **rating / description**: flag gate only — iCloud is the source of truth.
 /// - **XMP-only fields** (title, keywords, people, hidden/archived,
-///   media_subtype, burst_id): gated on `embed_xmp`.
+///   media_subtype, burst_id): gated on the `EMBED_XMP` flag.
 #[cfg(feature = "xmp")]
 fn plan_metadata_write(
     flags: MetadataFlags,
@@ -2034,26 +2304,26 @@ fn plan_metadata_write(
 ) -> super::metadata::MetadataWrite {
     let mut write = super::metadata::MetadataWrite::default();
 
-    if flags.datetime && probe.datetime_original.is_none() {
+    if flags.contains(MetadataFlags::DATETIME) && probe.datetime_original.is_none() {
         write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
     }
-    if flags.rating {
+    if flags.contains(MetadataFlags::RATING) {
         write.rating = payload.rating;
     }
-    if flags.gps && !probe.has_gps {
+    if flags.contains(MetadataFlags::GPS) && !probe.has_gps {
         write.gps = gps_from_payload(payload);
     }
-    if flags.description {
-        write.description = payload.description.clone();
+    if flags.contains(MetadataFlags::DESCRIPTION) {
+        write.description.clone_from(&payload.description);
     }
-    if flags.embed_xmp {
-        write.title = payload.title.clone();
-        write.keywords = payload.keywords.clone();
-        write.people = payload.people.clone();
+    if flags.contains(MetadataFlags::EMBED_XMP) {
+        write.title.clone_from(&payload.title);
+        write.keywords.clone_from(&payload.keywords);
+        write.people.clone_from(&payload.people);
         write.is_hidden = payload.is_hidden;
         write.is_archived = payload.is_archived;
-        write.media_subtype = payload.media_subtype.clone();
-        write.burst_id = payload.burst_id.clone();
+        write.media_subtype.clone_from(&payload.media_subtype);
+        write.burst_id.clone_from(&payload.burst_id);
     }
 
     write
@@ -2190,7 +2460,7 @@ async fn download_single_task(
     }
 
     #[cfg(feature = "xmp")]
-    if metadata_flags.xmp_sidecar {
+    if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
         let sidecar_path = task.download_path.clone();
         let payload = task.metadata.clone();
         let created_local = task.created_local;
@@ -2496,6 +2766,352 @@ mod tests {
         assert_eq!(total, 500);
     }
 
+    // ── Free-space re-snapshot cadence ───────────────────────────────
+
+    /// A re-snapshot is required once the running queued total has
+    /// crossed `interval` bytes past the last snapshot point. Pinning the
+    /// happy path so a future tweak doesn't regress to the stale-snapshot
+    /// behaviour the fix was added to repair.
+    #[test]
+    fn should_resnapshot_free_space_fires_at_interval_boundary() {
+        let interval = FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES;
+        // Just below the interval: no resnapshot.
+        assert!(!should_resnapshot_free_space(interval - 1, 0, interval));
+        // Exactly at the interval: resnapshot required.
+        assert!(should_resnapshot_free_space(interval, 0, interval));
+        // Past the interval: resnapshot still required (caller updates
+        // last_snapshot to suppress repeats; this helper is stateless).
+        assert!(should_resnapshot_free_space(interval * 2, 0, interval));
+    }
+
+    /// When the interval is 0 the helper must return `false` for any
+    /// total. Guards against accidentally turning the cadence into "every
+    /// call" if a constant is ever zeroed out.
+    #[test]
+    fn should_resnapshot_free_space_zero_interval_never_fires() {
+        for total in [0u64, 1, 1_000, u64::MAX] {
+            assert!(
+                !should_resnapshot_free_space(total, 0, 0),
+                "interval=0 must never request a resnapshot (total={total})"
+            );
+        }
+    }
+
+    /// Drives the helper through a sequence where the simulated free
+    /// space drops between snapshots and asserts the bail decision picks up
+    /// the fresher snapshot. Pre-fix, the bail rode on the stale 1 TiB
+    /// snapshot and never fired even though the FS had only 1 GiB left.
+    #[test]
+    fn batch_forecast_resnapshot_picks_up_fs_filling_mid_sync() {
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+
+        // Snapshot 1: 1 TiB free. Queue 500 GiB → still well under 90%, no
+        // warn or bail.
+        let initial_free = 1024u64 * 1024 * 1024 * 1024; // 1 TiB
+        let snapshot1_total = 500u64 * 1024 * 1024 * 1024; // 500 GiB
+        let (decision, total) =
+            batch_forecast_decision(snapshot1_total, Some(initial_free), &queued, &warn);
+        assert_eq!(
+            decision,
+            BatchForecast::Continue,
+            "500 GiB / 1 TiB stays under 90%"
+        );
+        assert_eq!(total, snapshot1_total);
+
+        // Between snapshots an unrelated process consumed almost all the
+        // disk. Refresh free-space to 1 GiB. Even though `queued` already
+        // counts 500 GiB, the next forecast call should see the fresher
+        // 1 GiB free figure and bail.
+        let refreshed_free = 1024u64 * 1024 * 1024; // 1 GiB
+        let (decision, total) =
+            batch_forecast_decision(1024 * 1024, Some(refreshed_free), &queued, &warn);
+        assert_eq!(
+            decision,
+            BatchForecast::Bail,
+            "after re-snapshot to 1 GiB free, queued 500 GiB+ must trigger Bail"
+        );
+        assert!(total > refreshed_free, "queued total dwarfs refreshed free");
+    }
+
+    // ── add_asset_album retry tests ─────────────────────────────────
+
+    /// StateDb stub whose `add_asset_album` returns `LockPoisoned` for the
+    /// first `fail_first` calls, then succeeds. Tracks total call count so
+    /// tests can pin the retry-attempt accounting. Other methods panic
+    /// because the test path never reaches them.
+    struct AlbumRetryStubDb {
+        remaining_failures: AtomicUsize,
+        calls: AtomicUsize,
+        recorded: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl AlbumRetryStubDb {
+        fn new(fail_first: usize) -> Self {
+            Self {
+                remaining_failures: AtomicUsize::new(fail_first),
+                calls: AtomicUsize::new(0),
+                recorded: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateDb for AlbumRetryStubDb {
+        #[cfg(test)]
+        async fn should_download(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &Path,
+        ) -> Result<bool, StateError> {
+            unimplemented!()
+        }
+        async fn upsert_seen(&self, _: &AssetRecord) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn mark_downloaded(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &Path,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn get_failed_sample(&self, _: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
+            unimplemented!()
+        }
+        async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn get_summary(&self) -> Result<SyncSummary, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_page(
+            &self,
+            _: u64,
+            _: u32,
+        ) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn start_sync_run(&self) -> Result<i64, StateError> {
+            unimplemented!()
+        }
+        async fn complete_sync_run(&self, _: i64, _: &SyncRunStats) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+        async fn begin_enum_progress(&self, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn end_enum_progress(&self, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+            unimplemented!()
+        }
+        async fn reset_failed(&self) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+            unimplemented!()
+        }
+        async fn promote_pending_to_failed(&self, _: i64) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_ids(
+            &self,
+        ) -> Result<HashSet<(String, String, String)>, StateError> {
+            unimplemented!()
+        }
+        async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+            unimplemented!()
+        }
+        async fn touch_last_seen_many(&self, _: &str, _: &[&str]) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn sample_downloaded_paths(
+            &self,
+            _: usize,
+        ) -> Result<Vec<std::path::PathBuf>, StateError> {
+            unimplemented!()
+        }
+        async fn add_asset_album(
+            &self,
+            asset_id: &str,
+            album_name: &str,
+            source: &str,
+        ) -> Result<(), StateError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let prev = self.remaining_failures.fetch_sub(1, Ordering::Relaxed);
+            if prev > 0 {
+                Err(StateError::LockPoisoned("simulated SQLite busy".into()))
+            } else {
+                self.remaining_failures.store(0, Ordering::Relaxed);
+                self.recorded.lock().unwrap().push((
+                    asset_id.to_string(),
+                    album_name.to_string(),
+                    source.to_string(),
+                ));
+                Ok(())
+            }
+        }
+        async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
+            unimplemented!()
+        }
+        async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
+            unimplemented!()
+        }
+        async fn mark_soft_deleted(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn mark_hidden_at_source(&self, _: &str, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn record_metadata_write_failure(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn clear_metadata_write_failure(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_checksums(
+            &self,
+        ) -> Result<HashMap<(String, String, String), String>, StateError> {
+            unimplemented!()
+        }
+        async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+            unimplemented!()
+        }
+        async fn get_metadata(&self, _: &str) -> Result<Option<String>, StateError> {
+            unimplemented!()
+        }
+        async fn set_metadata(&self, _: &str, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn delete_metadata_by_prefix(&self, _: &str) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_metadata_hashes(
+            &self,
+        ) -> Result<HashMap<(String, String, String), String>, StateError> {
+            unimplemented!()
+        }
+        async fn get_metadata_retry_markers(
+            &self,
+        ) -> Result<HashSet<(String, String, String)>, StateError> {
+            unimplemented!()
+        }
+        async fn get_pending_metadata_rewrites(
+            &self,
+            _: usize,
+        ) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn update_metadata_hash(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+    }
+
+    /// A single transient `LockPoisoned` from `add_asset_album` must
+    /// be retried so the album-membership row lands. Pre-fix this caller
+    /// logged at `warn!` and dropped the row, leaving downstream consumers
+    /// (EXIF keywords, Immich albums) with incomplete data until the next
+    /// full enumeration repopulated it.
+    #[tokio::test]
+    async fn add_asset_album_retry_recovers_after_one_transient_failure() {
+        let stub = AlbumRetryStubDb::new(1); // fail once, succeed on retry
+        let result = add_asset_album_with_retry(&stub, "ASSET_A", "Favorites", "icloud").await;
+        assert!(
+            result.is_ok(),
+            "transient SQLite-busy must be retried, not surfaced as Err"
+        );
+        let recorded = stub.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one row must be recorded");
+        assert_eq!(
+            recorded[0],
+            ("ASSET_A".into(), "Favorites".into(), "icloud".into())
+        );
+        assert_eq!(
+            stub.calls.load(Ordering::Relaxed),
+            2,
+            "must hit the DB twice: one fail + one success"
+        );
+    }
+
+    /// When failures persist beyond the retry cap, the error must
+    /// surface so the caller can log at `warn!` (existing behaviour) — a
+    /// genuinely-wedged DB shouldn't be silently retried forever.
+    #[tokio::test]
+    async fn add_asset_album_retry_surfaces_persistent_failure() {
+        // Fail more times than the retry cap.
+        let stub = AlbumRetryStubDb::new((ADD_ASSET_ALBUM_MAX_RETRIES + 5) as usize);
+        let result = add_asset_album_with_retry(&stub, "ASSET_B", "Trip", "icloud").await;
+        assert!(
+            result.is_err(),
+            "persistent failure must propagate so the caller's warn! fires"
+        );
+        assert_eq!(
+            stub.calls.load(Ordering::Relaxed) as u32,
+            ADD_ASSET_ALBUM_MAX_RETRIES,
+            "must attempt exactly ADD_ASSET_ALBUM_MAX_RETRIES times before giving up"
+        );
+        assert!(
+            stub.recorded.lock().unwrap().is_empty(),
+            "no row must be recorded when all attempts fail"
+        );
+    }
+
+    /// A first-call success must not pay the retry cost. Pinning so
+    /// the retry loop doesn't accidentally turn into "retry on every call".
+    #[tokio::test]
+    async fn add_asset_album_retry_no_op_on_first_success() {
+        let stub = AlbumRetryStubDb::new(0);
+        let result = add_asset_album_with_retry(&stub, "ASSET_C", "Holiday", "icloud").await;
+        assert!(result.is_ok());
+        assert_eq!(
+            stub.calls.load(Ordering::Relaxed),
+            1,
+            "first-call success must hit the DB exactly once"
+        );
+    }
+
     // ── maybe_warn_rate_limit_pressure ─────────────────────────────────────
     //
     // The helper itself is side-effect-only (emits tracing::warn!); we assert
@@ -2595,10 +3211,7 @@ mod tests {
         assert!(w.people.is_empty());
         assert!(!w.is_hidden);
 
-        let flags_embed = MetadataFlags {
-            embed_xmp: true,
-            ..MetadataFlags::default()
-        };
+        let flags_embed = MetadataFlags::EMBED_XMP;
         let w = plan_metadata_write(
             flags_embed,
             &payload,
@@ -2618,11 +3231,7 @@ mod tests {
     #[test]
     fn plan_metadata_write_respects_probe_skip_for_datetime_and_gps() {
         let payload = rich_payload();
-        let flags = MetadataFlags {
-            datetime: true,
-            gps: true,
-            ..MetadataFlags::default()
-        };
+        let flags = MetadataFlags::DATETIME | MetadataFlags::GPS;
         let probe = crate::download::metadata::ExifProbe {
             datetime_original: Some("2020:01:01 00:00:00".into()),
             has_gps: true,
@@ -2671,13 +3280,13 @@ mod tests {
     fn metadata_flags_any_embed_captures_embed_only() {
         let mut flags = MetadataFlags::default();
         assert!(!flags.any_embed());
-        flags.xmp_sidecar = true;
+        flags.insert(MetadataFlags::XMP_SIDECAR);
         assert!(
             !flags.any_embed(),
             "sidecar-only must not trigger the .part-edit flow"
         );
-        flags.xmp_sidecar = false;
-        flags.embed_xmp = true;
+        flags.remove(MetadataFlags::XMP_SIDECAR);
+        flags.insert(MetadataFlags::EMBED_XMP);
         assert!(flags.any_embed());
     }
 
@@ -2822,6 +3431,7 @@ mod tests {
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                             bandwidth_limiter: None,
+                            library: std::sync::Arc::from("PrimarySync"),
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert!(result.failed.is_empty());
@@ -2874,6 +3484,7 @@ mod tests {
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                             bandwidth_limiter: None,
+                            library: std::sync::Arc::from("PrimarySync"),
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert_eq!(result.failed.len(), 1);
@@ -2999,6 +3610,7 @@ mod tests {
     struct FailingStateDb {
         remaining_failures: AtomicUsize,
         successes: AtomicUsize,
+        fail_metadata_clear: AtomicBool,
     }
 
     impl FailingStateDb {
@@ -3006,7 +3618,14 @@ mod tests {
             Self {
                 remaining_failures: AtomicUsize::new(fail_count),
                 successes: AtomicUsize::new(0),
+                fail_metadata_clear: AtomicBool::new(false),
             }
+        }
+
+        fn with_failing_metadata_clear() -> Self {
+            let s = Self::new(0);
+            s.fail_metadata_clear.store(true, Ordering::Relaxed);
+            s
         }
 
         fn success_count(&self) -> usize {
@@ -3022,6 +3641,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
+            _: &str,
             _: &Path,
         ) -> Result<bool, StateError> {
             unimplemented!()
@@ -3031,6 +3651,7 @@ mod tests {
         }
         async fn mark_downloaded(
             &self,
+            _: &str,
             _: &str,
             _: &str,
             _: &Path,
@@ -3046,7 +3667,7 @@ mod tests {
                 Ok(())
             }
         }
-        async fn mark_failed(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+        async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
             unimplemented!()
         }
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
@@ -3098,7 +3719,9 @@ mod tests {
         async fn promote_pending_to_failed(&self, _seen_since: i64) -> Result<u64, StateError> {
             Ok(0)
         }
-        async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
+        async fn get_downloaded_ids(
+            &self,
+        ) -> Result<HashSet<(String, String, String)>, StateError> {
             unimplemented!()
         }
         async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
@@ -3106,7 +3729,7 @@ mod tests {
         }
         async fn get_downloaded_checksums(
             &self,
-        ) -> Result<HashMap<(String, String), String>, StateError> {
+        ) -> Result<HashMap<(String, String, String), String>, StateError> {
             unimplemented!()
         }
         async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
@@ -3121,7 +3744,7 @@ mod tests {
         async fn delete_metadata_by_prefix(&self, _: &str) -> Result<u64, StateError> {
             unimplemented!()
         }
-        async fn touch_last_seen_many(&self, _: &[&str]) -> Result<(), StateError> {
+        async fn touch_last_seen_many(&self, _: &str, _: &[&str]) -> Result<(), StateError> {
             // Unused in these tests; default no-op so they don't bump the
             // pipeline's batch-flush path.
             Ok(())
@@ -3144,27 +3767,42 @@ mod tests {
         async fn mark_soft_deleted(
             &self,
             _: &str,
+            _: &str,
             _: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<(), StateError> {
             Ok(())
         }
-        async fn mark_hidden_at_source(&self, _: &str) -> Result<(), StateError> {
+        async fn mark_hidden_at_source(&self, _: &str, _: &str) -> Result<(), StateError> {
             Ok(())
         }
-        async fn record_metadata_write_failure(&self, _: &str, _: &str) -> Result<(), StateError> {
+        async fn record_metadata_write_failure(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
             Ok(())
         }
-        async fn clear_metadata_write_failure(&self, _: &str, _: &str) -> Result<(), StateError> {
-            Ok(())
+        async fn clear_metadata_write_failure(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
+            if self.fail_metadata_clear.load(Ordering::Relaxed) {
+                Err(StateError::LockPoisoned("simulated clear failure".into()))
+            } else {
+                Ok(())
+            }
         }
         async fn get_downloaded_metadata_hashes(
             &self,
-        ) -> Result<HashMap<(String, String), String>, StateError> {
+        ) -> Result<HashMap<(String, String, String), String>, StateError> {
             Ok(HashMap::new())
         }
         async fn get_metadata_retry_markers(
             &self,
-        ) -> Result<HashSet<(String, String)>, StateError> {
+        ) -> Result<HashSet<(String, String, String)>, StateError> {
             Ok(HashSet::new())
         }
         async fn get_pending_metadata_rewrites(
@@ -3173,7 +3811,13 @@ mod tests {
         ) -> Result<Vec<AssetRecord>, StateError> {
             Ok(Vec::new())
         }
-        async fn update_metadata_hash(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+        async fn update_metadata_hash(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
             Ok(())
         }
         async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
@@ -3189,10 +3833,31 @@ mod tests {
         assert_eq!(db.success_count(), 0);
     }
 
+    /// CG-13: when `clear_metadata_write_failure` returns Err, the
+    /// previous `let _ = ...` swallow let the metadata-rewrite marker
+    /// stay set forever. The asset would be re-rewritten on every
+    /// subsequent sync. Surface the failure as a structured warn so it
+    /// shows up in logs/metrics.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn update_metadata_marker_warns_when_clear_fails() {
+        let db = FailingStateDb::with_failing_metadata_clear();
+        update_metadata_marker(&db, "PrimarySync", "ASSET_X", "original", true).await;
+        assert!(
+            logs_contain("Could not clear metadata-write-failed marker"),
+            "warn must fire when clear returns Err"
+        );
+        assert!(
+            logs_contain("asset_id=\"ASSET_X\""),
+            "structured asset_id field expected"
+        );
+    }
+
     #[tokio::test]
     async fn flush_pending_state_writes_succeeds_on_first_try() {
         let db = FailingStateDb::new(0);
         let pending = vec![PendingStateWrite {
+            library: "PrimarySync".into(),
             asset_id: "A1".into(),
             version_size: VersionSizeKey::Original,
             download_path: PathBuf::from("/tmp/claude/photo.jpg"),
@@ -3209,6 +3874,7 @@ mod tests {
         // Fail the first attempt, succeed on retry
         let db = FailingStateDb::new(1);
         let pending = vec![PendingStateWrite {
+            library: "PrimarySync".into(),
             asset_id: "A1".into(),
             version_size: VersionSizeKey::Original,
             download_path: PathBuf::from("/tmp/claude/photo.jpg"),
@@ -3225,6 +3891,7 @@ mod tests {
         // Fail all attempts — must exceed STATE_WRITE_MAX_RETRIES
         let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize);
         let pending = vec![PendingStateWrite {
+            library: "PrimarySync".into(),
             asset_id: "A1".into(),
             version_size: VersionSizeKey::Original,
             download_path: PathBuf::from("/tmp/claude/photo.jpg"),
@@ -3243,6 +3910,7 @@ mod tests {
         let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize + 1);
         let pending = vec![
             PendingStateWrite {
+                library: "PrimarySync".into(),
                 asset_id: "A1".into(),
                 version_size: VersionSizeKey::Original,
                 download_path: PathBuf::from("/tmp/claude/photo1.jpg"),
@@ -3250,6 +3918,7 @@ mod tests {
                 download_checksum: None,
             },
             PendingStateWrite {
+                library: "PrimarySync".into(),
                 asset_id: "A2".into(),
                 version_size: VersionSizeKey::Original,
                 download_path: PathBuf::from("/tmp/claude/photo2.jpg"),
@@ -3272,6 +3941,7 @@ mod tests {
         let db = FailingStateDb::new(2);
         let pending: Vec<PendingStateWrite> = (0..5)
             .map(|i| PendingStateWrite {
+                library: "PrimarySync".into(),
                 asset_id: format!("ASSET_{i}").into(),
                 version_size: VersionSizeKey::Original,
                 download_path: PathBuf::from(format!("/tmp/claude/photo_{i}.jpg")),
@@ -3319,7 +3989,7 @@ mod tests {
         assert_eq!(seen_ids.len(), 2, "only 2 unique IDs should be tracked");
     }
 
-    /// NB-1: When a CancellationToken fires during a download pass with
+    /// When a CancellationToken fires during a download pass with
     /// concurrent tasks, the function must return promptly (well within the
     /// Docker stop_grace_period) rather than blocking on the remaining stream.
     #[tokio::test]
@@ -3351,6 +4021,10 @@ mod tests {
         let config = Arc::new(DownloadConfig {
             directory: std::sync::Arc::from(dir.path()),
             folder_structure: "{:%Y/%m/%d}".to_string(),
+            folder_structure_albums: Arc::from(crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS),
+            folder_structure_smart_folders: Arc::from(
+                crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
+            ),
             size: AssetVersionSize::Original,
             skip_videos: false,
             skip_photos: false,
@@ -3395,6 +4069,7 @@ mod tests {
             exclude_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
+            library: std::sync::Arc::from("PrimarySync"),
         });
 
         let client = reqwest::Client::builder()
@@ -3440,6 +4115,10 @@ mod tests {
                 "/nonexistent/download_filter_tests",
             )),
             folder_structure: "{:%Y/%m/%d}".to_string(),
+            folder_structure_albums: Arc::from(crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS),
+            folder_structure_smart_folders: Arc::from(
+                crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
+            ),
             size: AssetVersionSize::Original,
             skip_videos: false,
             skip_photos: false,
@@ -3480,6 +4159,7 @@ mod tests {
             exclude_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
+            library: std::sync::Arc::from("PrimarySync"),
         });
         let client = reqwest::Client::new();
         let shutdown_token = CancellationToken::new();
@@ -3530,6 +4210,7 @@ mod tests {
 
         let prior_seen_at = chrono::Utc::now().timestamp() - 86400;
         let record = AssetRecord::new_pending(
+            "PrimarySync".into(),
             "GHOST".into(),
             VersionSizeKey::Original,
             "ck_ghost".into(),
@@ -3709,10 +4390,17 @@ mod tests {
             .metadata(metadata)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded("REWRITE_1", "original", &photo_path, "rewrite_ck", None)
-            .await
-            .unwrap();
-        db.record_metadata_write_failure("REWRITE_1", "original")
+        db.mark_downloaded(
+            "PrimarySync",
+            "REWRITE_1",
+            "original",
+            &photo_path,
+            "rewrite_ck",
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "REWRITE_1", "original")
             .await
             .unwrap();
 
@@ -3721,11 +4409,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(&*pending[0].id, "REWRITE_1");
 
-        let flags = MetadataFlags {
-            rating: true,
-            embed_xmp: true,
-            ..MetadataFlags::default()
-        };
+        let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
         run_metadata_rewrites(&db, flags, &token).await;
 
@@ -3743,7 +4427,11 @@ mod tests {
         // to completion (not the seeded placeholder).
         let hashes = db.get_downloaded_metadata_hashes().await.unwrap();
         let new_hash = hashes
-            .get(&("REWRITE_1".to_string(), "original".to_string()))
+            .get(&(
+                "PrimarySync".to_string(),
+                "REWRITE_1".to_string(),
+                "original".to_string(),
+            ))
             .expect("row must remain in the downloaded set");
         assert_eq!(
             new_hash, &seeded_hash,
@@ -3789,6 +4477,7 @@ mod tests {
             .build();
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
+            "PrimarySync",
             "MISSING_FILE",
             "original",
             &vanished_path,
@@ -3797,15 +4486,11 @@ mod tests {
         )
         .await
         .unwrap();
-        db.record_metadata_write_failure("MISSING_FILE", "original")
+        db.record_metadata_write_failure("PrimarySync", "MISSING_FILE", "original")
             .await
             .unwrap();
 
-        let flags = MetadataFlags {
-            rating: true,
-            embed_xmp: true,
-            ..MetadataFlags::default()
-        };
+        let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
         run_metadata_rewrites(&db, flags, &token).await;
 
@@ -3815,5 +4500,55 @@ mod tests {
             1,
             "marker must survive when the file is absent so a future sync retries"
         );
+    }
+
+    /// The trust-state sample-check moved off the
+    /// blocking `Path::exists` onto `tokio::fs::try_exists`. Pin the helper:
+    /// existing paths are not in the missing set, non-existent paths are.
+    #[tokio::test]
+    async fn sample_missing_paths_returns_only_absent_paths() {
+        use std::fs::File;
+        use std::io::Write;
+
+        let dir = tempfile::Builder::new()
+            .prefix("kei-sample-missing-")
+            .tempdir()
+            .expect("tempdir");
+
+        let present = dir.path().join("present.jpg");
+        File::create(&present).unwrap().write_all(b"x").unwrap();
+
+        let absent = dir.path().join("absent.jpg");
+
+        let paths = vec![present.clone(), absent.clone()];
+        let missing = sample_missing_paths(&paths).await;
+
+        assert_eq!(missing, vec![absent], "only the absent path should surface");
+    }
+
+    /// An all-empty input yields an empty output (no false positives
+    /// when the sample query returns no rows).
+    #[tokio::test]
+    async fn sample_missing_paths_empty_input_yields_empty_output() {
+        let missing = sample_missing_paths(&[]).await;
+        assert!(missing.is_empty());
+    }
+
+    /// Every path absent → every path returned. Pins the inverse of
+    /// the happy path so the iteration shape can't drift.
+    #[tokio::test]
+    async fn sample_missing_paths_all_absent_returns_full_input() {
+        let dir = tempfile::Builder::new()
+            .prefix("kei-sample-all-absent-")
+            .tempdir()
+            .expect("tempdir");
+        // Don't create any of these files; the whole input is absent.
+        let paths = vec![
+            dir.path().join("a.jpg"),
+            dir.path().join("b.jpg"),
+            dir.path().join("c.jpg"),
+        ];
+        let missing = sample_missing_paths(&paths).await;
+        assert_eq!(missing, paths);
     }
 }

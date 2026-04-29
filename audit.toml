@@ -4,7 +4,10 @@
 [advisories]
 ignore = [
     # `paste` unmaintained; reaches kei only transitively via `mp4-atom`
-    # (pure-Rust HEIC atom editor). No mp4-atom replacement yet.
+    # (pure-Rust HEIC atom editor). Tracked alongside the mp4-atom
+    # replacement work in `.scratch/mp4-atom-iloc-issue.md`; revisit when
+    # upstream cuts a release that handles `uri infe` boxes (issue #274)
+    # and drops the proc-macro `paste` dep.
     "RUSTSEC-2024-0436",
 
     # `rand 0.9.2` unsound with a custom logger. kei's direct
