@@ -1255,6 +1255,339 @@ mod tests {
         assert!(paths.is_empty());
     }
 
+    // ── expected_paths_for / filter_asset_to_tasks parity ────────────────
+    //
+    // expected_paths_for is import-existing's view of where sync would have
+    // written each asset. filter_asset_to_tasks is sync's source of truth
+    // for the same derivation. They must agree on the bare path (before
+    // collision-suffix resolution) so import-existing scans the file sync
+    // actually produces. These tests pin parity across the configurations
+    // most likely to drift apart (file_match_policy, size variants, live
+    // photo modes, raw alignment).
+
+    fn assert_primary_path_parity(asset: &PhotoAsset, config: &DownloadConfig, label: &str) {
+        let expected = expected_paths_for(asset, config);
+        let tasks = filter_asset_fresh(asset, config);
+        let primary_expected = expected
+            .iter()
+            .find(|p| !matches!(p.version_size, VersionSizeKey::LiveOriginal))
+            .map(|p| p.path.clone())
+            .unwrap_or_default();
+        let primary_task = tasks
+            .iter()
+            .find(|t| !matches!(t.version_size, VersionSizeKey::LiveOriginal))
+            .map(|t| t.download_path.to_path_buf())
+            .unwrap_or_default();
+        assert_eq!(
+            primary_expected, primary_task,
+            "{label}: expected_paths_for primary path drifted from filter_asset_to_tasks"
+        );
+    }
+
+    fn assert_live_mov_parity(asset: &PhotoAsset, config: &DownloadConfig, label: &str) {
+        let expected = expected_paths_for(asset, config);
+        let tasks = filter_asset_fresh(asset, config);
+        let mov_expected = expected
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal))
+            .map(|p| p.path.clone())
+            .unwrap_or_default();
+        let mov_task = tasks
+            .iter()
+            .find(|t| matches!(t.version_size, VersionSizeKey::LiveOriginal))
+            .map(|t| t.download_path.to_path_buf())
+            .unwrap_or_default();
+        assert_eq!(
+            mov_expected, mov_task,
+            "{label}: expected_paths_for live-MOV path drifted from filter_asset_to_tasks"
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_default_config() {
+        let asset = TestPhotoAsset::new("PAR_1")
+            .filename("IMG_5001.JPG")
+            .build();
+        let config = test_config();
+        assert_primary_path_parity(&asset, &config, "default");
+    }
+
+    #[test]
+    fn expected_paths_parity_name_id7() {
+        let asset = TestPhotoAsset::new("PAR_2")
+            .filename("IMG_5002.JPG")
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        assert_primary_path_parity(&asset, &config, "NameId7");
+    }
+
+    #[test]
+    fn expected_paths_parity_size_medium_with_fallback() {
+        // size=Medium but no medium version available; both call sites
+        // must fall back to Original consistently (force_size=false).
+        let asset = TestPhotoAsset::new("PAR_3")
+            .filename("IMG_5003.JPG")
+            .build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = false;
+        assert_primary_path_parity(&asset, &config, "Medium fallback");
+    }
+
+    #[test]
+    fn expected_paths_parity_live_photo_both() {
+        let asset = TestPhotoAsset::new("PAR_4")
+            .filename("IMG_5004.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let config = test_config();
+        assert_primary_path_parity(&asset, &config, "live both primary");
+        assert_live_mov_parity(&asset, &config, "live both mov");
+    }
+
+    #[test]
+    fn expected_paths_parity_live_photo_name_id7() {
+        let asset = TestPhotoAsset::new("PAR_5")
+            .filename("IMG_5005.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        assert_primary_path_parity(&asset, &config, "live id7 primary");
+        assert_live_mov_parity(&asset, &config, "live id7 mov");
+    }
+
+    #[test]
+    fn expected_paths_parity_live_photo_video_only() {
+        // VideoOnly: primary path absent in both, MOV present in both.
+        let asset = TestPhotoAsset::new("PAR_6")
+            .filename("IMG_5006.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        assert_primary_path_parity(&asset, &config, "video-only primary (absent)");
+        assert_live_mov_parity(&asset, &config, "video-only mov");
+    }
+
+    #[test]
+    fn expected_paths_parity_mov_filename_policy_original() {
+        // The non-default MOV filename policy is a known drift suspect:
+        // the live_photo_mov_path_original branch in expected_paths_for
+        // reuses a helper from paths.rs that filter_asset_to_tasks also
+        // calls; this pins them.
+        let asset = TestPhotoAsset::new("PAR_7")
+            .filename("IMG_5007.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mov_filename_policy = LivePhotoMovFilenamePolicy::Original;
+        assert_primary_path_parity(&asset, &config, "mov policy=Original primary");
+        assert_live_mov_parity(&asset, &config, "mov policy=Original mov");
+    }
+
+    #[test]
+    fn expected_paths_parity_custom_album_in_folder_template() {
+        let asset = TestPhotoAsset::new("PAR_8")
+            .filename("IMG_5008.JPG")
+            .build();
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        config.album_name = Some(Arc::from("Vacation 2025"));
+        assert_primary_path_parity(&asset, &config, "album in template");
+    }
+
+    // ── expected_paths_for negative-space coverage ───────────────────────
+    //
+    // The 11 happy-path expected_paths_* tests above leave a lot of input
+    // surface untested. These pin behavior on the filename / album-name
+    // edges most likely to surprise: non-ASCII when keep_unicode is on vs
+    // off, traversal-style names, names that vanish after sanitization,
+    // separators inside filenames, and weird album names.
+
+    #[test]
+    fn expected_paths_keeps_unicode_when_flag_set() {
+        let asset = TestPhotoAsset::new("UNI_1")
+            .filename("héllo_wörld.JPG")
+            .build();
+        let mut config = test_config();
+        config.keep_unicode_in_filenames = true;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains('é') && name.contains('ö'),
+            "keep_unicode=true should preserve non-ASCII, got {name}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_strips_unicode_when_flag_off() {
+        let asset = TestPhotoAsset::new("UNI_2")
+            .filename("héllo_wörld.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains('é') && !name.contains('ö') && name.contains("hllo_wrld"),
+            "keep_unicode=false should strip non-ASCII, got {name}"
+        );
+    }
+
+    /// Characterization test (current behavior, not desired behavior):
+    /// `日本語.jpg` with `keep_unicode_in_filenames=false` strips to a
+    /// dotfile-shaped `.JPG`. import-existing then scans for a literal
+    /// `.JPG` file, which is a hidden file on Unix and unlikely to
+    /// match anything sync wrote. The fingerprint-fallback only fires
+    /// when `filename()` returns `None`, not when the filename
+    /// degenerates after stripping. If a future change makes
+    /// `expected_paths_for` fall back to a fingerprint name in this
+    /// case, this test should be inverted; see TODO note.
+    // TODO: fall back to fingerprint name when post-strip filename is
+    // dotfile-only (`.<ext>`). Tracked separately from this test PR.
+    #[test]
+    fn expected_paths_filename_emptied_by_unicode_strip_characterization() {
+        let asset = TestPhotoAsset::new("UNI_3").filename("日本語.jpg").build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            name, ".JPG",
+            "current behavior: filename collapses to a dotfile after non-ASCII strip"
+        );
+    }
+
+    #[test]
+    fn expected_paths_keep_unicode_with_decomposed_form() {
+        // NFC "é" (U+00E9) vs NFD "e\u{0301}" — kei does no normalization,
+        // so both round-trip when keep_unicode=true. Pin that so a future
+        // unicode-normalization pass doesn't silently change matches.
+        let nfc = "ca\u{00e9}.JPG";
+        let nfd = "cae\u{0301}.JPG";
+        let mut config = test_config();
+        config.keep_unicode_in_filenames = true;
+        for (label, fname) in [("NFC", nfc), ("NFD", nfd)] {
+            let asset = TestPhotoAsset::new("UNI_4").filename(fname).build();
+            let paths = expected_paths_for(&asset, &config);
+            assert_eq!(paths.len(), 1, "{label}: expected one path");
+            let name = paths[0].path.file_name().unwrap().to_string_lossy();
+            assert_eq!(
+                name, fname,
+                "{label}: filename round-trip should be byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_paths_filename_with_path_separators_is_safe() {
+        // iCloud filenames shouldn't contain `/` but the wire format is
+        // a string, so a malformed asset could carry one. The path must
+        // still be confined to `directory` (no traversal out).
+        let asset = TestPhotoAsset::new("SEP_1")
+            .filename("evil/IMG.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let path_str = paths[0].path.to_string_lossy().into_owned();
+        // The directory prefix is stable; everything after must not
+        // re-introduce a `/IMG` segment that could escape into a sibling
+        // directory.
+        let dir_str = config.directory.to_string_lossy().into_owned();
+        assert!(
+            path_str.starts_with(&dir_str),
+            "path escaped directory: {path_str}"
+        );
+        let suffix = path_str.trim_start_matches(&*dir_str);
+        assert!(
+            !suffix.contains("/evil/") && !suffix.contains("evil/IMG.JPG"),
+            "raw `evil/IMG.JPG` survived sanitization: {suffix}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_filename_with_traversal_is_safe() {
+        // `../../etc/passwd.JPG` — the path-separator + traversal
+        // sequence has to land inside `directory`, not at /etc/passwd.
+        // Sanitization replaces `/` with `_`, so `..` substrings can
+        // survive *as part of one filename*, which is harmless. What
+        // must NOT happen: the path having extra segments that walk
+        // out of `directory`.
+        let asset = TestPhotoAsset::new("TRAV_1")
+            .filename("../../etc/passwd.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0].path;
+        assert!(
+            path.starts_with(&*config.directory),
+            "path escaped configured directory: {}",
+            path.display()
+        );
+        // Folder template is `%Y/%m/%d` (3 dated dirs) + 1 filename
+        // = 4 components past `directory`. Anything more means a
+        // traversal segment leaked into the path tree.
+        let suffix = path.strip_prefix(&*config.directory).unwrap();
+        assert_eq!(
+            suffix.components().count(),
+            4,
+            "extra path segments (traversal leak): {}",
+            suffix.display()
+        );
+        // And the literal `/etc/passwd` must not appear as part of a
+        // path component sequence.
+        let path_str = path.to_string_lossy();
+        assert!(
+            !path_str.contains("/etc/") && !path_str.contains("/passwd."),
+            "raw traversal segments survived in the path: {path_str}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_album_name_with_separators_sanitized() {
+        let asset = TestPhotoAsset::new("ALB_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.folder_structure = "{album}".to_string();
+        config.album_name = Some(Arc::from("evil/../escape"));
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let path_str = paths[0].path.to_string_lossy().into_owned();
+        assert!(
+            !path_str.contains("..") && !path_str.contains("/escape/"),
+            "album traversal survived: {path_str}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_filename_only_dots_and_spaces() {
+        // "  ...  " trims to empty — filename derivation has to produce
+        // *some* name, not a literal "" segment.
+        let asset = TestPhotoAsset::new("DOTS_1").filename("  ...  ").build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.is_empty() && !name.trim_matches(|c: char| c == '.' || c == ' ').is_empty(),
+            "filename must not collapse to a dots/spaces-only name, got {name:?}"
+        );
+    }
+
     #[test]
     fn test_filter_skips_videos_when_configured() {
         let asset = TestPhotoAsset::new("VID_1")

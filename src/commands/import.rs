@@ -1636,6 +1636,350 @@ mod wiremock_tests {
         assert!(all_downloaded(db.as_ref()).await.is_empty());
     }
 
+    // ── filter-then-no-hash: broader coverage ─────────────────────────
+    //
+    // `skip_videos_excludes_movie_assets` and
+    // `is_asset_filtered_blocks_excluded_asset_id` already pin the gate
+    // for two filter sources. The branch's commit "honor is_asset_filtered"
+    // (05356d2) ties the import path to ALL filter sources, not just two.
+    // These pin skip_photos / date / filename-exclude so a future change
+    // that loses one of them surfaces here.
+    //
+    // Each test stages the file the matcher would land on without the
+    // filter and asserts matched=0 + no DB rows -- proving the filter
+    // ran *before* the path derivation + hash + upsert chain.
+
+    #[tokio::test]
+    async fn skip_photos_excludes_still_assets() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("STILL1", "IMG_S1.JPG", "public.jpeg").orig(
+            1000,
+            "ck_still1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut config = base_config(&dl);
+        config.skip_photos = true;
+        // File on disk so the only way for matched to stay 0 is the gate.
+        stage_expected(&asset.to_photo_asset(), &base_config(&dl));
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.matched, 0, "skip_photos must drop the still");
+        assert_eq!(stats.unmatched, 0, "filter fires before resolve_match_path");
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn date_filter_excludes_assets_outside_window() {
+        // skip_created_before set to mid-2025 drops anything older.
+        // The default WiremockAsset asset_date is Jan 14 2025, before
+        // the cutoff.
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("OLD1", "IMG_OLD.JPG", "public.jpeg").orig(
+            1000,
+            "ck_old1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut config = base_config(&dl);
+        // 2025-06-01 cutoff; asset is dated 2025-01-14, so it must be filtered.
+        config.skip_created_before = chrono::DateTime::from_timestamp(1_748_736_000, 0);
+        stage_expected(&asset.to_photo_asset(), &base_config(&dl));
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats.total, 1);
+        assert_eq!(
+            stats.matched, 0,
+            "date filter must drop the asset before hash"
+        );
+        assert_eq!(stats.unmatched, 0);
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filename_exclude_glob_drops_matching_assets() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("BLOCK1", "IMG_BLOCK.JPG", "public.jpeg").orig(
+            1000,
+            "ck_block1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut config = base_config(&dl);
+        // Glob matches the filename above.
+        let pattern = glob::Pattern::new("IMG_BLOCK.*").expect("compile glob");
+        config.filename_exclude = Arc::from(vec![pattern]);
+        stage_expected(&asset.to_photo_asset(), &base_config(&dl));
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats.total, 1);
+        assert_eq!(
+            stats.matched, 0,
+            "filename_exclude must drop the asset before hash"
+        );
+        assert_eq!(stats.unmatched, 0);
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+    }
+
+    // ── filesystem-edge coverage ──────────────────────────────────────
+    //
+    // The matcher reads `metadata.len()` and (on size match) `compute_sha256`.
+    // A user library can contain symlinks, hardlinks, broken symlinks,
+    // permission-denied directories, and unusual file types. These pin
+    // kei's behavior on each edge so a future scan-tree refactor doesn't
+    // silently change semantics on real-world libraries.
+    //
+    // We don't test races (file mutating mid-scan) because reproducing
+    // them deterministically requires fault injection we don't have, and
+    // a flaky test for a real correctness bug is worse than no test.
+
+    /// A symlink to a same-size file at the expected path matches like the
+    /// real file -- `metadata.len()` follows symlinks by default. Pins the
+    /// "user reorganized via symlink" migration story.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_to_real_file_at_expected_path_matches() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("SYM1", "IMG_SYM.JPG", "public.jpeg").orig(
+            1234,
+            "ck_sym1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+
+        // Stage the real file in a sibling dir, then symlink it to where
+        // expected_paths_for says the file should be.
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("IMG_SYM.JPG");
+        stage_file(&real, 1234);
+
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(expected.len(), 1);
+        if let Some(parent) = expected[0].path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, &expected[0].path).expect("symlink");
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats.total, 1);
+        assert_eq!(
+            stats.matched, 1,
+            "symlink to a same-size file must read as a match"
+        );
+        assert_eq!(stats.unmatched, 0);
+        assert_eq!(all_downloaded(db.as_ref()).await.len(), 1);
+    }
+
+    /// A broken (dangling) symlink at the expected path must NOT match,
+    /// must NOT panic, and must NOT leave an orphan pending row in the
+    /// state DB. Counts as one "unmatched" version since the resolve step
+    /// fails to stat.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broken_symlink_at_expected_path_does_not_match() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("BROKEN1", "IMG_BR.JPG", "public.jpeg").orig(
+            500,
+            "ck_br1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(expected.len(), 1);
+        if let Some(parent) = expected[0].path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let target = tmp.path().join("does_not_exist");
+        std::os::unix::fs::symlink(&target, &expected[0].path).expect("dangling symlink");
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats.total, 1);
+        assert_eq!(
+            stats.matched, 0,
+            "broken symlink must not match (stat fails)"
+        );
+        assert_eq!(stats.unmatched, 1);
+        assert!(
+            all_downloaded(db.as_ref()).await.is_empty(),
+            "no DB row for the broken symlink"
+        );
+    }
+
+    /// Two hardlinks to the same content count as two distinct files for
+    /// matching purposes -- import treats each `expected_paths_for` entry
+    /// as its own match attempt, so a library with `IMG.JPG` linked from
+    /// two albums should still produce two matches (one per asset_id +
+    /// album combination). This pins the simpler "single-asset hardlinked
+    /// at the expected path" case: the file matches normally regardless
+    /// of link count.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hardlinked_file_at_expected_path_matches() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("HARD1", "IMG_H1.JPG", "public.jpeg").orig(
+            900,
+            "ck_h1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+
+        // Stage the real file elsewhere and hardlink it into the
+        // expected location. metadata.len follows the inode so a hardlink
+        // is indistinguishable from a regular file at this layer.
+        let real_dir = tmp.path().join("orig");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("IMG_H1.JPG");
+        stage_file(&real, 900);
+
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(expected.len(), 1);
+        if let Some(parent) = expected[0].path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::hard_link(&real, &expected[0].path).expect("hard_link");
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats.matched, 1, "hardlinked file matches like a regular");
+        assert_eq!(stats.unmatched, 0);
+    }
+
+    /// A file inside a permission-denied directory cannot be stat'd, so
+    /// resolve_match_path returns None and the asset reads as unmatched
+    /// (not a hard error). Pins that import-existing keeps going past
+    /// EACCES rather than aborting the whole scan.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_denied_subdir_does_not_abort_scan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let server = MockServer::start().await;
+        let blocked = WiremockAsset::new("DENIED1", "IMG_D.JPG", "public.jpeg").orig(
+            1000,
+            "ck_denied1",
+            "public.jpeg",
+        );
+        let visible = WiremockAsset::new("VIS1", "IMG_V.JPG", "public.jpeg").orig(
+            1000,
+            "ck_vis1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+
+        // Stage both expected files, then strip read+execute on the
+        // blocked file's parent dir so resolve_match_path's stat fails.
+        let blocked_paths = stage_expected(&blocked.to_photo_asset(), &config);
+        stage_expected(&visible.to_photo_asset(), &config);
+        let blocked_parent = blocked_paths[0].parent().expect("parent").to_path_buf();
+        std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[blocked, visible], db.as_ref(), &config, false).await;
+
+        // Restore so TempDir cleanup can drop the file.
+        let _ = std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o755));
+
+        assert_eq!(stats.total, 2, "both assets must be enumerated");
+        // Both assets share asset_date default, so they land under the
+        // same `%Y/%m/%d` parent dir; stripping perms on one parent
+        // blocks both files. The invariant we're pinning is "no panic,
+        // no abort": every enumerated asset reaches a terminal state.
+        assert_eq!(
+            stats.matched + stats.unmatched,
+            stats.total,
+            "every enumerated asset must reach a terminal state, got {stats:?}",
+        );
+        assert!(
+            all_downloaded(db.as_ref()).await.len() == stats.matched as usize,
+            "DB downloaded rows must equal matched count",
+        );
+    }
+
+    // ── cancellation / fetcher-panic propagation ──────────────────────
+    //
+    // import_assets accepts `panic_rx`, the receiver from
+    // `photo_stream`'s panic guard. After draining, if the channel
+    // signals true, the function bails -- otherwise a fetcher panic
+    // would close the stream early and we'd report a partial scan as
+    // clean. The wiremock end-to-end tests above never trigger this
+    // path. These tests construct the channel manually.
+
+    /// The happy path: the panic_rx sender is dropped without sending,
+    /// matching `photo_stream`'s clean-exit signal. import_assets must
+    /// return Ok with whatever stats accumulated.
+    #[tokio::test]
+    async fn import_assets_returns_ok_when_panic_rx_sender_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        let db = open_db(&tmp).await;
+
+        // Empty stream + dropped-sender panic_rx.
+        let stream = futures_util::stream::empty::<anyhow::Result<PhotoAsset>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        drop(tx);
+
+        let stats = import_assets(stream, rx, db.as_ref(), &config, "test-all", false, false)
+            .await
+            .expect("clean exit must be Ok");
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.matched, 0);
+        assert_eq!(stats.unmatched, 0);
+    }
+
+    /// Fetcher panic: the panic_rx delivers `true`. import_assets must
+    /// surface this as Err so callers don't report a partial scan as a
+    /// clean enumeration -- the invariant the contract was added for.
+    #[tokio::test]
+    async fn import_assets_bails_when_panic_rx_signals_true() {
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        let db = open_db(&tmp).await;
+
+        let stream = futures_util::stream::empty::<anyhow::Result<PhotoAsset>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        tx.send(true).expect("send panic signal");
+
+        let err = import_assets(stream, rx, db.as_ref(), &config, "test-all", false, false)
+            .await
+            .expect_err("must bail on fetcher panic");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("import scan aborted") && msg.contains("test-all"),
+            "error message must name the abort + label, got: {msg}"
+        );
+    }
+
     // ── icloudpd compat baseline ──────────────────────────────────────
     //
     // Scenario-driven tests that stage on-disk layouts using icloudpd's

@@ -680,3 +680,148 @@ async fn live_photos_id7_multi_asset() {
         "live photos id7 multi-asset shape diverged",
     );
 }
+
+// ── Intentional divergence from icloudpd ────────────────────────────────
+//
+// Cases where kei deliberately differs from icloudpd's path derivation.
+// These are characterization tests: if any one fails, ask "was the
+// divergence intentional?" before adjusting. Re-converging with icloudpd
+// here would silently change matches for kei users who rely on the
+// current shape.
+
+/// kei preserves the iCloud-side extension case verbatim (`.JPG`,
+/// `.HEIC`, `.MOV` -- whatever Apple sends). icloudpd lowercases to
+/// `.jpg`/`.heic`/`.mov` in some code paths. If a future kei change
+/// starts lowercasing, this test catches it.
+#[tokio::test]
+async fn kei_preserves_uppercase_extension_from_icloud() {
+    let server = MockServer::start().await;
+    let tmp = TempDir::new().unwrap();
+    let dl = tmp.path().join("photos");
+    std::fs::create_dir_all(&dl).unwrap();
+    let config = base_config(&dl);
+
+    // Stage at the *uppercase* extension to prove kei's expected_paths_for
+    // emits uppercase, not lowercase.
+    let fixtures: &[(&str, &str, u64)] = &[("2020/01/15", "PHOTO_42.JPG", 50_000)];
+    stage_icloudpd_fixtures(&dl, fixtures);
+
+    let mut a = WiremockAsset::new("UPPER1", "PHOTO_42.JPG", "public.jpeg").orig(
+        50_000,
+        "ck_upper1",
+        "public.jpeg",
+    );
+    a.asset_date = ts_for_folder("2020/01/15");
+
+    let db = open_db(&tmp).await;
+    let stats = run_import(&server, &[a], db.as_ref(), &config, false).await;
+    assert_eq!(stats.matched, 1, "kei must keep .JPG uppercase verbatim");
+    let row = &all_downloaded(db.as_ref()).await[0];
+    assert!(
+        row.filename.ends_with(".JPG"),
+        "DB row must record uppercase extension, got {:?}",
+        row.filename,
+    );
+}
+
+/// kei falls back to a SHA256-derived fingerprint name when iCloud
+/// doesn't return a filename. icloudpd uses `<record_name>.<ext>` with
+/// the raw record name. The fingerprint is collision-resistant and stable;
+/// pinning it ensures import-existing keeps finding files sync writes
+/// when filename is absent (e.g. some CloudKit responses for synthetic
+/// or migrated assets).
+#[tokio::test]
+async fn kei_uses_fingerprint_filename_when_filename_missing() {
+    use crate::download::paths::generate_fingerprint_filename;
+    use serde_json::json;
+
+    let server = MockServer::start().await;
+    let tmp = TempDir::new().unwrap();
+    let dl = tmp.path().join("photos");
+    std::fs::create_dir_all(&dl).unwrap();
+    let config = base_config(&dl);
+
+    // Build asset directly via JSON: omit filenameEnc so PhotoAsset's
+    // `filename()` returns None and expected_paths_for falls back.
+    let record_name = "FNGR_RECORD_99";
+    let asset_date = ts_for_folder("2024/03/14");
+    let master = json!({
+        "recordName": record_name,
+        "fields": {
+            "itemType": {"value": "public.jpeg"},
+            "resOriginalFileType": {"value": "public.jpeg"},
+            "resOriginalRes": {"value": {
+                "size": 7777,
+                "downloadURL": "https://p01.icloud-content.com/orig",
+                "fileChecksum": "ck_fpgr",
+            }},
+        },
+    });
+    let asset_record = json!({
+        "fields": {"assetDate": {"value": asset_date}, "addedDate": {"value": asset_date}},
+    });
+    let asset = PhotoAsset::new(master, asset_record);
+
+    // What kei's fingerprint fallback should land on.
+    let fp_name = generate_fingerprint_filename(record_name, "public.jpeg");
+    stage_file(&dl.join("2024/03/14").join(&fp_name), 7777);
+
+    // Drive import_assets with a hand-built single-asset stream so we
+    // don't need a wire fixture for this case.
+    let stream = futures_util::stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]);
+    let (tx, panic_rx) = tokio::sync::oneshot::channel::<bool>();
+    drop(tx);
+    let db = open_db(&tmp).await;
+    let stats = import_assets(
+        stream,
+        panic_rx,
+        db.as_ref(),
+        &config,
+        "test-all",
+        false,
+        false,
+    )
+    .await
+    .expect("import_assets ok");
+    assert_eq!(stats.matched, 1, "kei must use the fingerprint fallback");
+    let _ = server; // suppress unused-mut on server (not used; kept for symmetry)
+}
+
+/// `RawTreatmentPolicy::Unchanged` (kei's default) keeps the iCloud-side
+/// `.DNG` extension verbatim and does not pair RAW + JPEG. icloudpd's
+/// `--keep-raw` has different semantics (it changes pairing behavior in
+/// ways kei doesn't replicate). Pin kei's Unchanged shape so a future
+/// align_raw refactor doesn't accidentally reach for icloudpd-style
+/// pairing.
+#[tokio::test]
+async fn kei_align_raw_unchanged_keeps_dng_extension() {
+    let server = MockServer::start().await;
+    let tmp = TempDir::new().unwrap();
+    let dl = tmp.path().join("photos");
+    std::fs::create_dir_all(&dl).unwrap();
+    let config = base_config(&dl);
+    assert_eq!(
+        config.align_raw,
+        crate::types::RawTreatmentPolicy::Unchanged,
+        "test depends on the Unchanged default"
+    );
+
+    let fixtures: &[(&str, &str, u64)] = &[("2024/02/02", "RAW_007.DNG", 18_000_000)];
+    stage_icloudpd_fixtures(&dl, fixtures);
+
+    let mut a = WiremockAsset::new("RAW1", "RAW_007.DNG", "com.adobe.raw-image").orig(
+        18_000_000,
+        "ck_raw1",
+        "com.adobe.raw-image",
+    );
+    a.asset_date = ts_for_folder("2024/02/02");
+
+    let db = open_db(&tmp).await;
+    let stats = run_import(&server, &[a], db.as_ref(), &config, false).await;
+    assert_eq!(stats.matched, 1, "Unchanged must preserve .DNG verbatim");
+    let row = &all_downloaded(db.as_ref()).await[0];
+    assert_eq!(
+        &*row.filename, "RAW_007.DNG",
+        "kei must not lowercase or mutate the DNG extension under Unchanged"
+    );
+}
