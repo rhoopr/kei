@@ -10,7 +10,7 @@ use crate::auth;
 use crate::cli;
 use crate::config;
 use crate::download;
-use crate::download::filter::{expected_paths_for, ExpectedAssetPath};
+use crate::download::filter::{expected_paths_for, is_asset_filtered, ExpectedAssetPath};
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
@@ -56,7 +56,13 @@ async fn resolve_match_path(
     }
     if policy == FileMatchPolicy::NameSizeDedupWithSuffix {
         let parent = primary.parent().unwrap_or(Path::new(""));
-        let fname = primary.file_name().and_then(|f| f.to_str())?;
+        let Some(fname) = primary.file_name().and_then(|f| f.to_str()) else {
+            tracing::debug!(
+                path = %primary.display(),
+                "Skipping dedup-suffix fallback: filename is not valid UTF-8",
+            );
+            return None;
+        };
         let suffixed_fname = download::paths::add_dedup_suffix(fname, expected_size);
         let suffixed = parent.join(suffixed_fname);
         if let Ok(m) = tokio::fs::metadata(&suffixed).await {
@@ -110,6 +116,17 @@ where
 
         if asset.versions().is_empty() {
             tracing::debug!(id = %asset.id(), "Skipping asset with no versions");
+            continue;
+        }
+
+        // `expected_paths_for` documents the precondition that callers run
+        // `is_asset_filtered` first to apply content/date filters. Most filter
+        // inputs are inert here (build_import_download_config zeros them out),
+        // but live_photo_mode IS user-configurable, and other filter sources
+        // (TOML defaults, future flag additions) could leak through. Honor the
+        // contract uniformly so the gate stays in one place.
+        if let Some(reason) = is_asset_filtered(&asset, download_config) {
+            tracing::debug!(id = %asset.id(), ?reason, "Skipping (is_asset_filtered)");
             continue;
         }
 
@@ -206,6 +223,11 @@ where
     // Enumeration drained -- but if a fetcher panicked, the stream just
     // closed short, leaving `total` understated. Bail so the scan is
     // obviously aborted (not a silently partial report).
+    //
+    // `unwrap_or(false)`: a recv error means the sender was dropped without
+    // sending, i.e. the prefetch task exited cleanly. The only writer to
+    // this channel is the panic guard in `photo_stream`, which sends `true`
+    // on panic; absence of a send is the clean-exit signal.
     if panic_rx.await.unwrap_or(false) {
         anyhow::bail!(
             "import scan aborted for library '{library_label}': a fetcher task panicked; \
@@ -1006,8 +1028,12 @@ mod wiremock_tests {
         assert!(filenames.iter().any(|f| f.ends_with(".MOV")));
     }
 
+    /// `LivePhotoMode::Skip` is "skip live photos entirely (both image and
+    /// MOV)" per the type doc. The asset is still enumerated (so `total`
+    /// ticks) but `expected_paths_for` returns empty, so neither matched
+    /// nor unmatched moves and no DB rows are written.
     #[tokio::test]
-    async fn live_photo_skip_drops_mov() {
+    async fn live_photo_skip_drops_image_and_mov() {
         let server = MockServer::start().await;
         let asset = WiremockAsset::new("LIVE2", "IMG_0200.HEIC", "public.heic")
             .orig(3000, "ck_live2", "public.heic")
@@ -1018,15 +1044,24 @@ mod wiremock_tests {
         let mut config = base_config(&dl);
         config.live_photo_mode = LivePhotoMode::Skip;
 
-        stage_expected(&asset.to_photo_asset(), &config);
+        // Deliberately stage NOTHING: Skip means sync wouldn't have written
+        // either file. If import-existing later starts emitting paths under
+        // Skip again, this test would still pass (nothing on disk → both
+        // counters stay 0), so we additionally verify no DB rows.
 
         let db = open_db(&tmp).await;
         let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
 
-        assert_eq!(stats.matched, 1, "only HEIC matched, MOV skipped");
-        let rows = all_downloaded(db.as_ref()).await;
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].filename.ends_with(".HEIC"));
+        assert_eq!(stats.total, 1, "asset still enumerated");
+        assert_eq!(stats.matched, 0, "Skip drops both image and MOV");
+        assert_eq!(
+            stats.unmatched, 0,
+            "no path is attempted under Skip, so unmatched stays 0",
+        );
+        assert!(
+            all_downloaded(db.as_ref()).await.is_empty(),
+            "no DB rows for skipped live photo"
+        );
     }
 
     #[tokio::test]
@@ -1396,10 +1431,21 @@ mod wiremock_tests {
 
     // ── Tests: skip_videos / skip_photos ──────────────────────────────
 
+    /// `skip_videos` filtering happens via `is_asset_filtered`, which
+    /// `import_assets` now invokes upstream of `expected_paths_for`. The
+    /// previous incarnation of this test asserted `matched == 0` without
+    /// staging a file, so it would have passed even if the gate were
+    /// missing entirely (no file → no match for an unrelated reason). Stage
+    /// the file the matcher would land on AND verify `is_asset_filtered`
+    /// classifies it as a video-skip; if the gate disappears, `matched`
+    /// becomes 1 and `unmatched` stays 0, failing this test loudly.
     #[tokio::test]
     async fn skip_videos_excludes_movie_assets() {
         let server = MockServer::start().await;
-        let mut config = base_config(StdPath::new("/tmp/never-used"));
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut config = base_config(&dl);
         config.skip_videos = true;
 
         let asset = WiremockAsset::new("VID1", "MOV_0001.MOV", "com.apple.quicktime-movie").orig(
@@ -1408,20 +1454,35 @@ mod wiremock_tests {
             "com.apple.quicktime-movie",
         );
 
-        // skip_videos should make expected_paths_for skip movie types.
-        // (If sync skips it, import-existing must also skip it -- otherwise
-        //  a re-sync would silently re-download.)
-        let tmp = TempDir::new().unwrap();
-        let dl = tmp.path().join("photos");
-        std::fs::create_dir_all(&dl).unwrap();
-        config.directory = Arc::from(dl.as_path());
+        // Stage the file at the path expected_paths_for *would* emit if the
+        // gate were missing. Without skip_videos honored, this would match.
+        let probe_config = base_config(&dl); // skip_videos defaults to false
+        let expected_if_unfiltered = expected_paths_for(&asset.to_photo_asset(), &probe_config);
+        assert_eq!(
+            expected_if_unfiltered.len(),
+            1,
+            "probe: video should have one expected path when skip_videos=false",
+        );
+        stage_file(
+            &expected_if_unfiltered[0].path,
+            expected_if_unfiltered[0].size,
+        );
+
+        // is_asset_filtered must classify a movie under skip_videos as filtered.
+        assert!(
+            crate::download::filter::is_asset_filtered(&asset.to_photo_asset(), &config).is_some(),
+            "skip_videos must filter movie assets via is_asset_filtered",
+        );
 
         let db = open_db(&tmp).await;
         let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
-        // Movie skipped -> no path expected -> nothing matched/unmatched.
-        // (This test fails loudly if expected_paths_for stops respecting
-        // skip_videos for image+movie classification.)
-        assert_eq!(stats.matched, 0);
+
+        assert_eq!(stats.total, 1, "asset still enumerated");
+        assert_eq!(stats.matched, 0, "skip_videos must drop the movie");
+        assert_eq!(
+            stats.unmatched, 0,
+            "filter happens before path derivation; unmatched stays 0",
+        );
     }
 
     // ── icloudpd compat baseline ──────────────────────────────────────
