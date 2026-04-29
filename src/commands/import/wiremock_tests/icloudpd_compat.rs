@@ -160,9 +160,6 @@ async fn dedup_size_suffix_collision() {
     std::fs::create_dir_all(&dl).unwrap();
     let config = base_config(&dl);
 
-    // Two iCloud assets, same filename, different sizes. On disk the
-    // first gets the bare name and the second gets the icloudpd-style
-    // size suffix.
     let fixtures: &[(&str, &str, u64)] = &[
         ("2018/07/30", "IMG_DUP.JPG", 100_000),
         ("2018/07/30", "IMG_DUP-200000.JPG", 200_000),
@@ -318,11 +315,7 @@ async fn live_photo_name_id7_layout() {
 
     let rec = "REC_LIVE_HEIC";
     let img = apply_name_id7("IMG_5000.HEIC", rec); // IMG_5000_<id7>.HEIC
-                                                    // Replace `.HEIC` on the already-suffixed stem with `_HEVC.MOV`.
-    let mov = format!(
-        "{}_HEVC.MOV",
-        img.strip_suffix(".HEIC").expect("img ends in .HEIC"),
-    );
+    let mov = crate::download::paths::live_photo_mov_path_suffix(&img);
     stage_file(&dl.join(folder).join(&img), 800_000);
     stage_file(&dl.join(folder).join(&mov), 3_000_000);
 
@@ -670,10 +663,7 @@ async fn live_photos_id7_multi_asset() {
             "public.heic",
         );
         if *mov_size > 0 {
-            let mov = format!(
-                "{}_HEVC.MOV",
-                img.strip_suffix(".HEIC").expect("ends .HEIC"),
-            );
+            let mov = crate::download::paths::live_photo_mov_path_suffix(&img);
             stage_file(&dl.join(folder).join(&mov), *mov_size);
             a = a.live_mov(*mov_size, &format!("ck_{rec}_mov"));
         }
