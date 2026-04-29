@@ -469,6 +469,14 @@ pub(crate) fn expected_paths_for(
     let mut result = SmallVec::new();
     let mut effective_primary_filename: Option<String> = None;
 
+    // LivePhotoMode::Skip drops the live photo entirely (image + MOV) per the
+    // type's contract; emitting a primary path would make import-existing scan
+    // for a file sync never wrote and report it unmatched. Bail before version
+    // selection so the result stays empty for the live-photo case.
+    if config.live_photo_mode == LivePhotoMode::Skip && is_live_photo {
+        return result;
+    }
+
     let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
         versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     };
@@ -1136,13 +1144,32 @@ mod tests {
         assert_eq!(paths[0].version_size, VersionSizeKey::Original);
     }
 
+    /// `LivePhotoMode::Skip` is documented as "skip live photos entirely (both
+    /// image and MOV)." A live-photo asset under Skip must yield no paths so
+    /// import-existing doesn't scan for files sync never wrote.
     #[test]
-    fn expected_paths_skip_mode_returns_primary_only() {
+    fn expected_paths_skip_mode_emits_nothing_for_live_photo() {
         let asset = TestPhotoAsset::new("LIVE_4")
             .filename("IMG_2003.HEIC")
             .item_type("public.heic")
             .orig_file_type("public.heic")
             .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let paths = expected_paths_for(&asset, &config);
+        assert!(
+            paths.is_empty(),
+            "Skip + live photo must drop the asset, got {paths:?}"
+        );
+    }
+
+    /// Skip applies only to live photos: a non-live asset under Skip still
+    /// produces its primary path.
+    #[test]
+    fn expected_paths_skip_mode_keeps_non_live_primary() {
+        let asset = TestPhotoAsset::new("STILL_1")
+            .filename("IMG_0001.JPG")
             .build();
         let mut config = test_config();
         config.live_photo_mode = LivePhotoMode::Skip;
