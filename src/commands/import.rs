@@ -15,7 +15,7 @@ use crate::download::paths::{normalize_ampm, DirCache};
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
-use crate::state::StateDb;
+use crate::state::{StateDb, StateError};
 use crate::types::{
     AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize,
     RawTreatmentPolicy, VersionSize,
@@ -252,7 +252,7 @@ where
                     continue;
                 }
 
-                if let Err(e) = db
+                match db
                     .mark_downloaded(
                         asset.id(),
                         version_size.as_str(),
@@ -262,8 +262,19 @@ where
                     )
                     .await
                 {
-                    tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to mark as downloaded");
-                    continue;
+                    Ok(()) => {}
+                    Err(e @ StateError::AssetRowMissing { .. }) => {
+                        // The row we just upsert_seen'd is gone. This is
+                        // an invariant violation (concurrent writer? DB
+                        // corruption?) that retry can't fix; bail so the
+                        // operator can investigate before more assets
+                        // are silently dropped.
+                        anyhow::bail!("import scan aborted for library '{library_label}': {e}");
+                    }
+                    Err(e) => {
+                        tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to mark as downloaded");
+                        continue;
+                    }
                 }
             }
 

@@ -13,4 +13,5 @@ pub mod schema;
 pub mod types;
 
 pub use db::{SqliteStateDb, StateDb};
+pub use error::StateError;
 pub use types::{AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, VersionSizeKey};
