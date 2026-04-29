@@ -11,6 +11,7 @@ use crate::cli;
 use crate::config;
 use crate::download;
 use crate::download::filter::{expected_paths_for, is_asset_filtered, ExpectedAssetPath};
+use crate::download::paths::{normalize_ampm, DirCache};
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
@@ -48,16 +49,16 @@ impl std::ops::AddAssign for ImportStats {
     }
 }
 
-/// Find the on-disk path that satisfies the expected size, trying the
-/// primary path first and -- for `NameSizeDedupWithSuffix` policy -- the
-/// `<stem>-<size><ext>` collision shape as a fallback.
-///
-/// Returns `(path, metadata)` for the matching file, or `None` if neither
-/// candidate exists with size `expected_size`.
+/// Find the on-disk path that satisfies the expected size: primary, then
+/// the dedup-collision shape under `NameSizeDedupWithSuffix`, then an
+/// AM/PM whitespace sibling. macOS screenshots use NARROW NO-BREAK SPACE
+/// (`\u{202F}`) before AM/PM; trees synced through other tools may have
+/// normalized to a regular space (or vice versa).
 async fn resolve_match_path(
     primary: &Path,
     expected_size: u64,
     policy: FileMatchPolicy,
+    dir_cache: &mut DirCache,
 ) -> Option<(std::path::PathBuf, std::fs::Metadata)> {
     if let Ok(m) = tokio::fs::metadata(primary).await {
         if m.len() == expected_size {
@@ -81,7 +82,30 @@ async fn resolve_match_path(
             }
         }
     }
-    None
+    // Cheap pre-check: only pay for the dir read if the filename actually
+    // has an AM/PM whitespace token to vary. `normalize_ampm` is idempotent
+    // on filenames that have no such token, so the inequality below is the
+    // exact condition under which `find_ampm_variant` could return Some.
+    let needs_probe = primary
+        .file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|f| normalize_ampm(f) != f);
+    if !needs_probe {
+        return None;
+    }
+    let parent = primary.parent()?;
+    dir_cache.ensure_dir_async(parent).await;
+    let variant = dir_cache.find_ampm_variant(primary)?;
+    if dir_cache.file_size(&variant) != Some(expected_size) {
+        return None;
+    }
+    let m = tokio::fs::metadata(&variant).await.ok()?;
+    tracing::info!(
+        primary = %primary.display(),
+        variant = %variant.display(),
+        "Matched AM/PM whitespace variant on disk",
+    );
+    Some((variant, m))
 }
 
 /// Run the import-existing matching loop over a stream of `PhotoAsset`s.
@@ -112,6 +136,9 @@ where
 
     tokio::pin!(stream);
     let mut stats = ImportStats::default();
+    // One cache per library scan: each parent directory is read_dir'd at
+    // most once across all sibling probes.
+    let mut dir_cache = DirCache::new();
 
     while let Some(result) = stream.next().await {
         let asset: PhotoAsset = match result {
@@ -180,6 +207,7 @@ where
                 &primary_path,
                 expected_size,
                 download_config.file_match_policy,
+                &mut dir_cache,
             )
             .await
             {
@@ -2106,6 +2134,82 @@ mod wiremock_tests {
             "no downloaded rows expected after bail, got {n}",
             n = downloaded.len(),
         );
+    }
+
+    // ── AM/PM whitespace variant probe ────────────────────────────────
+    //
+    // macOS uses NARROW NO-BREAK SPACE (U+202F) before AM/PM in default
+    // screenshot filenames since macOS 13. A user whose tree was synced
+    // via a third-party tool that normalized the filename to a regular
+    // space (or the other way around) would otherwise see every such
+    // photo come up unmatched on import. The DirCache-backed AM/PM probe
+    // bridges both directions.
+
+    /// Run an end-to-end import where the iCloud filename is `icloud`
+    /// and the file actually staged is named `on_disk_filename` in the
+    /// same parent directory. `keep_unicode_in_filenames=true` keeps
+    /// the U+202F in the expected path; otherwise `remove_unicode_chars`
+    /// would strip it before the AM/PM probe could fire.
+    async fn assert_ampm_variant_adopted(icloud: &str, on_disk_filename: &str) {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("AMPM_TEST", icloud, "public.png").orig(
+            4096,
+            "ck_ampm_test",
+            "public.png",
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut config = base_config(&dl);
+        config.keep_unicode_in_filenames = true;
+
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(
+            expected.len(),
+            1,
+            "single-version asset must yield one path"
+        );
+        let parent = expected[0]
+            .path
+            .parent()
+            .expect("expected path always has a parent");
+        let on_disk = parent.join(on_disk_filename);
+        stage_file(&on_disk, expected[0].size);
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+
+        assert_eq!(stats.total, 1);
+        assert_eq!(
+            stats.matched, 1,
+            "AM/PM probe must adopt the on-disk variant",
+        );
+        let rows = all_downloaded(db.as_ref()).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].local_path.as_deref().map(StdPath::new),
+            Some(on_disk.as_path()),
+            "DB must record the variant path that was actually adopted",
+        );
+    }
+
+    #[tokio::test]
+    async fn ampm_variant_with_regular_space_on_disk_matches_nbsp_from_icloud() {
+        assert_ampm_variant_adopted(
+            "Screenshot 2025-01-14 at 1.40.01\u{202F}PM.PNG",
+            "Screenshot 2025-01-14 at 1.40.01 PM.PNG",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ampm_variant_with_nbsp_on_disk_matches_regular_space_from_icloud() {
+        assert_ampm_variant_adopted(
+            "Screenshot 2025-01-14 at 1.40.02 PM.PNG",
+            "Screenshot 2025-01-14 at 1.40.02\u{202F}PM.PNG",
+        )
+        .await;
     }
 
     // ── icloudpd compat baseline ──────────────────────────────────────
