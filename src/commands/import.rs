@@ -107,8 +107,16 @@ where
         let asset: PhotoAsset = match result {
             Ok(a) => a,
             Err(e) => {
-                tracing::warn!(library = %library_label, error = %e, "Error fetching asset");
-                continue;
+                // A fetcher Err means the enumeration stream is partial:
+                // CloudKit returned an error mid-page, or a record decode
+                // failed. Continuing would silently report fewer matches
+                // than reality, so the next sync would re-download files
+                // that import-existing should have adopted. Bail loudly
+                // and let the operator re-run after the upstream issue
+                // clears.
+                anyhow::bail!(
+                    "import scan aborted for library '{library_label}': fetcher returned error: {e}"
+                );
             }
         };
 
@@ -1957,6 +1965,105 @@ mod wiremock_tests {
         assert!(
             msg.contains("import scan aborted") && msg.contains("test-all"),
             "error message must name the abort + label, got: {msg}"
+        );
+    }
+
+    /// Stateful responder: serves a sequence of canned responses and then
+    /// HTTP 500 forever after. Lets a single-fetcher test simulate a
+    /// mid-enumeration upstream failure.
+    struct ScriptedPagesThenError {
+        bodies: Vec<String>,
+        counter: std::sync::atomic::AtomicUsize,
+    }
+
+    impl wiremock::Respond for ScriptedPagesThenError {
+        fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+            let n = self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.bodies.len() {
+                ResponseTemplate::new(200).set_body_string(self.bodies[n].clone())
+            } else {
+                ResponseTemplate::new(500).set_body_string("upstream error")
+            }
+        }
+    }
+
+    /// PR-1 / robustness CF-2 + MS-3: a fetcher Err mid-enumeration must
+    /// abort `import_assets` instead of being downgraded to a warning. This
+    /// stages two successful pages followed by a 500 so the fetcher surfaces
+    /// `Err` after the second page. Assert the bail names the library and
+    /// the fetcher error.
+    #[tokio::test]
+    async fn import_assets_bails_when_fetcher_errs_mid_enumeration() {
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        let db = open_db(&tmp).await;
+
+        // Two pages with one asset each, then 500.
+        let asset1 = WiremockAsset::new("rec_a", "IMG_0001.JPG", "public.jpeg").orig(
+            1024,
+            "ck_a",
+            "public.jpeg",
+        );
+        let asset2 = WiremockAsset::new("rec_b", "IMG_0002.JPG", "public.jpeg").orig(
+            2048,
+            "ck_b",
+            "public.jpeg",
+        );
+
+        let body_for = |a: &WiremockAsset| {
+            serde_json::to_string(&json!({
+                "records": a.to_cloudkit_records(),
+                "syncToken": "stub-token",
+            }))
+            .expect("serialize body")
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/records/query"))
+            .respond_with(ScriptedPagesThenError {
+                bodies: vec![body_for(&asset1), body_for(&asset2)],
+                counter: std::sync::atomic::AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        let album = album_pointed_at(&server);
+        let (stream, panic_rx) = album.photo_stream(None, None, 1);
+        let err = import_assets(
+            stream,
+            panic_rx,
+            db.as_ref(),
+            &config,
+            "test-all",
+            true,
+            false,
+        )
+        .await
+        .expect_err("must bail on fetcher Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("import scan aborted") && msg.contains("test-all"),
+            "error message must name the abort + library label, got: {msg}",
+        );
+        assert!(
+            msg.contains("fetcher returned error"),
+            "error message must name the fetcher source, got: {msg}",
+        );
+
+        // The DB must have no `downloaded` rows (we ran with dry_run=true,
+        // but even otherwise the matched assets in pages 1+2 had no staged
+        // files so they would have been counted as `unmatched`). Assert
+        // explicitly that bail short-circuited cleanly.
+        let downloaded = all_downloaded(db.as_ref()).await;
+        assert!(
+            downloaded.is_empty(),
+            "no downloaded rows expected after bail, got {n}",
+            n = downloaded.len(),
         );
     }
 
