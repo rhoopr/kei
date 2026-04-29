@@ -2065,3 +2065,269 @@ mod wiremock_tests {
     // baseline against accidental layout divergence.
     mod icloudpd_compat;
 }
+
+#[cfg(test)]
+mod build_config_tests {
+    //! Unit tests for [`build_import_download_config`] -- the
+    //! CLI > TOML > default resolution chain for import-existing's
+    //! path-derivation flags. Each new flag added to import-existing
+    //! needs a row in this test mod or the precedence is unverified.
+    //!
+    //! Construction of `ImportArgs` happens through `Cli::try_parse_from`
+    //! (rather than struct literals) so a regression that reorders
+    //! `or_else` arms or flips a default reaches us through the same
+    //! parse path that production uses.
+    use super::build_import_download_config;
+    use crate::cli::{Cli, Command};
+    use crate::config::{TomlConfig, TomlPhotos};
+    use crate::types::{
+        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
+        LivePhotoSize, RawTreatmentPolicy, VersionSize,
+    };
+    use clap::Parser;
+
+    fn parse_import_args(extra: &[&str]) -> crate::cli::ImportArgs {
+        let mut argv = vec!["kei", "import-existing", "--download-dir", "/photos"];
+        argv.extend(extra.iter().copied());
+        let cli = Cli::try_parse_from(argv).expect("clap parse");
+        match cli.command {
+            Some(Command::ImportExisting(a)) => a,
+            _ => panic!("expected ImportExisting"),
+        }
+    }
+
+    fn empty_toml() -> TomlConfig {
+        TomlConfig {
+            data_dir: None,
+            log_level: None,
+            auth: None,
+            download: None,
+            filters: None,
+            photos: None,
+            watch: None,
+            notifications: None,
+            metrics: None,
+            server: None,
+            report: None,
+        }
+    }
+
+    fn toml_with_photos(p: TomlPhotos) -> TomlConfig {
+        let mut t = empty_toml();
+        t.photos = Some(p);
+        t
+    }
+
+    fn empty_photos() -> TomlPhotos {
+        TomlPhotos {
+            size: None,
+            live_photo_size: None,
+            live_photo_mode: None,
+            live_photo_mov_filename_policy: None,
+            align_raw: None,
+            file_match_policy: None,
+            force_size: None,
+            keep_unicode_in_filenames: None,
+        }
+    }
+
+    /// CG-1 / AT-3: CLI value beats TOML value across every photos field.
+    /// Each row plants a different value at each layer; if the resolver
+    /// reverses precedence on any field, exactly that row fails.
+    #[test]
+    fn build_import_download_config_cli_overrides_toml() {
+        // size: CLI=Medium, TOML=Thumb -> Medium
+        let args = parse_import_args(&["--size", "medium"]);
+        let toml = toml_with_photos(TomlPhotos {
+            size: Some(VersionSize::Thumb),
+            ..empty_photos()
+        });
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        assert_eq!(cfg.size, AssetVersionSize::Medium, "size: CLI must win");
+
+        // file_match_policy: CLI=NameId7, TOML=NameSizeDedupWithSuffix -> NameId7
+        let args = parse_import_args(&["--file-match-policy", "name-id7"]);
+        let toml = toml_with_photos(TomlPhotos {
+            file_match_policy: Some(FileMatchPolicy::NameSizeDedupWithSuffix),
+            ..empty_photos()
+        });
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        assert_eq!(
+            cfg.file_match_policy,
+            FileMatchPolicy::NameId7,
+            "file_match_policy: CLI must win"
+        );
+
+        // live_photo_mode: CLI=VideoOnly, TOML=ImageOnly -> VideoOnly
+        let args = parse_import_args(&["--live-photo-mode", "video-only"]);
+        let toml = toml_with_photos(TomlPhotos {
+            live_photo_mode: Some(LivePhotoMode::ImageOnly),
+            ..empty_photos()
+        });
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        assert_eq!(
+            cfg.live_photo_mode,
+            LivePhotoMode::VideoOnly,
+            "live_photo_mode: CLI must win"
+        );
+
+        // live_photo_size: CLI=Medium, TOML=Thumb -> LiveMedium
+        let args = parse_import_args(&["--live-photo-size", "medium"]);
+        let toml = toml_with_photos(TomlPhotos {
+            live_photo_size: Some(LivePhotoSize::Thumb),
+            ..empty_photos()
+        });
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        assert_eq!(
+            cfg.live_photo_size,
+            AssetVersionSize::LiveMedium,
+            "live_photo_size: CLI must win"
+        );
+
+        // live_photo_mov_filename_policy: CLI=Original, TOML=Suffix -> Original
+        let args = parse_import_args(&["--live-photo-mov-filename-policy", "original"]);
+        let toml = toml_with_photos(TomlPhotos {
+            live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Suffix),
+            ..empty_photos()
+        });
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        assert_eq!(
+            cfg.live_photo_mov_filename_policy,
+            LivePhotoMovFilenamePolicy::Original,
+            "live_photo_mov_filename_policy: CLI must win"
+        );
+
+        // align_raw: CLI=PreferOriginal, TOML=PreferAlternative -> PreferOriginal
+        let args = parse_import_args(&["--align-raw", "original"]);
+        let toml = toml_with_photos(TomlPhotos {
+            align_raw: Some(RawTreatmentPolicy::PreferAlternative),
+            ..empty_photos()
+        });
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        assert_eq!(
+            cfg.align_raw,
+            RawTreatmentPolicy::PreferOriginal,
+            "align_raw: CLI must win"
+        );
+
+        // force_size: CLI=true, TOML=false -> true
+        let args = parse_import_args(&["--force-size"]);
+        let toml = toml_with_photos(TomlPhotos {
+            force_size: Some(false),
+            ..empty_photos()
+        });
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        assert!(
+            cfg.force_size,
+            "force_size: CLI true must win over TOML false"
+        );
+
+        // keep_unicode_in_filenames: CLI=true, TOML=false -> true
+        let args = parse_import_args(&["--keep-unicode-in-filenames"]);
+        let toml = toml_with_photos(TomlPhotos {
+            keep_unicode_in_filenames: Some(false),
+            ..empty_photos()
+        });
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        assert!(
+            cfg.keep_unicode_in_filenames,
+            "keep_unicode_in_filenames: CLI true must win over TOML false"
+        );
+    }
+
+    /// CG-1: TOML value beats default when CLI absent.
+    #[test]
+    fn build_import_download_config_uses_toml_when_cli_absent() {
+        let args = parse_import_args(&[]);
+        let toml = toml_with_photos(TomlPhotos {
+            size: Some(VersionSize::Medium),
+            file_match_policy: Some(FileMatchPolicy::NameId7),
+            live_photo_mode: Some(LivePhotoMode::VideoOnly),
+            live_photo_size: Some(LivePhotoSize::Thumb),
+            live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
+            align_raw: Some(RawTreatmentPolicy::PreferOriginal),
+            force_size: Some(true),
+            keep_unicode_in_filenames: Some(true),
+        });
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        assert_eq!(cfg.size, AssetVersionSize::Medium);
+        assert_eq!(cfg.file_match_policy, FileMatchPolicy::NameId7);
+        assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
+        assert_eq!(cfg.live_photo_size, AssetVersionSize::LiveThumb);
+        assert_eq!(
+            cfg.live_photo_mov_filename_policy,
+            LivePhotoMovFilenamePolicy::Original
+        );
+        assert_eq!(cfg.align_raw, RawTreatmentPolicy::PreferOriginal);
+        assert!(cfg.force_size);
+        assert!(cfg.keep_unicode_in_filenames);
+    }
+
+    /// CG-1: documented defaults when neither CLI nor TOML set the field.
+    /// Pinning the *documented* default protects against silent default
+    /// drift (per memory `feedback_default_value_change_test`).
+    #[test]
+    fn build_import_download_config_falls_through_to_default() {
+        let args = parse_import_args(&[]);
+        let cfg = build_import_download_config(&args, None).unwrap();
+        assert_eq!(cfg.size, AssetVersionSize::Original);
+        assert_eq!(
+            cfg.file_match_policy,
+            FileMatchPolicy::NameSizeDedupWithSuffix
+        );
+        assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
+        assert_eq!(cfg.live_photo_size, AssetVersionSize::LiveOriginal);
+        assert_eq!(
+            cfg.live_photo_mov_filename_policy,
+            LivePhotoMovFilenamePolicy::Suffix
+        );
+        assert_eq!(cfg.align_raw, RawTreatmentPolicy::Unchanged);
+        assert!(!cfg.force_size);
+        assert!(!cfg.keep_unicode_in_filenames);
+        assert_eq!(cfg.folder_structure, "%Y/%m/%d");
+    }
+
+    /// CG-9: empty `directory` after TOML resolve produces the documented
+    /// "is required" error rather than a confusing downstream failure.
+    #[test]
+    fn build_import_download_config_empty_directory_bails() {
+        // No --download-dir on the CLI, no TOML directory either: bails.
+        let cli = Cli::try_parse_from([
+            "kei",
+            "import-existing",
+            // explicitly absent --download-dir
+        ])
+        .unwrap();
+        let args = match cli.command {
+            Some(Command::ImportExisting(a)) => a,
+            _ => panic!("expected ImportExisting"),
+        };
+        let err =
+            build_import_download_config(&args, None).expect_err("empty directory should bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--download-dir is required"),
+            "error must name the missing flag, got: {msg}"
+        );
+    }
+
+    /// CG-10: setting both `--directory` (deprecated) and `--download-dir`
+    /// at once fails fast rather than letting one silently win. The
+    /// deprecation warning users rely on requires this guard to stay
+    /// strict.
+    #[test]
+    fn build_import_download_config_both_directory_flags_bails() {
+        let args = parse_import_args(&["--directory", "/old/photos"]);
+        // parse_import_args already set --download-dir=/photos, so both
+        // are present.
+        assert!(args.download_dir.is_some());
+        assert!(args.directory.is_some());
+        let err = build_import_download_config(&args, None)
+            .expect_err("both directory flags should bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--directory") && (msg.contains("deprecated") || msg.contains("pick one")),
+            "error must name the deprecation conflict, got: {msg}"
+        );
+    }
+}

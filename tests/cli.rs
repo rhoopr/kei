@@ -813,25 +813,19 @@ fn import_existing_accepts_no_progress_bar() {
 
 // ── import-existing path-derivation flags ───────────────────────────────
 //
-// import-existing must accept every flag that affects sync's output paths,
-// or files synced under those settings will silently fail to match. Each of
-// these mirrors a sync flag and was added to close that gap.
+// The CLI-string -> enum mapping for each flag (--size, --live-photo-mode,
+// --live-photo-size, --live-photo-mov-filename-policy, --align-raw,
+// --force-size, --keep-unicode-in-filenames, --file-match-policy) is pinned
+// by `Cli::try_parse_from`-driven unit tests in src/cli.rs (search for
+// `import_existing_*_parses_to_correct_variant`). Those assert on parsed
+// variants -- which `--help`-driven subprocess tests cannot.
+//
+// The subprocess-level test below stays because it exercises one thing the
+// unit tests can't: that clap's value rejection produces a non-zero subprocess
+// exit code (the contract Docker / systemd consumers rely on).
 
 #[test]
-fn import_existing_file_match_policy_flag() {
-    for input in ["name-size-dedup-with-suffix", "name-id7"] {
-        common::cmd()
-            .args([
-                "import-existing",
-                "--download-dir",
-                "/tmp",
-                "--file-match-policy",
-                input,
-                "--help",
-            ])
-            .assert()
-            .success();
-    }
+fn import_existing_file_match_policy_rejects_bogus_value() {
     common::cmd()
         .args([
             "import-existing",
@@ -843,72 +837,6 @@ fn import_existing_file_match_policy_flag() {
         ])
         .assert()
         .failure();
-}
-
-#[test]
-fn import_existing_size_flag() {
-    for input in ["original", "medium", "thumb", "adjusted", "alternative"] {
-        common::cmd()
-            .args([
-                "import-existing",
-                "--download-dir",
-                "/tmp",
-                "--size",
-                input,
-                "--help",
-            ])
-            .assert()
-            .success();
-    }
-}
-
-#[test]
-fn import_existing_live_photo_flags() {
-    common::cmd()
-        .args([
-            "import-existing",
-            "--download-dir",
-            "/tmp",
-            "--live-photo-mode",
-            "video-only",
-            "--live-photo-size",
-            "medium",
-            "--live-photo-mov-filename-policy",
-            "original",
-            "--help",
-        ])
-        .assert()
-        .success();
-}
-
-#[test]
-fn import_existing_align_raw_and_force_size_flags() {
-    common::cmd()
-        .args([
-            "import-existing",
-            "--download-dir",
-            "/tmp",
-            "--align-raw",
-            "original",
-            "--force-size",
-            "--help",
-        ])
-        .assert()
-        .success();
-}
-
-#[test]
-fn import_existing_keep_unicode_flag_takes_env() {
-    common::cmd()
-        .args([
-            "import-existing",
-            "--download-dir",
-            "/tmp",
-            "--keep-unicode-in-filenames",
-            "--help",
-        ])
-        .assert()
-        .success();
 }
 
 // ── exit codes ────────────────────────────────────────────────────────

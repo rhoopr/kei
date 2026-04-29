@@ -1438,6 +1438,336 @@ mod tests {
         );
     }
 
+    // ── size / live_photo_size matrix on present versions ───────────────
+    //
+    // The matrix expansion below pins behaviour for the import-existing
+    // CLI flags `--size` and `--live-photo-size` when the requested
+    // version *is* published. The pre-existing `expected_paths_size_*`
+    // tests cover the fallback (size missing) and force_size branches;
+    // these cover the "actually use the requested size" branch and the
+    // independence between primary and live-photo sizing.
+
+    /// Builds a primary photo with original + medium + thumb JPEG
+    /// resolutions. Mirrors `multi_size_photo_asset` (defined later in
+    /// this mod) but is independent so test reordering can't break it.
+    fn primary_multi_size_asset(record: &str, filename: &str) -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": record, "fields": {
+                "filenameEnc": {"value": filename, "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/orig",
+                    "fileChecksum": "orig_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resJPEGMedRes": {"value": {
+                    "size": 2000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/med",
+                    "fileChecksum": "med_ck"
+                }},
+                "resJPEGMedFileType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 500_u64,
+                    "downloadURL": "https://p01.icloud-content.com/thumb",
+                    "fileChecksum": "thumb_ck"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
+        )
+    }
+
+    /// Live-photo HEIC primary with both LiveOriginal and LiveMedium MOV
+    /// companions. Covers the live_photo_size=Medium path.
+    fn live_photo_multi_size_asset(record: &str) -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": record, "fields": {
+                "filenameEnc": {"value": "IMG_LIVE.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 4000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_orig",
+                    "fileChecksum": "live_orig_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"},
+                "resVidMedRes": {"value": {
+                    "size": 1500_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_med",
+                    "fileChecksum": "live_med_ck"
+                }},
+                "resVidMedFileType": {"value": "com.apple.quicktime-movie"},
+            }}),
+            json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
+        )
+    }
+
+    /// CG-2: regression-guards `--size medium` actually-published path.
+    /// A bug in the size-suffix branch of `expected_paths_for` would emit
+    /// an unsuffixed path; sync would write `IMG-medium.JPG` while
+    /// import-existing scans for `IMG.JPG` (silent miss).
+    #[test]
+    fn expected_paths_size_medium_present_emits_medium_suffix() {
+        let asset = primary_multi_size_asset("MED_PRESENT", "IMG_6001.JPG");
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Medium);
+        assert_eq!(paths[0].size, 2000);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains("-medium"),
+            "size=Medium present should carry '-medium' suffix, got {name}"
+        );
+    }
+
+    /// CG-2 parity: when Medium is published and `--size medium` is set,
+    /// sync's path and import's path agree.
+    #[test]
+    fn expected_paths_parity_size_medium_present() {
+        let asset = primary_multi_size_asset("PAR_MED", "IMG_6002.JPG");
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        assert_path_parity(&asset, &config, VersionSizeKey::Medium, "Medium present");
+    }
+
+    /// CG-3: regression-guards `--size thumb` actually-published path.
+    #[test]
+    fn expected_paths_size_thumb_present_emits_thumb_suffix() {
+        let asset = primary_multi_size_asset("THUMB_PRESENT", "IMG_6003.JPG");
+        let mut config = test_config();
+        config.size = AssetVersionSize::Thumb;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Thumb);
+        assert_eq!(paths[0].size, 500);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains("-thumb"),
+            "size=Thumb present should carry '-thumb' suffix, got {name}"
+        );
+    }
+
+    /// CG-3 parity.
+    #[test]
+    fn expected_paths_parity_size_thumb_present() {
+        let asset = primary_multi_size_asset("PAR_THUMB", "IMG_6004.JPG");
+        let mut config = test_config();
+        config.size = AssetVersionSize::Thumb;
+        assert_path_parity(&asset, &config, VersionSizeKey::Thumb, "Thumb present");
+    }
+
+    /// CG-4: regression-guards `--live-photo-size medium`. A bug in the
+    /// `version_with_fallback` call inside the live branch would silently
+    /// land the LiveOriginal MOV at the LiveMedium config, producing the
+    /// wrong path.
+    #[test]
+    fn expected_paths_live_photo_size_medium_emits_live_medium_path() {
+        let asset = live_photo_multi_size_asset("LIVE_MED_1");
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2, "expected primary + MOV companion");
+        let mov = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveMedium))
+            .expect("LiveMedium MOV path missing");
+        assert_eq!(mov.size, 1500);
+        assert_eq!(&*mov.checksum, "live_med_ck");
+        // The primary stays at Original and unaffected by live_photo_size.
+        let primary = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::Original))
+            .expect("primary path missing");
+        assert_eq!(primary.version_size, VersionSizeKey::Original);
+        assert_eq!(primary.size, 4000);
+    }
+
+    /// CG-5: `--size` and `--live-photo-size` are independent. A
+    /// regression that couples them (e.g. live branch reading
+    /// `config.size` instead of `config.live_photo_size`) lands silently
+    /// without this assertion.
+    #[test]
+    fn expected_paths_size_medium_with_live_photo_size_thumb_independent() {
+        // Build a HEIC primary with original + medium res, and a live MOV
+        // companion at LiveOriginal + LiveMedium. We don't have a
+        // LiveThumb resolution to point to, so we use LiveMedium for the
+        // live size and Medium for the primary -- different non-default
+        // values across the two flags.
+        let asset = PhotoAsset::new(
+            json!({"recordName": "INDEP_1", "fields": {
+                "filenameEnc": {"value": "IMG_INDEP.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 4000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resJPEGMedRes": {"value": {
+                    "size": 1800_u64,
+                    "downloadURL": "https://p01.icloud-content.com/heic_med",
+                    "fileChecksum": "heic_med_ck"
+                }},
+                "resJPEGMedFileType": {"value": "public.jpeg"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_orig",
+                    "fileChecksum": "live_orig_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"},
+                "resVidMedRes": {"value": {
+                    "size": 1500_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_med",
+                    "fileChecksum": "live_med_ck"
+                }},
+                "resVidMedFileType": {"value": "com.apple.quicktime-movie"},
+            }}),
+            json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
+        );
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        let primary = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::Medium))
+            .expect("primary at Medium missing");
+        assert_eq!(primary.size, 1800);
+        let mov = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveMedium))
+            .expect("MOV at LiveMedium missing");
+        assert_eq!(mov.size, 1500);
+        // Crucially: primary did not key off live_photo_size, MOV did
+        // not key off size. (If the two flags were coupled, both would
+        // share one variant.)
+        assert_ne!(primary.version_size, VersionSizeKey::LiveMedium);
+        assert_ne!(mov.version_size, VersionSizeKey::Medium);
+    }
+
+    /// CG-6: `--align-raw original` + `--size medium`. apply_raw_policy
+    /// runs before size selection; this pins that the swap doesn't
+    /// silently re-key the size lookup off the wrong version.
+    #[test]
+    fn expected_paths_align_raw_prefer_original_with_size_medium_keys_correctly() {
+        // RAW + JPEG pair where the alt is the JPEG. With
+        // align_raw=PreferOriginal we want Original to remain the JPEG
+        // (the "user-visible" original) per the existing `align_raw_*`
+        // tests; the question here is whether `--size medium` then keys
+        // off the Medium version of that JPEG (the test's primary has no
+        // medium published, so we expect fallback to Original size with
+        // force_size=false).
+        let asset = TestPhotoAsset::new("ALIGN_MED")
+            .filename("IMG_RAW_MED.DNG")
+            .item_type("public.camera-raw-image")
+            .orig_file_type("public.camera-raw-image")
+            .alt_version(
+                "https://p01.icloud-content.com/jpeg",
+                "jpeg_ck",
+                2500,
+                "public.jpeg",
+            )
+            .build();
+        let mut config = test_config();
+        config.align_raw = RawTreatmentPolicy::PreferOriginal;
+        config.size = AssetVersionSize::Medium;
+        config.force_size = false;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        // No medium published in the swapped Original (which is the
+        // JPEG alt promoted to Original under PreferOriginal); the
+        // fallback should land on Original-without-suffix.
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains("-medium"),
+            "fallback to Original under align_raw must drop the medium suffix, got {name}"
+        );
+    }
+
+    /// CG-7: `--force-size` applied to the live-photo companion. With
+    /// force_size=true and live_photo_size=LiveMedium but only LiveOriginal
+    /// published, the MOV companion should drop entirely (not silently
+    /// land at LiveOriginal).
+    #[test]
+    fn expected_paths_force_size_drops_live_companion_when_live_size_missing() {
+        let asset = TestPhotoAsset::new("FORCE_LIVE")
+            .filename("IMG_FL.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/live_orig", "live_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+        config.force_size = true;
+        let paths = expected_paths_for(&asset, &config);
+        // Primary HEIC is still Original and kept (force_size applies to
+        // the requested primary `size` and to the requested
+        // `live_photo_size`; primary `size` is Original which is
+        // present).
+        assert!(
+            paths
+                .iter()
+                .any(|p| matches!(p.version_size, VersionSizeKey::Original)),
+            "primary should remain present when its requested size is published"
+        );
+        // The MOV companion should drop because LiveMedium is missing
+        // and force_size=true forbids fallback.
+        assert!(
+            !paths.iter().any(|p| matches!(
+                p.version_size,
+                VersionSizeKey::LiveOriginal | VersionSizeKey::LiveMedium
+            )),
+            "force_size + missing LiveMedium should drop the MOV companion entirely, got {paths:?}"
+        );
+    }
+
+    /// CG-8: `--live-photo-mov-filename-policy original` + `name-id7`.
+    /// The Original-policy branch must still apply the name-id7 suffix
+    /// to the MOV (otherwise id7 users on the non-default MOV policy
+    /// silently break).
+    #[test]
+    fn expected_paths_mov_policy_original_with_name_id7_carries_suffix() {
+        let asset = TestPhotoAsset::new("MOV_ID7_ORIG")
+            .filename("IMG_8001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        config.live_photo_mov_filename_policy = LivePhotoMovFilenamePolicy::Original;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        let mov = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal))
+            .expect("MOV companion missing");
+        let mov_name = mov.path.file_name().unwrap().to_string_lossy();
+        // Under Original policy the MOV reuses the primary's stem (no
+        // _HEVC suffix); under NameId7 the stem itself carries the id7
+        // marker, so the MOV path must carry it too. The HEIC->MOV
+        // extension map happens regardless of policy.
+        assert!(
+            mov_name.starts_with("IMG_8001_") && mov_name.ends_with(".MOV"),
+            "MOV under Original policy + id7 should be IMG_8001_<id7>.MOV, got {mov_name}"
+        );
+        assert!(
+            !mov_name.contains("_HEVC"),
+            "Original MOV policy should NOT add _HEVC suffix, got {mov_name}"
+        );
+    }
+
     // ── expected_paths_for negative-space coverage ───────────────────────
     //
     // The 11 happy-path expected_paths_* tests above leave a lot of input

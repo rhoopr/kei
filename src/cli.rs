@@ -2606,6 +2606,140 @@ mod tests {
         }
     }
 
+    // ── import-existing path-derivation flags ──────────────────────────
+    //
+    // Each flag here changes how `expected_paths_for` derives the on-disk
+    // path. A regression in the clap value_parser (e.g. mapping `medium` to
+    // `Original`) is silent unless the parsed variant is asserted -- a
+    // `--help`-driven smoke test catches "spelling vanished" but not
+    // "spelling reaches the wrong variant". These tests pin the
+    // CLI-string -> enum mapping for every accepted value.
+
+    fn parse_import(extra: &[&str]) -> ImportArgs {
+        let mut args = vec!["kei", "import-existing", "--download-dir", "/tmp"];
+        args.extend(extra.iter().copied());
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Some(Command::ImportExisting(a)) => a,
+            _ => panic!("Expected ImportExisting command"),
+        }
+    }
+
+    #[test]
+    fn import_existing_size_flag_parses_to_correct_variant() {
+        for (input, expected) in [
+            ("original", VersionSize::Original),
+            ("medium", VersionSize::Medium),
+            ("thumb", VersionSize::Thumb),
+            ("adjusted", VersionSize::Adjusted),
+            ("alternative", VersionSize::Alternative),
+        ] {
+            let args = parse_import(&["--size", input]);
+            assert_eq!(args.size, Some(expected), "size={input}");
+        }
+    }
+
+    #[test]
+    fn import_existing_live_photo_mode_parses_to_correct_variant() {
+        for (input, expected) in [
+            ("both", LivePhotoMode::Both),
+            ("image-only", LivePhotoMode::ImageOnly),
+            ("video-only", LivePhotoMode::VideoOnly),
+            ("skip", LivePhotoMode::Skip),
+        ] {
+            let args = parse_import(&["--live-photo-mode", input]);
+            assert_eq!(args.live_photo_mode, Some(expected), "mode={input}");
+        }
+    }
+
+    #[test]
+    fn import_existing_live_photo_size_parses_to_correct_variant() {
+        for (input, expected) in [
+            ("original", LivePhotoSize::Original),
+            ("medium", LivePhotoSize::Medium),
+            ("thumb", LivePhotoSize::Thumb),
+            ("adjusted", LivePhotoSize::Adjusted),
+        ] {
+            let args = parse_import(&["--live-photo-size", input]);
+            assert_eq!(args.live_photo_size, Some(expected), "size={input}");
+        }
+    }
+
+    #[test]
+    fn import_existing_live_photo_mov_filename_policy_parses_to_correct_variant() {
+        for (input, expected) in [
+            ("suffix", LivePhotoMovFilenamePolicy::Suffix),
+            ("original", LivePhotoMovFilenamePolicy::Original),
+        ] {
+            let args = parse_import(&["--live-photo-mov-filename-policy", input]);
+            assert_eq!(
+                args.live_photo_mov_filename_policy,
+                Some(expected),
+                "policy={input}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_existing_align_raw_parses_to_correct_variant() {
+        for (input, expected) in [
+            ("as-is", RawTreatmentPolicy::Unchanged),
+            ("original", RawTreatmentPolicy::PreferOriginal),
+            ("alternative", RawTreatmentPolicy::PreferAlternative),
+        ] {
+            let args = parse_import(&["--align-raw", input]);
+            assert_eq!(args.align_raw, Some(expected), "policy={input}");
+        }
+    }
+
+    #[test]
+    fn import_existing_force_size_flag_parses_to_true() {
+        let args = parse_import(&["--force-size"]);
+        assert_eq!(args.force_size, Some(true));
+    }
+
+    #[test]
+    fn import_existing_keep_unicode_flag_parses_to_true() {
+        let args = parse_import(&["--keep-unicode-in-filenames"]);
+        assert_eq!(args.keep_unicode_in_filenames, Some(true));
+    }
+
+    #[test]
+    fn import_existing_keep_unicode_env_var_parses_to_true() {
+        let _guard = scrub_auth_env();
+        // SAFETY: scrub_auth_env serializes against any other test that
+        // mutates these env vars; KEI_KEEP_UNICODE_IN_FILENAMES is read
+        // synchronously by clap during parse below.
+        unsafe {
+            std::env::set_var("KEI_KEEP_UNICODE_IN_FILENAMES", "true");
+        }
+        let cli =
+            Cli::try_parse_from(["kei", "import-existing", "--download-dir", "/tmp"]).unwrap();
+        unsafe {
+            std::env::remove_var("KEI_KEEP_UNICODE_IN_FILENAMES");
+        }
+        match cli.command {
+            Some(Command::ImportExisting(args)) => {
+                assert_eq!(args.keep_unicode_in_filenames, Some(true));
+            }
+            _ => panic!("Expected ImportExisting command"),
+        }
+    }
+
+    #[test]
+    fn import_existing_file_match_policy_parses_to_correct_variant() {
+        for (input, expected) in [
+            (
+                "name-size-dedup-with-suffix",
+                FileMatchPolicy::NameSizeDedupWithSuffix,
+            ),
+            ("name-id7", FileMatchPolicy::NameId7),
+        ] {
+            let args = parse_import(&["--file-match-policy", input]);
+            assert_eq!(args.file_match_policy, Some(expected), "policy={input}");
+        }
+    }
+
     #[test]
     fn test_list_albums_library_flag() {
         let cli = Cli::try_parse_from(["kei", "list", "--library", "all", "albums"]).unwrap();
