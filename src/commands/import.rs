@@ -107,8 +107,12 @@ where
         let asset: PhotoAsset = match result {
             Ok(a) => a,
             Err(e) => {
-                tracing::warn!(library = %library_label, error = %e, "Error fetching asset");
-                continue;
+                // Continuing past a fetcher Err would let a partial scan
+                // report as clean, leaving unmatched files to re-download
+                // on the next sync.
+                anyhow::bail!(
+                    "import scan aborted for library '{library_label}': fetcher returned error: {e}"
+                );
             }
         };
 
@@ -664,25 +668,29 @@ mod wiremock_tests {
         }
     }
 
-    /// Mount a single mock on `server` that returns the assets on the
-    /// first `/records/query` POST and empty pages on all later requests.
-    async fn stub_records_query(server: &MockServer, assets: &[WiremockAsset]) {
+    /// Build a `/records/query` response body wrapping the given assets'
+    /// CloudKit records. Used both by `stub_records_query` (single-page
+    /// stubs) and by tests that script a sequence of pages.
+    fn cloudkit_records_body(assets: &[&WiremockAsset]) -> String {
         let mut records = Vec::with_capacity(assets.len() * 2);
         for a in assets {
             for rec in a.to_cloudkit_records() {
                 records.push(rec);
             }
         }
-        let full_body = serde_json::to_string(&json!({
+        serde_json::to_string(&json!({
             "records": records,
             "syncToken": "stub-token",
         }))
-        .expect("serialize full body");
-        let empty_body = serde_json::to_string(&json!({
-            "records": [],
-            "syncToken": "stub-token",
-        }))
-        .expect("serialize empty body");
+        .expect("serialize body")
+    }
+
+    /// Mount a single mock on `server` that returns the assets on the
+    /// first `/records/query` POST and empty pages on all later requests.
+    async fn stub_records_query(server: &MockServer, assets: &[WiremockAsset]) {
+        let asset_refs: Vec<&WiremockAsset> = assets.iter().collect();
+        let full_body = cloudkit_records_body(&asset_refs);
+        let empty_body = cloudkit_records_body(&[]);
 
         Mock::given(wm_method("POST"))
             .and(wm_path("/records/query"))
@@ -1957,6 +1965,95 @@ mod wiremock_tests {
         assert!(
             msg.contains("import scan aborted") && msg.contains("test-all"),
             "error message must name the abort + label, got: {msg}"
+        );
+    }
+
+    /// Stateful responder: serves a sequence of canned bodies, then HTTP
+    /// 500 forever after. Lets a single-fetcher test simulate a partial
+    /// enumeration that hits an upstream failure mid-scan.
+    struct ScriptedPagesThenError {
+        bodies: Vec<String>,
+        counter: std::sync::atomic::AtomicUsize,
+    }
+
+    impl wiremock::Respond for ScriptedPagesThenError {
+        fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+            let n = self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.bodies.get(n) {
+                Some(body) => ResponseTemplate::new(200).set_body_string(body),
+                None => ResponseTemplate::new(500).set_body_string("upstream error"),
+            }
+        }
+    }
+
+    /// A fetcher Err mid-enumeration must abort `import_assets` instead of
+    /// being downgraded to a warning. Two successful pages followed by a
+    /// 500 surface as `Err` after page 2; the bail must name the library
+    /// and the fetcher error so operators can re-run after upstream clears.
+    #[tokio::test]
+    async fn import_assets_bails_when_fetcher_errs_mid_enumeration() {
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        let db = open_db(&tmp).await;
+
+        let asset1 = WiremockAsset::new("rec_a", "IMG_0001.JPG", "public.jpeg").orig(
+            1024,
+            "ck_a",
+            "public.jpeg",
+        );
+        let asset2 = WiremockAsset::new("rec_b", "IMG_0002.JPG", "public.jpeg").orig(
+            2048,
+            "ck_b",
+            "public.jpeg",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/records/query"))
+            .respond_with(ScriptedPagesThenError {
+                bodies: vec![
+                    cloudkit_records_body(&[&asset1]),
+                    cloudkit_records_body(&[&asset2]),
+                ],
+                counter: std::sync::atomic::AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        let album = album_pointed_at(&server);
+        let (stream, panic_rx) = album.photo_stream(None, None, 1);
+        let err = import_assets(
+            stream,
+            panic_rx,
+            db.as_ref(),
+            &config,
+            "test-all",
+            true,
+            false,
+        )
+        .await
+        .expect_err("must bail on fetcher Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("import scan aborted") && msg.contains("test-all"),
+            "error message must name the abort + library label, got: {msg}",
+        );
+        assert!(
+            msg.contains("fetcher returned error"),
+            "error message must name the fetcher source, got: {msg}",
+        );
+
+        // Bail must short-circuit before any DB write so a re-run starts
+        // clean.
+        let downloaded = all_downloaded(db.as_ref()).await;
+        assert!(
+            downloaded.is_empty(),
+            "no downloaded rows expected after bail, got {n}",
+            n = downloaded.len(),
         );
     }
 
