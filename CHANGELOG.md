@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.1] - 2026-04-29
+
+### Fixed
+
+- **`CMM-{UUID}` share-link zones are no longer treated as Shared Photo Libraries.** Accounts that have ever received an iCloud share link surface one or more `CMM-{UUID}` zones in the shared CloudKit database. These are "Cloud Master Moment Share Asset" containers, not iCloud Shared Photo Libraries (which use the `SharedSync-{UUID}` zone naming). kei previously enumerated them alongside real shared libraries and ran a `CheckIndexingState` probe per zone, which produced spurious `ERROR ... Failed to load library zone zone=CMM-...` lines whenever Apple's CloudKit gateway transiently 502'd, and inflated the "Detected N iCloud shared libraries" notice. CMM zones are now skipped entirely with a debug-level log; only `SharedSync-*` zones count as shared libraries. No download behavior changes — primary-library syncs were never affected. (#289)
+
+---
+
 ## [0.12.0] - 2026-04-26
 
 ### Added

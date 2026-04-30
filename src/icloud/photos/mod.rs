@@ -204,6 +204,19 @@ impl PhotosService {
                 continue;
             }
             let zone_name = zone.zone_id.zone_name.clone();
+            // CMM-{UUID} zones are iCloud share-link bundles ("Cloud Master
+            // Moment Share Assets"), not Shared Photo Libraries. They use a
+            // different record schema and don't answer `CheckIndexingState`,
+            // so probing them produces noisy errors and they can't be
+            // enumerated through the library/album path anyway. Skip them
+            // entirely; they're not meaningful as a sync target today.
+            if zone_name.starts_with("CMM-") {
+                tracing::debug!(
+                    zone = %zone_name,
+                    "Skipping CMM share-link zone (not a Shared Photo Library)"
+                );
+                continue;
+            }
             let zone_id = Arc::new(serde_json::to_value(&zone.zone_id)?);
             let ep = self.get_service_endpoint(library_type);
             let lib_session = self.session.clone_box();
@@ -591,6 +604,34 @@ mod tests {
         assert_eq!(libs.len(), 1);
         assert!(libs.contains_key("LiveZone"));
         assert!(!libs.contains_key("GoneZone"));
+    }
+
+    /// CMM-{UUID} share-link zones are filtered out of the library map.
+    /// They use a different record schema and aren't Shared Photo Libraries,
+    /// so probing them produces noisy errors and they can't be synced.
+    #[tokio::test]
+    async fn test_fetch_libraries_skips_cmm_share_link_zones() {
+        let session = CloneableSession {
+            response: json!({
+                "zones": [
+                    {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "t"},
+                    {
+                        "zoneID": {"zoneName": "CMM-657AE284-D1E0-4C7F-9B4D-987888651AC6"},
+                        "syncToken": "t2",
+                    },
+                    {"zoneID": {"zoneName": "SharedSync-ABCD"}, "syncToken": "t3"}
+                ]
+            }),
+        };
+        let mut svc = make_service(Box::new(session), HashMap::new());
+        let libs = svc.fetch_private_libraries().await.unwrap();
+        assert!(libs.contains_key("PrimarySync"));
+        assert!(libs.contains_key("SharedSync-ABCD"));
+        assert!(
+            !libs.contains_key("CMM-657AE284-D1E0-4C7F-9B4D-987888651AC6"),
+            "CMM zones must be skipped: {:?}",
+            libs.keys().collect::<Vec<_>>()
+        );
     }
 
     /// Second call to fetch_private_libraries reuses the cached map

@@ -10,6 +10,12 @@ on:
       - Cargo.toml
       - Cargo.lock
       - Dockerfile
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag, branch, or SHA to build (e.g. v0.12.1)
+        required: true
+        type: string
 
 jobs:
   docker:
@@ -20,6 +26,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - uses: docker/setup-qemu-action@v3
 
