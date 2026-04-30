@@ -698,12 +698,11 @@ impl StateDb for SqliteStateDb {
                 .map_err(|e| StateError::query("mark_downloaded", e))?;
 
             if rows == 0 {
-                tracing::warn!(
-                    id = %id,
-                    version_size = %version_size,
-                    "mark_downloaded matched 0 rows — asset may not have been recorded via upsert_seen"
-                );
                 crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.inc();
+                return Err(StateError::AssetRowMissing {
+                    asset_id: id,
+                    version_size,
+                });
             }
 
             Ok(())
@@ -3365,13 +3364,13 @@ mod tests {
     // ── Gap: mark_downloaded on non-existent record (no upsert_seen) ──
 
     #[tokio::test]
-    async fn mark_downloaded_without_upsert_seen_succeeds_with_zero_rows() {
-        // mark_downloaded does an UPDATE, not an UPSERT. If the asset was
-        // never recorded via upsert_seen, it updates 0 rows and logs a
-        // warning. This should NOT return an error -- it's a graceful no-op.
+    async fn mark_downloaded_without_upsert_seen_returns_asset_row_missing() {
+        // The UPDATE matches zero rows when the asset wasn't recorded
+        // via upsert_seen. The caller must see this loudly so a missed
+        // dispatch step doesn't silently drop a downloaded file.
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let result = db
+        let err = db
             .mark_downloaded(
                 "NEVER_SEEN",
                 "original",
@@ -3379,38 +3378,39 @@ mod tests {
                 "abc123",
                 None,
             )
-            .await;
-        assert!(
-            result.is_ok(),
-            "mark_downloaded on unknown asset should succeed (0-row update)"
-        );
-
-        // Verify: the asset is NOT in the DB (it was never inserted)
-        let summary = db.get_summary().await.unwrap();
-        assert_eq!(summary.downloaded, 0);
-        assert_eq!(summary.total_assets, 0);
+            .await
+            .expect_err("mark_downloaded on unknown asset must err");
+        match err {
+            StateError::AssetRowMissing {
+                asset_id,
+                version_size,
+            } => {
+                assert_eq!(asset_id, "NEVER_SEEN");
+                assert_eq!(version_size, "original");
+            }
+            other => panic!("expected AssetRowMissing, got {other:?}"),
+        }
     }
 
-    /// Robustness review NB-1 (2026-04-25): a `mark_downloaded` call
-    /// without a prior `upsert_seen` is self-healing in 1 cycle, but a
-    /// regression that increases the rate (producer-dispatch invariant
-    /// quietly broken) needs to be visible in /metrics rather than only
-    /// in logs. Pin the counter increment so the wiring can't be silently
-    /// dropped on a future refactor.
+    /// A regression that increases the rate of zero-row `mark_downloaded`
+    /// calls (e.g. a producer-dispatch invariant quietly broken) needs to
+    /// be visible in /metrics, not only in logs / per-asset errors. Pin
+    /// the counter increment so the wiring can't be silently dropped on
+    /// a future refactor.
     #[tokio::test]
     async fn mark_downloaded_zero_rows_increments_metric_counter() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         let before = crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.get();
-        db.mark_downloaded(
-            "NEVER_SEEN_FOR_METRIC",
-            "original",
-            Path::new("/tmp/never_metric.jpg"),
-            "abc123",
-            None,
-        )
-        .await
-        .expect("mark_downloaded on unknown row should succeed");
+        let _ = db
+            .mark_downloaded(
+                "NEVER_SEEN_FOR_METRIC",
+                "original",
+                Path::new("/tmp/never_metric.jpg"),
+                "abc123",
+                None,
+            )
+            .await;
         let after = crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.get();
 
         assert!(

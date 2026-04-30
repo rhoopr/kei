@@ -50,6 +50,15 @@ pub enum StateError {
     /// The database schema version is newer than supported.
     #[error("Database schema version {found} is newer than supported version {expected}")]
     UnsupportedSchemaVersion { found: i32, expected: i32 },
+
+    /// `mark_downloaded` matched zero rows. The asset row should have
+    /// been upserted before this call; its absence indicates a missed
+    /// upsert step or out-of-band row deletion.
+    #[error("mark_downloaded: no row for asset {asset_id} version_size {version_size}")]
+    AssetRowMissing {
+        asset_id: String,
+        version_size: String,
+    },
 }
 
 impl StateError {
