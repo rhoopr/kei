@@ -2144,7 +2144,7 @@ async fn download_single_task(
             let probe = match super::metadata::probe_exif(&exif_path) {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(path = %exif_path.display(), error = %e, "Failed to read EXIF");
+                    tracing::warn!(path = %exif_path.display(), error = format!("{e:#}"), "Failed to read EXIF");
                     super::metadata::ExifProbe::default()
                 }
             };
@@ -2153,7 +2153,7 @@ async fn download_single_task(
                 return true;
             }
             if let Err(e) = super::metadata::apply_metadata(&exif_path, &write) {
-                tracing::warn!(path = %exif_path.display(), error = %e, "Failed to write metadata");
+                tracing::warn!(path = %exif_path.display(), error = format!("{e:#}"), "Failed to write metadata");
                 false
             } else {
                 true
