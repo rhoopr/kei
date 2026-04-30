@@ -15,7 +15,7 @@ use crate::download::paths::{normalize_ampm, DirCache};
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
-use crate::state::{StateDb, StateError};
+use crate::state::StateDb;
 use crate::types::{
     AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize,
     RawTreatmentPolicy, VersionSize,
@@ -247,32 +247,12 @@ where
                     expected_size,
                     media_type,
                 );
-                if let Err(e) = db.upsert_seen(&record).await {
-                    tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to record asset");
-                    continue;
-                }
-
-                match db
-                    .mark_downloaded(
-                        asset.id(),
-                        version_size.as_str(),
-                        &expected_path,
-                        &local_checksum,
-                        None,
-                    )
+                if let Err(e) = db
+                    .import_adopt(&record, &expected_path, &local_checksum)
                     .await
                 {
-                    Ok(()) => {}
-                    Err(e @ StateError::AssetRowMissing { .. }) => {
-                        // Row vanished between upsert_seen and
-                        // mark_downloaded — retry can't fix this. Bail
-                        // before more assets are silently dropped.
-                        anyhow::bail!("import scan aborted for library '{library_label}': {e}");
-                    }
-                    Err(e) => {
-                        tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to mark as downloaded");
-                        continue;
-                    }
+                    tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to adopt asset");
+                    continue;
                 }
             }
 

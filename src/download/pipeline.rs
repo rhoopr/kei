@@ -3046,6 +3046,9 @@ mod tests {
                 Ok(())
             }
         }
+        async fn import_adopt(&self, _: &AssetRecord, _: &Path, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
         async fn mark_failed(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
             unimplemented!()
         }

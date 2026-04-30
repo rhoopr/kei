@@ -1839,6 +1839,14 @@ mod tests {
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
+            async fn import_adopt(
+                &self,
+                _: &state::types::AssetRecord,
+                _: &std::path::Path,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
             async fn mark_failed(
                 &self,
                 _: &str,
@@ -2266,6 +2274,14 @@ mod tests {
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
+            async fn import_adopt(
+                &self,
+                _: &state::types::AssetRecord,
+                _: &std::path::Path,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
             async fn mark_failed(
                 &self,
                 _: &str,
@@ -2549,6 +2565,14 @@ mod tests {
                 _: &std::path::Path,
                 _: &str,
                 _: Option<&str>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn import_adopt(
+                &self,
+                _: &state::types::AssetRecord,
+                _: &std::path::Path,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
