@@ -907,6 +907,7 @@ pub(crate) async fn run_import_existing(
         auth_result,
         retry::RetryConfig::default(),
         crate::personality::Mode::Off,
+        None,
     )
     .await?;
 

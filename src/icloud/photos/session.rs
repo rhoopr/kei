@@ -1,8 +1,10 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 
+use super::capture::ResponseCapture;
 use crate::retry::{self, RetryAction, RetryConfig, parse_retry_after_header};
 
 /// Upper bound on any `Retry-After` hint from CloudKit, chosen so a
@@ -88,6 +90,127 @@ impl PhotosSession for reqwest::Client {
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CapturingPhotosSession {
+    pub(crate) session: crate::auth::SharedSession,
+    pub(crate) capture: Arc<ResponseCapture>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for CapturingPhotosSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        self.capture.check()?;
+        let client = self.session.write().await.photos_capture_client()?;
+        captured_post(&client, url, body, headers, &self.capture).await
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+// A captured JSON decode failure must retry just like reqwest::Response::json,
+// without putting provider-controlled bytes from serde's error into logs.
+#[derive(Debug, thiserror::Error)]
+#[error("Could not decode the captured iCloud Photos JSON response")]
+struct CapturedJsonError;
+
+async fn captured_post(
+    client: &reqwest::Client,
+    url: &str,
+    body: String,
+    headers: &[(&str, &str)],
+    capture: &Arc<ResponseCapture>,
+) -> anyhow::Result<Value> {
+    use anyhow::Context;
+    use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
+
+    let mut url = reqwest::Url::parse(url).context("Invalid iCloud Photos request URL")?;
+    let origin = url.origin();
+    let mut method = reqwest::Method::POST;
+    let mut redirects = 0;
+    loop {
+        // A fresh lease per hop keeps cancellation and finish admission correct.
+        let mut request = capture.begin().await?;
+        let mut builder = client.request(method.clone(), url.clone());
+        if method == reqwest::Method::POST {
+            builder = builder.body(body.clone());
+        }
+        for &(key, value) in headers {
+            if method == reqwest::Method::GET
+                && [
+                    CONTENT_ENCODING,
+                    CONTENT_LENGTH,
+                    CONTENT_TYPE,
+                    TRANSFER_ENCODING,
+                ]
+                .iter()
+                .any(|header| header.as_str().eq_ignore_ascii_case(key))
+            {
+                continue;
+            }
+            builder = builder.header(key, value);
+        }
+        let resp = match builder.send().await {
+            Ok(resp) => resp,
+            Err(error) => {
+                request.complete();
+                return Err(error.without_url().into());
+            }
+        };
+        let status = resp.status();
+        if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+            && let Some(location) = resp.headers().get(reqwest::header::LOCATION).cloned()
+        {
+            // Save even rejected redirects, without retaining their bodies in memory.
+            request.read_body(resp, Some(0)).await?;
+            anyhow::ensure!(
+                redirects < 10,
+                "iCloud Photos capture redirect limit exceeded"
+            );
+            let next = location
+                .to_str()
+                .ok()
+                .and_then(|location| url.join(location).ok())
+                .context("Invalid iCloud Photos capture redirect location")?;
+            anyhow::ensure!(
+                next.origin() == origin
+                    && next.host_str().is_some()
+                    && next.username().is_empty()
+                    && next.password().is_none(),
+                "Refusing iCloud Photos capture redirect outside the original origin or with credentials"
+            );
+            if matches!(status.as_u16(), 301..=303) {
+                method = reqwest::Method::GET;
+            }
+            url = next;
+            redirects += 1;
+            continue;
+        }
+        let is_error = status.is_client_error() || status.is_server_error();
+        let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
+        let bytes = request
+            .read_body(resp, is_error.then_some(MAX_PRESERVED_BODY + 16))
+            .await?;
+        if is_error {
+            let body = String::from_utf8_lossy(&bytes);
+            return Err(HttpStatusError {
+                status: status.as_u16(),
+                url: "[captured iCloud Photos endpoint]".to_string(),
+                retry_after,
+                body: (!body.is_empty()).then(|| truncate_body(&body)),
+            }
+            .into());
+        }
+        return serde_json::from_slice(&bytes).map_err(|_decode_error| CapturedJsonError.into());
     }
 }
 
@@ -326,6 +449,9 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
 /// (5xx, 429), and retryable `CloudKit` server errors are transient;
 /// client errors (4xx) and non-retryable server errors are permanent.
 fn classify_api_error(e: &anyhow::Error) -> RetryAction {
+    if e.is::<CapturedJsonError>() {
+        return RetryAction::Retry;
+    }
     if let Some(ck_err) = e.downcast_ref::<CloudKitServerError>() {
         return if ck_err.retryable {
             RetryAction::Retry
@@ -469,6 +595,54 @@ pub fn check_changes_zone_error(
             error_code: code.into(),
         }),
         None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod wiremock_tests {
+    use std::sync::Arc;
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, ResponseTemplate};
+
+    use super::{CapturingPhotosSession, PhotosSession};
+    use crate::icloud::photos::capture::ResponseCapture;
+
+    #[tokio::test]
+    async fn capture_http_response_body() {
+        let server = crate::start_wiremock_or_skip!();
+        let raw = b"{}";
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(raw.to_vec()))
+            .mount(&server)
+            .await;
+        let data = tempfile::tempdir().unwrap();
+        let auth = crate::auth::session::Session::new(
+            data.path(),
+            "capture@example.test",
+            "https://example.test",
+            None,
+        )
+        .await
+        .unwrap();
+        let session = CapturingPhotosSession {
+            session: Arc::new(tokio::sync::RwLock::new(auth)),
+            capture: ResponseCapture::new(data.path()).await.unwrap(),
+        };
+        session.post(&server.uri(), "{}".into(), &[]).await.unwrap();
+        session.capture.finish().await.unwrap();
+        let run = std::fs::read_dir(data.path().join(".diagnostics"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut files = std::fs::read_dir(run).unwrap();
+        let body = files.next().unwrap().unwrap().path();
+        assert_eq!(body.extension().unwrap(), "body");
+        assert_eq!(std::fs::read(body).unwrap(), raw);
+        assert!(files.next().is_none());
     }
 }
 

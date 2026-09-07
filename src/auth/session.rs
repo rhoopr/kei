@@ -415,16 +415,11 @@ pub(crate) async fn strip_session_routing_state(
     Ok(())
 }
 
-/// Build the API and download HTTP clients for a session.
-///
-/// Both share the same cookie jar. The API client uses a total-request timeout;
-/// the download client uses connect + read timeouts without a total cap so
-/// large file transfers aren't killed mid-stream.
-fn build_clients(
+/// Common cookie jar and browser headers for all session clients.
+fn client_builder(
     cookie_jar: &Arc<reqwest::cookie::Jar>,
     home_endpoint: &str,
-    api_timeout: Duration,
-) -> Result<(Client, Client)> {
+) -> Result<reqwest::ClientBuilder> {
     let mut default_headers = HeaderMap::new();
     default_headers.insert(ORIGIN, HeaderValue::from_str(home_endpoint)?);
     default_headers.insert(
@@ -433,15 +428,23 @@ fn build_clients(
     );
     default_headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
 
-    let client = Client::builder()
+    Ok(Client::builder()
         .cookie_provider(cookie_jar.clone())
-        .default_headers(default_headers.clone())
+        .default_headers(default_headers))
+}
+
+/// The API client has a total timeout; downloads use connect + read timeouts
+/// without a total cap so large transfers aren't killed mid-stream.
+fn build_clients(
+    cookie_jar: &Arc<reqwest::cookie::Jar>,
+    home_endpoint: &str,
+    api_timeout: Duration,
+) -> Result<(Client, Client)> {
+    let client = client_builder(cookie_jar, home_endpoint)?
         .timeout(api_timeout)
         .build()?;
 
-    let download_client = Client::builder()
-        .cookie_provider(cookie_jar.clone())
-        .default_headers(default_headers)
+    let download_client = client_builder(cookie_jar, home_endpoint)?
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(120))
         .pool_max_idle_per_host(20)
@@ -456,6 +459,7 @@ fn build_clients(
 pub struct Session {
     client: Client,
     download_client: Client,
+    photos_capture_client: Option<Client>,
     /// Cookie jar shared with `reqwest::Client`. Queried by
     /// `persist_jar_cookies` to save session cookies to disk, and kept alive
     /// so the client's internal weak reference remains valid.
@@ -650,6 +654,7 @@ impl Session {
         Ok(Self {
             client,
             download_client,
+            photos_capture_client: None,
             cookie_jar,
             session_data,
             cookie_dir,
@@ -717,7 +722,7 @@ impl Session {
         }
     }
 
-    /// Replace both HTTP clients with fresh ones, dropping the old connection
+    /// Replace HTTP clients with fresh ones, dropping the old connection
     /// pools. The existing cookie jar and session data are preserved so no
     /// re-authentication is needed. Used for 421 recovery where the issue is
     /// stale HTTP/2 connection routing, not invalid auth state.
@@ -726,7 +731,21 @@ impl Session {
             build_clients(&self.cookie_jar, &self.home_endpoint, self.api_timeout)?;
         self.client = client;
         self.download_client = download_client;
+        self.photos_capture_client = None;
         Ok(())
+    }
+
+    /// Reuse the API settings and live cookie jar, but expose each redirect body.
+    pub(crate) fn photos_capture_client(&mut self) -> Result<Client> {
+        if let Some(client) = &self.photos_capture_client {
+            return Ok(client.clone());
+        }
+        let client = client_builder(&self.cookie_jar, &self.home_endpoint)?
+            .timeout(self.api_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        self.photos_capture_client = Some(client.clone());
+        Ok(client)
     }
 
     /// Release the exclusive file lock without dropping the Session.

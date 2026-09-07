@@ -3000,6 +3000,7 @@ mod tests {
             auth,
             RetryConfig::default(),
             crate::personality::Mode::Off,
+            None,
         )
         .await
         .expect("initialize live Photos service");

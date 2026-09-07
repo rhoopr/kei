@@ -124,6 +124,20 @@ fn sync_help_succeeds() {
 }
 
 #[test]
+fn response_capture_help_covers_sync_and_service() {
+    for args in [&["sync", "--help"][..], &["service", "run", "--help"][..]] {
+        common::cmd()
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--capture-icloud-responses"))
+            .stdout(predicate::str::contains("sensitive, unredacted"))
+            .stdout(predicate::str::contains(".diagnostics"))
+            .stdout(predicate::str::contains("Explicitly writes diagnostics"));
+    }
+}
+
+#[test]
 fn friendly_flags_are_not_shown_on_non_sync_help() {
     for args in [
         &["password", "--help"][..],

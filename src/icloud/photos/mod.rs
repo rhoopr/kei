@@ -3,6 +3,7 @@
 
 mod album;
 pub(crate) mod asset;
+pub(crate) mod capture;
 pub mod cloudkit;
 pub(crate) mod enc;
 pub mod error;

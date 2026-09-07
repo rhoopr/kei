@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
@@ -31,6 +32,7 @@ pub(crate) async fn init_photos_service(
     mut auth_result: auth::AuthResult,
     api_retry_config: retry::RetryConfig,
     mode: crate::personality::Mode,
+    capture: Option<Arc<crate::icloud::photos::capture::ResponseCapture>>,
 ) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
     if auth_result.data.i_cdp_enabled {
         anyhow::bail!(
@@ -71,12 +73,20 @@ pub(crate) async fn init_photos_service(
 
     let shared_session: auth::SharedSession =
         std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
-    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
+    let make_session = || -> Box<dyn icloud::photos::PhotosSession> {
+        match &capture {
+            Some(capture) => Box::new(icloud::photos::session::CapturingPhotosSession {
+                session: Arc::clone(&shared_session),
+                capture: Arc::clone(capture),
+            }),
+            None => Box::new(Arc::clone(&shared_session)),
+        }
+    };
 
     tracing::debug!("Initializing photos service...");
     match icloud::photos::PhotosService::new(
         ckdatabasews_url.clone(),
-        session_box,
+        make_session(),
         params.clone(),
         api_retry_config,
     )
@@ -102,10 +112,9 @@ pub(crate) async fn init_photos_service(
         session.reset_http_clients()?;
     }
 
-    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
     let service = match icloud::photos::PhotosService::new(
         ckdatabasews_url.clone(),
-        session_box,
+        make_session(),
         params,
         api_retry_config,
     )
@@ -2168,8 +2177,13 @@ mod tests {
             .await;
 
         let auth_result = fake_auth_result(&mock_server.uri()).await;
-        let result =
-            init_photos_service(auth_result, no_delay_retry(), crate::personality::Mode::Off).await;
+        let result = init_photos_service(
+            auth_result,
+            no_delay_retry(),
+            crate::personality::Mode::Off,
+            None,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -2203,8 +2217,13 @@ mod tests {
             .await;
 
         let auth_result = fake_auth_result(&mock_server.uri()).await;
-        let result =
-            init_photos_service(auth_result, no_delay_retry(), crate::personality::Mode::Off).await;
+        let result = init_photos_service(
+            auth_result,
+            no_delay_retry(),
+            crate::personality::Mode::Off,
+            None,
+        )
+        .await;
 
         let err = result.expect_err("expected double-421 to return Err");
         // The error must downcast to MisdirectedRequest so sync_loop can

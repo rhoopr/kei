@@ -241,6 +241,12 @@ pub struct SyncArgs {
     #[arg(long)]
     pub no_progress_bar: bool,
 
+    /// Save sensitive, unredacted iCloud Photos response bodies under the data directory's
+    /// .diagnostics folder (Unix only). Includes errors and retries, not authentication or media bodies.
+    /// Explicitly writes diagnostics even with --dry-run or --only-print-filenames.
+    #[arg(long)]
+    pub capture_icloud_responses: bool,
+
     /// Skip assets before this cutoff. Date-only values compare the capture-local calendar date;
     /// explicit datetimes and relative intervals compare the instant (e.g., 2025-01-02 or 20d).
     #[arg(long)]
@@ -1558,6 +1564,21 @@ mod tests {
             "echo pw",
         ]);
         assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn sync_response_capture_is_explicit_and_allows_preview() {
+        assert!(!SyncArgs::default().capture_icloud_responses);
+        for preview in ["--dry-run", "--only-print-filenames"] {
+            let Command::Sync { sync, .. } =
+                Cli::try_parse_from(["kei", "sync", "--capture-icloud-responses", preview])
+                    .unwrap()
+                    .command
+            else {
+                panic!("expected Sync command");
+            };
+            assert!(sync.capture_icloud_responses);
+        }
     }
 
     #[test]
