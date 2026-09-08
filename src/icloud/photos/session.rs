@@ -9,6 +9,23 @@ use crate::retry::{self, RetryAction, RetryConfig, parse_retry_after_header};
 /// pathological server value can't stall the retry loop.
 const RETRY_AFTER_MAX: Duration = Duration::from_secs(120);
 
+#[cfg(debug_assertions)]
+async fn dump_body(dir: &std::path::Path, id: usize, kind: &str, body: &str) {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let result: std::io::Result<()> = async {
+        let mut directory = tokio::fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        directory.mode(0o700);
+        directory.create(dir).await?;
+        tokio::fs::write(dir.join(format!("{id:06}.{kind}.{timestamp}.json")), body).await
+    }
+    .await;
+    if result.is_err() {
+        tracing::warn!(id, kind, "Could not dump Photos body");
+    }
+}
+
 /// Async HTTP session trait for the photos service.
 ///
 /// Abstracted as a trait so album/library code can be tested with stubs
@@ -36,6 +53,20 @@ impl PhotosSession for reqwest::Client {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        #[cfg(debug_assertions)]
+        let dump = std::env::var_os("KEI_REQUEST_DUMP_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| {
+                static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+                (
+                    std::path::PathBuf::from(dir),
+                    NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                )
+            });
+        #[cfg(debug_assertions)]
+        if let Some((dir, id)) = &dump {
+            dump_body(dir, *id, "req", &body).await;
+        }
         let mut builder = self.post(url).body(body);
         for &(k, v) in headers {
             builder = builder.header(k, v);
@@ -47,6 +78,10 @@ impl PhotosSession for reqwest::Client {
             let url = resp.url().to_string();
             let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
             let resp_body = read_bounded_error_body(resp, &url).await;
+            #[cfg(debug_assertions)]
+            if let Some((dir, id)) = &dump {
+                dump_body(dir, *id, "res", &resp_body).await;
+            }
             if !resp_body.is_empty() {
                 // 421 bodies are the most diagnostic signal for distinguishing
                 // ADP-class from session-class misdirected requests (e.g. the
@@ -83,6 +118,10 @@ impl PhotosSession for reqwest::Client {
         }
 
         let json: Value = resp.json().await?;
+        #[cfg(debug_assertions)]
+        if let Some((dir, id)) = &dump {
+            dump_body(dir, *id, "res", &json.to_string()).await;
+        }
         Ok(json)
     }
 

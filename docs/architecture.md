@@ -111,6 +111,15 @@ provider checkpoints while local catalog paths are reconciled.
 
 ### Full and incremental enumeration
 
+Debug builds can set `KEI_REQUEST_DUMP_DIR` to capture Photos session
+bodies as `000001.req.<epoch-ms>.json` and `000001.res.<epoch-ms>.json`.
+The counter pairs requests and responses; timestamps are captured separately.
+Bodies are unredacted and private; request URLs and headers are not captured.
+HTTP error bodies retain the existing size bound and may contain non-JSON text.
+Successful responses are serialized from parsed JSON without pretty-printing.
+Writes are best-effort, with no run subfolder or cleanup.
+Release builds without debug assertions do not include this diagnostic code.
+
 Full enumeration streams records/query results and gathers a provider token
 from every active pass. Natural stream completion and usable, unanimous pass
 tokens are the authoritative proof. Count probes and pagination differences

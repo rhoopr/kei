@@ -42,6 +42,7 @@ download pipeline does not parse CloudKit records.
 - Keep trust-boundary validation and data-loss guards intact.
 - Never log passwords, cookies, bearer tokens, Apple IDs, or unredacted
   provider identifiers. Preserve secret wrappers and redaction.
+- Exception: with debug assertions and `KEI_REQUEST_DUMP_DIR` explicitly enabled, unredacted Photos request/response bodies may be dumped to that private local directory; headers, URLs, normal logs, and builds without debug assertions are excluded.
 - Keep `unsafe` local. Document each block with a concrete `SAFETY` invariant
   and update `UNSAFE.md` when unsafe code changes.
 
