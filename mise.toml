@@ -1,0 +1,9 @@
+[tools]
+rust = { version = "1.94.1", components = ["rust-analyzer", "rust-src"] }
+just = "latest"
+typos = "latest"
+actionlint = "latest"
+"aqua:koalaman/shellcheck" = "latest"
+shfmt = "latest"
+ruff = "latest"
+"aqua:rustsec/rustsec/cargo-audit" = "latest"
