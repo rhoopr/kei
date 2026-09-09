@@ -9,6 +9,33 @@ use crate::retry::{self, RetryAction, RetryConfig, parse_retry_after_header};
 /// pathological server value can't stall the retry loop.
 const RETRY_AFTER_MAX: Duration = Duration::from_secs(120);
 
+#[cfg(debug_assertions)]
+async fn dump_body(dir: &std::path::Path, id: usize, kind: &str, body: &str) {
+    use tokio::io::AsyncWriteExt;
+
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let result: std::io::Result<()> = async {
+        let mut directory = tokio::fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        directory.mode(0o700);
+        directory.create(dir).await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(dir.join(format!("{id:06}.{kind}.{timestamp}.json")))
+            .await?;
+        file.write_all(body.as_bytes()).await?;
+        file.flush().await
+    }
+    .await;
+    if result.is_err() {
+        tracing::warn!(id, kind, "Could not dump Photos body");
+    }
+}
+
 /// Async HTTP session trait for the photos service.
 ///
 /// Abstracted as a trait so album/library code can be tested with stubs
@@ -36,6 +63,20 @@ impl PhotosSession for reqwest::Client {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        #[cfg(debug_assertions)]
+        let dump = std::env::var_os("KEI_REQUEST_DUMP_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| {
+                static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+                (
+                    std::path::PathBuf::from(dir),
+                    NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                )
+            });
+        #[cfg(debug_assertions)]
+        if let Some((dir, id)) = &dump {
+            dump_body(dir, *id, "req", &body).await;
+        }
         let mut builder = self.post(url).body(body);
         for &(k, v) in headers {
             builder = builder.header(k, v);
@@ -47,6 +88,10 @@ impl PhotosSession for reqwest::Client {
             let url = resp.url().to_string();
             let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
             let resp_body = read_bounded_error_body(resp, &url).await;
+            #[cfg(debug_assertions)]
+            if let Some((dir, id)) = &dump {
+                dump_body(dir, *id, "res", &resp_body).await;
+            }
             if !resp_body.is_empty() {
                 // 421 bodies are the most diagnostic signal for distinguishing
                 // ADP-class from session-class misdirected requests (e.g. the
@@ -83,6 +128,10 @@ impl PhotosSession for reqwest::Client {
         }
 
         let json: Value = resp.json().await?;
+        #[cfg(debug_assertions)]
+        if let Some((dir, id)) = &dump {
+            dump_body(dir, *id, "res", &json.to_string()).await;
+        }
         Ok(json)
     }
 
@@ -1127,6 +1176,62 @@ mod tests {
 
     use wiremock::matchers::method as wm_method;
     use wiremock::{Mock, ResponseTemplate};
+
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn dump_files_are_private_in_existing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var_os("KEI_DUMP_PERMISSION_CHILD").is_some() {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let server = wiremock::MockServer::start().await;
+                Mock::given(wm_method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"records": []})),
+                    )
+                    .mount(&server)
+                    .await;
+                let response =
+                    PhotosSession::post(&reqwest::Client::new(), &server.uri(), "{}".into(), &[])
+                        .await
+                        .unwrap();
+                assert_eq!(response, serde_json::json!({"records": []}));
+            });
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Isolate process-wide umask and environment changes from parallel tests.
+        let output = std::process::Command::new("sh")
+            .args(["-c", "umask 022; exec \"$@\"", "sh"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "icloud::photos::session::tests::dump_files_are_private_in_existing_directory",
+                "--nocapture",
+            ])
+            .env("KEI_DUMP_PERMISSION_CHILD", "1")
+            .env("KEI_REQUEST_DUMP_DIR", dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(files.len(), 2);
+        for file in files {
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            let expected = if file.file_name().to_str().unwrap().contains(".req.") {
+                "{}"
+            } else {
+                "{\"records\":[]}"
+            };
+            assert_eq!(std::fs::read_to_string(file.path()).unwrap(), expected);
+        }
+    }
 
     /// The FIDO failure mode from issue #221: CloudKit returns 401 with
     /// `"no auth method found"` in the JSON body. A real reqwest client
