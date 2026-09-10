@@ -1,6 +1,6 @@
 //! State database trait and `SQLite` implementation.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +24,129 @@ use super::types::{
 /// CloudKit parsing sets `source` explicitly; this fallback is a safety net,
 /// not the intended write path.
 const DEFAULT_SOURCE: &str = "icloud";
+
+/// Project provider relations into the compatibility grouping table. Only
+/// explicit relation/container tombstones remove names; an unfinished snapshot
+/// retains its prior live rows. External grouping sources are never removed.
+fn refresh_asset_album_groupings_tx(
+    tx: &Transaction<'_>,
+    library: &str,
+    asset_id: &str,
+    previous_name: Option<&str>,
+) -> Result<(), StateError> {
+    let operation = "refresh_asset_album_groupings";
+    let mut stmt = tx
+        .prepare_cached(
+            "SELECT c.album_name, m.is_deleted OR c.is_deleted \
+         FROM asset_album_memberships m JOIN album_containers c \
+           ON c.library = m.library AND c.container_id = m.container_id \
+         WHERE m.library = ?1 AND m.asset_record_name IN ( \
+             SELECT ?2 UNION SELECT asset_record_name FROM legacy_master_state_owners \
+             WHERE library = ?1 AND master_record_name = ?2)",
+        )
+        .map_err(|e| StateError::query(operation, e))?;
+    let rows = stmt
+        .query_map(rusqlite::params![library, asset_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
+        .map_err(|e| StateError::query(operation, e))?;
+    let mut known = BTreeSet::new();
+    let mut live = BTreeSet::new();
+    for row in rows {
+        let (name, deleted) = row.map_err(|e| StateError::query(operation, e))?;
+        known.insert(name.clone());
+        if !deleted {
+            live.insert(name);
+        }
+    }
+    if let Some(name) = previous_name {
+        known.insert(name.to_owned());
+    }
+    let mut changed = 0;
+    for name in known.difference(&live) {
+        changed += tx
+            .execute(
+                "DELETE FROM asset_albums WHERE library = ?1 AND asset_id = ?2 \
+             AND album_name = ?3 AND source = 'icloud'",
+                rusqlite::params![library, asset_id, name],
+            )
+            .map_err(|e| StateError::query(operation, e))?;
+    }
+    for name in live {
+        changed += tx
+            .execute(
+                "INSERT INTO asset_albums (library, asset_id, album_name, source) \
+             SELECT ?1, ?2, ?3, 'icloud' WHERE NOT EXISTS ( \
+                 SELECT 1 FROM asset_albums WHERE library = ?1 AND asset_id = ?2 \
+                 AND album_name = ?3 AND source = 'icloud')",
+                rusqlite::params![library, asset_id, name],
+            )
+            .map_err(|e| StateError::query(operation, e))?;
+    }
+    if changed > 0 {
+        mark_album_groupings_dirty_tx(tx, library, asset_id)?;
+    }
+    Ok(())
+}
+
+fn mark_album_groupings_dirty_tx(
+    tx: &Transaction<'_>,
+    library: &str,
+    asset_id: &str,
+) -> Result<(), StateError> {
+    tx.execute(
+        "UPDATE assets SET metadata_write_failed_at = COALESCE(metadata_write_failed_at, ?3) \
+         WHERE library = ?1 AND id = ?2 AND is_deleted = 0",
+        rusqlite::params![library, asset_id, Utc::now().timestamp()],
+    )
+    .map_err(|e| StateError::query("mark_album_groupings_dirty", e))?;
+    tx.execute(
+        "UPDATE asset_metadata_paths SET metadata_write_failed_at = COALESCE(metadata_write_failed_at, ?3) \
+         WHERE library = ?1 AND id = ?2",
+        rusqlite::params![library, asset_id, Utc::now().timestamp()],
+    ).map_err(|e| StateError::query("mark_album_metadata_paths_dirty", e))?;
+    Ok(())
+}
+
+// Keep the optional member filter in separate branches so both scopes use
+// indexed lookups. IN deduplicates child and legacy-owner identities.
+const ALBUM_GROUPING_STATE_IDS_SQL: &str = "WITH members AS MATERIALIZED ( \
+    SELECT asset_record_name FROM asset_album_memberships \
+    WHERE library = ?1 AND container_id = ?2 AND asset_record_name = ?3 \
+    UNION ALL \
+    SELECT asset_record_name FROM asset_album_memberships \
+    INDEXED BY idx_asset_album_memberships_container \
+    WHERE library = ?1 AND container_id = ?2 AND ?3 IS NULL \
+) SELECT DISTINCT id FROM assets WHERE library = ?1 AND id IN ( \
+    SELECT asset_record_name FROM members \
+    UNION ALL \
+    SELECT master_record_name FROM legacy_master_state_owners \
+    WHERE library = ?1 AND asset_record_name IN (SELECT asset_record_name FROM members))";
+
+fn refresh_container_groupings_tx(
+    tx: &Transaction<'_>,
+    library: &str,
+    container_id: &str,
+    asset_record_name: Option<&str>,
+    previous_name: Option<&str>,
+) -> Result<(), StateError> {
+    let operation = "refresh_container_groupings";
+    let mut stmt = tx
+        .prepare_cached(ALBUM_GROUPING_STATE_IDS_SQL)
+        .map_err(|e| StateError::query(operation, e))?;
+    let ids = stmt
+        .query_map(
+            rusqlite::params![library, container_id, asset_record_name],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| StateError::query(operation, e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| StateError::query(operation, e))?;
+    for id in ids {
+        refresh_asset_album_groupings_tx(tx, library, &id, previous_name)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 struct OwnedTempPathKey(Vec<u8>);
@@ -1137,10 +1260,12 @@ fn upsert_asset_row(
         None
     };
     let metadata_hash: Option<&str> = meta.metadata_hash.as_deref().or(computed_hash.as_deref());
+    let source = metadata_rewrite_source_sql();
     let blocked_capture_repair: i64 = conn
         .query_row(
-            "SELECT EXISTS( \
-                SELECT 1 FROM assets \
+            &format!(
+                "SELECT EXISTS( \
+                SELECT 1 FROM ({source}) \
                 WHERE library = ?1 AND id = ?2 \
                   AND status = 'downloaded' AND is_deleted = 0 \
                   AND capture_repair_metadata_hash IS NOT NULL \
@@ -1151,7 +1276,8 @@ fn upsert_asset_row(
                   AND capture_repair_output_size >= 0 \
                   AND capture_repair_metadata_hash IS NOT ?3 \
                   AND (version_size <> ?4 OR checksum = ?5) \
-            )",
+            )"
+            ),
             rusqlite::params![
                 &record.library,
                 &record.id,
@@ -1377,6 +1503,124 @@ fn record_metadata_capture_revision(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum MetadataPathWrite {
+    Published,
+    Rewritten,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetadataRewriteTarget {
+    Catalogue,
+    AdditionalPath,
+}
+
+impl MetadataRewriteTarget {
+    fn sql(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Catalogue => (
+                "assets",
+                "status = 'downloaded' AND is_deleted = 0 AND metadata_hash IS ?4",
+            ),
+            Self::AdditionalPath => (
+                "asset_metadata_paths",
+                "EXISTS (SELECT 1 FROM assets a \
+                WHERE a.library = asset_metadata_paths.library AND a.id = asset_metadata_paths.id \
+                  AND a.version_size = asset_metadata_paths.version_size \
+                  AND a.checksum = asset_metadata_paths.provider_checksum \
+                  AND a.status = 'downloaded' AND a.is_deleted = 0 AND a.metadata_hash IS ?4)",
+            ),
+        }
+    }
+}
+
+/// Select a path-specific compare-and-swap target without changing sync ownership.
+fn metadata_rewrite_target(
+    conn: &Connection,
+    library: &str,
+    id: &str,
+    version_size: &str,
+    path: &Path,
+) -> Result<MetadataRewriteTarget, StateError> {
+    let primary = conn.query_row(
+        "SELECT local_path IS ?4 FROM assets WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+        rusqlite::params![library, id, version_size, path.to_string_lossy()], |row| row.get::<_, bool>(0),
+    ).optional().map_err(|e| StateError::query("metadata_rewrite_target", e))?.unwrap_or(false);
+    Ok(if primary {
+        MetadataRewriteTarget::Catalogue
+    } else {
+        MetadataRewriteTarget::AdditionalPath
+    })
+}
+
+/// Copy the catalogue path's exact publication evidence in the same transaction.
+/// Other paths retain their own fingerprints and independent retry receipts.
+fn record_metadata_path(
+    conn: &Connection,
+    library: &str,
+    id: &str,
+    version_size: &str,
+    write: MetadataPathWrite,
+) -> Result<(), StateError> {
+    let preserve_debt = i64::from(matches!(write, MetadataPathWrite::Published));
+    conn.execute(
+        "INSERT INTO asset_metadata_paths \
+            (library, id, version_size, local_path, provider_checksum, local_checksum, \
+             download_checksum, metadata_write_failed_at, capture_repair_metadata_hash, \
+             capture_repair_output_checksum, capture_repair_output_size) \
+         SELECT library, id, version_size, local_path, checksum, local_checksum, \
+                download_checksum, metadata_write_failed_at, capture_repair_metadata_hash, \
+                capture_repair_output_checksum, capture_repair_output_size \
+         FROM assets WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
+             AND status = 'downloaded' AND local_path IS NOT NULL \
+         ON CONFLICT(library, id, version_size, local_path) DO UPDATE SET \
+             provider_checksum = excluded.provider_checksum, \
+             local_checksum = excluded.local_checksum, \
+             download_checksum = excluded.download_checksum, \
+             metadata_write_failed_at = CASE WHEN ?4 = 1 THEN \
+                 COALESCE(excluded.metadata_write_failed_at, asset_metadata_paths.metadata_write_failed_at) \
+                 ELSE excluded.metadata_write_failed_at END, \
+             capture_repair_metadata_hash = CASE WHEN ?4 = 1 \
+                 AND asset_metadata_paths.provider_checksum = excluded.provider_checksum \
+                 AND asset_metadata_paths.local_checksum IS excluded.local_checksum \
+                 THEN COALESCE(excluded.capture_repair_metadata_hash, asset_metadata_paths.capture_repair_metadata_hash) \
+                 ELSE excluded.capture_repair_metadata_hash END, \
+             capture_repair_output_checksum = CASE WHEN ?4 = 1 \
+                 AND asset_metadata_paths.provider_checksum = excluded.provider_checksum \
+                 AND asset_metadata_paths.local_checksum IS excluded.local_checksum \
+                 THEN COALESCE(excluded.capture_repair_output_checksum, asset_metadata_paths.capture_repair_output_checksum) \
+                 ELSE excluded.capture_repair_output_checksum END, \
+             capture_repair_output_size = CASE WHEN ?4 = 1 \
+                 AND asset_metadata_paths.provider_checksum = excluded.provider_checksum \
+                 AND asset_metadata_paths.local_checksum IS excluded.local_checksum \
+                 THEN COALESCE(excluded.capture_repair_output_size, asset_metadata_paths.capture_repair_output_size) \
+                 ELSE excluded.capture_repair_output_size END",
+        rusqlite::params![library, id, version_size, preserve_debt],
+    )
+    .map_err(|e| StateError::query("record_metadata_path", e))?;
+    if matches!(write, MetadataPathWrite::Published) {
+        // A previously additional path can become the catalogue path again.
+        // Keep its own preserved debt visible in the catalogue projection.
+        conn.execute(
+            "UPDATE assets SET (metadata_write_failed_at, capture_repair_metadata_hash, \
+                 capture_repair_output_checksum, capture_repair_output_size) = ( \
+                 SELECT p.metadata_write_failed_at, p.capture_repair_metadata_hash, \
+                        p.capture_repair_output_checksum, p.capture_repair_output_size \
+                 FROM asset_metadata_paths p WHERE p.library = assets.library AND p.id = assets.id \
+                   AND p.version_size = assets.version_size AND p.local_path = assets.local_path) \
+             WHERE library = ?1 AND id = ?2 AND version_size = ?3 AND EXISTS ( \
+                 SELECT 1 FROM asset_metadata_paths p WHERE p.library = assets.library AND p.id = assets.id \
+                   AND p.version_size = assets.version_size AND p.local_path = assets.local_path \
+                   AND (p.metadata_write_failed_at IS NOT assets.metadata_write_failed_at \
+                     OR p.capture_repair_metadata_hash IS NOT assets.capture_repair_metadata_hash \
+                     OR p.capture_repair_output_checksum IS NOT assets.capture_repair_output_checksum \
+                     OR p.capture_repair_output_size IS NOT assets.capture_repair_output_size))",
+            rusqlite::params![library, id, version_size],
+        ).map_err(|e| StateError::query("record_metadata_path::restore_debt", e))?;
+    }
+    Ok(())
+}
+
 /// Execute the `mark_downloaded` UPDATE on `conn`. Returns rows affected;
 /// callers decide what zero rows means in their context.
 #[expect(
@@ -1400,27 +1644,36 @@ fn update_status_to_downloaded(
              local_checksum = ?3, download_checksum = COALESCE(?4, download_checksum), last_error = NULL, \
              capture_repair_metadata_hash = CASE \
                  WHEN ?5 = 1 THEN metadata_hash \
-                 WHEN local_checksum IS ?3 THEN capture_repair_metadata_hash ELSE NULL END, \
+                 WHEN local_checksum IS ?3 AND local_path IS ?2 THEN capture_repair_metadata_hash ELSE NULL END, \
              capture_repair_output_checksum = CASE \
                  WHEN ?5 = 1 THEN NULL \
-                 WHEN local_checksum IS ?3 THEN capture_repair_output_checksum ELSE NULL END, \
+                 WHEN local_checksum IS ?3 AND local_path IS ?2 THEN capture_repair_output_checksum ELSE NULL END, \
              capture_repair_output_size = CASE \
                  WHEN ?5 = 1 THEN NULL \
-                 WHEN local_checksum IS ?3 THEN capture_repair_output_size ELSE NULL END \
+                 WHEN local_checksum IS ?3 AND local_path IS ?2 THEN capture_repair_output_size ELSE NULL END \
              WHERE library = ?6 AND id = ?7 AND version_size = ?8",
         )
         .map_err(|e| StateError::query("mark_downloaded::prepare", e))?;
-    stmt.execute(rusqlite::params![
-        downloaded_at,
-        local_path.to_string_lossy(),
-        local_checksum,
-        download_checksum,
-        i64::from(mark_capture_repair),
+    let updated = stmt
+        .execute(rusqlite::params![
+            downloaded_at,
+            local_path.to_string_lossy(),
+            local_checksum,
+            download_checksum,
+            i64::from(mark_capture_repair),
+            library,
+            id,
+            version_size
+        ])
+        .map_err(|e| StateError::query("mark_downloaded", e))?;
+    record_metadata_path(
+        conn,
         library,
         id,
-        version_size
-    ])
-    .map_err(|e| StateError::query("mark_downloaded", e))
+        version_size,
+        MetadataPathWrite::Published,
+    )?;
+    Ok(updated)
 }
 
 fn ensure_asset_has_no_prepared_capture_repair(
@@ -1429,10 +1682,12 @@ fn ensure_asset_has_no_prepared_capture_repair(
     asset_id: &str,
     operation: &'static str,
 ) -> Result<(), StateError> {
+    let source = metadata_rewrite_source_sql();
     let prepared: i64 = conn
         .query_row(
-            "SELECT EXISTS( \
-                SELECT 1 FROM assets \
+            &format!(
+                "SELECT EXISTS( \
+                SELECT 1 FROM ({source}) \
                 WHERE library = ?1 AND id = ?2 \
                   AND capture_repair_metadata_hash IS NOT NULL \
                   AND capture_repair_metadata_hash <> '' \
@@ -1440,7 +1695,8 @@ fn ensure_asset_has_no_prepared_capture_repair(
                   AND capture_repair_output_checksum <> '' \
                   AND capture_repair_output_size IS NOT NULL \
                   AND capture_repair_output_size >= 0 \
-            )",
+            )"
+            ),
             rusqlite::params![library, asset_id],
             |row| row.get(0),
         )
@@ -1460,10 +1716,12 @@ fn ensure_master_family_has_no_prepared_capture_repair(
     master_record_name: &str,
     operation: &'static str,
 ) -> Result<(), StateError> {
+    let source = metadata_rewrite_source_sql();
     let prepared: i64 = conn
         .query_row(
-            "SELECT EXISTS( \
-                SELECT 1 FROM assets \
+            &format!(
+                "SELECT EXISTS( \
+                SELECT 1 FROM ({source}) \
                 WHERE library = ?1 \
                   AND (id = ?2 OR id IN ( \
                       SELECT asset_record_name FROM asset_master_mappings \
@@ -1475,7 +1733,8 @@ fn ensure_master_family_has_no_prepared_capture_repair(
                   AND capture_repair_output_checksum <> '' \
                   AND capture_repair_output_size IS NOT NULL \
                   AND capture_repair_output_size >= 0 \
-            )",
+            )"
+            ),
             rusqlite::params![library, master_record_name],
             |row| row.get(0),
         )
@@ -1699,8 +1958,19 @@ impl SqliteStateDb {
 
     pub(crate) async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
         let record = record.clone();
-        self.with_conn("upsert_seen", move |conn| {
-            upsert_asset_row(conn, &record, Utc::now().timestamp())
+        self.with_conn_mut("upsert_seen", move |conn| {
+            let tx = conn.transaction().map_err(|e| StateError::query("upsert_seen::begin", e))?;
+            upsert_asset_row(&tx, &record, Utc::now().timestamp())?;
+            refresh_asset_album_groupings_tx(&tx, &record.library, &record.id, None)?;
+            // Membership may precede the first state row. Keep a retry marker
+            // until the end-of-cycle writer sees all selected album producers.
+            tx.execute(
+                "UPDATE assets SET metadata_write_failed_at = COALESCE(metadata_write_failed_at, ?3) \
+                 WHERE library = ?1 AND id = ?2 AND status = 'pending' AND EXISTS ( \
+                     SELECT 1 FROM asset_albums WHERE library = ?1 AND asset_id = ?2)",
+                rusqlite::params![&record.library, &record.id, Utc::now().timestamp()],
+            ).map_err(|e| StateError::query("upsert_seen::album_marker", e))?;
+            tx.commit().map_err(|e| StateError::query("upsert_seen::commit", e))
         })
         .await
     }
@@ -1744,9 +2014,12 @@ impl SqliteStateDb {
         let local_checksum = local_checksum.to_owned();
         let download_checksum = download_checksum.map(str::to_owned);
 
-        self.with_conn("mark_downloaded", move |conn| {
+        self.with_conn_mut("mark_downloaded", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("mark_downloaded::begin", e))?;
             let rows = update_status_to_downloaded(
-                conn,
+                &tx,
                 &library,
                 &id,
                 &version_size,
@@ -1766,13 +2039,15 @@ impl SqliteStateDb {
             }
 
             record_metadata_capture_revision(
-                conn,
+                &tx,
                 &library,
                 &id,
                 METADATA_CAPTURE_REVISION,
                 downloaded_at,
             )?;
 
+            tx.commit()
+                .map_err(|e| StateError::query("mark_downloaded::commit", e))?;
             Ok(())
         })
         .await
@@ -3237,13 +3512,22 @@ impl SqliteStateDb {
         let asset_id = asset_id.to_owned();
         let album_name = album_name.to_owned();
         let source = source.to_owned();
-        self.with_conn("add_asset_album", move |conn| {
-            conn.execute(
-                "INSERT OR IGNORE INTO asset_albums (library, asset_id, album_name, source) \
+        self.with_conn_mut("add_asset_album", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("add_asset_album::begin", e))?;
+            let changed = tx
+                .execute(
+                    "INSERT OR IGNORE INTO asset_albums (library, asset_id, album_name, source) \
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![library, asset_id, album_name, source],
-            )
-            .map_err(|e| StateError::query("add_asset_album", e))?;
+                    rusqlite::params![&library, &asset_id, album_name, source],
+                )
+                .map_err(|e| StateError::query("add_asset_album", e))?;
+            if changed > 0 {
+                mark_album_groupings_dirty_tx(&tx, &library, &asset_id)?;
+            }
+            tx.commit()
+                .map_err(|e| StateError::query("add_asset_album::commit", e))?;
             Ok(())
         })
         .await
@@ -3353,9 +3637,16 @@ impl SqliteStateDb {
         let container_id = container_id.to_owned();
         let album_name = album_name.to_owned();
         let pass_kind = pass_kind.to_owned();
-        self.with_conn("upsert_album_container", move |conn| {
+        self.with_conn_mut("upsert_album_container", move |conn| {
             let now = Utc::now().timestamp();
-            conn.execute(
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("upsert_album_container::begin", e))?;
+            let previous_name: Option<String> = tx.query_row(
+                "SELECT album_name FROM album_containers WHERE library = ?1 AND container_id = ?2",
+                rusqlite::params![&library, &container_id], |row| row.get(0),
+            ).optional().map_err(|e| StateError::query("upsert_album_container::name", e))?;
+            tx.execute(
                 "INSERT INTO album_containers \
                     (library, container_id, album_name, pass_kind, is_deleted, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, 0, ?5) \
@@ -3364,9 +3655,18 @@ impl SqliteStateDb {
                     pass_kind = excluded.pass_kind, \
                     is_deleted = 0, \
                     updated_at = excluded.updated_at",
-                rusqlite::params![library, container_id, album_name, pass_kind, now],
+                rusqlite::params![&library, &container_id, album_name, pass_kind, now],
             )
             .map_err(|e| StateError::query("upsert_album_container", e))?;
+            refresh_container_groupings_tx(
+                &tx,
+                &library,
+                &container_id,
+                None,
+                previous_name.as_deref(),
+            )?;
+            tx.commit()
+                .map_err(|e| StateError::query("upsert_album_container::commit", e))?;
             Ok(())
         })
         .await
@@ -3379,15 +3679,31 @@ impl SqliteStateDb {
     ) -> Result<(), StateError> {
         let library = library.to_owned();
         let container_id = container_id.to_owned();
-        self.with_conn("mark_album_container_deleted", move |conn| {
+        self.with_conn_mut("mark_album_container_deleted", move |conn| {
             let now = Utc::now().timestamp();
-            conn.execute(
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("mark_album_container_deleted::begin", e))?;
+            let previous_name: Option<String> = tx.query_row(
+                "SELECT album_name FROM album_containers WHERE library = ?1 AND container_id = ?2",
+                rusqlite::params![&library, &container_id], |row| row.get(0),
+            ).optional().map_err(|e| StateError::query("mark_album_container_deleted::name", e))?;
+            tx.execute(
                 "UPDATE album_containers \
                  SET is_deleted = 1, updated_at = ?1 \
                  WHERE library = ?2 AND container_id = ?3",
-                rusqlite::params![now, library, container_id],
+                rusqlite::params![now, &library, &container_id],
             )
             .map_err(|e| StateError::query("mark_album_container_deleted", e))?;
+            refresh_container_groupings_tx(
+                &tx,
+                &library,
+                &container_id,
+                None,
+                previous_name.as_deref(),
+            )?;
+            tx.commit()
+                .map_err(|e| StateError::query("mark_album_container_deleted::commit", e))?;
             Ok(())
         })
         .await
@@ -3498,6 +3814,7 @@ impl SqliteStateDb {
                 ],
             )
             .map_err(|e| StateError::query("add_album_membership_to_snapshot::upsert", e))?;
+            refresh_container_groupings_tx(&tx, &library, &container_id, Some(&asset_record_name), None)?;
             tx.commit()
                 .map_err(|e| StateError::query("add_album_membership_to_snapshot::commit", e))?;
             Ok(())
@@ -3549,6 +3866,7 @@ impl SqliteStateDb {
                 ],
             )
             .map_err(|e| StateError::query("upsert_album_membership_delta::upsert", e))?;
+            refresh_container_groupings_tx(&tx, &library, &container_id, Some(&asset_record_name), None)?;
             tx.commit()
                 .map_err(|e| StateError::query("upsert_album_membership_delta::commit", e))?;
             Ok(container_known)
@@ -3583,6 +3901,13 @@ impl SqliteStateDb {
                 rusqlite::params![now, &library, &container_id, &asset_record_name],
             )
             .map_err(|e| StateError::query("mark_album_membership_deleted::update", e))?;
+            refresh_container_groupings_tx(
+                &tx,
+                &library,
+                &container_id,
+                Some(&asset_record_name),
+                None,
+            )?;
             tx.commit()
                 .map_err(|e| StateError::query("mark_album_membership_deleted::commit", e))?;
             Ok(container_known)
@@ -3630,6 +3955,7 @@ impl SqliteStateDb {
                 rusqlite::params![now, &library, &container_id, generation],
             )
             .map_err(|e| StateError::query("complete_album_membership_snapshot::prune", e))?;
+            refresh_container_groupings_tx(&tx, &library, &container_id, None, None)?;
             tx.commit()
                 .map_err(|e| StateError::query("complete_album_membership_snapshot::commit", e))?;
             Ok(())
@@ -4252,13 +4578,24 @@ impl SqliteStateDb {
         let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         let version_size = version_size.to_owned();
-        self.with_conn("record_metadata_write_failure", move |conn| {
-            conn.execute(
+        self.with_conn_mut("record_metadata_write_failure", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("record_metadata_write_failure::begin", e))?;
+            tx.execute(
                 "UPDATE assets SET metadata_write_failed_at = ?1 \
+                 WHERE library = ?2 AND id = ?3 AND version_size = ?4",
+                rusqlite::params![ts, &library, &asset_id, &version_size],
+            )
+            .map_err(|e| StateError::query("record_metadata_write_failure", e))?;
+            tx.execute(
+                "UPDATE asset_metadata_paths SET metadata_write_failed_at = ?1 \
                  WHERE library = ?2 AND id = ?3 AND version_size = ?4",
                 rusqlite::params![ts, library, asset_id, version_size],
             )
-            .map_err(|e| StateError::query("record_metadata_write_failure", e))?;
+            .map_err(|e| StateError::query("record_metadata_write_failure::paths", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("record_metadata_write_failure::commit", e))?;
             Ok(())
         })
         .await
@@ -4316,30 +4653,52 @@ impl SqliteStateDb {
                 operation: "record_capture_repair_prepared",
                 detail: "capture-repair output size exceeds SQLite INTEGER".into(),
             })?;
-        self.with_conn("record_capture_repair_prepared", move |conn| {
-            let updated = conn
+        let Some(path) = pending.asset.local_path.clone() else {
+            return Ok(None);
+        };
+        self.with_conn_mut("record_capture_repair_prepared", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("record_capture_repair_prepared::begin", e))?;
+            let target = metadata_rewrite_target(&tx, &library, &asset_id, &version_size, &path)?;
+            let (table, evidence) = target.sql();
+
+            let updated = tx
                 .execute(
-                    "UPDATE assets SET capture_repair_output_checksum = ?8, \
+                    &format!(
+                        "UPDATE {table} SET capture_repair_output_checksum = ?8, \
                         capture_repair_output_size = ?9 \
                      WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
-                       AND status = 'downloaded' AND is_deleted = 0 \
-                       AND metadata_hash IS ?4 AND local_checksum IS ?5 \
+                       AND {evidence} AND local_checksum IS ?5 \
                        AND capture_repair_metadata_hash IS ?4 \
                        AND capture_repair_output_checksum IS ?6 \
-                       AND capture_repair_output_size IS ?7",
+                       AND capture_repair_output_size IS ?7 AND local_path IS ?10"
+                    ),
                     rusqlite::params![
-                        library,
-                        asset_id,
-                        version_size,
+                        &library,
+                        &asset_id,
+                        &version_size,
                         metadata_hash,
                         input_checksum,
                         selected_output_checksum,
                         selected_output_size,
                         output_checksum,
-                        output_size_sql
+                        output_size_sql,
+                        path.to_string_lossy()
                     ],
                 )
                 .map_err(|e| StateError::query("record_capture_repair_prepared", e))?;
+            if updated > 0 && target == MetadataRewriteTarget::Catalogue {
+                record_metadata_path(
+                    &tx,
+                    &library,
+                    &asset_id,
+                    &version_size,
+                    MetadataPathWrite::Rewritten,
+                )?;
+            }
+            tx.commit()
+                .map_err(|e| StateError::query("record_capture_repair_prepared::commit", e))?;
             Ok((updated > 0).then_some(CaptureRepairReceipt::Prepared {
                 metadata_hash,
                 output_checksum,
@@ -4365,10 +4724,13 @@ impl SqliteStateDb {
             metadata.refresh_hash();
         }
         let rewrite_at = Utc::now().timestamp();
-        self.with_conn("refresh_downloaded_asset_metadata", move |conn| {
+        self.with_conn_mut("refresh_downloaded_asset_metadata", move |connection| {
+            let tx = connection.transaction().map_err(|e| StateError::query("refresh_downloaded_asset_metadata::begin", e))?;
+            let conn = &tx;
+            let source = metadata_rewrite_source_sql();
             let updated = conn
                 .execute(
-                    r"
+                    &format!(r"
                     UPDATE assets SET
                         source = COALESCE(?1, source),
                         is_favorite = ?2,
@@ -4446,7 +4808,7 @@ impl SqliteStateDb {
                     WHERE library = ?27 AND id = ?28
                       AND status = 'downloaded' AND is_deleted = 0
                       AND NOT EXISTS (
-                          SELECT 1 FROM assets AS blocked
+                          SELECT 1 FROM ({source}) AS blocked
                           WHERE blocked.library = ?27 AND blocked.id = ?28
                             AND blocked.status = 'downloaded' AND blocked.is_deleted = 0
                             AND blocked.capture_repair_metadata_hash IS NOT NULL
@@ -4457,7 +4819,7 @@ impl SqliteStateDb {
                             AND blocked.capture_repair_output_size >= 0
                             AND blocked.capture_repair_metadata_hash IS NOT ?23
                       )
-                    ",
+                    "),
                     rusqlite::params![
                         metadata.source.as_deref(),
                         i64::from(metadata.is_favorite),
@@ -4500,11 +4862,11 @@ impl SqliteStateDb {
                 // write. A missing or still-stale row stays a failure.
                 let durable: i64 = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM assets \
+                        &format!("SELECT COUNT(*) FROM assets \
                          WHERE library = ?1 AND id = ?2 AND is_deleted = 0 \
                            AND metadata_hash IS NOT NULL AND metadata_hash = ?3 \
                            AND NOT EXISTS ( \
-                               SELECT 1 FROM assets AS blocked \
+                               SELECT 1 FROM ({source}) AS blocked \
                                WHERE blocked.library = ?1 AND blocked.id = ?2 \
                                  AND blocked.status = 'downloaded' \
                                  AND blocked.is_deleted = 0 \
@@ -4515,7 +4877,7 @@ impl SqliteStateDb {
                                  AND blocked.capture_repair_output_size IS NOT NULL \
                                  AND blocked.capture_repair_output_size >= 0 \
                                  AND blocked.capture_repair_metadata_hash IS NOT ?3 \
-                           )",
+                           )"),
                         rusqlite::params![library, asset_id, metadata.metadata_hash.as_deref()],
                         |row| row.get(0),
                     )
@@ -4523,6 +4885,20 @@ impl SqliteStateDb {
                 usize::try_from(durable).unwrap_or(0)
             };
             if durable > 0 {
+                conn.execute(
+                    "UPDATE asset_metadata_paths SET \
+                        metadata_write_failed_at = CASE WHEN ?3 = 1 THEN ?5 ELSE metadata_write_failed_at END, \
+                        capture_repair_metadata_hash = CASE WHEN ?4 = 1 AND ( \
+                            (capture_repair_metadata_hash IS NULL AND capture_repair_output_checksum IS NULL AND capture_repair_output_size IS NULL) \
+                            OR (capture_repair_metadata_hash <> '' AND capture_repair_output_checksum IS NULL AND capture_repair_output_size IS NULL)) \
+                            THEN ?6 ELSE capture_repair_metadata_hash END \
+                     WHERE library = ?1 AND id = ?2 AND EXISTS ( \
+                         SELECT 1 FROM assets a WHERE a.library = ?1 AND a.id = ?2 \
+                           AND a.version_size = asset_metadata_paths.version_size \
+                           AND a.checksum = asset_metadata_paths.provider_checksum \
+                           AND a.status = 'downloaded' AND a.is_deleted = 0)",
+                    rusqlite::params![&library, &asset_id, i64::from(mark_for_rewrite), i64::from(mark_capture_repair), rewrite_at, metadata.metadata_hash.as_deref()],
+                ).map_err(|e| StateError::query("refresh_downloaded_asset_metadata::paths", e))?;
                 record_metadata_capture_revision(
                     conn,
                     &library,
@@ -4531,6 +4907,7 @@ impl SqliteStateDb {
                     rewrite_at,
                 )?;
             }
+            tx.commit().map_err(|e| StateError::query("refresh_downloaded_asset_metadata::commit", e))?;
             Ok(durable)
         })
         .await
@@ -4720,10 +5097,20 @@ impl SqliteStateDb {
         let selected_capture = i64::from(selected_queue == MetadataRewriteQueue::CaptureRepair);
         let clear_ordinary = i64::from(completion.clears(MetadataRewriteQueue::Ordinary));
         let clear_capture = i64::from(completion.clears(MetadataRewriteQueue::CaptureRepair));
-        self.with_conn("finish_metadata_rewrite", move |conn| {
-            let updated = conn
+        let Some(path) = pending.asset.local_path.clone() else {
+            return Ok(false);
+        };
+        self.with_conn_mut("finish_metadata_rewrite", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("finish_metadata_rewrite::begin", e))?;
+            let target = metadata_rewrite_target(&tx, &library, &asset_id, &version_size, &path)?;
+            let (table, evidence) = target.sql();
+
+            let updated = tx
                 .execute(
-                    "UPDATE assets SET \
+                    &format!(
+                        "UPDATE {table} SET \
                         local_checksum = ?6, \
                         download_checksum = COALESCE(download_checksum, ?7), \
                         metadata_write_failed_at = CASE WHEN ?8 = 1 \
@@ -4738,8 +5125,7 @@ impl SqliteStateDb {
                             WHEN ?9 = 1 OR local_checksum IS NOT ?6 \
                                 THEN NULL ELSE capture_repair_output_size END \
                      WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
-                       AND status = 'downloaded' AND is_deleted = 0 \
-                       AND metadata_hash IS ?4 AND local_checksum IS ?5 \
+                       AND {evidence} AND local_checksum IS ?5 \
                        AND ((?10 = 0 AND metadata_write_failed_at IS NOT NULL) \
                          OR (?10 = 1 \
                            AND capture_repair_metadata_hash IS ?11 \
@@ -4748,11 +5134,12 @@ impl SqliteStateDb {
                        AND (?9 = 0 OR ( \
                            capture_repair_metadata_hash IS ?11 \
                            AND capture_repair_output_checksum IS ?12 \
-                           AND capture_repair_output_size IS ?13))",
+                           AND capture_repair_output_size IS ?13)) AND local_path IS ?14"
+                    ),
                     rusqlite::params![
-                        library,
-                        asset_id,
-                        version_size,
+                        &library,
+                        &asset_id,
+                        &version_size,
                         metadata_hash,
                         input_checksum,
                         local_checksum,
@@ -4762,10 +5149,22 @@ impl SqliteStateDb {
                         selected_capture,
                         capture_metadata_hash,
                         capture_output_checksum,
-                        capture_output_size
+                        capture_output_size,
+                        path.to_string_lossy()
                     ],
                 )
                 .map_err(|e| StateError::query("finish_metadata_rewrite", e))?;
+            if updated > 0 && target == MetadataRewriteTarget::Catalogue {
+                record_metadata_path(
+                    &tx,
+                    &library,
+                    &asset_id,
+                    &version_size,
+                    MetadataPathWrite::Rewritten,
+                )?;
+            }
+            tx.commit()
+                .map_err(|e| StateError::query("finish_metadata_rewrite::commit", e))?;
             Ok(updated > 0 && completion.clears(selected_queue))
         })
         .await
@@ -4775,11 +5174,9 @@ impl SqliteStateDb {
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError> {
         self.with_conn("get_metadata_retry_markers", move |conn| {
+            let source = metadata_rewrite_source_sql();
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT library, id, version_size FROM assets \
-                     WHERE metadata_write_failed_at IS NOT NULL",
-                )
+                .prepare(&format!("SELECT library, id, version_size FROM ({source}) WHERE metadata_write_failed_at IS NOT NULL"))
                 .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
             let mut markers: HashSet<(String, String, String)> = HashSet::new();
             let rows = stmt
@@ -6073,6 +6470,30 @@ const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
 /// asserts `row_to_asset_record` reads exactly this many indices (0..N).
 const ASSET_COLUMN_COUNT: usize = 40;
 
+fn metadata_rewrite_source_sql() -> String {
+    let path_columns = ASSET_COLUMNS
+        .split(',')
+        .map(str::trim)
+        .map(|column| {
+            let owner = match column {
+                "local_path" | "local_checksum" | "download_checksum" => "p",
+                _ => "a",
+            };
+            format!("{owner}.{column}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT {ASSET_COLUMNS}, metadata_write_failed_at, capture_repair_metadata_hash, \
+             capture_repair_output_checksum, capture_repair_output_size FROM assets \
+         UNION ALL SELECT {path_columns}, p.metadata_write_failed_at, p.capture_repair_metadata_hash, \
+             p.capture_repair_output_checksum, p.capture_repair_output_size \
+         FROM asset_metadata_paths p JOIN assets a \
+           ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
+         WHERE p.local_path IS NOT a.local_path AND p.provider_checksum = a.checksum"
+    )
+}
+
 fn query_pending_metadata_rewrites(
     conn: &Connection,
     queue: MetadataRewriteQueue,
@@ -6095,12 +6516,13 @@ fn query_pending_metadata_rewrites(
     let scope = libraries
         .map(|libraries| format!(" AND library IN ({})", sqlite_placeholders(libraries.len())))
         .unwrap_or_default();
+    let source = metadata_rewrite_source_sql();
     let sql = format!(
         "SELECT {ASSET_COLUMNS}, capture_repair_metadata_hash, \
             capture_repair_output_checksum, capture_repair_output_size \
-         FROM assets WHERE {queue_predicate} \
+         FROM ({source}) WHERE {queue_predicate} \
            AND status = 'downloaded' AND is_deleted = 0 AND local_path IS NOT NULL \
-           {scope} ORDER BY {order} LIMIT ? OFFSET ?"
+           {scope} ORDER BY {order}, local_path LIMIT ? OFFSET ?"
     );
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let offset = i64::try_from(offset).unwrap_or(i64::MAX);
@@ -10119,6 +10541,600 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_paths_finalize_atomically_and_complete_independently() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("copies").checksum("provider").build();
+        db.upsert_seen(&record).await.unwrap();
+        db.acquire_lock("test_path_registration_failure")
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_path_registration BEFORE INSERT ON asset_metadata_paths \
+             BEGIN SELECT RAISE(ABORT, 'path registration failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.mark_downloaded(
+                "PrimarySync",
+                "copies",
+                "original",
+                Path::new("/photos/a.jpg"),
+                "local-a",
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db.acquire_lock("test_atomic_finalize")
+                .unwrap()
+                .query_row(
+                    "SELECT status, local_path FROM assets WHERE id = 'copies'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                )
+                .unwrap(),
+            ("pending".into(), None)
+        );
+        db.acquire_lock("test_allow_path_registration")
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_path_registration")
+            .unwrap();
+        for (path, checksum) in [("/photos/a.jpg", "local-a"), ("/photos/b.jpg", "local-b")] {
+            db.mark_downloaded(
+                "PrimarySync",
+                "copies",
+                "original",
+                Path::new(path),
+                checksum,
+                Some("download"),
+            )
+            .await
+            .unwrap();
+        }
+        db.record_metadata_write_failure("PrimarySync", "copies", "original")
+            .await
+            .unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                Some(&["PrimarySync"]),
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].asset.local_checksum.as_deref(), Some("local-a"));
+        assert_eq!(pending[1].asset.local_checksum.as_deref(), Some("local-b"));
+        assert!(
+            db.finish_metadata_rewrite(
+                &pending[0],
+                MetadataRewriteQueue::Ordinary,
+                Some("rewritten-a"),
+                Some("local-a"),
+                MetadataRewriteCompletion::Ordinary
+            )
+            .await
+            .unwrap()
+        );
+        let remaining = db.get_pending_metadata_rewrites(10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].local_path.as_deref(),
+            Some(Path::new("/photos/b.jpg"))
+        );
+        assert_eq!(remaining[0].local_checksum.as_deref(), Some("local-b"));
+        db.record_metadata_write_failure("PrimarySync", "copies", "original")
+            .await
+            .unwrap();
+        assert!(
+            !db.finish_metadata_rewrite(
+                &pending[0],
+                MetadataRewriteQueue::Ordinary,
+                Some("stale-a"),
+                Some("local-a"),
+                MetadataRewriteCompletion::Ordinary
+            )
+            .await
+            .unwrap()
+        );
+        let copies = db.get_pending_metadata_rewrites(10).await.unwrap();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(copies[0].local_checksum.as_deref(), Some("rewritten-a"));
+        assert_eq!(copies[1].local_checksum.as_deref(), Some("local-b"));
+        assert!(
+            db.finish_metadata_rewrite(
+                &pending[1],
+                MetadataRewriteQueue::Ordinary,
+                Some("local-b"),
+                None,
+                MetadataRewriteCompletion::Ordinary
+            )
+            .await
+            .unwrap()
+        );
+        let only_additional = db.get_pending_metadata_rewrites(1).await.unwrap();
+        assert_eq!(only_additional.len(), 1);
+        assert_eq!(
+            only_additional[0].local_path.as_deref(),
+            Some(Path::new("/photos/a.jpg"))
+        );
+        assert!(
+            db.get_metadata_retry_markers().await.unwrap().contains(&(
+                "PrimarySync".into(),
+                "copies".into(),
+                "original".into()
+            )),
+            "an additional copy must remain visible after the catalogue copy completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn additional_path_prepared_capture_receipt_blocks_stale_metadata() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("copies")
+            .checksum("provider")
+            .metadata(AssetMetadata {
+                metadata_hash: Some("metadata-v1".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        for path in ["/photos/a.jpg", "/photos/b.jpg"] {
+            db.mark_downloaded(
+                "PrimarySync",
+                "copies",
+                "original",
+                Path::new(path),
+                "local",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "copies",
+            &record.metadata,
+            true,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            db.record_capture_repair_prepared(&pending[0], "prepared", 42)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        db.mark_downloaded(
+            "PrimarySync",
+            "copies",
+            "original",
+            Path::new("/photos/a.jpg"),
+            "local",
+            None,
+        )
+        .await
+        .unwrap();
+        let switched = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            switched.len(),
+            2,
+            "changing the catalogue path must not hide either copy's debt"
+        );
+        assert!(matches!(
+            switched[0].capture_repair_receipt,
+            Some(CaptureRepairReceipt::Prepared { .. })
+        ));
+        let mut changed = (*record.metadata).clone();
+        changed.metadata_hash = Some("metadata-v2".into());
+        assert_eq!(
+            db.refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "copies",
+                &changed,
+                true,
+                true,
+                METADATA_CAPTURE_REVISION
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let changed_record = TestAssetRecord::new("copies")
+            .checksum("provider")
+            .metadata(changed)
+            .build();
+        assert!(db.upsert_seen(&changed_record).await.is_err());
+        let preserved = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            preserved[0].capture_repair_receipt,
+            Some(CaptureRepairReceipt::Prepared {
+                metadata_hash: "metadata-v1".into(),
+                output_checksum: "prepared".into(),
+                output_size: 42
+            })
+        );
+        assert_eq!(
+            preserved[1].capture_repair_receipt,
+            Some(CaptureRepairReceipt::Pending {
+                metadata_hash: "metadata-v1".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn album_grouping_projection_has_bounded_sql_work() {
+        use rusqlite::StatementStatus;
+
+        const SINGLE_MEMBER_STEP_LIMIT: i32 = 300;
+        const STEPS_PER_MEMBER_LIMIT: i32 = 150;
+        for members in [128, 512] {
+            let db = SqliteStateDb::open_in_memory().unwrap();
+            db.upsert_album_container("PrimarySync", "trip", "Trip", "album")
+                .await
+                .unwrap();
+            {
+                let mut conn = db.acquire_lock("seed_populated_album").unwrap();
+                let tx = conn.transaction().unwrap();
+                for index in 0..members {
+                    let child = format!("child-{index}");
+                    let master = format!("master-{index}");
+                    for id in [&child, &master] {
+                        tx.execute(
+                            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at) VALUES ('PrimarySync', ?1, 'original', 'provider', 'image.jpg', 0, 10, 'photo', 'downloaded', 0)",
+                            [id],
+                        ).unwrap();
+                    }
+                    tx.execute(
+                        "INSERT INTO legacy_master_state_owners VALUES ('PrimarySync', ?1, ?2, 0)",
+                        [&master, &child],
+                    )
+                    .unwrap();
+                    // Missing master hints must not hide the durable legacy owner.
+                    tx.execute("INSERT INTO asset_album_memberships VALUES ('PrimarySync', ?1, NULL, 'trip', 1, 0, 'icloud', 0)", [&child]).unwrap();
+                }
+                tx.commit().unwrap();
+            }
+            let steps = || {
+                db.acquire_lock("projection_sql_work")
+                    .unwrap()
+                    .prepare_cached(ALBUM_GROUPING_STATE_IDS_SQL)
+                    .unwrap()
+                    .reset_status(StatementStatus::VmStep)
+            };
+            let dirty = || {
+                let conn = db.acquire_lock("projection_dirty_rows").unwrap();
+                conn.query_row(
+                    "SELECT COUNT(*) FROM assets WHERE metadata_write_failed_at IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .unwrap()
+            };
+            steps();
+            for expected_dirty in [2, 0] {
+                db.upsert_album_membership_delta("PrimarySync", "trip", "child-0", None, "icloud")
+                    .await
+                    .unwrap();
+                let work = steps();
+                assert!(
+                    work > 0 && work <= SINGLE_MEMBER_STEP_LIMIT,
+                    "{members} members: {work} single-member VM steps"
+                );
+                assert_eq!(
+                    db.get_asset_groupings("PrimarySync", &["child-0", "master-0"])
+                        .await
+                        .unwrap()
+                        .albums,
+                    [
+                        ("child-0".into(), "Trip".into()),
+                        ("master-0".into(), "Trip".into())
+                    ]
+                );
+                assert_eq!(dirty(), expected_dirty);
+                for id in ["child-0", "master-0"] {
+                    db.clear_metadata_write_failure("PrimarySync", id, "original")
+                        .await
+                        .unwrap();
+                }
+            }
+            for expected_dirty in [members * 2, 0] {
+                db.upsert_album_container("PrimarySync", "trip", "Renamed", "album")
+                    .await
+                    .unwrap();
+                let work = steps();
+                assert!(
+                    work > 0 && work <= members * STEPS_PER_MEMBER_LIMIT,
+                    "{members} members: {work} container VM steps"
+                );
+                let groups = db.get_all_asset_albums("PrimarySync").await.unwrap();
+                assert_eq!(groups.len(), usize::try_from(members * 2).unwrap());
+                assert!(groups.iter().all(|(_, name)| name == "Renamed"));
+                assert_eq!(
+                    dirty(),
+                    expected_dirty,
+                    "unchanged projection must not queue work"
+                );
+                db.acquire_lock("clear_projection_debt")
+                    .unwrap()
+                    .execute("UPDATE assets SET metadata_write_failed_at = NULL", [])
+                    .unwrap();
+            }
+            assert_eq!(dirty(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn album_grouping_projection_respects_legacy_state_ownership() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for id in ["master", "child-b"] {
+            db.upsert_seen(&TestAssetRecord::new(id).build())
+                .await
+                .unwrap();
+        }
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", "master", "child-a")
+                .await
+                .unwrap()
+        );
+        db.upsert_album_container("PrimarySync", "trip", "Trip", "album")
+            .await
+            .unwrap();
+        db.upsert_album_membership_delta(
+            "PrimarySync",
+            "trip",
+            "child-b",
+            Some("master"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.get_asset_groupings("PrimarySync", &["master"])
+                .await
+                .unwrap()
+                .albums
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_asset_groupings("PrimarySync", &["child-b"])
+                .await
+                .unwrap()
+                .albums,
+            [("child-b".into(), "Trip".into())]
+        );
+        db.upsert_album_membership_delta(
+            "PrimarySync",
+            "trip",
+            "child-a",
+            Some("master"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_asset_groupings("PrimarySync", &["master"])
+                .await
+                .unwrap()
+                .albums,
+            [("master".into(), "Trip".into())]
+        );
+        db.mark_album_membership_deleted("PrimarySync", "trip", "child-b")
+            .await
+            .unwrap();
+        assert!(
+            db.get_asset_groupings("PrimarySync", &["child-b"])
+                .await
+                .unwrap()
+                .albums
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_asset_groupings("PrimarySync", &["master"])
+                .await
+                .unwrap()
+                .albums,
+            [("master".into(), "Trip".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn album_grouping_mutations_keep_atomic_retry_evidence() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for (library, id) in [
+            ("PrimarySync", "child"),
+            ("PrimarySync", "sibling"),
+            ("SharedSync", "child"),
+        ] {
+            db.upsert_seen(&TestAssetRecord::new(id).library(library).build())
+                .await
+                .unwrap();
+        }
+        db.add_asset_album("PrimarySync", "child", "External", "external-import")
+            .await
+            .unwrap();
+        db.upsert_album_container("PrimarySync", "trip", "Trip", "album")
+            .await
+            .unwrap();
+        let generation = db
+            .start_album_membership_snapshot("PrimarySync", "trip", None)
+            .await
+            .unwrap();
+        db.add_album_membership_to_snapshot(
+            "PrimarySync",
+            "trip",
+            generation,
+            "child",
+            Some("master"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        let groups = db
+            .get_asset_groupings("PrimarySync", &["child"])
+            .await
+            .unwrap();
+        assert_eq!(
+            groups.albums,
+            [
+                ("child".into(), "External".into()),
+                ("child".into(), "Trip".into())
+            ]
+        );
+        db.clear_metadata_write_failure("PrimarySync", "child", "original")
+            .await
+            .unwrap();
+        db.add_album_membership_to_snapshot(
+            "PrimarySync",
+            "trip",
+            generation,
+            "child",
+            Some("master"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        db.complete_album_membership_snapshot("PrimarySync", "trip", generation)
+            .await
+            .unwrap();
+        let dirty = || {
+            db.acquire_lock("test_grouping_markers")
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM assets WHERE metadata_write_failed_at IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(dirty(), 0, "replayed membership must not queue a rewrite");
+        db.acquire_lock("test_grouping_marker_failure").unwrap().execute_batch(
+            "CREATE TEMP TRIGGER fail_grouping_marker BEFORE UPDATE OF metadata_write_failed_at ON assets \
+             BEGIN SELECT RAISE(ABORT, 'grouping marker failure'); END;",
+        ).unwrap();
+        assert!(
+            db.mark_album_membership_deleted("PrimarySync", "trip", "child")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.get_asset_groupings("PrimarySync", &["child"])
+                .await
+                .unwrap()
+                .albums,
+            groups.albums
+        );
+        assert_eq!(
+            db.get_live_selected_album_memberships_for_asset("PrimarySync", "child", &["trip"])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.acquire_lock("test_grouping_marker_recovery")
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_grouping_marker")
+            .unwrap();
+        db.mark_album_membership_deleted("PrimarySync", "trip", "child")
+            .await
+            .unwrap();
+        assert_eq!(
+            dirty(),
+            1,
+            "only the changed child in this library is dirty"
+        );
+        assert_eq!(
+            db.get_asset_groupings("PrimarySync", &["child"])
+                .await
+                .unwrap()
+                .albums,
+            [("child".into(), "External".into())]
+        );
+        db.clear_metadata_write_failure("PrimarySync", "child", "original")
+            .await
+            .unwrap();
+        db.mark_album_membership_deleted("PrimarySync", "trip", "child")
+            .await
+            .unwrap();
+        assert_eq!(dirty(), 0, "replayed tombstones are a no-op");
+
+        db.upsert_album_membership_delta("PrimarySync", "trip", "child", Some("master"), "icloud")
+            .await
+            .unwrap();
+        db.clear_metadata_write_failure("PrimarySync", "child", "original")
+            .await
+            .unwrap();
+        let next = db
+            .start_album_membership_snapshot("PrimarySync", "trip", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_asset_groupings("PrimarySync", &["child"])
+                .await
+                .unwrap()
+                .albums,
+            groups.albums,
+            "an interrupted empty snapshot cannot remove the prior membership"
+        );
+        assert_eq!(dirty(), 0);
+        db.complete_album_membership_snapshot("PrimarySync", "trip", next)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_asset_groupings("PrimarySync", &["child"])
+                .await
+                .unwrap()
+                .albums,
+            [("child".into(), "External".into())]
+        );
+        assert_eq!(
+            dirty(),
+            1,
+            "completed snapshot removal must queue a rewrite"
+        );
+        db.clear_metadata_write_failure("PrimarySync", "child", "original")
+            .await
+            .unwrap();
+        let steady = db
+            .start_album_membership_snapshot("PrimarySync", "trip", None)
+            .await
+            .unwrap();
+        db.complete_album_membership_snapshot("PrimarySync", "trip", steady)
+            .await
+            .unwrap();
+        assert_eq!(dirty(), 0);
+    }
+
+    #[tokio::test]
     async fn add_asset_album_is_idempotent() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         db.add_asset_album("PrimarySync", "A1", "Favorites", "icloud")
@@ -10596,7 +11612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_asset_album_reader_ignores_trusted_membership_tables() {
+    async fn unmaterialized_relations_do_not_create_compatibility_groupings() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         db.add_asset_album("PrimarySync", "master-old", "Legacy Album", "icloud")
             .await
@@ -10626,7 +11642,7 @@ mod tests {
         assert_eq!(
             legacy_rows,
             vec![("master-old".to_string(), "Legacy Album".to_string())],
-            "trusted membership rows must not change the old asset_albums read model",
+            "relations without a catalogued state identity must not create compatibility groupings",
         );
     }
 
@@ -11958,6 +12974,30 @@ mod tests {
         )
         .await
         .unwrap();
+        let preserved = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(
+            preserved[0].asset.local_path.as_deref(),
+            Some(Path::new("/photos/adopted.jpg")),
+            "changing one copy must not erase another path's prepared receipt"
+        );
+        db.import_adopt(
+            &record,
+            Path::new("/photos/adopted.jpg"),
+            "local-changed",
+            2048,
+            Some(4),
+        )
+        .await
+        .unwrap();
         assert!(
             db.get_pending_metadata_rewrites_page_for_queue(
                 MetadataRewriteQueue::CaptureRepair,
@@ -11968,7 +13008,7 @@ mod tests {
             .await
             .unwrap()
             .is_empty(),
-            "changed installed bytes must invalidate capture evidence"
+            "changed bytes at the same path invalidate capture evidence"
         );
 
         db.refresh_downloaded_asset_metadata(

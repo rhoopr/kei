@@ -2927,18 +2927,20 @@ impl AlbumSnapshotRecorder {
         db: Option<Arc<dyn DownloadStore>>,
         pass: &crate::commands::AlbumPass,
         enum_config_hash: Option<&str>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>> {
         if pass.kind != crate::commands::PassKind::Album {
-            return None;
+            return Ok(None);
         }
-        let db = db?;
+        let Some(db) = db else {
+            return Ok(None);
+        };
         let Some(container_id) = pass.album.container_id() else {
             tracing::debug!(
                 album = %pass.album.name,
                 library = %pass.album.zone_name(),
                 "Album pass has no container ID; skipping membership snapshot"
             );
-            return None;
+            return Ok(None);
         };
         let library = pass.album.zone_name();
         if let Err(e) = db
@@ -2952,7 +2954,7 @@ impl AlbumSnapshotRecorder {
                 error = %e,
                 "Failed to upsert album container; skipping membership snapshot"
             );
-            return None;
+            return Err(e.into());
         }
         let generation = match db
             .start_album_membership_snapshot(library, container_id, enum_config_hash)
@@ -2967,16 +2969,16 @@ impl AlbumSnapshotRecorder {
                     error = %e,
                     "Failed to start album membership snapshot"
                 );
-                return None;
+                return Err(e.into());
             }
         };
-        Some(Self {
+        Ok(Some(Self {
             db,
             library: Arc::from(library),
             container_id: Arc::from(container_id),
             generation,
             write_failed: Arc::new(AtomicBool::new(false)),
-        })
+        }))
     }
 
     async fn record_asset(&self, asset: &PhotoAsset) {
@@ -3005,11 +3007,12 @@ impl AlbumSnapshotRecorder {
         }
     }
 
-    async fn complete_if_clean(&self, result: &StreamingResult) {
-        if self.write_failed.load(Ordering::Relaxed)
-            || result.enumeration_errors > 0
-            || !result.enumeration_complete
-        {
+    async fn complete_if_clean(&self, result: &mut StreamingResult) {
+        if self.write_failed.load(Ordering::Relaxed) {
+            result.state_write_failures += 1;
+            return;
+        }
+        if result.enumeration_errors > 0 || !result.enumeration_complete {
             tracing::debug!(
                 library = %self.library,
                 container_id = %self.container_id,
@@ -3026,6 +3029,7 @@ impl AlbumSnapshotRecorder {
             .complete_album_membership_snapshot(&self.library, &self.container_id, self.generation)
             .await
         {
+            result.state_write_failures += 1;
             tracing::warn!(
                 library = %self.library,
                 container_id = %self.container_id,
@@ -3246,7 +3250,7 @@ where
         None => Box::pin(stream),
     };
 
-    let result = stream_and_download_from_stream(
+    let mut result = stream_and_download_from_stream(
         &download_client,
         stream,
         &pass_config,
@@ -3262,7 +3266,7 @@ where
     )
     .await?;
     if let Some(snapshot) = &options.album_snapshot {
-        snapshot.complete_if_clean(&result).await;
+        snapshot.complete_if_clean(&mut result).await;
     }
 
     let elapsed = pass_start.elapsed();
@@ -6011,7 +6015,7 @@ async fn download_photos_full_with_token_policy(
                             pass,
                             config.enum_config_hash.as_deref(),
                         )
-                        .await
+                        .await?
                     } else {
                         None
                     };
@@ -16071,6 +16075,443 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn album_membership_rewrites_every_finalized_path_after_restart() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta, xmp_ns};
+
+        for embed_xmp in [false, true] {
+            let server = crate::start_wiremock_or_skip!();
+            let body = vec![
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+                0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+            ];
+            Mock::given(method("GET"))
+                .and(path("/copies.jpg"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let mut records = incremental_photo_records_with_url(
+                "COPIES",
+                "copies.jpg",
+                &format!("{}/copies.jpg", server.uri()),
+                body.len() as u64,
+            );
+            records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
+            let passes: Vec<_> = [("Family", "family"), ("Trip", "trip")]
+                .into_iter()
+                .map(|(name, id)| AlbumPass {
+                    kind: PassKind::Album,
+                    album: mock_album_with_container(
+                        name,
+                        id,
+                        MockPhotosFlow::new()
+                            .album_count(1)
+                            .query_page(records.clone(), Some("token-full"))
+                            .build(),
+                    ),
+                    exclude_ids: Arc::new(FxHashSet::default()),
+                })
+                .collect();
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("state.db");
+            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path().join("media"));
+            config.metadata.xmp_sidecar = true;
+            config.metadata.embed_xmp = embed_xmp;
+            config.state_db = Some(db.clone());
+            let initial = download_photos_with_sync(
+                &Client::new(),
+                &passes,
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(initial.outcome, DownloadOutcome::Success),
+                "{initial:?}"
+            );
+            assert_eq!(initial.stats.downloaded, 2);
+            let paths: Vec<PathBuf> = {
+                let conn = db.acquire_lock("test_finalized_paths").unwrap();
+                let mut stmt = conn
+                    .prepare("SELECT local_path FROM asset_metadata_paths ORDER BY local_path")
+                    .unwrap();
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .map(|row| PathBuf::from(row.unwrap()))
+                    .collect()
+            };
+            assert_eq!(paths.len(), 2);
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(|path| path
+                        .parent()
+                        .unwrap()
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap())
+                    .collect::<Vec<_>>(),
+                ["Family", "Trip"]
+            );
+            let sidecars: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    let mut name = path.file_name().unwrap().to_os_string();
+                    name.push(".xmp");
+                    path.with_file_name(name)
+                })
+                .collect();
+            let subjects = |contents: &str| {
+                let meta: XmpMeta = contents.parse().unwrap();
+                let mut values: Vec<_> = meta
+                    .property_array(xmp_ns::DC, "subject")
+                    .map(|item| item.value)
+                    .collect();
+                values.sort();
+                values
+            };
+            let embedded_subjects = |path: &Path| {
+                let mut file = XmpFile::new().unwrap();
+                file.open_file(path, OpenFileOptions::default().for_read())
+                    .unwrap();
+                let meta = file.xmp().unwrap();
+                let mut values: Vec<_> = meta
+                    .property_array(xmp_ns::DC, "subject")
+                    .map(|item| item.value)
+                    .collect();
+                values.sort();
+                values
+            };
+            if embed_xmp {
+                for path in &paths {
+                    assert_eq!(embedded_subjects(path), ["Family", "Trip"]);
+                }
+            }
+            for path in &sidecars {
+                assert_eq!(
+                    subjects(&tokio::fs::read_to_string(path).await.unwrap()),
+                    ["Family", "Trip"]
+                );
+            }
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                db.acquire_lock("test_registered_paths")
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM asset_metadata_paths", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                2
+            );
+            config.state_db = None;
+            drop(db);
+            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            config.state_db = Some(db.clone());
+            config.recent = Some(10);
+            let pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: changes_album(
+                    "",
+                    changes_zone_session(
+                        Arc::new(AtomicUsize::new(0)),
+                        vec![relation_delete_record("trip", "asset-COPIES")],
+                    ),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            // One independently damaged sidecar must not prevent the other copy's
+            // rewrite, or clear the damaged copy's durable retry marker.
+            let original_sidecar = tokio::fs::read(&sidecars[0]).await.unwrap();
+            tokio::fs::write(&sidecars[0], b"not parseable XMP")
+                .await
+                .unwrap();
+            let failed = download_photos_incremental(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                &Arc::new(config.clone()),
+                "token-full",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(failed.outcome, DownloadOutcome::PartialFailure { .. }),
+                "{failed:?}"
+            );
+            assert_eq!(failed.stats.downloaded, 0);
+            assert_eq!(
+                tokio::fs::read(&sidecars[0]).await.unwrap(),
+                b"not parseable XMP"
+            );
+            assert_eq!(
+                subjects(&tokio::fs::read_to_string(&sidecars[1]).await.unwrap()),
+                ["Family"]
+            );
+            let pending = db.get_pending_metadata_rewrites(10).await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].local_path.as_ref(), Some(&paths[0]));
+            tokio::fs::write(&sidecars[0], original_sidecar)
+                .await
+                .unwrap();
+            let repaired = download_photos_incremental(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                &Arc::new(config.clone()),
+                "token-full",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(repaired.outcome, DownloadOutcome::Success),
+                "{repaired:?}"
+            );
+            assert_eq!(repaired.stats.downloaded, 0);
+            let mut mtimes = Vec::new();
+            for (media, sidecar) in paths.iter().zip(&sidecars) {
+                if embed_xmp {
+                    assert_eq!(embedded_subjects(media), ["Family"]);
+                } else {
+                    assert_eq!(tokio::fs::read(media).await.unwrap(), body);
+                }
+                let checksum = file::compute_sha256(media).await.unwrap();
+                let recorded: String = db
+                    .acquire_lock("test_path_fingerprints")
+                    .unwrap()
+                    .query_row(
+                        "SELECT local_checksum FROM asset_metadata_paths WHERE local_path = ?1",
+                        [media.to_string_lossy()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(recorded, checksum);
+                assert_eq!(
+                    subjects(&tokio::fs::read_to_string(sidecar).await.unwrap()),
+                    ["Family"]
+                );
+                mtimes.push(
+                    tokio::fs::metadata(sidecar)
+                        .await
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                );
+            }
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let steady = download_photos_incremental(
+                &Client::new(),
+                &[pass],
+                &Arc::new(config),
+                "token-full",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(steady.outcome, DownloadOutcome::Success),
+                "{steady:?}"
+            );
+            assert_eq!(steady.stats.downloaded, 0);
+            for (sidecar, before) in sidecars.iter().zip(mtimes) {
+                assert_eq!(
+                    tokio::fs::metadata(sidecar)
+                        .await
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    before
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn album_membership_first_xmp_and_tracked_path_removal() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use xmp_toolkit::{XmpMeta, xmp_ns};
+
+        let server = crate::start_wiremock_or_skip!();
+        let body = vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ];
+        Mock::given(method("GET"))
+            .and(path("/album.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut records = incremental_photo_records_with_url(
+            "FIRST_ALBUM",
+            "album.jpg",
+            &format!("{}/album.jpg", server.uri()),
+            body.len() as u64,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.album_name = Some(Arc::from("Trip"));
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(db.clone());
+        assert!(
+            db.get_all_asset_albums("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let first = stream_and_download_from_stream(
+            &Client::new(),
+            futures_util::stream::iter(vec![Ok(asset.clone())]),
+            &Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None).deferring_metadata_drain(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.downloaded, 1);
+        assert_eq!(first.exif_failures, 0);
+        let row = db.get_downloaded_page(0, 10).await.unwrap().remove(0);
+        let media_path = row.local_path.as_ref().unwrap();
+        let mut sidecar_name = media_path.file_name().unwrap().to_os_string();
+        sidecar_name.push(".xmp");
+        let sidecar_path = media_path.with_file_name(sidecar_name);
+        let subjects = |contents: &str| {
+            let xmp: XmpMeta = contents.parse().expect("parse actual sidecar");
+            let mut names: Vec<_> = xmp
+                .property_array(xmp_ns::DC, "subject")
+                .map(|value| value.value)
+                .collect();
+            names.sort();
+            names
+        };
+        let first_xmp = tokio::fs::read_to_string(&sidecar_path).await.unwrap();
+        assert_eq!(
+            subjects(&first_xmp),
+            ["Trip"],
+            "inspect before any rewrite drain"
+        );
+        assert_eq!(tokio::fs::read(media_path).await.unwrap(), body);
+
+        seed_complete_album_snapshot(&db, "trip", "Trip", &[("asset-FIRST_ALBUM", "FIRST_ALBUM")])
+            .await;
+        seed_complete_album_snapshot(
+            &db,
+            "family",
+            "Family",
+            &[("asset-FIRST_ALBUM", "FIRST_ALBUM")],
+        )
+        .await;
+        config.album_name = Some(Arc::from("Family"));
+        let second = stream_and_download_from_stream(
+            &Client::new(),
+            futures_util::stream::iter(vec![Ok(asset)]),
+            &Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.downloaded, 0);
+        assert_eq!(second.exif_failures, 0);
+        assert_eq!(
+            subjects(&tokio::fs::read_to_string(&sidecar_path).await.unwrap()),
+            ["Family", "Trip"]
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        config.album_name = None;
+        config.recent = Some(10);
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                changes_zone_session(
+                    Arc::new(AtomicUsize::new(0)),
+                    vec![relation_delete_record("trip", "asset-FIRST_ALBUM")],
+                ),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        for _ in 0..2 {
+            let removed = download_photos_incremental(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                &Arc::new(config.clone()),
+                "zone-token-prev",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(removed.outcome, DownloadOutcome::Success),
+                "{removed:?}"
+            );
+            assert_eq!(removed.stats.downloaded, 0);
+            assert_eq!(
+                subjects(&tokio::fs::read_to_string(&sidecar_path).await.unwrap()),
+                ["Family"]
+            );
+            assert_eq!(tokio::fs::read(media_path).await.unwrap(), body);
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].local_path, row.local_path);
+        }
+    }
+
     #[tokio::test]
     async fn collecting_album_membership_failure_replays_without_redownloading() {
         let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
@@ -16311,7 +16752,7 @@ mod tests {
 
         assert!(matches!(
             result.outcome,
-            DownloadOutcome::PartialFailure { failed_count: 1 }
+            DownloadOutcome::PartialFailure { failed_count: 2 }
         ));
         assert_eq!(result.stats.downloaded, 0);
         assert_eq!(result.sync_token, None);
@@ -16326,12 +16767,24 @@ mod tests {
             .expect("read unchanged row")
             .remove(0);
         assert!(!unchanged.metadata.is_favorite);
+        let pending = db
+            .get_pending_metadata_rewrites(10)
+            .await
+            .expect("read rewrite queue");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the independent album removal must retain retry evidence"
+        );
         assert!(
-            db.get_pending_metadata_rewrites(10)
+            !pending[0].metadata.is_favorite,
+            "failed provider metadata must not leak into the rewrite"
+        );
+        assert!(
+            db.get_all_asset_albums("PrimarySync")
                 .await
-                .expect("read rewrite queue")
-                .is_empty(),
-            "the catalogue and rewrite marker must fail atomically"
+                .unwrap()
+                .is_empty()
         );
     }
 

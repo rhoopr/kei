@@ -389,6 +389,35 @@ album and people rows for its library-scoped asset IDs. A grouping-read failure
 leaves the affected markers pending. A completed download writes the snapshot
 it was planned from, so it records a marker on failure but never retires one.
 
+The first task payload includes its concrete pass album, even when the cycle's
+grouping preload is empty. Provider membership changes update the
+`asset_albums` read model and metadata retry markers in one transaction. The
+projection uses child identity or the recorded legacy state owner, never a
+sibling's master reference alone. Individual membership changes use indexed
+identity lookups; container refreshes enumerate only that container. Schema v22
+adds a reverse index for legacy owners without changing their recorded
+identities. Completed snapshots can remove missing memberships; interrupted
+snapshots preserve the prior live memberships. External grouping sources remain
+unchanged. The end-of-cycle writer uses the accumulated memberships for each
+tracked media path. Retry markers do not authorize writes when metadata outputs
+are disabled.
+
+`asset_metadata_paths` records each successfully finalized media path, its
+provider rendition checksum, local fingerprints, and metadata retry receipts.
+Registration and downloaded-state finalization share one transaction. The
+catalogue still owns sync selection and keeps one path per rendition. Metadata
+rewrites also visit the additional recorded paths that match the current
+provider rendition. Each completion checks the selected path and fingerprints,
+then clears only that path's debt. A failed copy does not block successful
+copies or lose its retry evidence. Capture-repair receipts remain path-specific.
+Missing paths retain retry evidence; old provider renditions remain recorded
+but do not receive current-rendition metadata.
+
+Schema migration seeds only the path already recorded in each catalogue row.
+It does not scan for, infer ownership of, or authorize writes to older copies
+that were never recorded. Additional paths enter the registry through verified
+download finalization or explicit import adoption.
+
 XMP sidecars record the exact properties that kei writes in the kei namespace.
 A later rewrite deletes a cleared property only when that marker proves kei
 owned the prior value. Unmarked standard properties and unrelated third-party
