@@ -1735,7 +1735,7 @@ where
                                 .refresh_downloaded_asset_metadata(
                                     &library,
                                     asset.state_id(),
-                                    asset.metadata(),
+                                    (asset.metadata(), asset.created(), Some(asset.added_date())),
                                     mark_for_rewrite,
                                     capture_repair_requested(config),
                                     crate::state::METADATA_CAPTURE_REVISION,
@@ -1948,6 +1948,7 @@ where
                                         {
                                             state_write_failures_producer
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            continue;
                                         }
                                         let size = task.size;
                                         if task_tx.send(task).await.is_err() {
@@ -2037,6 +2038,7 @@ where
                                                         1,
                                                         std::sync::atomic::Ordering::Relaxed,
                                                     );
+                                                    continue;
                                                 }
                                                 let size = task.size;
                                                 if task_tx.send(task).await.is_err() {
@@ -4824,7 +4826,11 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &crate::state::AssetMetadata,
+            _: (
+                &crate::state::AssetMetadata,
+                chrono::DateTime<chrono::Utc>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
             _: bool,
             _: bool,
             _: i64,
@@ -6642,12 +6648,12 @@ mod tests {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
         use crate::state::SqliteStateDb;
-        use crate::state::types::AssetMetadata;
         use futures_util::stream;
         use std::sync::Arc;
 
         fn existing_asset() -> PhotoAsset {
             TestPhotoAsset::new("REFRESH_FILTERED")
+                .asset_date(1_700_000_000_123.0)
                 .filename("filtered.jpg")
                 .item_type("public.jpeg")
                 .orig_file_type("public.jpeg")
@@ -6684,11 +6690,7 @@ mod tests {
             .checksum("historical-medium")
             .filename("historical-medium.jpg")
             .size(1234)
-            .metadata(AssetMetadata {
-                title: Some("stale".to_string()),
-                metadata_hash: Some("stale-hash".to_string()),
-                ..AssetMetadata::default()
-            })
+            .metadata(existing_asset().metadata().clone())
             .build();
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
@@ -6724,10 +6726,12 @@ mod tests {
             rewrites[0].version_size,
             crate::state::VersionSizeKey::Medium
         );
-        assert_ne!(
+        assert_eq!(
             rewrites[0].metadata.metadata_hash.as_deref(),
-            Some("stale-hash")
+            existing_asset().metadata().metadata_hash.as_deref()
         );
+        assert_eq!(rewrites[0].created_at, existing_asset().created());
+        assert_eq!(rewrites[0].added_at, Some(existing_asset().added_date()));
         assert_eq!(rewrites[0].metadata.title, None);
         let capture_repairs = db
             .get_pending_metadata_rewrites_page_for_queue(
@@ -6743,6 +6747,31 @@ mod tests {
             capture_repairs[0].asset.version_size,
             crate::state::VersionSizeKey::Medium
         );
+        let original_bytes = fs::read(&historical_path).unwrap();
+        let mut retry_config = config.as_ref().clone();
+        retry_config.refresh_metadata = false;
+        retry_config.capture_timestamp_repair = crate::download::CaptureTimestampRepair::Preserve;
+        let retry_config = Arc::new(retry_config);
+        for _ in 0..2 {
+            let result = stream_and_download_from_stream(
+                &reqwest::Client::new(),
+                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(existing_asset())]),
+                &retry_config,
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.downloaded, 0);
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].created_at, existing_asset().created());
+            assert_eq!(rows[0].added_at, Some(existing_asset().added_date()));
+            assert_eq!(fs::read(&historical_path).unwrap(), original_bytes);
+            assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+        }
     }
 
     /// #707 review: the pre-plan refresh makes embedded rewrites reachable for

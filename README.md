@@ -176,6 +176,14 @@ sweep, cannot use album, smart-folder, media, or date/recent filters, and does
 not run under `kei service run`. It is a manual recovery step; the permanent
 automatic fix is tracked in [#687](https://github.com/rhoopr/kei/issues/687).
 
+Capture and addition dates now retain Apple's milliseconds in the catalogue.
+Run this refresh to recover fractions lost by older versions; enable
+`metadata.xmp_sidecar` to correct sidecar capture dates too. Disable embedded
+metadata outputs if media bytes must remain untouched. This requires no schema
+migration or automatic precision-backfill sweep. Older kei binaries cannot read
+catalogue rows containing the new fractional timestamps; do not downgrade after
+they have been written. Native embedded subsecond writing is unchanged.
+
 Use this command after upgrading from a version that rendered capture times in
 the backup host's timezone. It rewrites XMP sidecars in full. For a timestamp
 already present in a file, it adds the capture offset only where the timestamp

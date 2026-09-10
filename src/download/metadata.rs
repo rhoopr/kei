@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset, NaiveDateTime};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Timelike};
 use little_exif::exif_tag::ExifTag;
 use little_exif::filetype::FileExtension;
 #[cfg(not(feature = "xmp"))]
@@ -258,11 +258,7 @@ impl ExifProbe {
         let Some(existing) = self.datetime_original.as_deref() else {
             return false;
         };
-        let Some((wall_clock, zone)) = parse_capture_timestamp(existing) else {
-            return false;
-        };
-        wall_clock == created_local.naive_local()
-            && zone.is_none_or(|zone| zone == *created_local.offset())
+        capture_timestamp_matches(existing, created_local)
     }
 
     pub(crate) fn native_heif_capture_time_repair_required(
@@ -293,15 +289,20 @@ impl ExifProbe {
                 datetime_original: Some(datetime),
                 offset_time_original: Some(offset),
             } => {
-                let denotes_capture_time =
-                    parse_capture_timestamp(datetime).is_some_and(|(wall_clock, zone)| {
-                        wall_clock == created_local.naive_local()
-                            && zone.is_none_or(|zone| zone == *created_local.offset())
-                    });
+                let denotes_capture_time = capture_timestamp_matches(datetime, created_local);
                 Ok(Some(!denotes_capture_time || offset != expected_offset))
             }
         }
     }
+}
+
+fn capture_timestamp_matches(value: &str, expected: &DateTime<FixedOffset>) -> bool {
+    parse_capture_timestamp(value).is_some_and(|(wall_clock, zone)| {
+        // Native writers may omit subseconds. Never forgive an incorrect nonzero fraction.
+        (wall_clock == expected.naive_local()
+            || Some(wall_clock) == expected.naive_local().with_nanosecond(0))
+            && zone.is_none_or(|zone| zone == *expected.offset())
+    })
 }
 
 /// Split a capture timestamp into its wall clock and the zone it names, if
@@ -314,9 +315,9 @@ fn parse_capture_timestamp(value: &str) -> Option<(NaiveDateTime, Option<FixedOf
         return Some((zoned.naive_local(), Some(*zoned.offset())));
     }
     [
-        "%Y:%m:%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
+        "%Y:%m:%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
     ]
     .into_iter()
     .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
@@ -1064,7 +1065,9 @@ pub(crate) struct SourceGpsMetadata {
 /// fields are skipped.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MetadataWrite {
-    /// `"YYYY:MM:DD HH:MM:SS"` EXIF-style datetime string.
+    /// Unzoned datetime: `YYYY:MM:DD HH:MM:SS` for embedded writes, or
+    /// `YYYY-MM-DDTHH:MM:SS` with optional fractional seconds for sidecars.
+    /// `offset_time_original` supplies the XMP zone separately.
     pub(crate) datetime: Option<String>,
     /// EXIF `OffsetTimeOriginal`, formatted as `+HH:MM` or `-HH:MM`.
     pub(crate) offset_time_original: Option<String>,
@@ -2151,9 +2154,7 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
         }
     }
     if let Some(dt) = &write.datetime {
-        // XMP uses ISO 8601; our stored form is EXIF-style "YYYY:MM:DD HH:MM:SS".
-        // Convert for XMP, keep a local EXIF copy so XMP Toolkit's reconciler
-        // writes the native block too on formats that have one.
+        // Embedded plans use EXIF form; sidecar plans already carry unzoned ISO 8601.
         let iso = exif_datetime_to_iso(dt);
         let iso_with_offset = write
             .offset_time_original

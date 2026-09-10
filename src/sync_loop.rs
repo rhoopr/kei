@@ -5180,11 +5180,22 @@ mod tests {
                 return Err(state::error::StateError::LockPoisoned(self.message.into()));
             }
             if let Some(newer) = &self.refresh_on_mark_downloaded {
+                let record = self
+                    .inner
+                    .get_downloaded_page(0, u32::MAX)
+                    .await?
+                    .into_iter()
+                    .find(|row| {
+                        row.library.as_ref() == library
+                            && row.id.as_ref() == id
+                            && row.version_size.as_str() == version_size
+                    })
+                    .expect("refresh target");
                 self.inner
                     .refresh_downloaded_asset_metadata(
                         library,
                         id,
-                        newer,
+                        (newer, record.created_at, record.added_at),
                         true,
                         false,
                         state::METADATA_CAPTURE_REVISION,
@@ -5784,7 +5795,11 @@ mod tests {
             &self,
             library: &str,
             asset_id: &str,
-            metadata: &state::AssetMetadata,
+            metadata: (
+                &state::AssetMetadata,
+                chrono::DateTime<chrono::Utc>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
             mark_for_rewrite: bool,
             mark_capture_repair: bool,
             capture_revision: i64,
@@ -8207,7 +8222,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/expired.jpg"))
             .respond_with(ResponseTemplate::new(410))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -8253,7 +8268,7 @@ mod tests {
         .await
         .expect("expired URL cycle with failed pending-row write");
 
-        assert_eq!(result.failed_count, 2);
+        assert_eq!(result.failed_count, 1);
         assert_eq!(result.stats.state_write_failures, 1);
         assert!(!result.db_sync_token_advance_safe);
         assert_eq!(
