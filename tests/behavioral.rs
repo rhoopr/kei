@@ -82,7 +82,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 21;
+const HELPER_SCHEMA_VERSION: i32 = 22;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -286,6 +286,9 @@ CREATE INDEX IF NOT EXISTS idx_asset_metadata_paths_retry
             PRIMARY KEY (library, master_record_name)
         );
 
+        CREATE INDEX IF NOT EXISTS idx_legacy_master_state_owners_asset
+            ON legacy_master_state_owners (library, asset_record_name, master_record_name);
+
         CREATE TABLE IF NOT EXISTS asset_metadata_capture_revisions (
             library TEXT NOT NULL,
             asset_id TEXT NOT NULL,
@@ -357,7 +360,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 21). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 22). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -375,7 +378,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 21;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 22;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \

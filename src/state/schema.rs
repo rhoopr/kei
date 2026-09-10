@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 21;
+pub(crate) const SCHEMA_VERSION: i32 = 22;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -559,6 +559,10 @@ SELECT library, id, version_size, local_path, checksum, local_checksum,
 FROM assets WHERE status = 'downloaded' AND local_path IS NOT NULL;
 ";
 
+/// Reverse lookup for the authoritative legacy owner of a child identity.
+const SCHEMA_V22: &str = "CREATE INDEX IF NOT EXISTS idx_legacy_master_state_owners_asset \
+    ON legacy_master_state_owners (library, asset_record_name, master_record_name);";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -725,6 +729,7 @@ fn migrate_to_version(
             }
         }
         21 => conn.execute_batch(SCHEMA_V21)?,
+        22 => conn.execute_batch(SCHEMA_V22)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -740,6 +745,32 @@ fn migrate_to_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v22_indexes_existing_legacy_owners_without_changing_them() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=21 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO legacy_master_state_owners VALUES ('PrimarySync', 'master', 'child', 123)",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let columns: Vec<String> = conn.prepare("SELECT name FROM pragma_index_info('idx_legacy_master_state_owners_asset') ORDER BY seqno").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            columns,
+            ["library", "asset_record_name", "master_record_name"]
+        );
+        let owner = conn.query_row("SELECT master_record_name, asset_record_name, claimed_at FROM legacy_master_state_owners WHERE library = 'PrimarySync'", [], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        }).unwrap();
+        assert_eq!(owner, ("master".into(), "child".into(), 123));
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
 
     #[test]
     fn v21_migrates_only_recorded_paths_with_independent_retry_evidence() {

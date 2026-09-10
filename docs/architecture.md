@@ -390,10 +390,13 @@ leaves the affected markers pending. A completed download writes the snapshot
 it was planned from, so it records a marker on failure but never retires one.
 
 The first task payload includes its concrete pass album, even when the cycle's
-grouping preload is empty. Provider membership changes update the `asset_albums`
-read model and metadata retry markers in one transaction. The projection uses
-child identity or the recorded legacy state owner, never a sibling's master
-reference alone. Completed snapshots can remove missing memberships; interrupted
+grouping preload is empty. Provider membership changes update the
+`asset_albums` read model and metadata retry markers in one transaction. The
+projection uses child identity or the recorded legacy state owner, never a
+sibling's master reference alone. Individual membership changes use indexed
+identity lookups; container refreshes enumerate only that container. Schema v22
+adds a reverse index for legacy owners without changing their recorded
+identities. Completed snapshots can remove missing memberships; interrupted
 snapshots preserve the prior live memberships. External grouping sources remain
 unchanged. The end-of-cycle writer uses the accumulated memberships for each
 tracked media path. Retry markers do not authorize writes when metadata outputs

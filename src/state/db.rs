@@ -108,6 +108,21 @@ fn mark_album_groupings_dirty_tx(
     Ok(())
 }
 
+// Keep the optional member filter in separate branches so both scopes use
+// indexed lookups. IN deduplicates child and legacy-owner identities.
+const ALBUM_GROUPING_STATE_IDS_SQL: &str = "WITH members AS MATERIALIZED ( \
+    SELECT asset_record_name FROM asset_album_memberships \
+    WHERE library = ?1 AND container_id = ?2 AND asset_record_name = ?3 \
+    UNION ALL \
+    SELECT asset_record_name FROM asset_album_memberships \
+    INDEXED BY idx_asset_album_memberships_container \
+    WHERE library = ?1 AND container_id = ?2 AND ?3 IS NULL \
+) SELECT DISTINCT id FROM assets WHERE library = ?1 AND id IN ( \
+    SELECT asset_record_name FROM members \
+    UNION ALL \
+    SELECT master_record_name FROM legacy_master_state_owners \
+    WHERE library = ?1 AND asset_record_name IN (SELECT asset_record_name FROM members))";
+
 fn refresh_container_groupings_tx(
     tx: &Transaction<'_>,
     library: &str,
@@ -117,15 +132,7 @@ fn refresh_container_groupings_tx(
 ) -> Result<(), StateError> {
     let operation = "refresh_container_groupings";
     let mut stmt = tx
-        .prepare_cached(
-            "SELECT DISTINCT a.id FROM asset_album_memberships m \
-         LEFT JOIN legacy_master_state_owners o \
-           ON o.library = m.library AND o.asset_record_name = m.asset_record_name \
-         JOIN assets a ON a.library = m.library \
-           AND (a.id = m.asset_record_name OR a.id = o.master_record_name) \
-         WHERE m.library = ?1 AND m.container_id = ?2 \
-           AND (?3 IS NULL OR m.asset_record_name = ?3)",
-        )
+        .prepare_cached(ALBUM_GROUPING_STATE_IDS_SQL)
         .map_err(|e| StateError::query(operation, e))?;
     let ids = stmt
         .query_map(
@@ -10782,6 +10789,108 @@ mod tests {
                 metadata_hash: "metadata-v1".into()
             })
         );
+    }
+
+    #[tokio::test]
+    async fn album_grouping_projection_has_bounded_sql_work() {
+        use rusqlite::StatementStatus;
+
+        const SINGLE_MEMBER_STEP_LIMIT: i32 = 300;
+        const STEPS_PER_MEMBER_LIMIT: i32 = 150;
+        for members in [128, 512] {
+            let db = SqliteStateDb::open_in_memory().unwrap();
+            db.upsert_album_container("PrimarySync", "trip", "Trip", "album")
+                .await
+                .unwrap();
+            {
+                let mut conn = db.acquire_lock("seed_populated_album").unwrap();
+                let tx = conn.transaction().unwrap();
+                for index in 0..members {
+                    let child = format!("child-{index}");
+                    let master = format!("master-{index}");
+                    for id in [&child, &master] {
+                        tx.execute(
+                            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at) VALUES ('PrimarySync', ?1, 'original', 'provider', 'image.jpg', 0, 10, 'photo', 'downloaded', 0)",
+                            [id],
+                        ).unwrap();
+                    }
+                    tx.execute(
+                        "INSERT INTO legacy_master_state_owners VALUES ('PrimarySync', ?1, ?2, 0)",
+                        [&master, &child],
+                    )
+                    .unwrap();
+                    // Missing master hints must not hide the durable legacy owner.
+                    tx.execute("INSERT INTO asset_album_memberships VALUES ('PrimarySync', ?1, NULL, 'trip', 1, 0, 'icloud', 0)", [&child]).unwrap();
+                }
+                tx.commit().unwrap();
+            }
+            let steps = || {
+                db.acquire_lock("projection_sql_work")
+                    .unwrap()
+                    .prepare_cached(ALBUM_GROUPING_STATE_IDS_SQL)
+                    .unwrap()
+                    .reset_status(StatementStatus::VmStep)
+            };
+            let dirty = || {
+                let conn = db.acquire_lock("projection_dirty_rows").unwrap();
+                conn.query_row(
+                    "SELECT COUNT(*) FROM assets WHERE metadata_write_failed_at IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .unwrap()
+            };
+            steps();
+            for expected_dirty in [2, 0] {
+                db.upsert_album_membership_delta("PrimarySync", "trip", "child-0", None, "icloud")
+                    .await
+                    .unwrap();
+                let work = steps();
+                assert!(
+                    work > 0 && work <= SINGLE_MEMBER_STEP_LIMIT,
+                    "{members} members: {work} single-member VM steps"
+                );
+                assert_eq!(
+                    db.get_asset_groupings("PrimarySync", &["child-0", "master-0"])
+                        .await
+                        .unwrap()
+                        .albums,
+                    [
+                        ("child-0".into(), "Trip".into()),
+                        ("master-0".into(), "Trip".into())
+                    ]
+                );
+                assert_eq!(dirty(), expected_dirty);
+                for id in ["child-0", "master-0"] {
+                    db.clear_metadata_write_failure("PrimarySync", id, "original")
+                        .await
+                        .unwrap();
+                }
+            }
+            for expected_dirty in [members * 2, 0] {
+                db.upsert_album_container("PrimarySync", "trip", "Renamed", "album")
+                    .await
+                    .unwrap();
+                let work = steps();
+                assert!(
+                    work > 0 && work <= members * STEPS_PER_MEMBER_LIMIT,
+                    "{members} members: {work} container VM steps"
+                );
+                let groups = db.get_all_asset_albums("PrimarySync").await.unwrap();
+                assert_eq!(groups.len(), usize::try_from(members * 2).unwrap());
+                assert!(groups.iter().all(|(_, name)| name == "Renamed"));
+                assert_eq!(
+                    dirty(),
+                    expected_dirty,
+                    "unchanged projection must not queue work"
+                );
+                db.acquire_lock("clear_projection_debt")
+                    .unwrap()
+                    .execute("UPDATE assets SET metadata_write_failed_at = NULL", [])
+                    .unwrap();
+            }
+            assert_eq!(dirty(), 0);
+        }
     }
 
     #[tokio::test]
