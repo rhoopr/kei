@@ -291,6 +291,16 @@ impl CaptureRepairReceipt {
 pub struct PendingMetadataRewrite {
     pub asset: AssetRecord,
     pub capture_repair_receipt: Option<CaptureRepairReceipt>,
+    /// SHA-256 captured from a verified download before embedding, for this
+    /// exact path and provider rendition. Never inferred from local checksums.
+    #[cfg_attr(
+        not(feature = "xmp"),
+        allow(
+            dead_code,
+            reason = "native-only builds retain provenance for later sidecar writes"
+        )
+    )]
+    pub source_checksum: Option<String>,
 }
 
 /// Debt retired by one atomic metadata-rewrite completion.
@@ -462,6 +472,36 @@ pub trait DownloadStateStore: Send + Sync {
             local_path,
             local_checksum,
             download_checksum,
+        )
+        .await
+    }
+    /// Finalize bytes received by the verified download pipeline.
+    ///
+    /// `download_checksum`, when present, must hash the received bytes before
+    /// any kei metadata write. Adoption and local reconciliation must instead
+    /// use `mark_downloaded` or `mark_downloaded_with_capture_repair`.
+    /// Stores without source-provenance support retain unknown evidence.
+    ///
+    /// # Errors
+    /// Returns a state error if downloaded-state finalization fails.
+    async fn mark_verified_download(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError> {
+        self.mark_downloaded_with_capture_repair(
+            library,
+            id,
+            version_size,
+            local_path,
+            local_checksum,
+            download_checksum,
+            mark_capture_repair,
         )
         .await
     }
@@ -1553,6 +1593,13 @@ fn metadata_rewrite_target(
     })
 }
 
+/// Checksum roles supplied by one file-finalization route.
+struct DownloadChecksums<'a> {
+    local: &'a str,
+    downloaded: Option<&'a str>,
+    source: Option<&'a str>,
+}
+
 /// Copy the catalogue path's exact publication evidence in the same transaction.
 /// Other paths retain their own fingerprints and independent retry receipts.
 fn record_metadata_path(
@@ -1577,6 +1624,8 @@ fn record_metadata_path(
              provider_checksum = excluded.provider_checksum, \
              local_checksum = excluded.local_checksum, \
              download_checksum = excluded.download_checksum, \
+             source_checksum = CASE WHEN asset_metadata_paths.provider_checksum = excluded.provider_checksum \
+                 THEN asset_metadata_paths.source_checksum ELSE NULL END, \
              metadata_write_failed_at = CASE WHEN ?4 = 1 THEN \
                  COALESCE(excluded.metadata_write_failed_at, asset_metadata_paths.metadata_write_failed_at) \
                  ELSE excluded.metadata_write_failed_at END, \
@@ -2006,13 +2055,38 @@ impl SqliteStateDb {
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
     ) -> Result<(), StateError> {
+        self.mark_downloaded_with_checksums(
+            library,
+            id,
+            version_size,
+            local_path,
+            DownloadChecksums {
+                local: local_checksum,
+                downloaded: download_checksum,
+                source: None,
+            },
+            mark_capture_repair,
+        )
+        .await
+    }
+
+    async fn mark_downloaded_with_checksums(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        checksums: DownloadChecksums<'_>,
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError> {
         let downloaded_at = Utc::now().timestamp();
         let library = library.to_owned();
         let id = id.to_owned();
         let version_size = version_size.to_owned();
         let local_path = local_path.to_path_buf();
-        let local_checksum = local_checksum.to_owned();
-        let download_checksum = download_checksum.map(str::to_owned);
+        let local_checksum = checksums.local.to_owned();
+        let download_checksum = checksums.downloaded.map(str::to_owned);
+        let source_checksum = checksums.source.map(str::to_owned);
 
         self.with_conn_mut("mark_downloaded", move |conn| {
             let tx = conn
@@ -2036,6 +2110,23 @@ impl SqliteStateDb {
                     asset_id: id,
                     version_size,
                 });
+            }
+
+            if let Some(source_checksum) = &source_checksum {
+                // CONTRACT: XMP_GPS_ACCURACY_REQUIRES_MATCHING_LOCATION
+                // Source provenance and downloaded state commit together.
+                tx.execute(
+                    "UPDATE asset_metadata_paths SET source_checksum = ?5 \
+                     WHERE library = ?1 AND id = ?2 AND version_size = ?3 AND local_path = ?4",
+                    rusqlite::params![
+                        library,
+                        id,
+                        version_size,
+                        local_path.to_string_lossy(),
+                        source_checksum
+                    ],
+                )
+                .map_err(|e| StateError::query("mark_downloaded::source_checksum", e))?;
             }
 
             record_metadata_capture_revision(
@@ -5606,6 +5697,31 @@ impl DownloadStateStore for SqliteStateDb {
         .await
     }
 
+    async fn mark_verified_download(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError> {
+        self.mark_downloaded_with_checksums(
+            library,
+            id,
+            version_size,
+            local_path,
+            DownloadChecksums {
+                local: local_checksum,
+                downloaded: download_checksum,
+                source: download_checksum,
+            },
+            mark_capture_repair,
+        )
+        .await
+    }
+
     async fn mark_failed(
         &self,
         library: &str,
@@ -6485,9 +6601,13 @@ fn metadata_rewrite_source_sql() -> String {
         .join(", ");
     format!(
         "SELECT {ASSET_COLUMNS}, metadata_write_failed_at, capture_repair_metadata_hash, \
-             capture_repair_output_checksum, capture_repair_output_size FROM assets \
+             capture_repair_output_checksum, capture_repair_output_size, \
+             (SELECT p.source_checksum FROM asset_metadata_paths p \
+              WHERE p.library = assets.library AND p.id = assets.id \
+                AND p.version_size = assets.version_size AND p.local_path = assets.local_path \
+                AND p.provider_checksum = assets.checksum) AS source_checksum FROM assets \
          UNION ALL SELECT {path_columns}, p.metadata_write_failed_at, p.capture_repair_metadata_hash, \
-             p.capture_repair_output_checksum, p.capture_repair_output_size \
+             p.capture_repair_output_checksum, p.capture_repair_output_size, p.source_checksum \
          FROM asset_metadata_paths p JOIN assets a \
            ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
          WHERE p.local_path IS NOT a.local_path AND p.provider_checksum = a.checksum"
@@ -6519,7 +6639,7 @@ fn query_pending_metadata_rewrites(
     let source = metadata_rewrite_source_sql();
     let sql = format!(
         "SELECT {ASSET_COLUMNS}, capture_repair_metadata_hash, \
-            capture_repair_output_checksum, capture_repair_output_size \
+            capture_repair_output_checksum, capture_repair_output_size, source_checksum \
          FROM ({source}) WHERE {queue_predicate} \
            AND status = 'downloaded' AND is_deleted = 0 AND local_path IS NOT NULL \
            {scope} ORDER BY {order}, local_path LIMIT ? OFFSET ?"
@@ -6583,6 +6703,7 @@ fn row_to_pending_metadata_rewrite(
     Ok(PendingMetadataRewrite {
         asset: row_to_asset_record(row)?,
         capture_repair_receipt,
+        source_checksum: row.get(ASSET_COLUMN_COUNT + 3)?,
     })
 }
 
@@ -6747,6 +6868,218 @@ mod tests {
 
     fn test_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[tokio::test]
+    async fn verified_source_checksum_round_trip_is_path_and_rendition_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let first = dir.path().join("first.jpg");
+        let second = dir.path().join("second.jpg");
+        let mut record = TestAssetRecord::new("PROVENANCE")
+            .checksum("provider-v1")
+            .metadata(AssetMetadata {
+                metadata_hash: Some("metadata".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_verified_download(
+            "PrimarySync",
+            "PROVENANCE",
+            "original",
+            &first,
+            "local-first",
+            Some("source-first"),
+            false,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "PROVENANCE", "original")
+            .await
+            .unwrap();
+        // Import/reconciliation-style registration must not treat recovered
+        // download_checksum values as source provenance for a different path.
+        db.mark_downloaded(
+            "PrimarySync",
+            "PROVENANCE",
+            "original",
+            &second,
+            "local-second",
+            Some("recovered-second"),
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "PROVENANCE", "original")
+            .await
+            .unwrap();
+        drop(db);
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        for work in &pending {
+            let expected = if work.asset.local_path.as_deref() == Some(first.as_path()) {
+                Some("source-first")
+            } else {
+                None
+            };
+            assert_eq!(work.source_checksum.as_deref(), expected);
+        }
+        // Metadata finalization must preserve the additional path's source
+        // evidence while updating the independent local/size checksum state.
+        let extra = pending
+            .iter()
+            .find(|work| work.asset.local_path.as_deref() == Some(first.as_path()))
+            .unwrap();
+        db.finish_metadata_rewrite(
+            extra,
+            MetadataRewriteQueue::Ordinary,
+            Some("local-rewritten"),
+            Some("local-first"),
+            MetadataRewriteCompletion::None,
+        )
+        .await
+        .unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        let extra = pending
+            .iter()
+            .find(|work| work.asset.local_path.as_deref() == Some(first.as_path()))
+            .unwrap();
+        assert_eq!(extra.source_checksum.as_deref(), Some("source-first"));
+        assert_eq!(
+            extra.asset.local_checksum.as_deref(),
+            Some("local-rewritten")
+        );
+
+        db.mark_verified_download(
+            "PrimarySync",
+            "PROVENANCE",
+            "original",
+            &second,
+            "local-second",
+            Some("source-second"),
+            false,
+        )
+        .await
+        .unwrap();
+        record.checksum = "provider-v2".into();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "PROVENANCE",
+            "original",
+            &second,
+            "local-v2",
+            Some("recovered-v2"),
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "PROVENANCE", "original")
+            .await
+            .unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "old provider paths cannot supply current metadata evidence"
+        );
+        assert_eq!(
+            pending[0].asset.local_path.as_deref(),
+            Some(second.as_path())
+        );
+        assert!(pending[0].source_checksum.is_none());
+    }
+
+    #[tokio::test]
+    async fn verified_source_checksum_failure_rolls_back_download_finalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let media = dir.path().join("source.jpg");
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let record = TestAssetRecord::new("SOURCE_COMMIT").build();
+        db.upsert_seen(&record).await.unwrap();
+        {
+            let conn = db.acquire_lock("test_source_checksum_failure").unwrap();
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER fail_source_checksum BEFORE UPDATE OF source_checksum \
+                 ON asset_metadata_paths BEGIN SELECT RAISE(ABORT, 'source checksum failure'); END;"
+            ).unwrap();
+        }
+        assert!(
+            db.mark_verified_download(
+                "PrimarySync",
+                "SOURCE_COMMIT",
+                "original",
+                &media,
+                "local",
+                Some("source"),
+                false
+            )
+            .await
+            .is_err()
+        );
+        assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+        {
+            let conn = db.acquire_lock("test_source_checksum_rollback").unwrap();
+            let paths: i64 = conn
+                .query_row("SELECT COUNT(*) FROM asset_metadata_paths", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(paths, 0);
+        }
+        drop(db);
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        db.mark_verified_download(
+            "PrimarySync",
+            "SOURCE_COMMIT",
+            "original",
+            &media,
+            "local",
+            Some("source"),
+            false,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "SOURCE_COMMIT", "original")
+            .await
+            .unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_checksum.as_deref(), Some("source"));
     }
 
     #[tokio::test]

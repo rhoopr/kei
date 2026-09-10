@@ -1085,7 +1085,7 @@ where
                 &path,
                 Arc::clone(&payload),
                 created_local,
-                record.download_checksum.as_deref(),
+                pending_rewrite.source_checksum.as_deref(),
                 &temp_suffix,
             )
             .await;
@@ -3265,6 +3265,139 @@ mod tests {
 
     #[cfg(feature = "xmp")]
     #[tokio::test]
+    async fn contract_xmp_gps_accuracy_requires_matching_location_checksum_recovery() {
+        use crate::state::{AssetMetadata, SqliteStateDb};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.jpg");
+        let sidecar = path.with_extension("jpg.xmp");
+        std::fs::write(&path, crate::test_helpers::minimal_jpeg_with_source_gps()).unwrap();
+        let original_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        let original_gps = super::super::metadata::read_source_gps(&path).unwrap();
+        assert!(original_gps.latitude.is_none() && original_gps.longitude.is_none());
+        assert!(original_gps.horizontal_positioning_error.is_some());
+        let db_path = dir.path().join("state.db");
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let mut metadata = AssetMetadata {
+            rating: Some(1),
+            latitude: Some(1.5),
+            longitude: Some(2.5),
+            ..AssetMetadata::default()
+        };
+        seed_downloaded_marker(
+            &db,
+            "PROVENANCE",
+            "source.jpg",
+            &path,
+            &original_checksum,
+            metadata.clone(),
+            None,
+        )
+        .await;
+        db.fail_metadata_checksum_write_for_test();
+        let first = run_pending(
+            &db,
+            MetadataFlags::GPS | MetadataFlags::RATING | MetadataFlags::XMP_SIDECAR,
+            Arc::from(".review"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(first.failed, 1);
+        assert_eq!(stored_checksums(&db).await, (None, None));
+        let gps = super::super::metadata::read_source_gps(&path).unwrap();
+        assert_eq!((gps.latitude, gps.longitude), (Some(1.5), Some(2.5)));
+        drop(db);
+
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let retry = run_pending(
+            &db,
+            MetadataFlags::RATING | MetadataFlags::XMP_SIDECAR,
+            Arc::from(".review"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((retry.applied, retry.failed), (1, 0));
+        let rewritten_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        assert_ne!(rewritten_checksum, original_checksum);
+        assert_eq!(
+            stored_checksums(&db).await,
+            (Some(rewritten_checksum.clone()), None)
+        );
+        for rating in [2, 1] {
+            metadata.rating = Some(rating);
+            db.refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "PROVENANCE",
+                &metadata,
+                true,
+                false,
+                crate::state::METADATA_CAPTURE_REVISION,
+            )
+            .await
+            .unwrap();
+            let pass = run_pending(
+                &db,
+                MetadataFlags::RATING | MetadataFlags::XMP_SIDECAR,
+                Arc::from(".review"),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!((pass.applied, pass.failed), (1, 0));
+        }
+        assert_eq!(
+            stored_checksums(&db).await,
+            (Some(rewritten_checksum.clone()), Some(rewritten_checksum))
+        );
+        let xmp: XmpMeta = std::fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+        assert!(
+            !xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+            "kei-inserted coordinates acquired fabricated original-byte provenance"
+        );
+        let media = std::fs::read(&path).unwrap();
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        drop(db);
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        db.record_metadata_write_failure("PrimarySync", "PROVENANCE", "original")
+            .await
+            .unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(pending[0].source_checksum.is_none());
+        let retry = run_pending(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".review"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((retry.applied, retry.failed), (1, 0));
+        let steady = run_pending(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".review"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((steady.applied, steady.failed), (0, 0));
+        assert_eq!(std::fs::read(&path).unwrap(), media);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
     async fn contract_xmp_gps_accuracy_requires_matching_location_native_boundaries() {
         use crate::test_helpers::ur64;
         use little_exif::exif_tag::ExifTag;
@@ -3331,7 +3464,7 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn contract_xmp_gps_accuracy_requires_matching_location_rewrite_and_retry() {
-        use crate::state::{AssetMetadata, SqliteStateDb};
+        use crate::state::{AssetMetadata, DownloadStateStore, SqliteStateDb};
         use xmp_toolkit::XmpValue;
 
         for owned in [true, false] {
@@ -3359,13 +3492,14 @@ mod tests {
                 None,
             )
             .await;
-            db.mark_downloaded(
+            db.mark_verified_download(
                 "PrimarySync",
                 "GPS_PROVENANCE",
                 "original",
                 &path,
                 &checksum,
                 Some(&checksum),
+                false,
             )
             .await
             .unwrap();
