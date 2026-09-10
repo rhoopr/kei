@@ -1771,6 +1771,23 @@ where
                         }
                     }
 
+                    // Persist membership even when planning skips already-landed media.
+                    if let Some(db) = &producer_state_db
+                        && let Err(e) =
+                            planner::record_album_membership_if_named(db.as_ref(), config, &asset)
+                                .await
+                        && let Some(album) = config.album_name.as_deref()
+                    {
+                        state_write_failures_producer
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            asset_id = %asset.id(),
+                            album = %album,
+                            error = %e,
+                            "Failed to record album membership after retries"
+                        );
+                    }
+
                     let plan = task_planner.plan_asset(&asset, config).await;
                     if let Some(reason) = plan.filter_reason {
                         skips.record_filter_reason(reason);
@@ -1874,28 +1891,6 @@ where
                             }
 
                             if let Some(db) = &producer_state_db {
-                                // Per-album config (set when {album} is in folder_structure)
-                                // carries the album name so we can record membership.
-                                // In merged-stream mode album is unknown at this point;
-                                // the next incremental sync fills it in.
-                                if let Err(e) = planner::record_album_membership_if_named(
-                                    db.as_ref(),
-                                    config,
-                                    &asset,
-                                )
-                                .await
-                                    && let Some(album) = config.album_name.as_deref()
-                                {
-                                    state_write_failures_producer
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(
-                                        asset_id = %asset.id(),
-                                        album = %album,
-                                        error = %e,
-                                        "Failed to record album membership after retries"
-                                    );
-                                }
-
                                 if let Some(adoption) = adopt_pending_on_disk_task(
                                     producer_state_db.as_deref(),
                                     config,

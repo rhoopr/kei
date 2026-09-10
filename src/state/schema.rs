@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 20;
+pub(crate) const SCHEMA_VERSION: i32 = 21;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -529,6 +529,36 @@ const V20_ASSET_COLUMNS: &[(&str, &str)] = &[
     ("capture_repair_output_size", "INTEGER"),
 ];
 
+/// Metadata evidence for every successfully finalized path. The catalogue still
+/// owns sync selection; this table does not authorize adoption or media deletion.
+const SCHEMA_V21: &str = r"
+CREATE TABLE IF NOT EXISTS asset_metadata_paths (
+    library TEXT NOT NULL,
+    id TEXT NOT NULL,
+    version_size TEXT NOT NULL,
+    local_path TEXT NOT NULL,
+    provider_checksum TEXT NOT NULL,
+    local_checksum TEXT,
+    download_checksum TEXT,
+    metadata_write_failed_at INTEGER,
+    capture_repair_metadata_hash TEXT,
+    capture_repair_output_checksum TEXT,
+    capture_repair_output_size INTEGER,
+    PRIMARY KEY (library, id, version_size, local_path)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_metadata_paths_retry
+    ON asset_metadata_paths(metadata_write_failed_at, library, id, version_size, local_path)
+    WHERE metadata_write_failed_at IS NOT NULL;
+INSERT OR IGNORE INTO asset_metadata_paths
+    (library, id, version_size, local_path, provider_checksum, local_checksum,
+     download_checksum, metadata_write_failed_at, capture_repair_metadata_hash,
+     capture_repair_output_checksum, capture_repair_output_size)
+SELECT library, id, version_size, local_path, checksum, local_checksum,
+       download_checksum, metadata_write_failed_at, capture_repair_metadata_hash,
+       capture_repair_output_checksum, capture_repair_output_size
+FROM assets WHERE status = 'downloaded' AND local_path IS NOT NULL;
+";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -694,6 +724,7 @@ fn migrate_to_version(
                 }
             }
         }
+        21 => conn.execute_batch(SCHEMA_V21)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -709,6 +740,42 @@ fn migrate_to_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v21_migrates_only_recorded_paths_with_independent_retry_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=20 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        let path = "/photos/Trip's été/image.jpg";
+        conn.execute(
+            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at, local_path, local_checksum, metadata_write_failed_at, capture_repair_metadata_hash, capture_repair_output_checksum, capture_repair_output_size) VALUES ('PrimarySync', 'child', 'original', 'provider', 'image.jpg', 1, 10, 'photo', 'downloaded', 1, ?1, 'local', 123, 'metadata', 'prepared', 12)",
+            [path],
+        ).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let row = conn.query_row("SELECT local_path, local_checksum, metadata_write_failed_at, capture_repair_output_checksum FROM asset_metadata_paths", [], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?))
+        }).unwrap();
+        assert_eq!(row, (path.into(), "local".into(), 123, "prepared".into()));
+        conn.execute("INSERT INTO asset_metadata_paths (library, id, version_size, local_path, provider_checksum) VALUES ('PrimarySync', 'child', 'original', '/photos/Family/image.jpg', 'provider')", []).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM asset_metadata_paths", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM assets", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "path metadata tracking must not duplicate the sync catalogue"
+        );
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
 
     #[test]
     fn test_fresh_db_migration() {
