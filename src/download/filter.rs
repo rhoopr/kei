@@ -522,11 +522,16 @@ fn build_payload(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> Arc<MetadataPayload> {
-    Arc::new(
-        config
-            .asset_groupings
-            .metadata_payload(asset.state_id(), asset.metadata()),
-    )
+    let mut payload = config
+        .asset_groupings
+        .metadata_payload(asset.state_id(), asset.metadata());
+    // The current pass is newer evidence than the cycle's grouping preload.
+    if let Some(album) = config.album_name.as_deref().filter(|name| !name.is_empty())
+        && !payload.keywords.iter().any(|keyword| keyword == album)
+    {
+        payload.keywords.push(album.to_owned());
+    }
+    Arc::new(payload)
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
