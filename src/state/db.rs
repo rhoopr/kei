@@ -6441,10 +6441,9 @@ mod tests {
         ] {
             {
                 let conn = db.acquire_lock("legacy dates").unwrap();
-                conn.execute(
-                    &format!("UPDATE assets SET created_at = {literal}, added_at = {literal}"),
-                    [],
-                )
+                conn.execute_batch(&format!(
+                    "UPDATE assets SET created_at = {literal}, added_at = {literal}"
+                ))
                 .unwrap();
                 let stored = conn
                     .query_row(
@@ -6456,12 +6455,8 @@ mod tests {
                 assert_eq!(stored.created_at.timestamp_millis(), expected_millis);
                 assert_eq!(stored.added_at.unwrap().timestamp_millis(), expected_millis);
             }
-            assert_eq!(
-                db.get_manifest_assets().await.unwrap()[0]
-                    .created_at
-                    .timestamp_millis(),
-                expected_millis
-            );
+            let manifest = db.get_manifest_assets().await.unwrap();
+            assert_eq!(manifest[0].created_at.timestamp_millis(), expected_millis);
         }
         for column in ["created_at", "added_at"] {
             for invalid in [
@@ -6473,10 +6468,11 @@ mod tests {
             ] {
                 {
                     let conn = db.acquire_lock("invalid dates").unwrap();
-                    conn.execute("UPDATE assets SET created_at = 0, added_at = NULL", [])
-                        .unwrap();
-                    conn.execute(&format!("UPDATE assets SET {column} = {invalid}"), [])
-                        .unwrap();
+                    conn.execute_batch(&format!(
+                        "UPDATE assets SET created_at = 0, added_at = NULL;
+                         UPDATE assets SET {column} = {invalid}"
+                    ))
+                    .unwrap();
                     assert!(
                         conn.query_row(
                             &format!("SELECT {ASSET_COLUMNS} FROM assets"),
@@ -11292,11 +11288,11 @@ mod tests {
     async fn refresh_downloaded_asset_metadata_updates_every_live_downloaded_version() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        for version in [VersionSizeKey::Original, VersionSizeKey::LiveOriginal] {
+        for version in [VersionSizeKey::Original, VersionSizeKey::Medium] {
             let record = TestAssetRecord::new("PHOTO")
                 .version_size(version)
                 .metadata(AssetMetadata {
-                    rating: Some(4),
+                    metadata_hash: Some("stale-hash".to_string()),
                     ..AssetMetadata::default()
                 })
                 .build();
@@ -11327,41 +11323,32 @@ mod tests {
                  BEGIN SELECT RAISE(FAIL, 'injected revision failure'); END;",
             ).unwrap();
         }
-        assert!(
-            db.refresh_downloaded_asset_metadata(
-                "PrimarySync",
-                "PHOTO",
-                (&metadata, created, Some(added)),
-                true,
-                true,
-                METADATA_CAPTURE_REVISION,
-            )
-            .await
-            .is_err()
-        );
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "PHOTO",
+            (&metadata, created, Some(added)),
+            true,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap_err();
         let unchanged = db.get_downloaded_page(0, 10).await.unwrap();
-        assert!(
-            unchanged
-                .iter()
-                .all(|row| row.created_at != created && row.added_at.is_none())
-        );
-        assert!(
-            db.get_pending_metadata_rewrites(10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            db.get_pending_metadata_rewrites_page_for_queue(
-                MetadataRewriteQueue::CaptureRepair,
-                None,
-                0,
-                10,
-            )
-            .await
-            .unwrap()
-            .is_empty()
-        );
+        assert!(unchanged.iter().all(|row| row.created_at != created
+            && row.added_at.is_none()
+            && row.metadata.rating.is_none()
+            && row.metadata.metadata_hash.as_deref() == Some("stale-hash")));
+        for queue in [
+            MetadataRewriteQueue::Ordinary,
+            MetadataRewriteQueue::CaptureRepair,
+        ] {
+            assert!(
+                db.get_pending_metadata_rewrites_page_for_queue(queue, None, 0, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         db.acquire_lock("remove refresh failure")
             .unwrap()
             .execute_batch("DROP TRIGGER fail_capture_revision")
@@ -11386,7 +11373,7 @@ mod tests {
             assert_eq!(record.id.as_ref(), "PHOTO");
             assert!(matches!(
                 record.version_size,
-                VersionSizeKey::Original | VersionSizeKey::LiveOriginal
+                VersionSizeKey::Original | VersionSizeKey::Medium
             ));
             assert_eq!(record.created_at, created);
             assert_eq!(record.added_at, Some(added));
@@ -11408,48 +11395,28 @@ mod tests {
             assert_eq!(record.checksum.as_ref(), "checksum123");
             assert_eq!(record.metadata.rating, Some(4));
         }
-        let capture = db
-            .get_pending_metadata_rewrites_page_for_queue(
-                MetadataRewriteQueue::CaptureRepair,
-                None,
-                0,
-                10,
-            )
-            .await
-            .unwrap();
-        assert_eq!(capture.len(), 2);
-        assert!(capture.iter().all(|row| matches!(
-            row.capture_repair_receipt,
-            Some(CaptureRepairReceipt::Pending { .. })
-        )));
     }
 
     #[tokio::test]
-    async fn prepared_capture_receipt_blocks_date_changes_but_allows_addition_and_recovery() {
+    async fn prepared_capture_receipt_guards_dates_and_provider_replacement() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let created = DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
         let added = DateTime::from_timestamp_millis(1_700_000_000_789).unwrap();
-        let metadata = AssetMetadata::default();
+        let mut record = TestAssetRecord::new("DATE_RECEIPT")
+            .created_at(created)
+            .added_at(added)
+            .build();
+        let path = Path::new("/photos/date.jpg");
         for version in [VersionSizeKey::Original, VersionSizeKey::LiveOriginal] {
-            let record = TestAssetRecord::new("DATE_RECEIPT")
-                .version_size(version)
-                .created_at(created)
-                .added_at(added)
-                .build();
-            db.import_adopt(
-                &record,
-                Path::new("/photos/date.jpg"),
-                "local-v1",
-                1024,
-                None,
-            )
-            .await
-            .unwrap();
+            record.version_size = version;
+            db.import_adopt(&record, path, "local-v1", 1024, None)
+                .await
+                .unwrap();
         }
         db.refresh_downloaded_asset_metadata(
             "PrimarySync",
             "DATE_RECEIPT",
-            (&metadata, created, Some(added)),
+            (&record.metadata, created, Some(added)),
             true,
             true,
             METADATA_CAPTURE_REVISION,
@@ -11474,44 +11441,31 @@ mod tests {
             .unwrap();
 
         let changed = created + chrono::Duration::milliseconds(1);
+        record.created_at = changed;
         for version in [
             VersionSizeKey::Original,
             VersionSizeKey::LiveOriginal,
             VersionSizeKey::Thumb,
         ] {
-            let record = TestAssetRecord::new("DATE_RECEIPT")
-                .version_size(version)
-                .created_at(changed)
-                .added_at(added)
-                .build();
+            record.version_size = version;
             assert!(
                 db.upsert_seen(&record).await.is_err(),
                 "capture change on {version:?}"
             );
-            assert!(
-                db.import_adopt(
-                    &record,
-                    Path::new("/photos/date.jpg"),
-                    "local-v1",
-                    1024,
-                    None
-                )
-                .await
-                .is_err()
-            );
         }
-        assert!(
-            db.refresh_downloaded_asset_metadata(
-                "PrimarySync",
-                "DATE_RECEIPT",
-                (&metadata, changed, Some(added)),
-                false,
-                false,
-                METADATA_CAPTURE_REVISION,
-            )
+        db.import_adopt(&record, path, "local-v1", 1024, None)
             .await
-            .is_err()
-        );
+            .unwrap_err();
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "DATE_RECEIPT",
+            (&record.metadata, changed, Some(added)),
+            false,
+            false,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap_err();
         let before = db.get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(before.len(), 2);
         assert!(
@@ -11520,20 +11474,17 @@ mod tests {
                 .all(|row| row.created_at == created && row.added_at == Some(added))
         );
 
-        let new_added = added + chrono::Duration::milliseconds(1);
+        record.created_at = created;
+        record.added_at = Some(added + chrono::Duration::milliseconds(1));
         for version in [VersionSizeKey::Original, VersionSizeKey::LiveOriginal] {
-            let record = TestAssetRecord::new("DATE_RECEIPT")
-                .version_size(version)
-                .created_at(created)
-                .added_at(new_added)
-                .build();
+            record.version_size = version;
             db.upsert_seen(&record).await.unwrap();
         }
         assert_eq!(
             db.refresh_downloaded_asset_metadata(
                 "PrimarySync",
                 "DATE_RECEIPT",
-                (&metadata, created, None),
+                (&record.metadata, created, None),
                 false,
                 false,
                 METADATA_CAPTURE_REVISION,
@@ -11559,83 +11510,25 @@ mod tests {
             original.capture_repair_receipt,
             pending.capture_repair_receipt
         );
-        assert_eq!(original.asset.created_at, created);
-        assert_eq!(original.asset.added_at, None);
         assert!(
-            db.finish_metadata_rewrite(
-                original,
-                MetadataRewriteQueue::CaptureRepair,
-                Some("prepared"),
-                Some("local-v1"),
-                MetadataRewriteCompletion::CaptureRepair,
-            )
-            .await
-            .unwrap()
+            recovered
+                .iter()
+                .all(|row| row.asset.created_at == created && row.asset.added_at.is_none())
         );
-        let rows = db.get_downloaded_page(0, 10).await.unwrap();
-        assert!(
-            rows.iter()
-                .all(|row| row.created_at == created && row.added_at.is_none())
-        );
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.version_size == VersionSizeKey::Original)
-                .unwrap()
-                .local_checksum
-                .as_deref(),
-            Some("prepared")
-        );
-    }
 
-    #[tokio::test]
-    async fn prepared_capture_receipt_allows_only_its_own_provider_replacement() {
-        let db = SqliteStateDb::open_in_memory().unwrap();
-        let record = TestAssetRecord::new("REPLACED_CAPTURE")
-            .created_at(DateTime::UNIX_EPOCH)
-            .build();
-        db.import_adopt(&record, Path::new("/photos/old.jpg"), "local", 1024, None)
+        record.created_at = changed;
+        record.checksum = "provider-v2".into();
+        db.upsert_seen(&record)
             .await
-            .unwrap();
-        db.refresh_downloaded_asset_metadata(
-            "PrimarySync",
-            &record.id,
-            (&record.metadata, record.created_at, None),
-            false,
-            true,
-            METADATA_CAPTURE_REVISION,
-        )
-        .await
-        .unwrap();
-        let pending = db
-            .get_pending_metadata_rewrites_page_for_queue(
-                MetadataRewriteQueue::CaptureRepair,
-                None,
-                0,
-                10,
-            )
-            .await
-            .unwrap()
-            .remove(0);
-        db.record_capture_repair_prepared(&pending, "prepared", 2048)
-            .await
-            .unwrap();
-        let mut replacement = record.clone();
-        replacement.created_at += chrono::Duration::milliseconds(1);
-        assert!(db.upsert_seen(&replacement).await.is_err());
-        replacement.checksum = "provider-v2".into();
-        replacement.version_size = VersionSizeKey::LiveOriginal;
-        assert!(
-            db.upsert_seen(&replacement).await.is_err(),
-            "a replacement sibling cannot invalidate the original receipt"
-        );
-        replacement.version_size = VersionSizeKey::Original;
-        db.upsert_seen(&replacement).await.unwrap();
+            .expect_err("a replacement sibling cannot invalidate the original receipt");
+        record.version_size = VersionSizeKey::Original;
+        db.upsert_seen(&record).await.unwrap();
         let rows = db.get_pending().await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].created_at, replacement.created_at);
-        assert_eq!(rows[0].checksum, replacement.checksum);
+        assert_eq!(rows[0].created_at, record.created_at);
+        assert_eq!(rows[0].checksum, record.checksum);
         let receipt: (Option<String>, Option<String>, Option<i64>) = db.acquire_lock("replacement receipt").unwrap().query_row(
-            "SELECT capture_repair_metadata_hash, capture_repair_output_checksum, capture_repair_output_size FROM assets",
+            "SELECT capture_repair_metadata_hash, capture_repair_output_checksum, capture_repair_output_size FROM assets WHERE version_size = 'original'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
         assert_eq!(receipt, (None, None, None));

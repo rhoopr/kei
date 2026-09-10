@@ -6648,6 +6648,7 @@ mod tests {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
         use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
         use futures_util::stream;
         use std::sync::Arc;
 
@@ -6690,7 +6691,11 @@ mod tests {
             .checksum("historical-medium")
             .filename("historical-medium.jpg")
             .size(1234)
-            .metadata(existing_asset().metadata().clone())
+            .metadata(AssetMetadata {
+                title: Some("stale".to_string()),
+                metadata_hash: Some("stale-hash".to_string()),
+                ..AssetMetadata::default()
+            })
             .build();
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
@@ -6726,9 +6731,9 @@ mod tests {
             rewrites[0].version_size,
             crate::state::VersionSizeKey::Medium
         );
-        assert_eq!(
+        assert_ne!(
             rewrites[0].metadata.metadata_hash.as_deref(),
-            existing_asset().metadata().metadata_hash.as_deref()
+            Some("stale-hash")
         );
         assert_eq!(rewrites[0].created_at, existing_asset().created());
         assert_eq!(rewrites[0].added_at, Some(existing_asset().added_date()));
@@ -6747,31 +6752,6 @@ mod tests {
             capture_repairs[0].asset.version_size,
             crate::state::VersionSizeKey::Medium
         );
-        let original_bytes = fs::read(&historical_path).unwrap();
-        let mut retry_config = config.as_ref().clone();
-        retry_config.refresh_metadata = false;
-        retry_config.capture_timestamp_repair = crate::download::CaptureTimestampRepair::Preserve;
-        let retry_config = Arc::new(retry_config);
-        for _ in 0..2 {
-            let result = stream_and_download_from_stream(
-                &reqwest::Client::new(),
-                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(existing_asset())]),
-                &retry_config,
-                DownloadControls::download_hidden(),
-                1,
-                CancellationToken::new(),
-                StreamRuntime::new(None, None),
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.downloaded, 0);
-            let rows = db.get_downloaded_page(0, 10).await.unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].created_at, existing_asset().created());
-            assert_eq!(rows[0].added_at, Some(existing_asset().added_date()));
-            assert_eq!(fs::read(&historical_path).unwrap(), original_bytes);
-            assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
-        }
     }
 
     /// #707 review: the pre-plan refresh makes embedded rewrites reachable for

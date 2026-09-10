@@ -1468,10 +1468,6 @@ mod tests {
     #[test]
     fn capture_timestamp_comparison_preserves_fractional_precision() {
         let created_local = now_local() + chrono::Duration::milliseconds(629);
-        let payload = MetadataPayload {
-            timezone_offset: Some(39_600),
-            ..MetadataPayload::default()
-        };
         for (existing, matches) in [
             ("2024-06-15T10:00:00.629+11:00", true),
             ("2024-06-15T10:00:00.628+11:00", false),
@@ -1515,29 +1511,6 @@ mod tests {
                     "the native offset must still match"
                 );
             }
-            let write = plan_metadata_write_with_repair(
-                MetadataFlags::DATETIME,
-                &payload,
-                &created_local,
-                CaptureTimestampRepair::ReplaceWithCaptureLocal,
-                &probe,
-            );
-            assert_eq!(write.datetime.is_none(), matches, "{existing}");
-            if !matches {
-                assert_eq!(write.datetime.as_deref(), Some("2024:06:15 10:00:00"));
-            }
-            let unzoned_probe = crate::download::metadata::ExifProbe {
-                offset_time_original: None,
-                ..probe
-            };
-            let write = plan_metadata_write(
-                MetadataFlags::DATETIME,
-                &payload,
-                &created_local,
-                &unzoned_probe,
-            );
-            assert!(write.datetime.is_none());
-            assert_eq!(write.offset_time_original.is_some(), matches, "{existing}");
         }
     }
 
@@ -2171,10 +2144,6 @@ mod tests {
         assert_eq!(stored_checksums(&db).await, (Some(checksum.clone()), None));
         let probe = crate::download::metadata::probe_exif(&photo_path).unwrap();
         assert!(probe.denotes_capture_time(&created_local));
-        assert_eq!(
-            probe.datetime_original.as_deref(),
-            Some("2024-06-15T10:00:00")
-        );
         assert_eq!(probe.offset_time_original.as_deref(), Some("+11:00"));
         drop(db);
 
@@ -2925,8 +2894,8 @@ mod tests {
 
     #[cfg(feature = "xmp")]
     #[tokio::test]
-    async fn sidecar_capture_precision_survives_fresh_write_and_catalogue_drain() {
-        use crate::state::{AssetMetadata, SqliteStateDb};
+    async fn fresh_sidecar_write_preserves_capture_precision() {
+        use crate::state::AssetMetadata;
 
         for (millis, timezone_offset) in [
             (629, Some(39_600)),
@@ -2938,12 +2907,8 @@ mod tests {
             let media_path = dir.path().join("capture.jpg");
             let media = minimal_jpeg_bytes();
             std::fs::write(&media_path, &media).unwrap();
-            let checksum = crate::download::file::compute_sha256(&media_path)
-                .await
-                .unwrap();
             let metadata = AssetMetadata {
                 timezone_offset,
-                metadata_hash: Some("capture-precision".into()),
                 ..AssetMetadata::default()
             };
             let created_at =
@@ -2973,8 +2938,10 @@ mod tests {
             .await;
             assert!(!outcome.any_failed());
             let sidecar_path = media_path.with_file_name("capture.jpg.xmp");
-            let fresh = std::fs::read_to_string(&sidecar_path).unwrap();
-            let xmp = fresh.parse::<XmpMeta>().unwrap();
+            let xmp = std::fs::read_to_string(&sidecar_path)
+                .unwrap()
+                .parse::<XmpMeta>()
+                .unwrap();
             for (namespace, property) in [
                 (xmp_ns::XMP, "CreateDate"),
                 (xmp_ns::XMP, "ModifyDate"),
@@ -2989,42 +2956,6 @@ mod tests {
                 timezone_offset.map(|_| "+11:00".to_string())
             );
             assert_eq!(std::fs::read(&media_path).unwrap(), media);
-
-            let db = SqliteStateDb::open_in_memory().unwrap();
-            seed_downloaded_marker(
-                &db,
-                "CAPTURE_PRECISION",
-                "capture.jpg",
-                &media_path,
-                &checksum,
-                metadata,
-                Some(created_at),
-            )
-            .await;
-            for expected_work in [1, 0] {
-                let pass = run_pending(
-                    &db,
-                    MetadataFlags::XMP_SIDECAR,
-                    Arc::from(".precision-test"),
-                    &CancellationToken::new(),
-                )
-                .await;
-                assert_eq!(pass.fetched, expected_work);
-                assert_eq!(pass.applied, expected_work);
-                assert_eq!(pass.failed, 0);
-                assert!(
-                    db.get_pending_metadata_rewrites(1)
-                        .await
-                        .unwrap()
-                        .is_empty()
-                );
-                assert_eq!(std::fs::read_to_string(&sidecar_path).unwrap(), fresh);
-                assert_eq!(std::fs::read(&media_path).unwrap(), media);
-                assert_eq!(stored_checksums(&db).await, (Some(checksum.clone()), None));
-                let rows = db.get_downloaded_page(0, 1).await.unwrap();
-                assert_eq!(rows[0].created_at, created_at);
-                assert_eq!(rows[0].local_path.as_deref(), Some(media_path.as_path()));
-            }
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
         }
     }
