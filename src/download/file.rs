@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::Context;
 use base64::Engine;
@@ -12,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::DownloadError;
 use super::limiter::BandwidthLimiter;
+use crate::fs_util::{ConfinedParents, ConfinedPath, FileIdentity, file_identity};
 use crate::retry::{self, RetryAction, RetryConfig};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -983,19 +985,71 @@ enum PublishResult {
     DestinationExists,
 }
 
-/// Reject unsafe derived entries before on-disk planning can skip them.
-#[must_use = "unsafe reconciliation destinations must keep the old state path"]
-pub(super) async fn validate_reconciliation_leaf(path: &Path) -> anyhow::Result<()> {
-    match fs::symlink_metadata(path).await {
-        Ok(metadata) => anyhow::ensure!(
-            metadata.file_type().is_file(),
-            "Reconciliation destination is not a regular file: {}",
-            path.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+/// Validate source and destination ancestors before path-aware planning.
+#[must_use = "unsafe reconciliation paths must keep the old state path"]
+pub(super) async fn validate_reconciliation_paths(
+    root: &Path,
+    source: Option<&Path>,
+    destination: &Path,
+) -> anyhow::Result<()> {
+    let root = root.to_path_buf();
+    let source = source.map(Path::to_path_buf);
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if let Some(source) = source {
+            let source_root = reconciliation_source_root(&root, &source)?;
+            match ConfinedPath::open(&source_root, &source, ConfinedParents::Existing)
+                .and_then(|path| path.open_optional_regular())
+            {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        ConfinedPath::open(&root, &destination, ConfinedParents::Create)?
+            .open_optional_regular()?;
+        Ok(())
+    })
+    .await?
+}
+
+/// Retain verified files and directory capabilities through state finalization.
+#[derive(Debug)]
+pub(crate) struct ReconciledFile {
+    pub(super) source: ConfinedPath,
+    pub(super) destination: ConfinedPath,
+    source_file: std::fs::File,
+    destination_file: std::fs::File,
+    checksum: String,
+}
+
+impl ReconciledFile {
+    pub(super) fn checksum(&self) -> &str {
+        &self.checksum
     }
-    Ok(())
+
+    pub(super) async fn validate(self: &Arc<Self>) -> anyhow::Result<()> {
+        let copy = Arc::clone(self);
+        tokio::task::spawn_blocking(move || copy.validate_blocking()).await?
+    }
+
+    pub(super) fn validate_blocking(&self) -> anyhow::Result<()> {
+        self.source
+            .validate_identity(file_identity(&self.source_file)?)?;
+        let mut file = self
+            .destination
+            .validate_identity(file_identity(&self.destination_file)?)?;
+        let fingerprint =
+            fingerprint_open_file_snapshot_blocking(&mut file, self.destination.path())?
+                .fingerprint;
+        anyhow::ensure!(
+            data_encoding::HEXLOWER.encode(&fingerprint.sha256) == self.checksum,
+            "Reconciled bytes changed before state finalization"
+        );
+        self.destination
+            .validate_identity(file_identity(&self.destination_file)?)?;
+        Ok(())
+    }
 }
 
 /// Copy regular media without following leaf symlinks or replacing destinations.
@@ -1004,49 +1058,54 @@ pub(super) async fn validate_reconciliation_leaf(path: &Path) -> anyhow::Result<
 /// validation return an error; callers must preserve the previous state path.
 #[must_use = "only verified reconciliation destinations may be recorded in state"]
 pub(crate) async fn copy_local_file_no_replace(
+    root: &Path,
     source: &Path,
     destination: &Path,
     temp_suffix: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<Arc<ReconciledFile>>> {
+    let root = root.to_path_buf();
     let source = source.to_path_buf();
     let destination = destination.to_path_buf();
     let temp_suffix = temp_suffix.to_owned();
     tokio::task::spawn_blocking(move || {
-        copy_local_file_no_replace_blocking(&source, &destination, &temp_suffix, |_| {}, || {})
+        copy_local_file_no_replace_blocking(
+            &root,
+            &source,
+            &destination,
+            &temp_suffix,
+            |_| {},
+            || {},
+        )
     })
     .await?
 }
 
 fn copy_local_file_no_replace_blocking(
+    root: &Path,
     source: &Path,
     destination: &Path,
     temp_suffix: &str,
     before_publication: impl FnOnce(&Path),
     after_publication: impl FnOnce(),
-) -> anyhow::Result<Option<String>> {
-    let mut source_file = open_regular_file_blocking(source)?;
+) -> anyhow::Result<Option<Arc<ReconciledFile>>> {
+    let source_root = reconciliation_source_root(root, source)?;
+    let source = ConfinedPath::open(&source_root, source, ConfinedParents::Existing)?;
+    let destination = ConfinedPath::open(root, destination, ConfinedParents::Create)?;
+    let mut source_file = source.open_regular()?;
     let source_identity = file_identity(&source_file)?;
     let source_fingerprint =
-        fingerprint_open_file_snapshot_blocking(&mut source_file, source)?.fingerprint;
-    match std::fs::symlink_metadata(destination) {
-        Ok(_) => return matching_reconciliation_destination(destination, source_fingerprint, None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)?;
+        fingerprint_open_file_snapshot_blocking(&mut source_file, source.path())?.fingerprint;
+    if destination.open_optional_regular()?.is_some() {
+        return finish_reconciled_copy(source, source_file, destination, source_fingerprint, None);
     }
     // Create a new, unpredictable name. Never truncate or remove a pre-existing
     // entry. Retain ambiguous temporary entries rather than risking user bytes.
-    let part_path = destination.with_file_name(format!(
+    let part_path = destination.path().with_file_name(format!(
         ".kei-reconcile-{}{temp_suffix}",
         uuid::Uuid::new_v4()
     ));
-    let mut part = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&part_path)?;
+    let part_path = destination.sibling(&part_path)?;
+    let mut part = part_path.create_new_regular()?;
     let part_identity = file_identity(&part)?;
     use std::io::Seek;
     source_file.rewind()?;
@@ -1055,91 +1114,92 @@ fn copy_local_file_no_replace_blocking(
     part.sync_all()?;
     part.rewind()?;
     anyhow::ensure!(
-        fingerprint_open_file_snapshot_blocking(&mut part, &part_path)?.fingerprint
+        fingerprint_open_file_snapshot_blocking(&mut part, part_path.path())?.fingerprint
             == source_fingerprint,
         "Local path reconciliation checksum mismatch"
     );
     source_file.rewind()?;
     anyhow::ensure!(
-        file_identity(&open_regular_file_blocking(source)?)? == source_identity
-            && fingerprint_open_file_snapshot_blocking(&mut source_file, source)?.fingerprint
+        file_identity(&source.validate_identity(source_identity)?)? == source_identity
+            && fingerprint_open_file_snapshot_blocking(&mut source_file, source.path())?
+                .fingerprint
                 == source_fingerprint,
         "Reconciliation source changed during copy"
     );
-    before_publication(&part_path);
+    before_publication(part_path.path());
     anyhow::ensure!(
-        file_identity(&open_regular_file_blocking(&part_path)?)? == part_identity,
+        file_identity(&part_path.validate_identity(part_identity)?)? == part_identity,
         "Reconciliation temporary entry changed before publication"
     );
-    let publication = publish_reconciliation_part_blocking(&part_path, destination)?;
+    let publication = publish_reconciliation_part_blocking(&part_path, &destination)?;
     after_publication();
     let expected_identity = match publication {
         PublishResult::Published => Some(part_identity),
         PublishResult::DestinationExists => None,
     };
-    let result =
-        matching_reconciliation_destination(destination, source_fingerprint, expected_identity)?;
-    if result.is_some() {
-        crate::fs_util::fsync_parent_dir(destination)?;
+    if part_path.entry_exists()? {
+        tracing::warn!(path = %part_path.path().display(), "Retaining reconciliation temporary file for manual inspection");
     }
-    if std::fs::symlink_metadata(&part_path).is_ok() {
-        tracing::warn!(path = %part_path.display(), "Retaining reconciliation temporary file for manual inspection");
-    }
-    Ok(result)
+    finish_reconciled_copy(
+        source,
+        source_file,
+        destination,
+        source_fingerprint,
+        expected_identity,
+    )
 }
 
-fn matching_reconciliation_destination(
-    destination: &Path,
+fn finish_reconciled_copy(
+    source: ConfinedPath,
+    source_file: std::fs::File,
+    destination: ConfinedPath,
     expected: ExistingFileFingerprint,
     expected_identity: Option<FileIdentity>,
-) -> anyhow::Result<Option<String>> {
-    let mut file = open_regular_file_blocking(destination)?;
+) -> anyhow::Result<Option<Arc<ReconciledFile>>> {
+    let mut file = destination.open_regular()?;
     let identity = file_identity(&file)?;
     anyhow::ensure!(
         expected_identity.is_none_or(|expected| expected == identity),
         "Reconciled destination identity changed"
     );
-    let actual = fingerprint_open_file_snapshot_blocking(&mut file, destination)?.fingerprint;
+    let actual =
+        fingerprint_open_file_snapshot_blocking(&mut file, destination.path())?.fingerprint;
     anyhow::ensure!(
-        file_identity(&open_regular_file_blocking(destination)?)? == identity,
+        file_identity(&destination.validate_identity(identity)?)? == identity,
         "Reconciled destination changed while hashing"
     );
-    Ok((actual == expected).then(|| data_encoding::HEXLOWER.encode(&actual.sha256)))
+    if actual != expected {
+        return Ok(None);
+    }
+    destination.sync_parent()?;
+    Ok(Some(Arc::new(ReconciledFile {
+        source,
+        destination,
+        source_file,
+        destination_file: file,
+        checksum: data_encoding::HEXLOWER.encode(&actual.sha256),
+    })))
 }
 
 fn publish_reconciliation_part_blocking(
-    part: &Path,
-    destination: &Path,
+    part: &ConfinedPath,
+    destination: &ConfinedPath,
 ) -> std::io::Result<PublishResult> {
     #[cfg(target_os = "linux")]
-    let result = renameat2_no_replace_blocking(part, destination).or_else(|error| {
-        if is_renameat2_unsupported(&error) {
-            // Retain the hard-link source: pathname cleanup could unlink a replacement.
-            std::fs::hard_link(part, destination)
-        } else {
-            Err(error)
-        }
-    });
+    let result =
+        renameat2_confined_blocking(part, destination, libc::RENAME_NOREPLACE).or_else(|error| {
+            if is_renameat2_unsupported(&error) {
+                hard_link_confined(part, destination)
+            } else {
+                Err(error)
+            }
+        });
     #[cfg(target_os = "macos")]
-    let result = {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let part = CString::new(part.as_os_str().as_bytes())?;
-        let destination = CString::new(destination.as_os_str().as_bytes())?;
-        // SAFETY: both owned C strings remain valid for the call. RENAME_EXCL
-        // atomically rejects an existing destination rather than replacing it.
-        let status =
-            unsafe { libc::renamex_np(part.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    };
+    let result = rename_confined_macos(part, destination, libc::RENAME_EXCL);
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-    let result = std::fs::hard_link(part, destination);
+    let result = hard_link_confined(part, destination);
     #[cfg(windows)]
-    let result = move_file_no_replace_blocking(part, destination);
+    let result = move_file_no_replace_blocking(part.path(), destination.path());
     match result {
         Ok(()) => Ok(PublishResult::Published),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1147,6 +1207,94 @@ fn publish_reconciliation_part_blocking(
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn hard_link_confined(part: &ConfinedPath, destination: &ConfinedPath) -> std::io::Result<()> {
+    // SAFETY: both retained directory descriptors and NUL-terminated names
+    // remain live. linkat refuses an existing destination; no path cleanup follows.
+    if unsafe {
+        libc::linkat(
+            part.parent_fd(),
+            part.name_cstr().as_ptr(),
+            destination.parent_fd(),
+            destination.name_cstr().as_ptr(),
+            0,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2_confined_blocking(
+    part_path: &ConfinedPath,
+    final_path: &ConfinedPath,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
+    // SAFETY: both directory descriptors and NUL-terminated names remain live,
+    // and callers pass one documented renameat2 flag.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            part_path.parent_fd(),
+            part_path.name_cstr().as_ptr(),
+            final_path.parent_fd(),
+            final_path.name_cstr().as_ptr(),
+            flags,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_confined_macos(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
+    // SAFETY: both retained directory descriptors and NUL-terminated names
+    // remain live and callers pass a documented renameatx_np flag.
+    if unsafe {
+        libc::renameatx_np(
+            source.parent_fd(),
+            source.name_cstr().as_ptr(),
+            destination.parent_fd(),
+            destination.name_cstr().as_ptr(),
+            flags,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn reconciliation_source_root(download_root: &Path, source: &Path) -> anyhow::Result<PathBuf> {
+    let download_root = crate::fs_util::absolute_lexical(download_root)?;
+    let source = crate::fs_util::absolute_lexical(source)?;
+    if source.starts_with(&download_root) {
+        return Ok(download_root);
+    }
+    let source_parent = source.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot confine reconciliation source without a parent: {}",
+            source.display()
+        )
+    })?;
+    Ok(source_parent
+        .ancestors()
+        .find(|ancestor| download_root.starts_with(ancestor))
+        .unwrap_or(source_parent)
+        .to_path_buf())
 }
 
 #[cfg(target_os = "linux")]
@@ -1552,118 +1700,6 @@ fn destination_exists_or(err: std::io::Error, final_path: &Path) -> std::io::Res
     } else {
         Err(err)
     }
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileIdentity {
-    Extended { volume: u64, index: [u8; 16] },
-    Legacy { volume: u32, index: u64 },
-}
-
-fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = file.metadata()?;
-        Ok(FileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        };
-
-        let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
-        // SAFETY: the file handle is live and `info` points to writable storage
-        // of the exact FileIdInfo structure requested from Windows.
-        let result = unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle() as isize,
-                FileIdInfo,
-                info.as_mut_ptr().cast(),
-                std::mem::size_of::<FILE_ID_INFO>() as u32,
-            )
-        };
-        if result != 0 {
-            // SAFETY: the successful call initialized the complete structure.
-            let info = unsafe { info.assume_init() };
-            if info.FileId.Identifier != [0; 16] {
-                return Ok(FileIdentity::Extended {
-                    volume: info.VolumeSerialNumber,
-                    index: info.FileId.Identifier,
-                });
-            }
-        }
-
-        let mut legacy = std::mem::MaybeUninit::uninit();
-        // SAFETY: the file handle is live and `legacy` points to writable
-        // storage of the exact structure initialized by Windows.
-        let result = unsafe {
-            GetFileInformationByHandle(file.as_raw_handle() as isize, legacy.as_mut_ptr())
-        };
-        if result == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: the successful call initialized the complete structure.
-        let legacy = unsafe { legacy.assume_init() };
-        let index = (u64::from(legacy.nFileIndexHigh) << 32) | u64::from(legacy.nFileIndexLow);
-        if index == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "filesystem did not provide a stable file identity",
-            ));
-        }
-        Ok(FileIdentity::Legacy {
-            volume: legacy.dwVolumeSerialNumber,
-            index,
-        })
-    }
-}
-
-fn open_regular_file_blocking(path: &Path) -> anyhow::Result<std::fs::File> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    #[cfg(windows)]
-    use std::os::windows::fs::OpenOptionsExt;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    #[cfg(windows)]
-    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options
-        .open(path)
-        .with_context(|| format!("Could not open regular file {}", path.display()))?;
-    anyhow::ensure!(
-        file.metadata()?.file_type().is_file(),
-        "Path is not a regular file: {}",
-        path.display()
-    );
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        anyhow::ensure!(
-            file.metadata()?.file_attributes()
-                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-                == 0,
-            "Reconciliation entry is a reparse point: {}",
-            path.display()
-        );
-    }
-    Ok(file)
 }
 
 /// Compute the SHA-256 hash of a file, returning a hex-encoded string.
@@ -2153,7 +2189,7 @@ mod tests {
         let destination = dir.path().join("nested/destination.jpg");
         std::fs::write(&source, b"catalog bytes").unwrap();
 
-        let copied = copy_local_file_no_replace(&source, &destination, ".part")
+        let copied = copy_local_file_no_replace(dir.path(), &source, &destination, ".part")
             .await
             .unwrap();
         assert!(copied.is_some());
@@ -2161,10 +2197,10 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"catalog bytes");
 
         std::fs::write(&destination, b"user bytes").unwrap();
-        let conflict = copy_local_file_no_replace(&source, &destination, ".part")
+        let conflict = copy_local_file_no_replace(dir.path(), &source, &destination, ".part")
             .await
             .unwrap();
-        assert_eq!(conflict, None);
+        assert!(conflict.is_none());
         assert_eq!(std::fs::read(&destination).unwrap(), b"user bytes");
     }
 
@@ -2182,7 +2218,7 @@ mod tests {
         for target_path in [&target, &outside.path().join("missing.jpg")] {
             symlink(target_path, &destination).unwrap();
             assert!(
-                copy_local_file_no_replace(&source, &destination, ".part")
+                copy_local_file_no_replace(dir.path(), &source, &destination, ".part")
                     .await
                     .is_err()
             );
@@ -2192,7 +2228,7 @@ mod tests {
         }
         std::fs::create_dir(&destination).unwrap();
         assert!(
-            copy_local_file_no_replace(&source, &destination, ".part")
+            copy_local_file_no_replace(dir.path(), &source, &destination, ".part")
                 .await
                 .is_err()
         );
@@ -2201,7 +2237,7 @@ mod tests {
         let linked_source = dir.path().join("source-link.jpg");
         symlink(&source, &linked_source).unwrap();
         assert!(
-            copy_local_file_no_replace(&linked_source, &destination, ".part")
+            copy_local_file_no_replace(dir.path(), &linked_source, &destination, ".part")
                 .await
                 .is_err()
         );
@@ -2222,6 +2258,7 @@ mod tests {
             let destination = dir.path().join("destination.jpg");
             std::fs::write(&source, b"catalog bytes").unwrap();
             let result = copy_local_file_no_replace_blocking(
+                dir.path(),
                 &source,
                 &destination,
                 ".part",
@@ -2254,9 +2291,10 @@ mod tests {
         let expected = compute_sha256(&source).await.unwrap();
         for _ in 0..2 {
             assert_eq!(
-                copy_local_file_no_replace(&source, &destination, ".part")
+                copy_local_file_no_replace(dir.path(), &source, &destination, ".part")
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .map(|copy| copy.checksum().to_owned()),
                 Some(expected.clone())
             );
         }
@@ -2272,6 +2310,7 @@ mod tests {
         let destination = dir.path().join("destination.jpg");
         std::fs::write(&source, b"catalog bytes").unwrap();
         let result = copy_local_file_no_replace_blocking(
+            dir.path(),
             &source,
             &destination,
             ".part",
@@ -2284,6 +2323,91 @@ mod tests {
         assert!(result.is_err());
         assert!(!destination.exists());
         assert_eq!(std::fs::read(&source).unwrap(), b"catalog bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_confined_parent_publication_races_reject_external_redirects() {
+        use std::os::unix::fs::symlink;
+        for after_publish in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let source = root.path().join("source.jpg");
+            let parent = root.path().join("parent");
+            let retained = root.path().join("retained");
+            let destination = parent.join("destination.jpg");
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::write(&source, b"media").unwrap();
+            let replace_parent = || {
+                std::fs::rename(&parent, &retained).unwrap();
+                symlink(outside.path(), &parent).unwrap();
+            };
+            let result = copy_local_file_no_replace_blocking(
+                root.path(),
+                &source,
+                &destination,
+                ".part",
+                |_| {
+                    if !after_publish {
+                        replace_parent();
+                    }
+                },
+                || {
+                    if after_publish {
+                        replace_parent();
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&source).unwrap(), b"media");
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconciliation_confined_receipt_detects_parent_change_before_state() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jpg");
+        let parent = root.path().join("parent");
+        let destination = parent.join("destination.jpg");
+        std::fs::write(&source, b"media").unwrap();
+        let copied = copy_local_file_no_replace(root.path(), &source, &destination, ".part")
+            .await
+            .unwrap()
+            .unwrap();
+        copied.validate().await.unwrap();
+        std::fs::rename(&parent, root.path().join("retained")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+        assert!(copied.validate().await.is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&source).unwrap(), b"media");
+    }
+
+    #[tokio::test]
+    async fn reconciliation_confined_relative_root_reaches_steady_state() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&cwd).unwrap();
+        let relative_root = root.path().strip_prefix(&cwd).unwrap();
+        let source = root.path().join("source.jpg");
+        let destination = relative_root.join("nested/destination.jpg");
+        std::fs::write(&source, b"media").unwrap();
+        for _ in 0..2 {
+            let copy = copy_local_file_no_replace(relative_root, &source, &destination, ".part")
+                .await
+                .unwrap()
+                .unwrap();
+            copy.validate().await.unwrap();
+            assert_eq!(copy.checksum(), compute_sha256(&source).await.unwrap());
+        }
+        assert_eq!(
+            std::fs::read_dir(destination.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"media");
     }
 
     #[test]
@@ -3563,8 +3687,8 @@ mod tests {
         first_chunk_len: usize,
         calls: std::sync::atomic::AtomicUsize,
         resume_requests: std::sync::Mutex<Vec<Option<u64>>>,
-        release_first_chunk: std::sync::Arc<tokio::sync::Notify>,
-        first_chunk_delivered: std::sync::Arc<tokio::sync::Notify>,
+        release_first_chunk: Arc<tokio::sync::Notify>,
+        first_chunk_delivered: Arc<tokio::sync::Notify>,
     }
 
     impl InterruptingResumeClient {
@@ -3574,18 +3698,18 @@ mod tests {
                 first_chunk_len,
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 resume_requests: std::sync::Mutex::new(Vec::new()),
-                release_first_chunk: std::sync::Arc::new(tokio::sync::Notify::new()),
-                first_chunk_delivered: std::sync::Arc::new(tokio::sync::Notify::new()),
+                release_first_chunk: Arc::new(tokio::sync::Notify::new()),
+                first_chunk_delivered: Arc::new(tokio::sync::Notify::new()),
             }
         }
 
         fn pending_after_first_chunk(&self) -> DownloadResponse {
             let first_chunk = self.body[..self.first_chunk_len].to_vec();
-            let release_first_chunk = std::sync::Arc::clone(&self.release_first_chunk);
-            let first_chunk_delivered = std::sync::Arc::clone(&self.first_chunk_delivered);
+            let release_first_chunk = Arc::clone(&self.release_first_chunk);
+            let first_chunk_delivered = Arc::clone(&self.first_chunk_delivered);
             let stream = futures_util::stream::unfold(Some(first_chunk), move |next| {
-                let release_first_chunk = std::sync::Arc::clone(&release_first_chunk);
-                let first_chunk_delivered = std::sync::Arc::clone(&first_chunk_delivered);
+                let release_first_chunk = Arc::clone(&release_first_chunk);
+                let first_chunk_delivered = Arc::clone(&first_chunk_delivered);
                 async move {
                     let Some(chunk) = next else {
                         std::future::pending().await
@@ -5092,7 +5216,7 @@ mod tests {
     /// in time for the race to manifest if exclusivity is broken.
     struct GatedStubDownloadClient {
         body: Vec<u8>,
-        barrier: std::sync::Arc<tokio::sync::Barrier>,
+        barrier: Arc<tokio::sync::Barrier>,
     }
 
     #[async_trait::async_trait]
