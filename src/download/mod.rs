@@ -3572,7 +3572,9 @@ pub(crate) async fn reconcile_catalog_paths(
                     if unsafe_destination {
                         continue;
                     }
-                    let plan = task_planner.plan_asset(&asset, pass_config).await;
+                    let plan = task_planner
+                        .plan_reconciliation_asset(&asset, pass_config)
+                        .await;
                     if plan.filter_reason.is_some() {
                         continue;
                     }
@@ -3679,9 +3681,42 @@ pub(crate) async fn reconcile_catalog_paths(
         .await
         {
             Ok(Some(copy)) => {
+                if let Err(error) = copy.set_capture_time(task.created_local.timestamp()).await {
+                    stats.failed += 1;
+                    tracing::warn!(%error, "Could not restore reconciled capture mtime");
+                    continue;
+                }
+                #[cfg(feature = "xmp")]
+                let sidecar = if config.metadata.xmp_sidecar {
+                    match metadata_rewrite::write_reconciled_sidecar(
+                        Arc::clone(&copy),
+                        Arc::clone(&task.metadata),
+                        task.created_local,
+                        config.temp_suffix.to_string(),
+                    )
+                    .await
+                    {
+                        Ok(receipt) => Some(receipt),
+                        Err(error) => {
+                            stats.exif_failures += 1;
+                            tracing::warn!(%error, "Could not preserve reconciled XMP sidecar");
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 if let Err(error) = copy.validate().await {
                     stats.failed += 1;
                     tracing::warn!(%error, "Reconciliation changed before state finalization");
+                    continue;
+                }
+                #[cfg(feature = "xmp")]
+                if let Some(sidecar) = &sidecar
+                    && let Err(error) = sidecar.validate().await
+                {
+                    stats.exif_failures += 1;
+                    tracing::warn!(%error, "Reconciled sidecar changed before state finalization");
                     continue;
                 }
                 if let Err(error) = db
@@ -3727,6 +3762,7 @@ pub(crate) async fn reconcile_catalog_paths(
         && targets.is_empty()
         && !deferred_to_pending_retry
         && stats.failed == 0
+        && stats.exif_failures == 0
         && stats.state_write_failures == 0
         && !stats.interrupted;
     Ok(PathReconciliationResult { complete, stats })
@@ -14317,6 +14353,254 @@ mod tests {
         assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&expected_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&target).unwrap(), vec![0u8; 1024]);
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_preserves_mtime_and_metadata_across_retry() {
+        for mode in [
+            ReconciliationMetadataCase::Disabled,
+            ReconciliationMetadataCase::MediaConflict,
+            ReconciliationMetadataCase::Conflict,
+            ReconciliationMetadataCase::StateFailure,
+            ReconciliationMetadataCase::Missing,
+        ] {
+            #[cfg(not(feature = "xmp"))]
+            if !matches!(
+                mode,
+                ReconciliationMetadataCase::Disabled | ReconciliationMetadataCase::MediaConflict
+            ) {
+                continue;
+            }
+            reconciliation_metadata_transition(mode).await;
+        }
+    }
+
+    #[derive(Debug)]
+    enum ReconciliationMetadataCase {
+        Disabled,
+        MediaConflict,
+        Conflict,
+        StateFailure,
+        Missing,
+    }
+
+    async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
+        #[derive(Clone, Debug)]
+        struct LookupOnlySession {
+            records: Arc<Vec<Value>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PhotosSession for LookupOnlySession {
+            async fn post(
+                &self,
+                url: &str,
+                _body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                if url.contains("/records/lookup?") {
+                    return Ok(json!({"records": self.records.as_ref().clone()}));
+                }
+                anyhow::bail!("path reconciliation made an unexpected provider request: {url}")
+            }
+
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        let old_dir = TempDir::new().expect("old dir");
+        let db_path = old_dir.path().join("state.db");
+        let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let new_dir = TempDir::new().expect("new dir");
+        let old_path = old_dir.path().join("reconcile.jpg");
+        tokio::fs::write(&old_path, vec![0u8; 1024]).await.unwrap();
+        let local_checksum = file::compute_sha256(&old_path).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("RECONCILE")
+            .filename("reconcile.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "RECONCILE",
+            "original",
+            &old_path,
+            &local_checksum,
+            Some("provider-checksum"),
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-RECONCILE", "RECONCILE")
+            .await
+            .unwrap();
+
+        let mut records =
+            mock_photo_records_for_zone_with_filename("RECONCILE", "PrimarySync", "reconcile.jpg");
+        records[1]["fields"]["resJPEGFullRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/reconcile-adjusted.jpg",
+            "size": 512,
+            "fileChecksum": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        }});
+        records[1]["fields"]["resJPEGFullFileType"] = json!({"value": "public.jpeg"});
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(LookupOnlySession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(new_dir.path());
+        config.state_db = Some(db.clone());
+        config.edited = true;
+        let expected_paths = filter::expected_paths_for(&asset, &config);
+        let expected_path = expected_paths
+            .into_iter()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap()
+            .path;
+        let source_sidecar = old_path.with_file_name("reconcile.jpg.xmp");
+        let mut sidecar_name = expected_path.file_name().unwrap().to_os_string();
+        sidecar_name.push(".xmp");
+        let new_sidecar = expected_path.with_file_name(sidecar_name);
+        let packet = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:custom="https://example.test/custom/" custom:Note="keep this exact packet" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="5"/></rdf:RDF></x:xmpmeta>"#;
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(12345);
+        std::fs::File::options()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        if !matches!(mode, ReconciliationMetadataCase::Missing) {
+            std::fs::write(&source_sidecar, packet).unwrap();
+        }
+        #[cfg(feature = "xmp")]
+        {
+            config.metadata.xmp_sidecar = !matches!(mode, ReconciliationMetadataCase::Disabled);
+        }
+        if matches!(mode, ReconciliationMetadataCase::Conflict) {
+            std::fs::create_dir_all(new_sidecar.parent().unwrap()).unwrap();
+            std::fs::write(&new_sidecar, b"user-owned conflicting sidecar").unwrap();
+        }
+        if matches!(mode, ReconciliationMetadataCase::MediaConflict) {
+            std::fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
+            std::fs::write(&expected_path, vec![1u8; 1024]).unwrap();
+        }
+        if matches!(mode, ReconciliationMetadataCase::StateFailure) {
+            db.acquire_lock("inject reconciliation finalization failure").unwrap().execute_batch(
+                "CREATE TEMP TRIGGER fail_reconciled_path BEFORE UPDATE OF local_path ON assets WHEN NEW.local_path IS NOT OLD.local_path BEGIN SELECT RAISE(FAIL, 'injected reconciliation state failure'); END;"
+            ).unwrap();
+        }
+        let config = Arc::new(config);
+        if matches!(
+            mode,
+            ReconciliationMetadataCase::Conflict
+                | ReconciliationMetadataCase::StateFailure
+                | ReconciliationMetadataCase::MediaConflict
+        ) {
+            let failed =
+                reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                    .await
+                    .unwrap();
+            assert!(!failed.complete);
+            assert_eq!(failed.stats.downloaded, 0);
+            assert_eq!(
+                failed.stats.failed
+                    + failed.stats.exif_failures
+                    + failed.stats.state_write_failures,
+                1
+            );
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows[0].local_path.as_deref(), Some(old_path.as_path()));
+            assert_eq!(std::fs::read(&source_sidecar).unwrap(), packet);
+            if matches!(mode, ReconciliationMetadataCase::MediaConflict) {
+                assert_eq!(std::fs::read(&expected_path).unwrap(), vec![1u8; 1024]);
+                assert_eq!(
+                    std::fs::read_dir(expected_path.parent().unwrap())
+                        .unwrap()
+                        .count(),
+                    1
+                );
+                std::fs::remove_file(&expected_path).unwrap();
+            } else {
+                assert_eq!(std::fs::read(&expected_path).unwrap(), vec![0u8; 1024]);
+            }
+            if matches!(mode, ReconciliationMetadataCase::Conflict) {
+                assert_eq!(
+                    std::fs::read(&new_sidecar).unwrap(),
+                    b"user-owned conflicting sidecar"
+                );
+                std::fs::remove_file(&new_sidecar).unwrap();
+            } else if matches!(mode, ReconciliationMetadataCase::StateFailure) {
+                db.acquire_lock("restore reconciliation finalization")
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER fail_reconciled_path")
+                    .unwrap();
+            }
+        }
+        let repaired =
+            reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(repaired.complete, "case {mode:?}");
+        assert_eq!(repaired.stats.downloaded, 1);
+        assert_eq!(repaired.stats.exif_failures, 0);
+        let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows[0].local_path.as_deref(), Some(expected_path.as_path()));
+        assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
+        assert_eq!(
+            std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+            old_time
+        );
+        assert_eq!(
+            std::fs::metadata(&expected_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(asset.created_local().timestamp().unsigned_abs())
+        );
+        if !cfg!(feature = "xmp") || matches!(mode, ReconciliationMetadataCase::Disabled) {
+            assert!(!new_sidecar.exists());
+        } else if !matches!(mode, ReconciliationMetadataCase::Missing) {
+            assert_eq!(std::fs::read(&source_sidecar).unwrap(), packet);
+            assert_eq!(std::fs::read(&new_sidecar).unwrap(), packet);
+        } else {
+            #[cfg(feature = "xmp")]
+            {
+                let text = std::fs::read_to_string(&new_sidecar).unwrap();
+                let xmp: xmp_toolkit::XmpMeta = text.parse().unwrap();
+                assert!(
+                    xmp.property(xmp_toolkit::xmp_ns::EXIF, "DateTimeOriginal")
+                        .is_some()
+                );
+            }
+        }
+        let count = std::fs::read_dir(expected_path.parent().unwrap())
+            .unwrap()
+            .count();
+        let sidecar_before = std::fs::read(&new_sidecar).ok();
+        let steady = reconcile_catalog_paths(&passes, config, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(steady.complete);
+        assert_eq!(steady.stats.downloaded, 0);
+        assert_eq!(
+            std::fs::read_dir(expected_path.parent().unwrap())
+                .unwrap()
+                .count(),
+            count
+        );
+        assert_eq!(std::fs::read(&new_sidecar).ok(), sidecar_before);
     }
 
     #[tokio::test]

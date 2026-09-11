@@ -448,6 +448,57 @@ fn offset_time_original(payload: &MetadataPayload) -> Option<String> {
     Some(format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60))
 }
 
+/// Read source GPS before publishing any generated sidecar. A transient read
+/// failure must not leave an incomplete packet that prevents a corrected retry.
+#[cfg(feature = "xmp")]
+pub(super) async fn write_reconciled_sidecar(
+    copy: Arc<super::file::ReconciledFile>,
+    payload: Arc<MetadataPayload>,
+    created_local: DateTime<FixedOffset>,
+    temp_suffix: String,
+) -> anyhow::Result<Arc<super::metadata::ReconciledSidecar>> {
+    write_reconciled_sidecar_with_reader(
+        copy,
+        payload,
+        created_local,
+        temp_suffix,
+        super::metadata::read_source_gps_from_file,
+    )
+    .await
+}
+
+#[cfg(feature = "xmp")]
+async fn write_reconciled_sidecar_with_reader(
+    copy: Arc<super::file::ReconciledFile>,
+    payload: Arc<MetadataPayload>,
+    created_local: DateTime<FixedOffset>,
+    temp_suffix: String,
+    read_gps: fn(&mut std::fs::File, &Path) -> anyhow::Result<super::metadata::SourceGpsMetadata>,
+) -> anyhow::Result<Arc<super::metadata::ReconciledSidecar>> {
+    tokio::task::spawn_blocking(move || {
+        copy.validate_blocking()?;
+        super::metadata::write_reconciled_sidecar(
+            &copy,
+            || {
+                let mut source = copy.open_source_for_metadata()?;
+                let gps = read_gps(&mut source, copy.source.path())?;
+                copy.validate_blocking()?;
+                // Reconciliation does not invent original-byte provenance from a
+                // recovered local checksum. Existing source packets are preserved.
+                Ok(plan_sidecar_from_gps(
+                    &payload,
+                    &created_local,
+                    gps,
+                    NativeAccuracy::Unknown,
+                    None,
+                ))
+            },
+            &temp_suffix,
+        )
+    })
+    .await?
+}
+
 /// Comprehensive snapshot of every field a payload can contribute. Used as
 /// the sidecar plan (sidecars are fresh files; no probe gating applies).
 /// Source-media GPS facts are read here on every attempt so metadata-only
@@ -492,6 +543,38 @@ fn plan_sidecar_write(
     } else {
         false
     };
+    let accuracy = if original_source {
+        NativeAccuracy::Verified
+    } else {
+        NativeAccuracy::Unknown
+    };
+    (
+        plan_sidecar_from_gps(
+            payload,
+            created_local,
+            source_gps,
+            accuracy,
+            source_error.as_ref(),
+        ),
+        source_error,
+    )
+}
+
+#[cfg(feature = "xmp")]
+#[derive(PartialEq, Eq)]
+enum NativeAccuracy {
+    Verified,
+    Unknown,
+}
+
+#[cfg(feature = "xmp")]
+fn plan_sidecar_from_gps(
+    payload: &MetadataPayload,
+    created_local: &DateTime<FixedOffset>,
+    source_gps: super::metadata::SourceGpsMetadata,
+    accuracy: NativeAccuracy,
+    source_error: Option<&anyhow::Error>,
+) -> super::metadata::MetadataWrite {
     let mut write = super::metadata::MetadataWrite {
         datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
         offset_time_original: offset_time_original(payload),
@@ -500,7 +583,7 @@ fn plan_sidecar_write(
         gps_speed_ref: source_gps.speed_ref,
         gps_h_positioning_error: source_gps
             .horizontal_positioning_error
-            .filter(|_| original_source),
+            .filter(|_| accuracy == NativeAccuracy::Verified),
         preserve_source_gps: source_error.is_some(),
         rating: payload.rating,
         gps: gps_from_payload(payload),
@@ -514,7 +597,7 @@ fn plan_sidecar_write(
     write.people.clone_from(&payload.people);
     write.media_subtype.clone_from(&payload.media_subtype);
     write.burst_id.clone_from(&payload.burst_id);
-    (write, source_error)
+    write
 }
 
 /// Plan the embed-path write. Per-tag gates:
@@ -1250,6 +1333,126 @@ mod tests {
 
     use super::*;
     use chrono::TimeZone;
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn reconciled_sidecar_source_read_failure_can_retry_without_conflicting_output() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jpg");
+        let destination = root.path().join("destination.jpg");
+        let sidecar = root.path().join("destination.jpg.xmp");
+        let bytes = crate::test_helpers::minimal_jpeg_with_source_gps();
+        std::fs::write(&source, &bytes).unwrap();
+        let copy = super::super::file::copy_local_file_no_replace(
+            root.path(),
+            &source,
+            &destination,
+            ".part",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload = Arc::new(rich_payload());
+        let failed = write_reconciled_sidecar_with_reader(
+            Arc::clone(&copy),
+            Arc::clone(&payload),
+            now_local(),
+            ".part".to_owned(),
+            |_, _| Err(std::io::Error::other("injected source GPS read failure").into()),
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(!sidecar.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        let completed = write_reconciled_sidecar(
+            Arc::clone(&copy),
+            Arc::clone(&payload),
+            now_local(),
+            ".part".to_owned(),
+        )
+        .await
+        .unwrap();
+        completed.validate().await.unwrap();
+        let packet = std::fs::read_to_string(&sidecar).unwrap();
+        let xmp: XmpMeta = packet.parse().unwrap();
+        assert_eq!(xmp.property(xmp_ns::XMP, "Rating").unwrap().value, "4");
+        crate::test_helpers::assert_source_gps_in_xmp(&xmp);
+        let repeated = write_reconciled_sidecar(copy, payload, now_local(), ".part".to_owned())
+            .await
+            .unwrap();
+        repeated.validate().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), packet);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
+    }
+
+    #[cfg(all(feature = "xmp", unix))]
+    #[tokio::test]
+    async fn reconciled_sidecar_rejects_unsafe_metadata_entries() {
+        use std::os::unix::fs::symlink;
+        for source_link in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let source = root.path().join("source.jpg");
+            let destination = root.path().join("destination.jpg");
+            let external = outside.path().join("user.xmp");
+            std::fs::write(&source, minimal_jpeg_bytes()).unwrap();
+            std::fs::write(&external, b"external custom packet").unwrap();
+            let link = root.path().join(if source_link {
+                "source.jpg.xmp"
+            } else {
+                "destination.jpg.xmp"
+            });
+            symlink(&external, &link).unwrap();
+            let copy = super::super::file::copy_local_file_no_replace(
+                root.path(),
+                &source,
+                &destination,
+                ".part",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let result = write_reconciled_sidecar(
+                copy,
+                Arc::new(rich_payload()),
+                now_local(),
+                ".part".to_owned(),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_link(&link).unwrap(), external);
+            assert_eq!(std::fs::read(&external).unwrap(), b"external custom packet");
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jpg");
+        let parent = root.path().join("parent");
+        let destination = parent.join("destination.jpg");
+        std::fs::write(&source, minimal_jpeg_bytes()).unwrap();
+        let copy = super::super::file::copy_local_file_no_replace(
+            root.path(),
+            &source,
+            &destination,
+            ".part",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        std::fs::rename(&parent, root.path().join("retained")).unwrap();
+        symlink(outside.path(), &parent).unwrap();
+        assert!(
+            write_reconciled_sidecar(
+                copy,
+                Arc::new(rich_payload()),
+                now_local(),
+                ".part".to_owned()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
 
     /// Capture-local time for an asset whose stored offset is +11:00, which is
     /// what every payload below carries. Production derives this offset and
