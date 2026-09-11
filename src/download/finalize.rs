@@ -68,7 +68,7 @@ where
     D: DownloadFinalizationStore + ?Sized,
 {
     match db
-        .mark_downloaded_with_capture_repair(
+        .mark_verified_download(
             library,
             &task.asset_id,
             task.version_size.as_str(),
@@ -174,7 +174,7 @@ where
 
     for attempt in 1..=STATE_WRITE_MAX_RETRIES {
         match db
-            .mark_downloaded_with_capture_repair(
+            .mark_verified_download(
                 &write.library,
                 &write.asset_id,
                 write.version_size.as_str(),
@@ -440,6 +440,57 @@ mod tests {
         assert_eq!(
             pending[0].asset.local_checksum.as_deref(),
             Some("replacement_checksum")
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_verified_download_preserves_source_checksum_after_reopen() {
+        use crate::state::db::MetadataRewriteQueue;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("source.jpg");
+        let db_path = dir.path().join("state.db");
+        write_file(&path).await;
+        let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let result = finalize_downloaded(
+            &db,
+            &Arc::from(LIBRARY),
+            &task("SOURCE_DEFER", path.clone()),
+            checksum.clone(),
+            Some(checksum.clone()),
+            true,
+            false,
+        )
+        .await;
+        let DownloadedFinalization::Deferred { write, .. } = result else {
+            panic!("missing catalogue row must defer source provenance too");
+        };
+        seed_pending(&db, "SOURCE_DEFER", "source.jpg").await;
+        assert_eq!(flush_pending_state_writes(&db, &[write]).await, 0);
+        db.record_metadata_write_failure(LIBRARY, "SOURCE_DEFER", "original")
+            .await
+            .unwrap();
+        drop(db);
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].asset.local_path.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            pending[0].source_checksum.as_deref(),
+            Some(checksum.as_str())
+        );
+        assert_eq!(
+            pending[0].asset.local_checksum.as_deref(),
+            Some(checksum.as_str())
         );
     }
 
