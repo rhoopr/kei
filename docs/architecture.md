@@ -488,6 +488,13 @@ Provider metadata updates that would invalidate a prepared receipt remain
 retryable until the published bytes are finalised in state. Source-deletion
 transitions follow the same rule so a tombstone cannot hide the only proof of
 published repair bytes.
+Capture-instant changes are guarded across every version of the asset, even
+when the metadata hash is unchanged. Addition-date-only updates preserve the
+prepared receipt. An upsert replacing the receipt's own rendition with a new
+provider checksum may invalidate that receipt; a sibling replacement may not.
+Tasks rejected by the state upsert are not dispatched or marked failed, so the
+existing receipt and catalogue evidence remain intact and the state-write
+failure keeps the checkpoint ineligible.
 Provider-version or non-metadata file replacement invalidates the repair state;
 byte-identical re-adoption preserves it. When replacement or adoption occurs
 during the explicit repair run, downloaded-state finalization creates fresh
@@ -502,6 +509,13 @@ short of its provider size. Capture timestamp repair instead leaves that row
 pending because it cannot prove file provenance.
 
 ### State and serialization
+
+Asset capture and addition dates use fractional Unix seconds in the existing
+non-STRICT SQLite INTEGER columns. Readers accept legacy whole seconds and
+round fractional seconds to milliseconds without scaling the whole timestamp.
+Invalid stored dates fail decoding. Metadata refresh commits these dates with
+the metadata and rewrite markers; operational timestamps remain whole seconds.
+This representation requires no schema migration or historical backfill.
 
 Schema, primary-key, sentinel, durable-key, and serialization changes are
 cross-cutting. Search every reader and writer, migrations, fixtures, reports,
