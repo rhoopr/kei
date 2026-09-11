@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 #[cfg(feature = "xmp")]
+use std::sync::Arc;
+#[cfg(feature = "xmp")]
 use std::sync::Once;
 
 use anyhow::{Context, Result};
@@ -453,8 +455,18 @@ fn probe_from_meta(meta: &XmpMeta) -> ExifProbe {
 pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
     let mut source = std::fs::File::open(path)
         .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
+    read_source_gps_from_file(&mut source, path)
+}
+
+#[cfg(feature = "xmp")]
+pub(super) fn read_source_gps_from_file(
+    source: &mut std::fs::File,
+    path: &Path,
+) -> Result<SourceGpsMetadata> {
+    use std::io::Seek;
+    source.rewind()?;
     let mut head = [0_u8; 12];
-    let bytes_read = std::io::Read::read(&mut source, &mut head)
+    let bytes_read = std::io::Read::read(source, &mut head)
         .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
     let Some(file_type) = source_file_type(head.get(..bytes_read).unwrap_or_default()) else {
         return Ok(SourceGpsMetadata::default());
@@ -465,7 +477,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
             .metadata()
             .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
             .len();
-        return match read_jpeg_source_gps(&mut source, source_len) {
+        return match read_jpeg_source_gps(source, source_len) {
             Ok(metadata) => Ok(metadata),
             Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
             Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
@@ -479,7 +491,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
             .metadata()
             .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
             .len();
-        return match read_tiff_source_gps(&mut source, 0, source_len) {
+        return match read_tiff_source_gps(source, 0, source_len) {
             Ok(metadata) => Ok(metadata),
             Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
             Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
@@ -493,7 +505,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
             .metadata()
             .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
             .len();
-        return match read_png_source_gps(&mut source, source_len) {
+        return match read_png_source_gps(source, source_len) {
             Ok(metadata) => Ok(metadata),
             Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
             Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
@@ -507,7 +519,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
             .metadata()
             .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
             .len();
-        let extent = match heif::locate_exif_tiff(&mut source, source_len) {
+        let extent = match heif::locate_exif_tiff(source, source_len) {
             Ok(extent) => extent,
             Err(heif::HeifExifError::Malformed) => {
                 return Ok(SourceGpsMetadata::default());
@@ -521,7 +533,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
         let Some((tiff_start, tiff_len)) = extent else {
             return Ok(SourceGpsMetadata::default());
         };
-        return match read_tiff_source_gps(&mut source, tiff_start, tiff_len) {
+        return match read_tiff_source_gps(source, tiff_start, tiff_len) {
             Ok(metadata) => Ok(metadata),
             Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
             Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
@@ -1577,6 +1589,143 @@ fn create_unique_embed_temp_with_sequence(
             }
         }
     }
+}
+
+#[cfg(feature = "xmp")]
+struct ReconciledSidecarSnapshot {
+    path: crate::fs_util::ConfinedPath,
+    file: std::fs::File,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "xmp")]
+impl ReconciledSidecarSnapshot {
+    fn read(path: crate::fs_util::ConfinedPath) -> Result<Option<Self>> {
+        let Some(mut file) = path.open_optional_regular()? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)?;
+        path.validate_identity(crate::fs_util::file_identity(&file)?)?;
+        Ok(Some(Self { path, file, bytes }))
+    }
+
+    fn validate(&self) -> Result<()> {
+        let identity = crate::fs_util::file_identity(&self.file)?;
+        let mut current = self.path.validate_identity(identity)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut current, &mut bytes)?;
+        anyhow::ensure!(
+            bytes == self.bytes,
+            "Reconciled sidecar changed before state finalization"
+        );
+        self.path.validate_identity(identity)?;
+        Ok(())
+    }
+}
+
+/// Keep source and destination sidecar evidence live through catalogue finalization.
+#[cfg(feature = "xmp")]
+pub(super) struct ReconciledSidecar {
+    source_path: crate::fs_util::ConfinedPath,
+    source: Option<ReconciledSidecarSnapshot>,
+    destination: ReconciledSidecarSnapshot,
+}
+
+#[cfg(feature = "xmp")]
+impl ReconciledSidecar {
+    pub(super) async fn validate(self: &Arc<Self>) -> Result<()> {
+        let sidecar = Arc::clone(self);
+        tokio::task::spawn_blocking(move || sidecar.validate_blocking()).await?
+    }
+
+    fn validate_blocking(&self) -> Result<()> {
+        if let Some(source) = &self.source {
+            source.validate()?;
+        } else {
+            anyhow::ensure!(
+                self.source_path.open_optional_regular()?.is_none(),
+                "Source sidecar appeared during reconciliation"
+            );
+        }
+        self.destination.validate()
+    }
+}
+
+/// Preserve an existing packet byte-for-byte. Generate a configured packet only
+/// when no source sidecar exists. Never overwrite a conflicting destination.
+#[cfg(feature = "xmp")]
+pub(super) fn write_reconciled_sidecar(
+    copy: &super::file::ReconciledFile,
+    write_missing: impl FnOnce() -> Result<MetadataWrite>,
+    temp_suffix: &str,
+) -> Result<Arc<ReconciledSidecar>> {
+    fn sidecar_name(path: &Path) -> Result<PathBuf> {
+        let mut name = path
+            .file_name()
+            .context("Reconciled media has no filename")?
+            .to_os_string();
+        name.push(".xmp");
+        Ok(path.with_file_name(name))
+    }
+    let source_path = copy.source.sibling(&sidecar_name(copy.source.path())?)?;
+    // Sibling creates a second retained capability without resolving ancestors.
+    let source = ReconciledSidecarSnapshot::read(copy.source.sibling(source_path.path())?)?;
+    let bytes = if let Some(source) = &source {
+        ensure_initialized();
+        parse_existing_sidecar(
+            std::str::from_utf8(&source.bytes).context("Source sidecar is not UTF-8")?,
+        )?;
+        source.bytes.clone()
+    } else {
+        let write = write_missing()?;
+        ensure_initialized();
+        let mut meta = XmpMeta::new().context("creating reconciled XMP packet")?;
+        apply_to_owned_sidecar(&mut meta, &write)?;
+        meta.to_string().into_bytes()
+    };
+    if let Some(source) = &source {
+        source.validate()?;
+    }
+    copy.validate_blocking()?;
+    let destination = copy
+        .destination
+        .sibling(&sidecar_name(copy.destination.path())?)?;
+    // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
+    let existing = ReconciledSidecarSnapshot::read(copy.destination.sibling(destination.path())?)?;
+    let destination = if let Some(existing) = existing {
+        anyhow::ensure!(
+            existing.bytes == bytes,
+            "Reconciled sidecar destination conflicts with source metadata"
+        );
+        existing
+    } else {
+        let temp_path = destination.path().with_file_name(format!(
+            ".kei-xmp-reconcile-{}{temp_suffix}",
+            uuid::Uuid::new_v4()
+        ));
+        let temp = destination.sibling(&temp_path)?;
+        let mut file = temp.create_new_regular()?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+        temp.validate_identity(crate::fs_util::file_identity(&file)?)?;
+        super::file::publish_reconciliation_part_blocking(&temp, &destination)?;
+        let installed = ReconciledSidecarSnapshot::read(destination)?
+            .context("Reconciled sidecar disappeared")?;
+        anyhow::ensure!(
+            installed.bytes == bytes,
+            "Reconciled sidecar changed during publication"
+        );
+        installed
+    };
+    destination.path.sync_parent()?;
+    let receipt = Arc::new(ReconciledSidecar {
+        source_path,
+        source,
+        destination,
+    });
+    receipt.validate_blocking()?;
+    Ok(receipt)
 }
 
 /// Write `write` as a `.xmp` sidecar next to the media file, atomically.
@@ -3407,8 +3556,8 @@ mod tests {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "durable_install.jpg");
         let original = fs::read(&path).unwrap();
-        let install_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let install_called_in_closure = std::sync::Arc::clone(&install_called);
+        let install_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let install_called_in_closure = Arc::clone(&install_called);
         let expected_path = path.clone();
 
         let prepared = prepare_metadata_xmp_toolkit(
