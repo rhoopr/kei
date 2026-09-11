@@ -8820,6 +8820,178 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_cycle_reconciliation_rejection_preserves_source_dispatch_and_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone, Debug)]
+        struct ReconciliationSession {
+            records: serde_json::Value,
+            source_calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::icloud::photos::PhotosSession for ReconciliationSession {
+            async fn post(
+                &self,
+                url: &str,
+                _body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                if url.contains("/records/lookup?") {
+                    return Ok(self.records.clone());
+                }
+                self.source_calls.fetch_add(1, Ordering::SeqCst);
+                if url.contains("/changes/zone?") {
+                    return Ok(
+                        serde_json::json!({"zones": [{"zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"}, "syncToken": "zone-after", "moreComing": false, "records": []}]}),
+                    );
+                }
+                if url.contains("/internal/records/query/batch") {
+                    return Ok(album_count_response(0));
+                }
+                Ok(serde_json::json!({"records": [], "syncToken": "zone-after"}))
+            }
+            fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+        let config = make_run_cycle_config();
+        let old_dir = tempfile::tempdir().unwrap();
+        let new_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let db_path = old_dir.path().join("state.db");
+        let db = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+        let old_path = old_dir.path().join("photo.jpg");
+        let external = outside.path().join("photo.jpg");
+        std::fs::write(&old_path, vec![0u8; 1024]).unwrap();
+        std::fs::write(&external, vec![0u8; 1024]).unwrap();
+        let checksum = download::file::compute_sha256(&old_path).await.unwrap();
+        let provider_checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let record = crate::test_helpers::TestAssetRecord::new("BLOCKED")
+            .filename("photo.jpg")
+            .size(1024)
+            .checksum(provider_checksum)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "BLOCKED",
+            "original",
+            &old_path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-BLOCKED", "BLOCKED")
+            .await
+            .unwrap();
+        db.set_metadata(
+            ENUM_CONFIG_HASH_KEY,
+            &download::compute_config_hash(&config),
+        )
+        .await
+        .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "zone-before")
+            .await
+            .unwrap();
+        let old_builder = make_run_cycle_download_config_builder(old_dir.path(), db.clone());
+        let new_builder = make_run_cycle_download_config_builder(new_dir.path(), db.clone());
+        let old_config = old_builder(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from("PrimarySync"),
+        );
+        let new_config = new_builder(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from("PrimarySync"),
+        );
+        let old_hash = download::hash_download_config(&old_config);
+        let new_hash = download::hash_download_config(&new_config);
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, &old_hash)
+            .await
+            .unwrap();
+        let records = full_album_page_with_download(
+            "PrimarySync",
+            "BLOCKED",
+            "unused",
+            "https://p01.icloud-content.com/photo.jpg",
+            1024,
+            provider_checksum,
+        );
+        let asset = crate::icloud::photos::PhotoAsset::new(
+            records["records"][0].clone(),
+            records["records"][1].clone(),
+        );
+        let expected = download::filter::expected_paths_for(&asset, new_config.as_ref())
+            .remove(0)
+            .path;
+        std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&external, &expected).unwrap();
+        let source_calls = Arc::new(AtomicUsize::new(0));
+        let album = make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(ReconciliationSession {
+                records,
+                source_calls: Arc::clone(&source_calls),
+            }),
+        );
+        let lib =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+        for _ in 0..2 {
+            let result = run_cycle(
+                &[&lib],
+                &config,
+                Some(db.as_ref()),
+                false,
+                &new_builder,
+                download::DownloadControls::download_hidden(),
+                &session,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.failed_count, 1);
+            assert!(!result.db_sync_token_advance_safe);
+            assert_eq!(source_calls.load(Ordering::SeqCst), 0);
+            let reopened = state::SqliteStateDb::open(&db_path).await.unwrap();
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows[0].local_path.as_deref(), Some(old_path.as_path()));
+            assert_eq!(rows[0].local_checksum.as_deref(), Some(checksum.as_str()));
+            assert_eq!(
+                reopened
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("zone-before")
+            );
+            assert_eq!(
+                reopened
+                    .get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(old_hash.as_str())
+            );
+            assert_eq!(
+                reopened
+                    .get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(new_hash.as_str())
+            );
+            assert_eq!(std::fs::read_link(&expected).unwrap(), external);
+            assert_eq!(std::fs::read(&external).unwrap(), vec![0u8; 1024]);
+            assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
+        }
+    }
+
     #[tokio::test]
     async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
         let config = make_run_cycle_config();
