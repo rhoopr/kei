@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 22;
+pub(crate) const SCHEMA_VERSION: i32 = 23;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -730,6 +730,15 @@ fn migrate_to_version(
         }
         21 => conn.execute_batch(SCHEMA_V21)?,
         22 => conn.execute_batch(SCHEMA_V22)?,
+        23 => {
+            // Historical download_checksum values may come from rewritten
+            // local bytes. Only new verified downloads establish provenance.
+            if !column_exists(conn, "asset_metadata_paths", "source_checksum")? {
+                conn.execute_batch(
+                    "ALTER TABLE asset_metadata_paths ADD COLUMN source_checksum TEXT;",
+                )?;
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -2131,6 +2140,88 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 0);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v23_source_checksum_migration_keeps_historical_provenance_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..=22 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        set_schema_version(&conn, 22).unwrap();
+        for (name, local, downloaded) in [
+            ("equal", Some("rewritten"), Some("rewritten")),
+            ("different", Some("local"), Some("downloaded")),
+            ("missing", None, None),
+        ] {
+            conn.execute(
+                "INSERT INTO asset_metadata_paths \
+                    (library, id, version_size, local_path, provider_checksum, \
+                     local_checksum, download_checksum, metadata_write_failed_at) \
+                 VALUES ('PrimarySync', ?1, 'original', ?1, 'provider', ?2, ?3, 7)",
+                rusqlite::params![name, local, downloaded],
+            )
+            .unwrap();
+        }
+        migrate(&conn).unwrap();
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        let known: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_metadata_paths WHERE source_checksum IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(known, 0);
+        // Re-entry cannot overwrite subsequently established source evidence.
+        conn.execute(
+            "UPDATE asset_metadata_paths SET source_checksum = 'verified' WHERE id = 'equal'",
+            [],
+        )
+        .unwrap();
+        migrate_to_version(&conn, 22, 23).unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, local_checksum, download_checksum, source_checksum, metadata_write_failed_at \
+             FROM asset_metadata_paths ORDER BY id"
+        ).unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "different".into(),
+                    Some("local".into()),
+                    Some("downloaded".into()),
+                    None,
+                    7
+                ),
+                (
+                    "equal".into(),
+                    Some("rewritten".into()),
+                    Some("rewritten".into()),
+                    Some("verified".into()),
+                    7
+                ),
+                ("missing".into(), None, None, None, 7),
+            ]
+        );
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 

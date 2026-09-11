@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset, NaiveDateTime};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Timelike};
 use little_exif::exif_tag::ExifTag;
 use little_exif::filetype::FileExtension;
 #[cfg(not(feature = "xmp"))]
@@ -258,11 +258,7 @@ impl ExifProbe {
         let Some(existing) = self.datetime_original.as_deref() else {
             return false;
         };
-        let Some((wall_clock, zone)) = parse_capture_timestamp(existing) else {
-            return false;
-        };
-        wall_clock == created_local.naive_local()
-            && zone.is_none_or(|zone| zone == *created_local.offset())
+        capture_timestamp_matches(existing, created_local)
     }
 
     pub(crate) fn native_heif_capture_time_repair_required(
@@ -293,15 +289,20 @@ impl ExifProbe {
                 datetime_original: Some(datetime),
                 offset_time_original: Some(offset),
             } => {
-                let denotes_capture_time =
-                    parse_capture_timestamp(datetime).is_some_and(|(wall_clock, zone)| {
-                        wall_clock == created_local.naive_local()
-                            && zone.is_none_or(|zone| zone == *created_local.offset())
-                    });
+                let denotes_capture_time = capture_timestamp_matches(datetime, created_local);
                 Ok(Some(!denotes_capture_time || offset != expected_offset))
             }
         }
     }
+}
+
+fn capture_timestamp_matches(value: &str, expected: &DateTime<FixedOffset>) -> bool {
+    parse_capture_timestamp(value).is_some_and(|(wall_clock, zone)| {
+        // Native writers may omit subseconds. Never forgive an incorrect nonzero fraction.
+        (wall_clock == expected.naive_local()
+            || Some(wall_clock) == expected.naive_local().with_nanosecond(0))
+            && zone.is_none_or(|zone| zone == *expected.offset())
+    })
 }
 
 /// Split a capture timestamp into its wall clock and the zone it names, if
@@ -314,9 +315,9 @@ fn parse_capture_timestamp(value: &str) -> Option<(NaiveDateTime, Option<FixedOf
         return Some((zoned.naive_local(), Some(*zoned.offset())));
     }
     [
-        "%Y:%m:%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
+        "%Y:%m:%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
     ]
     .into_iter()
     .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
@@ -793,9 +794,29 @@ fn read_tiff_source_gps<R: std::io::Read + std::io::Seek>(
     let mut speed = None;
     let mut speed_ref = None;
     let mut horizontal_positioning_error = None;
+    let mut latitude = None;
+    let mut latitude_ref = None;
+    let mut longitude = None;
+    let mut longitude_ref = None;
     for index in 0..gps_count {
         let entry = reader.read_ifd_entry(gps_ifd_offset, index)?;
         match tiff_u16(reader.endian, [entry[0], entry[1]]) {
+            0x0001 => {
+                latitude_ref = reader.entry_value::<2>(&entry, "GPSLatitudeRef", 2, 2)?;
+            }
+            0x0002 => {
+                latitude = reader
+                    .entry_value::<24>(&entry, "GPSLatitude", 5, 3)?
+                    .and_then(|value| tiff_rational_triplet(reader.endian, &value));
+            }
+            0x0003 => {
+                longitude_ref = reader.entry_value::<2>(&entry, "GPSLongitudeRef", 2, 2)?;
+            }
+            0x0004 => {
+                longitude = reader
+                    .entry_value::<24>(&entry, "GPSLongitude", 5, 3)?
+                    .and_then(|value| tiff_rational_triplet(reader.endian, &value));
+            }
             0x0007 if time.is_none() => {
                 if let Some(value) = reader.entry_value::<24>(&entry, "GPSTimeStamp", 5, 3)? {
                     time = tiff_rational_triplet(reader.endian, &value);
@@ -846,10 +867,48 @@ fn read_tiff_source_gps<R: std::io::Read + std::io::Seek>(
     };
     let speed_ref = speed.as_ref().and(speed_ref);
     Ok(SourceGpsMetadata {
+        latitude: latitude.zip(latitude_ref).and_then(|(value, reference)| {
+            source_gps_degrees(&value, reference, GpsAxis::Latitude)
+        }),
+        longitude: longitude.zip(longitude_ref).and_then(|(value, reference)| {
+            source_gps_degrees(&value, reference, GpsAxis::Longitude)
+        }),
         datetime,
         speed,
         speed_ref,
         horizontal_positioning_error,
+    })
+}
+
+#[cfg(feature = "xmp")]
+enum GpsAxis {
+    Latitude,
+    Longitude,
+}
+
+#[cfg(feature = "xmp")]
+fn source_gps_degrees(values: &[XmpRational; 3], reference: [u8; 2], axis: GpsAxis) -> Option<f64> {
+    const MINUTES_PER_DEGREE: f64 = 60.0;
+    const SECONDS_PER_DEGREE: f64 = 3600.0;
+    let (positive, negative, maximum) = match axis {
+        GpsAxis::Latitude => (b'N', b'S', 90.0),
+        GpsAxis::Longitude => (b'E', b'W', 180.0),
+    };
+    if reference[1] != 0 || ![positive, negative].contains(&reference[0]) {
+        return None;
+    }
+    let [degrees, minutes, seconds] = values.each_ref().map(XmpRational::as_f64);
+    if minutes >= MINUTES_PER_DEGREE || seconds >= MINUTES_PER_DEGREE {
+        return None;
+    }
+    let decimal = degrees + minutes / MINUTES_PER_DEGREE + seconds / SECONDS_PER_DEGREE;
+    if decimal > maximum {
+        return None;
+    }
+    Some(if reference[0] == negative {
+        -decimal
+    } else {
+        decimal
     })
 }
 
@@ -1054,6 +1113,8 @@ impl XmpRational {
 #[cfg(feature = "xmp")]
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct SourceGpsMetadata {
+    pub(crate) latitude: Option<f64>,
+    pub(crate) longitude: Option<f64>,
     pub(crate) datetime: Option<String>,
     pub(crate) speed: Option<XmpRational>,
     pub(crate) speed_ref: Option<String>,
@@ -1064,7 +1125,9 @@ pub(crate) struct SourceGpsMetadata {
 /// fields are skipped.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MetadataWrite {
-    /// `"YYYY:MM:DD HH:MM:SS"` EXIF-style datetime string.
+    /// Unzoned datetime: `YYYY:MM:DD HH:MM:SS` for embedded writes, or
+    /// `YYYY-MM-DDTHH:MM:SS` with optional fractional seconds for sidecars.
+    /// `offset_time_original` supplies the XMP zone separately.
     pub(crate) datetime: Option<String>,
     /// EXIF `OffsetTimeOriginal`, formatted as `+HH:MM` or `-HH:MM`.
     pub(crate) offset_time_original: Option<String>,
@@ -2151,9 +2214,7 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
         }
     }
     if let Some(dt) = &write.datetime {
-        // XMP uses ISO 8601; our stored form is EXIF-style "YYYY:MM:DD HH:MM:SS".
-        // Convert for XMP, keep a local EXIF copy so XMP Toolkit's reconciler
-        // writes the native block too on formats that have one.
+        // Embedded plans use EXIF form; sidecar plans already carry unzoned ISO 8601.
         let iso = exif_datetime_to_iso(dt);
         let iso_with_offset = write
             .offset_time_original

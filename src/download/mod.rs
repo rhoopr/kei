@@ -4315,7 +4315,7 @@ async fn refresh_metadata_capture_candidate(
         .refresh_downloaded_asset_metadata(
             &candidate.library,
             &candidate.asset_id,
-            &capture,
+            (&capture, asset.created(), Some(asset.added_date())),
             mark_for_rewrite,
             false,
             crate::state::METADATA_CAPTURE_REVISION,
@@ -7952,7 +7952,7 @@ async fn apply_changed_provider_metadata(
         .refresh_downloaded_asset_metadata(
             library,
             asset.state_id(),
-            &capture,
+            (&capture, asset.created(), Some(asset.added_date())),
             mark_for_rewrite,
             false,
             crate::state::METADATA_CAPTURE_REVISION,
@@ -8407,24 +8407,18 @@ async fn download_photos_incremental_collecting_inner(
             }
         }
         skip_breakdown.by_state = skip_breakdown.by_state.saturating_add(state_skipped);
-
-        for task in &plan.tasks {
-            retry_sources.insert(
-                RetryTaskKey::from(task),
-                UrlRetrySource {
-                    asset_record_name: asset.asset_record_name_arc(),
-                    pass_index: *pass_index,
-                },
-            );
+        if plan.tasks.is_empty() && state_skipped == 0 {
+            skip_breakdown.on_disk += 1;
         }
 
         // Upsert state records so mark_downloaded/mark_failed can find them.
         // Without this, the UPDATE in mark_downloaded matches 0 rows and the
         // file ends up on disk but untracked in the state DB.
         if let Some(db) = &config.state_db {
-            for task in &plan.tasks {
+            let planned_tasks = std::mem::take(&mut plan.tasks);
+            for task in planned_tasks {
                 if let Err(e) =
-                    planner::upsert_seen_for_task(db.as_ref(), effective_config, asset, task).await
+                    planner::upsert_seen_for_task(db.as_ref(), effective_config, asset, &task).await
                 {
                     planning_state_write_failures = planning_state_write_failures.saturating_add(1);
                     tracing::warn!(
@@ -8432,7 +8426,9 @@ async fn download_photos_incremental_collecting_inner(
                         error = %e,
                         "Failed to record asset in state DB"
                     );
+                    continue;
                 }
+                plan.tasks.push(task);
             }
             // Record this asset's membership in the current album so
             // consumers (EXIF keywords, XMP sidecars, Immich albums) can
@@ -8453,8 +8449,14 @@ async fn download_photos_incremental_collecting_inner(
             }
         }
 
-        if plan.tasks.is_empty() && state_skipped == 0 {
-            skip_breakdown.on_disk += 1;
+        for task in &plan.tasks {
+            retry_sources.insert(
+                RetryTaskKey::from(task),
+                UrlRetrySource {
+                    asset_record_name: asset.asset_record_name_arc(),
+                    pass_index: *pass_index,
+                },
+            );
         }
         tasks.extend(plan.tasks);
     }
@@ -15482,7 +15484,9 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let stored_records = incremental_photo_records_with_favorite("CAPTURE_REVISION", false);
         let stored_asset = PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
-        let changed_records = incremental_photo_records_with_favorite("CAPTURE_REVISION", true);
+        let mut changed_records = incremental_photo_records_with_favorite("CAPTURE_REVISION", true);
+        changed_records[1]["fields"]["assetDate"]["value"] = json!(1_700_000_000_123_i64);
+        changed_records[1]["fields"]["addedDate"]["value"] = json!(1_700_000_000_789_i64);
         let pass = AlbumPass {
             kind: PassKind::Unfiled,
             album: album_with_session(
@@ -15547,6 +15551,11 @@ mod tests {
             .expect("read refreshed row")
             .remove(0);
         assert!(refreshed.metadata.is_favorite);
+        assert_eq!(refreshed.created_at.timestamp_millis(), 1_700_000_000_123);
+        assert_eq!(
+            refreshed.added_at.unwrap().timestamp_millis(),
+            1_700_000_000_789
+        );
         assert_eq!(refreshed.local_path.as_deref(), Some(media_path.as_path()));
         assert_eq!(
             tokio::fs::read(&media_path)
@@ -17585,6 +17594,338 @@ mod tests {
                 .expect("read rewrite queue")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_capture_upserts_never_dispatch_streaming_or_collecting_tasks() {
+        let server = crate::start_wiremock_or_skip!();
+        for collecting in [false, true] {
+            let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+            let dir = TempDir::new().unwrap();
+            let mut records = incremental_photo_records_with_url(
+                "REJECTED",
+                "capture.jpg",
+                &format!("{}/capture.jpg", server.uri()),
+                1024,
+            );
+            records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+                "downloadURL": format!("{}/capture.mov", server.uri()),
+                "fileChecksum": "provider-motion", "size": 1024,
+            }});
+            records[0]["fields"]["resOriginalVidComplFileType"] =
+                json!({"value": "com.apple.quicktime-movie"});
+            let old = PhotoAsset::new(records[0].clone(), records[1].clone());
+            let path = dir.path().join("historical.jpg");
+            tokio::fs::write(&path, b"historical media").await.unwrap();
+            let record = TestAssetRecord::new(old.asset_record_name())
+                .created_at(old.created())
+                .added_at(old.added_date())
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .metadata(old.metadata().clone())
+                .build();
+            db.import_adopt(&record, &path, "local-original", 16, None)
+                .await
+                .unwrap();
+            db.refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                &record.id,
+                (
+                    &crate::state::MetadataCapture {
+                        shared: Arc::clone(&record.metadata),
+                        renditions: Arc::from([(
+                            record.version_size,
+                            crate::state::RenditionMetadata {
+                                checksum: Some(Arc::from(record.checksum.as_ref())),
+                                width: record.metadata.width,
+                                height: record.metadata.height,
+                                duration_secs: record.metadata.duration_secs,
+                            },
+                        )]),
+                    },
+                    record.created_at,
+                    record.added_at,
+                ),
+                false,
+                true,
+                crate::state::METADATA_CAPTURE_REVISION,
+            )
+            .await
+            .unwrap();
+            let mut pending = db
+                .get_pending_metadata_rewrites_page_for_queue(
+                    crate::state::db::MetadataRewriteQueue::CaptureRepair,
+                    None,
+                    0,
+                    10,
+                )
+                .await
+                .unwrap()
+                .remove(0);
+            pending.capture_repair_receipt = db
+                .record_capture_repair_prepared(&pending, "prepared", 2048)
+                .await
+                .unwrap();
+            records[1]["fields"]["assetDate"]["value"] = json!(1_700_086_400_123_i64);
+            let pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: changes_album(
+                    "",
+                    changes_zone_session(Arc::new(AtomicUsize::new(0)), records),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let mut config = incremental_test_config(&dir);
+            config.state_db = Some(db.clone());
+            config.recent = collecting.then_some(10);
+            let result = download_photos_incremental(
+                &Client::new(),
+                &[pass],
+                &Arc::new(config),
+                "zone-token-prev",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                0,
+                "collecting={collecting}"
+            );
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(result.stats.failed, 0);
+            assert_eq!(result.stats.state_write_failures, 2);
+            assert_eq!(result.stats.skipped.on_disk, 0);
+            assert!(matches!(
+                result.outcome,
+                DownloadOutcome::PartialFailure { .. }
+            ));
+            let recovered = db
+                .get_pending_metadata_rewrites_page_for_queue(
+                    crate::state::db::MetadataRewriteQueue::CaptureRepair,
+                    None,
+                    0,
+                    10,
+                )
+                .await
+                .unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].capture_repair_receipt,
+                pending.capture_repair_receipt
+            );
+            assert_eq!(recovered[0].asset.created_at, record.created_at);
+            assert_eq!(recovered[0].asset.checksum, record.checksum);
+            assert_eq!(
+                recovered[0].asset.local_checksum.as_deref(),
+                Some("local-original")
+            );
+            assert_eq!(
+                recovered[0].asset.local_path.as_deref(),
+                Some(path.as_path())
+            );
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), b"historical media");
+            assert!(db.get_pending().await.unwrap().is_empty());
+            assert!(db.get_failed().await.unwrap().is_empty());
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stays_incremental()
+    {
+        use xmp_toolkit::{XmpMeta, xmp_ns};
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let still = include_bytes!("../../tests/data/sample.heic").as_slice();
+        let motion = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ".as_slice();
+        let mut records = incremental_photo_records_with_url(
+            "LIVE_DATES",
+            "capture.HEIC",
+            "https://p01.icloud-content.com/capture.HEIC",
+            still.len() as u64,
+        );
+        records[0]["fields"]["itemType"] = json!({"value": "public.heic"});
+        records[0]["fields"]["resOriginalFileType"] = json!({"value": "public.heic"});
+        records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/capture.MOV",
+            "fileChecksum": "provider-motion", "size": motion.len(),
+        }});
+        records[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value": "com.apple.quicktime-movie"});
+        records[1]["fields"]["timeZoneOffset"] = json!({"value": 0});
+        let old = PhotoAsset::new(records[0].clone(), records[1].clone());
+        records[1]["fields"]["assetDate"]["value"] = json!(1_700_000_000_123_i64);
+        records[1]["fields"]["addedDate"]["value"] = json!(1_700_000_000_789_i64);
+        let current = PhotoAsset::new(records[0].clone(), records[1].clone());
+        assert_eq!(
+            old.metadata().metadata_hash,
+            current.metadata().metadata_hash
+        );
+        let session = changes_zone_session_with_query_page(
+            Arc::new(AtomicUsize::new(0)),
+            records.clone(),
+            json!({"records": records, "syncToken": "full-token"}),
+            1,
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session.clone()),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Full;
+        config.refresh_metadata = true;
+        config.metadata.xmp_sidecar = true;
+        let expected = filter::expected_paths_for(&old, &config);
+        assert_eq!(expected.len(), 2);
+        let capture = filter::metadata_capture(&old);
+        for rendition in &expected {
+            let bytes = if rendition.version_size == VersionSizeKey::Original {
+                still
+            } else {
+                motion
+            };
+            tokio::fs::create_dir_all(rendition.path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&rendition.path, bytes).await.unwrap();
+            let checksum = file::compute_sha256(&rendition.path).await.unwrap();
+            let record = TestAssetRecord::new(old.asset_record_name())
+                .version_size(rendition.version_size)
+                .filename(rendition.path.file_name().unwrap().to_str().unwrap())
+                .created_at(old.created())
+                .added_at(old.added_date())
+                .checksum(&rendition.checksum)
+                .size(rendition.size)
+                .metadata(capture.resolve(rendition.version_size, &rendition.checksum))
+                .build();
+            db.import_adopt(&record, &rendition.path, &checksum, rendition.size, None)
+                .await
+                .unwrap();
+            let outcome =
+                metadata_rewrite::write_download_metadata(metadata_rewrite::MetadataWriteRequest {
+                    final_path: &rendition.path,
+                    embed_path: None,
+                    expected_embed_fingerprint: None,
+                    source_checksum: None,
+                    sidecar_path: Some(&rendition.path),
+                    payload: Arc::new(filter::MetadataPayload::from_metadata(old.metadata())),
+                    created_local: old.metadata().capture_local(old.created()),
+                    flags: MetadataFlags::XMP_SIDECAR,
+                    capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+                    temp_suffix: ".seed",
+                })
+                .await;
+            assert!(!outcome.any_failed());
+        }
+        let before = db.get_downloaded_page(0, 10).await.unwrap();
+        let mut sidecars = HashMap::new();
+        let mut full_query_count = 0;
+        for refresh in [true, false] {
+            config.refresh_metadata = refresh;
+            let result = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result.outcome, DownloadOutcome::Success),
+                "{:?}",
+                result.stats
+            );
+            assert_eq!(result.full_enumeration_ran, refresh);
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(result.stats.state_write_failures, 0);
+            assert_eq!(result.stats.exif_failures, 0);
+            assert!(!result.stats.sync_token_blocked);
+            assert_eq!(
+                result.sync_token.as_deref(),
+                Some(if refresh {
+                    "full-token"
+                } else {
+                    "zone-token-next"
+                })
+            );
+            if refresh {
+                full_query_count = session.records_query_count();
+                assert!(full_query_count > 0);
+                assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 2);
+                // The explicit sync owner drains only after the full producer has finished.
+                assert_eq!(
+                    drain_pending_metadata_rewrites(
+                        db.as_ref(),
+                        &config.metadata,
+                        CaptureTimestampRepair::Preserve,
+                        &["PrimarySync"],
+                        config.temp_suffix.clone(),
+                        &CancellationToken::new(),
+                    )
+                    .await,
+                    0
+                );
+            }
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in &rows {
+                let prior = before
+                    .iter()
+                    .find(|prior| prior.version_size == row.version_size)
+                    .unwrap();
+                assert_eq!(row.created_at, current.created());
+                assert_eq!(row.added_at, Some(current.added_date()));
+                assert_eq!(row.metadata.metadata_hash, prior.metadata.metadata_hash);
+                assert_eq!(row.local_path, prior.local_path);
+                assert_eq!(row.local_checksum, prior.local_checksum);
+                assert_eq!(row.download_checksum, prior.download_checksum);
+                assert_eq!(row.checksum, prior.checksum);
+                assert_eq!(row.downloaded_at, prior.downloaded_at);
+                let path = row.local_path.as_ref().unwrap();
+                assert_eq!(
+                    tokio::fs::read(path).await.unwrap(),
+                    if row.version_size == VersionSizeKey::Original {
+                        still
+                    } else {
+                        motion
+                    }
+                );
+                let sidecar = path.with_file_name(format!(
+                    "{}.xmp",
+                    path.file_name().unwrap().to_str().unwrap()
+                ));
+                let text = tokio::fs::read_to_string(sidecar).await.unwrap();
+                if refresh {
+                    let xmp: XmpMeta = text.parse().unwrap();
+                    assert_eq!(
+                        xmp.property(xmp_ns::EXIF, "DateTimeOriginal")
+                            .unwrap()
+                            .value,
+                        "2023-11-14T22:13:20.123+00:00"
+                    );
+                    sidecars.insert(path.clone(), text);
+                } else {
+                    assert_eq!(sidecars.get(path), Some(&text));
+                }
+            }
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(session.records_query_count(), full_query_count);
+            config.sync_mode = SyncMode::Incremental {
+                zone_sync_token: result.sync_token.unwrap(),
+            };
+        }
+        assert_eq!(session.changes_zone_calls.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(feature = "xmp")]

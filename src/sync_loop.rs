@@ -4372,9 +4372,9 @@ mod tests {
             &checksum,
         );
         page["records"][1]["fields"]["assetDate"]["value"] =
-            serde_json::json!(1_769_898_719_000_i64);
+            serde_json::json!(1_769_898_719_629_i64);
         page["records"][1]["fields"]["addedDate"]["value"] =
-            serde_json::json!(1_769_898_719_000_i64);
+            serde_json::json!(1_769_898_719_789_i64);
         page["records"][1]["fields"]["timeZoneOffset"] =
             serde_json::json!({"value": 39_600, "type": "INT64"});
 
@@ -4419,6 +4419,14 @@ mod tests {
 
         assert_eq!(result.stats.downloaded, 1);
         let downloaded = db.get_downloaded_page(0, 1).await.expect("downloaded row");
+        assert_eq!(
+            downloaded[0].created_at.timestamp_millis(),
+            1_769_898_719_629
+        );
+        assert_eq!(
+            downloaded[0].added_at.map(|date| date.timestamp_millis()),
+            Some(1_769_898_719_789)
+        );
         let media_path = downloaded[0].local_path.as_ref().expect("downloaded path");
         assert!(
             media_path
@@ -4436,13 +4444,20 @@ mod tests {
         )))
         .expect("capture-offset sidecar");
         let metadata = sidecar.parse::<XmpMeta>().expect("valid XMP sidecar");
-        assert_eq!(
-            metadata
-                .property(xmp_ns::EXIF, "DateTimeOriginal")
-                .expect("DateTimeOriginal")
-                .value,
-            "2026-02-01T09:31:59+11:00"
-        );
+        for (namespace, property) in [
+            (xmp_ns::XMP, "CreateDate"),
+            (xmp_ns::XMP, "ModifyDate"),
+            (xmp_ns::EXIF, "DateTimeOriginal"),
+            (xmp_ns::PHOTOSHOP, "DateCreated"),
+        ] {
+            assert_eq!(
+                metadata
+                    .property(namespace, property)
+                    .expect(property)
+                    .value,
+                "2026-02-01T09:31:59.629+11:00"
+            );
+        }
         assert_eq!(
             metadata
                 .property("http://cipa.jp/exif/1.0/", "OffsetTimeOriginal")
@@ -5180,14 +5195,29 @@ mod tests {
                 return Err(state::error::StateError::LockPoisoned(self.message.into()));
             }
             if let Some(newer) = &self.refresh_on_mark_downloaded {
+                let record = self
+                    .inner
+                    .get_downloaded_page(0, u32::MAX)
+                    .await?
+                    .into_iter()
+                    .find(|row| {
+                        row.library.as_ref() == library
+                            && row.id.as_ref() == id
+                            && row.version_size.as_str() == version_size
+                    })
+                    .expect("refresh target");
                 self.inner
                     .refresh_downloaded_asset_metadata(
                         library,
                         id,
-                        &state::MetadataCapture {
-                            shared: Arc::new(newer.clone()),
-                            renditions: Arc::from([]),
-                        },
+                        (
+                            &state::MetadataCapture {
+                                shared: Arc::new(newer.clone()),
+                                renditions: Arc::from([]),
+                            },
+                            record.created_at,
+                            record.added_at,
+                        ),
                         true,
                         false,
                         state::METADATA_CAPTURE_REVISION,
@@ -5787,7 +5817,11 @@ mod tests {
             &self,
             library: &str,
             asset_id: &str,
-            metadata: &state::MetadataCapture,
+            metadata: (
+                &state::MetadataCapture,
+                chrono::DateTime<chrono::Utc>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
             mark_for_rewrite: bool,
             mark_capture_repair: bool,
             capture_revision: i64,
@@ -8210,7 +8244,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/expired.jpg"))
             .respond_with(ResponseTemplate::new(410))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -8256,7 +8290,7 @@ mod tests {
         .await
         .expect("expired URL cycle with failed pending-row write");
 
-        assert_eq!(result.failed_count, 2);
+        assert_eq!(result.failed_count, 1);
         assert_eq!(result.stats.state_write_failures, 1);
         assert!(!result.db_sync_token_advance_safe);
         assert_eq!(

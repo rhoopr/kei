@@ -1193,8 +1193,8 @@ pub fn heif_ftyp_without_meta_bytes() -> Vec<u8> {
     ]
 }
 
-/// Asserts an XMP packet carries the standard source GPS facts with the values
-/// `exif_with_source_gps` yields.
+/// Asserts the standard source GPS time and speed, without accuracy when
+/// native coordinates are absent or differ from the provider location.
 #[cfg(feature = "xmp")]
 pub fn assert_source_gps_in_xmp(meta: &xmp_toolkit::XmpMeta) {
     use xmp_toolkit::xmp_ns;
@@ -1203,7 +1203,7 @@ pub fn assert_source_gps_in_xmp(meta: &xmp_toolkit::XmpMeta) {
     assert_eq!(text("GPSTimeStamp"), SOURCE_GPS_DATETIME);
     assert_eq!(text("GPSSpeedRef"), SOURCE_GPS_SPEED_REF);
     assert_eq!(text("GPSSpeed"), SOURCE_GPS_SPEED);
-    assert_eq!(text("GPSHPositioningError"), SOURCE_GPS_H_POSITIONING_ERROR);
+    assert!(!meta.contains_property(xmp_ns::EXIF, "GPSHPositioningError"));
     assert!(
         !meta.contains_property("http://cipa.jp/exif/1.0/", "GPSHPositioningError"),
         "Apple-compatible sidecars must not duplicate GPSHPositioningError in exifEX"

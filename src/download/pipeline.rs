@@ -1728,7 +1728,7 @@ where
                                 .refresh_downloaded_asset_metadata(
                                     &library,
                                     asset.state_id(),
-                                    &capture,
+                                    (&capture, asset.created(), Some(asset.added_date())),
                                     mark_for_rewrite,
                                     capture_repair_requested(config),
                                     crate::state::METADATA_CAPTURE_REVISION,
@@ -1936,6 +1936,7 @@ where
                                         {
                                             state_write_failures_producer
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            continue;
                                         }
                                         let size = task.size;
                                         if task_tx.send(task).await.is_err() {
@@ -2025,6 +2026,7 @@ where
                                                         1,
                                                         std::sync::atomic::Ordering::Relaxed,
                                                     );
+                                                    continue;
                                                 }
                                                 let size = task.size;
                                                 if task_tx.send(task).await.is_err() {
@@ -3340,6 +3342,7 @@ async fn download_single_task<C: super::file::DownloadClient>(
                     final_path: &task.download_path,
                     embed_path: Some(part),
                     expected_embed_fingerprint: None,
+                    source_checksum: download_checksum.as_deref(),
                     sidecar_path: None,
                     payload: Arc::clone(&task.metadata),
                     created_local: task.created_local,
@@ -3370,11 +3373,22 @@ async fn download_single_task<C: super::file::DownloadClient>(
             super::file::publish_part_to_final(part, &task.download_path, task.publication).await?;
         }
 
+        // Embed work already captured the original checksum. Otherwise take
+        // a baseline for the unchanged download before sidecar planning.
+        let unmodified_checksum = if download_checksum.is_none()
+            && metadata_flags.contains(metadata_rewrite::MetadataFlags::XMP_SIDECAR)
+        {
+            Some(super::file::compute_sha256(&task.download_path).await?)
+        } else {
+            None
+        };
+
         let outcome =
             metadata_rewrite::write_download_metadata(metadata_rewrite::MetadataWriteRequest {
                 final_path: &task.download_path,
                 embed_path: None,
                 expected_embed_fingerprint: None,
+                source_checksum: download_checksum.as_deref().or(unmodified_checksum.as_deref()),
                 sidecar_path: Some(&task.download_path),
                 payload: Arc::clone(&task.metadata),
                 created_local: task.created_local,
@@ -3395,7 +3409,8 @@ async fn download_single_task<C: super::file::DownloadClient>(
 
         tracing::debug!(path = %task.download_path.display(), "Downloaded");
 
-        // Compute SHA-256 of the final file for local storage and verification.
+        // Recheck after sidecar work before finalization, preserving the
+        // existing final-file checksum boundary.
         let local_checksum = super::file::compute_sha256(&task.download_path).await?;
 
         // Note: Apple's `fileChecksum` is an MMCS (MobileMe Chunked Storage)
@@ -3404,6 +3419,10 @@ async fn download_single_task<C: super::file::DownloadClient>(
         // is verified by size matching (Content-Length + API size field) and
         // magic-byte validation during download instead.
 
+        // Retain original-byte evidence even when no embedding was requested.
+        // Future sidecar-only retries must not infer provenance from a local
+        // checksum that may have been refreshed after an embedded rewrite.
+        let download_checksum = Some(download_checksum.or(unmodified_checksum).unwrap_or_else(|| local_checksum.clone()));
         Ok((
             exif_ok,
             local_checksum,
@@ -4812,7 +4831,11 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &crate::state::MetadataCapture,
+            _: (
+                &crate::state::MetadataCapture,
+                chrono::DateTime<chrono::Utc>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
             _: bool,
             _: bool,
             _: i64,
@@ -5822,6 +5845,159 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn contract_xmp_gps_accuracy_requires_matching_location_download_and_reopen() {
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use base64::Engine as _;
+        use futures_util::stream;
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        use xmp_toolkit::{XmpMeta, xmp_ns};
+
+        for (native_location, embed) in [(false, true), (true, false), (true, true)] {
+            let source = if native_location {
+                crate::test_helpers::minimal_jpeg_with_source_gps_and_location()
+            } else {
+                crate::test_helpers::minimal_jpeg_with_source_gps()
+            };
+            let original_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&source));
+            let server = crate::start_wiremock_or_skip!();
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(source.clone())
+                        .insert_header("content-type", "image/jpeg"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let asset = PhotoAsset::new(
+                json!({
+                    "recordName": "GPS_MASTER",
+                    "fields": {
+                        "filenameEnc": {"value": "source.jpg", "type": "STRING"},
+                        "itemType": {"value": "public.jpeg"},
+                        "resOriginalRes": {"value": {
+                            "size": source.len(), "downloadURL": format!("{}/source.jpg", server.uri()),
+                            "fileChecksum": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&source))
+                        }},
+                        "resOriginalFileType": {"value": "public.jpeg"}
+                    }
+                }),
+                json!({
+                    "recordName": "asset-GPS_CHILD",
+                    "fields": {
+                        "assetDate": {"value": 1736899200000.0},
+                        "locationLatitude": {"value": 1.5}, "locationLongitude": {"value": 2.5}
+                    }
+                }),
+            );
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("state.db");
+            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let download_dir = dir.path().join("downloads");
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(download_dir.as_path());
+            config.metadata.set_exif_gps = embed;
+            config.metadata.xmp_sidecar = true;
+            config.state_db = Some(db.clone());
+            let config = Arc::new(config);
+            let result = stream_and_download_from_stream(
+                &Client::new(),
+                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+                &config,
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.downloaded, 1);
+            assert!(result.failed.is_empty());
+            assert_eq!(result.exif_failures, 0);
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].download_checksum.as_deref(),
+                Some(original_checksum.as_str())
+            );
+            let media = rows[0].local_path.as_ref().unwrap().clone();
+            let sidecar = sidecar_path_for(&media);
+            let xmp: XmpMeta = fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+            assert_eq!(
+                xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+                native_location
+            );
+            let media_bytes = fs::read(&media).unwrap();
+            if native_location {
+                assert_eq!(media_bytes, source);
+            } else {
+                assert_ne!(media_bytes, source);
+            }
+            let native = super::super::metadata::read_source_gps(&media).unwrap();
+            assert!(native.horizontal_positioning_error.is_some());
+            db.record_metadata_write_failure("PrimarySync", asset.state_id(), "original")
+                .await
+                .unwrap();
+            drop(config);
+            drop(db);
+
+            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(download_dir.as_path());
+            config.metadata.xmp_sidecar = true;
+            config.state_db = Some(db.clone());
+            let config = Arc::new(config);
+            let mut previous_sidecar = None;
+            for _ in 0..2 {
+                let result = stream_and_download_from_stream(
+                    &Client::new(),
+                    stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+                    &config,
+                    DownloadControls::download_hidden(),
+                    1,
+                    CancellationToken::new(),
+                    StreamRuntime::new(None, None),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.downloaded, 0);
+                assert!(result.failed.is_empty());
+                assert_eq!(result.exif_failures, 0);
+                assert_eq!(fs::read(&media).unwrap(), media_bytes);
+                let sidecar_bytes = fs::read(&sidecar).unwrap();
+                if let Some(previous) = previous_sidecar.replace(sidecar_bytes.clone()) {
+                    assert_eq!(
+                        sidecar_bytes, previous,
+                        "steady state must not repeat sidecar work"
+                    );
+                }
+                let rows = db.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(
+                    rows[0].download_checksum.as_deref(),
+                    Some(original_checksum.as_str())
+                );
+                let current: XmpMeta = fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+                assert_eq!(
+                    current.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+                    native_location
+                );
+                assert!(
+                    db.get_pending_metadata_rewrites(10)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            server.verify().await;
+        }
+    }
+
     #[tokio::test]
     async fn print_and_dry_run_preserve_downloaded_child_identity() {
         use base64::Engine as _;
@@ -6636,6 +6812,7 @@ mod tests {
 
         fn existing_asset() -> PhotoAsset {
             TestPhotoAsset::new("REFRESH_FILTERED")
+                .asset_date(1_700_000_000_123.0)
                 .filename("filtered.jpg")
                 .item_type("public.jpeg")
                 .orig_file_type("public.jpeg")
@@ -6716,6 +6893,8 @@ mod tests {
             rewrites[0].metadata.metadata_hash.as_deref(),
             Some("stale-hash")
         );
+        assert_eq!(rewrites[0].created_at, existing_asset().created());
+        assert_eq!(rewrites[0].added_at, Some(existing_asset().added_date()));
         assert_eq!(rewrites[0].metadata.title, None);
         let capture_repairs = db
             .get_pending_metadata_rewrites_page_for_queue(

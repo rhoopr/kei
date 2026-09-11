@@ -126,6 +126,13 @@ pub(super) struct MetadataWriteRequest<'a> {
     pub(super) final_path: &'a Path,
     pub(super) embed_path: Option<&'a Path>,
     pub(super) expected_embed_fingerprint: Option<super::file::ExistingFileFingerprint>,
+    /// SHA-256 of the bytes before any kei metadata rewrite. Missing evidence
+    /// permits provider metadata, but not a native horizontal accuracy claim.
+    #[cfg_attr(
+        not(feature = "xmp"),
+        allow(dead_code, reason = "native-only builds do not write sidecars")
+    )]
+    pub(super) source_checksum: Option<&'a str>,
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     pub(super) sidecar_path: Option<&'a Path>,
     pub(super) payload: Arc<MetadataPayload>,
@@ -183,6 +190,7 @@ pub(super) async fn write_download_metadata(
             sidecar_path,
             Arc::clone(&request.payload),
             request.created_local,
+            request.source_checksum,
             request.temp_suffix,
         )
         .await;
@@ -374,12 +382,19 @@ async fn write_sidecar_metadata(
     path: &Path,
     payload: Arc<MetadataPayload>,
     created_local: DateTime<FixedOffset>,
+    source_checksum: Option<&str>,
     temp_suffix: &str,
 ) -> bool {
+    let source_checksum = source_checksum.map(str::to_owned);
     let sidecar_path = path.to_path_buf();
     let log_path = sidecar_path.clone();
     let planned = tokio::task::spawn_blocking(move || {
-        plan_sidecar_write(&sidecar_path, &payload, &created_local)
+        plan_sidecar_write(
+            &sidecar_path,
+            &payload,
+            &created_local,
+            source_checksum.as_deref(),
+        )
     })
     .await;
     let (write, source_error) = match planned {
@@ -442,18 +457,50 @@ fn plan_sidecar_write(
     path: &Path,
     payload: &MetadataPayload,
     created_local: &DateTime<FixedOffset>,
+    source_checksum: Option<&str>,
 ) -> (super::metadata::MetadataWrite, Option<anyhow::Error>) {
-    let (source_gps, source_error) = match super::metadata::read_source_gps(path) {
+    let (source_gps, mut source_error) = match super::metadata::read_source_gps(path) {
         Ok(metadata) => (metadata, None),
         Err(error) => (super::metadata::SourceGpsMetadata::default(), Some(error)),
     };
+    // CONTRACT: XMP_GPS_ACCURACY_REQUIRES_MATCHING_LOCATION
+    // Exact decoded-coordinate equality is conservative: rounding differences
+    // omit accuracy rather than using proximity as evidence of the same fix.
+    // I/O failures remain unknown under the shared sidecar ownership policy.
+    let accuracy_matches_location =
+        source_gps
+            .latitude
+            .zip(source_gps.longitude)
+            .is_some_and(|(latitude, longitude)| {
+                payload.latitude == Some(latitude) && payload.longitude == Some(longitude)
+            });
+    // Current native coordinates may have been inserted by an earlier embed.
+    // Reuse the pre-embed checksum, including on retries after a state reopen.
+    // A changed or unrecorded source cannot establish native provenance. This
+    // conservatively omits accuracy after unrelated embedded edits as well.
+    let original_source = if accuracy_matches_location
+        && source_gps.horizontal_positioning_error.is_some()
+        && let Some(expected) = source_checksum
+    {
+        match super::file::fingerprint_regular_file_snapshot_blocking(path) {
+            Ok(actual) => fingerprint_checksum(actual.fingerprint) == expected,
+            Err(error) => {
+                source_error = Some(error);
+                false
+            }
+        }
+    } else {
+        false
+    };
     let mut write = super::metadata::MetadataWrite {
-        datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
+        datetime: Some(created_local.format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
         offset_time_original: offset_time_original(payload),
         gps_datetime: source_gps.datetime,
         gps_speed: source_gps.speed,
         gps_speed_ref: source_gps.speed_ref,
-        gps_h_positioning_error: source_gps.horizontal_positioning_error,
+        gps_h_positioning_error: source_gps
+            .horizontal_positioning_error
+            .filter(|_| original_source),
         preserve_source_gps: source_error.is_some(),
         rating: payload.rating,
         gps: gps_from_payload(payload),
@@ -1042,9 +1089,14 @@ where
 
         #[cfg(feature = "xmp")]
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
-            outcome.sidecar_failed =
-                !write_sidecar_metadata(&path, Arc::clone(&payload), created_local, &temp_suffix)
-                    .await;
+            outcome.sidecar_failed = !write_sidecar_metadata(
+                &path,
+                Arc::clone(&payload),
+                created_local,
+                pending_rewrite.source_checksum.as_deref(),
+                &temp_suffix,
+            )
+            .await;
         }
 
         if drifted {
@@ -1246,18 +1298,22 @@ mod tests {
         db.refresh_downloaded_asset_metadata(
             &record.library,
             &record.id,
-            &crate::state::MetadataCapture {
-                shared: Arc::clone(&record.metadata),
-                renditions: Arc::from([(
-                    record.version_size,
-                    crate::state::RenditionMetadata {
-                        checksum: Some(Arc::from(record.checksum.as_ref())),
-                        width: record.metadata.width,
-                        height: record.metadata.height,
-                        duration_secs: record.metadata.duration_secs,
-                    },
-                )]),
-            },
+            (
+                &crate::state::MetadataCapture {
+                    shared: Arc::clone(&record.metadata),
+                    renditions: Arc::from([(
+                        record.version_size,
+                        crate::state::RenditionMetadata {
+                            checksum: Some(Arc::from(record.checksum.as_ref())),
+                            width: record.metadata.width,
+                            height: record.metadata.height,
+                            duration_secs: record.metadata.duration_secs,
+                        },
+                    )]),
+                },
+                record.created_at,
+                record.added_at,
+            ),
             true,
             true,
             crate::state::METADATA_CAPTURE_REVISION,
@@ -1455,7 +1511,7 @@ mod tests {
             ..MetadataPayload::default()
         };
         let flags = MetadataFlags::DATETIME;
-        let created_local = now_local();
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
         let host_local = (created_local - chrono::Duration::hours(11))
             .format("%Y:%m:%d %H:%M:%S")
             .to_string();
@@ -1465,14 +1521,21 @@ mod tests {
             "not a timestamp".to_string(),
             String::new(),
             "2024-06-15".to_string(),
+            "2024-06-15T10:00:00.628+11:00".to_string(),
+            "2024-06-15T10:00:00.628".to_string(),
+            "2024-06-15T10:00:01+11:00".to_string(),
             // Capture-local wall clock, but claiming a different zone.
+            "2024-06-15T10:00:00.629+10:00".to_string(),
             created_local.format("%Y-%m-%dT%H:%M:%S+05:00").to_string(),
         ] {
             let probe = crate::download::metadata::ExifProbe {
                 datetime_original: Some(existing.clone()),
-                offset_time_original: None,
-                has_other_datetime_offset: false,
-                has_gps: false,
+                #[cfg(feature = "xmp")]
+                native_heif_capture_time:
+                    crate::download::metadata::HeifNativeCaptureTime::Present {
+                        datetime_original: Some(existing.clone()),
+                        offset_time_original: Some("+11:00".into()),
+                    },
                 ..crate::download::metadata::ExifProbe::default()
             };
             let write = plan_metadata_write(flags, &payload, &created_local, &probe);
@@ -1481,12 +1544,18 @@ mod tests {
                 write.offset_time_original.is_none(),
                 "offset must not join the unverified timestamp {existing:?}"
             );
+            #[cfg(feature = "xmp")]
+            assert_eq!(
+                probe.native_heif_capture_time_repair_required(&created_local, "+11:00"),
+                Ok(Some(true)),
+                "{existing}"
+            );
         }
     }
 
     #[test]
     fn capture_timestamp_repair_requires_an_offset_and_replaces_the_pair() {
-        let created_local = now_local();
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
         let probe = crate::download::metadata::ExifProbe {
             datetime_original: Some("2024:06:14 23:00:00".into()),
             offset_time_original: Some("+05:00".into()),
@@ -1548,27 +1617,49 @@ mod tests {
             timezone_offset: Some(39_600),
             ..MetadataPayload::default()
         };
-        let created_local = now_local();
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
 
         for existing in [
             created_local.format("%Y-%m-%dT%H:%M:%S").to_string(),
             created_local.format("%Y-%m-%dT%H:%M:%S+11:00").to_string(),
+            "2024-06-15T10:00:00.629+11:00".to_string(),
+            "2024-06-15T10:00:00.000+11:00".to_string(),
+            "2024-06-15T10:00:00.629".to_string(),
+            "2024-06-15T10:00:00.000".to_string(),
             format!("  {}\0", created_local.format("%Y:%m:%d %H:%M:%S")),
         ] {
             let probe = crate::download::metadata::ExifProbe {
                 datetime_original: Some(existing.clone()),
-                offset_time_original: None,
-                has_other_datetime_offset: false,
-                has_gps: false,
+                #[cfg(feature = "xmp")]
+                native_heif_capture_time:
+                    crate::download::metadata::HeifNativeCaptureTime::Present {
+                        datetime_original: Some(existing.clone()),
+                        offset_time_original: Some("+11:00".into()),
+                    },
                 ..crate::download::metadata::ExifProbe::default()
             };
             let write =
                 plan_metadata_write(MetadataFlags::DATETIME, &payload, &created_local, &probe);
+            assert!(write.datetime.is_none());
             assert_eq!(
                 write.offset_time_original.as_deref(),
                 Some("+11:00"),
                 "capture-local timestamp {existing:?} must accept its offset"
             );
+            #[cfg(feature = "xmp")]
+            assert_eq!(
+                probe.native_heif_capture_time_repair_required(&created_local, "+11:00"),
+                Ok(Some(false)),
+                "{existing}"
+            );
+            #[cfg(feature = "xmp")]
+            if existing == "2024-06-15T10:00:00.629+11:00" {
+                assert_eq!(
+                    probe.native_heif_capture_time_repair_required(&created_local, "+10:00"),
+                    Ok(Some(true)),
+                    "the native offset must still match"
+                );
+            }
         }
     }
 
@@ -1597,10 +1688,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("photo.jpg");
         std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
-        let (w, source_error) = plan_sidecar_write(&path, &payload, &now_local());
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
+        let (w, source_error) = plan_sidecar_write(&path, &payload, &created_local, None);
         assert!(source_error.is_none());
         // Every payload field should land in the sidecar write, no flag gating.
-        assert!(w.datetime.is_some());
+        assert_eq!(w.datetime.as_deref(), Some("2024-06-15T10:00:00.629"));
         assert_eq!(w.offset_time_original.as_deref(), Some("+11:00"));
         assert_eq!(w.rating, Some(4));
         assert!(w.gps.is_some());
@@ -1622,7 +1714,7 @@ mod tests {
         let path = dir.path().join("photo.jpg");
         std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
         let (w, source_error) =
-            plan_sidecar_write(&path, &MetadataPayload::default(), &now_local());
+            plan_sidecar_write(&path, &MetadataPayload::default(), &now_local(), None);
         assert!(source_error.is_none());
         assert!(w.datetime.is_some());
         assert!(w.gps_datetime.is_none());
@@ -1660,6 +1752,7 @@ mod tests {
             final_path: &photo_path,
             embed_path: Some(&photo_path),
             expected_embed_fingerprint: None,
+            source_checksum: None,
             sidecar_path: Some(&photo_path),
             payload: Arc::new(MetadataPayload::default()),
             created_local: now_local(),
@@ -1697,6 +1790,7 @@ mod tests {
             final_path: &photo_path,
             embed_path: Some(&photo_path),
             expected_embed_fingerprint: None,
+            source_checksum: None,
             sidecar_path: None,
             payload: Arc::new(MetadataPayload {
                 rating: Some(5),
@@ -1745,6 +1839,7 @@ mod tests {
             final_path: &photo_path,
             embed_path: Some(&photo_path),
             expected_embed_fingerprint: Some(approved),
+            source_checksum: None,
             sidecar_path: None,
             payload: Arc::new(MetadataPayload {
                 rating: Some(5),
@@ -1779,6 +1874,7 @@ mod tests {
             final_path: &photo_path,
             embed_path: Some(&photo_path),
             expected_embed_fingerprint: Some(approved),
+            source_checksum: None,
             sidecar_path: None,
             payload: Arc::new(MetadataPayload {
                 rating: Some(5),
@@ -2049,10 +2145,11 @@ mod tests {
             .await
             .unwrap();
 
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
         let record = crate::test_helpers::TestAssetRecord::new("CAPTURE_REPAIR_RECOVERY")
             .filename("capture-repair-recovery.jpg")
             .checksum("provider-checksum")
-            .created_at(now_local().with_timezone(&chrono::Utc))
+            .created_at(created_local.with_timezone(&chrono::Utc))
             .metadata(AssetMetadata {
                 timezone_offset: Some(39_600),
                 ..AssetMetadata::default()
@@ -2101,8 +2198,18 @@ mod tests {
             pending[0].capture_repair_receipt,
             Some(CaptureRepairReceipt::Prepared { .. })
         ));
+        assert_eq!(pending[0].asset.created_at, record.created_at);
+        let published = std::fs::read(&photo_path).unwrap();
+        let fingerprint = crate::download::file::fingerprint_regular_file(&photo_path)
+            .await
+            .unwrap();
+        assert!(receipt_matches_fingerprint(
+            pending[0].capture_repair_receipt.as_ref().unwrap(),
+            fingerprint
+        ));
+        assert_eq!(stored_checksums(&db).await, (Some(checksum.clone()), None));
         let probe = crate::download::metadata::probe_exif(&photo_path).unwrap();
-        assert!(probe.denotes_capture_time(&now_local()));
+        assert!(probe.denotes_capture_time(&created_local));
         assert_eq!(probe.offset_time_original.as_deref(), Some("+11:00"));
         drop(db);
 
@@ -2118,6 +2225,14 @@ mod tests {
         .await;
 
         assert_eq!(second, 0);
+        assert_eq!(std::fs::read(&photo_path).unwrap(), published);
+        assert_eq!(
+            stored_checksums(&reopened).await,
+            (
+                Some(fingerprint_checksum(fingerprint)),
+                Some(checksum.clone())
+            )
+        );
         assert!(
             reopened
                 .get_pending_metadata_rewrites_page_for_queue(
@@ -2157,6 +2272,11 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(std::fs::read(&photo_path).unwrap(), published);
+        assert_eq!(
+            stored_checksums(&reopened).await,
+            (Some(fingerprint_checksum(fingerprint)), Some(checksum))
         );
     }
 
@@ -2840,6 +2960,792 @@ mod tests {
 
     #[cfg(feature = "xmp")]
     #[tokio::test]
+    async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
+        use crate::test_helpers::ur64;
+        use little_exif::exif_tag::ExifTag;
+        use little_exif::filetype::FileExtension;
+        use little_exif::metadata::Metadata;
+
+        let source = crate::test_helpers::minimal_jpeg_with_source_gps_and_location();
+        let dir = tempfile::tempdir().unwrap();
+        // Even a one-ULP edit does not establish provenance. Invalid provider
+        // evidence must not authorize accuracy, whether or not it is rendered.
+        let provider_cases = [
+            ("matching", Some(1.5), Some(2.5), true),
+            ("edited-latitude", Some(12.3456), Some(2.5), false),
+            ("edited-longitude", Some(1.5), Some(-78.9012), false),
+            (
+                "adjacent-float",
+                Some(f64::from_bits(1.5_f64.to_bits() + 1)),
+                Some(2.5),
+                false,
+            ),
+            ("missing-latitude", None, Some(2.5), false),
+            ("missing-longitude", Some(1.5), None, false),
+            ("invalid-latitude", Some(91.0), Some(2.5), false),
+            ("invalid-longitude", Some(1.5), Some(181.0), false),
+            ("nan", Some(f64::NAN), Some(2.5), false),
+            ("infinite", Some(1.5), Some(f64::INFINITY), false),
+        ];
+        for (name, latitude, longitude, expected) in provider_cases {
+            let path = dir.path().join(format!("{name}.jpg"));
+            std::fs::write(&path, &source).unwrap();
+            let payload = Arc::new(MetadataPayload {
+                latitude,
+                longitude,
+                ..MetadataPayload::default()
+            });
+            let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+            assert!(
+                write_sidecar_metadata(&path, payload, now_local(), Some(&checksum), ".gps-test")
+                    .await
+            );
+            let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+                expected,
+                "{name}"
+            );
+            if expected {
+                assert_eq!(
+                    xmp.property(xmp_ns::EXIF, "GPSHPositioningError")
+                        .unwrap()
+                        .value,
+                    "3/2"
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), source, "{name}");
+        }
+
+        // Neither an absent legacy baseline nor a different recorded source
+        // can certify matching coordinates in the current file.
+        let path = dir.path().join("unproven.jpg");
+        std::fs::write(&path, &source).unwrap();
+        for checksum in [None, Some("different-source-checksum")] {
+            assert!(
+                write_sidecar_metadata(
+                    &path,
+                    Arc::new(MetadataPayload {
+                        latitude: Some(1.5),
+                        longitude: Some(2.5),
+                        ..MetadataPayload::default()
+                    }),
+                    now_local(),
+                    checksum,
+                    ".gps-test"
+                )
+                .await
+            );
+            let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(!xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"));
+            assert_eq!(std::fs::read(&path).unwrap(), source);
+        }
+
+        // Remove a tag, or replace it with invalid readable EXIF. Both are
+        // known absence, not retryable I/O failures.
+        let native_cases = [
+            (
+                "missing-native-latitude",
+                ExifTag::GPSLatitude(vec![]),
+                None,
+            ),
+            (
+                "missing-native-longitude",
+                ExifTag::GPSLongitude(vec![]),
+                None,
+            ),
+            (
+                "missing-native-reference",
+                ExifTag::GPSLatitudeRef(String::new()),
+                None,
+            ),
+            (
+                "missing-accuracy",
+                ExifTag::GPSHPositioningError(vec![]),
+                None,
+            ),
+            (
+                "invalid-native-latitude",
+                ExifTag::GPSLatitude(vec![]),
+                Some(ExifTag::GPSLatitude(vec![
+                    ur64(91, 1),
+                    ur64(0, 1),
+                    ur64(0, 1),
+                ])),
+            ),
+            (
+                "invalid-native-longitude",
+                ExifTag::GPSLongitude(vec![]),
+                Some(ExifTag::GPSLongitude(vec![
+                    ur64(181, 1),
+                    ur64(0, 1),
+                    ur64(0, 1),
+                ])),
+            ),
+            (
+                "invalid-minutes",
+                ExifTag::GPSLatitude(vec![]),
+                Some(ExifTag::GPSLatitude(vec![
+                    ur64(0, 1),
+                    ur64(90, 1),
+                    ur64(0, 1),
+                ])),
+            ),
+            (
+                "invalid-seconds",
+                ExifTag::GPSLatitude(vec![]),
+                Some(ExifTag::GPSLatitude(vec![
+                    ur64(1, 1),
+                    ur64(29, 1),
+                    ur64(60, 1),
+                ])),
+            ),
+            (
+                "invalid-reference",
+                ExifTag::GPSLatitudeRef(String::new()),
+                Some(ExifTag::GPSLatitudeRef("E".into())),
+            ),
+            (
+                "zero-coordinate-denominator",
+                ExifTag::GPSLatitude(vec![]),
+                Some(ExifTag::GPSLatitude(vec![
+                    ur64(1, 0),
+                    ur64(30, 1),
+                    ur64(0, 1),
+                ])),
+            ),
+            (
+                "zero-accuracy-denominator",
+                ExifTag::GPSHPositioningError(vec![]),
+                Some(ExifTag::GPSHPositioningError(vec![ur64(3, 0)])),
+            ),
+        ];
+        for (name, removed, replacement) in native_cases {
+            let mut metadata = Metadata::new_from_vec(&source, FileExtension::JPEG).unwrap();
+            assert!(metadata.remove_tag(removed) > 0);
+            if let Some(tag) = replacement {
+                metadata.set_tag(tag);
+            }
+            let mut bytes = minimal_jpeg_bytes();
+            metadata
+                .write_to_vec(&mut bytes, FileExtension::JPEG)
+                .unwrap();
+            let path = dir.path().join(format!("{name}.jpg"));
+            std::fs::write(&path, &bytes).unwrap();
+            let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+            // Out-of-range native values deliberately match the provider so
+            // coordinate validation, not mere inequality, must reject them.
+            let (latitude, longitude, rendered_latitude) = match name {
+                "invalid-native-latitude" => (91.0, 2.5, "91,0.0000N"),
+                "invalid-native-longitude" => (1.5, 181.0, "1,30.0000N"),
+                _ => (1.5, 2.5, "1,30.0000N"),
+            };
+            assert!(
+                write_sidecar_metadata(
+                    &path,
+                    Arc::new(MetadataPayload {
+                        latitude: Some(latitude),
+                        longitude: Some(longitude),
+                        ..MetadataPayload::default()
+                    }),
+                    now_local(),
+                    Some(&checksum),
+                    ".gps-test"
+                )
+                .await,
+                "{name}"
+            );
+            let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                !xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+                "{name}"
+            );
+            assert_eq!(
+                xmp.property(xmp_ns::EXIF, "GPSLatitude").unwrap().value,
+                rendered_latitude,
+                "{name}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn contract_xmp_gps_accuracy_requires_matching_location_after_embed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.jpg");
+        std::fs::write(&path, crate::test_helpers::minimal_jpeg_with_source_gps()).unwrap();
+        let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        let native = super::super::metadata::read_source_gps(&path).unwrap();
+        assert!(native.latitude.is_none());
+        assert!(native.longitude.is_none());
+        assert!(native.horizontal_positioning_error.is_some());
+        // Match the download path: embed before publication, then write the
+        // sidecar from the published media in a separate call.
+        for (embed_path, sidecar_path) in
+            [(Some(path.as_path()), None), (None, Some(path.as_path()))]
+        {
+            let outcome = write_download_metadata(MetadataWriteRequest {
+                final_path: &path,
+                embed_path,
+                expected_embed_fingerprint: None,
+                source_checksum: Some(&checksum),
+                sidecar_path,
+                payload: Arc::new(MetadataPayload {
+                    latitude: Some(1.5),
+                    longitude: Some(2.5),
+                    ..MetadataPayload::default()
+                }),
+                created_local: now_local(),
+                flags: MetadataFlags::GPS | MetadataFlags::XMP_SIDECAR,
+                capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+                temp_suffix: ".gps-test",
+            })
+            .await;
+            assert!(!outcome.any_failed());
+        }
+        let rewritten = super::super::metadata::read_source_gps(&path).unwrap();
+        assert_eq!(rewritten.latitude, Some(1.5));
+        assert_eq!(rewritten.longitude, Some(2.5));
+        let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(!xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"));
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn contract_xmp_gps_accuracy_requires_matching_location_embed_retry() {
+        use crate::state::{AssetMetadata, SqliteStateDb};
+
+        for fail_state_write in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.jpg");
+            let sidecar = path.with_extension("jpg.xmp");
+            let source = crate::test_helpers::minimal_jpeg_with_source_gps();
+            std::fs::write(&path, &source).unwrap();
+            let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+            let db_path = dir.path().join("state.db");
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            seed_downloaded_marker(
+                &db,
+                "GPS_EMBED_RETRY",
+                "source.jpg",
+                &path,
+                &checksum,
+                AssetMetadata {
+                    latitude: Some(1.5),
+                    longitude: Some(2.5),
+                    ..AssetMetadata::default()
+                },
+                None,
+            )
+            .await;
+            // The native coordinate mutation succeeds, then publication and,
+            // in the second case, checksum finalization fail.
+            std::fs::create_dir(&sidecar).unwrap();
+            if fail_state_write {
+                db.fail_metadata_checksum_write_for_test();
+            }
+            let pass = run_pending(
+                &db,
+                MetadataFlags::GPS | MetadataFlags::XMP_SIDECAR,
+                Arc::from(".gps-test"),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(pass.failed, 1);
+            assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+            let rewritten = std::fs::read(&path).unwrap();
+            assert_ne!(rewritten, source);
+            let native = super::super::metadata::read_source_gps(&path).unwrap();
+            assert_eq!((native.latitude, native.longitude), (Some(1.5), Some(2.5)));
+            assert!(
+                native.horizontal_positioning_error.is_some(),
+                "native accuracy must not be deleted"
+            );
+            let checksums = stored_checksums(&db).await;
+            if fail_state_write {
+                assert_eq!(checksums, (None, None));
+            } else {
+                assert_eq!(checksums.1.as_deref(), Some(checksum.as_str()));
+            }
+            drop(db);
+            std::fs::remove_dir(&sidecar).unwrap();
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let pass = run_pending(
+                &db,
+                MetadataFlags::XMP_SIDECAR,
+                Arc::from(".gps-test"),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!((pass.applied, pass.failed), (1, 0));
+            let xmp: XmpMeta = std::fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+            assert!(!xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"));
+            assert_eq!(
+                xmp.property(xmp_ns::EXIF, "GPSLatitude").unwrap().value,
+                "1,30.0000N"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), rewritten);
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            // A later no-op embed may establish a local checksum after failed
+            // finalization. It must not promote those rewritten bytes into
+            // original-source evidence for the next sidecar-only retry.
+            for flags in [
+                MetadataFlags::GPS | MetadataFlags::XMP_SIDECAR,
+                MetadataFlags::XMP_SIDECAR,
+            ] {
+                db.record_metadata_write_failure("PrimarySync", "GPS_EMBED_RETRY", "original")
+                    .await
+                    .unwrap();
+                let pass = run_pending(
+                    &db,
+                    flags,
+                    Arc::from(".gps-test"),
+                    &CancellationToken::new(),
+                )
+                .await;
+                assert_eq!((pass.applied, pass.failed), (1, 0));
+                let xmp: XmpMeta = std::fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+                assert!(!xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"));
+                assert_eq!(std::fs::read(&path).unwrap(), rewritten);
+            }
+            let before = std::fs::read(&sidecar).unwrap();
+            let steady = run_pending(
+                &db,
+                MetadataFlags::XMP_SIDECAR,
+                Arc::from(".gps-test"),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!((steady.applied, steady.failed), (0, 0));
+            assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn contract_xmp_gps_accuracy_requires_matching_location_checksum_recovery() {
+        use crate::state::{AssetMetadata, SqliteStateDb};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.jpg");
+        let sidecar = path.with_extension("jpg.xmp");
+        std::fs::write(&path, crate::test_helpers::minimal_jpeg_with_source_gps()).unwrap();
+        let original_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        let original_gps = super::super::metadata::read_source_gps(&path).unwrap();
+        assert!(original_gps.latitude.is_none() && original_gps.longitude.is_none());
+        assert!(original_gps.horizontal_positioning_error.is_some());
+        let db_path = dir.path().join("state.db");
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let mut metadata = AssetMetadata {
+            rating: Some(1),
+            latitude: Some(1.5),
+            longitude: Some(2.5),
+            ..AssetMetadata::default()
+        };
+        seed_downloaded_marker(
+            &db,
+            "PROVENANCE",
+            "source.jpg",
+            &path,
+            &original_checksum,
+            metadata.clone(),
+            Some(now_local().to_utc()),
+        )
+        .await;
+        db.fail_metadata_checksum_write_for_test();
+        let first = run_pending(
+            &db,
+            MetadataFlags::GPS | MetadataFlags::RATING | MetadataFlags::XMP_SIDECAR,
+            Arc::from(".review"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(first.failed, 1);
+        assert_eq!(stored_checksums(&db).await, (None, None));
+        let gps = super::super::metadata::read_source_gps(&path).unwrap();
+        assert_eq!((gps.latitude, gps.longitude), (Some(1.5), Some(2.5)));
+        drop(db);
+
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let retry = run_pending(
+            &db,
+            MetadataFlags::RATING | MetadataFlags::XMP_SIDECAR,
+            Arc::from(".review"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((retry.applied, retry.failed), (1, 0));
+        let rewritten_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        assert_ne!(rewritten_checksum, original_checksum);
+        assert_eq!(
+            stored_checksums(&db).await,
+            (Some(rewritten_checksum.clone()), None)
+        );
+        for rating in [2, 1] {
+            metadata.rating = Some(rating);
+            db.refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "PROVENANCE",
+                (
+                    &crate::state::MetadataCapture {
+                        shared: Arc::new(metadata.clone()),
+                        renditions: Arc::from([]),
+                    },
+                    now_local().to_utc(),
+                    None,
+                ),
+                true,
+                false,
+                crate::state::METADATA_CAPTURE_REVISION,
+            )
+            .await
+            .unwrap();
+            let pass = run_pending(
+                &db,
+                MetadataFlags::RATING | MetadataFlags::XMP_SIDECAR,
+                Arc::from(".review"),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!((pass.applied, pass.failed), (1, 0));
+        }
+        assert_eq!(
+            stored_checksums(&db).await,
+            (Some(rewritten_checksum.clone()), Some(rewritten_checksum))
+        );
+        let xmp: XmpMeta = std::fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+        assert!(
+            !xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+            "kei-inserted coordinates acquired fabricated original-byte provenance"
+        );
+        let media = std::fs::read(&path).unwrap();
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        drop(db);
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        db.record_metadata_write_failure("PrimarySync", "PROVENANCE", "original")
+            .await
+            .unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(pending[0].source_checksum.is_none());
+        let retry = run_pending(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".review"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((retry.applied, retry.failed), (1, 0));
+        let steady = run_pending(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".review"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((steady.applied, steady.failed), (0, 0));
+        assert_eq!(std::fs::read(&path).unwrap(), media);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn contract_xmp_gps_accuracy_requires_matching_location_native_boundaries() {
+        use crate::test_helpers::ur64;
+        use little_exif::exif_tag::ExifTag;
+
+        let dir = tempfile::tempdir().unwrap();
+        for (name, latitude, longitude, lat_ref, lon_ref) in [
+            ("south-west", 1, 2, "S", "W"),
+            ("north-east-limits", 90, 180, "N", "E"),
+            ("south-west-limits", 90, 180, "S", "W"),
+            ("zero", 0, 0, "N", "E"),
+        ] {
+            let mut metadata = crate::test_helpers::exif_with_source_gps();
+            metadata.set_tag(ExifTag::GPSLatitude(vec![
+                ur64(latitude, 1),
+                ur64(0, 1),
+                ur64(0, 1),
+            ]));
+            metadata.set_tag(ExifTag::GPSLongitude(vec![
+                ur64(longitude, 1),
+                ur64(0, 1),
+                ur64(0, 1),
+            ]));
+            metadata.set_tag(ExifTag::GPSLatitudeRef(lat_ref.into()));
+            metadata.set_tag(ExifTag::GPSLongitudeRef(lon_ref.into()));
+            metadata.set_tag(ExifTag::GPSHPositioningError(vec![ur64(0, 1)]));
+            let tiff = metadata.encode().unwrap();
+            let heic = crate::download::heif::apple_tmap_insertion_heic(&tiff, b"");
+            for (extension, bytes) in [("dng", &tiff), ("heic", &heic)] {
+                let path = dir.path().join(format!("{name}.{extension}"));
+                std::fs::write(&path, bytes).unwrap();
+                let payload = Arc::new(MetadataPayload {
+                    latitude: Some(f64::from(latitude) * if lat_ref == "S" { -1.0 } else { 1.0 }),
+                    longitude: Some(f64::from(longitude) * if lon_ref == "W" { -1.0 } else { 1.0 }),
+                    ..MetadataPayload::default()
+                });
+                let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+                assert!(
+                    write_sidecar_metadata(
+                        &path,
+                        payload,
+                        now_local(),
+                        Some(&checksum),
+                        ".gps-test"
+                    )
+                    .await
+                );
+                let xmp: XmpMeta =
+                    std::fs::read_to_string(path.with_extension(format!("{extension}.xmp")))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                assert_eq!(
+                    xmp.property(xmp_ns::EXIF, "GPSHPositioningError")
+                        .unwrap()
+                        .value,
+                    "0/1",
+                    "{name}.{extension}"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), *bytes);
+            }
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn contract_xmp_gps_accuracy_requires_matching_location_rewrite_and_retry() {
+        use crate::state::{AssetMetadata, DownloadStateStore, SqliteStateDb};
+        use xmp_toolkit::XmpValue;
+
+        for owned in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.jpg");
+            let sidecar_path = path.with_extension("jpg.xmp");
+            let source = crate::test_helpers::minimal_jpeg_with_source_gps_and_location();
+            std::fs::write(&path, &source).unwrap();
+            let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+            let db = SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap();
+            let mut metadata = AssetMetadata {
+                latitude: Some(1.5),
+                longitude: Some(2.5),
+                ..AssetMetadata::default()
+            };
+            seed_downloaded_marker(
+                &db,
+                "GPS_PROVENANCE",
+                "source.jpg",
+                &path,
+                &checksum,
+                metadata.clone(),
+                Some(now_local().to_utc()),
+            )
+            .await;
+            db.mark_verified_download(
+                "PrimarySync",
+                "GPS_PROVENANCE",
+                "original",
+                &path,
+                &checksum,
+                Some(&checksum),
+                false,
+            )
+            .await
+            .unwrap();
+            db.record_metadata_write_failure("PrimarySync", "GPS_PROVENANCE", "original")
+                .await
+                .unwrap();
+            let token = CancellationToken::new();
+            let drain = || {
+                run_pending(
+                    &db,
+                    MetadataFlags::XMP_SIDECAR,
+                    Arc::from(".gps-test"),
+                    &token,
+                )
+            };
+            assert_eq!(drain().await.applied, 1);
+            let mut initial: XmpMeta = std::fs::read_to_string(&sidecar_path)
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                initial
+                    .property(xmp_ns::EXIF, "GPSHPositioningError")
+                    .unwrap()
+                    .value,
+                "3/2"
+            );
+            if !owned {
+                initial
+                    .delete_property("https://github.com/rhoopr/kei/ns/1.0/", "managedFields")
+                    .unwrap();
+            }
+            initial
+                .set_property(xmp_ns::XMP, "Label", &XmpValue::new("keep me".to_owned()))
+                .unwrap();
+            std::fs::write(&sidecar_path, initial.to_string()).unwrap();
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            metadata.latitude = Some(12.3456);
+            metadata.longitude = Some(-78.9012);
+            db.refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "GPS_PROVENANCE",
+                (
+                    &crate::state::MetadataCapture {
+                        shared: Arc::new(metadata.clone()),
+                        renditions: Arc::from([]),
+                    },
+                    now_local().to_utc(),
+                    None,
+                ),
+                true,
+                false,
+                crate::state::METADATA_CAPTURE_REVISION,
+            )
+            .await
+            .unwrap();
+
+            // A source read failure is unknown: preserve the old accuracy and
+            // its ownership while publishing current provider coordinates.
+            let saved_media = dir.path().join("saved.jpg");
+            std::fs::rename(&path, &saved_media).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert_eq!(drain().await.failed, 1);
+            let unknown: XmpMeta = std::fs::read_to_string(&sidecar_path)
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                unknown
+                    .property(xmp_ns::EXIF, "GPSHPositioningError")
+                    .unwrap()
+                    .value,
+                "3/2"
+            );
+            assert_eq!(
+                unknown.property(xmp_ns::EXIF, "GPSLatitude").unwrap().value,
+                "12,20.7360N"
+            );
+            assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&saved_media, &path).unwrap();
+
+            // Publication failure must not consume the pending correction.
+            let saved_sidecar = dir.path().join("saved.xmp");
+            let before_failure = std::fs::read(&sidecar_path).unwrap();
+            std::fs::rename(&sidecar_path, &saved_sidecar).unwrap();
+            std::fs::create_dir(&sidecar_path).unwrap();
+            assert_eq!(drain().await.failed, 1);
+            assert!(sidecar_path.is_dir());
+            assert_eq!(std::fs::read(&saved_sidecar).unwrap(), before_failure);
+            assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+            std::fs::remove_dir(&sidecar_path).unwrap();
+            std::fs::rename(&saved_sidecar, &sidecar_path).unwrap();
+
+            assert_eq!(drain().await.applied, 1);
+            let corrected_bytes = std::fs::read(&sidecar_path).unwrap();
+            let corrected: XmpMeta = std::str::from_utf8(&corrected_bytes)
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                corrected.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+                !owned
+            );
+            if !owned {
+                assert_eq!(
+                    corrected
+                        .property(xmp_ns::EXIF, "GPSHPositioningError")
+                        .unwrap()
+                        .value,
+                    "3/2"
+                );
+            }
+            assert_eq!(
+                corrected
+                    .property(xmp_ns::EXIF, "GPSLatitude")
+                    .unwrap()
+                    .value,
+                "12,20.7360N"
+            );
+            assert_eq!(
+                corrected
+                    .property(xmp_ns::EXIF, "GPSLongitude")
+                    .unwrap()
+                    .value,
+                "78,54.0720W"
+            );
+            assert_eq!(
+                corrected.property(xmp_ns::XMP, "Label").unwrap().value,
+                "keep me"
+            );
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let steady = drain().await;
+            assert_eq!((steady.applied, steady.failed), (0, 0));
+            assert_eq!(std::fs::read(&sidecar_path).unwrap(), corrected_bytes);
+            assert_eq!(std::fs::read(&path).unwrap(), source);
+            assert_eq!(
+                stored_checksums(&db).await.0.as_deref(),
+                Some(checksum.as_str())
+            );
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
     async fn sidecar_write_carries_source_gps_and_corrected_coordinates() {
         let dir = tempfile::tempdir().expect("metadata temp dir");
         let media_path = dir.path().join("source.jpg");
@@ -2857,6 +3763,7 @@ mod tests {
             final_path: &media_path,
             embed_path: None,
             expected_embed_fingerprint: None,
+            source_checksum: None,
             sidecar_path: Some(&media_path),
             payload: Arc::new(payload.clone()),
             created_local: cloudkit_created,
@@ -2933,54 +3840,70 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn sidecar_write_reads_source_gps_from_dng_content() {
-        let dir = tempfile::tempdir().expect("metadata temp dir");
-        let media_path = dir.path().join("source.DNG");
-        let source_bytes = crate::test_helpers::minimal_tiff_with_source_gps();
-        std::fs::write(&media_path, &source_bytes).expect("write source DNG");
-        let payload = MetadataPayload {
-            rating: Some(4),
-            latitude: Some(12.3456),
-            longitude: Some(-78.9012),
-            altitude: Some(9.25),
-            ..MetadataPayload::default()
-        };
+        for (millis, expected) in [(0, "2024-06-15T10:00:00"), (629, "2024-06-15T10:00:00.629")] {
+            let dir = tempfile::tempdir().expect("metadata temp dir");
+            let media_path = dir.path().join("source.DNG");
+            let source_bytes = crate::test_helpers::minimal_tiff_with_source_gps();
+            std::fs::write(&media_path, &source_bytes).expect("write source DNG");
+            let payload = MetadataPayload {
+                rating: Some(4),
+                latitude: Some(12.3456),
+                longitude: Some(-78.9012),
+                altitude: Some(9.25),
+                ..MetadataPayload::default()
+            };
 
-        let outcome = write_download_metadata(MetadataWriteRequest {
-            final_path: &media_path,
-            embed_path: None,
-            expected_embed_fingerprint: None,
-            sidecar_path: Some(&media_path),
-            payload: Arc::new(payload),
-            created_local: now_local(),
-            flags: MetadataFlags::XMP_SIDECAR,
-            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
-            temp_suffix: ".gps-dng-test",
-        })
-        .await;
+            let outcome = write_download_metadata(MetadataWriteRequest {
+                final_path: &media_path,
+                embed_path: None,
+                expected_embed_fingerprint: None,
+                source_checksum: None,
+                sidecar_path: Some(&media_path),
+                payload: Arc::new(payload),
+                created_local: now_local() + chrono::Duration::milliseconds(millis),
+                flags: MetadataFlags::XMP_SIDECAR,
+                capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+                temp_suffix: ".gps-dng-test",
+            })
+            .await;
 
-        assert!(!outcome.any_failed());
-        let sidecar_path = media_path.with_file_name("source.DNG.xmp");
-        let xmp = std::fs::read_to_string(&sidecar_path)
-            .expect("read DNG sidecar")
-            .parse::<XmpMeta>()
-            .expect("parse DNG sidecar");
-        crate::test_helpers::assert_source_gps_in_xmp(&xmp);
-        let value = |namespace, name| xmp.property(namespace, name).expect(name).value;
-        assert_eq!(value(xmp_ns::XMP, "Rating"), "4");
-        assert_eq!(value(xmp_ns::EXIF, "GPSLatitude"), "12,20.7360N");
-        assert_eq!(value(xmp_ns::EXIF, "GPSLongitude"), "78,54.0720W");
-        assert_eq!(value(xmp_ns::EXIF, "GPSAltitude"), "37/4");
-        assert_eq!(
-            std::fs::read(&media_path).expect("read source DNG after sidecar"),
-            source_bytes,
-            "sidecar-only metadata must not alter DNG bytes"
-        );
-        assert!(
-            !media_path
-                .with_file_name("source.DNG.xmp.gps-dng-test")
-                .exists(),
-            "successful sidecar publication must remove its temporary file"
-        );
+            assert!(!outcome.any_failed());
+            let sidecar_path = media_path.with_file_name("source.DNG.xmp");
+            let xmp = std::fs::read_to_string(&sidecar_path)
+                .expect("read DNG sidecar")
+                .parse::<XmpMeta>()
+                .expect("parse DNG sidecar");
+            crate::test_helpers::assert_source_gps_in_xmp(&xmp);
+            let value = |namespace, name| xmp.property(namespace, name).expect(name).value;
+            for (namespace, property) in [
+                (xmp_ns::XMP, "CreateDate"),
+                (xmp_ns::XMP, "ModifyDate"),
+                (xmp_ns::EXIF, "DateTimeOriginal"),
+                (xmp_ns::PHOTOSHOP, "DateCreated"),
+            ] {
+                assert_eq!(value(namespace, property), expected);
+            }
+            assert!(
+                xmp.property("http://cipa.jp/exif/1.0/", "OffsetTimeOriginal")
+                    .is_none()
+            );
+            assert_eq!(value(xmp_ns::XMP, "Rating"), "4");
+            assert_eq!(value(xmp_ns::EXIF, "GPSLatitude"), "12,20.7360N");
+            assert_eq!(value(xmp_ns::EXIF, "GPSLongitude"), "78,54.0720W");
+            assert_eq!(value(xmp_ns::EXIF, "GPSAltitude"), "37/4");
+            assert_eq!(
+                std::fs::read(&media_path).expect("read source DNG after sidecar"),
+                source_bytes,
+                "sidecar-only metadata must not alter DNG bytes"
+            );
+            assert!(
+                !media_path
+                    .with_file_name("source.DNG.xmp.gps-dng-test")
+                    .exists(),
+                "successful sidecar publication must remove its temporary file"
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        }
     }
 
     #[cfg(feature = "xmp")]
@@ -3290,6 +4213,7 @@ mod tests {
             final_path: &normal_path,
             embed_path: Some(&normal_path),
             expected_embed_fingerprint: None,
+            source_checksum: None,
             sidecar_path: Some(&normal_path),
             payload: Arc::new(normal_payload),
             created_local: record.metadata.capture_local(record.created_at),
