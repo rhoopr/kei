@@ -3523,6 +3523,7 @@ pub(crate) async fn reconcile_catalog_paths(
     let mut task_planner = planner::TaskPlanner::new();
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
+    let mut stats = SyncStats::default();
     for (state_id, resolution) in batch.results {
         if shutdown_token.is_cancelled() {
             break;
@@ -3541,6 +3542,29 @@ pub(crate) async fn reconcile_catalog_paths(
                         crate::commands::PassKind::SmartFolder => false,
                     };
                     if !selected {
+                        continue;
+                    }
+                    if filter::is_asset_filtered(&asset, pass_config.as_ref()).is_some() {
+                        continue;
+                    }
+                    let mut unsafe_destination = false;
+                    for expected in filter::expected_paths_for(&asset, pass_config.as_ref()) {
+                        let target = PendingRetryTarget {
+                            library: Arc::clone(&pass_config.library),
+                            asset_id: Arc::from(state_id.as_str()),
+                            version_size: expected.version_size,
+                        };
+                        if !records_by_target.contains_key(&target) {
+                            continue;
+                        }
+                        if let Err(error) = file::validate_reconciliation_leaf(&expected.path).await
+                        {
+                            stats.failed += 1;
+                            unsafe_destination = true;
+                            tracing::warn!(%error, "Path reconciliation rejected an unsafe destination");
+                        }
+                    }
+                    if unsafe_destination {
                         continue;
                     }
                     let plan = task_planner.plan_asset(&asset, pass_config).await;
@@ -3611,7 +3635,6 @@ pub(crate) async fn reconcile_catalog_paths(
         }
     }
 
-    let mut stats = SyncStats::default();
     let mut deferred_to_pending_retry = false;
     for task in tasks {
         let target = PendingRetryTarget::from_task(&task);
@@ -14101,6 +14124,139 @@ mod tests {
         assert_eq!(summary.downloaded, 2);
         assert_eq!(summary.pending, 0);
         assert_eq!(summary.failed, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_reconciliation_rejects_leaf_symlink_then_recovers() {
+        #[derive(Clone, Debug)]
+        struct LookupOnlySession {
+            records: Arc<Vec<Value>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PhotosSession for LookupOnlySession {
+            async fn post(
+                &self,
+                url: &str,
+                _body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                if url.contains("/records/lookup?") {
+                    return Ok(json!({"records": self.records.as_ref().clone()}));
+                }
+                anyhow::bail!("path reconciliation made an unexpected provider request: {url}")
+            }
+
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        let old_dir = TempDir::new().expect("old dir");
+        let db_path = old_dir.path().join("state.db");
+        let db = Arc::new(
+            crate::state::SqliteStateDb::open(&db_path)
+                .await
+                .expect("state db"),
+        );
+        let new_dir = TempDir::new().expect("new dir");
+        let old_path = old_dir.path().join("reconcile.jpg");
+        tokio::fs::write(&old_path, vec![0u8; 1024]).await.unwrap();
+        let local_checksum = file::compute_sha256(&old_path).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("RECONCILE")
+            .filename("reconcile.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "RECONCILE",
+            "original",
+            &old_path,
+            &local_checksum,
+            Some("provider-checksum"),
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-RECONCILE", "RECONCILE")
+            .await
+            .unwrap();
+
+        let mut records =
+            mock_photo_records_for_zone_with_filename("RECONCILE", "PrimarySync", "reconcile.jpg");
+        records[1]["fields"]["resJPEGFullRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/reconcile-adjusted.jpg",
+            "size": 512,
+            "fileChecksum": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        }});
+        records[1]["fields"]["resJPEGFullFileType"] = json!({"value": "public.jpeg"});
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(LookupOnlySession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(new_dir.path());
+        config.state_db = Some(db.clone());
+        config.edited = true;
+        let expected_paths = filter::expected_paths_for(&asset, &config);
+        let expected_path = expected_paths
+            .into_iter()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap()
+            .path;
+        let external = TempDir::new().unwrap();
+        let target = external.path().join("target.jpg");
+        std::fs::write(&target, vec![0u8; 1024]).unwrap();
+        std::fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &expected_path).unwrap();
+        let config = Arc::new(config);
+        for _ in 0..2 {
+            let result =
+                reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                    .await
+                    .unwrap();
+            assert!(!result.complete);
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(result.stats.failed, 1);
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].local_path.as_deref(), Some(old_path.as_path()));
+            assert_eq!(
+                rows[0].local_checksum.as_deref(),
+                Some(local_checksum.as_str())
+            );
+            assert_eq!(std::fs::read_link(&expected_path).unwrap(), target);
+            assert_eq!(std::fs::read(&target).unwrap(), vec![0u8; 1024]);
+        }
+        std::fs::remove_file(&expected_path).unwrap();
+        let repaired =
+            reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(repaired.complete);
+        assert_eq!(repaired.stats.downloaded, 1);
+        let steady = reconcile_catalog_paths(&passes, config, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(steady.complete);
+        assert_eq!(steady.stats.downloaded, 0);
+        let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows[0].local_path.as_deref(), Some(expected_path.as_path()));
+        assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
+        assert_eq!(std::fs::read(&expected_path).unwrap(), vec![0u8; 1024]);
+        assert_eq!(std::fs::read(&target).unwrap(), vec![0u8; 1024]);
     }
 
     #[tokio::test]

@@ -109,6 +109,14 @@ Eligibility-config drift preserves the active checkpoint while a complete
 inventory and delta bridge build a replacement. Path-config drift preserves
 provider checkpoints while local catalog paths are reconciled.
 
+Local path reconciliation opens source and destination leaf entries without
+following symlinks. It hashes the opened file and rechecks its identity before
+accepting a destination, including entries that appear during publication.
+Temporary copies use new unique names, verified bytes, and no-overwrite
+publication. An unsafe or replaced entry preserves the previous catalogue path
+and leaves reconciliation incomplete. Ambiguous temporary entries remain for
+inspection. These leaf checks do not confine ancestor directories.
+
 ### Full and incremental enumeration
 
 Debug builds can set `KEI_REQUEST_DUMP_DIR` to capture Photos session
