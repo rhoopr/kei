@@ -114,7 +114,10 @@ following symlinks. It hashes the opened file and rechecks its identity before
 accepting a destination, including entries that appear during publication.
 Temporary copies use new unique names, verified bytes, and no-overwrite
 publication. An unsafe or replaced entry preserves the previous catalogue path
-and leaves reconciliation incomplete. Ambiguous temporary entries remain for
+and leaves reconciliation incomplete. A blocking reconciliation failure skips
+that library's normal source/download pass, so adoption cannot bypass the
+rejection. Its provider checkpoint and the aggregate database pre-check token
+remain unchanged. Ambiguous temporary entries remain for
 inspection. These leaf checks do not confine ancestor directories.
 
 ### Full and incremental enumeration
