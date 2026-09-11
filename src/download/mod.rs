@@ -14472,7 +14472,9 @@ mod tests {
         let new_sidecar = expected_path.with_file_name(sidecar_name);
         let packet = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:custom="https://example.test/custom/" custom:Note="keep this exact packet" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="5"/></rdf:RDF></x:xmpmeta>"#;
         let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(12345);
-        std::fs::File::open(&old_path)
+        std::fs::File::options()
+            .write(true)
+            .open(&old_path)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(old_time))
             .unwrap();
