@@ -17296,6 +17296,7 @@ mod tests {
                     final_path: &rendition.path,
                     embed_path: None,
                     expected_embed_fingerprint: None,
+                    source_checksum: None,
                     sidecar_path: Some(&rendition.path),
                     payload: Arc::new(filter::MetadataPayload::from_metadata(old.metadata())),
                     created_local: old.metadata().capture_local(old.created()),

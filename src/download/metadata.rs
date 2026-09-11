@@ -794,9 +794,29 @@ fn read_tiff_source_gps<R: std::io::Read + std::io::Seek>(
     let mut speed = None;
     let mut speed_ref = None;
     let mut horizontal_positioning_error = None;
+    let mut latitude = None;
+    let mut latitude_ref = None;
+    let mut longitude = None;
+    let mut longitude_ref = None;
     for index in 0..gps_count {
         let entry = reader.read_ifd_entry(gps_ifd_offset, index)?;
         match tiff_u16(reader.endian, [entry[0], entry[1]]) {
+            0x0001 => {
+                latitude_ref = reader.entry_value::<2>(&entry, "GPSLatitudeRef", 2, 2)?;
+            }
+            0x0002 => {
+                latitude = reader
+                    .entry_value::<24>(&entry, "GPSLatitude", 5, 3)?
+                    .and_then(|value| tiff_rational_triplet(reader.endian, &value));
+            }
+            0x0003 => {
+                longitude_ref = reader.entry_value::<2>(&entry, "GPSLongitudeRef", 2, 2)?;
+            }
+            0x0004 => {
+                longitude = reader
+                    .entry_value::<24>(&entry, "GPSLongitude", 5, 3)?
+                    .and_then(|value| tiff_rational_triplet(reader.endian, &value));
+            }
             0x0007 if time.is_none() => {
                 if let Some(value) = reader.entry_value::<24>(&entry, "GPSTimeStamp", 5, 3)? {
                     time = tiff_rational_triplet(reader.endian, &value);
@@ -847,10 +867,48 @@ fn read_tiff_source_gps<R: std::io::Read + std::io::Seek>(
     };
     let speed_ref = speed.as_ref().and(speed_ref);
     Ok(SourceGpsMetadata {
+        latitude: latitude.zip(latitude_ref).and_then(|(value, reference)| {
+            source_gps_degrees(&value, reference, GpsAxis::Latitude)
+        }),
+        longitude: longitude.zip(longitude_ref).and_then(|(value, reference)| {
+            source_gps_degrees(&value, reference, GpsAxis::Longitude)
+        }),
         datetime,
         speed,
         speed_ref,
         horizontal_positioning_error,
+    })
+}
+
+#[cfg(feature = "xmp")]
+enum GpsAxis {
+    Latitude,
+    Longitude,
+}
+
+#[cfg(feature = "xmp")]
+fn source_gps_degrees(values: &[XmpRational; 3], reference: [u8; 2], axis: GpsAxis) -> Option<f64> {
+    const MINUTES_PER_DEGREE: f64 = 60.0;
+    const SECONDS_PER_DEGREE: f64 = 3600.0;
+    let (positive, negative, maximum) = match axis {
+        GpsAxis::Latitude => (b'N', b'S', 90.0),
+        GpsAxis::Longitude => (b'E', b'W', 180.0),
+    };
+    if reference[1] != 0 || ![positive, negative].contains(&reference[0]) {
+        return None;
+    }
+    let [degrees, minutes, seconds] = values.each_ref().map(XmpRational::as_f64);
+    if minutes >= MINUTES_PER_DEGREE || seconds >= MINUTES_PER_DEGREE {
+        return None;
+    }
+    let decimal = degrees + minutes / MINUTES_PER_DEGREE + seconds / SECONDS_PER_DEGREE;
+    if decimal > maximum {
+        return None;
+    }
+    Some(if reference[0] == negative {
+        -decimal
+    } else {
+        decimal
     })
 }
 
@@ -1055,6 +1113,8 @@ impl XmpRational {
 #[cfg(feature = "xmp")]
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct SourceGpsMetadata {
+    pub(crate) latitude: Option<f64>,
+    pub(crate) longitude: Option<f64>,
     pub(crate) datetime: Option<String>,
     pub(crate) speed: Option<XmpRational>,
     pub(crate) speed_ref: Option<String>,

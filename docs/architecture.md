@@ -435,8 +435,35 @@ counts are streamed without allocating from provider-controlled lengths.
 CloudKit is authoritative for the currently decoded coordinates, altitude, and
 capture timestamps. The location decoder currently maps only `lat`, `lon`, and
 `alt` from `locationEnc`, so source EXIF supplies GPS receiver time, speed,
-speed units, and horizontal positioning error. No coordinate matching or
-tolerance is applied for minor Photos location edits.
+speed units, and horizontal positioning error. Native horizontal accuracy is
+emitted only when both validated native coordinates equal the provider latitude
+and longitude after decoding to decimal degrees. There is no geographic
+proximity tolerance: rounding differences can omit accuracy, but nearby or
+edited locations do not establish that accuracy describes the same fix.
+Matching coordinates alone are insufficient after GPS embedding: kei may have
+inserted them beside an older native accuracy value. Sidecar planning also
+requires the current file to match SHA-256 evidence from a verified download,
+captured before any kei metadata write. Normal downloads pass that baseline to
+the sidecar phase, even when embedding is disabled. Download finalization
+atomically stores it in the path's `asset_metadata_paths.source_checksum`.
+Queued rewrites use only that source checksum, never `local_checksum` or
+`download_checksum`. Those older columns also support size validation and can
+be populated from already-rewritten bytes during checksum recovery.
+
+Schema v23 adds the nullable source checksum without backfilling historical
+rows. Missing evidence stays unknown across embedded writes, failed state
+updates, restart, and later retries. Adoption and local reconciliation do not
+establish new source evidence. Existing evidence remains scoped to its path
+and provider rendition; a different rendition invalidates it. Metadata-only
+finalization preserves source evidence without changing it. This conservative
+rule can omit valid accuracy from older downloads or after unrelated embedded
+edits. It does not delete native metadata or add an output-revision sweep.
+
+Missing, invalid, or different coordinates omit accuracy. A supported rewrite
+removes the obsolete value only if the existing property marker proves kei
+ownership. Unowned values remain unchanged. This rule applies to new sidecars
+and already-supported rewrites; automatic catch-up for untouched sidecars is
+separate work in #799. GPS receiver time and speed keep their existing policy.
 Source I/O failures still publish current CloudKit metadata, preserve prior
 kei-owned source GPS fields as unknown, and retain the metadata retry marker.
 Readable unsupported or malformed metadata permits a CloudKit-only sidecar.
@@ -524,6 +551,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `METADATA_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | Every embedded metadata rewrite prepares a uniquely owned sibling and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
 | `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/heif.rs`, `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | A HEIF-family embedded rewrite accepts tone-map insertion only when `dimg` and primary Exif `cdsc` relationships prove the exact target and no existing XMP owns that tone map, prepares a uniquely owned sibling, and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
 | `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
+| `XMP_GPS_ACCURACY_REQUIRES_MATCHING_LOCATION` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs`, `src/state/db.rs` | Native horizontal accuracy requires valid native latitude and longitude equal to the exported provider coordinates, plus a matching verified-download source checksum. Recovered local or download checksums cannot establish native provenance. Readable missing, invalid, or mismatched evidence omits accuracy and clears only obsolete kei-owned values. Source I/O failure preserves unknown fields and durable retry evidence. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 
 ## Change-impact checklist
