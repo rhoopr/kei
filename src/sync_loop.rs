@@ -5210,7 +5210,14 @@ mod tests {
                     .refresh_downloaded_asset_metadata(
                         library,
                         id,
-                        (newer, record.created_at, record.added_at),
+                        (
+                            &state::MetadataCapture {
+                                shared: Arc::new(newer.clone()),
+                                renditions: Arc::from([]),
+                            },
+                            record.created_at,
+                            record.added_at,
+                        ),
                         true,
                         false,
                         state::METADATA_CAPTURE_REVISION,
@@ -5811,7 +5818,7 @@ mod tests {
             library: &str,
             asset_id: &str,
             metadata: (
-                &state::AssetMetadata,
+                &state::MetadataCapture,
                 chrono::DateTime<chrono::Utc>,
                 Option<chrono::DateTime<chrono::Utc>>,
             ),

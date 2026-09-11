@@ -260,6 +260,7 @@ fn asset_record_for_derived_path(
     library: Arc<str>,
     asset: &PhotoAsset,
     derived: &DerivedPath,
+    config: &DownloadConfig,
 ) -> AssetRecord {
     AssetRecord::new_pending(
         library,
@@ -272,7 +273,11 @@ fn asset_record_for_derived_path(
         derived.size,
         determine_media_type(derived.version_size, asset),
     )
-    .with_metadata_arc(asset.metadata_arc())
+    .with_metadata_arc(super::filter::metadata_for_selected_version(
+        asset,
+        config,
+        derived.version_size,
+    ))
 }
 
 fn pending_versions_for_asset<'a>(
@@ -335,7 +340,7 @@ async fn adopt_pending_on_disk_skip(
         }
         match adopt_pending_derived_path(
             db,
-            library,
+            config,
             asset,
             task_planner,
             &derived,
@@ -345,7 +350,6 @@ async fn adopt_pending_on_disk_skip(
                 derived.version_size,
                 derived.checksum.as_ref(),
             ),
-            capture_repair_requested(config),
         )
         .await
         {
@@ -456,13 +460,12 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
         {
             if let Some(adoption) = adopt_pending_derived_path_at(
                 db,
-                effective_asset_library(asset, config),
+                config,
                 asset,
                 task_planner,
                 &derived,
                 local_path,
                 Some(recorded_file),
-                capture_repair_requested(config),
             )
             .await
             {
@@ -493,16 +496,8 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
                 && pending_filename_matches_derived(evidence.filename, &derived.filename)
         })
     {
-        if let Some(adoption) = adopt_pending_derived_path(
-            db,
-            effective_asset_library(asset, config),
-            asset,
-            task_planner,
-            &derived,
-            None,
-            capture_repair_requested(config),
-        )
-        .await
+        if let Some(adoption) =
+            adopt_pending_derived_path(db, config, asset, task_planner, &derived, None).await
         {
             return adoption.into();
         }
@@ -557,7 +552,7 @@ async fn adopt_pending_on_disk_task(
         }
         if let Some(adoption) = adopt_pending_derived_path(
             db,
-            library,
+            config,
             asset,
             task_planner,
             &derived,
@@ -567,7 +562,6 @@ async fn adopt_pending_on_disk_task(
                 derived.version_size,
                 derived.checksum.as_ref(),
             ),
-            capture_repair_requested(config),
         )
         .await
         {
@@ -675,36 +669,34 @@ async fn adopt_pending_task_path(
 
 async fn adopt_pending_derived_path(
     db: &dyn DownloadStore,
-    library: &str,
+    config: &DownloadConfig,
     asset: &PhotoAsset,
     task_planner: &mut TaskPlanner,
     derived: &DerivedPath,
     recorded_file: Option<&RecordedLocalFile>,
-    mark_capture_repair: bool,
 ) -> Option<PendingOnDiskAdoption> {
     adopt_pending_derived_path_at(
         db,
-        library,
+        config,
         asset,
         task_planner,
         derived,
         &derived.path,
         recorded_file,
-        mark_capture_repair,
     )
     .await
 }
 
 async fn adopt_pending_derived_path_at(
     db: &dyn DownloadStore,
-    library: &str,
+    config: &DownloadConfig,
     asset: &PhotoAsset,
     task_planner: &mut TaskPlanner,
     derived: &DerivedPath,
     path: &Path,
     recorded_file: Option<&RecordedLocalFile>,
-    mark_capture_repair: bool,
 ) -> Option<PendingOnDiskAdoption> {
+    let library = effective_asset_library(asset, config);
     let version_size = derived.version_size.as_str();
     let (existing_path, existing_size) = task_planner.existing_path_with_size(path)?;
     if !pending_file_size_allows_adoption(
@@ -720,7 +712,7 @@ async fn adopt_pending_derived_path_at(
         return None;
     }
 
-    let record = asset_record_for_derived_path(Arc::from(library), asset, derived);
+    let record = asset_record_for_derived_path(Arc::from(library), asset, derived, config);
     if let Err(e) = db.upsert_seen(&record).await {
         tracing::warn!(
             asset_id = %asset.id(),
@@ -737,7 +729,7 @@ async fn adopt_pending_derived_path_at(
         asset,
         version_size,
         existing_path,
-        mark_capture_repair,
+        capture_repair_requested(config),
     )
     .await
 }
@@ -1715,10 +1707,11 @@ where
                         // path planning, so a metadata-only edit reaches the
                         // catalogue even when the media task is filtered or
                         // skipped as already on disk.
+                        let capture = super::filter::metadata_capture(&asset);
                         let drift = download_ctx.has_provider_metadata_drift(
                             &library,
                             asset.state_id(),
-                            asset.metadata().metadata_hash.as_deref(),
+                            &capture,
                         );
                         // A marker outlives a stale row whose stored hash still
                         // matches the provider, which drift alone cannot see.
@@ -1735,7 +1728,7 @@ where
                                 .refresh_downloaded_asset_metadata(
                                     &library,
                                     asset.state_id(),
-                                    (asset.metadata(), asset.created(), Some(asset.added_date())),
+                                    (&capture, asset.created(), Some(asset.added_date())),
                                     mark_for_rewrite,
                                     capture_repair_requested(config),
                                     crate::state::METADATA_CAPTURE_REVISION,
@@ -4839,7 +4832,7 @@ mod tests {
             _: &str,
             _: &str,
             _: (
-                &crate::state::AssetMetadata,
+                &crate::state::MetadataCapture,
                 chrono::DateTime<chrono::Utc>,
                 Option<chrono::DateTime<chrono::Utc>>,
             ),
@@ -7065,7 +7058,8 @@ mod tests {
         let seeded_checksum = crate::download::file::compute_sha256(&derived.path)
             .await
             .unwrap();
-        let record = asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived);
+        let record =
+            asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived, &config);
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
             "PrimarySync",
@@ -7144,7 +7138,8 @@ mod tests {
             .unwrap();
         fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
         fs::write(&derived.path, MINIMAL_JPEG).unwrap();
-        let record = asset_record_for_derived_path(Arc::from("PrimarySync"), stored, &derived);
+        let record =
+            asset_record_for_derived_path(Arc::from("PrimarySync"), stored, &derived, config);
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
             "PrimarySync",
@@ -7205,7 +7200,8 @@ mod tests {
             .unwrap();
         fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
         fs::write(&derived.path, vec![0u8; 1000]).unwrap();
-        let record = asset_record_for_derived_path(Arc::from("PrimarySync"), stored, &derived);
+        let record =
+            asset_record_for_derived_path(Arc::from("PrimarySync"), stored, &derived, config);
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
             "PrimarySync",
@@ -7274,6 +7270,638 @@ mod tests {
             before,
             "local files must be untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_drift() {
+        use crate::types::RawPolicy;
+        use base64::Engine as _;
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for policy in [RawPolicy::PreferRaw, RawPolicy::PreferJpeg] {
+            for adopt_existing in [false, true] {
+                let server = crate::start_wiremock_or_skip!();
+                let jpeg = b"\xff\xd8\xff\xe0\0\x10JFIF\0".as_slice();
+                let raw = b"II*\0\x08\0\0\0\0\0".as_slice();
+                let (original, alternative) = if policy == RawPolicy::PreferRaw {
+                    ((jpeg, "public.jpeg"), (raw, "com.adobe.raw-image"))
+                } else {
+                    ((raw, "com.adobe.raw-image"), (jpeg, "public.jpeg"))
+                };
+                let mut master = json!({"recordName": "RAW_METADATA", "fields": {
+                    "filenameEnc": {"value": "pair.jpg", "type": "STRING"},
+                    "itemType": {"value": "public.jpeg"},
+                    "resOriginalWidth": {"value": 4000},
+                    "resOriginalHeight": {"value": 3000},
+                    "resOriginalAltWidth": {"value": 6000},
+                    "resOriginalAltHeight": {"value": 4500},
+                }});
+                for (prefix, name, (body, uti)) in [
+                    ("resOriginal", "/original", original),
+                    ("resOriginalAlt", "/alternative", alternative),
+                ] {
+                    Mock::given(method("GET"))
+                        .and(path(name))
+                        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                        .expect(if adopt_existing { 0 } else { 1 })
+                        .mount(&server)
+                        .await;
+                    master["fields"][format!("{prefix}Res")] = json!({"value": {
+                        "downloadURL": format!("{}{name}", server.uri()),
+                        "size": body.len(),
+                        "fileChecksum": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body)),
+                    }});
+                    master["fields"][format!("{prefix}FileType")] = json!({"value": uti});
+                }
+                let fields = json!({"recordName": "asset-RAW_METADATA", "fields": {
+                    "assetDate": {"value": 1736899200000.0},
+                }});
+                let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+                let dir = TempDir::new().unwrap();
+                let mut config = DownloadConfig::test_default();
+                config.directory = Arc::from(dir.path());
+                config.raw_policy = policy;
+                config.alternative = true;
+                config.state_db = Some(db.clone());
+                if adopt_existing {
+                    let asset = PhotoAsset::new(master.clone(), fields.clone())
+                        .with_state_record_name(Arc::from("asset-RAW_METADATA"));
+                    let plan = TaskPlanner::new().plan_asset(&asset, &config).await;
+                    assert_eq!(plan.tasks.len(), 2);
+                    for task in plan.tasks {
+                        planner::upsert_seen_for_task(db.as_ref(), &config, &asset, &task)
+                            .await
+                            .unwrap();
+                        let body = if task.version_size == VersionSizeKey::Original {
+                            alternative.0
+                        } else {
+                            original.0
+                        };
+                        fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
+                        fs::write(&task.download_path, body).unwrap();
+                    }
+                }
+                let mut initial = Vec::<AssetRecord>::new();
+                let mut refreshed = Vec::new();
+                for cycle in 0..4 {
+                    if cycle == 1 {
+                        master["fields"]["resOriginalAltWidth"] = json!({"value": 6200});
+                    }
+                    if cycle == 2 {
+                        // A filtered historical row survives policy drift. Refresh
+                        // must identify its bytes even without downloadable URLs.
+                        config.raw_policy = RawPolicy::AsIs;
+                        config.exclude_asset_ids =
+                            Arc::new(["RAW_METADATA".into()].into_iter().collect());
+                        for prefix in ["resOriginal", "resOriginalAlt"] {
+                            master["fields"][format!("{prefix}Res")]["value"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("downloadURL");
+                        }
+                        master["fields"]["resOriginalAltHeight"] = json!({"value": 4600});
+                    }
+                    if cycle == 3 {
+                        db.fail_provider_metadata_refresh_for_test();
+                    }
+                    let asset = PhotoAsset::new(master.clone(), fields.clone());
+                    let result = stream_and_download_from_stream(
+                        &Client::new(),
+                        stream::iter(vec![Ok::<_, anyhow::Error>(asset.clone())]),
+                        &Arc::new(config.clone()),
+                        DownloadControls::download_hidden(),
+                        1,
+                        CancellationToken::new(),
+                        StreamRuntime::new(None, None),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        result.state_write_failures, 0,
+                        "{policy:?} cycle {cycle}: {result:?}"
+                    );
+                    assert!(result.failed.is_empty());
+                    assert_eq!(
+                        result.downloaded,
+                        if cycle == 0 && !adopt_existing { 2 } else { 0 }
+                    );
+                    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+                    assert_eq!(rows.len(), 2);
+                    for row in &rows {
+                        let (provider_key, body, width, height) =
+                            if row.version_size == VersionSizeKey::Original {
+                                (
+                                    VersionSizeKey::Alternative,
+                                    alternative.0,
+                                    if cycle == 0 { 6000 } else { 6200 },
+                                    if cycle < 2 { 4500 } else { 4600 },
+                                )
+                            } else {
+                                (VersionSizeKey::Original, original.0, 4000, 3000)
+                            };
+                        assert_eq!(
+                            (row.metadata.width, row.metadata.height),
+                            (Some(width), Some(height))
+                        );
+                        assert_eq!(
+                            row.metadata.metadata_hash,
+                            asset.metadata_arc(provider_key).metadata_hash
+                        );
+                        assert_eq!(
+                            row.metadata.metadata_hash,
+                            Some(row.metadata.compute_hash())
+                        );
+                        assert_eq!(fs::read(row.local_path.as_ref().unwrap()).unwrap(), body);
+                        if cycle > 0 {
+                            let before = initial
+                                .iter()
+                                .find(|before| before.version_size == row.version_size)
+                                .unwrap();
+                            assert_eq!(row.local_path, before.local_path);
+                            assert_eq!(row.checksum, before.checksum);
+                            assert_eq!(row.local_checksum, before.local_checksum);
+                            assert_eq!(row.downloaded_at, before.downloaded_at);
+                        }
+                    }
+                    assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+                    let hashes: Vec<_> = rows
+                        .iter()
+                        .map(|row| row.metadata.metadata_hash.clone())
+                        .collect();
+                    if cycle == 0 {
+                        initial = rows;
+                    }
+                    if cycle == 2 {
+                        refreshed = hashes.clone();
+                    }
+                    if cycle == 3 {
+                        assert_eq!(hashes, refreshed);
+                    }
+                }
+                // Unknown historical bytes retain shared metadata but no measurements.
+                db.acquire_lock("allow raw metadata refresh")
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER fail_provider_metadata_refresh")
+                    .unwrap();
+                master["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("replacement");
+                master["fields"]["resOriginalAltWidth"] = json!({"value": 9999});
+                let result = stream_and_download_from_stream(
+                    &Client::new(),
+                    stream::iter(vec![Ok::<_, anyhow::Error>(PhotoAsset::new(
+                        master, fields,
+                    ))]),
+                    &Arc::new(config),
+                    DownloadControls::download_hidden(),
+                    1,
+                    CancellationToken::new(),
+                    StreamRuntime::new(None, None),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.state_write_failures, 0);
+                let rows = db.get_downloaded_page(0, 10).await.unwrap();
+                for row in rows {
+                    if row.version_size == VersionSizeKey::Original {
+                        assert_eq!(row.metadata.width, Some(9999));
+                    } else {
+                        assert_eq!(
+                            (
+                                row.metadata.width,
+                                row.metadata.height,
+                                row.metadata.duration_secs
+                            ),
+                            (None, None, None)
+                        );
+                    }
+                    let before = initial
+                        .iter()
+                        .find(|before| before.version_size == row.version_size)
+                        .unwrap();
+                    assert_eq!(row.checksum, before.checksum);
+                    assert_eq!(row.local_checksum, before.local_checksum);
+                    assert_eq!(row.local_path, before.local_path);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_replacement_renditions_capture_shared_metadata_without_guessing() {
+        use serde_json::json;
+
+        for (key, prefix) in [
+            (VersionSizeKey::LiveOriginal, "resOriginalVidCompl"),
+            (VersionSizeKey::Medium, "resJPEGMed"),
+            (VersionSizeKey::LiveMedium, "resVidMed"),
+            (VersionSizeKey::Original, "resOriginal"),
+        ] {
+            let mut master = json!({"recordName": "REPLACED", "fields": {
+                "filenameEnc": {"value": "replaced.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {"size": 1000, "fileChecksum": "original", "downloadURL": "https://p01.icloud-content.com/original"}},
+                "resOriginalFileType": {"value": "public.jpeg"},
+            }});
+            master["fields"][format!("{prefix}Res")] = json!({"value": {
+                "size": 1000, "fileChecksum": "previous", "downloadURL": "https://p01.icloud-content.com/unused",
+            }});
+            master["fields"][format!("{prefix}FileType")] = json!({"value": if key.is_live_photo_motion() { "com.apple.quicktime-movie" } else { "public.jpeg" }});
+            master["fields"][format!("{prefix}Width")] = json!({"value": 1920});
+            master["fields"][format!("{prefix}Height")] = json!({"value": 1080});
+            if key == VersionSizeKey::Original {
+                // Equal current RAW/JPEG measurements do not identify historical bytes.
+                master["fields"]["resOriginalAltRes"] =
+                    json!({"value": {"fileChecksum": "alternative"}});
+                master["fields"]["resOriginalAltWidth"] = json!({"value": 1920});
+                master["fields"]["resOriginalAltHeight"] = json!({"value": 1080});
+            }
+            let mut fields = json!({"recordName": "asset-REPLACED", "fields": {
+                "assetDate": {"value": 1736899200000.0},
+                "duration": {"value": 2.3},
+                "vidComplDurValue": {"value": 23},
+                "vidComplDurScale": {"value": 10},
+            }});
+            let stored = PhotoAsset::new(master.clone(), fields.clone())
+                .with_state_record_name(Arc::from("asset-REPLACED"));
+            let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+            let dir = TempDir::new().unwrap();
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(dir.path());
+            config.state_db = Some(db.clone());
+            if key == VersionSizeKey::Medium {
+                config.resolution = crate::types::PhotoResolution::Medium;
+            }
+            if key == VersionSizeKey::LiveMedium {
+                config.live_resolution = crate::types::AssetVersionSize::LiveMedium;
+            }
+            let derived = derive_expected_paths(&stored, &config)
+                .into_iter()
+                .find(|path| path.version_size == key)
+                .unwrap();
+            fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+            let bytes = vec![0u8; 1000];
+            fs::write(&derived.path, &bytes).unwrap();
+            let local_checksum = crate::download::file::compute_sha256(&derived.path)
+                .await
+                .unwrap();
+            let record =
+                asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived, &config);
+            assert_eq!(record.metadata.width, Some(1920));
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                stored.state_id(),
+                key.as_str(),
+                &derived.path,
+                &local_checksum,
+                None,
+            )
+            .await
+            .unwrap();
+            let before = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+            config.exclude_asset_ids = Arc::new(["asset-REPLACED".into()].into_iter().collect());
+            master["fields"][format!("{prefix}Res")]["value"]["fileChecksum"] =
+                json!("replacement");
+            fields["fields"]["isFavorite"] = json!({"value": 1});
+            let mut refreshed_hash = None;
+            for cycle in 0..2 {
+                if cycle == 1 {
+                    db.fail_provider_metadata_refresh_for_test();
+                }
+                let result = stream_and_download_from_stream(
+                    &Client::new(),
+                    stream::iter(vec![Ok::<_, anyhow::Error>(PhotoAsset::new(
+                        master.clone(),
+                        fields.clone(),
+                    ))]),
+                    &Arc::new(config.clone()),
+                    DownloadControls::download_hidden(),
+                    1,
+                    CancellationToken::new(),
+                    StreamRuntime::new(None, None),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.state_write_failures, 0,
+                    "{key:?} cycle {cycle}: {result:?}"
+                );
+                assert_eq!(result.downloaded, 0);
+                assert!(result.failed.is_empty());
+                let row = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+                assert!(row.metadata.is_favorite);
+                assert_eq!(
+                    (
+                        row.metadata.width,
+                        row.metadata.height,
+                        row.metadata.duration_secs
+                    ),
+                    (None, None, None)
+                );
+                assert_eq!(
+                    row.metadata.metadata_hash,
+                    Some(row.metadata.compute_hash())
+                );
+                assert_eq!(row.local_path, before.local_path);
+                assert_eq!(row.status, before.status);
+                assert_eq!(row.checksum, before.checksum);
+                assert_eq!(row.local_checksum, before.local_checksum);
+                assert_eq!(row.download_checksum, before.download_checksum);
+                assert_eq!(row.downloaded_at, before.downloaded_at);
+                assert_eq!(fs::read(&derived.path).unwrap(), bytes);
+                assert_eq!(
+                    fs::read_dir(derived.path.parent().unwrap())
+                        .unwrap()
+                        .count(),
+                    1
+                );
+                assert!(db.get_pending().await.unwrap().is_empty());
+                assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+                if cycle == 0 {
+                    refreshed_hash = row.metadata.metadata_hash.clone();
+                } else {
+                    assert_eq!(row.metadata.metadata_hash, refreshed_hash);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_metadata_refresh_resolves_completed_sibling_with_stale_preload() {
+        use crate::types::RawPolicy;
+        use base64::Engine as _;
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+
+        let jpeg = b"\xff\xd8\xff\xe0\0\x10JFIF\0".as_slice();
+        let raw = b"II*\0\x08\0\0\0\0\0".as_slice();
+        let mut master = json!({"recordName": "STALE_PAIR", "fields": {
+            "filenameEnc": {"value": "pair.jpg", "type": "STRING"},
+            "itemType": {"value": "public.jpeg"},
+            "resOriginalWidth": {"value": 4000},
+            "resOriginalHeight": {"value": 3000},
+            "resOriginalAltWidth": {"value": 6000},
+            "resOriginalAltHeight": {"value": 4500},
+        }});
+        for (prefix, body, uti) in [
+            ("resOriginal", jpeg, "public.jpeg"),
+            ("resOriginalAlt", raw, "com.adobe.raw-image"),
+        ] {
+            master["fields"][format!("{prefix}Res")] = json!({"value": {
+                "downloadURL": format!("https://p01.icloud-content.com/{prefix}"),
+                "size": body.len(),
+                "fileChecksum": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body)),
+            }});
+            master["fields"][format!("{prefix}FileType")] = json!({"value": uti});
+        }
+        let mut fields = json!({"recordName": "asset-STALE_PAIR", "fields": {
+            "assetDate": {"value": 1736899200000.0},
+        }});
+        let asset = PhotoAsset::new(master.clone(), fields.clone())
+            .with_state_record_name(Arc::from("asset-STALE_PAIR"));
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.raw_policy = RawPolicy::PreferRaw;
+        config.alternative = true;
+        config.refresh_metadata = true;
+        let plan = TaskPlanner::new().plan_asset(&asset, &config).await;
+        assert_eq!(plan.tasks.len(), 2);
+        for task in &plan.tasks {
+            planner::upsert_seen_for_task(db.as_ref(), &config, &asset, task)
+                .await
+                .unwrap();
+            let body = if task.version_size == VersionSizeKey::Original {
+                raw
+            } else {
+                jpeg
+            };
+            fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
+            fs::write(&task.download_path, body).unwrap();
+            if task.version_size == VersionSizeKey::Original {
+                let checksum = crate::download::file::compute_sha256(&task.download_path)
+                    .await
+                    .unwrap();
+                db.mark_downloaded(
+                    "PrimarySync",
+                    asset.state_id(),
+                    "original",
+                    &task.download_path,
+                    &checksum,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let stale = preload_download_context(&config).await;
+        assert_eq!(db.get_pending().await.unwrap().len(), 1);
+        // Reject even an intermediate refresh that uses provider keys instead of
+        // the current downloaded checksums. Final-state assertions alone miss it.
+        db.acquire_lock("guard swapped metadata")
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER guard_swapped_metadata BEFORE UPDATE OF width ON assets
+             WHEN (NEW.version_size = 'original' AND NEW.width IS NOT 6000)
+               OR (NEW.version_size = 'alternative' AND NEW.width IS NOT 4000)
+             BEGIN SELECT RAISE(ABORT, 'wrong rendition metadata'); END;",
+            )
+            .unwrap();
+        for cycle in 0..3 {
+            if cycle == 1 {
+                config.raw_policy = RawPolicy::AsIs;
+                config.media.photos = false;
+                fields["fields"]["isFavorite"] = json!({"value": 1});
+            }
+            let result = stream_and_download_from_stream_with_context(
+                &Client::new(),
+                stream::iter(vec![Ok::<_, anyhow::Error>(PhotoAsset::new(
+                    master.clone(),
+                    fields.clone(),
+                ))]),
+                &Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::with_context(None, None, Some(stale.clone())),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.state_write_failures, 0, "cycle {cycle}: {result:?}");
+            assert_eq!(result.downloaded, 0);
+            assert!(result.failed.is_empty());
+            assert!(db.get_pending().await.unwrap().is_empty());
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                let task = plan
+                    .tasks
+                    .iter()
+                    .find(|task| task.version_size == row.version_size)
+                    .unwrap();
+                let (width, body) = if row.version_size == VersionSizeKey::Original {
+                    (6000, raw)
+                } else {
+                    (4000, jpeg)
+                };
+                assert_eq!(row.metadata.width, Some(width));
+                assert_eq!(row.metadata.is_favorite, cycle > 0);
+                assert_eq!(row.checksum.as_ref(), task.checksum.as_ref());
+                assert_eq!(row.local_path.as_ref(), Some(&task.download_path));
+                assert_eq!(fs::read(&task.download_path).unwrap(), body);
+                assert_eq!(
+                    row.metadata.metadata_hash,
+                    Some(row.metadata.compute_hash())
+                );
+            }
+            assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_photo_streaming_rendition_metadata_is_catalogue_only_and_idempotent() {
+        use base64::Engine as _;
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let still = b"\xff\xd8\xff\xe0\0\x10JFIF\0";
+        let motion = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ";
+        for (name, body, content_type) in [
+            ("/live.jpg", still.as_slice(), "image/jpeg"),
+            ("/live.MOV", motion.as_slice(), "video/quicktime"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(name))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(body)
+                        .insert_header("content-type", content_type),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let make_asset = |favorite: bool| {
+            PhotoAsset::new(
+                json!({"recordName": "LIVE_METADATA", "fields": {
+                    "filenameEnc": {"value": "live.jpg", "type": "STRING"},
+                    "itemType": {"value": "public.jpeg"},
+                    "resOriginalRes": {"value": {
+                        "downloadURL": format!("{}/live.jpg", server.uri()),
+                        "size": still.len(),
+                        "fileChecksum": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(still)),
+                    }},
+                    "resOriginalFileType": {"value": "public.jpeg"},
+                    "resOriginalWidth": {"value": 5712},
+                    "resOriginalHeight": {"value": 4284},
+                    "resOriginalVidComplRes": {"value": {
+                        "downloadURL": format!("{}/live.MOV", server.uri()),
+                        "size": motion.len(),
+                        "fileChecksum": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(motion)),
+                    }},
+                    "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"},
+                    "resOriginalVidComplWidth": {"value": 1744},
+                    "resOriginalVidComplHeight": {"value": 1308},
+                }}),
+                json!({"recordName": "asset-LIVE_METADATA", "fields": {
+                    "assetDate": {"value": 1736899200000.0},
+                    "duration": {"value": 0},
+                    "vidComplDurValue": {"value": 2300000000_u64},
+                    "vidComplDurScale": {"value": 1000000000},
+                    "isFavorite": {"value": i64::from(favorite)},
+                }}),
+            )
+        };
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+        let mut initial = Vec::<AssetRecord>::new();
+        let mut refreshed_hashes = Vec::new();
+
+        for cycle in 0..3 {
+            if cycle == 2 {
+                db.fail_provider_metadata_refresh_for_test();
+            }
+            let asset = make_asset(cycle > 0);
+            let result = stream_and_download_from_stream(
+                &reqwest::Client::new(),
+                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+                &config,
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert!(result.failed.is_empty(), "cycle {cycle}: {result:?}");
+            assert_eq!(result.state_write_failures, 0, "cycle {cycle}");
+            assert_eq!(result.downloaded, if cycle == 0 { 2 } else { 0 });
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_ne!(
+                rows[0].metadata.metadata_hash,
+                rows[1].metadata.metadata_hash
+            );
+            for row in &rows {
+                let (width, height, duration, body) = match row.version_size {
+                    VersionSizeKey::Original => (5712, 4284, 0.0, still.as_slice()),
+                    VersionSizeKey::LiveOriginal => (1744, 1308, 2.3, motion.as_slice()),
+                    other => panic!("unexpected rendition {other:?}"),
+                };
+                assert_eq!(
+                    (
+                        row.metadata.width,
+                        row.metadata.height,
+                        row.metadata.duration_secs
+                    ),
+                    (Some(width), Some(height), Some(duration))
+                );
+                assert_eq!(
+                    row.metadata.metadata_hash,
+                    asset.metadata_arc(row.version_size).metadata_hash
+                );
+                assert_eq!(row.metadata.is_favorite, cycle > 0);
+                let media_path = row.local_path.as_ref().unwrap();
+                assert_eq!(fs::read(media_path).unwrap(), body);
+                assert_eq!(
+                    fs::read_dir(media_path.parent().unwrap()).unwrap().count(),
+                    2
+                );
+                if cycle > 0 {
+                    let before = initial
+                        .iter()
+                        .find(|before| before.version_size == row.version_size)
+                        .unwrap();
+                    assert_eq!(row.status, before.status);
+                    assert_eq!(row.local_path, before.local_path);
+                    assert_eq!(row.checksum, before.checksum);
+                    assert_eq!(row.local_checksum, before.local_checksum);
+                    assert_eq!(row.download_checksum, before.download_checksum);
+                    assert_ne!(row.metadata.metadata_hash, before.metadata.metadata_hash);
+                }
+            }
+            assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+            let hashes: Vec<_> = rows
+                .iter()
+                .map(|row| row.metadata.metadata_hash.clone())
+                .collect();
+            match cycle {
+                0 => initial = rows,
+                1 => refreshed_hashes = hashes,
+                _ => assert_eq!(hashes, refreshed_hashes),
+            }
+        }
     }
 
     /// #707: a downloaded asset whose media task is filtered out must still
@@ -7629,6 +8257,111 @@ mod tests {
                 .is_empty(),
             "a failed refresh must not queue a rewrite, which would publish the stale row"
         );
+    }
+
+    /// The skip helper must compare the same unknown-measurement projection as
+    /// drift detection. Defer draining so an unnecessary marker stays observable.
+    #[tokio::test]
+    async fn unknown_measurements_idle_cycle_does_not_queue_metadata_rewrites() {
+        use serde_json::json;
+
+        for checksum in ["", "historical"] {
+            let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+            let dir = TempDir::new().unwrap();
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(dir.path());
+            config.state_db = Some(db.clone());
+            config.metadata.set_exif_rating = true;
+            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            let asset = PhotoAsset::new(
+                json!({"recordName": "UNKNOWN_IDLE", "fields": {
+                    "filenameEnc": {"value": "idle.jpg", "type": "STRING"},
+                    "itemType": {"value": "public.jpeg"},
+                    "resOriginalRes": {"value": {"size": 1000, "fileChecksum": "current", "downloadURL": "https://p01.icloud-content.com/current"}},
+                    "resOriginalFileType": {"value": "public.jpeg"},
+                    "resOriginalWidth": {"value": 1920},
+                    "resOriginalHeight": {"value": 1080},
+                }}),
+                json!({"recordName": "asset-UNKNOWN_IDLE", "fields": {
+                    "assetDate": {"value": 1736899200000.0},
+                    "duration": {"value": 2.3},
+                }}),
+            ).with_state_record_name(Arc::from("asset-UNKNOWN_IDLE"));
+            let derived = derive_expected_paths(&asset, &config).remove(0);
+            fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+            let bytes = vec![0u8; 1000];
+            fs::write(&derived.path, &bytes).unwrap();
+            let mut record =
+                asset_record_for_derived_path(Arc::from("PrimarySync"), &asset, &derived, &config);
+            record.checksum = checksum.into();
+            record.metadata = Arc::new(
+                super::super::filter::metadata_capture(&asset)
+                    .resolve(VersionSizeKey::Original, checksum),
+            );
+            db.upsert_seen(&record).await.unwrap();
+            let local_checksum = crate::download::file::compute_sha256(&derived.path)
+                .await
+                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                asset.state_id(),
+                "original",
+                &derived.path,
+                &local_checksum,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(db.get_pending().await.unwrap().is_empty());
+            let context = preload_download_context(&config).await;
+            assert!(!context.has_provider_metadata_drift(
+                "PrimarySync",
+                asset.state_id(),
+                &super::super::filter::metadata_capture(&asset)
+            ));
+            db.fail_provider_metadata_refresh_for_test();
+            for _ in 0..2 {
+                let result = stream_and_download_from_stream_with_context(
+                    &Client::new(),
+                    stream::iter(vec![Ok::<_, anyhow::Error>(asset.clone())]),
+                    &Arc::new(config.clone()),
+                    DownloadControls::download_hidden(),
+                    1,
+                    CancellationToken::new(),
+                    StreamRuntime::new(None, None).deferring_metadata_drain(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.state_write_failures, 0,
+                    "checksum {checksum:?}: {result:?}"
+                );
+                assert_eq!(result.downloaded, 0);
+                assert_eq!(result.skip_summary.on_disk, 1);
+                assert!(result.failed.is_empty());
+                assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+                let row = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+                assert_eq!(row.metadata.metadata_hash, record.metadata.metadata_hash);
+                assert_eq!(
+                    (
+                        row.metadata.width,
+                        row.metadata.height,
+                        row.metadata.duration_secs
+                    ),
+                    (None, None, None)
+                );
+                assert_eq!(row.checksum, record.checksum);
+                assert_eq!(row.local_checksum.as_deref(), Some(local_checksum.as_str()));
+                assert_eq!(row.local_path.as_ref(), Some(&derived.path));
+                assert_eq!(fs::read(&derived.path).unwrap(), bytes);
+                assert_eq!(
+                    fs::read_dir(derived.path.parent().unwrap())
+                        .unwrap()
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     /// #707: unchanged provider metadata is a no-op. The failure trigger

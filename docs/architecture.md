@@ -316,6 +316,25 @@ recovery work needed after that checkpoint is durable.
 
 Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
+The iCloud adapter retains shared metadata once and compact resource facts for
+each rendition, independently of download URL availability. Catalogue dimensions
+describe the provider-declared resource dimensions, not probed track or displayed
+dimensions. Live Photo motion
+duration comes from the companion duration ratio; missing or invalid companion
+facts remain unknown rather than inheriting still-image values. Planning,
+adoption, and import project metadata for the selected resource. RAW preference
+can swap logical original and alternative keys; download policy supplies both
+resource candidates for those historical keys. Refresh resolves every rendition
+against its current provider checksum inside the state transaction, not against
+preloaded row identities or current RAW preference. Missing or conflicting matches
+update shared library metadata but leave dimensions and duration unknown. Full
+metadata snapshots and hashes are computed only when needed, rather than retained
+for every possible rendition.
+Refresh updates the downloaded rendition family atomically, checking
+each prepared capture-repair receipt against its own rendition's incoming hash.
+An individual upsert guards the affected rendition and provider checksum without
+invalidating another rendition's prepared receipt.
+Failed receipt validation or state writes preserve checkpoint failure evidence.
 HEIF-family embedded XMP updates use the byte-preserving item-map writer and
 reject layouts that cannot be changed without re-encoding unknown item-graph
 data. A file may hold one XMP item per image, so probe and write both resolve

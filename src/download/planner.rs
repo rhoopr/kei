@@ -210,7 +210,7 @@ pub(super) enum ExistingPathMatch {
 /// `mark_failed` call will finalize.
 pub(super) async fn upsert_seen_for_task<D>(
     db: &D,
-    _config: &DownloadConfig,
+    config: &DownloadConfig,
     asset: &PhotoAsset,
     task: &DownloadTask,
 ) -> Result<(), crate::state::error::StateError>
@@ -235,7 +235,11 @@ where
         task.size,
         media_type,
     )
-    .with_metadata_arc(asset.metadata_arc());
+    .with_metadata_arc(super::filter::metadata_for_selected_version(
+        asset,
+        config,
+        task.version_size,
+    ));
     db.upsert_seen(&record).await
 }
 

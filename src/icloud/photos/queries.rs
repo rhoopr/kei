@@ -436,6 +436,22 @@ mod tests {
     }
 
     #[test]
+    fn rendition_metadata_fields_are_requested_for_every_mapping() {
+        for (_, resource, file_type) in PHOTO_VERSION_LOOKUP.iter().chain(VIDEO_VERSION_LOOKUP) {
+            assert!(DESIRED_KEYS.contains(resource), "{resource}");
+            assert!(DESIRED_KEYS.contains(file_type), "{file_type}");
+            let prefix = resource.strip_suffix("Res").unwrap();
+            for suffix in ["Width", "Height"] {
+                let field = format!("{prefix}{suffix}");
+                assert!(DESIRED_KEYS.contains(&field.as_str()), "{field}");
+            }
+        }
+        for field in ["duration", "vidComplDurValue", "vidComplDurScale"] {
+            assert!(DESIRED_KEYS.contains(&field), "{field}");
+        }
+    }
+
+    #[test]
     fn test_desired_keys_contains_critical_fields() {
         // Fields essential for the download pipeline
         let critical = [

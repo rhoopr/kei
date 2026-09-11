@@ -24,5 +24,8 @@ pub use db::{
 };
 #[cfg(test)]
 pub(crate) use types::MetadataCaptureStatus;
-pub use types::{AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, VersionSizeKey};
+pub use types::{
+    AssetMetadata, AssetRecord, AssetStatus, MediaType, MetadataCapture, RenditionMetadata,
+    SyncRunStats, VersionSizeKey,
+};
 pub(crate) use types::{METADATA_CAPTURE_REVISION, MetadataCaptureCandidate};
