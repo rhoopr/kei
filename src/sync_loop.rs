@@ -5184,7 +5184,10 @@ mod tests {
                     .refresh_downloaded_asset_metadata(
                         library,
                         id,
-                        newer,
+                        &state::MetadataCapture {
+                            shared: Arc::new(newer.clone()),
+                            renditions: Arc::from([]),
+                        },
                         true,
                         false,
                         state::METADATA_CAPTURE_REVISION,
@@ -5784,7 +5787,7 @@ mod tests {
             &self,
             library: &str,
             asset_id: &str,
-            metadata: &state::AssetMetadata,
+            metadata: &state::MetadataCapture,
             mark_for_rewrite: bool,
             mark_capture_repair: bool,
             capture_revision: i64,

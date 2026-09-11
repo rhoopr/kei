@@ -789,6 +789,13 @@ where
                     Some(asset.added_date()),
                     expected_size,
                     media_type,
+                )
+                .with_metadata_arc(
+                    download::filter::metadata_for_selected_version(
+                        &asset,
+                        path_config,
+                        version_size,
+                    ),
                 );
                 if let Err(e) = db
                     .import_adopt(
@@ -1379,6 +1386,8 @@ mod wiremock_tests {
         /// `(size, checksum, file_type)` for the alternative version
         /// (used for RAW+JPEG pairs).
         alt: Option<(u64, String, String)>,
+        master_metadata_fields: serde_json::Map<String, Value>,
+        metadata_fields: serde_json::Map<String, Value>,
     }
 
     impl WiremockAsset {
@@ -1393,6 +1402,8 @@ mod wiremock_tests {
                 asset_date: 1_736_899_200_000.0,
                 live_mov: None,
                 alt: None,
+                master_metadata_fields: serde_json::Map::new(),
+                metadata_fields: serde_json::Map::new(),
             }
         }
 
@@ -1442,6 +1453,10 @@ mod wiremock_tests {
                 fields["resOriginalAltFileType"] = json!({"value": ftype});
             }
             fields
+                .as_object_mut()
+                .unwrap()
+                .extend(self.master_metadata_fields.clone());
+            fields
         }
 
         /// Build the in-memory `PhotoAsset` for staging-path calculation.
@@ -1450,12 +1465,16 @@ mod wiremock_tests {
                 "recordName": &self.record_name,
                 "fields": self.master_fields(),
             });
-            let asset = json!({
+            let mut asset = json!({
                 "fields": {
                     "assetDate": {"value": self.asset_date},
                     "addedDate": {"value": self.asset_date},
                 },
             });
+            asset["fields"]
+                .as_object_mut()
+                .unwrap()
+                .extend(self.metadata_fields.clone());
             PhotoAsset::new(master, asset)
         }
 
@@ -1468,7 +1487,7 @@ mod wiremock_tests {
                 "recordType": "CPLMaster",
                 "fields": self.master_fields(),
             });
-            let asset = json!({
+            let mut asset = json!({
                 "recordName": format!("{}_asset", self.record_name),
                 "recordType": "CPLAsset",
                 "fields": {
@@ -1477,6 +1496,10 @@ mod wiremock_tests {
                     "addedDate": {"value": self.asset_date},
                 },
             });
+            asset["fields"]
+                .as_object_mut()
+                .unwrap()
+                .extend(self.metadata_fields.clone());
             [master, asset]
         }
     }
@@ -1940,21 +1963,50 @@ mod wiremock_tests {
     #[tokio::test]
     async fn live_photo_both_matches_image_and_mov() {
         let server = crate::start_wiremock_or_skip!();
-        let asset = WiremockAsset::new("LIVE1", "IMG_0100.HEIC", "public.heic")
+        let mut asset = WiremockAsset::new("LIVE1", "IMG_0100.HEIC", "public.heic")
             .orig(3000, "ck_live1", "public.heic")
             .live_mov(2000, "ck_live1_mov");
+        asset.master_metadata_fields = serde_json::from_value(json!({
+            "resOriginalWidth": {"value": 5712},
+            "resOriginalHeight": {"value": 4284},
+            "resOriginalVidComplWidth": {"value": 1744},
+            "resOriginalVidComplHeight": {"value": 1308},
+        }))
+        .unwrap();
+        asset.metadata_fields = serde_json::from_value(json!({
+            "duration": {"value": 0},
+            "vidComplDurValue": {"type": "INT64", "value": 2300000000_u64},
+            "vidComplDurScale": {"type": "INT64", "value": 1000000000},
+        }))
+        .unwrap();
         let tmp = TempDir::new().unwrap();
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let config = base_config(&dl); // default LivePhotoMode::Both
 
-        stage_expected(&asset.to_photo_asset(), &config);
+        let staged = stage_expected(&asset.to_photo_asset(), &config);
+        let original_bytes: Vec<_> = staged
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
 
         let db = open_db(&tmp).await;
-        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+        let stats = run_import(
+            &server,
+            std::slice::from_ref(&asset),
+            db.as_ref(),
+            &config,
+            false,
+        )
+        .await;
 
         // Live photo with mode=Both should produce 2 versions: HEIC + MOV.
+        assert_eq!(stats.total, 1);
         assert_eq!(stats.matched, 2, "image + MOV both match");
+        assert_eq!(stats.skipped_already_imported, 0);
+        assert_eq!(stats.unmatched, 0);
+        assert_eq!(stats.hash_errors, 0);
 
         let rows = all_downloaded(db.as_ref()).await;
         assert_eq!(rows.len(), 2);
@@ -1962,6 +2014,72 @@ mod wiremock_tests {
         let filenames: Vec<&str> = rows.iter().map(|r| &*r.filename).collect();
         assert!(filenames.iter().any(|f| f.ends_with(".HEIC")));
         assert!(filenames.iter().any(|f| f.ends_with(".MOV")));
+        for row in &rows {
+            let expected = match row.version_size {
+                VersionSizeKey::Original => (Some(5712), Some(4284), Some(0.0)),
+                VersionSizeKey::LiveOriginal => (Some(1744), Some(1308), Some(2.3)),
+                other => panic!("unexpected rendition: {other:?}"),
+            };
+            assert_eq!(
+                (
+                    row.metadata.width,
+                    row.metadata.height,
+                    row.metadata.duration_secs,
+                ),
+                expected,
+            );
+            assert_eq!(row.status, AssetStatus::Downloaded);
+            assert!(staged.contains(row.local_path.as_ref().unwrap()));
+            assert!(row.local_checksum.is_some());
+            assert_eq!(row.last_error, None);
+            assert_eq!(
+                row.metadata.metadata_hash,
+                Some(row.metadata.compute_hash())
+            );
+        }
+        assert_ne!(
+            rows[0].metadata.metadata_hash,
+            rows[1].metadata.metadata_hash
+        );
+
+        server.reset().await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.matched, 2);
+        assert_eq!(
+            stats.skipped_already_imported, 2,
+            "no rehash or re-adoption"
+        );
+        assert_eq!(stats.unmatched, 0);
+        assert_eq!(stats.hash_errors, 0);
+        let followup = all_downloaded(db.as_ref()).await;
+        assert_eq!(followup.len(), rows.len());
+        for before in &rows {
+            let after = followup
+                .iter()
+                .find(|row| row.version_size == before.version_size)
+                .unwrap();
+            assert_eq!(after.local_path, before.local_path);
+            assert_eq!(after.local_checksum, before.local_checksum);
+            assert_eq!(after.metadata.metadata_hash, before.metadata.metadata_hash);
+            assert_eq!(
+                after.metadata.metadata_hash,
+                Some(after.metadata.compute_hash())
+            );
+            assert_eq!(after.downloaded_at, before.downloaded_at);
+            assert_eq!(after.last_seen_at, before.last_seen_at);
+            assert_eq!(after.download_attempts, before.download_attempts);
+            assert_eq!(after.last_error, before.last_error);
+        }
+        for (path, bytes) in staged.iter().zip(original_bytes) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(
+            std::fs::read_dir(staged[0].parent().unwrap())
+                .unwrap()
+                .count(),
+            2
+        );
     }
 
     /// `LivePhotoMode::Skip` is "skip live photos entirely (both image and
@@ -2504,6 +2622,83 @@ mod wiremock_tests {
     /// Apple's typical RAW arrangement: Original=JPEG (processed), Alt=RAW.
     /// `raw_policy=PreferRaw` swaps so the RAW Alt becomes the primary,
     /// matching what a user who wants "the actual original RAW" expects.
+    #[tokio::test]
+    async fn raw_policy_import_persists_selected_rendition_metadata() {
+        for policy in [RawPolicy::PreferRaw, RawPolicy::PreferJpeg] {
+            let server = crate::start_wiremock_or_skip!();
+            let (original, alternative) = if policy == RawPolicy::PreferRaw {
+                ("public.jpeg", "com.adobe.raw-image")
+            } else {
+                ("com.adobe.raw-image", "public.jpeg")
+            };
+            let mut asset = WiremockAsset::new("RAW_METADATA", "pair.jpg", "public.jpeg")
+                .orig(2000, "original", original)
+                .alt(8000, "alternative", alternative);
+            asset.master_metadata_fields = serde_json::from_value(json!({
+                "resOriginalWidth": {"value": 4000},
+                "resOriginalHeight": {"value": 3000},
+                "resOriginalAltWidth": {"value": 6000},
+                "resOriginalAltHeight": {"value": 4500},
+            }))
+            .unwrap();
+            let tmp = TempDir::new().unwrap();
+            let dl = tmp.path().join("photos");
+            std::fs::create_dir_all(&dl).unwrap();
+            let mut config = base_config(&dl);
+            config.raw_policy = policy;
+            config.alternative = true;
+            let paths = stage_expected(&asset.to_photo_asset(), &config);
+            let db = open_db(&tmp).await;
+            let mut hashes = Vec::new();
+            for cycle in 0..2 {
+                server.reset().await;
+                let stats = run_import(
+                    &server,
+                    std::slice::from_ref(&asset),
+                    db.as_ref(),
+                    &config,
+                    false,
+                )
+                .await;
+                assert_eq!(stats.matched, 2);
+                assert_eq!(stats.skipped_already_imported, cycle * 2);
+                let rows = all_downloaded(db.as_ref()).await;
+                assert_eq!(rows.len(), 2);
+                for row in &rows {
+                    let (width, height, checksum) = if row.version_size == VersionSizeKey::Original
+                    {
+                        (6000, 4500, "alternative")
+                    } else {
+                        (4000, 3000, "original")
+                    };
+                    assert_eq!(
+                        (row.metadata.width, row.metadata.height),
+                        (Some(width), Some(height))
+                    );
+                    assert_eq!(row.checksum.as_ref(), checksum);
+                    assert_eq!(
+                        row.metadata.metadata_hash,
+                        Some(row.metadata.compute_hash())
+                    );
+                    assert!(paths.contains(row.local_path.as_ref().unwrap()));
+                    assert_eq!(
+                        std::fs::read(row.local_path.as_ref().unwrap()).unwrap(),
+                        vec![0; row.size_bytes as usize]
+                    );
+                }
+                let current: Vec<_> = rows
+                    .iter()
+                    .map(|row| row.metadata.metadata_hash.clone())
+                    .collect();
+                if cycle == 0 {
+                    hashes = current;
+                } else {
+                    assert_eq!(current, hashes);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn raw_policy_prefer_raw_swaps_to_raw() {
         let server = crate::start_wiremock_or_skip!();

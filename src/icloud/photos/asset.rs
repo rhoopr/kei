@@ -9,7 +9,7 @@ use super::enc;
 use super::metadata;
 use super::queries::{PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP, item_type_from_str};
 use super::types::{AssetItemType, AssetVersion, AssetVersionSize, ChangeReason};
-use crate::state::AssetMetadata;
+use crate::state::{AssetMetadata, RenditionMetadata, VersionSizeKey};
 
 /// Type alias for the versions map.
 ///
@@ -128,6 +128,7 @@ pub struct PhotoAsset {
     // pipeline's metadata-hash comparisons) can share the same
     // allocation via refcount bumps. Immutable after construction.
     asset_metadata: Arc<AssetMetadata>,
+    rendition_facts: Arc<[(VersionSizeKey, RenditionMetadata)]>,
     versions: VersionsMap,
     malformed_resources: Arc<[MalformedResource]>,
     // f64 primitives
@@ -195,7 +196,7 @@ fn resolve_item_type(fields: &Value, filename: Option<&str>) -> AssetItemType {
 }
 
 /// Pre-parse version URLs at construction so `PhotoAsset` carries no raw
-/// JSON — reducing per-asset memory and making `versions()` infallible.
+/// JSON, reducing per-asset memory and making `versions()` infallible.
 /// Incomplete entries (missing URL or checksum) are logged and skipped;
 /// the caller sees an empty map rather than a runtime error.
 fn extract_versions(
@@ -406,6 +407,8 @@ impl PhotoAsset {
         let (versions, malformed_resources) =
             extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
         let asset_metadata = Arc::new(metadata::extract(&master_fields, &asset_fields));
+        let rendition_facts =
+            metadata::extract_renditions(item_type_val, &master_fields, &asset_fields);
         let asset_record_name: Arc<str> = asset_record["recordName"]
             .as_str()
             .unwrap_or(record_name.as_ref())
@@ -417,6 +420,7 @@ impl PhotoAsset {
             source_zone: None,
             filename,
             asset_metadata,
+            rendition_facts,
             item_type_val,
             asset_date_ms,
             added_date_ms,
@@ -481,6 +485,8 @@ impl PhotoAsset {
             &master.record_name,
         );
         let asset_metadata = Arc::new(metadata::extract(&master.fields, &asset.fields));
+        let rendition_facts =
+            metadata::extract_renditions(item_type_val, &master.fields, &asset.fields);
         Self {
             record_name: Arc::from(master.record_name),
             asset_record_name: Arc::from(asset.record_name.as_str()),
@@ -488,6 +494,7 @@ impl PhotoAsset {
             source_zone,
             filename,
             asset_metadata,
+            rendition_facts,
             item_type_val,
             asset_date_ms,
             added_date_ms,
@@ -501,11 +508,31 @@ impl PhotoAsset {
         &self.asset_metadata
     }
 
-    /// Shared handle on the metadata. Consumers that persist the metadata
-    /// (state DB writes via `AssetRecord::with_metadata_arc`) clone the
-    /// `Arc` instead of deep-cloning every owned string.
+    /// Project the selected provider rendition. Unsupported keys retain
+    /// shared fields but have no known dimensions or duration.
     #[must_use]
-    pub fn metadata_arc(&self) -> Arc<AssetMetadata> {
+    pub fn metadata_arc(&self, version: VersionSizeKey) -> Arc<AssetMetadata> {
+        let facts = self
+            .rendition_facts
+            .iter()
+            .find(|(key, _)| *key == version)
+            .map(|(_, facts)| facts);
+        let mut metadata = self.asset_metadata.as_ref().clone();
+        metadata.width = facts.and_then(|facts| facts.width);
+        metadata.height = facts.and_then(|facts| facts.height);
+        metadata.duration_secs = facts.and_then(|facts| facts.duration_secs);
+        metadata.refresh_hash();
+        Arc::new(metadata)
+    }
+
+    /// All supported resource facts, independent of downloadable URLs.
+    pub fn rendition_facts(&self) -> &[(VersionSizeKey, RenditionMetadata)] {
+        &self.rendition_facts
+    }
+
+    /// Shared asset fields; rendition projections replace all measurements.
+    #[must_use]
+    pub fn shared_metadata_arc(&self) -> Arc<AssetMetadata> {
         Arc::clone(&self.asset_metadata)
     }
 
@@ -1020,6 +1047,291 @@ mod tests {
 
     fn make_asset(master: Value, asset: Value) -> PhotoAsset {
         PhotoAsset::new(master, asset)
+    }
+
+    fn rendition_assets(master_fields: Value, asset_fields: Value) -> [PhotoAsset; 2] {
+        let master = json!({
+            "recordName": "master", "recordType": "CPLMaster", "fields": master_fields,
+        });
+        let asset = json!({
+            "recordName": "asset", "recordType": "CPLAsset", "fields": asset_fields,
+        });
+        [
+            PhotoAsset::new(master.clone(), asset.clone()),
+            PhotoAsset::from_records(
+                serde_json::from_value(master).unwrap(),
+                &serde_json::from_value(asset).unwrap(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn rendition_metadata_live_photo_dimensions_and_duration_without_urls() {
+        for asset in rendition_assets(
+            json!({
+                "itemType": {"value": "public.heic"},
+                "resOriginalWidth": {"value": 5712},
+                "resOriginalHeight": {"value": 4284},
+                "resOriginalVidComplWidth": {"value": 1744},
+                "resOriginalVidComplHeight": {"value": 1308},
+            }),
+            json!({
+                "duration": {"value": 0},
+                "vidComplDurValue": {"type": "INT64", "value": 2300000000_u64},
+                "vidComplDurScale": {"type": "INT64", "value": 1000000000},
+                "isFavorite": {"value": 1},
+                "captionEnc": {"type": "STRING", "value": "Live Photo"},
+            }),
+        ) {
+            assert!(asset.versions().is_empty());
+            assert_eq!(asset.rendition_facts().len(), PHOTO_VERSION_LOOKUP.len());
+            let cloned = asset.clone();
+            assert!(Arc::ptr_eq(&asset.rendition_facts, &cloned.rendition_facts));
+            assert!(Arc::ptr_eq(
+                &asset.shared_metadata_arc(),
+                &cloned.shared_metadata_arc()
+            ));
+            let original = asset.metadata_arc(VersionSizeKey::Original);
+            assert_eq!((original.width, original.height), (Some(5712), Some(4284)));
+            assert_eq!(original.duration_secs, Some(0.0));
+            assert_eq!(original.metadata_hash, asset.metadata().metadata_hash);
+            let live = asset.metadata_arc(VersionSizeKey::LiveOriginal);
+            assert_eq!((live.width, live.height), (Some(1744), Some(1308)));
+            assert_eq!(live.duration_secs, Some(2.3));
+            assert_ne!(original.metadata_hash, live.metadata_hash);
+            let raw: Value = serde_json::from_str(live.provider_data.as_ref().unwrap()).unwrap();
+            assert_eq!(raw["vidComplDurValue"]["value"], 2300000000_u64);
+            assert_eq!(raw["vidComplDurScale"]["value"], 1000000000);
+            for (key, _) in asset.rendition_facts() {
+                let metadata = asset.metadata_arc(*key);
+                assert!(metadata.is_favorite);
+                assert_eq!(metadata.title.as_deref(), Some("Live Photo"));
+                assert_eq!(metadata.provider_data, original.provider_data);
+                assert_eq!(metadata.metadata_hash, Some(metadata.compute_hash()));
+                assert!(!Arc::ptr_eq(&metadata, &asset.metadata_arc(*key)));
+            }
+            for key in [
+                VersionSizeKey::LiveMedium,
+                VersionSizeKey::LiveThumb,
+                VersionSizeKey::LiveAdjusted,
+            ] {
+                let metadata = asset.metadata_arc(key);
+                assert_eq!((metadata.width, metadata.height), (None, None));
+                assert_eq!(metadata.duration_secs, Some(2.3));
+            }
+        }
+    }
+
+    #[test]
+    fn rendition_metadata_uses_exact_photo_and_video_prefixes_and_resource_provenance() {
+        let photo = [
+            (VersionSizeKey::Original, "resOriginal"),
+            (VersionSizeKey::Alternative, "resOriginalAlt"),
+            (VersionSizeKey::Adjusted, "resJPEGFull"),
+            (VersionSizeKey::Medium, "resJPEGMed"),
+            (VersionSizeKey::Thumb, "resJPEGThumb"),
+            (VersionSizeKey::LiveOriginal, "resOriginalVidCompl"),
+            (VersionSizeKey::LiveAdjusted, "resVidCompl"),
+            (VersionSizeKey::LiveMedium, "resVidMed"),
+            (VersionSizeKey::LiveThumb, "resVidSmall"),
+        ];
+        let video = [
+            (VersionSizeKey::Original, "resOriginal"),
+            (VersionSizeKey::Adjusted, "resVidFull"),
+            (VersionSizeKey::Medium, "resVidMed"),
+            (VersionSizeKey::Thumb, "resVidSmall"),
+        ];
+        for (item_type, mappings) in [
+            ("public.heic", photo.as_slice()),
+            ("com.apple.quicktime-movie", video.as_slice()),
+        ] {
+            for (index, (key, prefix)) in mappings.iter().enumerate() {
+                let width = u32::try_from(index).unwrap() + 100;
+                let height = width + 10;
+                let resource = json!({"value": {
+                    "size": 1000, "fileChecksum": "checksum",
+                    "downloadURL": "https://p01.icloud-content.com/rendition",
+                }});
+                for source in [
+                    "absent",
+                    "historical",
+                    "master",
+                    "asset",
+                    "no_url",
+                    "malformed",
+                    "blank_checksum",
+                ] {
+                    let mut master = json!({"itemType": {"value": item_type}});
+                    let mut asset_fields = json!({"duration": {"value": 12.5}});
+                    master[format!("{prefix}Width")] = json!({"value": width});
+                    master[format!("{prefix}Height")] = json!({"value": height});
+                    if source != "historical" {
+                        asset_fields[format!("{prefix}Width")] = json!({"value": width + 1000});
+                        asset_fields[format!("{prefix}Height")] = json!({"value": height + 1000});
+                    }
+                    if !matches!(source, "absent" | "historical") {
+                        master[format!("{prefix}Res")] = resource.clone();
+                        master[format!("{prefix}FileType")] = json!({"value": item_type});
+                    }
+                    if matches!(source, "asset" | "no_url" | "malformed" | "blank_checksum") {
+                        asset_fields[format!("{prefix}Res")] = match source {
+                            "asset" => {
+                                let mut selected = resource.clone();
+                                selected["value"]["fileChecksum"] = json!("asset-checksum");
+                                selected
+                            }
+                            "no_url" => {
+                                json!({"value": {"size": 1000, "fileChecksum": "asset-checksum"}})
+                            }
+                            "blank_checksum" => json!({"value": {"fileChecksum": " \t"}}),
+                            _ => json!({"value": null}),
+                        };
+                        asset_fields[format!("{prefix}FileType")] = json!({"value": item_type});
+                    }
+                    for asset in rendition_assets(master, asset_fields) {
+                        assert_eq!(asset.rendition_facts().len(), mappings.len());
+                        let cloned = asset.clone();
+                        assert!(Arc::ptr_eq(&asset.rendition_facts, &cloned.rendition_facts));
+                        let facts = &asset
+                            .rendition_facts()
+                            .iter()
+                            .find(|(k, _)| k == key)
+                            .unwrap()
+                            .1;
+                        let cloned_facts = facts.clone();
+                        assert_eq!(&cloned_facts, facts);
+                        if let Some(checksum) = &facts.checksum {
+                            assert!(Arc::ptr_eq(
+                                checksum,
+                                cloned_facts.checksum.as_ref().unwrap()
+                            ));
+                        }
+                        assert_eq!(
+                            facts.checksum.as_deref(),
+                            match source {
+                                "master" => Some("checksum"),
+                                "asset" | "no_url" => Some("asset-checksum"),
+                                _ => None,
+                            }
+                        );
+                        let metadata = asset.metadata_arc(*key);
+                        let offset = if matches!(source, "master" | "historical") {
+                            0
+                        } else {
+                            1000
+                        };
+                        assert_eq!(metadata.width, Some(width + offset), "{prefix}: {source}");
+                        assert_eq!(metadata.height, Some(height + offset), "{prefix}: {source}");
+                        assert_eq!(
+                            asset.versions().len(),
+                            usize::from(matches!(source, "master" | "asset"))
+                        );
+                        if item_type == "com.apple.quicktime-movie" {
+                            assert_eq!(metadata.duration_secs, Some(12.5));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rendition_metadata_rejects_missing_and_invalid_dimensions_without_cross_record_fallback() {
+        for value in [
+            json!(null),
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("1744"),
+            json!(4294967296_u64),
+        ] {
+            for asset in rendition_assets(
+                json!({
+                    "itemType": {"value": "public.heic"},
+                    "resOriginalWidth": {"value": 5712},
+                    "resOriginalHeight": {"value": 4284},
+                    "resOriginalVidComplWidth": {"value": 1744},
+                    "resOriginalVidComplHeight": {"value": 1308},
+                }),
+                json!({
+                    "resOriginalVidComplRes": {"value": {}},
+                    "resOriginalVidComplWidth": {"value": value},
+                }),
+            ) {
+                let live = asset.metadata_arc(VersionSizeKey::LiveOriginal);
+                assert_eq!((live.width, live.height), (None, None));
+                assert_eq!(live.duration_secs, None);
+            }
+        }
+    }
+
+    #[test]
+    fn rendition_metadata_validates_companion_duration_without_asset_or_master_fallback() {
+        for (value, scale, expected) in [
+            (json!(null), json!(1000), None),
+            (json!(2300), json!(null), None),
+            (json!(2300), json!(0), None),
+            (json!(2300), json!(-1000), None),
+            (json!(-2300), json!(1000), None),
+            (json!("2300"), json!(1000), None),
+            (json!(2300), json!("1000"), None),
+            (json!(true), json!(1000), None),
+            (json!(2300), json!({}), None),
+            (json!(1e308), json!(1e-308), None),
+            (json!(0), json!(1000), Some(0.0)),
+            (json!(2300), json!(1000), Some(2.3)),
+        ] {
+            let mut fields = json!({"duration": {"value": 99}});
+            if !value.is_null() {
+                fields["vidComplDurValue"] = json!({"value": value});
+            }
+            if !scale.is_null() {
+                fields["vidComplDurScale"] = json!({"value": scale});
+            }
+            for asset in rendition_assets(
+                json!({
+                    "itemType": {"value": "public.heic"},
+                    "vidComplDurValue": {"value": 2300},
+                    "vidComplDurScale": {"value": 1000},
+                }),
+                fields,
+            ) {
+                for key in [
+                    VersionSizeKey::LiveOriginal,
+                    VersionSizeKey::LiveMedium,
+                    VersionSizeKey::LiveThumb,
+                    VersionSizeKey::LiveAdjusted,
+                ] {
+                    assert_eq!(asset.metadata_arc(key).duration_secs, expected);
+                }
+                assert_eq!(asset.metadata().duration_secs, Some(99.0));
+                assert_eq!(
+                    asset.metadata_arc(VersionSizeKey::Original).duration_secs,
+                    Some(99.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rendition_metadata_unsupported_key_does_not_inherit_original_measurements() {
+        for asset in rendition_assets(
+            json!({
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalWidth": {"value": 1920},
+                "resOriginalHeight": {"value": 1080},
+            }),
+            json!({"duration": {"value": 12.5}, "isFavorite": {"value": 1}}),
+        ) {
+            let metadata = asset.metadata_arc(VersionSizeKey::LiveOriginal);
+            assert_eq!(
+                (metadata.width, metadata.height, metadata.duration_secs),
+                (None, None, None)
+            );
+            assert!(metadata.is_favorite);
+            assert_eq!(metadata.metadata_hash, Some(metadata.compute_hash()));
+            assert_eq!(asset.rendition_facts().len(), VIDEO_VERSION_LOOKUP.len());
+        }
     }
 
     #[test]

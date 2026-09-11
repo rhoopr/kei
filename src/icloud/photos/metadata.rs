@@ -8,10 +8,12 @@
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::state::AssetMetadata;
+use crate::state::{AssetMetadata, RenditionMetadata, VersionSizeKey};
 
 use super::asset::f64_to_millis_datetime;
 use super::enc;
+use super::queries::{PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
+use super::types::{AssetItemType, AssetVersionSize};
 
 /// Source identifier stored on every iCloud-sourced asset record.
 pub const SOURCE: &str = "icloud";
@@ -102,6 +104,76 @@ pub fn extract(master_fields: &Value, asset_fields: &Value) -> AssetMetadata {
     meta.provider_data = collect_provider_data(master_fields, asset_fields);
     meta.refresh_hash();
     meta
+}
+
+/// Capture every mapped rendition, even when its resource URL is unavailable.
+pub(super) fn extract_renditions(
+    item_type: Option<AssetItemType>,
+    master_fields: &Value,
+    asset_fields: &Value,
+) -> Arc<[(VersionSizeKey, RenditionMetadata)]> {
+    let lookup = if item_type == Some(AssetItemType::Movie) {
+        VIDEO_VERSION_LOOKUP
+    } else {
+        PHOTO_VERSION_LOOKUP
+    };
+    lookup
+        .iter()
+        .map(|(key, resource, _)| {
+            let mut meta = RenditionMetadata::default();
+            let prefix = resource.strip_suffix("Res").unwrap_or(resource);
+            // Match resource selection's provenance, including malformed resources.
+            // With no resource advertised, historical snapshots still carry dimensions.
+            let fields = if asset_fields.get(resource).is_some() {
+                Some(asset_fields)
+            } else if master_fields.get(resource).is_some() {
+                Some(master_fields)
+            } else {
+                None
+            };
+            meta.checksum = fields
+                .and_then(|fields| fields.get(resource))
+                .and_then(|field| field.get("value"))
+                .and_then(|value| value.get("fileChecksum"))
+                .and_then(Value::as_str)
+                .filter(|checksum| !checksum.trim().is_empty())
+                .map(Arc::from);
+            let dimension = |suffix| {
+                let field = format!("{prefix}{suffix}");
+                fields
+                    .map_or_else(
+                        || {
+                            u64_field(asset_fields, &field)
+                                .or_else(|| u64_field(master_fields, &field))
+                        },
+                        |fields| u64_field(fields, &field),
+                    )
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|v| *v > 0)
+            };
+            meta.width = dimension("Width");
+            meta.height = dimension("Height");
+            if matches!(
+                key,
+                AssetVersionSize::LiveOriginal
+                    | AssetVersionSize::LiveMedium
+                    | AssetVersionSize::LiveThumb
+                    | AssetVersionSize::LiveAdjusted
+            ) {
+                meta.duration_secs = f64_field(asset_fields, "vidComplDurValue")
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .zip(
+                        f64_field(asset_fields, "vidComplDurScale")
+                            .filter(|v| v.is_finite() && *v > 0.0),
+                    )
+                    .map(|(value, scale)| value / scale)
+                    .filter(|v| v.is_finite());
+            } else {
+                meta.duration_secs = f64_field(asset_fields, "duration");
+            }
+            (VersionSizeKey::from(*key), meta)
+        })
+        .collect()
 }
 
 /// PHAssetMediaSubtype bit flags. Values match Apple's PhotoKit enum as

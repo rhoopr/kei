@@ -576,9 +576,17 @@ pub(super) async fn tag_if_needed<D>(
     let Some(db) = state_db else {
         return;
     };
-    let new_hash = asset.metadata().metadata_hash.as_deref();
     let library = asset.source_zone().unwrap_or(config.library.as_ref());
+    let capture = super::filter::metadata_capture(asset);
     for &(vs, _) in candidates {
+        let checksum = ctx
+            .downloaded_checksums
+            .get(library)
+            .and_then(|assets| assets.get(asset.state_id()))
+            .and_then(|versions| versions.get(vs.as_str()))
+            .map_or("", AsRef::as_ref);
+        let metadata = capture.resolve(vs, checksum);
+        let new_hash = metadata.metadata_hash.as_deref();
         if !ctx.needs_metadata_rewrite(library, asset.state_id(), vs, new_hash) {
             continue;
         }
@@ -1238,7 +1246,18 @@ mod tests {
         db.refresh_downloaded_asset_metadata(
             &record.library,
             &record.id,
-            &record.metadata,
+            &crate::state::MetadataCapture {
+                shared: Arc::clone(&record.metadata),
+                renditions: Arc::from([(
+                    record.version_size,
+                    crate::state::RenditionMetadata {
+                        checksum: Some(Arc::from(record.checksum.as_ref())),
+                        width: record.metadata.width,
+                        height: record.metadata.height,
+                        duration_secs: record.metadata.duration_secs,
+                    },
+                )]),
+            },
             true,
             true,
             crate::state::METADATA_CAPTURE_REVISION,

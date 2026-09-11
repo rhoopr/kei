@@ -685,6 +685,47 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawPolicy) -> VersionsView<'
     }
 }
 
+/// Task keys follow RAW policy; provider metadata keys never do.
+pub(crate) fn metadata_for_selected_version(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &(impl PathDerivationSource + ?Sized),
+    version: VersionSizeKey,
+) -> Arc<crate::state::AssetMetadata> {
+    let provider_version = if apply_raw_policy(asset.versions(), config.raw_policy())
+        .swap
+        .is_some()
+    {
+        match version {
+            VersionSizeKey::Original => VersionSizeKey::Alternative,
+            VersionSizeKey::Alternative => VersionSizeKey::Original,
+            _ => version,
+        }
+    } else {
+        version
+    };
+    asset.metadata_arc(provider_version)
+}
+
+/// Historical original/alternative keys may have been swapped by RAW policy.
+/// State resolves these candidates against its current checksums, not today's policy.
+pub(crate) fn metadata_capture(
+    asset: &crate::icloud::photos::PhotoAsset,
+) -> crate::state::MetadataCapture {
+    let mut renditions = asset.rendition_facts().to_vec();
+    for (key, facts) in asset.rendition_facts() {
+        let paired_key = match key {
+            VersionSizeKey::Original => VersionSizeKey::Alternative,
+            VersionSizeKey::Alternative => VersionSizeKey::Original,
+            _ => continue,
+        };
+        renditions.push((paired_key, facts.clone()));
+    }
+    crate::state::MetadataCapture {
+        shared: asset.shared_metadata_arc(),
+        renditions: renditions.into(),
+    }
+}
+
 /// Returns the reason this asset should be skipped by content/metadata
 /// filters, or `None` if the asset passes all filters.
 ///
@@ -3720,6 +3761,105 @@ mod tests {
                 .unwrap()
                 .url,
             "https://p01.icloud-content.com/alt"
+        );
+    }
+
+    #[test]
+    fn ordinary_original_metadata_refresh_does_not_require_resource_urls_or_checksums() {
+        for item_type in ["public.jpeg", "com.apple.quicktime-movie"] {
+            for resource in [
+                serde_json::json!(null),
+                serde_json::json!({"value": {"fileChecksum": "replacement"}}),
+                serde_json::json!({"value": {"fileChecksum": "previous"}}),
+            ] {
+                let asset = PhotoAsset::new(
+                    serde_json::json!({"recordName": "master", "fields": {
+                        "itemType": {"value": item_type},
+                        "resOriginalRes": resource,
+                        "resOriginalWidth": {"value": 1920},
+                        "resOriginalHeight": {"value": 1080},
+                    }}),
+                    serde_json::json!({"fields": {"duration": {"value": 12.5}, "isFavorite": {"value": 1}}}),
+                );
+                assert!(asset.versions().is_empty());
+                let capture = metadata_capture(&asset);
+                let original = capture.resolve(VersionSizeKey::Original, "previous");
+                let matched = asset.rendition_facts().iter().any(|(key, facts)| {
+                    *key == VersionSizeKey::Original
+                        && facts.checksum.as_deref() == Some("previous")
+                });
+                assert_eq!(original.width, matched.then_some(1920));
+                assert_eq!(original.height, matched.then_some(1080));
+                assert_eq!(original.duration_secs, matched.then_some(12.5));
+                assert!(original.is_favorite);
+                assert_eq!(original.metadata_hash, Some(original.compute_hash()));
+                assert_eq!(
+                    asset.metadata_arc(VersionSizeKey::Original).width,
+                    Some(1920)
+                );
+                // Either logical key may hold the original provider bytes.
+                assert_eq!(
+                    capture
+                        .resolve(VersionSizeKey::Alternative, "previous")
+                        .metadata_hash,
+                    original.metadata_hash
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_policy_stored_metadata_requires_unambiguous_url_independent_evidence() {
+        let master = serde_json::json!({"recordName": "master", "fields": {
+            "itemType": {"value": "public.jpeg"},
+            "resOriginalRes": {"value": {"fileChecksum": "original"}},
+            "resOriginalAltRes": {"value": {"fileChecksum": "alternative"}},
+            "resOriginalWidth": {"value": 4000},
+            "resOriginalAltWidth": {"value": 6000},
+        }});
+        for (fields, checksum, expected) in [
+            (serde_json::json!({}), "alternative", Some(6000)),
+            (serde_json::json!({}), "original", Some(4000)),
+            (serde_json::json!({}), "unknown", None),
+            (
+                serde_json::json!({
+                    "resOriginalAltRes": {"value": {"fileChecksum": "alternative"}},
+                    "resOriginalAltWidth": {"value": 4000}
+                }),
+                "unknown",
+                None,
+            ),
+            (
+                serde_json::json!({"resOriginalAltRes": {"value": null}}),
+                "alternative",
+                None,
+            ),
+            (
+                serde_json::json!({
+                    "resOriginalAltRes": {"value": {"fileChecksum": "original"}},
+                    "resOriginalAltWidth": {"value": 6000},
+                }),
+                "original",
+                None,
+            ),
+        ] {
+            let asset = PhotoAsset::new(master.clone(), serde_json::json!({"fields": fields}));
+            assert!(asset.versions().is_empty());
+            let capture = metadata_capture(&asset);
+            for key in [VersionSizeKey::Original, VersionSizeKey::Alternative] {
+                assert_eq!(capture.resolve(key, checksum).width, expected);
+            }
+        }
+        let typed = PhotoAsset::from_records(
+            serde_json::from_value(master).unwrap(),
+            &serde_json::from_value(serde_json::json!({"recordName": "asset", "fields": {}}))
+                .unwrap(),
+        );
+        assert_eq!(
+            metadata_capture(&typed)
+                .resolve(VersionSizeKey::Alternative, "alternative")
+                .width,
+            Some(6000)
         );
     }
 
