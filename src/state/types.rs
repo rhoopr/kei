@@ -234,6 +234,44 @@ pub struct AssetMetadata {
     pub metadata_hash: Option<String>,
 }
 
+/// Provider resource identity and measurements, without shared asset metadata.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RenditionMetadata {
+    pub checksum: Option<Arc<str>>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_secs: Option<f64>,
+}
+
+/// Shared provider metadata and candidates already mapped to logical versions.
+#[derive(Clone, Debug)]
+pub struct MetadataCapture {
+    pub shared: Arc<AssetMetadata>,
+    pub renditions: Arc<[(VersionSizeKey, RenditionMetadata)]>,
+}
+
+impl MetadataCapture {
+    /// Resolve only exact, nonblank resource identities with unanimous measurements.
+    #[must_use]
+    pub(crate) fn resolve(&self, version: VersionSizeKey, checksum: &str) -> AssetMetadata {
+        let mut matching = self.renditions.iter().filter_map(|(key, facts)| {
+            (*key == version
+                && !checksum.trim().is_empty()
+                && facts.checksum.as_deref() == Some(checksum))
+            .then_some(facts)
+        });
+        let facts = matching
+            .next()
+            .filter(|first| matching.all(|other| *first == other));
+        let mut metadata = self.shared.as_ref().clone();
+        metadata.width = facts.and_then(|facts| facts.width);
+        metadata.height = facts.and_then(|facts| facts.height);
+        metadata.duration_secs = facts.and_then(|facts| facts.duration_secs);
+        metadata.refresh_hash();
+        metadata
+    }
+}
+
 impl AssetMetadata {
     /// Compute a stable SHA-256 hash of metadata fields for change detection.
     ///
@@ -648,6 +686,90 @@ mod tests {
     #[test]
     fn test_version_size_key_from_invalid() {
         assert_eq!(VersionSizeKey::from_str("invalid"), None);
+    }
+
+    #[test]
+    fn metadata_capture_requires_exact_unanimous_resource_identity() {
+        let facts = RenditionMetadata {
+            checksum: Some(Arc::from("resource")),
+            width: Some(1920),
+            height: None,
+            duration_secs: Some(2.3),
+        };
+        let shared = Arc::new(AssetMetadata {
+            width: Some(4000),
+            height: Some(3000),
+            duration_secs: Some(99.0),
+            title: Some("shared edit".into()),
+            metadata_hash: Some("stale hash".into()),
+            ..AssetMetadata::default()
+        });
+        let original = VersionSizeKey::Original;
+        let mut missing_checksum = facts.clone();
+        missing_checksum.checksum = None;
+        let mut blank_checksum = facts.clone();
+        blank_checksum.checksum = Some(Arc::from(" \t"));
+        let mut other_checksum = facts.clone();
+        other_checksum.checksum = Some(Arc::from("other"));
+        other_checksum.width = None;
+        let mut missing_width = facts.clone();
+        missing_width.width = None;
+        let mut different_height = facts.clone();
+        different_height.height = Some(1080);
+        let mut missing_duration = facts.clone();
+        missing_duration.duration_secs = None;
+        for (candidates, checksum, known) in [
+            (vec![(original, facts.clone())], "resource", true),
+            (vec![(original, facts.clone()); 2], "resource", true),
+            (vec![(original, facts.clone())], "other", false),
+            (vec![(original, facts.clone())], " resource", false),
+            (vec![(original, facts.clone())], "", false),
+            (vec![], "resource", false),
+            (
+                vec![(VersionSizeKey::Medium, facts.clone())],
+                "resource",
+                false,
+            ),
+            (vec![(original, missing_checksum)], "resource", false),
+            (vec![(original, blank_checksum)], " \t", false),
+            (
+                vec![(original, facts.clone()), (original, missing_width)],
+                "resource",
+                false,
+            ),
+            (
+                vec![(original, facts.clone()), (original, different_height)],
+                "resource",
+                false,
+            ),
+            (
+                vec![(original, facts.clone()), (original, missing_duration)],
+                "resource",
+                false,
+            ),
+            (
+                vec![(original, facts.clone()), (original, other_checksum)],
+                "resource",
+                true,
+            ),
+        ] {
+            let capture = MetadataCapture {
+                shared: Arc::clone(&shared),
+                renditions: candidates.into(),
+            };
+            let resolved = capture.resolve(original, checksum);
+            let expected = if known {
+                (facts.width, facts.height, facts.duration_secs)
+            } else {
+                (None, None, None)
+            };
+            assert_eq!(
+                (resolved.width, resolved.height, resolved.duration_secs),
+                expected
+            );
+            assert_eq!(resolved.title, shared.title);
+            assert_eq!(resolved.metadata_hash, Some(resolved.compute_hash()));
+        }
     }
 
     #[test]
