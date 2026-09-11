@@ -980,7 +980,7 @@ fn fsync_parent_dir_best_effort_blocking(path: &Path) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublishResult {
+pub(super) enum PublishResult {
     Published,
     DestinationExists,
 }
@@ -1033,21 +1033,65 @@ impl ReconciledFile {
         tokio::task::spawn_blocking(move || copy.validate_blocking()).await?
     }
 
-    pub(super) fn validate_blocking(&self) -> anyhow::Result<()> {
-        self.source
-            .validate_identity(file_identity(&self.source_file)?)?;
+    pub(super) async fn set_capture_time(self: &Arc<Self>, timestamp: i64) -> anyhow::Result<()> {
+        let copy = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            copy.validate_blocking()?;
+            let file = copy
+                .destination
+                .validate_for_metadata(file_identity(&copy.destination_file)?)?;
+            use std::time::{Duration, UNIX_EPOCH};
+            let duration = Duration::from_secs(timestamp.unsigned_abs());
+            let time = if timestamp >= 0 {
+                UNIX_EPOCH
+                    .checked_add(duration)
+                    .context("Capture mtime is out of range")?
+            } else {
+                UNIX_EPOCH.checked_sub(duration).unwrap_or(UNIX_EPOCH)
+            };
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(time)
+                    .set_accessed(time),
+            )?;
+            #[cfg(not(windows))]
+            file.sync_all()?;
+            copy.destination
+                .validate_identity(file_identity(&copy.destination_file)?)?;
+            Ok(())
+        })
+        .await?
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(super) fn open_source_for_metadata(&self) -> anyhow::Result<std::fs::File> {
         let mut file = self
-            .destination
-            .validate_identity(file_identity(&self.destination_file)?)?;
+            .source
+            .validate_identity(file_identity(&self.source_file)?)?;
         let fingerprint =
-            fingerprint_open_file_snapshot_blocking(&mut file, self.destination.path())?
-                .fingerprint;
+            fingerprint_open_file_snapshot_blocking(&mut file, self.source.path())?.fingerprint;
         anyhow::ensure!(
             data_encoding::HEXLOWER.encode(&fingerprint.sha256) == self.checksum,
-            "Reconciled bytes changed before state finalization"
+            "Reconciliation source changed before metadata planning"
         );
-        self.destination
-            .validate_identity(file_identity(&self.destination_file)?)?;
+        Ok(file)
+    }
+
+    pub(super) fn validate_blocking(&self) -> anyhow::Result<()> {
+        for (path, retained) in [
+            (&self.source, &self.source_file),
+            (&self.destination, &self.destination_file),
+        ] {
+            let identity = file_identity(retained)?;
+            let mut file = path.validate_identity(identity)?;
+            let fingerprint =
+                fingerprint_open_file_snapshot_blocking(&mut file, path.path())?.fingerprint;
+            anyhow::ensure!(
+                data_encoding::HEXLOWER.encode(&fingerprint.sha256) == self.checksum,
+                "Reconciliation media changed before state finalization"
+            );
+            path.validate_identity(identity)?;
+        }
         Ok(())
     }
 }
@@ -1181,7 +1225,7 @@ fn finish_reconciled_copy(
     })))
 }
 
-fn publish_reconciliation_part_blocking(
+pub(super) fn publish_reconciliation_part_blocking(
     part: &ConfinedPath,
     destination: &ConfinedPath,
 ) -> std::io::Result<PublishResult> {

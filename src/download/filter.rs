@@ -1469,6 +1469,13 @@ enum CollisionStrategy {
     SkipIfExists,
 }
 
+/// Existing files still need state and metadata finalization during reconciliation.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PathPlanningMode {
+    Download,
+    Reconciliation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathResolution {
     Download(PathBuf),
@@ -1496,6 +1503,7 @@ impl PathResolution {
 #[derive(Debug)]
 struct ResolveContext<'a> {
     config: &'a DownloadConfig,
+    planning_mode: PathPlanningMode,
     created_local: &'a DateTime<FixedOffset>,
     claimed_paths: &'a FxHashMap<NormalizedPath, u64>,
     dir_cache: &'a mut paths::DirCache,
@@ -1622,6 +1630,13 @@ fn resolve_download_path(
     make_collision_filename: impl Fn(CollisionFilenameKind) -> String,
     label: &str,
 ) -> PathResolution {
+    // Reconciliation must retry one deterministic destination after media
+    // publication but before metadata/state completion. The confined copy
+    // owner compares bytes and rejects conflicts instead of inventing a new
+    // filename on every retry. Ordinary downloads retain collision naming.
+    if matches!(ctx.planning_mode, PathPlanningMode::Reconciliation) {
+        return PathResolution::Download(download_path.to_path_buf());
+    }
     // Check for the file on disk. For primary photos, also check AM/PM
     // whitespace variants (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG").
     let on_disk_match = ctx
@@ -1721,6 +1736,7 @@ pub(super) fn filter_asset_to_tasks(
     config: &DownloadConfig,
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
+    planning_mode: PathPlanningMode,
 ) -> Vec<DownloadTask> {
     if !asset.has_valid_id() {
         return Vec::new();
@@ -1781,6 +1797,7 @@ pub(super) fn filter_asset_to_tasks(
         let primary_resolution = {
             let mut rctx = ResolveContext {
                 config,
+                planning_mode,
                 created_local: &ctx.created_local,
                 claimed_paths,
                 dir_cache,
@@ -1851,6 +1868,7 @@ pub(super) fn filter_asset_to_tasks(
         let final_path = {
             let mut rctx = ResolveContext {
                 config,
+                planning_mode,
                 created_local: &ctx.created_local,
                 claimed_paths,
                 dir_cache,
@@ -1909,6 +1927,7 @@ pub(super) fn filter_asset_to_tasks(
         let final_mov_path = {
             let mut rctx = ResolveContext {
                 config,
+                planning_mode,
                 created_local: &ctx.created_local,
                 claimed_paths,
                 dir_cache,
@@ -1980,7 +1999,13 @@ mod tests {
     fn filter_asset_fresh(asset: &PhotoAsset, config: &DownloadConfig) -> Vec<DownloadTask> {
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache)
+        filter_asset_to_tasks(
+            asset,
+            config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
     }
 
     #[cfg(unix)]
@@ -3565,7 +3590,13 @@ mod tests {
         // Process asset1: creates IMG_0001.HEIC (2000 bytes) and its MOV
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        let tasks1 = filter_asset_to_tasks(&asset1, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks1 = filter_asset_to_tasks(
+            &asset1,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
         assert_eq!(tasks1.len(), 2);
         let heic1_path = &tasks1[0].download_path;
 
@@ -3576,7 +3607,13 @@ mod tests {
         // Process asset2: same filename, different size → should dedup HEIC
         // Clear dir_cache since we just wrote a new file
         dir_cache.clear();
-        let tasks2 = filter_asset_to_tasks(&asset2, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks2 = filter_asset_to_tasks(
+            &asset2,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
         assert_eq!(tasks2.len(), 2, "Expected HEIC + MOV tasks for asset2");
 
         let heic2_path = tasks2[0].download_path.to_str().unwrap();
@@ -3650,7 +3687,13 @@ mod tests {
 
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        let tasks = filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks = filter_asset_to_tasks(
+            &asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
         assert_eq!(
             tasks.len(),
             2,
@@ -3672,7 +3715,13 @@ mod tests {
 
         fs::write(&paired_mov, vec![0u8; 2_266_088]).unwrap();
         dir_cache.clear();
-        let tasks = filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks = filter_asset_to_tasks(
+            &asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
         assert_eq!(
             tasks.len(),
             2,
@@ -4465,14 +4514,24 @@ mod tests {
         // Process both assets through claimed_paths
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        let video_tasks =
-            filter_asset_to_tasks(&video_asset, &config, &mut claimed_paths, &mut dir_cache);
+        let video_tasks = filter_asset_to_tasks(
+            &video_asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
         assert_eq!(video_tasks.len(), 1);
         let video_path = &video_tasks[0].download_path;
         eprintln!("Video path: {:?}", video_path);
 
-        let photo_tasks =
-            filter_asset_to_tasks(&photo_asset, &config, &mut claimed_paths, &mut dir_cache);
+        let photo_tasks = filter_asset_to_tasks(
+            &photo_asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
         assert_eq!(photo_tasks.len(), 2, "Expected 2 tasks (photo + MOV)");
 
         let mov_task = &photo_tasks[1];
@@ -5109,11 +5168,23 @@ mod tests {
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
 
-        let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_a = filter_asset_to_tasks(
+            &asset_a,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
         assert_eq!(tasks_a.len(), 1, "first asset should resolve to one task");
         let path_a = tasks_a[0].download_path.clone();
 
-        let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_b = filter_asset_to_tasks(
+            &asset_b,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
         assert_eq!(
             tasks_b.len(),
             1,
@@ -5177,8 +5248,13 @@ mod tests {
         claimed_paths.insert(NormalizedPath::new(&downloaded_path), 1000);
 
         let mut dir_cache = paths::DirCache::new();
-        let second_tasks =
-            filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        let second_tasks = filter_asset_to_tasks(
+            &asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
         assert_eq!(second_tasks.len(), 1);
         assert!(
             second_tasks[0]
@@ -5669,8 +5745,20 @@ mod tests {
         let mut dir_cache = paths::DirCache::new();
 
         // Act
-        let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
-        let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_a = filter_asset_to_tasks(
+            &asset_a,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
+        let tasks_b = filter_asset_to_tasks(
+            &asset_b,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
 
         // Assert: first asset gets the natural path, second gets an identity
         // collision path instead of being silently skipped.
@@ -5713,8 +5801,20 @@ mod tests {
         let mut dir_cache = paths::DirCache::new();
 
         // Act
-        let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
-        let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_a = filter_asset_to_tasks(
+            &asset_a,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
+        let tasks_b = filter_asset_to_tasks(
+            &asset_b,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        );
 
         // Assert: both get tasks, second has dedup suffix
         assert_eq!(tasks_a.len(), 1);
@@ -5752,10 +5852,16 @@ mod tests {
                         .orig_url(&format!("https://p01.icloud-content.com/{}", case.id))
                         .orig_checksum(case.checksum)
                         .build();
-                    filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache)
-                        .into_iter()
-                        .map(|task| task.download_path)
-                        .collect()
+                    filter_asset_to_tasks(
+                        &asset,
+                        &config,
+                        &mut claimed_paths,
+                        &mut dir_cache,
+                        PathPlanningMode::Download,
+                    )
+                    .into_iter()
+                    .map(|task| task.download_path)
+                    .collect()
                 })
                 .collect()
         }

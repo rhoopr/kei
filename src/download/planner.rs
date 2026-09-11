@@ -13,8 +13,8 @@ use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
 
 use super::DownloadConfig;
 use super::filter::{
-    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, determine_media_type,
-    filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
+    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, PathPlanningMode,
+    determine_media_type, filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
 };
 use super::paths;
 
@@ -40,6 +40,25 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> AssetTaskPlan {
+        self.plan_asset_with_mode(asset, config, PathPlanningMode::Download)
+            .await
+    }
+
+    pub(super) async fn plan_reconciliation_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> AssetTaskPlan {
+        self.plan_asset_with_mode(asset, config, PathPlanningMode::Reconciliation)
+            .await
+    }
+
+    async fn plan_asset_with_mode(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        planning_mode: PathPlanningMode,
+    ) -> AssetTaskPlan {
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
             return AssetTaskPlan {
                 tasks: Vec::new(),
@@ -49,8 +68,13 @@ impl TaskPlanner {
         }
 
         pre_ensure_asset_dir(&mut self.dir_cache, asset, config).await;
-        let tasks =
-            filter_asset_to_tasks(asset, config, &mut self.claimed_paths, &mut self.dir_cache);
+        let tasks = filter_asset_to_tasks(
+            asset,
+            config,
+            &mut self.claimed_paths,
+            &mut self.dir_cache,
+            planning_mode,
+        );
         let malformed_resource = if tasks.is_empty() {
             super::filter::malformed_no_task_resource(asset, config)
         } else {

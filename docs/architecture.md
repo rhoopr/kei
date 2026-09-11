@@ -132,7 +132,26 @@ the common lexical ancestor of the old path and new root, with no-follow
 traversal below that anchor. This allows root moves without trusting linked
 source directories. Destination writes stay beneath the new configured root.
 Relative paths are normalized inside the filesystem owner, not in durable
-catalogue keys. Metadata copying is a separate follow-up.
+catalogue keys.
+
+A reconciled media path receives the same capture mtime as a normal download.
+When XMP sidecars are enabled, an existing source packet is validated and
+copied byte-for-byte, including custom properties and ownership markers. Path
+migration does not upgrade or regenerate an existing packet. If no source
+sidecar exists, the normal metadata planner generates one from the current
+payload and source GPS facts. A source read failure stops before publication;
+it cannot leave an incomplete packet that blocks the next attempt. Generated
+packets do not infer native accuracy provenance from a local checksum.
+
+Sidecar publication uses the same retained directory capabilities and refuses
+conflicting destination bytes. Reconciliation records the new catalogue path
+only after capture mtime, sidecar work, and final input checks succeed. It
+retains the old files and keeps failed work pending. Reconciliation planning
+includes existing media destinations so a retry after a metadata or state-write
+failure can finish without downloading or creating a second media copy.
+Reconciliation retries the rendered destination and leaves conflicting media
+or sidecars untouched; it does not allocate another collision filename on each
+attempt. Ordinary download collision naming and on-disk skip rules are unchanged.
 
 ### Full and incremental enumeration
 
