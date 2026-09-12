@@ -1735,7 +1735,7 @@ where
                                 .refresh_downloaded_asset_metadata(
                                     &library,
                                     asset.state_id(),
-                                    asset.metadata(),
+                                    (asset.metadata(), asset.created(), Some(asset.added_date())),
                                     mark_for_rewrite,
                                     capture_repair_requested(config),
                                     crate::state::METADATA_CAPTURE_REVISION,
@@ -1943,6 +1943,7 @@ where
                                         {
                                             state_write_failures_producer
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            continue;
                                         }
                                         let size = task.size;
                                         if task_tx.send(task).await.is_err() {
@@ -2032,6 +2033,7 @@ where
                                                         1,
                                                         std::sync::atomic::Ordering::Relaxed,
                                                     );
+                                                    continue;
                                                 }
                                                 let size = task.size;
                                                 if task_tx.send(task).await.is_err() {
@@ -4836,7 +4838,11 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &crate::state::AssetMetadata,
+            _: (
+                &crate::state::AssetMetadata,
+                chrono::DateTime<chrono::Utc>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
             _: bool,
             _: bool,
             _: i64,
@@ -6813,6 +6819,7 @@ mod tests {
 
         fn existing_asset() -> PhotoAsset {
             TestPhotoAsset::new("REFRESH_FILTERED")
+                .asset_date(1_700_000_000_123.0)
                 .filename("filtered.jpg")
                 .item_type("public.jpeg")
                 .orig_file_type("public.jpeg")
@@ -6893,6 +6900,8 @@ mod tests {
             rewrites[0].metadata.metadata_hash.as_deref(),
             Some("stale-hash")
         );
+        assert_eq!(rewrites[0].created_at, existing_asset().created());
+        assert_eq!(rewrites[0].added_at, Some(existing_asset().added_date()));
         assert_eq!(rewrites[0].metadata.title, None);
         let capture_repairs = db
             .get_pending_metadata_rewrites_page_for_queue(

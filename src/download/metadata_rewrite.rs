@@ -493,7 +493,7 @@ fn plan_sidecar_write(
         false
     };
     let mut write = super::metadata::MetadataWrite {
-        datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
+        datetime: Some(created_local.format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
         offset_time_original: offset_time_original(payload),
         gps_datetime: source_gps.datetime,
         gps_speed: source_gps.speed,
@@ -1290,7 +1290,7 @@ mod tests {
         db.refresh_downloaded_asset_metadata(
             &record.library,
             &record.id,
-            &record.metadata,
+            (&record.metadata, record.created_at, record.added_at),
             true,
             true,
             crate::state::METADATA_CAPTURE_REVISION,
@@ -1488,7 +1488,7 @@ mod tests {
             ..MetadataPayload::default()
         };
         let flags = MetadataFlags::DATETIME;
-        let created_local = now_local();
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
         let host_local = (created_local - chrono::Duration::hours(11))
             .format("%Y:%m:%d %H:%M:%S")
             .to_string();
@@ -1498,14 +1498,21 @@ mod tests {
             "not a timestamp".to_string(),
             String::new(),
             "2024-06-15".to_string(),
+            "2024-06-15T10:00:00.628+11:00".to_string(),
+            "2024-06-15T10:00:00.628".to_string(),
+            "2024-06-15T10:00:01+11:00".to_string(),
             // Capture-local wall clock, but claiming a different zone.
+            "2024-06-15T10:00:00.629+10:00".to_string(),
             created_local.format("%Y-%m-%dT%H:%M:%S+05:00").to_string(),
         ] {
             let probe = crate::download::metadata::ExifProbe {
                 datetime_original: Some(existing.clone()),
-                offset_time_original: None,
-                has_other_datetime_offset: false,
-                has_gps: false,
+                #[cfg(feature = "xmp")]
+                native_heif_capture_time:
+                    crate::download::metadata::HeifNativeCaptureTime::Present {
+                        datetime_original: Some(existing.clone()),
+                        offset_time_original: Some("+11:00".into()),
+                    },
                 ..crate::download::metadata::ExifProbe::default()
             };
             let write = plan_metadata_write(flags, &payload, &created_local, &probe);
@@ -1514,12 +1521,18 @@ mod tests {
                 write.offset_time_original.is_none(),
                 "offset must not join the unverified timestamp {existing:?}"
             );
+            #[cfg(feature = "xmp")]
+            assert_eq!(
+                probe.native_heif_capture_time_repair_required(&created_local, "+11:00"),
+                Ok(Some(true)),
+                "{existing}"
+            );
         }
     }
 
     #[test]
     fn capture_timestamp_repair_requires_an_offset_and_replaces_the_pair() {
-        let created_local = now_local();
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
         let probe = crate::download::metadata::ExifProbe {
             datetime_original: Some("2024:06:14 23:00:00".into()),
             offset_time_original: Some("+05:00".into()),
@@ -1581,27 +1594,49 @@ mod tests {
             timezone_offset: Some(39_600),
             ..MetadataPayload::default()
         };
-        let created_local = now_local();
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
 
         for existing in [
             created_local.format("%Y-%m-%dT%H:%M:%S").to_string(),
             created_local.format("%Y-%m-%dT%H:%M:%S+11:00").to_string(),
+            "2024-06-15T10:00:00.629+11:00".to_string(),
+            "2024-06-15T10:00:00.000+11:00".to_string(),
+            "2024-06-15T10:00:00.629".to_string(),
+            "2024-06-15T10:00:00.000".to_string(),
             format!("  {}\0", created_local.format("%Y:%m:%d %H:%M:%S")),
         ] {
             let probe = crate::download::metadata::ExifProbe {
                 datetime_original: Some(existing.clone()),
-                offset_time_original: None,
-                has_other_datetime_offset: false,
-                has_gps: false,
+                #[cfg(feature = "xmp")]
+                native_heif_capture_time:
+                    crate::download::metadata::HeifNativeCaptureTime::Present {
+                        datetime_original: Some(existing.clone()),
+                        offset_time_original: Some("+11:00".into()),
+                    },
                 ..crate::download::metadata::ExifProbe::default()
             };
             let write =
                 plan_metadata_write(MetadataFlags::DATETIME, &payload, &created_local, &probe);
+            assert!(write.datetime.is_none());
             assert_eq!(
                 write.offset_time_original.as_deref(),
                 Some("+11:00"),
                 "capture-local timestamp {existing:?} must accept its offset"
             );
+            #[cfg(feature = "xmp")]
+            assert_eq!(
+                probe.native_heif_capture_time_repair_required(&created_local, "+11:00"),
+                Ok(Some(false)),
+                "{existing}"
+            );
+            #[cfg(feature = "xmp")]
+            if existing == "2024-06-15T10:00:00.629+11:00" {
+                assert_eq!(
+                    probe.native_heif_capture_time_repair_required(&created_local, "+10:00"),
+                    Ok(Some(true)),
+                    "the native offset must still match"
+                );
+            }
         }
     }
 
@@ -1630,10 +1665,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("photo.jpg");
         std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
-        let (w, source_error) = plan_sidecar_write(&path, &payload, &now_local(), None);
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
+        let (w, source_error) = plan_sidecar_write(&path, &payload, &created_local, None);
         assert!(source_error.is_none());
         // Every payload field should land in the sidecar write, no flag gating.
-        assert!(w.datetime.is_some());
+        assert_eq!(w.datetime.as_deref(), Some("2024-06-15T10:00:00.629"));
         assert_eq!(w.offset_time_original.as_deref(), Some("+11:00"));
         assert_eq!(w.rating, Some(4));
         assert!(w.gps.is_some());
@@ -2086,10 +2122,11 @@ mod tests {
             .await
             .unwrap();
 
+        let created_local = now_local() + chrono::Duration::milliseconds(629);
         let record = crate::test_helpers::TestAssetRecord::new("CAPTURE_REPAIR_RECOVERY")
             .filename("capture-repair-recovery.jpg")
             .checksum("provider-checksum")
-            .created_at(now_local().with_timezone(&chrono::Utc))
+            .created_at(created_local.with_timezone(&chrono::Utc))
             .metadata(AssetMetadata {
                 timezone_offset: Some(39_600),
                 ..AssetMetadata::default()
@@ -2138,8 +2175,18 @@ mod tests {
             pending[0].capture_repair_receipt,
             Some(CaptureRepairReceipt::Prepared { .. })
         ));
+        assert_eq!(pending[0].asset.created_at, record.created_at);
+        let published = std::fs::read(&photo_path).unwrap();
+        let fingerprint = crate::download::file::fingerprint_regular_file(&photo_path)
+            .await
+            .unwrap();
+        assert!(receipt_matches_fingerprint(
+            pending[0].capture_repair_receipt.as_ref().unwrap(),
+            fingerprint
+        ));
+        assert_eq!(stored_checksums(&db).await, (Some(checksum.clone()), None));
         let probe = crate::download::metadata::probe_exif(&photo_path).unwrap();
-        assert!(probe.denotes_capture_time(&now_local()));
+        assert!(probe.denotes_capture_time(&created_local));
         assert_eq!(probe.offset_time_original.as_deref(), Some("+11:00"));
         drop(db);
 
@@ -2155,6 +2202,14 @@ mod tests {
         .await;
 
         assert_eq!(second, 0);
+        assert_eq!(std::fs::read(&photo_path).unwrap(), published);
+        assert_eq!(
+            stored_checksums(&reopened).await,
+            (
+                Some(fingerprint_checksum(fingerprint)),
+                Some(checksum.clone())
+            )
+        );
         assert!(
             reopened
                 .get_pending_metadata_rewrites_page_for_queue(
@@ -2194,6 +2249,11 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(std::fs::read(&photo_path).unwrap(), published);
+        assert_eq!(
+            stored_checksums(&reopened).await,
+            (Some(fingerprint_checksum(fingerprint)), Some(checksum))
         );
     }
 
@@ -3291,7 +3351,7 @@ mod tests {
             &path,
             &original_checksum,
             metadata.clone(),
-            None,
+            Some(now_local().to_utc()),
         )
         .await;
         db.fail_metadata_checksum_write_for_test();
@@ -3328,7 +3388,7 @@ mod tests {
             db.refresh_downloaded_asset_metadata(
                 "PrimarySync",
                 "PROVENANCE",
-                &metadata,
+                (&metadata, now_local().to_utc(), None),
                 true,
                 false,
                 crate::state::METADATA_CAPTURE_REVISION,
@@ -3489,7 +3549,7 @@ mod tests {
                 &path,
                 &checksum,
                 metadata.clone(),
-                None,
+                Some(now_local().to_utc()),
             )
             .await;
             db.mark_verified_download(
@@ -3548,7 +3608,7 @@ mod tests {
             db.refresh_downloaded_asset_metadata(
                 "PrimarySync",
                 "GPS_PROVENANCE",
-                &metadata,
+                (&metadata, now_local().to_utc(), None),
                 true,
                 false,
                 crate::state::METADATA_CAPTURE_REVISION,
@@ -3743,55 +3803,70 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn sidecar_write_reads_source_gps_from_dng_content() {
-        let dir = tempfile::tempdir().expect("metadata temp dir");
-        let media_path = dir.path().join("source.DNG");
-        let source_bytes = crate::test_helpers::minimal_tiff_with_source_gps();
-        std::fs::write(&media_path, &source_bytes).expect("write source DNG");
-        let payload = MetadataPayload {
-            rating: Some(4),
-            latitude: Some(12.3456),
-            longitude: Some(-78.9012),
-            altitude: Some(9.25),
-            ..MetadataPayload::default()
-        };
+        for (millis, expected) in [(0, "2024-06-15T10:00:00"), (629, "2024-06-15T10:00:00.629")] {
+            let dir = tempfile::tempdir().expect("metadata temp dir");
+            let media_path = dir.path().join("source.DNG");
+            let source_bytes = crate::test_helpers::minimal_tiff_with_source_gps();
+            std::fs::write(&media_path, &source_bytes).expect("write source DNG");
+            let payload = MetadataPayload {
+                rating: Some(4),
+                latitude: Some(12.3456),
+                longitude: Some(-78.9012),
+                altitude: Some(9.25),
+                ..MetadataPayload::default()
+            };
 
-        let outcome = write_download_metadata(MetadataWriteRequest {
-            final_path: &media_path,
-            embed_path: None,
-            expected_embed_fingerprint: None,
-            source_checksum: None,
-            sidecar_path: Some(&media_path),
-            payload: Arc::new(payload),
-            created_local: now_local(),
-            flags: MetadataFlags::XMP_SIDECAR,
-            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
-            temp_suffix: ".gps-dng-test",
-        })
-        .await;
+            let outcome = write_download_metadata(MetadataWriteRequest {
+                final_path: &media_path,
+                embed_path: None,
+                expected_embed_fingerprint: None,
+                source_checksum: None,
+                sidecar_path: Some(&media_path),
+                payload: Arc::new(payload),
+                created_local: now_local() + chrono::Duration::milliseconds(millis),
+                flags: MetadataFlags::XMP_SIDECAR,
+                capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+                temp_suffix: ".gps-dng-test",
+            })
+            .await;
 
-        assert!(!outcome.any_failed());
-        let sidecar_path = media_path.with_file_name("source.DNG.xmp");
-        let xmp = std::fs::read_to_string(&sidecar_path)
-            .expect("read DNG sidecar")
-            .parse::<XmpMeta>()
-            .expect("parse DNG sidecar");
-        crate::test_helpers::assert_source_gps_in_xmp(&xmp);
-        let value = |namespace, name| xmp.property(namespace, name).expect(name).value;
-        assert_eq!(value(xmp_ns::XMP, "Rating"), "4");
-        assert_eq!(value(xmp_ns::EXIF, "GPSLatitude"), "12,20.7360N");
-        assert_eq!(value(xmp_ns::EXIF, "GPSLongitude"), "78,54.0720W");
-        assert_eq!(value(xmp_ns::EXIF, "GPSAltitude"), "37/4");
-        assert_eq!(
-            std::fs::read(&media_path).expect("read source DNG after sidecar"),
-            source_bytes,
-            "sidecar-only metadata must not alter DNG bytes"
-        );
-        assert!(
-            !media_path
-                .with_file_name("source.DNG.xmp.gps-dng-test")
-                .exists(),
-            "successful sidecar publication must remove its temporary file"
-        );
+            assert!(!outcome.any_failed());
+            let sidecar_path = media_path.with_file_name("source.DNG.xmp");
+            let xmp = std::fs::read_to_string(&sidecar_path)
+                .expect("read DNG sidecar")
+                .parse::<XmpMeta>()
+                .expect("parse DNG sidecar");
+            crate::test_helpers::assert_source_gps_in_xmp(&xmp);
+            let value = |namespace, name| xmp.property(namespace, name).expect(name).value;
+            for (namespace, property) in [
+                (xmp_ns::XMP, "CreateDate"),
+                (xmp_ns::XMP, "ModifyDate"),
+                (xmp_ns::EXIF, "DateTimeOriginal"),
+                (xmp_ns::PHOTOSHOP, "DateCreated"),
+            ] {
+                assert_eq!(value(namespace, property), expected);
+            }
+            assert!(
+                xmp.property("http://cipa.jp/exif/1.0/", "OffsetTimeOriginal")
+                    .is_none()
+            );
+            assert_eq!(value(xmp_ns::XMP, "Rating"), "4");
+            assert_eq!(value(xmp_ns::EXIF, "GPSLatitude"), "12,20.7360N");
+            assert_eq!(value(xmp_ns::EXIF, "GPSLongitude"), "78,54.0720W");
+            assert_eq!(value(xmp_ns::EXIF, "GPSAltitude"), "37/4");
+            assert_eq!(
+                std::fs::read(&media_path).expect("read source DNG after sidecar"),
+                source_bytes,
+                "sidecar-only metadata must not alter DNG bytes"
+            );
+            assert!(
+                !media_path
+                    .with_file_name("source.DNG.xmp.gps-dng-test")
+                    .exists(),
+                "successful sidecar publication must remove its temporary file"
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        }
     }
 
     #[cfg(feature = "xmp")]
