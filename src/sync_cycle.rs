@@ -859,11 +859,19 @@ pub(crate) async fn run_cycle(
             )
             .await?;
             path_reconciliation_complete = path_reconciliation_complete && reconciliation.complete;
-            cycle_failed_count = cycle_failed_count
-                .saturating_add(reconciliation.stats.failed)
+            let reconciliation_failures = reconciliation
+                .stats
+                .failed
                 .saturating_add(reconciliation.stats.exif_failures)
                 .saturating_add(reconciliation.stats.state_write_failures);
+            cycle_failed_count = cycle_failed_count.saturating_add(reconciliation_failures);
             cycle_stats.accumulate(&reconciliation.stats);
+            if reconciliation_failures > 0 {
+                // A normal download/adoption pass must not move state past a
+                // rejected reconciliation destination or failed finalization.
+                db_sync_token_advance_safe = false;
+                continue;
+            }
         }
         let mut sync_result = download::download_photos_with_sync(
             &download_client,

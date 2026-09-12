@@ -41,6 +41,17 @@ lint settings, and dependency lockfile entries are not counted. There are no
 | `src/personality/tty_echo.rs::EchoGuard::restore_now` | `tcsetattr(STDIN_FILENO, TCSANOW, &t)` in `restore_now`. | Restores the saved terminal flags. Failure is ignored because the next shell prompt normally resets tty state. | Removable with the same safe termios rewrite as `src/personality/tty_echo.rs::EchoGuard::install`. |
 | `src/service/env.rs::effective_uid` | `libc::geteuid()` in `effective_uid`. | Centralizes effective-UID lookup for Unix service backends. `geteuid` is stateless and has no pointer or aliasing preconditions. | Removable by adding a direct safe wrapper dependency, for example `rustix::process::geteuid` or `nix::unistd::geteuid`. This is a good cleanup target because tests duplicate this same unsafe call. |
 
+## Reconciliation leaf checks
+
+- `src/download/file.rs::file_identity` (Windows): handle-information calls
+  write into correctly sized storage. The live handle outlasts each call;
+  `assume_init` runs only after success. The result pins comparisons to the
+  opened file. Safe `std` has no equivalent stable Windows file-ID API.
+- `src/download/file.rs::publish_reconciliation_part_blocking` (macOS):
+  `renamex_np` receives owned NUL-terminated paths and `RENAME_EXCL`. The kernel
+  rejects an existing destination atomically. An existence check followed by
+  ordinary rename would not preserve no-overwrite publication.
+
 ## Best production removal candidates
 
 The easiest local removals are:
