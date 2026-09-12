@@ -3554,10 +3554,15 @@ pub(crate) async fn reconcile_catalog_paths(
                             asset_id: Arc::from(state_id.as_str()),
                             version_size: expected.version_size,
                         };
-                        if !records_by_target.contains_key(&target) {
+                        let Some(record) = records_by_target.get(&target) else {
                             continue;
-                        }
-                        if let Err(error) = file::validate_reconciliation_leaf(&expected.path).await
+                        };
+                        if let Err(error) = file::validate_reconciliation_paths(
+                            &pass_config.directory,
+                            record.local_path.as_deref(),
+                            &expected.path,
+                        )
+                        .await
                         {
                             stats.failed += 1;
                             unsafe_destination = true;
@@ -3666,20 +3671,26 @@ pub(crate) async fn reconcile_catalog_paths(
             }
         }
         match file::copy_local_file_no_replace(
+            &config.directory,
             source_path,
             &task.download_path,
             &config.temp_suffix,
         )
         .await
         {
-            Ok(Some(local_checksum)) => {
+            Ok(Some(copy)) => {
+                if let Err(error) = copy.validate().await {
+                    stats.failed += 1;
+                    tracing::warn!(%error, "Reconciliation changed before state finalization");
+                    continue;
+                }
                 if let Err(error) = db
                     .mark_downloaded(
                         &task.library,
                         &task.asset_id,
                         task.version_size.as_str(),
                         &task.download_path,
-                        &local_checksum,
+                        copy.checksum(),
                         None,
                     )
                     .await
@@ -14131,6 +14142,32 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn path_reconciliation_rejects_leaf_symlink_then_recovers() {
+        path_reconciliation_rejects_unsafe_entry_then_recovers(ReconciliationUnsafeEntry::Leaf)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_reconciliation_rejects_parent_symlinks_then_recovers() {
+        for entry in [
+            ReconciliationUnsafeEntry::DestinationParent,
+            ReconciliationUnsafeEntry::SourceParent,
+        ] {
+            path_reconciliation_rejects_unsafe_entry_then_recovers(entry).await;
+        }
+    }
+
+    #[cfg(unix)]
+    enum ReconciliationUnsafeEntry {
+        Leaf,
+        DestinationParent,
+        SourceParent,
+    }
+
+    #[cfg(unix)]
+    async fn path_reconciliation_rejects_unsafe_entry_then_recovers(
+        entry: ReconciliationUnsafeEntry,
+    ) {
         #[derive(Clone, Debug)]
         struct LookupOnlySession {
             records: Arc<Vec<Value>>,
@@ -14163,7 +14200,8 @@ mod tests {
                 .expect("state db"),
         );
         let new_dir = TempDir::new().expect("new dir");
-        let old_path = old_dir.path().join("reconcile.jpg");
+        let old_path = old_dir.path().join("source/reconcile.jpg");
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
         tokio::fs::write(&old_path, vec![0u8; 1024]).await.unwrap();
         let local_checksum = file::compute_sha256(&old_path).await.unwrap();
         let record = crate::test_helpers::TestAssetRecord::new("RECONCILE")
@@ -14220,7 +14258,22 @@ mod tests {
         let target = external.path().join("target.jpg");
         std::fs::write(&target, vec![0u8; 1024]).unwrap();
         std::fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&target, &expected_path).unwrap();
+        let (unsafe_path, link_target) = match entry {
+            ReconciliationUnsafeEntry::Leaf => (expected_path.clone(), target.clone()),
+            ReconciliationUnsafeEntry::DestinationParent => {
+                let parent = expected_path.parent().unwrap().to_path_buf();
+                std::fs::remove_dir(&parent).unwrap();
+                (parent, external.path().to_path_buf())
+            }
+            ReconciliationUnsafeEntry::SourceParent => {
+                let parent = old_path.parent().unwrap().to_path_buf();
+                let retained = external.path().join("retained-source");
+                std::fs::rename(&parent, &retained).unwrap();
+                (parent, retained)
+            }
+        };
+        std::os::unix::fs::symlink(&link_target, &unsafe_path).unwrap();
+        let external_entries = std::fs::read_dir(external.path()).unwrap().count();
         let config = Arc::new(config);
         for _ in 0..2 {
             let result =
@@ -14238,10 +14291,17 @@ mod tests {
                 rows[0].local_checksum.as_deref(),
                 Some(local_checksum.as_str())
             );
-            assert_eq!(std::fs::read_link(&expected_path).unwrap(), target);
+            assert_eq!(std::fs::read_link(&unsafe_path).unwrap(), link_target);
             assert_eq!(std::fs::read(&target).unwrap(), vec![0u8; 1024]);
         }
-        std::fs::remove_file(&expected_path).unwrap();
+        assert_eq!(
+            std::fs::read_dir(external.path()).unwrap().count(),
+            external_entries
+        );
+        std::fs::remove_file(&unsafe_path).unwrap();
+        if matches!(entry, ReconciliationUnsafeEntry::SourceParent) {
+            std::fs::rename(&link_target, &unsafe_path).unwrap();
+        }
         let repaired =
             reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
                 .await

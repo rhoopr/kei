@@ -118,7 +118,21 @@ and leaves reconciliation incomplete. A blocking reconciliation failure skips
 that library's normal source/download pass, so adoption cannot bypass the
 rejection. Its provider checkpoint and the aggregate database pre-check token
 remain unchanged. Ambiguous temporary entries remain for
-inspection. These leaf checks do not confine ancestor directories.
+inspection.
+
+Reconciliation retains directory capabilities through state finalization.
+Descendant directories are opened without following symlinks. Source reads,
+temporary creation, validation, and publication use these retained handles;
+namespace replacement leaves reconciliation incomplete. Windows directory
+handles deny rename and delete sharing while the receipt is live. Unix checks
+that the retained parent still occupies the planned namespace before accepting
+the result. Publication and temporary-file checks remain descriptor-relative.
+When the configured root changes, the recorded old source is opened beneath
+the common lexical ancestor of the old path and new root, with no-follow
+traversal below that anchor. This allows root moves without trusting linked
+source directories. Destination writes stay beneath the new configured root.
+Relative paths are normalized inside the filesystem owner, not in durable
+catalogue keys. Metadata copying is a separate follow-up.
 
 ### Full and incremental enumeration
 
