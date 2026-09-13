@@ -113,7 +113,9 @@ Local path reconciliation opens source and destination leaf entries without
 following symlinks. It hashes the opened file and rechecks its identity before
 accepting a destination, including entries that appear during publication.
 Temporary copies use new unique names, verified bytes, and no-overwrite
-publication. An unsafe or replaced entry preserves the previous catalogue path
+publication. On Unix, they start with owner-only permissions, so a failed copy
+remains private. A completed copy receives the source permissions.
+An unsafe or replaced entry preserves the previous catalogue path
 and leaves reconciliation incomplete. A blocking reconciliation failure skips
 that library's normal source/download pass, so adoption cannot bypass the
 rejection. Its provider checkpoint and the aggregate database pre-check token
@@ -121,6 +123,10 @@ remain unchanged. Ambiguous temporary entries remain for
 inspection.
 
 Reconciliation retains directory capabilities through state finalization.
+Configured roots, recorded sources, destinations, and temporary siblings must
+not contain `..` components. Reconciliation rejects these paths before lexical
+normalization or filesystem writes, because a linked preceding component can
+change which directory `..` selects. Ordinary relative roots remain supported.
 Descendant directories are opened without following symlinks. Source reads,
 temporary creation, validation, and publication use these retained handles;
 namespace replacement leaves reconciliation incomplete. Windows directory
@@ -143,13 +149,19 @@ payload and source GPS facts. A source read failure stops before publication;
 it cannot leave an incomplete packet that blocks the next attempt. Generated
 packets do not infer native accuracy provenance from a local checksum.
 
+Reconciliation reserves recorded and planned paths by asset. A collision with
+another asset's reservation selects a stable identity-suffixed path. Each asset
+can reuse its own reservation across passes and retries, including after a
+partial state-write failure. Existing files alone do not select another name;
+the confined copy owner checks their bytes and rejects conflicts.
+
 Sidecar publication uses the same retained directory capabilities and refuses
 conflicting destination bytes. Reconciliation records the new catalogue path
 only after capture mtime, sidecar work, and final input checks succeed. It
 retains the old files and keeps failed work pending. Reconciliation planning
 includes existing media destinations so a retry after a metadata or state-write
 failure can finish without downloading or creating a second media copy.
-Reconciliation retries the rendered destination and leaves conflicting media
+Reconciliation retries the selected destination and leaves conflicting media
 or sidecars untouched; it does not allocate another collision filename on each
 attempt. Ordinary download collision naming and on-disk skip rules are unchanged.
 

@@ -22,6 +22,7 @@ use super::paths;
 #[derive(Debug)]
 pub(super) struct TaskPlanner {
     claimed_paths: FxHashMap<NormalizedPath, u64>,
+    reconciliation_claims: FxHashMap<Box<str>, FxHashMap<NormalizedPath, u64>>,
     dir_cache: paths::DirCache,
 }
 
@@ -29,8 +30,29 @@ impl TaskPlanner {
     pub(super) fn new() -> Self {
         Self {
             claimed_paths: FxHashMap::default(),
+            reconciliation_claims: FxHashMap::default(),
             dir_cache: paths::DirCache::new(),
         }
+    }
+
+    /// Reserve durable paths before planning so a later or unresolved asset's
+    /// current destination cannot be claimed by an earlier collision peer.
+    pub(super) fn for_reconciliation(records: &[AssetRecord]) -> Self {
+        let mut planner = Self::new();
+        for record in records {
+            if let Some(path) = &record.local_path {
+                let path = NormalizedPath::new(path);
+                planner
+                    .claimed_paths
+                    .insert(path.clone(), record.size_bytes);
+                planner
+                    .reconciliation_claims
+                    .entry(record.id.clone())
+                    .or_default()
+                    .insert(path, record.size_bytes);
+            }
+        }
+        planner
     }
 
     /// Convert one asset into download tasks after applying the shared
@@ -49,8 +71,27 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> AssetTaskPlan {
-        self.plan_asset_with_mode(asset, config, PathPlanningMode::Reconciliation)
-            .await
+        // Release only this asset's reservations while deriving its paths.
+        // Keep foreign owners reserved, including assets not hydrated this cycle.
+        let mut owned = self
+            .reconciliation_claims
+            .remove(asset.state_id())
+            .unwrap_or_default();
+        for path in owned.keys() {
+            self.claimed_paths.remove(path);
+        }
+        let plan = self
+            .plan_asset_with_mode(asset, config, PathPlanningMode::Reconciliation)
+            .await;
+        for task in &plan.tasks {
+            owned.insert(NormalizedPath::new(&task.download_path), task.size);
+        }
+        for (path, size) in &owned {
+            self.claimed_paths.insert(path.clone(), *size);
+        }
+        self.reconciliation_claims
+            .insert(asset.state_id().into(), owned);
+        plan
     }
 
     async fn plan_asset_with_mode(
@@ -441,6 +482,52 @@ mod tests {
         let mut planner = TaskPlanner::new();
         let plan = planner.plan_asset(&asset, &config).await;
         assert_eq!(plan.filter_reason, Some(FilterReason::ExcludedAlbum));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_planner_reuses_each_live_photo_family_across_passes() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let first_asset = TestPhotoAsset::new("FIRST")
+            .filename("IMG_0001.JPG")
+            .live_photo(
+                "https://p01.icloud-content.com/first.mov",
+                "first-motion",
+                1000,
+            )
+            .build();
+        let second_asset = TestPhotoAsset::new("SECOND")
+            .filename("IMG_0001.JPG")
+            .live_photo(
+                "https://p01.icloud-content.com/second.mov",
+                "second-motion",
+                1000,
+            )
+            .build();
+        let mut planner = TaskPlanner::for_reconciliation(&[]);
+        let first = planner
+            .plan_reconciliation_asset(&first_asset, &config)
+            .await;
+        let second = planner
+            .plan_reconciliation_asset(&second_asset, &config)
+            .await;
+        assert_eq!(first.tasks.len(), 2);
+        assert_eq!(second.tasks.len(), 2);
+        let paths: FxHashSet<_> = first
+            .tasks
+            .iter()
+            .chain(&second.tasks)
+            .map(|task| &task.download_path)
+            .collect();
+        assert_eq!(paths.len(), 4);
+        for (asset, previous) in [(&second_asset, &second), (&first_asset, &first)] {
+            let repeated = planner.plan_reconciliation_asset(asset, &config).await;
+            assert_eq!(repeated.tasks.len(), previous.tasks.len());
+            for (actual, expected) in repeated.tasks.iter().zip(&previous.tasks) {
+                assert_eq!(actual.version_size, expected.version_size);
+                assert_eq!(actual.download_path, expected.download_path);
+            }
+        }
     }
 
     #[tokio::test]

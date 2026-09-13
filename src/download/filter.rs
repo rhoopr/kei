@@ -1603,8 +1603,8 @@ fn available_collision_path(
         return None;
     }
 
-    let unavailable =
-        ctx.dir_cache.exists(&path) || ctx.claimed_paths.contains_key(normalized.as_str());
+    let unavailable = ctx.claimed_paths.contains_key(normalized.as_str())
+        || (matches!(ctx.planning_mode, PathPlanningMode::Download) && ctx.dir_cache.exists(&path));
     tried.push(normalized.into_boxed_str());
     if unavailable { None } else { Some(path) }
 }
@@ -1635,7 +1635,17 @@ fn resolve_download_path(
     // owner compares bytes and rejects conflicts instead of inventing a new
     // filename on every retry. Ordinary downloads retain collision naming.
     if matches!(ctx.planning_mode, PathPlanningMode::Reconciliation) {
-        return PathResolution::Download(download_path.to_path_buf());
+        let normalized = NormalizedPath::normalize(download_path);
+        if !ctx.claimed_paths.contains_key(normalized.as_ref()) {
+            return PathResolution::Download(download_path.to_path_buf());
+        }
+        // Another catalog asset owns this path. Ignore on-disk existence when
+        // choosing its stable sibling: the copy owner validates retry bytes.
+        return PathResolution::Download(first_available_collision_path(
+            ctx,
+            CollisionFilenameKind::AssetIdentity,
+            make_collision_filename,
+        ));
     }
     // Check for the file on disk. For primary photos, also check AM/PM
     // whitespace variants (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG").

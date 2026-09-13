@@ -3527,7 +3527,7 @@ pub(crate) async fn reconcile_catalog_paths(
             .iter()
             .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
     let batch = provider_pass.album.resolve_records(&requests).await;
-    let mut task_planner = planner::TaskPlanner::new();
+    let mut task_planner = planner::TaskPlanner::for_reconciliation(&records);
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
     let mut stats = SyncStats::default();
@@ -14269,6 +14269,127 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn path_reconciliation_rejects_parent_components_then_recovers() {
+        let old_dir = TempDir::new().unwrap();
+        let new_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let db_path = old_dir.path().join("state.db");
+        let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let old_path = old_dir.path().join("reconcile.jpg");
+        let bytes = vec![7u8; 1024];
+        std::fs::write(&old_path, &bytes).unwrap();
+        let checksum = file::compute_sha256(&old_path).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("PARENT_COMPONENT")
+            .filename("reconcile.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "PARENT_COMPONENT",
+            "original",
+            &old_path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-PARENT_COMPONENT", "PARENT_COMPONENT")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "before-reconciliation")
+            .await
+            .unwrap();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(mock_photo_records_for_zone_with_filename(
+                        "PARENT_COMPONENT",
+                        "PrimarySync",
+                        "reconcile.jpg",
+                    )),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let external_root = outside.path().join("photos");
+        let lexical_root = new_dir.path().join("photos");
+        std::fs::create_dir_all(outside.path().join("child")).unwrap();
+        std::fs::create_dir(&external_root).unwrap();
+        std::fs::create_dir(&lexical_root).unwrap();
+        std::fs::write(external_root.join("user.jpg"), b"external user bytes").unwrap();
+        std::fs::write(lexical_root.join("user.jpg"), b"local user bytes").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("child"), new_dir.path().join("link"))
+            .unwrap();
+        let mut config = test_config();
+        config.directory = Arc::from(new_dir.path().join("link/../photos"));
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+        for _ in 0..2 {
+            let rejected =
+                reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                    .await
+                    .unwrap();
+            assert!(!rejected.complete);
+            assert_eq!(rejected.stats.failed, 1);
+            assert_eq!(rejected.stats.downloaded, 0);
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].local_path.as_deref(), Some(old_path.as_path()));
+            assert_eq!(rows[0].local_checksum.as_deref(), Some(checksum.as_str()));
+            assert_eq!(
+                reopened
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("before-reconciliation")
+            );
+            assert_eq!(std::fs::read_dir(&lexical_root).unwrap().count(), 1);
+            assert_eq!(std::fs::read_dir(&external_root).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read(lexical_root.join("user.jpg")).unwrap(),
+                b"local user bytes"
+            );
+            assert_eq!(
+                std::fs::read(external_root.join("user.jpg")).unwrap(),
+                b"external user bytes"
+            );
+            assert_eq!(std::fs::read(&old_path).unwrap(), bytes);
+        }
+        // Use the intended root directly instead of the ambiguous spelling.
+        let mut recovered = (*config).clone();
+        recovered.directory = Arc::from(external_root.as_path());
+        let recovered = Arc::new(recovered);
+        let first =
+            reconcile_catalog_paths(&passes, Arc::clone(&recovered), CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(first.complete);
+        assert_eq!(first.stats.downloaded, 1);
+        let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+        let recorded = rows[0].local_path.as_ref().unwrap();
+        assert!(recorded.starts_with(&external_root));
+        assert_eq!(std::fs::read(recorded).unwrap(), bytes);
+        let steady = reconcile_catalog_paths(&passes, recovered, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(steady.complete);
+        assert_eq!(steady.stats.downloaded, 0);
+        let rows_after = reopened.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows_after[0].local_path, rows[0].local_path);
+        assert_eq!(std::fs::read(&old_path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&lexical_root).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
     enum ReconciliationUnsafeEntry {
         Leaf,
         DestinationParent,
@@ -14678,6 +14799,197 @@ mod tests {
             count
         );
         assert_eq!(std::fs::read(&new_sidecar).ok(), sidecar_before);
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_distinct_assets_keep_stable_paths() {
+        #[derive(Debug, Clone, Copy)]
+        enum CollisionCase {
+            EmptyRoot,
+            StateFailure,
+            LaterAssetAlreadyMoved,
+        }
+
+        for case in [
+            CollisionCase::EmptyRoot,
+            CollisionCase::StateFailure,
+            CollisionCase::LaterAssetAlreadyMoved,
+        ] {
+            let old_dir = TempDir::new().unwrap();
+            let new_dir = TempDir::new().unwrap();
+            let db_path = old_dir.path().join("state.db");
+            let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+            let mut provider_records = Vec::new();
+            let mut fixtures = Vec::new();
+            for (id, byte) in [("COLLIDE_A", 1u8), ("COLLIDE_B", 2u8)] {
+                let old_path = old_dir.path().join(format!("IMG_0001-{id}.JPG"));
+                std::fs::write(&old_path, vec![byte; 1024]).unwrap();
+                let checksum = file::compute_sha256(&old_path).await.unwrap();
+                let row = crate::test_helpers::TestAssetRecord::new(id)
+                    .filename("IMG_0001.JPG")
+                    .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                    .size(1024)
+                    .build();
+                db.upsert_seen(&row).await.unwrap();
+                db.mark_downloaded("PrimarySync", id, "original", &old_path, &checksum, None)
+                    .await
+                    .unwrap();
+                db.upsert_asset_master_mapping("PrimarySync", &format!("asset-{id}"), id)
+                    .await
+                    .unwrap();
+                let packet = format!(
+                    r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:custom="https://example.test/custom/" custom:Note="{id}"/></rdf:RDF></x:xmpmeta>"#
+                );
+                let sidecar = old_path.with_file_name(format!("IMG_0001-{id}.JPG.xmp"));
+                std::fs::write(&sidecar, packet.as_bytes()).unwrap();
+                fixtures.push((id, byte, old_path, checksum, sidecar, packet));
+                provider_records.extend(mock_photo_records_for_zone_with_filename(
+                    id,
+                    "PrimarySync",
+                    "IMG_0001.JPG",
+                ));
+            }
+            let asset = PhotoAsset::new(provider_records[0].clone(), provider_records[1].clone());
+            let passes = vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(provider_records),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }];
+            let mut config = test_config();
+            config.directory = Arc::from(new_dir.path());
+            config.state_db = Some(db.clone());
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = true;
+            }
+            let canonical = filter::expected_paths_for(&asset, &config).remove(0).path;
+            if matches!(case, CollisionCase::LaterAssetAlreadyMoved) {
+                let (id, byte, _, checksum, _, packet) = &fixtures[1];
+                std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+                std::fs::write(&canonical, vec![*byte; 1024]).unwrap();
+                #[cfg(feature = "xmp")]
+                {
+                    let mut name = canonical.file_name().unwrap().to_os_string();
+                    name.push(".xmp");
+                    std::fs::write(canonical.with_file_name(name), packet.as_bytes()).unwrap();
+                }
+                #[cfg(not(feature = "xmp"))]
+                let _ = packet;
+                db.mark_downloaded("PrimarySync", id, "original", &canonical, checksum, None)
+                    .await
+                    .unwrap();
+            }
+            if matches!(case, CollisionCase::StateFailure) {
+                db.acquire_lock("inject collision finalization failure").unwrap().execute_batch(
+                    "CREATE TEMP TRIGGER fail_collision_path BEFORE UPDATE OF local_path ON assets WHEN NEW.id = 'COLLIDE_A' AND NEW.local_path IS NOT OLD.local_path BEGIN SELECT RAISE(FAIL, 'injected collision state failure'); END;"
+                ).unwrap();
+            }
+            let config = Arc::new(config);
+            let first =
+                reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                    .await
+                    .unwrap();
+            assert_eq!(first.stats.failed, 0, "case {case:?}");
+            if matches!(case, CollisionCase::StateFailure) {
+                assert!(!first.complete);
+                assert_eq!(first.stats.downloaded, 1);
+                assert_eq!(first.stats.state_write_failures, 1);
+                let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+                let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                let failed = rows
+                    .iter()
+                    .find(|row| row.id.as_ref() == "COLLIDE_A")
+                    .unwrap();
+                assert_eq!(failed.local_path.as_deref(), Some(fixtures[0].2.as_path()));
+                let repeated =
+                    reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                        .await
+                        .unwrap();
+                assert_eq!(repeated.stats.downloaded, 0);
+                assert_eq!(repeated.stats.state_write_failures, 1);
+                assert_eq!(repeated.stats.failed, 0);
+                db.acquire_lock("restore collision finalization")
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER fail_collision_path")
+                    .unwrap();
+                let retry =
+                    reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                        .await
+                        .unwrap();
+                assert!(retry.complete);
+                assert_eq!(retry.stats.downloaded, 1);
+            } else {
+                assert!(first.complete, "case {case:?}");
+                assert_eq!(
+                    first.stats.downloaded,
+                    if matches!(case, CollisionCase::EmptyRoot) {
+                        2
+                    } else {
+                        1
+                    }
+                );
+            }
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_ne!(rows[0].local_path, rows[1].local_path);
+            for (id, byte, old_path, checksum, old_sidecar, packet) in &fixtures {
+                let row = rows.iter().find(|row| row.id.as_ref() == *id).unwrap();
+                let path = row.local_path.as_ref().unwrap();
+                assert!(path.starts_with(new_dir.path()));
+                assert_eq!(row.local_checksum.as_deref(), Some(checksum.as_str()));
+                assert_eq!(std::fs::read(path).unwrap(), vec![*byte; 1024]);
+                assert_eq!(std::fs::read(old_path).unwrap(), vec![*byte; 1024]);
+                assert_eq!(std::fs::read(old_sidecar).unwrap(), packet.as_bytes());
+                #[cfg(feature = "xmp")]
+                {
+                    let mut name = path.file_name().unwrap().to_os_string();
+                    name.push(".xmp");
+                    assert_eq!(
+                        std::fs::read(path.with_file_name(name)).unwrap(),
+                        packet.as_bytes()
+                    );
+                }
+                if matches!(case, CollisionCase::LaterAssetAlreadyMoved) && *id == "COLLIDE_B" {
+                    assert_eq!(path, &canonical);
+                }
+            }
+            let visible_entries = || {
+                let mut paths: Vec<_> = std::fs::read_dir(canonical.parent().unwrap())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        !path
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".kei-reconcile-")
+                    })
+                    .collect();
+                paths.sort();
+                paths
+            };
+            let before = visible_entries();
+            assert_eq!(before.len(), if cfg!(feature = "xmp") { 4 } else { 2 });
+            let steady = reconcile_catalog_paths(&passes, config, CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(steady.complete);
+            assert_eq!(steady.stats.downloaded, 0);
+            assert_eq!(visible_entries(), before);
+            let steady_rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            for (before, after) in rows.iter().zip(&steady_rows) {
+                assert_eq!(after.id, before.id);
+                assert_eq!(after.local_path, before.local_path);
+                assert_eq!(after.local_checksum, before.local_checksum);
+            }
+        }
     }
 
     #[tokio::test]
