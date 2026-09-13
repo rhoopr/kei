@@ -2237,6 +2237,9 @@ mod tests {
                 "--nocapture",
             ])
             .env(CHILD_DIRECTORY, dir.path())
+            // The injected limit must not leave a truncated LLVM profile for
+            // the parent coverage run to merge. Only discard the child's data.
+            .env("LLVM_PROFILE_FILE", "/dev/null")
             .output()
             .unwrap();
         assert!(
