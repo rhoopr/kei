@@ -43,14 +43,33 @@ lint settings, and dependency lockfile entries are not counted. There are no
 
 ## Reconciliation leaf checks
 
-- `src/download/file.rs::file_identity` (Windows): handle-information calls
+- `src/fs_util.rs::file_identity` (Windows): handle-information calls
   write into correctly sized storage. The live handle outlasts each call;
   `assume_init` runs only after success. The result pins comparisons to the
   opened file. Safe `std` has no equivalent stable Windows file-ID API.
-- `src/download/file.rs::publish_reconciliation_part_blocking` (macOS):
-  `renamex_np` receives owned NUL-terminated paths and `RENAME_EXCL`. The kernel
+- `src/download/file.rs::rename_confined_macos` (macOS):
+  `renameatx_np` receives retained descriptors, NUL-terminated names, and
+  `RENAME_EXCL`. The kernel
   rejects an existing destination atomically. An existence check followed by
   ordinary rename would not preserve no-overwrite publication.
+
+## Reconciliation ancestor checks
+
+- `src/fs_util.rs::openat_owned` transfers each successful syscall descriptor
+  into one `OwnedFd`. The retained directory and NUL-terminated name remain
+  live; the variadic mode has the promoted C integer type required on macOS.
+- `ConfinedPath::open_platform` uses `mkdirat` beneath retained directories,
+  then opens each component with `O_DIRECTORY | O_NOFOLLOW`. Every created
+  directory's parent is synced before traversal continues.
+- `ConfinedPath::entry_exists` uses `fstatat` with `AT_SYMLINK_NOFOLLOW` and
+  reads its output only after success. It never follows a replaced leaf.
+- `src/download/file.rs::renameat2_confined_blocking`,
+  `rename_confined_macos`, and `hard_link_confined` retain both parent
+  descriptors and NUL-terminated names for no-overwrite publication.
+- Windows attribute probes use live handles and correctly sized output
+  storage. Initialization is assumed only after the syscall succeeds.
+- `std` has no equivalent descriptor-relative traversal/publication API.
+  Replacing these calls with ordinary path operations would restore the race.
 
 ## Best production removal candidates
 
