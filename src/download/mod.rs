@@ -1930,11 +1930,8 @@ impl DownloadContext {
         &self,
         library: &str,
         asset_id: &str,
-        new_metadata_hash: Option<&str>,
+        capture: &crate::state::MetadataCapture,
     ) -> bool {
-        let Some(new_hash) = new_metadata_hash else {
-            return false;
-        };
         if self.is_soft_deleted(library, asset_id) {
             return false;
         }
@@ -1950,9 +1947,19 @@ impl DownloadContext {
             .get(library)
             .and_then(|assets| assets.get(asset_id));
         downloaded_versions.iter().any(|version_size| {
+            let Some(key) = VersionSizeKey::from_str(version_size) else {
+                return true;
+            };
+            let checksum = self
+                .downloaded_checksums
+                .get(library)
+                .and_then(|assets| assets.get(asset_id))
+                .and_then(|versions| versions.get(version_size.as_ref()))
+                .map_or("", AsRef::as_ref);
+            let metadata = capture.resolve(key, checksum);
             stored_hashes
                 .and_then(|hashes| hashes.get(version_size.as_ref()))
-                .is_none_or(|stored| stored.as_ref() != new_hash)
+                .is_none_or(|stored| Some(stored.as_ref()) != metadata.metadata_hash.as_deref())
         })
     }
 
@@ -4303,11 +4310,12 @@ async fn refresh_metadata_capture_candidate(
         return;
     }
     let mark_for_rewrite = MetadataFlags::from(config).has_any_write();
+    let capture = filter::metadata_capture(&asset);
     match db
         .refresh_downloaded_asset_metadata(
             &candidate.library,
             &candidate.asset_id,
-            (asset.metadata(), asset.created(), Some(asset.added_date())),
+            (&capture, asset.created(), Some(asset.added_date())),
             mark_for_rewrite,
             false,
             crate::state::METADATA_CAPTURE_REVISION,
@@ -7935,11 +7943,8 @@ async fn apply_changed_provider_metadata(
         return;
     };
     let library = asset.source_zone().unwrap_or(&config.library);
-    if !download_ctx.has_provider_metadata_drift(
-        library,
-        asset.state_id(),
-        asset.metadata().metadata_hash.as_deref(),
-    ) {
+    let capture = filter::metadata_capture(asset);
+    if !download_ctx.has_provider_metadata_drift(library, asset.state_id(), &capture) {
         return;
     }
     let mark_for_rewrite = MetadataFlags::from(config).has_any_write();
@@ -7947,7 +7952,7 @@ async fn apply_changed_provider_metadata(
         .refresh_downloaded_asset_metadata(
             library,
             asset.state_id(),
-            (asset.metadata(), asset.created(), Some(asset.added_date())),
+            (&capture, asset.created(), Some(asset.added_date())),
             mark_for_rewrite,
             false,
             crate::state::METADATA_CAPTURE_REVISION,
@@ -9330,45 +9335,55 @@ mod tests {
         asset: &PhotoAsset,
     ) -> PathBuf {
         let pass_config = config.with_pass(pass);
-        let expected = filter::expected_paths_for(asset, &pass_config)
+        let expected_paths = filter::expected_paths_for(asset, &pass_config);
+        for expected in &expected_paths {
+            tokio::fs::create_dir_all(expected.path.parent().expect("path has parent"))
+                .await
+                .expect("create expected parent");
+            tokio::fs::write(
+                &expected.path,
+                vec![0u8; usize::try_from(expected.size).expect("test asset size fits usize")],
+            )
+            .await
+            .expect("seed existing media");
+            let filename = expected
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("path has UTF-8 filename");
+            let record = TestAssetRecord::new(asset.state_id())
+                .library(asset.source_zone().unwrap_or(&pass_config.library))
+                .checksum(&expected.checksum)
+                .filename(filename)
+                .created_at(asset.created())
+                .size(expected.size)
+                .version_size(expected.version_size)
+                .metadata(
+                    (*filter::metadata_for_selected_version(
+                        asset,
+                        &pass_config,
+                        expected.version_size,
+                    ))
+                    .clone(),
+                )
+                .build();
+            db.upsert_seen(&record).await.expect("seed state row");
+            db.mark_downloaded(
+                asset.source_zone().unwrap_or(&pass_config.library),
+                asset.state_id(),
+                expected.version_size.as_str(),
+                &expected.path,
+                "seeded-local-sha256",
+                None,
+            )
+            .await
+            .expect("mark seeded media downloaded");
+        }
+        expected_paths
             .into_iter()
             .next()
-            .expect("asset should have an expected path");
-        tokio::fs::create_dir_all(expected.path.parent().expect("path has parent"))
-            .await
-            .expect("create expected parent");
-        tokio::fs::write(
-            &expected.path,
-            vec![0u8; usize::try_from(expected.size).expect("test asset size fits usize")],
-        )
-        .await
-        .expect("seed existing media");
-        let filename = expected
+            .expect("asset should have an expected path")
             .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("path has UTF-8 filename");
-        let record = TestAssetRecord::new(asset.state_id())
-            .library(asset.source_zone().unwrap_or(&pass_config.library))
-            .checksum(&expected.checksum)
-            .filename(filename)
-            .created_at(asset.created())
-            .size(expected.size)
-            .version_size(expected.version_size)
-            .metadata(asset.metadata().clone())
-            .build();
-        db.upsert_seen(&record).await.expect("seed state row");
-        db.mark_downloaded(
-            asset.source_zone().unwrap_or(&pass_config.library),
-            asset.state_id(),
-            expected.version_size.as_str(),
-            &expected.path,
-            "seeded-local-sha256",
-            None,
-        )
-        .await
-        .expect("mark seeded media downloaded");
-        expected.path
     }
 
     async fn relation_removed_metadata_edit_fixture(
@@ -11905,28 +11920,88 @@ mod tests {
 
     #[test]
     fn provider_metadata_refresh_is_a_noop_for_unchanged_hash() {
+        let metadata = |original, live| crate::state::MetadataCapture {
+            shared: Arc::new(crate::state::AssetMetadata::default()),
+            renditions: Arc::from(
+                [
+                    (VersionSizeKey::Original, original),
+                    (VersionSizeKey::LiveOriginal, live),
+                ]
+                .map(|(key, width)| {
+                    (
+                        key,
+                        crate::state::RenditionMetadata {
+                            checksum: Some(Arc::from("checksum")),
+                            width: Some(width),
+                            ..Default::default()
+                        },
+                    )
+                }),
+            ),
+        };
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
             .entry("PrimarySync".into())
             .or_default()
             .entry("asset1".into())
             .or_default()
-            .insert("original".into());
+            .extend(["original".into(), "live_original".into()]);
         ctx.downloaded_metadata_hashes
             .entry("PrimarySync".into())
             .or_default()
             .entry("asset1".into())
             .or_default()
-            .insert("original".into(), "metadata-a".into());
+            .extend([
+                (
+                    "original".into(),
+                    metadata(4000, 1920)
+                        .resolve(VersionSizeKey::Original, "checksum")
+                        .compute_hash()
+                        .into(),
+                ),
+                (
+                    "live_original".into(),
+                    metadata(4000, 1920)
+                        .resolve(VersionSizeKey::LiveOriginal, "checksum")
+                        .compute_hash()
+                        .into(),
+                ),
+            ]);
+        ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset1".into())
+            .or_default()
+            .extend([
+                ("original".into(), "checksum".into()),
+                ("live_original".into(), "checksum".into()),
+            ]);
 
-        assert!(!ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-a")));
-        assert!(ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-b")));
+        assert!(!ctx.has_provider_metadata_drift("PrimarySync", "asset1", &metadata(4000, 1920)));
+        assert!(ctx.has_provider_metadata_drift("PrimarySync", "asset1", &metadata(6000, 1920)));
+        assert!(ctx.has_provider_metadata_drift("PrimarySync", "asset1", &metadata(4000, 1280)));
+        ctx.downloaded_checksums.clear();
+        let unknown_hash = metadata(4000, 1920)
+            .resolve(VersionSizeKey::Original, "")
+            .compute_hash();
+        for versions in ctx.downloaded_metadata_hashes.values_mut() {
+            for hashes in versions.values_mut() {
+                for hash in hashes.values_mut() {
+                    *hash = unknown_hash.clone().into();
+                }
+            }
+        }
+        assert!(!ctx.has_provider_metadata_drift("PrimarySync", "asset1", &metadata(6000, 1280)));
     }
 
     /// A tombstoned row cannot be refreshed, so no staleness check may
     /// report it as needing one.
     #[test]
     fn staleness_checks_ignore_soft_deleted_assets() {
+        let metadata = crate::state::MetadataCapture {
+            shared: Arc::new(crate::state::AssetMetadata::default()),
+            renditions: Arc::from([]),
+        };
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
             .entry("PrimarySync".into())
@@ -11941,7 +12016,7 @@ mod tests {
             .or_default()
             .insert("original".into());
 
-        assert!(ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-b")));
+        assert!(ctx.has_provider_metadata_drift("PrimarySync", "asset1", &metadata));
         assert!(ctx.has_downloaded_metadata_retry_marker("PrimarySync", "asset1"));
         assert!(ctx.needs_metadata_rewrite(
             "PrimarySync",
@@ -11955,7 +12030,7 @@ mod tests {
             .or_default()
             .insert("asset1".into());
 
-        assert!(!ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-b")));
+        assert!(!ctx.has_provider_metadata_drift("PrimarySync", "asset1", &metadata));
         assert!(!ctx.has_downloaded_metadata_retry_marker("PrimarySync", "asset1"));
         assert!(!ctx.needs_metadata_rewrite(
             "PrimarySync",
@@ -16618,6 +16693,295 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoint() {
+        for (item_type, swapped_original_only) in [
+            ("public.jpeg", false),
+            ("com.apple.quicktime-movie", false),
+            ("public.jpeg", true),
+        ] {
+            for recent in [None, Some(10)] {
+                let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+                let dir = TempDir::new().unwrap();
+                let mut records = incremental_photo_records_with_favorite("REPLACED", false);
+                records[0]["fields"]["itemType"] = json!({"value": item_type});
+                records[0]["fields"]["resOriginalFileType"] = json!({"value": item_type});
+                records[0]["fields"]["resOriginalWidth"] = json!({"value": 1920});
+                records[0]["fields"]["resOriginalHeight"] = json!({"value": 1080});
+                records[1]["fields"]["duration"] = json!({"value": 12.5});
+                if swapped_original_only {
+                    records[0]["fields"]["resOriginalAltRes"] = json!({"value": {
+                        "downloadURL": "https://p01.icloud-content.com/alternative",
+                        "size": 2048, "fileChecksum": "raw-alternative",
+                    }});
+                    records[0]["fields"]["resOriginalAltFileType"] =
+                        json!({"value": "com.adobe.raw-image"});
+                    records[0]["fields"]["resOriginalAltWidth"] = json!({"value": 6000});
+                    records[0]["fields"]["resOriginalAltHeight"] = json!({"value": 4500});
+                }
+                let stored = PhotoAsset::new(records[0].clone(), records[1].clone())
+                    .with_state_record_name(Arc::from("asset-REPLACED"));
+                let pass = AlbumPass {
+                    kind: PassKind::Unfiled,
+                    album: changes_album(
+                        "",
+                        changes_zone_session(Arc::new(AtomicUsize::new(0)), records.clone()),
+                    ),
+                    exclude_ids: Arc::new(FxHashSet::default()),
+                };
+                let mut config = test_config();
+                config.directory = Arc::from(dir.path());
+                config.recent = recent;
+                config.file_match_policy = FileMatchPolicy::NameId7;
+                config.state_db = Some(db.clone());
+                config.raw_policy = RawPolicy::PreferRaw;
+                config.alternative = false;
+                seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored).await;
+                let mut initial = db.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(initial.len(), 1);
+                let before = initial.remove(0);
+                if swapped_original_only {
+                    assert_eq!(before.version_size, VersionSizeKey::Original);
+                    assert_eq!(before.checksum.as_ref(), "raw-alternative");
+                    assert_eq!(
+                        (before.metadata.width, before.metadata.height),
+                        (Some(6000), Some(4500))
+                    );
+                    for suffix in ["Res", "FileType", "Width", "Height"] {
+                        records[0]["fields"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove(&format!("resOriginalAlt{suffix}"));
+                    }
+                }
+                config.media.photos = false;
+                config.media.videos = false;
+                if !swapped_original_only {
+                    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                        json!("provider-replacement");
+                }
+                records[1]["fields"]["isFavorite"] = json!({"value": 1});
+                records[1]["fields"]["captionEnc"] =
+                    json!({"value": "replacement title", "type": "STRING"});
+                let changed = PhotoAsset::new(records[0].clone(), records[1].clone());
+                assert_eq!(
+                    changed.metadata_arc(VersionSizeKey::Original).width,
+                    Some(1920)
+                );
+                let mut expected_metadata =
+                    (*changed.metadata_arc(VersionSizeKey::Original)).clone();
+                expected_metadata.width = None;
+                expected_metadata.height = None;
+                expected_metadata.duration_secs = None;
+                expected_metadata.refresh_hash();
+                let mut token = "zone-token-prev".to_owned();
+                for cycle in 0..2 {
+                    if cycle == 1 {
+                        db.fail_provider_metadata_refresh_for_test();
+                    }
+                    let pass = AlbumPass {
+                        kind: PassKind::Unfiled,
+                        album: changes_album(
+                            "",
+                            changes_zone_session(Arc::new(AtomicUsize::new(0)), records.clone()),
+                        ),
+                        exclude_ids: Arc::new(FxHashSet::default()),
+                    };
+                    let result = download_photos_incremental(
+                        &Client::new(),
+                        &[pass],
+                        &Arc::new(config.clone()),
+                        &token,
+                        DownloadControls::download_hidden(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        matches!(result.outcome, DownloadOutcome::Success),
+                        "{item_type}, swapped={swapped_original_only}, recent={recent:?}, cycle={cycle}: {result:?}"
+                    );
+                    assert_eq!(result.stats.downloaded, 0);
+                    assert_eq!(result.stats.state_write_failures, 0);
+                    assert!(!result.stats.sync_token_blocked);
+                    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+                    token = result.sync_token.unwrap();
+                    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    let row = &rows[0];
+                    assert!(row.metadata.is_favorite);
+                    assert_eq!(row.metadata.title.as_deref(), Some("replacement title"));
+                    assert_eq!(row.metadata.metadata_hash, expected_metadata.metadata_hash);
+                    assert_eq!(
+                        (
+                            row.metadata.width,
+                            row.metadata.height,
+                            row.metadata.duration_secs
+                        ),
+                        (None, None, None)
+                    );
+                    assert_eq!(
+                        row.metadata.metadata_hash,
+                        Some(row.metadata.compute_hash())
+                    );
+                    assert_eq!(row.status, before.status);
+                    assert_eq!(row.local_path, before.local_path);
+                    assert_eq!(row.checksum, before.checksum);
+                    assert_eq!(row.local_checksum, before.local_checksum);
+                    assert_eq!(row.download_checksum, before.download_checksum);
+                    assert_eq!(row.downloaded_at, before.downloaded_at);
+                    assert_eq!(
+                        tokio::fs::read(row.local_path.as_ref().unwrap())
+                            .await
+                            .unwrap(),
+                        vec![0; row.size_bytes as usize]
+                    );
+                    assert!(db.get_pending().await.unwrap().is_empty());
+                    assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_blocking() {
+        for policy in [RawPolicy::PreferRaw, RawPolicy::PreferJpeg] {
+            let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+            let dir = TempDir::new().unwrap();
+            let mut records = incremental_photo_records_with_favorite("RAW_DELTA", false);
+            let (original_type, alternative_type) = if policy == RawPolicy::PreferRaw {
+                ("public.jpeg", "com.adobe.raw-image")
+            } else {
+                ("com.adobe.raw-image", "public.jpeg")
+            };
+            records[0]["fields"]["resOriginalFileType"] = json!({"value": original_type});
+            records[0]["fields"]["resOriginalAltRes"] = json!({"value": {
+                "downloadURL": "https://p01.icloud-content.com/alternative",
+                "size": 2048, "fileChecksum": "alternative",
+            }});
+            records[0]["fields"]["resOriginalAltFileType"] = json!({"value": alternative_type});
+            records[0]["fields"]["resOriginalWidth"] = json!({"value": 4000});
+            records[0]["fields"]["resOriginalHeight"] = json!({"value": 3000});
+            records[0]["fields"]["resOriginalAltWidth"] = json!({"value": 6000});
+            records[0]["fields"]["resOriginalAltHeight"] = json!({"value": 4500});
+            let stored = PhotoAsset::new(records[0].clone(), records[1].clone())
+                .with_state_record_name(Arc::from("asset-RAW_DELTA"));
+            let pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: changes_album(
+                    "",
+                    changes_zone_session(Arc::new(AtomicUsize::new(0)), records.clone()),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path());
+            config.raw_policy = policy;
+            config.alternative = true;
+            config.recent = Some(10);
+            config.state_db = Some(db.clone());
+            seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored).await;
+            let before = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(before.len(), 2);
+            config.raw_policy = RawPolicy::AsIs;
+            config.media.photos = false;
+            config.exclude_asset_ids = Arc::new(
+                ["RAW_DELTA".into(), "asset-RAW_DELTA".into()]
+                    .into_iter()
+                    .collect(),
+            );
+            records[0]["fields"]["resOriginalAltWidth"] = json!({"value": 6200});
+            let mut hashes = Vec::new();
+            for cycle in 0..4 {
+                if cycle == 1 {
+                    db.fail_provider_metadata_refresh_for_test();
+                }
+                if cycle == 2 {
+                    db.acquire_lock("allow raw delta refresh")
+                        .unwrap()
+                        .execute_batch("DROP TRIGGER fail_provider_metadata_refresh")
+                        .unwrap();
+                    records[0]["fields"]["resOriginalAltRes"]["value"]["fileChecksum"] =
+                        json!("unknown");
+                    records[0]["fields"]["resOriginalAltWidth"] = json!({"value": 9999});
+                    records[1]["fields"]["isFavorite"] = json!({"value": 1});
+                }
+                if cycle == 3 {
+                    db.fail_provider_metadata_refresh_for_test();
+                }
+                let pass = AlbumPass {
+                    kind: PassKind::Unfiled,
+                    album: changes_album(
+                        "",
+                        changes_zone_session(Arc::new(AtomicUsize::new(0)), records.clone()),
+                    ),
+                    exclude_ids: Arc::new(FxHashSet::default()),
+                };
+                let result = download_photos_incremental(
+                    &Client::new(),
+                    &[pass],
+                    &Arc::new(config.clone()),
+                    "zone-token-prev",
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.stats.downloaded, 0);
+                assert!(
+                    matches!(result.outcome, DownloadOutcome::Success),
+                    "{result:?}"
+                );
+                assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+                assert_eq!(result.stats.state_write_failures, 0);
+                let rows = db.get_downloaded_page(0, 10).await.unwrap();
+                for row in &rows {
+                    let initial = before
+                        .iter()
+                        .find(|initial| initial.version_size == row.version_size)
+                        .unwrap();
+                    let expected = if row.version_size == VersionSizeKey::Original {
+                        if cycle < 2 {
+                            (Some(6200), Some(4500))
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (Some(4000), Some(3000))
+                    };
+                    assert_eq!((row.metadata.width, row.metadata.height), expected);
+                    assert_eq!(row.metadata.is_favorite, cycle >= 2);
+                    if cycle >= 2 && row.version_size == VersionSizeKey::Original {
+                        assert_eq!(row.metadata.duration_secs, None);
+                    }
+                    assert_eq!(
+                        row.metadata.metadata_hash,
+                        Some(row.metadata.compute_hash())
+                    );
+                    assert_eq!(row.local_path, initial.local_path);
+                    assert_eq!(row.checksum, initial.checksum);
+                    assert_eq!(row.local_checksum, initial.local_checksum);
+                    assert_eq!(
+                        tokio::fs::read(row.local_path.as_ref().unwrap())
+                            .await
+                            .unwrap(),
+                        vec![0; row.size_bytes as usize]
+                    );
+                }
+                let current: Vec<_> = rows
+                    .iter()
+                    .map(|row| row.metadata.metadata_hash.clone())
+                    .collect();
+                if cycle == 0 || cycle == 2 {
+                    hashes = current;
+                } else {
+                    assert_eq!(hashes, current);
+                }
+                assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both_path_policies()
     {
         for policy in [
@@ -16626,10 +16990,46 @@ mod tests {
         ] {
             let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
             let dir = TempDir::new().expect("temp dir");
-            let stored_records = incremental_photo_records_with_favorite("METADATA_EDIT", false);
+            let mut stored_records =
+                incremental_photo_records_with_favorite("METADATA_EDIT", false);
+            stored_records[0]["fields"]["resOriginalWidth"] = json!({"value": 5712});
+            stored_records[0]["fields"]["resOriginalHeight"] = json!({"value": 4284});
+            stored_records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+                "downloadURL": "https://p01.icloud-content.com/changed.MOV",
+                "size": 2048,
+                "fileChecksum": "motion-checksum",
+            }});
+            stored_records[0]["fields"]["resOriginalVidComplFileType"] =
+                json!({"value": "com.apple.quicktime-movie"});
+            stored_records[0]["fields"]["resOriginalVidComplWidth"] = json!({"value": 1744});
+            stored_records[0]["fields"]["resOriginalVidComplHeight"] = json!({"value": 1308});
+            stored_records[1]["fields"]["duration"] = json!({"value": 0});
+            stored_records[1]["fields"]["vidComplDurValue"] = json!({"value": 2300000000_u64});
+            stored_records[1]["fields"]["vidComplDurScale"] = json!({"value": 1000000000});
             let stored_asset =
                 PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
-            let changed_records = incremental_photo_records_with_favorite("METADATA_EDIT", true);
+            // Only the companion dimensions change; the original hash must remain current.
+            let mut changed_records = stored_records;
+            changed_records[0]["fields"]["resOriginalVidComplWidth"] = json!({"value": 1920});
+            changed_records[0]["fields"]["resOriginalVidComplHeight"] = json!({"value": 1440});
+            let changed_asset =
+                PhotoAsset::new(changed_records[0].clone(), changed_records[1].clone());
+            assert_eq!(
+                stored_asset
+                    .metadata_arc(VersionSizeKey::Original)
+                    .metadata_hash,
+                changed_asset
+                    .metadata_arc(VersionSizeKey::Original)
+                    .metadata_hash
+            );
+            assert_ne!(
+                stored_asset
+                    .metadata_arc(VersionSizeKey::LiveOriginal)
+                    .metadata_hash,
+                changed_asset
+                    .metadata_arc(VersionSizeKey::LiveOriginal)
+                    .metadata_hash
+            );
             let pass = AlbumPass {
                 kind: PassKind::Unfiled,
                 album: changes_album(
@@ -16645,35 +17045,134 @@ mod tests {
             config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
             let media_path =
                 seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
-
-            let result = download_photos_incremental(
+            let initial = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(initial.len(), 2);
+            let config = Arc::new(config);
+            db.fail_provider_metadata_refresh_for_test();
+            let failed = download_photos_incremental(
                 &Client::new(),
                 std::slice::from_ref(&pass),
-                &Arc::new(config),
+                &config,
                 "zone-token-prev",
                 DownloadControls::download_hidden(),
                 CancellationToken::new(),
             )
             .await
-            .expect("metadata-only incremental sync should complete");
-
-            assert!(matches!(result.outcome, DownloadOutcome::Success));
-            assert_eq!(result.stats.downloaded, 0, "policy: {policy:?}");
-            assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-            let refreshed = db
-                .get_downloaded_page(0, 1)
-                .await
-                .expect("read refreshed row")
-                .remove(0);
-            assert!(refreshed.metadata.is_favorite, "policy: {policy:?}");
-            assert!(media_path.exists(), "policy: {policy:?}");
+            .unwrap();
+            assert!(matches!(
+                failed.outcome,
+                DownloadOutcome::PartialFailure { .. }
+            ));
+            assert_eq!(failed.stats.downloaded, 0);
+            assert_eq!(failed.sync_token, None);
+            assert!(failed.stats.sync_token_blocked);
+            assert!(failed.stats.state_write_failures > 0);
             assert_eq!(
-                std::fs::read_dir(media_path.parent().expect("media parent"))
-                    .expect("read media parent")
-                    .count(),
-                1,
-                "metadata-only edit must not create a suffixed duplicate under {policy:?}"
+                failed.stats.sync_token_blocked_reason,
+                Some(PROVIDER_METADATA_STATE_WRITE_FAILED_REASON)
             );
+            for row in db.get_downloaded_page(0, 10).await.unwrap() {
+                let before = initial
+                    .iter()
+                    .find(|before| before.version_size == row.version_size)
+                    .unwrap();
+                assert_eq!(
+                    row.metadata.metadata_hash,
+                    stored_asset.metadata_arc(row.version_size).metadata_hash
+                );
+                assert_eq!(row.metadata.width, before.metadata.width);
+                assert_eq!(row.metadata.height, before.metadata.height);
+                assert_eq!(row.metadata.duration_secs, before.metadata.duration_secs);
+                assert_eq!(row.status, before.status);
+                assert_eq!(row.local_path, before.local_path);
+                assert_eq!(row.checksum, before.checksum);
+                assert_eq!(row.local_checksum, before.local_checksum);
+                assert_eq!(row.download_checksum, before.download_checksum);
+                assert_eq!(
+                    tokio::fs::read(row.local_path.as_ref().unwrap())
+                        .await
+                        .unwrap(),
+                    vec![0u8; row.size_bytes as usize]
+                );
+            }
+            assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+            db.acquire_lock("test_allow_provider_metadata_refresh")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_provider_metadata_refresh")
+                .unwrap();
+
+            for cycle in 0..2 {
+                if cycle == 1 {
+                    db.fail_provider_metadata_refresh_for_test();
+                }
+                let result = download_photos_incremental(
+                    &Client::new(),
+                    std::slice::from_ref(&pass),
+                    &config,
+                    "zone-token-prev",
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("metadata-only incremental sync should complete");
+
+                assert!(matches!(result.outcome, DownloadOutcome::Success));
+                assert_eq!(result.stats.downloaded, 0, "policy: {policy:?}");
+                assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+                assert_eq!(result.stats.state_write_failures, 0);
+                let refreshed = db
+                    .get_downloaded_page(0, 10)
+                    .await
+                    .expect("read refreshed rows");
+                assert_eq!(refreshed.len(), 2);
+                assert_ne!(
+                    refreshed[0].metadata.metadata_hash,
+                    refreshed[1].metadata.metadata_hash
+                );
+                for row in &refreshed {
+                    let before = initial
+                        .iter()
+                        .find(|before| before.version_size == row.version_size)
+                        .unwrap();
+                    assert_eq!(
+                        row.metadata.metadata_hash,
+                        changed_asset.metadata_arc(row.version_size).metadata_hash
+                    );
+                    let (width, height, duration) = match row.version_size {
+                        VersionSizeKey::Original => (5712, 4284, 0.0),
+                        VersionSizeKey::LiveOriginal => (1920, 1440, 2.3),
+                        other => panic!("unexpected rendition {other:?}"),
+                    };
+                    assert_eq!(
+                        (
+                            row.metadata.width,
+                            row.metadata.height,
+                            row.metadata.duration_secs
+                        ),
+                        (Some(width), Some(height), Some(duration))
+                    );
+                    assert_eq!(row.status, before.status);
+                    assert_eq!(row.local_path, before.local_path);
+                    assert_eq!(row.checksum, before.checksum);
+                    assert_eq!(row.local_checksum, before.local_checksum);
+                    assert_eq!(row.download_checksum, before.download_checksum);
+                    assert_eq!(
+                        tokio::fs::read(row.local_path.as_ref().unwrap())
+                            .await
+                            .unwrap(),
+                        vec![0u8; row.size_bytes as usize]
+                    );
+                }
+                assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+                assert!(media_path.exists(), "policy: {policy:?}");
+                assert_eq!(
+                    std::fs::read_dir(media_path.parent().expect("media parent"))
+                        .expect("read media parent")
+                        .count(),
+                    2,
+                    "metadata-only edit must not create a suffixed duplicate under {policy:?}"
+                );
+            }
         }
     }
 
@@ -17130,7 +17629,22 @@ mod tests {
             db.refresh_downloaded_asset_metadata(
                 "PrimarySync",
                 &record.id,
-                (&record.metadata, record.created_at, record.added_at),
+                (
+                    &crate::state::MetadataCapture {
+                        shared: Arc::clone(&record.metadata),
+                        renditions: Arc::from([(
+                            record.version_size,
+                            crate::state::RenditionMetadata {
+                                checksum: Some(Arc::from(record.checksum.as_ref())),
+                                width: record.metadata.width,
+                                height: record.metadata.height,
+                                duration_secs: record.metadata.duration_secs,
+                            },
+                        )]),
+                    },
+                    record.created_at,
+                    record.added_at,
+                ),
                 false,
                 true,
                 crate::state::METADATA_CAPTURE_REVISION,
@@ -17268,6 +17782,7 @@ mod tests {
         config.metadata.xmp_sidecar = true;
         let expected = filter::expected_paths_for(&old, &config);
         assert_eq!(expected.len(), 2);
+        let capture = filter::metadata_capture(&old);
         for rendition in &expected {
             let bytes = if rendition.version_size == VersionSizeKey::Original {
                 still
@@ -17286,7 +17801,7 @@ mod tests {
                 .added_at(old.added_date())
                 .checksum(&rendition.checksum)
                 .size(rendition.size)
-                .metadata(old.metadata().clone())
+                .metadata(capture.resolve(rendition.version_size, &rendition.checksum))
                 .build();
             db.import_adopt(&record, &rendition.path, &checksum, rendition.size, None)
                 .await
