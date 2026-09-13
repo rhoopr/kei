@@ -14573,10 +14573,16 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn path_reconciliation_rejects_hardlinked_destination_then_recovers() {
+        reconciliation_metadata_transition(ReconciliationMetadataCase::HardLinkedDestination).await;
+    }
+
     #[derive(Debug)]
     enum ReconciliationMetadataCase {
         Disabled,
         MediaConflict,
+        HardLinkedDestination,
         Conflict,
         StateFailure,
         Missing,
@@ -14691,6 +14697,10 @@ mod tests {
             std::fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
             std::fs::write(&expected_path, vec![1u8; 1024]).unwrap();
         }
+        if matches!(mode, ReconciliationMetadataCase::HardLinkedDestination) {
+            std::fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
+            std::fs::hard_link(&old_path, &expected_path).unwrap();
+        }
         if matches!(mode, ReconciliationMetadataCase::StateFailure) {
             db.acquire_lock("inject reconciliation finalization failure").unwrap().execute_batch(
                 "CREATE TEMP TRIGGER fail_reconciled_path BEFORE UPDATE OF local_path ON assets WHEN NEW.local_path IS NOT OLD.local_path BEGIN SELECT RAISE(FAIL, 'injected reconciliation state failure'); END;"
@@ -14702,11 +14712,16 @@ mod tests {
             ReconciliationMetadataCase::Conflict
                 | ReconciliationMetadataCase::StateFailure
                 | ReconciliationMetadataCase::MediaConflict
+                | ReconciliationMetadataCase::HardLinkedDestination
         ) {
             let failed =
                 reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
                     .await
                     .unwrap();
+            assert_eq!(
+                std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+                old_time
+            );
             assert!(!failed.complete);
             assert_eq!(failed.stats.downloaded, 0);
             assert_eq!(
@@ -14730,6 +14745,28 @@ mod tests {
                 std::fs::remove_file(&expected_path).unwrap();
             } else {
                 assert_eq!(std::fs::read(&expected_path).unwrap(), vec![0u8; 1024]);
+            }
+            if matches!(mode, ReconciliationMetadataCase::HardLinkedDestination) {
+                let repeated =
+                    reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                        .await
+                        .unwrap();
+                assert!(!repeated.complete);
+                assert_eq!(repeated.stats.failed, 1);
+                assert_eq!(repeated.stats.downloaded, 0);
+                assert_eq!(
+                    std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+                    old_time
+                );
+                assert_eq!(
+                    std::fs::read_dir(expected_path.parent().unwrap())
+                        .unwrap()
+                        .count(),
+                    1
+                );
+                let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(rows[0].local_path.as_deref(), Some(old_path.as_path()));
+                std::fs::remove_file(&expected_path).unwrap();
             }
             if matches!(mode, ReconciliationMetadataCase::Conflict) {
                 assert_eq!(

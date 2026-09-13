@@ -1040,6 +1040,10 @@ impl ReconciledFile {
             let file = copy
                 .destination
                 .validate_for_metadata(file_identity(&copy.destination_file)?)?;
+            anyhow::ensure!(
+                file_identity(&copy.source_file)? != file_identity(&file)?,
+                "Reconciliation destination aliases the source file"
+            );
             use std::time::{Duration, UNIX_EPOCH};
             let duration = Duration::from_secs(timestamp.unsigned_abs());
             let time = if timestamp >= 0 {
