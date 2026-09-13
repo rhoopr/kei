@@ -14233,6 +14233,127 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn path_reconciliation_rejects_parent_components_then_recovers() {
+        let old_dir = TempDir::new().unwrap();
+        let new_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let db_path = old_dir.path().join("state.db");
+        let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let old_path = old_dir.path().join("reconcile.jpg");
+        let bytes = vec![7u8; 1024];
+        std::fs::write(&old_path, &bytes).unwrap();
+        let checksum = file::compute_sha256(&old_path).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("PARENT_COMPONENT")
+            .filename("reconcile.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "PARENT_COMPONENT",
+            "original",
+            &old_path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-PARENT_COMPONENT", "PARENT_COMPONENT")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "before-reconciliation")
+            .await
+            .unwrap();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(mock_photo_records_for_zone_with_filename(
+                        "PARENT_COMPONENT",
+                        "PrimarySync",
+                        "reconcile.jpg",
+                    )),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let external_root = outside.path().join("photos");
+        let lexical_root = new_dir.path().join("photos");
+        std::fs::create_dir_all(outside.path().join("child")).unwrap();
+        std::fs::create_dir(&external_root).unwrap();
+        std::fs::create_dir(&lexical_root).unwrap();
+        std::fs::write(external_root.join("user.jpg"), b"external user bytes").unwrap();
+        std::fs::write(lexical_root.join("user.jpg"), b"local user bytes").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("child"), new_dir.path().join("link"))
+            .unwrap();
+        let mut config = test_config();
+        config.directory = Arc::from(new_dir.path().join("link/../photos"));
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+        for _ in 0..2 {
+            let rejected =
+                reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                    .await
+                    .unwrap();
+            assert!(!rejected.complete);
+            assert_eq!(rejected.stats.failed, 1);
+            assert_eq!(rejected.stats.downloaded, 0);
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].local_path.as_deref(), Some(old_path.as_path()));
+            assert_eq!(rows[0].local_checksum.as_deref(), Some(checksum.as_str()));
+            assert_eq!(
+                reopened
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("before-reconciliation")
+            );
+            assert_eq!(std::fs::read_dir(&lexical_root).unwrap().count(), 1);
+            assert_eq!(std::fs::read_dir(&external_root).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read(lexical_root.join("user.jpg")).unwrap(),
+                b"local user bytes"
+            );
+            assert_eq!(
+                std::fs::read(external_root.join("user.jpg")).unwrap(),
+                b"external user bytes"
+            );
+            assert_eq!(std::fs::read(&old_path).unwrap(), bytes);
+        }
+        // Use the intended root directly instead of the ambiguous spelling.
+        let mut recovered = (*config).clone();
+        recovered.directory = Arc::from(external_root.as_path());
+        let recovered = Arc::new(recovered);
+        let first =
+            reconcile_catalog_paths(&passes, Arc::clone(&recovered), CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(first.complete);
+        assert_eq!(first.stats.downloaded, 1);
+        let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+        let recorded = rows[0].local_path.as_ref().unwrap();
+        assert!(recorded.starts_with(&external_root));
+        assert_eq!(std::fs::read(recorded).unwrap(), bytes);
+        let steady = reconcile_catalog_paths(&passes, recovered, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(steady.complete);
+        assert_eq!(steady.stats.downloaded, 0);
+        let rows_after = reopened.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows_after[0].local_path, rows[0].local_path);
+        assert_eq!(std::fs::read(&old_path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&lexical_root).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
     enum ReconciliationUnsafeEntry {
         Leaf,
         DestinationParent,

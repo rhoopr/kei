@@ -113,7 +113,9 @@ Local path reconciliation opens source and destination leaf entries without
 following symlinks. It hashes the opened file and rechecks its identity before
 accepting a destination, including entries that appear during publication.
 Temporary copies use new unique names, verified bytes, and no-overwrite
-publication. An unsafe or replaced entry preserves the previous catalogue path
+publication. On Unix, they start with owner-only permissions, so a failed copy
+remains private. A completed copy receives the source permissions.
+An unsafe or replaced entry preserves the previous catalogue path
 and leaves reconciliation incomplete. A blocking reconciliation failure skips
 that library's normal source/download pass, so adoption cannot bypass the
 rejection. Its provider checkpoint and the aggregate database pre-check token
@@ -121,6 +123,10 @@ remain unchanged. Ambiguous temporary entries remain for
 inspection.
 
 Reconciliation retains directory capabilities through state finalization.
+Configured roots, recorded sources, destinations, and temporary siblings must
+not contain `..` components. Reconciliation rejects these paths before lexical
+normalization or filesystem writes, because a linked preceding component can
+change which directory `..` selects. Ordinary relative roots remain supported.
 Descendant directories are opened without following symlinks. Source reads,
 temporary creation, validation, and publication use these retained handles;
 namespace replacement leaves reconciliation incomplete. Windows directory

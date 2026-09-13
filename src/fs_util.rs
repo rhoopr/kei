@@ -140,8 +140,8 @@ impl ConfinedPath {
         path: &Path,
         parents: ConfinedParents,
     ) -> std::io::Result<Self> {
-        let root = absolute_lexical(root)?;
-        let path = absolute_lexical(path)?;
+        let root = absolute_confined_path(root)?;
+        let path = absolute_confined_path(path)?;
         let relative = path.strip_prefix(&root).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -172,7 +172,7 @@ impl ConfinedPath {
     }
 
     pub(crate) fn sibling(&self, path: &Path) -> std::io::Result<Self> {
-        let path = absolute_lexical(path)?;
+        let path = absolute_confined_path(path)?;
         if path.parent() != self.path.parent() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -238,7 +238,8 @@ impl ConfinedPath {
                 self.parent_dir.as_raw_fd(),
                 &self.name,
                 libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o666,
+                // Keep in-progress and failed copies private before writing bytes.
+                0o600,
             )?))
         }
         #[cfg(windows)]
@@ -915,6 +916,26 @@ fn open_confined_regular_file_platform(
     }))
 }
 
+/// Resolve a confined path without changing parent-component semantics.
+///
+/// Returns `InvalidInput` for any `..` component: removing it lexically can
+/// bypass a symlink and select a different file before no-follow traversal.
+pub(crate) fn absolute_confined_path(path: &Path) -> std::io::Result<PathBuf> {
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Confined path must not contain parent components: {}",
+                path.display()
+            ),
+        ));
+    }
+    absolute_lexical(path)
+}
+
 /// Resolve `path` against the current directory and remove lexical `.` and
 /// `..` components without following filesystem symlinks.
 pub(crate) fn absolute_lexical(path: &Path) -> std::io::Result<std::path::PathBuf> {
@@ -1098,6 +1119,30 @@ where
 mod tests {
     use super::*;
     use std::io;
+
+    #[test]
+    fn confined_path_rejects_parent_components() {
+        let root = tempfile::tempdir().unwrap();
+        let ambiguous_root = root.path().join("child/..");
+        let path = root.path().join("file.jpg");
+        for (root_path, file_path) in [
+            (ambiguous_root.as_path(), path.as_path()),
+            (root.path(), root.path().join("child/../file.jpg").as_path()),
+        ] {
+            let error =
+                ConfinedPath::open(root_path, file_path, ConfinedParents::Create).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        let confined = ConfinedPath::open(root.path(), &path, ConfinedParents::Existing).unwrap();
+        assert_eq!(
+            confined
+                .sibling(&root.path().join("child/../sibling.jpg"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn confined_path_rejects_outside_root() {
