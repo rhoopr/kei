@@ -1314,7 +1314,8 @@ fn upsert_asset_row(
                   AND capture_repair_output_checksum <> '' \
                   AND capture_repair_output_size IS NOT NULL \
                   AND capture_repair_output_size >= 0 \
-                  AND (created_at IS NOT ?6 OR capture_repair_metadata_hash IS NOT ?3) \
+                  AND (created_at IS NOT ?6 \
+                       OR (version_size = ?4 AND capture_repair_metadata_hash IS NOT ?3)) \
                   AND (version_size <> ?4 OR checksum = ?5) \
             )"
             ),
@@ -12846,6 +12847,38 @@ mod tests {
         }
         // Different hashes are compatible when every prepared receipt still
         // matches its own rendition, including the additional tracked copies.
+        assert_ne!(snapshots[0].1.compute_hash(), snapshots[5].1.compute_hash());
+        for _ in 0..2 {
+            for (version, metadata) in &snapshots {
+                let record = TestAssetRecord::new("PHOTO")
+                    .version_size(*version)
+                    .created_at(created)
+                    .added_at(added)
+                    .metadata((**metadata).clone())
+                    .build();
+                db.upsert_seen(&record).await.unwrap();
+            }
+            let preserved = db
+                .get_pending_metadata_rewrites_page_for_queue(
+                    MetadataRewriteQueue::CaptureRepair,
+                    None,
+                    0,
+                    30,
+                )
+                .await
+                .unwrap();
+            assert_eq!(preserved.len(), rewrites.len());
+            for pending in preserved {
+                assert_eq!(
+                    pending.capture_repair_receipt,
+                    Some(CaptureRepairReceipt::Prepared {
+                        metadata_hash: pending.asset.metadata.compute_hash(),
+                        output_checksum: "prepared".into(),
+                        output_size: 2048,
+                    })
+                );
+            }
+        }
         assert_eq!(
             db.refresh_downloaded_asset_metadata(
                 "PrimarySync",
@@ -13890,26 +13923,6 @@ mod tests {
         )
         .await
         .unwrap();
-        // A prepared receipt freezes the whole family, so the sibling edits
-        // have to land before the receipt exists.
-        let changed = AssetMetadata {
-            metadata_hash: Some("metadata-v2".into()),
-            rating: Some(5),
-            ..AssetMetadata::default()
-        };
-        let changed_medium = TestAssetRecord::new("MULTI_REFRESH")
-            .version_size(VersionSizeKey::Medium)
-            .checksum("provider-medium")
-            .metadata(changed.clone())
-            .build();
-        db.upsert_seen(&changed_medium).await.unwrap();
-        let new_thumb = TestAssetRecord::new("MULTI_REFRESH")
-            .version_size(VersionSizeKey::Thumb)
-            .checksum("provider-thumb")
-            .metadata(changed.clone())
-            .build();
-        db.upsert_seen(&new_thumb).await.unwrap();
-
         let mut pending = db
             .get_pending_metadata_rewrites_page_for_queue(
                 MetadataRewriteQueue::CaptureRepair,
@@ -13927,6 +13940,41 @@ mod tests {
             .await
             .unwrap();
         assert!(pending.capture_repair_receipt.is_some());
+
+        // Sibling metadata edits do not invalidate the original's receipt.
+        let changed = AssetMetadata {
+            metadata_hash: Some("metadata-v2".into()),
+            rating: Some(5),
+            ..AssetMetadata::default()
+        };
+        let changed_medium = TestAssetRecord::new("MULTI_REFRESH")
+            .version_size(VersionSizeKey::Medium)
+            .checksum("provider-medium")
+            .created_at(DateTime::UNIX_EPOCH)
+            .metadata(changed.clone())
+            .build();
+        db.upsert_seen(&changed_medium).await.unwrap();
+        let new_thumb = TestAssetRecord::new("MULTI_REFRESH")
+            .version_size(VersionSizeKey::Thumb)
+            .checksum("provider-thumb")
+            .created_at(DateTime::UNIX_EPOCH)
+            .metadata(changed.clone())
+            .build();
+        db.upsert_seen(&new_thumb).await.unwrap();
+
+        // Capture-date drift remains blocked even when a sibling is replaced.
+        for checksum in ["provider-medium", "provider-replacement"] {
+            let mut guarded = changed_medium.clone();
+            guarded.checksum = checksum.into();
+            guarded.created_at = DateTime::from_timestamp_millis(1).unwrap();
+            assert!(matches!(
+                db.upsert_seen(&guarded).await,
+                Err(StateError::Invariant {
+                    operation: "upsert_seen",
+                    ..
+                })
+            ));
+        }
 
         // The prepared receipt still guards its own rendition against both an
         // edited catalogue and a drifted capture timestamp.
@@ -14023,10 +14071,8 @@ mod tests {
                 "metadata-v2".into()
             };
             assert_eq!(record.metadata.metadata_hash, Some(expected));
-            if record.version_size == VersionSizeKey::Original {
-                assert_eq!(record.created_at, DateTime::UNIX_EPOCH);
-                assert!(record.added_at.is_none());
-            }
+            assert_eq!(record.created_at, DateTime::UNIX_EPOCH);
+            assert!(record.added_at.is_none());
         }
         let receipts_after = db
             .get_pending_metadata_rewrites_page_for_queue(
