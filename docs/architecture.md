@@ -156,8 +156,12 @@ payload and source GPS facts. A source read failure stops before publication;
 it cannot leave an incomplete packet that blocks the next attempt. Generated
 packets do not infer native accuracy provenance from a local checksum.
 
-Reconciliation reserves recorded and planned paths by asset. A collision with
-another asset's reservation selects a stable identity-suffixed path. Each asset
+Reconciliation reserves recorded and planned paths by asset. Reservation keys
+use the filesystem owner's checked absolute paths, so equivalent relative and
+absolute roots share ownership. These keys do not change task or catalogue path
+spellings. Invalid reservation paths leave reconciliation incomplete and block
+file finalization. A collision with another asset's reservation selects a stable
+identity-suffixed path. Each asset
 can reuse its own reservation across passes and retries, including after a
 partial state-write failure. Existing files alone do not select another name;
 the confined copy owner checks their bytes and rejects conflicts.

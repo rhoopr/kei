@@ -3527,7 +3527,19 @@ pub(crate) async fn reconcile_catalog_paths(
             .iter()
             .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
     let batch = provider_pass.album.resolve_records(&requests).await;
-    let mut task_planner = planner::TaskPlanner::for_reconciliation(&records);
+    let mut task_planner = match planner::TaskPlanner::for_reconciliation(&records) {
+        Ok(planner) => planner,
+        Err(error) => {
+            tracing::warn!(%error, "Path reconciliation rejected an unsafe recorded path");
+            return Ok(PathReconciliationResult {
+                stats: SyncStats {
+                    failed: 1,
+                    ..SyncStats::default()
+                },
+                ..PathReconciliationResult::default()
+            });
+        }
+    };
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
     let mut stats = SyncStats::default();
@@ -3579,9 +3591,20 @@ pub(crate) async fn reconcile_catalog_paths(
                     if unsafe_destination {
                         continue;
                     }
-                    let plan = task_planner
+                    let plan = match task_planner
                         .plan_reconciliation_asset(&asset, pass_config)
-                        .await;
+                        .await
+                    {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            stats.failed += 1;
+                            tracing::warn!(%error, "Path reconciliation could not reserve planned paths");
+                            return Ok(PathReconciliationResult {
+                                complete: false,
+                                stats,
+                            });
+                        }
+                    };
                     if plan.filter_reason.is_some() {
                         continue;
                     }
@@ -14558,6 +14581,146 @@ mod tests {
         assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&expected_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&target).unwrap(), vec![0u8; 1024]);
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_equivalent_root_collisions_preserve_ownership() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&cwd).unwrap();
+        let relative = root.path().strip_prefix(&cwd).unwrap();
+        let db_path = root.path().join("state.db");
+        let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let mut config = test_config();
+        config.directory = Arc::from(relative);
+        config.state_db = Some(db.clone());
+        #[cfg(feature = "xmp")]
+        {
+            config.metadata.xmp_sidecar = true;
+        }
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(12345);
+        let mut provider_records = Vec::new();
+        let mut fixtures = Vec::new();
+        // Row order need not match the order of successful downloads: B owns
+        // the natural filename, although A's durable row comes first.
+        for (id, byte) in [("COLLIDE_A", 1u8), ("COLLIDE_B", 2u8)] {
+            let records =
+                mock_photo_records_for_zone_with_filename(id, "PrimarySync", "IMG_0001.JPG");
+            let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+            let canonical = filter::expected_paths_for(&asset, &config).remove(0).path;
+            let source = if id == "COLLIDE_A" {
+                canonical.with_file_name(paths::insert_asset_identity_suffix("IMG_0001.JPG", id))
+            } else {
+                canonical
+            };
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, vec![byte; 1024]).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old_time))
+                .unwrap();
+            let sidecar = source.with_extension("JPG.xmp");
+            std::fs::write(&sidecar, id.as_bytes()).unwrap();
+            let checksum = file::compute_sha256(&source).await.unwrap();
+            let row = crate::test_helpers::TestAssetRecord::new(id)
+                .filename("IMG_0001.JPG")
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build();
+            db.upsert_seen(&row).await.unwrap();
+            db.mark_downloaded("PrimarySync", id, "original", &source, &checksum, None)
+                .await
+                .unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", &format!("asset-{id}"), id)
+                .await
+                .unwrap();
+            fixtures.push((
+                id,
+                byte,
+                source.strip_prefix(relative).unwrap().to_path_buf(),
+                checksum,
+            ));
+            provider_records.extend(records);
+        }
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(provider_records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut old_directory = relative;
+        for directory in [root.path(), relative] {
+            config.directory = Arc::from(directory);
+            let config = Arc::new(config.clone());
+            db.acquire_lock("inject equivalent-root collision state failure").unwrap().execute_batch(
+                "CREATE TEMP TRIGGER fail_collision_root BEFORE UPDATE OF local_path ON assets WHEN NEW.id = 'COLLIDE_A' AND NEW.local_path IS NOT OLD.local_path BEGIN SELECT RAISE(FAIL, 'injected path state failure'); END;"
+            ).unwrap();
+            let failed =
+                reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                    .await
+                    .unwrap();
+            assert!(!failed.complete);
+            assert_eq!(failed.stats.failed, 0);
+            assert_eq!(failed.stats.exif_failures, 0);
+            assert_eq!(failed.stats.state_write_failures, 1);
+            assert_eq!(failed.stats.downloaded, 1);
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            for (id, _, suffix, _) in &fixtures {
+                let row = rows.iter().find(|row| row.id.as_ref() == *id).unwrap();
+                let expected = if *id == "COLLIDE_A" {
+                    old_directory
+                } else {
+                    directory
+                }
+                .join(suffix);
+                assert_eq!(row.local_path.as_deref(), Some(expected.as_path()));
+            }
+            db.acquire_lock("restore equivalent-root collision state writes")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_collision_root")
+                .unwrap();
+            for cycle in 0..2 {
+                let result =
+                    reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
+                        .await
+                        .unwrap();
+                assert!(result.complete);
+                assert_eq!(result.stats.downloaded, if cycle == 0 { 1 } else { 0 });
+                assert_eq!(result.stats.disk_bytes_written, 0);
+                let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(rows.len(), 2);
+                for (id, byte, suffix, checksum) in &fixtures {
+                    let destination = directory.join(suffix);
+                    let row = rows.iter().find(|row| row.id.as_ref() == *id).unwrap();
+                    assert_eq!(row.local_path.as_deref(), Some(destination.as_path()));
+                    assert_eq!(row.local_checksum.as_deref(), Some(checksum.as_str()));
+                    assert_eq!(std::fs::read(&destination).unwrap(), vec![*byte; 1024]);
+                    assert_eq!(
+                        std::fs::metadata(&destination).unwrap().modified().unwrap(),
+                        old_time
+                    );
+                    assert_eq!(
+                        std::fs::read(destination.with_extension("JPG.xmp")).unwrap(),
+                        id.as_bytes()
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(destination.parent().unwrap())
+                            .unwrap()
+                            .count(),
+                        4
+                    );
+                }
+            }
+            old_directory = directory;
+        }
     }
 
     #[tokio::test]

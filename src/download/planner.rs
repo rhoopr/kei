@@ -37,11 +37,11 @@ impl TaskPlanner {
 
     /// Reserve durable paths before planning so a later or unresolved asset's
     /// current destination cannot be claimed by an earlier collision peer.
-    pub(super) fn for_reconciliation(records: &[AssetRecord]) -> Self {
+    pub(super) fn for_reconciliation(records: &[AssetRecord]) -> Result<Self> {
         let mut planner = Self::new();
         for record in records {
             if let Some(path) = &record.local_path {
-                let path = NormalizedPath::new(path);
+                let path = PathPlanningMode::Reconciliation.key(path)?;
                 planner
                     .claimed_paths
                     .insert(path.clone(), record.size_bytes);
@@ -52,7 +52,7 @@ impl TaskPlanner {
                     .insert(path, record.size_bytes);
             }
         }
-        planner
+        Ok(planner)
     }
 
     /// Convert one asset into download tasks after applying the shared
@@ -62,15 +62,20 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> AssetTaskPlan {
+        #[expect(
+            clippy::expect_used,
+            reason = "only reconciliation keys perform fallible path resolution"
+        )]
         self.plan_asset_with_mode(asset, config, PathPlanningMode::Download)
             .await
+            .expect("ordinary download planning uses infallible spelling-only path keys")
     }
 
     pub(super) async fn plan_reconciliation_asset(
         &mut self,
         asset: &PhotoAsset,
         config: &DownloadConfig,
-    ) -> AssetTaskPlan {
+    ) -> Result<AssetTaskPlan> {
         // Release only this asset's reservations while deriving its paths.
         // Keep foreign owners reserved, including assets not hydrated this cycle.
         let mut owned = self
@@ -82,10 +87,16 @@ impl TaskPlanner {
         }
         let plan = self
             .plan_asset_with_mode(asset, config, PathPlanningMode::Reconciliation)
-            .await;
-        for task in &plan.tasks {
-            owned.insert(NormalizedPath::new(&task.download_path), task.size);
-        }
+            .await
+            .and_then(|plan| {
+                for task in &plan.tasks {
+                    owned.insert(
+                        PathPlanningMode::Reconciliation.key(&task.download_path)?,
+                        task.size,
+                    );
+                }
+                Ok(plan)
+            });
         for (path, size) in &owned {
             self.claimed_paths.insert(path.clone(), *size);
         }
@@ -99,13 +110,13 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
         planning_mode: PathPlanningMode,
-    ) -> AssetTaskPlan {
+    ) -> Result<AssetTaskPlan> {
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
-            return AssetTaskPlan {
+            return Ok(AssetTaskPlan {
                 tasks: Vec::new(),
                 filter_reason: Some(filter_reason),
                 malformed_resource: None,
-            };
+            });
         }
 
         pre_ensure_asset_dir(&mut self.dir_cache, asset, config).await;
@@ -115,17 +126,17 @@ impl TaskPlanner {
             &mut self.claimed_paths,
             &mut self.dir_cache,
             planning_mode,
-        );
+        )?;
         let malformed_resource = if tasks.is_empty() {
             super::filter::malformed_no_task_resource(asset, config)
         } else {
             None
         };
-        AssetTaskPlan {
+        Ok(AssetTaskPlan {
             tasks,
             filter_reason: None,
             malformed_resource,
-        }
+        })
     }
 
     pub(super) fn existing_path_match(&mut self, path: &Path) -> ExistingPathMatch {
@@ -504,13 +515,15 @@ mod tests {
                 1000,
             )
             .build();
-        let mut planner = TaskPlanner::for_reconciliation(&[]);
+        let mut planner = TaskPlanner::for_reconciliation(&[]).unwrap();
         let first = planner
             .plan_reconciliation_asset(&first_asset, &config)
-            .await;
+            .await
+            .unwrap();
         let second = planner
             .plan_reconciliation_asset(&second_asset, &config)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(first.tasks.len(), 2);
         assert_eq!(second.tasks.len(), 2);
         let paths: FxHashSet<_> = first
@@ -521,7 +534,10 @@ mod tests {
             .collect();
         assert_eq!(paths.len(), 4);
         for (asset, previous) in [(&second_asset, &second), (&first_asset, &first)] {
-            let repeated = planner.plan_reconciliation_asset(asset, &config).await;
+            let repeated = planner
+                .plan_reconciliation_asset(asset, &config)
+                .await
+                .unwrap();
             assert_eq!(repeated.tasks.len(), previous.tasks.len());
             for (actual, expected) in repeated.tasks.iter().zip(&previous.tasks) {
                 assert_eq!(actual.version_size, expected.version_size);
