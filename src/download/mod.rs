@@ -3688,13 +3688,18 @@ pub(crate) async fn reconcile_catalog_paths(
         .await
         {
             Ok(Some(copy)) => {
-                if let Err(error) = copy.set_capture_time(task.created_local.timestamp()).await {
+                // Equivalent root spellings only change the durable path. Do
+                // not rewrite timestamps or sidecars on the existing source.
+                let same_path = copy.is_same_path();
+                if !same_path
+                    && let Err(error) = copy.set_capture_time(task.created_local.timestamp()).await
+                {
                     stats.failed += 1;
                     tracing::warn!(%error, "Could not restore reconciled capture mtime");
                     continue;
                 }
                 #[cfg(feature = "xmp")]
-                let sidecar = if config.metadata.xmp_sidecar {
+                let sidecar = if !same_path && config.metadata.xmp_sidecar {
                     match metadata_rewrite::write_reconciled_sidecar(
                         Arc::clone(&copy),
                         Arc::clone(&task.metadata),
@@ -3749,8 +3754,10 @@ pub(crate) async fn reconcile_catalog_paths(
                     } else {
                         stats.videos_downloaded += 1;
                     }
-                    stats.disk_bytes_written =
-                        stats.disk_bytes_written.saturating_add(record.size_bytes);
+                    if !same_path {
+                        stats.disk_bytes_written =
+                            stats.disk_bytes_written.saturating_add(record.size_bytes);
+                    }
                 }
             }
             Ok(None) => {
@@ -14551,6 +14558,137 @@ mod tests {
         assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&expected_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&target).unwrap(), vec![0u8; 1024]);
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_equivalent_roots_preserve_files_across_retry() {
+        for packet in [None, Some(b"unchanged user-owned sidecar".as_slice())] {
+            let cwd = std::env::current_dir().unwrap();
+            let root = tempfile::tempdir_in(&cwd).unwrap();
+            let relative = root.path().strip_prefix(&cwd).unwrap();
+            let db_path = root.path().join("state.db");
+            let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+            let records = mock_photo_records_for_zone_with_filename(
+                "RECONCILE",
+                "PrimarySync",
+                "reconcile.jpg",
+            );
+            let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+            let passes = vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(records),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }];
+            let mut config = test_config();
+            config.directory = Arc::from(relative);
+            config.state_db = Some(db.clone());
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = true;
+            }
+            let source = filter::expected_paths_for(&asset, &config).remove(0).path;
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, vec![1u8; 1024]).unwrap();
+            let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(12345);
+            std::fs::File::options()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old_time))
+                .unwrap();
+            let sidecar = source.with_file_name("reconcile.jpg.xmp");
+            if let Some(packet) = packet {
+                std::fs::write(&sidecar, packet).unwrap();
+            }
+            let checksum = file::compute_sha256(&source).await.unwrap();
+            let row = crate::test_helpers::TestAssetRecord::new("RECONCILE")
+                .filename("reconcile.jpg")
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build();
+            db.upsert_seen(&row).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "RECONCILE",
+                "original",
+                &source,
+                &checksum,
+                None,
+            )
+            .await
+            .unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", "asset-RECONCILE", "RECONCILE")
+                .await
+                .unwrap();
+            let mut recorded_path = source.clone();
+            for directory in [root.path(), relative] {
+                let old_hash = hash_download_config(&config);
+                config.directory = Arc::from(directory);
+                assert_ne!(hash_download_config(&config), old_hash);
+                let destination = filter::expected_paths_for(&asset, &config).remove(0).path;
+                let cycle_config = Arc::new(config.clone());
+                db.acquire_lock("inject equivalent-root finalization failure").unwrap().execute_batch(
+                    "CREATE TEMP TRIGGER fail_equivalent_root BEFORE UPDATE OF local_path ON assets WHEN NEW.local_path IS NOT OLD.local_path BEGIN SELECT RAISE(FAIL, 'injected path state failure'); END;"
+                ).unwrap();
+                let failed = reconcile_catalog_paths(
+                    &passes,
+                    Arc::clone(&cycle_config),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert!(!failed.complete);
+                assert_eq!(failed.stats.failed, 0);
+                assert_eq!(failed.stats.exif_failures, 0);
+                assert_eq!(failed.stats.state_write_failures, 1);
+                assert_eq!(failed.stats.downloaded, 0);
+                assert_eq!(
+                    std::fs::metadata(&source).unwrap().modified().unwrap(),
+                    old_time
+                );
+                assert_eq!(std::fs::read(&sidecar).ok().as_deref(), packet);
+                let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+                let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(rows[0].local_path.as_deref(), Some(recorded_path.as_path()));
+                db.acquire_lock("restore equivalent-root finalization")
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER fail_equivalent_root")
+                    .unwrap();
+                for cycle in 0..2 {
+                    let result = reconcile_catalog_paths(
+                        &passes,
+                        Arc::clone(&cycle_config),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(result.complete);
+                    assert_eq!(result.stats.downloaded, if cycle == 0 { 1 } else { 0 });
+                    assert_eq!(result.stats.disk_bytes_written, 0);
+                    assert_eq!(std::fs::read(&source).unwrap(), vec![1u8; 1024]);
+                    assert_eq!(
+                        std::fs::metadata(&source).unwrap().modified().unwrap(),
+                        old_time
+                    );
+                    assert_eq!(std::fs::read(&sidecar).ok().as_deref(), packet);
+                    assert_eq!(
+                        std::fs::read_dir(source.parent().unwrap()).unwrap().count(),
+                        1 + usize::from(packet.is_some())
+                    );
+                    let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].local_path.as_deref(), Some(destination.as_path()));
+                    assert_eq!(rows[0].local_checksum.as_deref(), Some(checksum.as_str()));
+                }
+                recorded_path = destination;
+            }
+        }
     }
 
     #[tokio::test]

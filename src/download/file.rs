@@ -1028,6 +1028,12 @@ impl ReconciledFile {
         &self.checksum
     }
 
+    /// Both paths have passed confined traversal and absolute normalization.
+    #[must_use]
+    pub(super) fn is_same_path(&self) -> bool {
+        self.source.path() == self.destination.path()
+    }
+
     pub(super) async fn validate(self: &Arc<Self>) -> anyhow::Result<()> {
         let copy = Arc::clone(self);
         tokio::task::spawn_blocking(move || copy.validate_blocking()).await?

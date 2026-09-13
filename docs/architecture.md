@@ -140,10 +140,14 @@ source directories. Destination writes stay beneath the new configured root.
 Relative paths are normalized inside the filesystem owner, not in durable
 catalogue keys.
 
-A reconciled media path receives the same capture mtime as a normal download.
-Before changing timestamps, reconciliation rejects a destination that shares
-the source file's identity, including a hard link. The source mtime and catalogue
-path stay unchanged until the conflicting entry is resolved.
+A reconciled media copy receives the same capture mtime as a normal download.
+If the retained source and destination paths resolve to the same pathname,
+reconciliation only updates the catalogue path spelling. It preserves media
+mtime and existing or absent sidecars, then validates media before finalization.
+This permits changes between relative and absolute download roots.
+Before changing timestamps, reconciliation rejects a distinct destination that
+shares the source file's identity, including a hard link. The source mtime and
+catalogue path stay unchanged until the conflicting entry is resolved.
 When XMP sidecars are enabled, an existing source packet is validated and
 copied byte-for-byte, including custom properties and ownership markers. Path
 migration does not upgrade or regenerate an existing packet. If no source
