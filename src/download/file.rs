@@ -1042,11 +1042,15 @@ fn copy_local_file_no_replace_blocking(
         ".kei-reconcile-{}{temp_suffix}",
         uuid::Uuid::new_v4()
     ));
-    let mut part = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&part_path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Keep in-progress and failed copies private, before any bytes exist.
+        options.mode(0o600);
+    }
+    let mut part = options.open(&part_path)?;
     let part_identity = file_identity(&part)?;
     use std::io::Seek;
     source_file.rewind()?;
@@ -2152,6 +2156,11 @@ mod tests {
         let source = dir.path().join("source.jpg");
         let destination = dir.path().join("nested/destination.jpg");
         std::fs::write(&source, b"catalog bytes").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
 
         let copied = copy_local_file_no_replace(&source, &destination, ".part")
             .await
@@ -2159,6 +2168,18 @@ mod tests {
         assert!(copied.is_some());
         assert_eq!(std::fs::read(&source).unwrap(), b"catalog bytes");
         assert_eq!(std::fs::read(&destination).unwrap(), b"catalog bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
 
         std::fs::write(&destination, b"user bytes").unwrap();
         let conflict = copy_local_file_no_replace(&source, &destination, ".part")
@@ -2166,6 +2187,106 @@ mod tests {
             .unwrap();
         assert_eq!(conflict, None);
         assert_eq!(std::fs::read(&destination).unwrap(), b"user bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconciliation_leaf_failed_copy_retains_private_partial_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_DIRECTORY: &str = "KEI_TEST_PRIVATE_RECONCILIATION_COPY";
+        const SOURCE_BYTES: &[u8] = &[0x5a; 8192];
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let directory = PathBuf::from(directory);
+            let error = copy_local_file_no_replace(
+                &directory.join("source.jpg"),
+                &directory.join("destination.jpg"),
+                ".part",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EFBIG)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        let destination = dir.path().join("destination.jpg");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&source, SOURCE_BYTES).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Isolate the umask, file-size limit, and signal disposition from other
+        // tests. Ignore SIGXFSZ so the real copy returns an error after writing.
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "umask 022; trap '' XFSZ; ulimit -f 2; exec \"$@\"",
+                "reconciliation-copy-test",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "download::file::tests::reconciliation_leaf_failed_copy_retains_private_partial_file",
+                "--nocapture",
+            ])
+            .env(CHILD_DIRECTORY, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(!destination.exists());
+        let partials: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "part"))
+            .collect();
+        assert_eq!(partials.len(), 1);
+        let partial = &partials[0];
+        let partial_bytes = std::fs::read(partial).unwrap();
+        assert!(!partial_bytes.is_empty());
+        assert!(partial_bytes.len() < SOURCE_BYTES.len());
+        assert_eq!(partial_bytes, SOURCE_BYTES[..partial_bytes.len()]);
+        assert_eq!(
+            std::fs::metadata(partial).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Retry without the limit, then reuse the published file unchanged.
+        let mut file_count_after_retry = None;
+        for _ in 0..2 {
+            assert!(
+                copy_local_file_no_replace(&source, &destination, ".part")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            for path in [&source, &destination] {
+                assert_eq!(std::fs::read(path).unwrap(), SOURCE_BYTES);
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            assert_eq!(std::fs::read(partial).unwrap(), partial_bytes);
+            // Hard-link publication can retain the successful temporary file.
+            let file_count = std::fs::read_dir(dir.path()).unwrap().count();
+            if let Some(previous_count) = file_count_after_retry {
+                assert_eq!(file_count, previous_count);
+            }
+            file_count_after_retry = Some(file_count);
+        }
     }
 
     #[cfg(unix)]

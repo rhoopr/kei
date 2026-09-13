@@ -113,7 +113,9 @@ Local path reconciliation opens source and destination leaf entries without
 following symlinks. It hashes the opened file and rechecks its identity before
 accepting a destination, including entries that appear during publication.
 Temporary copies use new unique names, verified bytes, and no-overwrite
-publication. An unsafe or replaced entry preserves the previous catalogue path
+publication. On Unix, they start with owner-only permissions, so a failed copy
+remains private. A completed copy receives the source permissions.
+An unsafe or replaced entry preserves the previous catalogue path
 and leaves reconciliation incomplete. A blocking reconciliation failure skips
 that library's normal source/download pass, so adoption cannot bypass the
 rejection. Its provider checkpoint and the aggregate database pre-check token
