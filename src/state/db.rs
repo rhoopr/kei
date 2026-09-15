@@ -352,6 +352,7 @@ pub(crate) struct ReconciliationReservation {
 pub(crate) struct ReconciliationCatalogPath {
     pub(crate) library: Arc<str>,
     pub(crate) asset_id: Box<str>,
+    pub(crate) version_size: VersionSizeKey,
     pub(crate) path: PathBuf,
 }
 
@@ -6211,14 +6212,16 @@ impl ReconciliationStateStore for SqliteStateDb {
     ) -> Result<Vec<ReconciliationCatalogPath>, StateError> {
         self.with_conn("get_reconciliation_catalog_paths", move |conn| {
             let mut statement = conn.prepare_cached(
-                "SELECT library, id, local_path FROM assets WHERE local_path IS NOT NULL \
-                 UNION SELECT library, id, local_path FROM asset_metadata_paths",
+                "SELECT library, id, version_size, local_path FROM assets WHERE local_path IS NOT NULL \
+                 UNION SELECT library, id, version_size, local_path FROM asset_metadata_paths",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(ReconciliationCatalogPath {
                     library: row.get::<_, String>(0)?.into(),
                     asset_id: row.get::<_, String>(1)?.into_boxed_str(),
-                    path: PathBuf::from(row.get::<_, String>(2)?),
+                    version_size: VersionSizeKey::from_str(&row.get::<_, String>(2)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    path: PathBuf::from(row.get::<_, String>(3)?),
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()

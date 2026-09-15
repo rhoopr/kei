@@ -14602,6 +14602,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn path_reconciliation_live_resolution_change_preserves_rendition_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let mut records =
+            mock_photo_records_for_zone_with_filename("LIVE", "PrimarySync", "live.jpg");
+        for (key, size, url) in [
+            ("resOriginalVidCompl", 1024, "original"),
+            ("resVidMed", 512, "medium"),
+        ] {
+            records[0]["fields"][format!("{key}Res")] = json!({"value": {
+                "downloadURL": format!("https://p01.icloud-content.com/{url}.mov"),
+                "size": size, "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            }});
+            records[0]["fields"][format!("{key}FileType")] =
+                json!({"value": "com.apple.quicktime-movie"});
+        }
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let mut config = test_config();
+        config.directory = Arc::from(root.path().join("new"));
+        std::fs::create_dir_all(&config.directory).unwrap();
+        config.state_db = Some(db.clone());
+        let expected = filter::expected_paths_for(&asset, &config);
+        assert_eq!(expected.len(), 2);
+        for item in expected {
+            let source = root.path().join("old").join(item.path.file_name().unwrap());
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, vec![1u8; 1024]).unwrap();
+            let checksum = file::compute_sha256(&source).await.unwrap();
+            let row = crate::test_helpers::TestAssetRecord::new("LIVE")
+                .filename("live.jpg")
+                .version_size(item.version_size)
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build();
+            db.upsert_seen(&row).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "LIVE",
+                item.version_size.as_str(),
+                &source,
+                &checksum,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.upsert_asset_master_mapping("PrimarySync", "asset-LIVE", "LIVE")
+            .await
+            .unwrap();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let first =
+            reconcile_catalog_paths(&passes, Arc::new(config.clone()), CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(first.complete, "initial move: {first:?}");
+        assert_eq!(first.stats.downloaded, 2);
+        let steady =
+            reconcile_catalog_paths(&passes, Arc::new(config.clone()), CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(steady.complete);
+        assert_eq!(steady.stats.downloaded, 0);
+        config.state_db = Some(Arc::new(
+            crate::state::SqliteStateDb::open(&db_path).await.unwrap(),
+        ));
+        config.live_resolution = AssetVersionSize::LiveMedium;
+        let changed =
+            reconcile_catalog_paths(&passes, Arc::new(config.clone()), CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(
+            changed.complete,
+            "changing live resolution must leave the newly selected rendition to normal download: {changed:?}"
+        );
+        assert_eq!(changed.stats.downloaded, 0);
+        assert_eq!(changed.stats.state_write_failures, 0);
+        let reservations = db.get_reconciliation_reservations().await.unwrap();
+        assert_eq!(reservations.len(), 3);
+        let motion_paths: FxHashSet<_> = reservations
+            .iter()
+            .filter(|reservation| reservation.version_size != VersionSizeKey::Original)
+            .map(|reservation| &reservation.destination_path)
+            .collect();
+        assert_eq!(
+            motion_paths.len(),
+            2,
+            "motion renditions must not share a path"
+        );
+        for resolution in [AssetVersionSize::LiveMedium, AssetVersionSize::LiveOriginal] {
+            config.state_db = Some(Arc::new(
+                crate::state::SqliteStateDb::open(&db_path).await.unwrap(),
+            ));
+            config.live_resolution = resolution;
+            let repeated = reconcile_catalog_paths(
+                &passes,
+                Arc::new(config.clone()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(repeated.complete);
+            assert_eq!(repeated.stats.downloaded, 0);
+            assert_eq!(repeated.stats.disk_bytes_written, 0);
+            let retained = db.get_reconciliation_reservations().await.unwrap();
+            assert_eq!(retained.len(), reservations.len());
+            assert!(
+                reservations
+                    .iter()
+                    .all(|reservation| retained.contains(reservation))
+            );
+        }
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 2, "new rendition remains for normal download");
+        for row in rows {
+            let destination = row.local_path.unwrap();
+            let source = root
+                .path()
+                .join("old")
+                .join(destination.file_name().unwrap());
+            assert_eq!(std::fs::read(&source).unwrap(), vec![1u8; 1024]);
+            assert_eq!(std::fs::read(&destination).unwrap(), vec![1u8; 1024]);
+            assert_eq!(
+                std::fs::read_dir(destination.parent().unwrap())
+                    .unwrap()
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn path_reconciliation_cross_library_reservations() {
         for scenario in [
             ReservationScenario::CrossLibraryDistinctBytes,

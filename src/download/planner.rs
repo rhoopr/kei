@@ -25,6 +25,7 @@ use super::paths;
 struct ReconciliationOwner {
     library: Arc<str>,
     asset_id: Box<str>,
+    version_size: VersionSizeKey,
 }
 
 /// Keep reconciliation-only state off the stack of the shared async planner.
@@ -32,8 +33,7 @@ struct ReconciliationOwner {
 struct ReconciliationPlanning {
     claims: FxHashMap<ReconciliationOwner, FxHashMap<NormalizedPath, u64>>,
     path_owners: FxHashMap<NormalizedPath, FxHashSet<ReconciliationOwner>>,
-    destinations:
-        FxHashMap<(ReconciliationOwner, VersionSizeKey, NormalizedPath), std::path::PathBuf>,
+    destinations: FxHashMap<(ReconciliationOwner, NormalizedPath), std::path::PathBuf>,
     reservations: Vec<ReconciliationReservation>,
 }
 
@@ -66,6 +66,7 @@ impl TaskPlanner {
                 ReconciliationOwner {
                     library: record.library,
                     asset_id: record.asset_id,
+                    version_size: record.version_size,
                 },
                 PathPlanningMode::Reconciliation.key(&record.path)?,
                 0,
@@ -75,6 +76,7 @@ impl TaskPlanner {
             let owner = ReconciliationOwner {
                 library: Arc::clone(&reservation.library),
                 asset_id: reservation.asset_id.clone(),
+                version_size: reservation.version_size,
             };
             let destination =
                 PathPlanningMode::Reconciliation.key(&reservation.destination_path)?;
@@ -87,7 +89,6 @@ impl TaskPlanner {
             planner.reconciliation.destinations.insert(
                 (
                     owner,
-                    reservation.version_size,
                     NormalizedPath::from_key(reservation.requested_path_key),
                 ),
                 reservation.destination_path,
@@ -140,28 +141,32 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
-        let owner = ReconciliationOwner {
-            library: Arc::clone(&config.library),
-            asset_id: asset.state_id().into(),
-        };
-        // A source can already be shared by legacy catalog rows. Release a
-        // reservation only when this asset is its sole owner.
-        let mut owned = self
-            .reconciliation
-            .claims
-            .remove(&owner)
-            .unwrap_or_default();
-        for path in owned.keys() {
-            if self
-                .reconciliation
-                .path_owners
-                .get(path)
-                .is_some_and(|owners| owners.len() == 1)
-            {
-                self.claimed_paths.remove(path);
-            }
-        }
         let expected = super::filter::expected_paths_for(asset, config);
+        let mut owned = FxHashMap::default();
+        for requested in &expected {
+            let owner = ReconciliationOwner {
+                library: Arc::clone(&config.library),
+                asset_id: asset.state_id().into(),
+                version_size: requested.version_size,
+            };
+            let claims = self
+                .reconciliation
+                .claims
+                .remove(&owner)
+                .unwrap_or_default();
+            // Keep unselected renditions and shared legacy paths occupied.
+            for path in claims.keys() {
+                if self
+                    .reconciliation
+                    .path_owners
+                    .get(path)
+                    .is_some_and(|owners| owners.len() == 1)
+                {
+                    self.claimed_paths.remove(path);
+                }
+            }
+            owned.insert(owner, claims);
+        }
         let plan = self
             .plan_asset_with_mode(asset, config, PathPlanningMode::Reconciliation)
             .await
@@ -174,7 +179,12 @@ impl TaskPlanner {
                         anyhow::bail!("reconciliation task has no requested path");
                     };
                     let requested_key = PathPlanningMode::Reconciliation.key(&requested.path)?;
-                    let slot = (owner.clone(), task.version_size, requested_key.clone());
+                    let owner = ReconciliationOwner {
+                        library: Arc::clone(&task.library),
+                        asset_id: task.asset_id.as_ref().into(),
+                        version_size: task.version_size,
+                    };
+                    let slot = (owner.clone(), requested_key.clone());
                     if let Some(destination) = self.reconciliation.destinations.get(&slot) {
                         let planned_key =
                             PathPlanningMode::Reconciliation.key(&task.download_path)?;
@@ -200,7 +210,10 @@ impl TaskPlanner {
                         PathPlanningMode::Reconciliation.key(&task.download_path)?;
                     self.claimed_paths
                         .insert(destination_key.clone(), task.size);
-                    owned.insert(destination_key.clone(), task.size);
+                    owned
+                        .entry(owner)
+                        .or_default()
+                        .insert(destination_key.clone(), task.size);
                     self.reconciliation
                         .destinations
                         .insert(slot, task.download_path.clone());
@@ -223,8 +236,10 @@ impl TaskPlanner {
                 }
                 Ok(plan)
             });
-        for (path, size) in owned {
-            self.add_reconciliation_claim(owner.clone(), path, size);
+        for (owner, claims) in owned {
+            for (path, size) in claims {
+                self.add_reconciliation_claim(owner.clone(), path, size);
+            }
         }
         plan
     }
