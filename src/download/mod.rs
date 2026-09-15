@@ -60,7 +60,8 @@ use crate::icloud::photos::{
 use crate::retry::RetryConfig;
 use crate::state::{
     DownloadContextStateStore, DownloadStateStore, MembershipStore, MetadataRewriteStore,
-    ReportStateStore, SyncTokenStore, TempFileOwnershipStore, VersionSizeKey,
+    ReconciliationStateStore, ReportStateStore, SyncTokenStore, TempFileOwnershipStore,
+    VersionSizeKey,
 };
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
@@ -100,6 +101,7 @@ pub(crate) trait DownloadStore:
     + ReportStateStore
     + SyncTokenStore
     + TempFileOwnershipStore
+    + ReconciliationStateStore
 {
 }
 
@@ -111,6 +113,7 @@ impl<T> DownloadStore for T where
         + ReportStateStore
         + SyncTokenStore
         + TempFileOwnershipStore
+        + ReconciliationStateStore
 {
 }
 
@@ -3527,19 +3530,22 @@ pub(crate) async fn reconcile_catalog_paths(
             .iter()
             .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
     let batch = provider_pass.album.resolve_records(&requests).await;
-    let mut task_planner = match planner::TaskPlanner::for_reconciliation(&records) {
-        Ok(planner) => planner,
-        Err(error) => {
-            tracing::warn!(%error, "Path reconciliation rejected an unsafe recorded path");
-            return Ok(PathReconciliationResult {
-                stats: SyncStats {
-                    failed: 1,
-                    ..SyncStats::default()
-                },
-                ..PathReconciliationResult::default()
-            });
-        }
-    };
+    let catalog_paths = db.get_reconciliation_catalog_paths().await?;
+    let reservations = db.get_reconciliation_reservations().await?;
+    let mut task_planner =
+        match planner::TaskPlanner::for_reconciliation(catalog_paths, reservations) {
+            Ok(planner) => planner,
+            Err(error) => {
+                tracing::warn!(%error, "Path reconciliation rejected an unsafe recorded path");
+                return Ok(PathReconciliationResult {
+                    stats: SyncStats {
+                        failed: 1,
+                        ..SyncStats::default()
+                    },
+                    ..PathReconciliationResult::default()
+                });
+            }
+        };
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
     let mut stats = SyncStats::default();
@@ -3670,6 +3676,18 @@ pub(crate) async fn reconcile_catalog_paths(
             | RecordResolution::Unknown
             | RecordResolution::TransientFailure(_) => {}
         }
+    }
+
+    if let Err(error) = db
+        .reserve_reconciliation_paths(task_planner.reconciliation_reservations())
+        .await
+    {
+        stats.state_write_failures += 1;
+        tracing::warn!(%error, "Could not persist reconciliation destinations before publication");
+        return Ok(PathReconciliationResult {
+            complete: false,
+            stats,
+        });
     }
 
     let mut deferred_to_pending_retry = false;
@@ -14581,6 +14599,249 @@ mod tests {
         assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&expected_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&target).unwrap(), vec![0u8; 1024]);
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_cross_library_reservations() {
+        for scenario in [
+            ReservationScenario::CrossLibraryDistinctBytes,
+            ReservationScenario::CrossLibraryIdenticalBytes,
+            ReservationScenario::CrossLibrarySameIdentity,
+        ] {
+            assert_reconciliation_reservations(scenario).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_reservations_survive_lookup_and_state_failure() {
+        assert_reconciliation_reservations(ReservationScenario::Interrupted).await;
+    }
+
+    #[tokio::test]
+    async fn reconciliation_reservations_write_failure_prevents_publication() {
+        assert_reconciliation_reservations(ReservationScenario::ReservationWriteFailure).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReservationScenario {
+        CrossLibraryDistinctBytes,
+        CrossLibraryIdenticalBytes,
+        CrossLibrarySameIdentity,
+        Interrupted,
+        ReservationWriteFailure,
+    }
+
+    async fn assert_reconciliation_reservations(scenario: ReservationScenario) {
+        let cross_library = matches!(
+            scenario,
+            ReservationScenario::CrossLibraryDistinctBytes
+                | ReservationScenario::CrossLibraryIdenticalBytes
+                | ReservationScenario::CrossLibrarySameIdentity
+        );
+        let same_bytes = matches!(scenario, ReservationScenario::CrossLibraryIdenticalBytes);
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let mut config = test_config();
+        config.directory = Arc::from(root.path().join("new"));
+        std::fs::create_dir_all(&config.directory).unwrap();
+        config.state_db = Some(db.clone());
+        let mut fixtures = Vec::new();
+        for (index, id) in ["COLLIDE_A", "COLLIDE_B"].into_iter().enumerate() {
+            let library = if cross_library && index == 1 {
+                "SharedSync"
+            } else {
+                "PrimarySync"
+            };
+            let id = if matches!(scenario, ReservationScenario::CrossLibrarySameIdentity) {
+                "COLLIDE"
+            } else {
+                id
+            };
+            let records = mock_photo_records_for_zone_with_filename(id, library, "IMG_0001.JPG");
+            let source = root.path().join(library).join(id).join("IMG_0001.JPG");
+            let bytes = vec![if same_bytes || index == 0 { 1u8 } else { 2u8 }; 1024];
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, &bytes).unwrap();
+            let checksum = file::compute_sha256(&source).await.unwrap();
+            let row = crate::test_helpers::TestAssetRecord::new(id)
+                .library(library)
+                .filename("IMG_0001.JPG")
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build();
+            db.upsert_seen(&row).await.unwrap();
+            db.mark_downloaded(library, id, "original", &source, &checksum, None)
+                .await
+                .unwrap();
+            db.upsert_asset_master_mapping(library, &format!("asset-{id}"), id)
+                .await
+                .unwrap();
+            db.set_metadata(&format!("sync_token:{library}"), "original-token")
+                .await
+                .unwrap();
+            fixtures.push((library, id, records, source, bytes));
+        }
+        let make_passes = |library: &str, records: Vec<Value>| {
+            vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    library,
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(records),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }]
+        };
+        if matches!(scenario, ReservationScenario::Interrupted) {
+            db.acquire_lock("inject reconciliation finalization failure").unwrap().execute_batch(
+                "CREATE TEMP TRIGGER fail_reservation BEFORE UPDATE OF local_path ON assets WHEN NEW.id = 'COLLIDE_B' AND NEW.local_path IS NOT OLD.local_path BEGIN SELECT RAISE(FAIL, 'injected path state failure'); END;"
+            ).unwrap();
+            // A is unresolved, so B publishes the unsuffixed path before its
+            // state write fails. Neither new destination is in assets yet.
+            let passes = make_passes("PrimarySync", fixtures[1].2.clone());
+            let failed = reconcile_catalog_paths(
+                &passes,
+                Arc::new(config.clone()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!failed.complete);
+            assert_eq!(failed.stats.state_write_failures, 1);
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            for (_, id, _, source, _) in &fixtures {
+                assert_eq!(
+                    rows.iter()
+                        .find(|row| row.id.as_ref() == *id)
+                        .unwrap()
+                        .local_path
+                        .as_ref(),
+                    Some(source)
+                );
+            }
+            db.acquire_lock("restore reconciliation finalization")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_reservation")
+                .unwrap();
+        }
+        if matches!(scenario, ReservationScenario::ReservationWriteFailure) {
+            db.acquire_lock("inject reservation write failure").unwrap().execute_batch(
+                "CREATE TEMP TRIGGER fail_reservation_insert BEFORE INSERT ON reconciliation_paths BEGIN SELECT RAISE(FAIL, 'injected reservation failure'); END;"
+            ).unwrap();
+            let passes = make_passes(
+                "PrimarySync",
+                fixtures
+                    .iter()
+                    .flat_map(|fixture| fixture.2.clone())
+                    .collect(),
+            );
+            let failed = reconcile_catalog_paths(
+                &passes,
+                Arc::new(config.clone()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!failed.complete);
+            assert_eq!(failed.stats.state_write_failures, 1);
+            assert_eq!(failed.stats.downloaded, 0);
+            assert!(
+                db.get_reconciliation_reservations()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            for fixture in &fixtures {
+                let asset = PhotoAsset::new(fixture.2[0].clone(), fixture.2[1].clone());
+                let destination = filter::expected_paths_for(&asset, &config).remove(0).path;
+                assert!(!destination.exists());
+            }
+            db.acquire_lock("restore reservation writes")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_reservation_insert")
+                .unwrap();
+        }
+        // Reopen SQLite and rebuild every planner, as after a process restart.
+        let reopened = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        config.state_db = Some(reopened.clone());
+        let libraries = if cross_library {
+            vec!["PrimarySync", "SharedSync"]
+        } else {
+            vec!["PrimarySync"]
+        };
+        let mut destinations = Vec::new();
+        for cycle in 0..2 {
+            for library in &libraries {
+                config.library = Arc::from(*library);
+                let records = fixtures
+                    .iter()
+                    .filter(|fixture| fixture.0 == *library)
+                    .flat_map(|fixture| fixture.2.clone())
+                    .collect();
+                let passes = make_passes(library, records);
+                let result = reconcile_catalog_paths(
+                    &passes,
+                    Arc::new(config.clone()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result.complete,
+                    "library {library}, cycle {cycle}: {result:?}"
+                );
+                assert_eq!(
+                    result.stats.downloaded,
+                    if cycle == 0 {
+                        if cross_library { 1 } else { 2 }
+                    } else {
+                        0
+                    }
+                );
+                if cycle == 1 {
+                    assert_eq!(result.stats.disk_bytes_written, 0);
+                }
+                assert_eq!(
+                    reopened
+                        .get_metadata(&format!("sync_token:{library}"))
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("original-token")
+                );
+            }
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            let paths: Vec<_> = fixtures
+                .iter()
+                .map(|(library, id, _, source, bytes)| {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.library.as_ref() == *library && row.id.as_ref() == *id)
+                        .unwrap();
+                    let path = row.local_path.clone().unwrap();
+                    assert_eq!(std::fs::read(source).unwrap(), *bytes);
+                    assert_eq!(std::fs::read(&path).unwrap(), *bytes);
+                    path
+                })
+                .collect();
+            assert_ne!(paths[0], paths[1]);
+            assert_eq!(
+                std::fs::read_dir(paths[0].parent().unwrap())
+                    .unwrap()
+                    .count(),
+                2,
+                "no orphaned reconciliation copies"
+            );
+            if cycle == 0 {
+                destinations = paths;
+            } else {
+                assert_eq!(paths, destinations);
+            }
+        }
     }
 
     #[tokio::test]

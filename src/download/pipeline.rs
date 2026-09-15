@@ -4673,6 +4673,33 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl crate::state::ReconciliationStateStore for FailingDownloadStore {
+        async fn get_reconciliation_catalog_paths(
+            &self,
+        ) -> Result<Vec<crate::state::ReconciliationCatalogPath>, crate::state::error::StateError>
+        {
+            Ok(Vec::new())
+        }
+
+        async fn get_reconciliation_reservations(
+            &self,
+        ) -> Result<Vec<crate::state::ReconciliationReservation>, crate::state::error::StateError>
+        {
+            Ok(Vec::new())
+        }
+
+        async fn reserve_reconciliation_paths(
+            &self,
+            _reservations: &[crate::state::ReconciliationReservation],
+        ) -> Result<(), crate::state::error::StateError> {
+            Err(StateError::Invariant {
+                operation: "reserve_reconciliation_paths",
+                detail: "test store does not support reconciliation".into(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::state::DownloadContextStateStore for FailingDownloadStore {
         async fn get_downloaded_file_records(
             &self,

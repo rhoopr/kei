@@ -24,10 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Automatic metadata-capture repair in watch and service mode now schedules another cycle after at most 60 seconds when a 500-asset batch makes clean progress and more work remains. Stalled or failed batches use the configured watch interval, and one-shot sync stays capped at one batch. `kei status` and `sync_report.json` continue to report remaining work. A synthetic database with one million distinct assets grew by 87.363 MiB, or 17.51 percent, for revision state. Repairing one million stale assets in one library needs 2,000 successful batches, which adds about 33 hours of follow-up waits plus provider and cycle processing time. ([#742])
-- State databases now use schema version 17 to record which iCloud asset owns an adopted legacy master row. Older kei versions reject a version 17 database instead of opening it. To downgrade, restore a state DB backup made before the upgrade; downloaded media files are unchanged. ([#721])
+- State databases now use schema version 24, including durable path reconciliation reservations. Versions that support only earlier schemas reject the upgraded database. To downgrade, restore a state DB backup made before the upgrade; downloaded media files are unchanged.
+- State records which iCloud asset owns an adopted legacy master row. ([#721])
 
 ### Fixed
 
+- Updated rustls to 0.23.45 to address [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285).
+- Path reconciliation reserves destinations across personal and shared libraries before copying media. Retries reuse these choices after lookup or state-write failures, so collision peers do not claim each other's files or leave duplicate copies.
 - Path reconciliation no longer reports newly selected adjusted renditions as failed moves before the download pass creates them. Expanding media or rendition
   settings now exits successfully when the new files download and state writes complete. ([#795])
 - Changing only `skip_created_before` or `skip_created_after` no longer copies

@@ -109,6 +109,17 @@ Eligibility-config drift preserves the active checkpoint while a complete
 inventory and delta bridge build a replacement. Path-config drift preserves
 provider checkpoints while local catalog paths are reconciled.
 
+Schema 24 stores local reconciliation destination choices in
+`reconciliation_paths`. The planner reserves current and historical catalog
+paths and previous choices across all libraries, with library-qualified asset
+ownership. Before it copies
+any media, it commits the new choices in one SQLite transaction. A failed
+reservation write prevents publication. Retries reuse the reserved leaf even
+when provider lookup order or availability changes. The recorded source path
+stays unchanged until file and metadata validation and state finalization pass.
+Choices remain reserved after completion and config drift because old copies
+remain on disk. This ledger does not authorize overwrite or deletion.
+
 Local path reconciliation opens source and destination leaf entries without
 following symlinks. It hashes the opened file and rechecks its identity before
 accepting a destination, including entries that appear during publication.

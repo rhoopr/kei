@@ -6,10 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::icloud::photos::PhotoAsset;
-use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
+use crate::state::{
+    AssetRecord, DownloadStateStore, MembershipStore, ReconciliationCatalogPath,
+    ReconciliationPathKey, ReconciliationReservation, VersionSizeKey,
+};
 
 use super::DownloadConfig;
 use super::filter::{
@@ -18,11 +21,27 @@ use super::filter::{
 };
 use super::paths;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReconciliationOwner {
+    library: Arc<str>,
+    asset_id: Box<str>,
+}
+
+/// Keep reconciliation-only state off the stack of the shared async planner.
+#[derive(Debug, Default)]
+struct ReconciliationPlanning {
+    claims: FxHashMap<ReconciliationOwner, FxHashMap<NormalizedPath, u64>>,
+    path_owners: FxHashMap<NormalizedPath, FxHashSet<ReconciliationOwner>>,
+    destinations:
+        FxHashMap<(ReconciliationOwner, VersionSizeKey, NormalizedPath), std::path::PathBuf>,
+    reservations: Vec<ReconciliationReservation>,
+}
+
 /// Mutable path-planning state carried across assets in one pass.
 #[derive(Debug)]
 pub(super) struct TaskPlanner {
     claimed_paths: FxHashMap<NormalizedPath, u64>,
-    reconciliation_claims: FxHashMap<Box<str>, FxHashMap<NormalizedPath, u64>>,
+    reconciliation: Box<ReconciliationPlanning>,
     dir_cache: paths::DirCache,
 }
 
@@ -30,29 +49,74 @@ impl TaskPlanner {
     pub(super) fn new() -> Self {
         Self {
             claimed_paths: FxHashMap::default(),
-            reconciliation_claims: FxHashMap::default(),
+            reconciliation: Box::default(),
             dir_cache: paths::DirCache::new(),
         }
     }
 
     /// Reserve durable paths before planning so a later or unresolved asset's
     /// current destination cannot be claimed by an earlier collision peer.
-    pub(super) fn for_reconciliation(records: &[AssetRecord]) -> Result<Self> {
+    pub(super) fn for_reconciliation(
+        records: Vec<ReconciliationCatalogPath>,
+        reservations: Vec<ReconciliationReservation>,
+    ) -> Result<Self> {
         let mut planner = Self::new();
         for record in records {
-            if let Some(path) = &record.local_path {
-                let path = PathPlanningMode::Reconciliation.key(path)?;
-                planner
-                    .claimed_paths
-                    .insert(path.clone(), record.size_bytes);
-                planner
-                    .reconciliation_claims
-                    .entry(record.id.clone())
-                    .or_default()
-                    .insert(path, record.size_bytes);
-            }
+            planner.add_reconciliation_claim(
+                ReconciliationOwner {
+                    library: record.library,
+                    asset_id: record.asset_id,
+                },
+                PathPlanningMode::Reconciliation.key(&record.path)?,
+                0,
+            );
+        }
+        for reservation in reservations {
+            let owner = ReconciliationOwner {
+                library: Arc::clone(&reservation.library),
+                asset_id: reservation.asset_id.clone(),
+            };
+            let destination =
+                PathPlanningMode::Reconciliation.key(&reservation.destination_path)?;
+            anyhow::ensure!(
+                destination.as_ref() == reservation.destination_path_key.0,
+                "reconciliation reservation has an inconsistent destination key"
+            );
+            // Reconciliation uses occupancy, not sizes, for collision decisions.
+            planner.add_reconciliation_claim(owner.clone(), destination, 0);
+            planner.reconciliation.destinations.insert(
+                (
+                    owner,
+                    reservation.version_size,
+                    NormalizedPath::from_key(reservation.requested_path_key),
+                ),
+                reservation.destination_path,
+            );
         }
         Ok(planner)
+    }
+
+    fn add_reconciliation_claim(
+        &mut self,
+        owner: ReconciliationOwner,
+        path: NormalizedPath,
+        size: u64,
+    ) {
+        self.claimed_paths.insert(path.clone(), size);
+        self.reconciliation
+            .path_owners
+            .entry(path.clone())
+            .or_default()
+            .insert(owner.clone());
+        self.reconciliation
+            .claims
+            .entry(owner)
+            .or_default()
+            .insert(path, size);
+    }
+
+    pub(super) fn reconciliation_reservations(&self) -> &[ReconciliationReservation] {
+        &self.reconciliation.reservations
     }
 
     /// Convert one asset into download tasks after applying the shared
@@ -76,32 +140,92 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
-        // Release only this asset's reservations while deriving its paths.
-        // Keep foreign owners reserved, including assets not hydrated this cycle.
+        let owner = ReconciliationOwner {
+            library: Arc::clone(&config.library),
+            asset_id: asset.state_id().into(),
+        };
+        // A source can already be shared by legacy catalog rows. Release a
+        // reservation only when this asset is its sole owner.
         let mut owned = self
-            .reconciliation_claims
-            .remove(asset.state_id())
+            .reconciliation
+            .claims
+            .remove(&owner)
             .unwrap_or_default();
         for path in owned.keys() {
-            self.claimed_paths.remove(path);
+            if self
+                .reconciliation
+                .path_owners
+                .get(path)
+                .is_some_and(|owners| owners.len() == 1)
+            {
+                self.claimed_paths.remove(path);
+            }
         }
+        let expected = super::filter::expected_paths_for(asset, config);
         let plan = self
             .plan_asset_with_mode(asset, config, PathPlanningMode::Reconciliation)
             .await
-            .and_then(|plan| {
-                for task in &plan.tasks {
-                    owned.insert(
-                        PathPlanningMode::Reconciliation.key(&task.download_path)?,
-                        task.size,
-                    );
+            .and_then(|mut plan| {
+                for task in &mut plan.tasks {
+                    let Some(requested) = expected
+                        .iter()
+                        .find(|path| path.version_size == task.version_size)
+                    else {
+                        anyhow::bail!("reconciliation task has no requested path");
+                    };
+                    let requested_key = PathPlanningMode::Reconciliation.key(&requested.path)?;
+                    let slot = (owner.clone(), task.version_size, requested_key.clone());
+                    if let Some(destination) = self.reconciliation.destinations.get(&slot) {
+                        let planned_key =
+                            PathPlanningMode::Reconciliation.key(&task.download_path)?;
+                        self.claimed_paths.remove(&planned_key);
+                        let destination_key = PathPlanningMode::Reconciliation.key(destination)?;
+                        anyhow::ensure!(
+                            !self.claimed_paths.contains_key(&destination_key),
+                            "reserved reconciliation destination has another owner"
+                        );
+                        let filename = destination.file_name().ok_or_else(|| {
+                            anyhow::anyhow!("reserved destination has no filename")
+                        })?;
+                        // Preserve the current root spelling while replaying the
+                        // exact reserved leaf, including identity/ordinal suffixes.
+                        task.download_path = requested.path.with_file_name(filename);
+                        anyhow::ensure!(
+                            PathPlanningMode::Reconciliation.key(&task.download_path)?
+                                == destination_key,
+                            "reserved reconciliation destination left its requested directory"
+                        );
+                    }
+                    let destination_key =
+                        PathPlanningMode::Reconciliation.key(&task.download_path)?;
+                    self.claimed_paths
+                        .insert(destination_key.clone(), task.size);
+                    owned.insert(destination_key.clone(), task.size);
+                    self.reconciliation
+                        .destinations
+                        .insert(slot, task.download_path.clone());
+                    self.reconciliation
+                        .reservations
+                        .push(ReconciliationReservation {
+                            library: Arc::clone(&task.library),
+                            asset_id: task.asset_id.as_ref().into(),
+                            version_size: task.version_size,
+                            requested_path_key: ReconciliationPathKey(
+                                requested_key.as_ref().to_owned(),
+                            ),
+                            destination_path_key: ReconciliationPathKey(
+                                destination_key.as_ref().to_owned(),
+                            ),
+                            destination_path: crate::fs_util::absolute_confined_path(
+                                &task.download_path,
+                            )?,
+                        });
                 }
                 Ok(plan)
             });
-        for (path, size) in &owned {
-            self.claimed_paths.insert(path.clone(), *size);
+        for (path, size) in owned {
+            self.add_reconciliation_claim(owner.clone(), path, size);
         }
-        self.reconciliation_claims
-            .insert(asset.state_id().into(), owned);
         plan
     }
 
@@ -515,7 +639,7 @@ mod tests {
                 1000,
             )
             .build();
-        let mut planner = TaskPlanner::for_reconciliation(&[]).unwrap();
+        let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
         let first = planner
             .plan_reconciliation_asset(&first_asset, &config)
             .await

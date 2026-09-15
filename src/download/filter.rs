@@ -375,6 +375,10 @@ pub(crate) fn determine_media_type(
 pub(super) struct NormalizedPath(Box<str>);
 
 impl NormalizedPath {
+    pub(super) fn from_key(key: crate::state::ReconciliationPathKey) -> Self {
+        Self(key.0.into_boxed_str())
+    }
+
     /// Create a new normalized path from a borrowed `Path`.
     /// For lookup operations, prefer `normalize()` to avoid `PathBuf` cloning.
     pub(super) fn new(path: &Path) -> Self {
@@ -398,6 +402,12 @@ impl NormalizedPath {
         {
             s
         }
+    }
+}
+
+impl AsRef<str> for NormalizedPath {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
