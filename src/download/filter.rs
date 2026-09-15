@@ -375,6 +375,10 @@ pub(crate) fn determine_media_type(
 pub(super) struct NormalizedPath(Box<str>);
 
 impl NormalizedPath {
+    pub(super) fn from_key(key: crate::state::ReconciliationPathKey) -> Self {
+        Self(key.0.into_boxed_str())
+    }
+
     /// Create a new normalized path from a borrowed `Path`.
     /// For lookup operations, prefer `normalize()` to avoid `PathBuf` cloning.
     pub(super) fn new(path: &Path) -> Self {
@@ -398,6 +402,12 @@ impl NormalizedPath {
         {
             s
         }
+    }
+}
+
+impl AsRef<str> for NormalizedPath {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
@@ -1469,6 +1479,35 @@ enum CollisionStrategy {
     SkipIfExists,
 }
 
+/// Existing files still need state and metadata finalization during reconciliation.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PathPlanningMode {
+    Download,
+    Reconciliation,
+}
+
+impl PathPlanningMode {
+    /// Reconciliation keys compare equivalent root spellings without changing
+    /// task paths. Invalid parent components remain errors, never aliases.
+    fn normalize(self, path: &Path) -> std::io::Result<Cow<'_, str>> {
+        match self {
+            Self::Download => Ok(NormalizedPath::normalize(path)),
+            Self::Reconciliation => {
+                let absolute = crate::fs_util::absolute_confined_path(path)?;
+                Ok(Cow::Owned(
+                    NormalizedPath::normalize(&absolute).into_owned(),
+                ))
+            }
+        }
+    }
+
+    pub(super) fn key(self, path: &Path) -> std::io::Result<NormalizedPath> {
+        Ok(NormalizedPath(
+            self.normalize(path)?.into_owned().into_boxed_str(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathResolution {
     Download(PathBuf),
@@ -1496,6 +1535,7 @@ impl PathResolution {
 #[derive(Debug)]
 struct ResolveContext<'a> {
     config: &'a DownloadConfig,
+    planning_mode: PathPlanningMode,
     created_local: &'a DateTime<FixedOffset>,
     claimed_paths: &'a FxHashMap<NormalizedPath, u64>,
     dir_cache: &'a mut paths::DirCache,
@@ -1559,12 +1599,12 @@ fn first_available_collision_path(
     ctx: &mut ResolveContext<'_>,
     preferred: CollisionFilenameKind,
     make_filename: impl Fn(CollisionFilenameKind) -> String,
-) -> PathBuf {
+) -> std::io::Result<PathBuf> {
     let mut tried = Vec::<Box<str>>::with_capacity(4);
 
     for kind in [preferred, CollisionFilenameKind::AssetIdentity] {
-        if let Some(path) = available_collision_path(ctx, &make_filename, kind, &mut tried) {
-            return path;
+        if let Some(path) = available_collision_path(ctx, &make_filename, kind, &mut tried)? {
+            return Ok(path);
         }
     }
 
@@ -1575,8 +1615,8 @@ fn first_available_collision_path(
             &make_filename,
             CollisionFilenameKind::AssetIdentityOrdinal(ordinal),
             &mut tried,
-        ) {
-            return path;
+        )? {
+            return Ok(path);
         }
         ordinal = ordinal.checked_add(1).unwrap_or(2);
     }
@@ -1587,18 +1627,18 @@ fn available_collision_path(
     make_filename: &impl Fn(CollisionFilenameKind) -> String,
     kind: CollisionFilenameKind,
     tried: &mut Vec<Box<str>>,
-) -> Option<PathBuf> {
+) -> std::io::Result<Option<PathBuf>> {
     let filename = make_filename(kind);
     let path = collision_path_for_filename(ctx, &filename);
-    let normalized = NormalizedPath::normalize(&path).into_owned();
+    let normalized = ctx.planning_mode.normalize(&path)?.into_owned();
     if tried.iter().any(|seen| seen.as_ref() == normalized) {
-        return None;
+        return Ok(None);
     }
 
-    let unavailable =
-        ctx.dir_cache.exists(&path) || ctx.claimed_paths.contains_key(normalized.as_str());
+    let unavailable = ctx.claimed_paths.contains_key(normalized.as_str())
+        || (matches!(ctx.planning_mode, PathPlanningMode::Download) && ctx.dir_cache.exists(&path));
     tried.push(normalized.into_boxed_str());
-    if unavailable { None } else { Some(path) }
+    Ok(if unavailable { None } else { Some(path) })
 }
 
 /// Resolve the final download path for a single version, handling on-disk
@@ -1621,7 +1661,24 @@ fn resolve_download_path(
     check_ampm: bool,
     make_collision_filename: impl Fn(CollisionFilenameKind) -> String,
     label: &str,
-) -> PathResolution {
+) -> std::io::Result<PathResolution> {
+    // Reconciliation must retry one deterministic destination after media
+    // publication but before metadata/state completion. The confined copy
+    // owner compares bytes and rejects conflicts instead of inventing a new
+    // filename on every retry. Ordinary downloads retain collision naming.
+    if matches!(ctx.planning_mode, PathPlanningMode::Reconciliation) {
+        let normalized = ctx.planning_mode.normalize(download_path)?;
+        if !ctx.claimed_paths.contains_key(normalized.as_ref()) {
+            return Ok(PathResolution::Download(download_path.to_path_buf()));
+        }
+        // Another catalog asset owns this path. Ignore on-disk existence when
+        // choosing its stable sibling: the copy owner validates retry bytes.
+        return Ok(PathResolution::Download(first_available_collision_path(
+            ctx,
+            CollisionFilenameKind::AssetIdentity,
+            make_collision_filename,
+        )?));
+    }
     // Check for the file on disk. For primary photos, also check AM/PM
     // whitespace variants (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG").
     let on_disk_match = ctx
@@ -1641,7 +1698,7 @@ fn resolve_download_path(
     let existing_match = if let Some((size, path)) = on_disk_match {
         Some((size, "on-disk", path))
     } else {
-        let normalized = NormalizedPath::normalize(download_path);
+        let normalized = ctx.planning_mode.normalize(download_path)?;
         if let Some(&size) = ctx.claimed_paths.get(normalized.as_ref()) {
             Some((size, "in-flight", download_path.to_path_buf()))
         } else {
@@ -1651,10 +1708,10 @@ fn resolve_download_path(
 
     let Some((existing_size, source, matched_path)) = existing_match else {
         // Path is unclaimed -- use it directly.
-        return PathResolution::Download(download_path.to_path_buf());
+        return Ok(PathResolution::Download(download_path.to_path_buf()));
     };
 
-    match strategy {
+    Ok(match strategy {
         CollisionStrategy::SkipIfExists => {
             if source == "on-disk" {
                 tracing::info!(
@@ -1681,7 +1738,7 @@ fn resolve_download_path(
                 CollisionFilenameKind::Default
             };
             let collision_path =
-                first_available_collision_path(ctx, preferred, make_collision_filename);
+                first_available_collision_path(ctx, preferred, make_collision_filename)?;
             if source == "on-disk" {
                 tracing::debug!(
                     asset_id,
@@ -1705,7 +1762,7 @@ fn resolve_download_path(
             }
             PathResolution::Download(collision_path)
         }
-    }
+    })
 }
 
 /// Apply content filters (type, date range) and local existence check,
@@ -1721,9 +1778,10 @@ pub(super) fn filter_asset_to_tasks(
     config: &DownloadConfig,
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
-) -> Vec<DownloadTask> {
+    planning_mode: PathPlanningMode,
+) -> std::io::Result<Vec<DownloadTask>> {
     if !asset.has_valid_id() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Sync-only fingerprint-fallback exclusion: when `asset.filename()` is
@@ -1747,7 +1805,7 @@ pub(super) fn filter_asset_to_tasks(
                 filename = %fp,
                 "Skipping (filename_exclude match on fallback)"
             );
-            return Vec::new();
+            return Ok(Vec::new());
         }
     }
 
@@ -1781,6 +1839,7 @@ pub(super) fn filter_asset_to_tasks(
         let primary_resolution = {
             let mut rctx = ResolveContext {
                 config,
+                planning_mode,
                 created_local: &ctx.created_local,
                 claimed_paths,
                 dir_cache,
@@ -1794,7 +1853,7 @@ pub(super) fn filter_asset_to_tasks(
                 check_ampm_on_disk,
                 |kind| size_or_identity_collision_filename(&filename, size, asset.state_id(), kind),
                 "asset",
-            )
+            )?
         };
 
         if let Some(stem) = primary_resolution
@@ -1805,7 +1864,7 @@ pub(super) fn filter_asset_to_tasks(
             effective_primary_filename = Some(stem.to_string());
         }
         if let Some(p) = primary_resolution.download_path() {
-            claimed_paths.insert(NormalizedPath::new(&p), size);
+            claimed_paths.insert(planning_mode.key(&p)?, size);
             seen_urls.push(url.clone());
             tasks.push(DownloadTask {
                 url,
@@ -1851,6 +1910,7 @@ pub(super) fn filter_asset_to_tasks(
         let final_path = {
             let mut rctx = ResolveContext {
                 config,
+                planning_mode,
                 created_local: &ctx.created_local,
                 claimed_paths,
                 dir_cache,
@@ -1866,12 +1926,12 @@ pub(super) fn filter_asset_to_tasks(
                 check_ampm_on_disk,
                 |kind| size_or_identity_collision_filename(&filename, size, asset.state_id(), kind),
                 "asset extra",
-            )
+            )?
             .download_path()
         };
 
         if let Some(p) = final_path {
-            claimed_paths.insert(NormalizedPath::new(&p), size);
+            claimed_paths.insert(planning_mode.key(&p)?, size);
             seen_urls.push(url.clone());
             tasks.push(DownloadTask {
                 url,
@@ -1903,12 +1963,13 @@ pub(super) fn filter_asset_to_tasks(
             check_ampm_on_disk,
         } = d;
         if seen_urls.iter().any(|seen| seen.as_ref() == url.as_ref()) {
-            return tasks;
+            return Ok(tasks);
         }
         let asset_id = asset.state_id();
         let final_mov_path = {
             let mut rctx = ResolveContext {
                 config,
+                planning_mode,
                 created_local: &ctx.created_local,
                 claimed_paths,
                 dir_cache,
@@ -1924,12 +1985,12 @@ pub(super) fn filter_asset_to_tasks(
                 check_ampm_on_disk,
                 |kind| identity_collision_filename(&filename, asset_id, kind),
                 "live photo MOV",
-            )
+            )?
             .download_path()
         };
 
         if let Some(p) = final_mov_path {
-            claimed_paths.insert(NormalizedPath::new(&p), size);
+            claimed_paths.insert(planning_mode.key(&p)?, size);
             seen_urls.push(url.clone());
             tasks.push(DownloadTask {
                 url,
@@ -1948,7 +2009,7 @@ pub(super) fn filter_asset_to_tasks(
         }
     }
 
-    tasks
+    Ok(tasks)
 }
 
 #[cfg(test)]
@@ -1975,12 +2036,45 @@ mod tests {
         DownloadConfig::test_default()
     }
 
+    #[test]
+    fn reconciliation_path_keys_preserve_confinement_and_download_spelling() {
+        let relative = Path::new("photos/./IMG.JPG");
+        let absolute = std::env::current_dir().unwrap().join("photos/IMG.JPG");
+        assert_eq!(
+            PathPlanningMode::Reconciliation.key(relative).unwrap(),
+            PathPlanningMode::Reconciliation.key(&absolute).unwrap()
+        );
+        assert_ne!(
+            PathPlanningMode::Download.key(relative).unwrap(),
+            PathPlanningMode::Download.key(&absolute).unwrap()
+        );
+        let unsafe_path = Path::new("photos/../IMG.JPG");
+        assert_eq!(
+            PathPlanningMode::Reconciliation
+                .key(unsafe_path)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            PathPlanningMode::Download.key(unsafe_path).unwrap(),
+            NormalizedPath::new(unsafe_path)
+        );
+    }
+
     /// Helper that calls filter_asset_to_tasks with a fresh claimed_paths map.
     /// Use this for simple tests that don't need to track paths across calls.
     fn filter_asset_fresh(asset: &PhotoAsset, config: &DownloadConfig) -> Vec<DownloadTask> {
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache)
+        filter_asset_to_tasks(
+            asset,
+            config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap()
     }
 
     #[cfg(unix)]
@@ -3565,7 +3659,14 @@ mod tests {
         // Process asset1: creates IMG_0001.HEIC (2000 bytes) and its MOV
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        let tasks1 = filter_asset_to_tasks(&asset1, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks1 = filter_asset_to_tasks(
+            &asset1,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
         assert_eq!(tasks1.len(), 2);
         let heic1_path = &tasks1[0].download_path;
 
@@ -3576,7 +3677,14 @@ mod tests {
         // Process asset2: same filename, different size → should dedup HEIC
         // Clear dir_cache since we just wrote a new file
         dir_cache.clear();
-        let tasks2 = filter_asset_to_tasks(&asset2, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks2 = filter_asset_to_tasks(
+            &asset2,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
         assert_eq!(tasks2.len(), 2, "Expected HEIC + MOV tasks for asset2");
 
         let heic2_path = tasks2[0].download_path.to_str().unwrap();
@@ -3650,7 +3758,14 @@ mod tests {
 
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        let tasks = filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks = filter_asset_to_tasks(
+            &asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -3672,7 +3787,14 @@ mod tests {
 
         fs::write(&paired_mov, vec![0u8; 2_266_088]).unwrap();
         dir_cache.clear();
-        let tasks = filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks = filter_asset_to_tasks(
+            &asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -4465,14 +4587,26 @@ mod tests {
         // Process both assets through claimed_paths
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        let video_tasks =
-            filter_asset_to_tasks(&video_asset, &config, &mut claimed_paths, &mut dir_cache);
+        let video_tasks = filter_asset_to_tasks(
+            &video_asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
         assert_eq!(video_tasks.len(), 1);
         let video_path = &video_tasks[0].download_path;
         eprintln!("Video path: {:?}", video_path);
 
-        let photo_tasks =
-            filter_asset_to_tasks(&photo_asset, &config, &mut claimed_paths, &mut dir_cache);
+        let photo_tasks = filter_asset_to_tasks(
+            &photo_asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
         assert_eq!(photo_tasks.len(), 2, "Expected 2 tasks (photo + MOV)");
 
         let mov_task = &photo_tasks[1];
@@ -5109,11 +5243,25 @@ mod tests {
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
 
-        let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_a = filter_asset_to_tasks(
+            &asset_a,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
         assert_eq!(tasks_a.len(), 1, "first asset should resolve to one task");
         let path_a = tasks_a[0].download_path.clone();
 
-        let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_b = filter_asset_to_tasks(
+            &asset_b,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
         assert_eq!(
             tasks_b.len(),
             1,
@@ -5177,8 +5325,14 @@ mod tests {
         claimed_paths.insert(NormalizedPath::new(&downloaded_path), 1000);
 
         let mut dir_cache = paths::DirCache::new();
-        let second_tasks =
-            filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        let second_tasks = filter_asset_to_tasks(
+            &asset,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
         assert_eq!(second_tasks.len(), 1);
         assert!(
             second_tasks[0]
@@ -5669,8 +5823,22 @@ mod tests {
         let mut dir_cache = paths::DirCache::new();
 
         // Act
-        let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
-        let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_a = filter_asset_to_tasks(
+            &asset_a,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
+        let tasks_b = filter_asset_to_tasks(
+            &asset_b,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
 
         // Assert: first asset gets the natural path, second gets an identity
         // collision path instead of being silently skipped.
@@ -5713,8 +5881,22 @@ mod tests {
         let mut dir_cache = paths::DirCache::new();
 
         // Act
-        let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
-        let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
+        let tasks_a = filter_asset_to_tasks(
+            &asset_a,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
+        let tasks_b = filter_asset_to_tasks(
+            &asset_b,
+            &config,
+            &mut claimed_paths,
+            &mut dir_cache,
+            PathPlanningMode::Download,
+        )
+        .unwrap();
 
         // Assert: both get tasks, second has dedup suffix
         assert_eq!(tasks_a.len(), 1);
@@ -5752,10 +5934,17 @@ mod tests {
                         .orig_url(&format!("https://p01.icloud-content.com/{}", case.id))
                         .orig_checksum(case.checksum)
                         .build();
-                    filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache)
-                        .into_iter()
-                        .map(|task| task.download_path)
-                        .collect()
+                    filter_asset_to_tasks(
+                        &asset,
+                        &config,
+                        &mut claimed_paths,
+                        &mut dir_cache,
+                        PathPlanningMode::Download,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|task| task.download_path)
+                    .collect()
                 })
                 .collect()
         }

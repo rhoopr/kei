@@ -5430,6 +5430,30 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl crate::state::ReconciliationStateStore for FailingMetadataSetDb {
+        async fn get_reconciliation_catalog_paths(
+            &self,
+        ) -> Result<Vec<crate::state::ReconciliationCatalogPath>, crate::state::error::StateError>
+        {
+            self.inner.get_reconciliation_catalog_paths().await
+        }
+
+        async fn get_reconciliation_reservations(
+            &self,
+        ) -> Result<Vec<crate::state::ReconciliationReservation>, crate::state::error::StateError>
+        {
+            self.inner.get_reconciliation_reservations().await
+        }
+
+        async fn reserve_reconciliation_paths(
+            &self,
+            reservations: &[crate::state::ReconciliationReservation],
+        ) -> Result<(), crate::state::error::StateError> {
+            self.inner.reserve_reconciliation_paths(reservations).await
+        }
+    }
+
+    #[async_trait::async_trait]
     impl state::DownloadContextStateStore for FailingMetadataSetDb {
         async fn get_downloaded_file_records(
             &self,
