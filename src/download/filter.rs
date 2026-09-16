@@ -1483,7 +1483,7 @@ enum CollisionStrategy {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum PathPlanningMode {
     Download,
-    PendingRetry,
+    ReservedDownload,
     Reconciliation,
 }
 
@@ -1493,7 +1493,7 @@ impl PathPlanningMode {
     fn normalize(self, path: &Path) -> std::io::Result<Cow<'_, str>> {
         match self {
             Self::Download => Ok(NormalizedPath::normalize(path)),
-            Self::PendingRetry | Self::Reconciliation => {
+            Self::ReservedDownload | Self::Reconciliation => {
                 let absolute = crate::fs_util::absolute_confined_path(path)?;
                 Ok(Cow::Owned(
                     NormalizedPath::normalize(&absolute).into_owned(),
@@ -1673,7 +1673,7 @@ fn resolve_download_path(
     // filename on every retry. Ordinary downloads retain collision naming.
     let normalized = ctx.planning_mode.normalize(download_path)?;
     if matches!(ctx.planning_mode, PathPlanningMode::Reconciliation)
-        || (matches!(ctx.planning_mode, PathPlanningMode::PendingRetry)
+        || (matches!(ctx.planning_mode, PathPlanningMode::ReservedDownload)
             && ctx.claimed_paths.contains_key(normalized.as_ref()))
     {
         if !ctx.claimed_paths.contains_key(normalized.as_ref()) {
@@ -2053,11 +2053,11 @@ mod tests {
             PathPlanningMode::Reconciliation.key(&absolute).unwrap()
         );
         assert_eq!(
-            PathPlanningMode::PendingRetry.key(relative).unwrap(),
+            PathPlanningMode::ReservedDownload.key(relative).unwrap(),
             PathPlanningMode::Reconciliation.key(&absolute).unwrap()
         );
         assert!(
-            PathPlanningMode::PendingRetry
+            PathPlanningMode::ReservedDownload
                 .key(Path::new("photos/../IMG.JPG"))
                 .is_err()
         );

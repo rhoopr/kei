@@ -419,6 +419,22 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
 
     if let PendingRetryLocalPath::Current(recorded_file) = evidence.local_path {
         let local_path = &recorded_file.path;
+        // A failed finalization can leave the old source in SQLite after the
+        // reserved sibling was published. Verify that sibling before retrying
+        // the recorded source or choosing another destination.
+        for task in planned_tasks.iter().filter(|task| {
+            task.version_size == evidence.version_size
+                && task.checksum.as_ref() == evidence.checksum
+                && task.size == evidence.size
+                && task.download_path != *local_path
+        }) {
+            if task_planner.has_durable_destination(task)
+                && let Some(adoption) =
+                    adopt_pending_task_path(db, config, asset, task_planner, task, None).await
+            {
+                return adoption.into();
+            }
+        }
         let recorded_filename_matches = local_path
             .file_name()
             .and_then(|filename| filename.to_str())
@@ -1299,7 +1315,7 @@ where
     if controls.run_mode.only_print_filenames() {
         tokio::pin!(combined);
         let mut enum_errors = 0usize;
-        let mut task_planner = TaskPlanner::new();
+        let mut task_planner = TaskPlanner::for_download(config.state_db.as_deref()).await?;
         let mut shutdown_break = false;
         #[cfg(test)]
         let mut printed_filenames = Vec::new();
@@ -1340,7 +1356,7 @@ where
                         }
                     }
 
-                    let plan = task_planner.plan_asset(&asset, config).await;
+                    let plan = task_planner.plan_download_asset(&asset, config).await?;
                     if let Some(resource) = &plan.malformed_resource {
                         enum_errors += 1;
                         tracing::error!(
@@ -1382,7 +1398,7 @@ where
         tokio::pin!(combined);
         let mut count = 0usize;
         let mut enum_errors = 0usize;
-        let mut task_planner = TaskPlanner::new();
+        let mut task_planner = TaskPlanner::for_download(config.state_db.as_deref()).await?;
         let mut shutdown_break = false;
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
@@ -1392,7 +1408,7 @@ where
             }
             match result {
                 Ok(asset) => {
-                    let plan = task_planner.plan_asset(&asset, config).await;
+                    let plan = task_planner.plan_download_asset(&asset, config).await?;
                     if plan.filter_reason.is_some() {
                         continue;
                     }
@@ -1556,7 +1572,14 @@ where
     let handle = tokio::spawn(async move {
         let config = &producer_config;
         let metadata_writers_enabled = MetadataFlags::from(config.as_ref()).has_any_write();
-        let mut task_planner = TaskPlanner::new();
+        let mut task_planner = match TaskPlanner::for_download(producer_state_db.as_deref()).await {
+            Ok(planner) => planner,
+            Err(error) => {
+                state_write_failures_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(%error, "Failed to load download path reservations");
+                return ProducerSkipSummary::default();
+            }
+        };
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
         // Skipped-asset IDs accumulated across the producer run and
@@ -1797,7 +1820,25 @@ where
                         );
                     }
 
-                    let plan = task_planner.plan_asset(&asset, config).await;
+                    let plan = match task_planner.plan_download_asset(&asset, config).await {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            state_write_failures_producer
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(%error, "Failed to plan reserved download paths");
+                            return skips;
+                        }
+                    };
+                    if let Some(db) = &producer_state_db
+                        && let Err(error) = task_planner
+                            .persist_download_reservations(db.as_ref(), &plan.tasks)
+                            .await
+                    {
+                        state_write_failures_producer
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(%error, "Failed to reserve download paths before publication");
+                        return skips;
+                    }
                     if let Some(reason) = plan.filter_reason {
                         skips.record_filter_reason(reason);
                         producer_pb.inc(1);

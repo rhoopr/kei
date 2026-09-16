@@ -120,10 +120,15 @@ when provider lookup order or availability changes. The recorded source path
 stays unchanged until file and metadata validation and state finalization pass.
 Choices remain reserved after completion and config drift because old copies
 remain on disk. This ledger does not authorize overwrite or deletion.
-Pending retries load this ledger and the catalog paths before planning. They
-reuse their own reserved destinations and cannot download into or adopt a path
-owned by another asset or rendition. Recorded retry paths follow the same
-ownership checks. Explicit truncated-file repair can still use its own path
+Full downloads, incremental downloads, and pending retries load this ledger
+and the catalog paths before planning. They reuse their own reserved
+destinations and cannot download into or adopt a path owned by another asset
+or rendition. When the ledger is active, downloads commit new destinations
+before publication. Pending retries commit the final choice after recorded-path
+overrides. A failed reservation write prevents download dispatch. After a
+failed finalization, retries can adopt a verified reserved sibling even when
+the catalog still records the previous source. Dry runs and filename listings
+do not commit choices. Recorded retry paths follow the same ownership checks. Explicit truncated-file repair can still use its own path
 when the existing fingerprint and repair authorization pass.
 
 Local path reconciliation opens source and destination leaf entries without

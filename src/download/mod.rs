@@ -3846,7 +3846,7 @@ async fn build_retry_download_tasks(
     let requested_count = pending_keys.len();
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested_count);
-    let mut task_planner = planner::TaskPlanner::new();
+    let mut task_planner = planner::TaskPlanner::for_download(config.state_db.as_deref()).await?;
 
     for (pass_index, pass) in passes.iter().enumerate() {
         if pending_keys.is_empty() || shutdown_token.is_cancelled() {
@@ -3869,7 +3869,9 @@ async fn build_retry_download_tasks(
                 continue;
             };
             let asset = asset.clone().with_state_record_name(Arc::clone(state_id));
-            let plan = task_planner.plan_asset(&asset, pass_config).await;
+            let plan = task_planner
+                .plan_download_asset(&asset, pass_config)
+                .await?;
             if plan.filter_reason.is_some() {
                 continue;
             }
@@ -3931,7 +3933,12 @@ async fn build_incremental_expired_url_retry_tasks(
     }
 
     let mut tasks = Vec::with_capacity(requested_count);
-    let mut task_planner = planner::TaskPlanner::new();
+    let mut task_planner = planner::TaskPlanner::for_download(
+        pass_configs
+            .first()
+            .and_then(|config| config.state_db.as_deref()),
+    )
+    .await?;
     if !pending_keys.is_empty()
         && !pass_indices_by_asset.is_empty()
         && !shutdown_token.is_cancelled()
@@ -3991,7 +3998,9 @@ async fn build_incremental_expired_url_retry_tasks(
                     let Some(pass_config) = pass_configs.get(pass_index) else {
                         continue;
                     };
-                    let plan = task_planner.plan_asset(&asset, pass_config).await;
+                    let plan = task_planner
+                        .plan_download_asset(&asset, pass_config)
+                        .await?;
                     if plan.filter_reason.is_some() {
                         continue;
                     }
@@ -5320,7 +5329,13 @@ async fn run_targeted_recovery_pass(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let plan = build_pending_retry_download_tasks(passes, config, shutdown_token.clone()).await?;
+    let plan = build_pending_retry_download_tasks(
+        passes,
+        config,
+        controls.run_mode,
+        shutdown_token.clone(),
+    )
+    .await?;
     let PendingRetryPlan {
         tasks,
         retry_sources,
@@ -8452,7 +8467,7 @@ async fn download_photos_incremental_collecting_inner(
     // applied. Configs are cached per pass index to avoid redundant
     // allocations when many assets flow through the same pass.
     let mut tasks: Vec<DownloadTask> = Vec::new();
-    let mut task_planner = planner::TaskPlanner::new();
+    let mut task_planner = planner::TaskPlanner::for_download(config.state_db.as_deref()).await?;
     let mut skip_breakdown = SkipBreakdown::default();
     let mut enumeration_errors = 0usize;
     // Incremental routing already decides whether a changed asset belongs to
@@ -8472,7 +8487,9 @@ async fn download_photos_incremental_collecting_inner(
         )]
         let effective_config = &pass_configs[*pass_index];
 
-        let mut plan = task_planner.plan_asset(asset, effective_config).await;
+        let mut plan = task_planner
+            .plan_download_asset(asset, effective_config)
+            .await?;
         if let Some(reason) = plan.filter_reason {
             skip_breakdown.record_filter_reason(reason);
             continue;
@@ -8565,6 +8582,14 @@ async fn download_photos_incremental_collecting_inner(
                     "Failed to record album membership after retries"
                 );
             }
+        }
+
+        if controls.run_mode.downloads_files()
+            && let Some(db) = &config.state_db
+        {
+            task_planner
+                .persist_download_reservations(db.as_ref(), &plan.tasks)
+                .await?;
         }
 
         for task in &plan.tasks {
@@ -13711,9 +13736,14 @@ mod tests {
             ),
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
-        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
-            .await
-            .expect("plan targeted retry");
+        let plan = build_pending_retry_download_tasks(
+            &passes,
+            &config,
+            DownloadRunMode::Download,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("plan targeted retry");
 
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].download_path, recorded_path);
@@ -13761,9 +13791,14 @@ mod tests {
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
 
-        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
-            .await
-            .expect("adopt targeted retry");
+        let plan = build_pending_retry_download_tasks(
+            &passes,
+            &config,
+            DownloadRunMode::Download,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("adopt targeted retry");
 
         assert!(plan.tasks.is_empty());
         let summary = db.get_summary().await.expect("state summary");
@@ -13855,9 +13890,14 @@ mod tests {
             ),
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
-        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
-            .await
-            .expect("adopt metadata-rewritten retry");
+        let plan = build_pending_retry_download_tasks(
+            &passes,
+            &config,
+            DownloadRunMode::Download,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("adopt metadata-rewritten retry");
 
         assert!(plan.tasks.is_empty());
         assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), b"shorter");
@@ -14599,6 +14639,483 @@ mod tests {
         assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&expected_path).unwrap(), vec![0u8; 1024]);
         assert_eq!(std::fs::read(&target).unwrap(), vec![0u8; 1024]);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReservedDownloadPass {
+        Full,
+        IncrementalStreaming,
+        IncrementalCollecting,
+        Pending,
+        PendingRecorded,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReservedDownloadFailure {
+        None,
+        Finalization,
+        Reservation,
+    }
+
+    #[tokio::test]
+    async fn full_download_preserves_rendition_reservations() {
+        Box::pin(assert_reserved_download_transition(
+            ReservedDownloadPass::Full,
+            ReservedDownloadFailure::None,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn incremental_streaming_preserves_rendition_reservations() {
+        Box::pin(assert_reserved_download_transition(
+            ReservedDownloadPass::IncrementalStreaming,
+            ReservedDownloadFailure::None,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn incremental_collecting_preserves_rendition_reservations() {
+        Box::pin(assert_reserved_download_transition(
+            ReservedDownloadPass::IncrementalCollecting,
+            ReservedDownloadFailure::None,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pending_retry_reservations_survive_finalization_failure() {
+        Box::pin(assert_reserved_download_transition(
+            ReservedDownloadPass::Pending,
+            ReservedDownloadFailure::Finalization,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pending_retry_reservation_failure_prevents_publication() {
+        Box::pin(assert_reserved_download_transition(
+            ReservedDownloadPass::Pending,
+            ReservedDownloadFailure::Reservation,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn full_download_reservation_failure_prevents_publication() {
+        Box::pin(assert_reserved_download_transition(
+            ReservedDownloadPass::Full,
+            ReservedDownloadFailure::Reservation,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn incremental_collecting_reservation_failure_prevents_publication() {
+        Box::pin(assert_reserved_download_transition(
+            ReservedDownloadPass::IncrementalCollecting,
+            ReservedDownloadFailure::Reservation,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pending_retry_reservations_preserve_final_recorded_override() {
+        Box::pin(assert_reserved_download_transition(
+            ReservedDownloadPass::PendingRecorded,
+            ReservedDownloadFailure::Finalization,
+        ))
+        .await;
+    }
+
+    async fn run_reserved_download_cycle(
+        pass: ReservedDownloadPass,
+        records: Vec<serde_json::Value>,
+        config: Arc<DownloadConfig>,
+        run_mode: DownloadRunMode,
+    ) -> Result<SyncResult> {
+        let album = match pass {
+            ReservedDownloadPass::Full => mock_album(
+                "",
+                MockPhotosFlow::new()
+                    .query_page(records, Some("after"))
+                    .build(),
+            ),
+            ReservedDownloadPass::Pending | ReservedDownloadPass::PendingRecorded => {
+                album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(records),
+                    }),
+                )
+            }
+            _ => mock_album(
+                "",
+                MockPhotosFlow::new()
+                    .changes_zone_page(records, "after", false)
+                    .build(),
+            ),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        if matches!(pass, ReservedDownloadPass::IncrementalCollecting) {
+            download_photos_incremental_collecting(
+                &Client::new(),
+                &passes,
+                &config,
+                "before",
+                DownloadControls::new(run_mode, DownloadReporting::hidden()),
+                CancellationToken::new(),
+            )
+            .await
+        } else {
+            download_photos_with_sync(
+                &Client::new(),
+                &passes,
+                config,
+                DownloadControls::new(run_mode, DownloadReporting::hidden()),
+                CancellationToken::new(),
+            )
+            .await
+        }
+    }
+
+    async fn assert_reserved_download_transition(
+        pass: ReservedDownloadPass,
+        failure: ReservedDownloadFailure,
+    ) {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = crate::start_wiremock_or_skip!();
+        let mut bytes = vec![3u8; 1024];
+        bytes[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
+        Mock::given(method("GET"))
+            .and(path("/new.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&server)
+            .await;
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let source = root.path().join("reserved.jpg");
+        std::fs::write(&source, vec![1u8; 1024]).unwrap();
+        let source_checksum = file::compute_sha256(&source).await.unwrap();
+        let mut a = mock_photo_records_for_zone_with_filename("A", "PrimarySync", "reserved.jpg");
+        a[1]["fields"]["resJPEGFullRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/edited.jpg", "size": 1024,
+            "fileChecksum": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        }});
+        a[1]["fields"]["resJPEGFullFileType"] = json!({"value": "public.jpeg"});
+        let asset_a = PhotoAsset::new(a[0].clone(), a[1].clone());
+        let mut b = incremental_photo_records_with_url(
+            "B",
+            "reserved_edited.JPG",
+            &format!("{}/new.jpg", server.uri()),
+            1024,
+        );
+        b[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        db.upsert_seen(
+            &TestAssetRecord::new("A")
+                .filename("reserved.jpg")
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "A",
+            "original",
+            &source,
+            &source_checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-A", "A")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "before")
+            .await
+            .unwrap();
+        let lookup_pass = |records| {
+            vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(records),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }]
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(root.path().join("new"));
+        std::fs::create_dir_all(&config.directory).unwrap();
+        config.edited = true;
+        config.state_db = Some(db.clone());
+        config.sync_mode = match pass {
+            ReservedDownloadPass::Full => SyncMode::Full,
+            _ => SyncMode::Incremental {
+                zone_sync_token: "before".into(),
+            },
+        };
+        let reserved = filter::expected_paths_for(&asset_a, &config)
+            .into_iter()
+            .find(|item| item.version_size != VersionSizeKey::Original)
+            .unwrap()
+            .path;
+        let first = reconcile_catalog_paths(
+            &lookup_pass(a.clone()),
+            Arc::new(config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(first.complete, "initial reconciliation: {first:?}");
+        assert_eq!(first.stats.downloaded, 1);
+        assert!(!reserved.exists());
+        assert!(
+            db.get_pending().await.unwrap().is_empty(),
+            "new assets must not enter through pending recovery"
+        );
+        if matches!(
+            pass,
+            ReservedDownloadPass::Pending | ReservedDownloadPass::PendingRecorded
+        ) {
+            db.upsert_seen(
+                &TestAssetRecord::new("B")
+                    .filename("reserved_edited.JPG")
+                    .checksum(&checksum)
+                    .size(1024)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", "asset-B", "B")
+                .await
+                .unwrap();
+        }
+        let recorded = reserved.with_file_name(paths::insert_asset_identity_suffix(
+            "reserved_edited.JPG",
+            "B",
+        ));
+        if matches!(pass, ReservedDownloadPass::PendingRecorded) {
+            std::fs::write(&recorded, vec![9u8; 1024]).unwrap();
+            let old_checksum = file::compute_sha256(&recorded).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "B",
+                "original",
+                &recorded,
+                &old_checksum,
+                None,
+            )
+            .await
+            .unwrap();
+            db.mark_failed(
+                "PrimarySync",
+                "B",
+                "original",
+                "retry with a conflicting recorded path",
+            )
+            .await
+            .unwrap();
+        }
+        let parent = reserved.parent().unwrap();
+        let initial_file_count = std::fs::read_dir(parent).unwrap().count();
+        let original_reservations = db.get_reconciliation_reservations().await.unwrap();
+        assert!(
+            original_reservations
+                .iter()
+                .all(|reservation| reservation.asset_id.as_ref() == "A")
+        );
+        if matches!(pass, ReservedDownloadPass::Pending) {
+            for run_mode in [DownloadRunMode::DryRun, DownloadRunMode::PrintFilenames] {
+                let preview = run_reserved_download_cycle(
+                    pass,
+                    b.clone(),
+                    Arc::new(config.clone()),
+                    run_mode,
+                )
+                .await
+                .unwrap();
+                assert_eq!(preview.stats.downloaded, usize::from(run_mode.is_dry_run()));
+                assert_eq!(
+                    std::fs::read_dir(parent).unwrap().count(),
+                    initial_file_count
+                );
+                assert!(server.received_requests().await.unwrap().is_empty());
+                assert_eq!(
+                    db.get_reconciliation_reservations().await.unwrap(),
+                    original_reservations
+                );
+            }
+        }
+        match failure {
+            ReservedDownloadFailure::Finalization => db.acquire_lock("inject finalization failure").unwrap().execute_batch(
+                "CREATE TEMP TRIGGER fail_reserved_download BEFORE UPDATE OF status ON assets WHEN NEW.id = 'B' AND NEW.status = 'downloaded' BEGIN SELECT RAISE(FAIL, 'injected finalization failure'); END;"
+            ).unwrap(),
+            ReservedDownloadFailure::Reservation => db.acquire_lock("inject reservation failure").unwrap().execute_batch(
+                "CREATE TEMP TRIGGER fail_reserved_download BEFORE INSERT ON reconciliation_paths WHEN NEW.id != 'A' BEGIN SELECT RAISE(FAIL, 'injected reservation failure'); END;"
+            ).unwrap(),
+            ReservedDownloadFailure::None => {},
+        }
+        let downloaded = run_reserved_download_cycle(
+            pass,
+            b.clone(),
+            Arc::new(config.clone()),
+            DownloadRunMode::Download,
+        )
+        .await;
+        match failure {
+            ReservedDownloadFailure::None => {
+                let downloaded = downloaded.unwrap();
+                assert!(
+                    matches!(downloaded.outcome, DownloadOutcome::Success),
+                    "{downloaded:?}"
+                );
+                assert_eq!(downloaded.stats.downloaded, 1);
+            }
+            ReservedDownloadFailure::Finalization => {
+                let downloaded = downloaded.unwrap();
+                assert!(downloaded.stats.state_write_failures > 0, "{downloaded:?}");
+                assert_eq!(
+                    std::fs::read_dir(parent).unwrap().count(),
+                    initial_file_count + 1
+                );
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+                let reservations = db.get_reconciliation_reservations().await.unwrap();
+                let choice = reservations
+                    .iter()
+                    .find(|r| r.asset_id.as_ref() == "B")
+                    .unwrap();
+                assert_eq!(std::fs::read(&choice.destination_path).unwrap(), bytes);
+                // End-of-cycle promotion depends on whether last_seen_at falls
+                // within this sync. Both statuses must retain retry evidence.
+                let mut retryable = db.get_pending().await.unwrap();
+                retryable.extend(db.get_failed().await.unwrap());
+                assert!(retryable.iter().any(|row| {
+                    row.id.as_ref() == "B"
+                        && row.local_path.as_ref()
+                            == matches!(pass, ReservedDownloadPass::PendingRecorded)
+                                .then_some(&recorded)
+                }));
+            }
+            ReservedDownloadFailure::Reservation => {
+                if let Ok(result) = downloaded {
+                    assert!(
+                        matches!(result.outcome, DownloadOutcome::PartialFailure { .. }),
+                        "{result:?}"
+                    );
+                    if matches!(pass, ReservedDownloadPass::Full) {
+                        assert!(result.stats.enumeration_incomplete);
+                        assert!(result.sync_token.is_none());
+                    }
+                }
+                assert!(server.received_requests().await.unwrap().is_empty());
+                assert_eq!(
+                    std::fs::read_dir(parent).unwrap().count(),
+                    initial_file_count
+                );
+                assert_eq!(
+                    db.get_reconciliation_reservations().await.unwrap(),
+                    original_reservations
+                );
+            }
+        }
+        assert!(
+            !reserved.exists(),
+            "another rendition's reserved path must stay empty"
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before")
+        );
+        if !matches!(failure, ReservedDownloadFailure::None) {
+            db.acquire_lock("restore state writes")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_reserved_download")
+                .unwrap();
+        }
+        config.state_db = Some(Arc::new(SqliteStateDb::open(&db_path).await.unwrap()));
+        if !matches!(failure, ReservedDownloadFailure::None) {
+            let recovered = run_reserved_download_cycle(
+                pass,
+                b.clone(),
+                Arc::new(config.clone()),
+                DownloadRunMode::Download,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(recovered.outcome, DownloadOutcome::Success),
+                "{recovered:?}"
+            );
+            assert_eq!(recovered.stats.state_write_failures, 0);
+            assert_eq!(
+                recovered.stats.downloaded,
+                usize::from(matches!(failure, ReservedDownloadFailure::Reservation))
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_dir(parent).unwrap().count(),
+            initial_file_count + 1
+        );
+        let reopened = config.state_db.as_ref().unwrap();
+        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+        let row = rows.iter().find(|row| row.id.as_ref() != "A").unwrap();
+        let new_path = row.local_path.as_ref().unwrap();
+        assert_ne!(new_path, &reserved);
+        assert_eq!(std::fs::read(new_path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&source).unwrap(), vec![1u8; 1024]);
+        if matches!(pass, ReservedDownloadPass::PendingRecorded) {
+            assert_eq!(std::fs::read(&recorded).unwrap(), vec![9u8; 1024]);
+        }
+        let reservations = reopened.get_reconciliation_reservations().await.unwrap();
+        assert!(
+            reservations
+                .iter()
+                .any(|choice| choice.asset_id == row.id && choice.destination_path == *new_path)
+        );
+        let both = lookup_pass(a.into_iter().chain(b).collect());
+        for _ in 0..2 {
+            let result =
+                reconcile_catalog_paths(&both, Arc::new(config.clone()), CancellationToken::new())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                (
+                    result.complete,
+                    result.stats.failed,
+                    result.stats.downloaded
+                ),
+                (true, 0, 0)
+            );
+            assert_eq!(
+                reopened.get_reconciliation_reservations().await.unwrap(),
+                reservations
+            );
+            assert_eq!(
+                std::fs::read_dir(parent).unwrap().count(),
+                initial_file_count + 1
+            );
+        }
     }
 
     #[tokio::test]
@@ -16994,9 +17511,14 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.state_db = Some(db.clone());
 
-        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
-            .await
-            .expect("non-matching siblings should remain safely unresolved");
+        let plan = build_pending_retry_download_tasks(
+            &passes,
+            &config,
+            DownloadRunMode::Download,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("non-matching siblings should remain safely unresolved");
 
         assert!(plan.tasks.is_empty());
         assert_eq!(plan.unmatched_targets.len(), 1);
@@ -17050,9 +17572,14 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.state_db = Some(db);
 
-        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
-            .await
-            .expect("persisted owner should resolve matching siblings");
+        let plan = build_pending_retry_download_tasks(
+            &passes,
+            &config,
+            DownloadRunMode::Download,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("persisted owner should resolve matching siblings");
 
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.unmatched_targets.len(), 0);
@@ -17081,9 +17608,14 @@ mod tests {
         let mut config = test_config();
         config.state_db = Some(db.clone());
 
-        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
-            .await
-            .expect("transient hydration failure should retain durable work");
+        let plan = build_pending_retry_download_tasks(
+            &passes,
+            &config,
+            DownloadRunMode::Download,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("transient hydration failure should retain durable work");
 
         assert!(plan.tasks.is_empty());
         assert_eq!(plan.unmatched_targets.len(), 1);
@@ -17130,9 +17662,14 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.state_db = Some(db.clone());
 
-        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
-            .await
-            .expect("build pending retry plan");
+        let plan = build_pending_retry_download_tasks(
+            &passes,
+            &config,
+            DownloadRunMode::Download,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("build pending retry plan");
 
         assert_eq!(plan.unmatched_targets.len(), 0);
         let summary = db.get_summary().await.expect("summary");
