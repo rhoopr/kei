@@ -109,6 +109,33 @@ Eligibility-config drift preserves the active checkpoint while a complete
 inventory and delta bridge build a replacement. Path-config drift preserves
 provider checkpoints while local catalog paths are reconciled.
 
+Schema 25 stores local reconciliation destination choices in
+`reconciliation_paths`. The planner reserves current and historical catalog
+paths and previous choices across all libraries, with library-qualified asset
+and rendition ownership. Unselected renditions keep their paths reserved when
+live resolution changes. Before it copies any media, it commits the new choices
+in one SQLite transaction. A failed
+reservation write prevents publication. Retries reuse the reserved leaf even
+when provider lookup order or availability changes. The recorded source path
+stays unchanged until file and metadata validation and state finalization pass.
+Each choice is keyed by the provider checksum and byte size. A changed rendition
+gets a separate destination; retries of the same content reuse its choice.
+Migration retains schema-24 choices with unknown content as occupied paths. It
+does not infer their content from a catalog row that may already describe a newer
+version. Reconciliation can create a new sibling for these legacy choices.
+Choices remain reserved after completion and config drift because old copies
+remain on disk. This ledger does not authorize overwrite or deletion.
+Full downloads, incremental downloads, and pending retries load this ledger
+and the catalog paths before planning. They reuse their own reserved
+destinations and cannot download into or adopt a path owned by another asset
+or rendition. When the ledger is active, downloads commit new destinations
+before publication. Pending retries commit the final choice after recorded-path
+overrides. A failed reservation write prevents download dispatch. After a
+failed finalization, retries can adopt a verified reserved sibling even when
+the catalog still records the previous source. Dry runs and filename listings
+do not commit choices. Recorded retry paths follow the same ownership checks. Explicit truncated-file repair can still use its own path
+when the existing fingerprint and repair authorization pass.
+
 Local path reconciliation opens source and destination leaf entries without
 following symlinks. It hashes the opened file and rechecks its identity before
 accepting a destination, including entries that appear during publication.
@@ -138,7 +165,43 @@ the common lexical ancestor of the old path and new root, with no-follow
 traversal below that anchor. This allows root moves without trusting linked
 source directories. Destination writes stay beneath the new configured root.
 Relative paths are normalized inside the filesystem owner, not in durable
-catalogue keys. Metadata copying is a separate follow-up.
+catalogue keys.
+
+A reconciled media copy receives the same capture mtime as a normal download.
+If the retained source and destination paths resolve to the same pathname,
+reconciliation only updates the catalogue path spelling. It preserves media
+mtime and existing or absent sidecars, then validates media before finalization.
+This permits changes between relative and absolute download roots.
+Before changing timestamps, reconciliation rejects a distinct destination that
+shares the source file's identity, including a hard link. The source mtime and
+catalogue path stay unchanged until the conflicting entry is resolved.
+When XMP sidecars are enabled, an existing source packet is validated and
+copied byte-for-byte, including custom properties and ownership markers. Path
+migration does not upgrade or regenerate an existing packet. If no source
+sidecar exists, the normal metadata planner generates one from the current
+payload and source GPS facts. A source read failure stops before publication;
+it cannot leave an incomplete packet that blocks the next attempt. Generated
+packets do not infer native accuracy provenance from a local checksum.
+
+Reconciliation reserves recorded and planned paths by asset and rendition. Keys
+use the filesystem owner's checked absolute paths, so equivalent relative and
+absolute roots share ownership. These keys do not change task or catalogue path
+spellings. Invalid reservation paths leave reconciliation incomplete and block
+file finalization. A collision with another asset or rendition selects a stable
+identity-suffixed path. Each rendition can reuse its own reservation across
+passes and retries, including after a
+partial state-write failure. Existing files alone do not select another name;
+the confined copy owner checks their bytes and rejects conflicts.
+
+Sidecar publication uses the same retained directory capabilities and refuses
+conflicting destination bytes. Reconciliation records the new catalogue path
+only after capture mtime, sidecar work, and final input checks succeed. It
+retains the old files and keeps failed work pending. Reconciliation planning
+includes existing media destinations so a retry after a metadata or state-write
+failure can finish without downloading or creating a second media copy.
+Reconciliation retries the selected destination and leaves conflicting media
+or sidecars untouched; it does not allocate another collision filename on each
+attempt. Ordinary download collision naming and on-disk skip rules are unchanged.
 
 ### Full and incremental enumeration
 
@@ -281,6 +344,10 @@ version and that its filename matches the recorded task filename.
 `src/commands/import.rs` shares configuration, selection, pass planning, and
 path derivation with normal sync. It optionally compares remote prefix bytes,
 hashes the local candidate, and calls `ImportStateStore::import_adopt`.
+Adoption checks durable destination reservations in the same transaction as
+catalog updates. A different asset, rendition, or provider content generation
+cannot adopt a reserved path. Unknown legacy content remains occupied.
+A refused adoption logs a warning and does not count as a match.
 Size/mtime snapshots may skip later rehashing only while path, size, and mtime
 still match.
 

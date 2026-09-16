@@ -216,6 +216,7 @@ pub(super) fn take_matching_pending_retry_tasks<I>(
 
 struct PendingRetryPlanning<'a> {
     db: &'a dyn DownloadStore,
+    run_mode: super::DownloadRunMode,
     pass_configs: &'a [Arc<DownloadConfig>],
     pending_evidence: &'a FxHashMap<PendingRetryTarget, PendingRetryEvidence>,
     pending_targets: &'a mut FxHashSet<PendingRetryTarget>,
@@ -230,7 +231,10 @@ impl PendingRetryPlanning<'_> {
         let mut state_write_failed_targets = FxHashSet::default();
         let mut filter_reasons = Vec::<filter::FilterReason>::new();
         for (pass_index, pass_config) in self.pass_configs.iter().enumerate() {
-            let plan = self.task_planner.plan_asset(asset, pass_config).await;
+            let plan = self
+                .task_planner
+                .plan_download_asset(asset, pass_config)
+                .await?;
             let targets: Vec<PendingRetryTarget> = self
                 .pending_targets
                 .iter()
@@ -294,6 +298,16 @@ impl PendingRetryPlanning<'_> {
                 let target = PendingRetryTarget::from_task(&task);
                 if let Some(evidence) = self.pending_evidence.get(&target)
                     && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
+                    && (!self.task_planner.has_durable_destination(&task)
+                        || task.download_path == local_path)
+                    && self.task_planner.retry_path_allowed(
+                        &task.library,
+                        &task.asset_id,
+                        task.version_size,
+                        &task.checksum,
+                        task.size,
+                        local_path,
+                    )
                 {
                     if evidence.matches_provider_version(&task)
                         && let Some(fingerprint) = evidence
@@ -302,7 +316,7 @@ impl PendingRetryPlanning<'_> {
                     {
                         if !self
                             .task_planner
-                            .claim_recorded_repair_path(local_path, &task.download_path, task.size)
+                            .claim_recorded_repair_path(local_path, &task)
                             .await
                         {
                             tracing::warn!(
@@ -318,12 +332,7 @@ impl PendingRetryPlanning<'_> {
                     } else {
                         let Some(retry_path) = self
                             .task_planner
-                            .resolve_recorded_retry_path(
-                                local_path,
-                                &task.download_path,
-                                task.size,
-                                &task.asset_id,
-                            )
+                            .resolve_recorded_retry_path(local_path, &task)
                             .await
                         else {
                             tracing::warn!(
@@ -337,7 +346,17 @@ impl PendingRetryPlanning<'_> {
                         task.download_path = retry_path;
                     }
                 }
+                self.task_planner.retain_retry_claim(&task)?;
                 retry_tasks.push(task);
+            }
+            retry_tasks.retain(|task| {
+                self.pending_targets
+                    .contains(&PendingRetryTarget::from_task(task))
+            });
+            if self.run_mode.downloads_files() {
+                self.task_planner
+                    .persist_download_reservations(self.db, &retry_tasks)
+                    .await?;
             }
             let queued_targets: Vec<PendingRetryTarget> = retry_tasks
                 .iter()
@@ -613,6 +632,7 @@ async fn revalidate_policy_excluded_assets(
 pub(super) async fn build_pending_retry_download_tasks(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
+    run_mode: super::DownloadRunMode,
     shutdown_token: CancellationToken,
 ) -> Result<PendingRetryPlan> {
     let Some(db) = &config.state_db else {
@@ -663,7 +683,7 @@ pub(super) async fn build_pending_retry_download_tasks(
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested);
     let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
-    let mut task_planner = planner::TaskPlanner::new();
+    let mut task_planner = planner::TaskPlanner::for_download(Some(db.as_ref())).await?;
     let pending_state_ids: Vec<&str> = pending
         .iter()
         .filter(|record| record.library.as_ref() == config.library.as_ref())
@@ -712,6 +732,7 @@ pub(super) async fn build_pending_retry_download_tasks(
         match resolution {
             RecordResolution::Present(asset) => {
                 PendingRetryPlanning {
+                    run_mode,
                     db: db.as_ref(),
                     pass_configs: &pass_configs,
                     pending_evidence: &pending_evidence,
@@ -896,6 +917,7 @@ pub(super) async fn build_pending_retry_download_tasks(
                     );
                     let asset = asset.with_state_record_name(Arc::from(state_id.as_str()));
                     PendingRetryPlanning {
+                        run_mode,
                         db: db.as_ref(),
                         pass_configs: &pass_configs,
                         pending_evidence: &pending_evidence,

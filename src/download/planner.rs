@@ -6,22 +6,46 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::icloud::photos::PhotoAsset;
-use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
+use crate::state::{
+    AssetRecord, DownloadStateStore, MembershipStore, ReconciliationCatalogPath,
+    ReconciliationContent, ReconciliationPathKey, ReconciliationReservation, VersionSizeKey,
+};
 
-use super::DownloadConfig;
 use super::filter::{
-    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, determine_media_type,
-    filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
+    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, PathPlanningMode,
+    determine_media_type, filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
 };
 use super::paths;
+use super::{DownloadConfig, DownloadStore};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReconciliationOwner {
+    library: Arc<str>,
+    asset_id: Box<str>,
+    version_size: VersionSizeKey,
+}
+
+/// Keep durable path ownership off the stack of the shared async planner.
+#[derive(Debug, Default)]
+struct ReconciliationPlanning {
+    claims: FxHashMap<ReconciliationOwner, FxHashMap<NormalizedPath, u64>>,
+    path_owners: FxHashMap<NormalizedPath, FxHashSet<ReconciliationOwner>>,
+    destinations:
+        FxHashMap<(ReconciliationOwner, ReconciliationContent, NormalizedPath), std::path::PathBuf>,
+    path_contents: FxHashMap<NormalizedPath, FxHashSet<Option<ReconciliationContent>>>,
+    reservations: Vec<ReconciliationReservation>,
+    durable_destinations: FxHashSet<NormalizedPath>,
+}
 
 /// Mutable path-planning state carried across assets in one pass.
 #[derive(Debug)]
 pub(super) struct TaskPlanner {
     claimed_paths: FxHashMap<NormalizedPath, u64>,
+    path_mode: PathPlanningMode,
+    reconciliation: Box<ReconciliationPlanning>,
     dir_cache: paths::DirCache,
 }
 
@@ -29,8 +53,242 @@ impl TaskPlanner {
     pub(super) fn new() -> Self {
         Self {
             claimed_paths: FxHashMap::default(),
+            path_mode: PathPlanningMode::Download,
+            reconciliation: Box::default(),
             dir_cache: paths::DirCache::new(),
         }
+    }
+
+    /// Reserve durable paths before planning so a later or unresolved asset's
+    /// current destination cannot be claimed by an earlier collision peer.
+    pub(super) fn for_reconciliation(
+        records: Vec<ReconciliationCatalogPath>,
+        reservations: Vec<ReconciliationReservation>,
+    ) -> Result<Self> {
+        let mut planner = Self::new();
+        planner.path_mode = PathPlanningMode::Reconciliation;
+        for record in records {
+            planner.add_reconciliation_claim(
+                ReconciliationOwner {
+                    library: record.library,
+                    asset_id: record.asset_id,
+                    version_size: record.version_size,
+                },
+                PathPlanningMode::Reconciliation.key(&record.path)?,
+                0,
+            );
+        }
+        for reservation in reservations {
+            let owner = ReconciliationOwner {
+                library: Arc::clone(&reservation.library),
+                asset_id: reservation.asset_id.clone(),
+                version_size: reservation.version_size,
+            };
+            let destination =
+                PathPlanningMode::Reconciliation.key(&reservation.destination_path)?;
+            anyhow::ensure!(
+                destination.as_ref() == reservation.destination_path_key.0,
+                "reconciliation reservation has an inconsistent destination key"
+            );
+            planner
+                .reconciliation
+                .durable_destinations
+                .insert(destination.clone());
+            // Reconciliation uses occupancy, not sizes, for collision decisions.
+            planner.add_reconciliation_claim(owner.clone(), destination.clone(), 0);
+            planner
+                .reconciliation
+                .path_contents
+                .entry(destination)
+                .or_default()
+                .insert(reservation.content.clone());
+            let Some(content) = reservation.content else {
+                continue;
+            };
+            planner.reconciliation.destinations.insert(
+                (
+                    owner,
+                    content,
+                    NormalizedPath::from_key(reservation.requested_path_key),
+                ),
+                reservation.destination_path,
+            );
+        }
+        Ok(planner)
+    }
+
+    /// Preserve ordinary download behavior until reconciliation has reserved paths.
+    pub(super) async fn for_download(db: Option<&dyn DownloadStore>) -> Result<Self> {
+        let Some(db) = db else {
+            return Ok(Self::new());
+        };
+        let reservations = db.get_reconciliation_reservations().await?;
+        if reservations.is_empty() {
+            return Ok(Self::new());
+        }
+        let mut planner =
+            Self::for_reconciliation(db.get_reconciliation_catalog_paths().await?, reservations)?;
+        planner.path_mode = PathPlanningMode::ReservedDownload;
+        Ok(planner)
+    }
+
+    pub(super) async fn plan_download_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Result<AssetTaskPlan> {
+        self.reconciliation.reservations.clear();
+        match self.path_mode {
+            PathPlanningMode::Download => Ok(self.plan_asset(asset, config).await),
+            // Adoption verifies existing files separately. Reuse the
+            // ownership-aware plan, including exact saved destination choices.
+            mode => self.plan_owned_asset(asset, config, mode).await,
+        }
+    }
+
+    /// Reject foreign ownership before adoption or recorded-path overrides.
+    /// An invalid confined path is never permission to claim a reservation.
+    #[must_use]
+    pub(super) fn retry_path_allowed(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+        checksum: &str,
+        size: u64,
+        path: &Path,
+    ) -> bool {
+        if matches!(self.path_mode, PathPlanningMode::Download) {
+            return true;
+        }
+        self.path_mode.key(path).is_ok_and(|key| {
+            self.content_path_allowed(&key, checksum, size)
+                && self
+                    .reconciliation
+                    .path_owners
+                    .get(&key)
+                    .is_none_or(|owners| {
+                        owners.iter().all(|owner| {
+                            owner.library.as_ref() == library
+                                && owner.asset_id.as_ref() == asset_id
+                                && owner.version_size == version_size
+                        })
+                    })
+        })
+    }
+
+    fn content_path_allowed(&self, key: &NormalizedPath, checksum: &str, size: u64) -> bool {
+        self.reconciliation
+            .path_contents
+            .get(key)
+            .is_none_or(|contents| {
+                contents.iter().all(|content| {
+                    content.as_ref().is_some_and(|content| {
+                        content.checksum.as_ref() == checksum && content.size == size
+                    })
+                })
+            })
+    }
+
+    /// A committed choice wins over an older recorded source path on restart.
+    #[must_use]
+    pub(super) fn has_durable_destination(&self, task: &DownloadTask) -> bool {
+        self.path_mode
+            .key(&task.download_path)
+            .is_ok_and(|key| self.reconciliation.durable_destinations.contains(&key))
+            && self.retry_path_allowed(
+                &task.library,
+                &task.asset_id,
+                task.version_size,
+                &task.checksum,
+                task.size,
+                &task.download_path,
+            )
+    }
+
+    fn add_reconciliation_claim(
+        &mut self,
+        owner: ReconciliationOwner,
+        path: NormalizedPath,
+        size: u64,
+    ) {
+        self.claimed_paths.insert(path.clone(), size);
+        self.reconciliation
+            .path_owners
+            .entry(path.clone())
+            .or_default()
+            .insert(owner.clone());
+        self.reconciliation
+            .claims
+            .entry(owner)
+            .or_default()
+            .insert(path, size);
+    }
+
+    pub(super) fn reconciliation_reservations(&self) -> &[ReconciliationReservation] {
+        &self.reconciliation.reservations
+    }
+
+    /// Commit final choices, including recorded-path overrides, before dispatch.
+    /// Drain each plan once so a streaming pass does not retain a growing write batch.
+    pub(super) async fn persist_download_reservations(
+        &mut self,
+        db: &dyn DownloadStore,
+        tasks: &[DownloadTask],
+    ) -> Result<()> {
+        let mut reservations = std::mem::take(&mut self.reconciliation.reservations);
+        reservations.retain_mut(|reservation| {
+            let Some(task) = tasks.iter().find(|task| {
+                task.library == reservation.library
+                    && task.asset_id.as_ref() == reservation.asset_id.as_ref()
+                    && task.version_size == reservation.version_size
+            }) else {
+                return false;
+            };
+            reservation.destination_path = task.download_path.clone();
+            true
+        });
+        for reservation in &mut reservations {
+            reservation.destination_path =
+                crate::fs_util::absolute_confined_path(&reservation.destination_path)?;
+            reservation.destination_path_key = ReconciliationPathKey(
+                self.path_mode
+                    .key(&reservation.destination_path)?
+                    .as_ref()
+                    .to_owned(),
+            );
+        }
+        if !reservations.is_empty() {
+            db.reserve_reconciliation_paths(&reservations).await?;
+            for reservation in reservations {
+                let Some(content) = reservation.content else {
+                    continue;
+                };
+                self.reconciliation
+                    .path_contents
+                    .entry(NormalizedPath::from_key(
+                        reservation.destination_path_key.clone(),
+                    ))
+                    .or_default()
+                    .insert(Some(content.clone()));
+                self.reconciliation
+                    .durable_destinations
+                    .insert(NormalizedPath::from_key(reservation.destination_path_key));
+                self.reconciliation.destinations.insert(
+                    (
+                        ReconciliationOwner {
+                            library: reservation.library,
+                            asset_id: reservation.asset_id,
+                            version_size: reservation.version_size,
+                        },
+                        content,
+                        NormalizedPath::from_key(reservation.requested_path_key),
+                    ),
+                    reservation.destination_path,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Convert one asset into download tasks after applying the shared
@@ -40,27 +298,180 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> AssetTaskPlan {
+        #[expect(
+            clippy::expect_used,
+            reason = "ordinary download keys never perform fallible path resolution"
+        )]
+        self.plan_asset_with_mode(asset, config, PathPlanningMode::Download)
+            .await
+            .expect("ordinary download planning uses infallible spelling-only path keys")
+    }
+
+    pub(super) async fn plan_reconciliation_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Result<AssetTaskPlan> {
+        self.plan_owned_asset(asset, config, PathPlanningMode::Reconciliation)
+            .await
+    }
+
+    async fn plan_owned_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        mode: PathPlanningMode,
+    ) -> Result<AssetTaskPlan> {
+        let expected = super::filter::expected_paths_for(asset, config);
+        let library = asset
+            .source_zone()
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::clone(&config.library));
+        let mut owned = FxHashMap::default();
+        for requested in &expected {
+            let owner = ReconciliationOwner {
+                library: Arc::clone(&library),
+                asset_id: asset.state_id().into(),
+                version_size: requested.version_size,
+            };
+            let claims = self
+                .reconciliation
+                .claims
+                .remove(&owner)
+                .unwrap_or_default();
+            // Keep unselected renditions and shared legacy paths occupied.
+            for path in claims.keys() {
+                if self
+                    .reconciliation
+                    .path_owners
+                    .get(path)
+                    .is_some_and(|owners| owners.len() == 1)
+                    && self.content_path_allowed(path, &requested.checksum, requested.size)
+                {
+                    self.claimed_paths.remove(path);
+                }
+            }
+            owned.insert(owner, claims);
+        }
+        let plan = self
+            .plan_asset_with_mode(asset, config, mode)
+            .await
+            .and_then(|mut plan| {
+                for task in &mut plan.tasks {
+                    let Some(requested) = expected
+                        .iter()
+                        .find(|path| path.version_size == task.version_size)
+                    else {
+                        anyhow::bail!("reconciliation task has no requested path");
+                    };
+                    let requested_key = PathPlanningMode::Reconciliation.key(&requested.path)?;
+                    let owner = ReconciliationOwner {
+                        library: Arc::clone(&task.library),
+                        asset_id: task.asset_id.as_ref().into(),
+                        version_size: task.version_size,
+                    };
+                    let content = ReconciliationContent {
+                        checksum: task.checksum.clone(),
+                        size: task.size,
+                    };
+                    let slot = (owner.clone(), content.clone(), requested_key.clone());
+                    if let Some(destination) = self.reconciliation.destinations.get(&slot) {
+                        let planned_key =
+                            PathPlanningMode::Reconciliation.key(&task.download_path)?;
+                        self.claimed_paths.remove(&planned_key);
+                        let destination_key = PathPlanningMode::Reconciliation.key(destination)?;
+                        anyhow::ensure!(
+                            !self.claimed_paths.contains_key(&destination_key),
+                            "reserved reconciliation destination has another owner"
+                        );
+                        let filename = destination.file_name().ok_or_else(|| {
+                            anyhow::anyhow!("reserved destination has no filename")
+                        })?;
+                        // Preserve the current root spelling while replaying the
+                        // exact reserved leaf, including identity/ordinal suffixes.
+                        task.download_path = requested.path.with_file_name(filename);
+                        anyhow::ensure!(
+                            PathPlanningMode::Reconciliation.key(&task.download_path)?
+                                == destination_key,
+                            "reserved reconciliation destination left its requested directory"
+                        );
+                    }
+                    let destination_key =
+                        PathPlanningMode::Reconciliation.key(&task.download_path)?;
+                    self.reconciliation
+                        .path_contents
+                        .entry(destination_key.clone())
+                        .or_default()
+                        .insert(Some(content.clone()));
+                    self.claimed_paths
+                        .insert(destination_key.clone(), task.size);
+                    owned
+                        .entry(owner)
+                        .or_default()
+                        .insert(destination_key.clone(), task.size);
+                    self.reconciliation
+                        .destinations
+                        .insert(slot, task.download_path.clone());
+                    self.reconciliation
+                        .reservations
+                        .push(ReconciliationReservation {
+                            content: Some(content),
+                            library: Arc::clone(&task.library),
+                            asset_id: task.asset_id.as_ref().into(),
+                            version_size: task.version_size,
+                            requested_path_key: ReconciliationPathKey(
+                                requested_key.as_ref().to_owned(),
+                            ),
+                            destination_path_key: ReconciliationPathKey(
+                                destination_key.as_ref().to_owned(),
+                            ),
+                            destination_path: crate::fs_util::absolute_confined_path(
+                                &task.download_path,
+                            )?,
+                        });
+                }
+                Ok(plan)
+            });
+        for (owner, claims) in owned {
+            for (path, size) in claims {
+                self.add_reconciliation_claim(owner.clone(), path, size);
+            }
+        }
+        plan
+    }
+
+    async fn plan_asset_with_mode(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        planning_mode: PathPlanningMode,
+    ) -> Result<AssetTaskPlan> {
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
-            return AssetTaskPlan {
+            return Ok(AssetTaskPlan {
                 tasks: Vec::new(),
                 filter_reason: Some(filter_reason),
                 malformed_resource: None,
-            };
+            });
         }
 
         pre_ensure_asset_dir(&mut self.dir_cache, asset, config).await;
-        let tasks =
-            filter_asset_to_tasks(asset, config, &mut self.claimed_paths, &mut self.dir_cache);
+        let tasks = filter_asset_to_tasks(
+            asset,
+            config,
+            &mut self.claimed_paths,
+            &mut self.dir_cache,
+            planning_mode,
+        )?;
         let malformed_resource = if tasks.is_empty() {
             super::filter::malformed_no_task_resource(asset, config)
         } else {
             None
         };
-        AssetTaskPlan {
+        Ok(AssetTaskPlan {
             tasks,
             filter_reason: None,
             malformed_resource,
-        }
+        })
     }
 
     pub(super) fn existing_path_match(&mut self, path: &Path) -> ExistingPathMatch {
@@ -94,38 +505,71 @@ impl TaskPlanner {
         }
     }
 
+    fn retry_claim_available(&self, task: &DownloadTask, path: &Path) -> bool {
+        self.retry_path_allowed(
+            &task.library,
+            &task.asset_id,
+            task.version_size,
+            &task.checksum,
+            task.size,
+            path,
+        ) && self.path_mode.key(path).is_ok_and(|key| {
+            !self.claimed_paths.contains_key(&key)
+                || self.reconciliation.path_owners.contains_key(&key)
+        })
+    }
+
+    pub(super) fn retain_retry_claim(&mut self, task: &DownloadTask) -> Result<()> {
+        if !matches!(self.path_mode, PathPlanningMode::Download) {
+            self.add_reconciliation_claim(
+                ReconciliationOwner {
+                    library: Arc::clone(&task.library),
+                    asset_id: task.asset_id.as_ref().into(),
+                    version_size: task.version_size,
+                },
+                self.path_mode.key(&task.download_path)?,
+                task.size,
+            );
+        }
+        Ok(())
+    }
+
     pub(super) async fn claim_recorded_repair_path(
         &mut self,
         recorded_path: &Path,
-        planned_path: &Path,
-        expected_size: u64,
+        task: &DownloadTask,
     ) -> bool {
-        let planned = NormalizedPath::normalize(planned_path);
-        if self.claimed_paths.get(planned.as_ref()) == Some(&expected_size) {
+        let Ok(planned) = self.path_mode.key(&task.download_path) else {
+            return false;
+        };
+        if matches!(self.path_mode, PathPlanningMode::Download)
+            && self.claimed_paths.get(planned.as_ref()) == Some(&task.size)
+        {
             self.claimed_paths.remove(planned.as_ref());
         }
 
-        let recorded = NormalizedPath::normalize(recorded_path);
-        if self.claimed_paths.contains_key(recorded.as_ref()) {
+        let Ok(recorded) = self.path_mode.key(recorded_path) else {
+            return false;
+        };
+        if !self.retry_claim_available(task, recorded_path) {
             return false;
         }
         self.prepare_path_parent(recorded_path).await;
-        self.claimed_paths
-            .insert(NormalizedPath::new(recorded_path), expected_size);
+        self.claimed_paths.insert(recorded, task.size);
         true
     }
 
     pub(super) async fn resolve_recorded_retry_path(
         &mut self,
         recorded_path: &Path,
-        planned_path: &Path,
-        expected_size: u64,
-        asset_id: &str,
+        task: &DownloadTask,
     ) -> Option<std::path::PathBuf> {
-        // `plan_asset` reserved this path for the current task. Release that
-        // reservation before the task chooses its recorded retry destination.
-        let planned = NormalizedPath::normalize(planned_path);
-        if self.claimed_paths.get(planned.as_ref()) == Some(&expected_size) {
+        // Release ordinary in-flight claims when choosing a recorded path.
+        // Durable reservations stay occupied even if this task chooses a sibling.
+        let planned = self.path_mode.key(&task.download_path).ok()?;
+        if matches!(self.path_mode, PathPlanningMode::Download)
+            && self.claimed_paths.get(planned.as_ref()) == Some(&task.size)
+        {
             self.claimed_paths.remove(planned.as_ref());
         }
 
@@ -134,27 +578,26 @@ impl TaskPlanner {
         self.dir_cache.ensure_dir_async(parent).await;
 
         let existing_size = self.dir_cache.file_size(recorded_path);
-        let normalized = NormalizedPath::normalize(recorded_path);
-        if existing_size.is_none() && !self.claimed_paths.contains_key(normalized.as_ref()) {
-            self.claimed_paths
-                .insert(NormalizedPath::new(recorded_path), expected_size);
+        let normalized = self.path_mode.key(recorded_path).ok()?;
+        if existing_size.is_none() && self.retry_claim_available(task, recorded_path) {
+            self.claimed_paths.insert(normalized, task.size);
             return Some(recorded_path.to_path_buf());
         }
 
         let mut tried = Vec::<Box<str>>::with_capacity(4);
-        let preferred = if existing_size == Some(expected_size) {
-            paths::insert_asset_identity_suffix(filename, asset_id)
+        let preferred = if existing_size == Some(task.size) {
+            paths::insert_asset_identity_suffix(filename, &task.asset_id)
         } else {
-            paths::add_dedup_suffix(filename, expected_size)
+            paths::add_dedup_suffix(filename, task.size)
         };
         for candidate in [
             preferred,
-            paths::insert_asset_identity_suffix(filename, asset_id),
+            paths::insert_asset_identity_suffix(filename, &task.asset_id),
         ] {
             if let Some(path) = self.available_recorded_retry_sibling(parent, candidate, &mut tried)
             {
                 self.claimed_paths
-                    .insert(NormalizedPath::new(&path), expected_size);
+                    .insert(self.path_mode.key(&path).ok()?, task.size);
                 return Some(path);
             }
         }
@@ -162,11 +605,11 @@ impl TaskPlanner {
         let mut ordinal = 2u64;
         loop {
             let candidate =
-                paths::insert_asset_identity_ordinal_suffix(filename, asset_id, ordinal);
+                paths::insert_asset_identity_ordinal_suffix(filename, &task.asset_id, ordinal);
             if let Some(path) = self.available_recorded_retry_sibling(parent, candidate, &mut tried)
             {
                 self.claimed_paths
-                    .insert(NormalizedPath::new(&path), expected_size);
+                    .insert(self.path_mode.key(&path).ok()?, task.size);
                 return Some(path);
             }
             ordinal = ordinal.checked_add(1)?;
@@ -180,13 +623,16 @@ impl TaskPlanner {
         tried: &mut Vec<Box<str>>,
     ) -> Option<std::path::PathBuf> {
         let path = parent.join(filename);
-        let normalized = NormalizedPath::normalize(&path).into_owned();
-        if tried.iter().any(|seen| seen.as_ref() == normalized) {
+        let normalized = self.path_mode.key(&path).ok()?;
+        if tried
+            .iter()
+            .any(|seen| seen.as_ref() == normalized.as_ref())
+        {
             return None;
         }
-        tried.push(normalized.clone().into_boxed_str());
+        tried.push(normalized.as_ref().into());
 
-        (!self.dir_cache.exists(&path) && !self.claimed_paths.contains_key(normalized.as_str()))
+        (!self.dir_cache.exists(&path) && !self.claimed_paths.contains_key(normalized.as_ref()))
             .then_some(path)
     }
 }
@@ -420,6 +866,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_planner_reuses_each_live_photo_family_across_passes() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let first_asset = TestPhotoAsset::new("FIRST")
+            .filename("IMG_0001.JPG")
+            .live_photo(
+                "https://p01.icloud-content.com/first.mov",
+                "first-motion",
+                1000,
+            )
+            .build();
+        let second_asset = TestPhotoAsset::new("SECOND")
+            .filename("IMG_0001.JPG")
+            .live_photo(
+                "https://p01.icloud-content.com/second.mov",
+                "second-motion",
+                1000,
+            )
+            .build();
+        let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
+        let first = planner
+            .plan_reconciliation_asset(&first_asset, &config)
+            .await
+            .unwrap();
+        let second = planner
+            .plan_reconciliation_asset(&second_asset, &config)
+            .await
+            .unwrap();
+        assert_eq!(first.tasks.len(), 2);
+        assert_eq!(second.tasks.len(), 2);
+        let paths: FxHashSet<_> = first
+            .tasks
+            .iter()
+            .chain(&second.tasks)
+            .map(|task| &task.download_path)
+            .collect();
+        assert_eq!(paths.len(), 4);
+        for (asset, previous) in [(&second_asset, &second), (&first_asset, &first)] {
+            let repeated = planner
+                .plan_reconciliation_asset(asset, &config)
+                .await
+                .unwrap();
+            assert_eq!(repeated.tasks.len(), previous.tasks.len());
+            for (actual, expected) in repeated.tasks.iter().zip(&previous.tasks) {
+                assert_eq!(actual.version_size, expected.version_size);
+                assert_eq!(actual.download_path, expected.download_path);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn planner_routes_existing_same_size_file_to_identity_path() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -578,6 +1075,127 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.policy_excluded, 0);
         assert_eq!(summary.pending, 1);
+    }
+
+    #[tokio::test]
+    async fn download_reservations_keep_unknown_legacy_content_occupied() {
+        use crate::state::ReconciliationStateStore;
+
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let config = test_config(root.path());
+        let asset = TestPhotoAsset::new("LEGACY").filename("legacy.JPG").build();
+        let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
+        let initial = planner
+            .plan_reconciliation_asset(&asset, &config)
+            .await
+            .unwrap();
+        let task = &initial.tasks[0];
+        let legacy_path = task.download_path.clone();
+        let mut legacy = planner.reconciliation_reservations()[0].clone();
+        legacy.content = None;
+        db.reserve_reconciliation_paths(std::slice::from_ref(&legacy))
+            .await
+            .unwrap();
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, b"older content without provenance").unwrap();
+        let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+        assert!(!planner.retry_path_allowed(
+            &task.library,
+            &task.asset_id,
+            task.version_size,
+            &task.checksum,
+            task.size,
+            &legacy_path
+        ));
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        let new_path = plan.tasks[0].download_path.clone();
+        assert_ne!(new_path, legacy_path);
+        planner
+            .persist_download_reservations(&db, &plan.tasks)
+            .await
+            .unwrap();
+        let choices = db.get_reconciliation_reservations().await.unwrap();
+        assert_eq!(choices.len(), 2);
+        assert!(choices.contains(&legacy));
+        drop(db);
+        for _ in 0..2 {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+            let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+            assert_eq!(plan.tasks[0].download_path, new_path);
+            assert!(planner.has_durable_destination(&plan.tasks[0]));
+            planner
+                .persist_download_reservations(&db, &plan.tasks)
+                .await
+                .unwrap();
+            assert_eq!(db.get_reconciliation_reservations().await.unwrap(), choices);
+        }
+        assert_eq!(
+            std::fs::read(legacy_path).unwrap(),
+            b"older content without provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_reservations_keep_cross_zone_owners_across_restart() {
+        use crate::state::ReconciliationStateStore;
+
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let config = test_config(root.path());
+        let primary = TestPhotoAsset::new("SAME_ID")
+            .filename("shared.JPG")
+            .build();
+        let shared = primary
+            .clone()
+            .with_source_zone(Arc::from("SharedSync-abc"));
+        let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
+        let initial = planner
+            .plan_reconciliation_asset(&shared, &config)
+            .await
+            .unwrap();
+        let shared_path = initial.tasks[0].download_path.clone();
+        db.reserve_reconciliation_paths(planner.reconciliation_reservations())
+            .await
+            .unwrap();
+        let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+        let primary_plan = planner
+            .plan_download_asset(&primary, &config)
+            .await
+            .unwrap();
+        let primary_path = primary_plan.tasks[0].download_path.clone();
+        assert_ne!(primary_path, shared_path);
+        planner
+            .persist_download_reservations(&db, &primary_plan.tasks)
+            .await
+            .unwrap();
+        let reservations = db.get_reconciliation_reservations().await.unwrap();
+        drop(db);
+
+        for _ in 0..2 {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+            for (asset, library, path) in [
+                (&shared, "SharedSync-abc", &shared_path),
+                (&primary, "PrimarySync", &primary_path),
+            ] {
+                let plan = planner.plan_download_asset(asset, &config).await.unwrap();
+                assert_eq!(plan.tasks.len(), 1);
+                assert_eq!(plan.tasks[0].library.as_ref(), library);
+                assert_eq!(&plan.tasks[0].download_path, path);
+                planner
+                    .persist_download_reservations(&db, &plan.tasks)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                db.get_reconciliation_reservations().await.unwrap(),
+                reservations
+            );
+        }
     }
 
     #[tokio::test]

@@ -413,6 +413,22 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
     planned_tasks: &[DownloadTask],
     evidence: PendingRetryFileEvidence<'_>,
 ) -> PendingRetryAdoption {
+    // A content change can leave historical catalog evidence after the new
+    // reserved sibling was published but finalization failed. Its immutable
+    // content-specific reservation and verified bytes permit adoption; the old
+    // recorded file still cannot stand in for the new provider generation.
+    for task in planned_tasks.iter().filter(|task| {
+        task.version_size == evidence.version_size
+            && task.checksum.as_ref() == evidence.checksum
+            && task.size == evidence.size
+    }) {
+        if task_planner.has_durable_destination(task)
+            && let Some(adoption) =
+                adopt_pending_task_path(db, config, asset, task_planner, task, None).await
+        {
+            return adoption.into();
+        }
+    }
     if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
         return PendingRetryAdoption::NotFound;
     }
@@ -633,6 +649,16 @@ async fn adopt_pending_task_path(
     let version_size = task.version_size.as_str();
     let (existing_path, existing_size) =
         task_planner.existing_path_with_size(&task.download_path)?;
+    if !task_planner.retry_path_allowed(
+        &task.library,
+        &task.asset_id,
+        task.version_size,
+        &task.checksum,
+        task.size,
+        &existing_path,
+    ) {
+        return None;
+    }
     if !pending_file_size_allows_adoption(
         asset,
         version_size,
@@ -699,6 +725,16 @@ async fn adopt_pending_derived_path_at(
     let library = effective_asset_library(asset, config);
     let version_size = derived.version_size.as_str();
     let (existing_path, existing_size) = task_planner.existing_path_with_size(path)?;
+    if !task_planner.retry_path_allowed(
+        library,
+        asset.state_id(),
+        derived.version_size,
+        &derived.checksum,
+        derived.size,
+        &existing_path,
+    ) {
+        return None;
+    }
     if !pending_file_size_allows_adoption(
         asset,
         version_size,
@@ -1283,7 +1319,7 @@ where
     if controls.run_mode.only_print_filenames() {
         tokio::pin!(combined);
         let mut enum_errors = 0usize;
-        let mut task_planner = TaskPlanner::new();
+        let mut task_planner = TaskPlanner::for_download(config.state_db.as_deref()).await?;
         let mut shutdown_break = false;
         #[cfg(test)]
         let mut printed_filenames = Vec::new();
@@ -1324,7 +1360,7 @@ where
                         }
                     }
 
-                    let plan = task_planner.plan_asset(&asset, config).await;
+                    let plan = task_planner.plan_download_asset(&asset, config).await?;
                     if let Some(resource) = &plan.malformed_resource {
                         enum_errors += 1;
                         tracing::error!(
@@ -1366,7 +1402,7 @@ where
         tokio::pin!(combined);
         let mut count = 0usize;
         let mut enum_errors = 0usize;
-        let mut task_planner = TaskPlanner::new();
+        let mut task_planner = TaskPlanner::for_download(config.state_db.as_deref()).await?;
         let mut shutdown_break = false;
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
@@ -1376,7 +1412,7 @@ where
             }
             match result {
                 Ok(asset) => {
-                    let plan = task_planner.plan_asset(&asset, config).await;
+                    let plan = task_planner.plan_download_asset(&asset, config).await?;
                     if plan.filter_reason.is_some() {
                         continue;
                     }
@@ -1540,7 +1576,14 @@ where
     let handle = tokio::spawn(async move {
         let config = &producer_config;
         let metadata_writers_enabled = MetadataFlags::from(config.as_ref()).has_any_write();
-        let mut task_planner = TaskPlanner::new();
+        let mut task_planner = match TaskPlanner::for_download(producer_state_db.as_deref()).await {
+            Ok(planner) => planner,
+            Err(error) => {
+                state_write_failures_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(%error, "Failed to load download path reservations");
+                return ProducerSkipSummary::default();
+            }
+        };
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
         // Skipped-asset IDs accumulated across the producer run and
@@ -1781,7 +1824,25 @@ where
                         );
                     }
 
-                    let plan = task_planner.plan_asset(&asset, config).await;
+                    let plan = match task_planner.plan_download_asset(&asset, config).await {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            state_write_failures_producer
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(%error, "Failed to plan reserved download paths");
+                            return skips;
+                        }
+                    };
+                    if let Some(db) = &producer_state_db
+                        && let Err(error) = task_planner
+                            .persist_download_reservations(db.as_ref(), &plan.tasks)
+                            .await
+                    {
+                        state_write_failures_producer
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(%error, "Failed to reserve download paths before publication");
+                        return skips;
+                    }
                     if let Some(reason) = plan.filter_reason {
                         skips.record_filter_reason(reason);
                         producer_pb.inc(1);
@@ -4669,6 +4730,33 @@ mod tests {
             _: &str,
         ) -> Result<HashMap<(String, String), crate::state::ImportedRecord>, StateError> {
             Ok(HashMap::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::state::ReconciliationStateStore for FailingDownloadStore {
+        async fn get_reconciliation_catalog_paths(
+            &self,
+        ) -> Result<Vec<crate::state::ReconciliationCatalogPath>, crate::state::error::StateError>
+        {
+            Ok(Vec::new())
+        }
+
+        async fn get_reconciliation_reservations(
+            &self,
+        ) -> Result<Vec<crate::state::ReconciliationReservation>, crate::state::error::StateError>
+        {
+            Ok(Vec::new())
+        }
+
+        async fn reserve_reconciliation_paths(
+            &self,
+            _reservations: &[crate::state::ReconciliationReservation],
+        ) -> Result<(), crate::state::error::StateError> {
+            Err(StateError::Invariant {
+                operation: "reserve_reconciliation_paths",
+                detail: "test store does not support reconciliation".into(),
+            })
         }
     }
 

@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 23;
+pub(crate) const SCHEMA_VERSION: i32 = 25;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -563,6 +563,45 @@ FROM assets WHERE status = 'downloaded' AND local_path IS NOT NULL;
 const SCHEMA_V22: &str = "CREATE INDEX IF NOT EXISTS idx_legacy_master_state_owners_asset \
     ON legacy_master_state_owners (library, asset_record_name, master_record_name);";
 
+/// Reconciliation reserves destinations before publishing media. Keep claims
+/// after finalization and config drift because previous copies remain on disk.
+const SCHEMA_V24: &str = r"
+CREATE TABLE IF NOT EXISTS reconciliation_paths (
+    library TEXT NOT NULL,
+    id TEXT NOT NULL,
+    version_size TEXT NOT NULL,
+    requested_path_key TEXT NOT NULL,
+    destination_path_key TEXT NOT NULL,
+    destination_path TEXT NOT NULL,
+    PRIMARY KEY (library, id, version_size, requested_path_key)
+);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_paths_destination
+    ON reconciliation_paths(destination_path_key);
+";
+
+/// Content generations retain independent immutable choices. Legacy reservations
+/// have unknown content (-1 bytes), so they remain occupied rather than being
+/// attributed to a possibly newer provider version in the catalog.
+const SCHEMA_V25: &str = r"
+CREATE TABLE reconciliation_paths_v25 (
+    library TEXT NOT NULL,
+    id TEXT NOT NULL,
+    version_size TEXT NOT NULL,
+    requested_path_key TEXT NOT NULL,
+    destination_path_key TEXT NOT NULL,
+    destination_path TEXT NOT NULL,
+    provider_checksum TEXT NOT NULL,
+    provider_size INTEGER NOT NULL CHECK (provider_size >= 0 OR (provider_size = -1 AND provider_checksum = '')),
+    PRIMARY KEY (library, id, version_size, requested_path_key, provider_checksum, provider_size)
+);
+INSERT INTO reconciliation_paths_v25
+    SELECT library, id, version_size, requested_path_key, destination_path_key,
+           destination_path, '', -1 FROM reconciliation_paths;
+DROP TABLE reconciliation_paths;
+ALTER TABLE reconciliation_paths_v25 RENAME TO reconciliation_paths;
+CREATE INDEX idx_reconciliation_paths_destination ON reconciliation_paths(destination_path_key);
+";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -739,6 +778,8 @@ fn migrate_to_version(
                 )?;
             }
         }
+        24 => conn.execute_batch(SCHEMA_V24)?,
+        25 => conn.execute_batch(SCHEMA_V25)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -2144,6 +2185,149 @@ mod tests {
     }
 
     #[test]
+    fn v25_reconciliation_paths_migration_preserves_unknown_content_and_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..=24 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes, media_type, status, local_path, last_seen_at)
+             VALUES ('PrimarySync', 'asset', 'original', 'new-provider-hash', 'photo.jpg', 1, 2048, 'photo', 'failed', '/old/photo.jpg', 1);
+             INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'preserved-token');
+             INSERT INTO reconciliation_paths VALUES ('PrimarySync', 'asset', 'original', '/new/photo.jpg', '/new/photo.jpg', '/new/photo.jpg');
+             INSERT INTO reconciliation_paths VALUES ('SharedSync', 'missing', 'original', '/new/photo.jpg', '/new/photo-missing.jpg', '/new/photo-missing.jpg');"
+        ).unwrap();
+        migrate(&conn).unwrap();
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let choices: Vec<_> = conn
+            .prepare(
+                "SELECT library, id, version_size, requested_path_key, destination_path_key, \
+                 destination_path, provider_checksum, provider_size \
+                 FROM reconciliation_paths ORDER BY library",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            choices,
+            vec![
+                (
+                    "PrimarySync".into(),
+                    "asset".into(),
+                    "original".into(),
+                    "/new/photo.jpg".into(),
+                    "/new/photo.jpg".into(),
+                    "/new/photo.jpg".into(),
+                    "".into(),
+                    -1
+                ),
+                (
+                    "SharedSync".into(),
+                    "missing".into(),
+                    "original".into(),
+                    "/new/photo.jpg".into(),
+                    "/new/photo-missing.jpg".into(),
+                    "/new/photo-missing.jpg".into(),
+                    "".into(),
+                    -1
+                ),
+            ]
+        );
+        let catalog: (String, String, String, i64) = conn
+            .query_row(
+                "SELECT status, local_path, checksum, size_bytes FROM assets WHERE id = 'asset'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog,
+            (
+                "failed".into(),
+                "/old/photo.jpg".into(),
+                "new-provider-hash".into(),
+                2048
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "preserved-token"
+        );
+        assert!(conn.execute("INSERT INTO reconciliation_paths SELECT library, id, version_size, requested_path_key, destination_path_key, destination_path, 'invalid', -1 FROM reconciliation_paths", []).is_err());
+    }
+
+    #[test]
+    fn v24_reconciliation_paths_migration_preserves_catalog_and_checkpoints() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=23 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes, media_type, status, local_path, last_seen_at)
+             VALUES ('PrimarySync', 'asset', 'original', 'provider-hash', 'photo.jpg', 1, 1024, 'photo', 'downloaded', '/old/photo.jpg', 1);
+             INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'preserved-token');",
+        ).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT status, local_path, checksum FROM assets WHERE id = 'asset'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "downloaded".into(),
+                "/old/photo.jpg".into(),
+                "provider-hash".into()
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "preserved-token"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM reconciliation_paths", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn v23_source_checksum_migration_keeps_historical_provenance_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
@@ -2185,6 +2369,8 @@ mod tests {
         )
         .unwrap();
         migrate_to_version(&conn, 22, 23).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 23);
+        migrate(&conn).unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, local_checksum, download_checksum, source_checksum, metadata_write_failed_at \
              FROM asset_metadata_paths ORDER BY id"

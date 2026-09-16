@@ -332,6 +332,58 @@ pub(crate) struct OwnedTempFile {
     pub(crate) claimed_at: i64,
 }
 
+/// Checked, absolute, platform-normalized key supplied by the path planner.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ReconciliationPathKey(pub(crate) String);
+
+/// Provider identity of one rendition's bytes, independent of URLs and metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ReconciliationContent {
+    pub(crate) checksum: Box<str>,
+    pub(crate) size: u64,
+}
+
+/// One immutable destination choice, retained across restarts and config drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReconciliationReservation {
+    /// None preserves a pre-generation reservation without guessing its content.
+    pub(crate) content: Option<ReconciliationContent>,
+    pub(crate) library: Arc<str>,
+    pub(crate) asset_id: Box<str>,
+    pub(crate) version_size: VersionSizeKey,
+    pub(crate) requested_path_key: ReconciliationPathKey,
+    pub(crate) destination_path_key: ReconciliationPathKey,
+    pub(crate) destination_path: PathBuf,
+}
+
+/// Current or historical catalog ownership, including pending and deleted rows.
+#[derive(Debug)]
+pub(crate) struct ReconciliationCatalogPath {
+    pub(crate) library: Arc<str>,
+    pub(crate) asset_id: Box<str>,
+    pub(crate) version_size: VersionSizeKey,
+    pub(crate) path: PathBuf,
+}
+
+/// Durable destination ownership for local catalog reconciliation.
+#[async_trait]
+pub(crate) trait ReconciliationStateStore: Send + Sync {
+    async fn get_reconciliation_catalog_paths(
+        &self,
+    ) -> Result<Vec<ReconciliationCatalogPath>, StateError>;
+
+    async fn get_reconciliation_reservations(
+        &self,
+    ) -> Result<Vec<ReconciliationReservation>, StateError>;
+
+    /// Commit every choice before any copy. Conflicting ownership or changed
+    /// choices fail the whole transaction; callers must not publish on error.
+    async fn reserve_reconciliation_paths(
+        &self,
+        reservations: &[ReconciliationReservation],
+    ) -> Result<(), StateError>;
+}
+
 /// State operation used only to preload the download context.
 #[async_trait]
 pub(crate) trait DownloadContextStateStore: Send + Sync {
@@ -2163,6 +2215,38 @@ impl SqliteStateDb {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("import_adopt::begin", e))?;
+
+            let has_reservations: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reconciliation_paths)",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_reservations {
+                // Check before any catalog or metadata mutation, in the same transaction.
+                let path_key = crate::fs_util::confined_path_key(&local_path).map_err(|error| {
+                    StateError::Invariant {
+                        operation: "import_adopt",
+                        detail: format!("invalid import destination: {error}"),
+                    }
+                })?;
+                let foreign_owner: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM reconciliation_paths \
+                     WHERE destination_path_key = ?1 AND (library != ?2 OR id != ?3 OR version_size != ?4 \
+                     OR provider_checksum != ?5 OR ?6 IS NULL OR provider_size != ?6))",
+                    rusqlite::params![
+                        path_key, record.library.as_ref(), record.id.as_ref(),
+                        record.version_size.as_str(), record.checksum.as_ref(),
+                        i64::try_from(record.size_bytes).ok(),
+                    ],
+                    |row| row.get(0),
+                )?;
+                if foreign_owner {
+                    return Err(StateError::Invariant {
+                        operation: "import_adopt",
+                        detail: "import destination is reserved for another asset, rendition, or content generation".into(),
+                    });
+                }
+            }
 
             let now = Utc::now().timestamp();
             upsert_asset_row(&tx, &record, now)?;
@@ -6163,6 +6247,126 @@ impl SyncTokenStore for SqliteStateDb {
 }
 
 #[async_trait]
+impl ReconciliationStateStore for SqliteStateDb {
+    async fn get_reconciliation_catalog_paths(
+        &self,
+    ) -> Result<Vec<ReconciliationCatalogPath>, StateError> {
+        self.with_conn("get_reconciliation_catalog_paths", move |conn| {
+            let mut statement = conn.prepare_cached(
+                "SELECT library, id, version_size, local_path FROM assets WHERE local_path IS NOT NULL \
+                 UNION SELECT library, id, version_size, local_path FROM asset_metadata_paths",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(ReconciliationCatalogPath {
+                    library: row.get::<_, String>(0)?.into(),
+                    asset_id: row.get::<_, String>(1)?.into_boxed_str(),
+                    version_size: VersionSizeKey::from_str(&row.get::<_, String>(2)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    path: PathBuf::from(row.get::<_, String>(3)?),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StateError::from)
+        })
+        .await
+    }
+
+    async fn get_reconciliation_reservations(
+        &self,
+    ) -> Result<Vec<ReconciliationReservation>, StateError> {
+        self.with_conn("get_reconciliation_reservations", move |conn| {
+            let mut statement = conn.prepare_cached(
+                "SELECT library, id, version_size, requested_path_key, \
+                 destination_path_key, destination_path, provider_checksum, \
+                 CASE WHEN provider_size >= 0 THEN provider_size END FROM reconciliation_paths",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let version: String = row.get(2)?;
+                Ok(ReconciliationReservation {
+                    content: row
+                        .get::<_, Option<i64>>(7)?
+                        .map(|size| {
+                            Ok::<_, rusqlite::Error>(ReconciliationContent {
+                                checksum: row.get::<_, String>(6)?.into_boxed_str(),
+                                size: u64::try_from(size).map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        7,
+                                        rusqlite::types::Type::Integer,
+                                        Box::new(error),
+                                    )
+                                })?,
+                            })
+                        })
+                        .transpose()?,
+                    library: row.get::<_, String>(0)?.into(),
+                    asset_id: row.get::<_, String>(1)?.into_boxed_str(),
+                    version_size: VersionSizeKey::from_str(&version)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    requested_path_key: ReconciliationPathKey(row.get(3)?),
+                    destination_path_key: ReconciliationPathKey(row.get(4)?),
+                    destination_path: PathBuf::from(row.get::<_, String>(5)?),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StateError::from)
+        })
+        .await
+    }
+
+    async fn reserve_reconciliation_paths(
+        &self,
+        reservations: &[ReconciliationReservation],
+    ) -> Result<(), StateError> {
+        let reservations = reservations.to_vec();
+        self.with_conn("reserve_reconciliation_paths", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            for reservation in reservations {
+                let destination = reservation.destination_path.to_str().ok_or_else(|| StateError::Invariant {
+                    operation: "reserve_reconciliation_paths",
+                    detail: "reconciliation destination is not representable in SQLite text".into(),
+                })?;
+                let provider_checksum = reservation.content.as_ref().map(|content| content.checksum.as_ref());
+                let provider_size = reservation.content.as_ref().map(|content| i64::try_from(content.size)).transpose().map_err(|error| StateError::Invariant {
+                    operation: "reserve_reconciliation_paths",
+                    detail: format!("provider size exceeds SQLite integer range: {error}"),
+                })?;
+                let foreign_owner: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM reconciliation_paths \
+                     WHERE destination_path_key = ?1 AND (library != ?2 OR id != ?3 OR version_size != ?4 \
+                     OR provider_checksum != COALESCE(?5, '') OR provider_size != COALESCE(?6, -1)))",
+                    rusqlite::params![reservation.destination_path_key.0, reservation.library.as_ref(), reservation.asset_id.as_ref(), reservation.version_size.as_str(), provider_checksum, provider_size],
+                    |row| row.get(0),
+                )?;
+                if foreign_owner {
+                    return Err(StateError::Invariant {
+                        operation: "reserve_reconciliation_paths",
+                        detail: "reconciliation destination belongs to another asset, rendition, or content generation".into(),
+                    });
+                }
+                let changed = tx.execute(
+                    "INSERT INTO reconciliation_paths \
+                     (library, id, version_size, requested_path_key, destination_path_key, destination_path, provider_checksum, provider_size) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, ''), COALESCE(?8, -1)) \
+                     ON CONFLICT(library, id, version_size, requested_path_key, provider_checksum, provider_size) DO UPDATE \
+                     SET destination_path = reconciliation_paths.destination_path \
+                     WHERE reconciliation_paths.destination_path_key = excluded.destination_path_key",
+                    rusqlite::params![reservation.library.as_ref(), reservation.asset_id.as_ref(), reservation.version_size.as_str(), reservation.requested_path_key.0, reservation.destination_path_key.0, destination, provider_checksum, provider_size],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::Invariant {
+                        operation: "reserve_reconciliation_paths",
+                        detail: "reconciliation retry changed its reserved destination".into(),
+                    });
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+#[async_trait]
 impl DownloadContextStateStore for SqliteStateDb {
     async fn get_downloaded_file_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
         SqliteStateDb::get_downloaded_file_records(self).await
@@ -7192,6 +7396,145 @@ mod tests {
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].source_checksum.as_deref(), Some("source"));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_reservations_round_trip_and_reject_conflicts_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let destination = root.path().join("photo-é.jpg");
+        let reservation = ReconciliationReservation {
+            content: Some(ReconciliationContent {
+                checksum: "provider".into(),
+                size: 1024,
+            }),
+            library: Arc::from("PrimarySync"),
+            asset_id: "asset".into(),
+            version_size: VersionSizeKey::Original,
+            requested_path_key: ReconciliationPathKey("requested-photo".into()),
+            destination_path_key: ReconciliationPathKey(destination.to_str().unwrap().into()),
+            destination_path: destination,
+        };
+        db.reserve_reconciliation_paths(std::slice::from_ref(&reservation))
+            .await
+            .unwrap();
+        db.reserve_reconciliation_paths(std::slice::from_ref(&reservation))
+            .await
+            .unwrap();
+        drop(db);
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        assert_eq!(
+            db.get_reconciliation_reservations().await.unwrap(),
+            vec![reservation.clone()]
+        );
+
+        let mut new_choice = reservation.clone();
+        new_choice.requested_path_key = ReconciliationPathKey("new-request".into());
+        new_choice.destination_path_key = ReconciliationPathKey("new-destination".into());
+        new_choice.destination_path = root.path().join("new.jpg");
+        let mut foreign = reservation.clone();
+        foreign.library = Arc::from("SharedSync");
+        assert!(
+            db.reserve_reconciliation_paths(&[new_choice.clone(), foreign])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.get_reconciliation_reservations().await.unwrap(),
+            vec![reservation.clone()],
+            "failed batches leave no partial claims"
+        );
+
+        let mut changed_choice = new_choice;
+        changed_choice.requested_path_key = reservation.requested_path_key.clone();
+        assert!(
+            db.reserve_reconciliation_paths(&[changed_choice])
+                .await
+                .is_err()
+        );
+        let mut foreign_version = reservation.clone();
+        foreign_version.version_size = VersionSizeKey::Medium;
+        assert!(
+            db.reserve_reconciliation_paths(&[foreign_version])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.get_reconciliation_reservations().await.unwrap(),
+            vec![reservation.clone()]
+        );
+
+        // A later template can request a path already owned by this rendition.
+        // Retain both request mappings without weakening foreign-owner checks.
+        let mut changed_template = reservation;
+        changed_template.requested_path_key = ReconciliationPathKey("changed-template".into());
+        db.reserve_reconciliation_paths(&[changed_template])
+            .await
+            .unwrap();
+        assert_eq!(db.get_reconciliation_reservations().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_reservations_keep_each_content_generation_immutable() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        let legacy = ReconciliationReservation {
+            library: Arc::from("PrimarySync"),
+            asset_id: "asset".into(),
+            version_size: VersionSizeKey::Adjusted,
+            content: None,
+            requested_path_key: ReconciliationPathKey("requested".into()),
+            destination_path_key: ReconciliationPathKey("legacy".into()),
+            destination_path: root.path().join("legacy.jpg"),
+        };
+        db.reserve_reconciliation_paths(std::slice::from_ref(&legacy))
+            .await
+            .unwrap();
+        let mut choices = vec![legacy.clone()];
+        for (checksum, size) in [("first", 1024), ("second", 1024), ("second", 2048)] {
+            let mut choice = legacy.clone();
+            choice.content = Some(ReconciliationContent {
+                checksum: checksum.into(),
+                size,
+            });
+            // Neither a legacy claim nor an older known generation is reusable.
+            for old in &choices {
+                choice.destination_path_key = old.destination_path_key.clone();
+                choice.destination_path = old.destination_path.clone();
+                assert!(
+                    db.reserve_reconciliation_paths(std::slice::from_ref(&choice))
+                        .await
+                        .is_err()
+                );
+            }
+            choice.destination_path = root.path().join(format!("{checksum}-{size}.jpg"));
+            choice.destination_path_key =
+                ReconciliationPathKey(choice.destination_path.to_str().unwrap().into());
+            db.reserve_reconciliation_paths(std::slice::from_ref(&choice))
+                .await
+                .unwrap();
+            db.reserve_reconciliation_paths(std::slice::from_ref(&choice))
+                .await
+                .unwrap();
+            let mut moved = choice.clone();
+            moved.destination_path_key = ReconciliationPathKey("different".into());
+            moved.destination_path = root.path().join("different.jpg");
+            assert!(db.reserve_reconciliation_paths(&[moved]).await.is_err());
+            choices.push(choice);
+        }
+        let mut oversized = legacy;
+        oversized.content = Some(ReconciliationContent {
+            checksum: "oversized".into(),
+            size: u64::MAX,
+        });
+        assert!(db.reserve_reconciliation_paths(&[oversized]).await.is_err());
+        drop(db);
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        let saved = db.get_reconciliation_reservations().await.unwrap();
+        assert_eq!(saved.len(), choices.len());
+        assert!(choices.iter().all(|choice| saved.contains(choice)));
     }
 
     #[tokio::test]
@@ -10431,6 +10774,118 @@ mod tests {
     }
 
     // ── import_adopt: atomic upsert + mark-downloaded ───────────────────
+
+    #[tokio::test]
+    async fn import_adopt_respects_reservation_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("photo.jpg");
+        let owner = TestAssetRecord::new("owner")
+            .checksum("provider")
+            .size(1024)
+            .build();
+        let reservation = ReconciliationReservation {
+            content: Some(ReconciliationContent {
+                checksum: owner.checksum.clone(),
+                size: owner.size_bytes,
+            }),
+            library: owner.library.clone(),
+            asset_id: owner.id.clone(),
+            version_size: owner.version_size,
+            requested_path_key: ReconciliationPathKey("requested".into()),
+            destination_path_key: ReconciliationPathKey(
+                crate::fs_util::confined_path_key(&destination).unwrap(),
+            ),
+            destination_path: destination.clone(),
+        };
+        let candidates = [
+            owner.clone(),
+            AssetRecord {
+                id: "other".into(),
+                ..owner.clone()
+            },
+            AssetRecord {
+                library: Arc::from("SharedSync"),
+                ..owner.clone()
+            },
+            AssetRecord {
+                version_size: VersionSizeKey::Medium,
+                ..owner.clone()
+            },
+            AssetRecord {
+                checksum: "changed".into(),
+                ..owner.clone()
+            },
+            AssetRecord {
+                size_bytes: 2048,
+                ..owner.clone()
+            },
+            AssetRecord {
+                size_bytes: u64::MAX,
+                ..owner.clone()
+            },
+        ];
+        for legacy in [false, true] {
+            for (index, candidate) in candidates.iter().enumerate() {
+                let db = SqliteStateDb::open_in_memory().unwrap();
+                let mut reservation = reservation.clone();
+                if legacy {
+                    reservation.content = None;
+                }
+                db.reserve_reconciliation_paths(std::slice::from_ref(&reservation))
+                    .await
+                    .unwrap();
+                let allowed = index == 0 && !legacy;
+                // Equivalent root spelling must not bypass the ownership check.
+                let alias = root.path().join(".").join("photo.jpg");
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                let alias = alias.with_file_name("PHOTO.JPG");
+                let adopted = db
+                    .import_adopt(candidate, &alias, "local", 1024, Some(1))
+                    .await;
+                assert_eq!(
+                    adopted.is_ok(),
+                    allowed,
+                    "legacy={legacy}, candidate={index}"
+                );
+                assert_eq!(
+                    db.get_summary().await.unwrap().total_assets,
+                    u64::from(allowed)
+                );
+                assert_eq!(
+                    db.get_reconciliation_catalog_paths().await.unwrap().len(),
+                    usize::from(allowed)
+                );
+                assert_eq!(
+                    db.get_reconciliation_reservations().await.unwrap(),
+                    vec![reservation]
+                );
+                if allowed {
+                    db.import_adopt(candidate, &alias, "local", 1024, Some(1))
+                        .await
+                        .unwrap();
+                    assert_eq!(db.get_summary().await.unwrap().total_assets, 1);
+                } else {
+                    // Refusal must also preserve an existing imported row and its historical path.
+                    let previous = root.path().join("previous.jpg");
+                    db.import_adopt(candidate, &previous, "previous-hash", 1024, Some(2))
+                        .await
+                        .unwrap();
+                    assert!(
+                        db.import_adopt(candidate, &alias, "replacement", 1024, Some(3))
+                            .await
+                            .is_err()
+                    );
+                    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].local_path.as_ref(), Some(&previous));
+                    assert_eq!(rows[0].local_checksum.as_deref(), Some("previous-hash"));
+                    let paths = db.get_reconciliation_catalog_paths().await.unwrap();
+                    assert_eq!(paths.len(), 1);
+                    assert_eq!(paths[0].path, previous);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn import_adopt_persists_downloaded_row_in_one_call() {

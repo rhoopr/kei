@@ -117,6 +117,12 @@ pub(crate) enum ConfinedParents {
     Create,
 }
 
+#[derive(Clone, Copy)]
+enum ConfinedAccess {
+    Read,
+    Metadata,
+}
+
 #[derive(Debug)]
 pub(crate) struct ConfinedPath {
     #[cfg(unix)]
@@ -217,7 +223,7 @@ impl ConfinedPath {
 
     pub(crate) fn open_regular(&self) -> std::io::Result<std::fs::File> {
         self.validate_namespace()?;
-        self.open_regular_read()
+        self.open_regular_with_access(ConfinedAccess::Read)
     }
 
     pub(crate) fn open_optional_regular(&self) -> std::io::Result<Option<std::fs::File>> {
@@ -266,7 +272,19 @@ impl ConfinedPath {
         expected: FileIdentity,
     ) -> std::io::Result<std::fs::File> {
         self.validate_namespace()?;
-        let file = self.open_regular_read()?;
+        let file = self.open_regular_with_access(ConfinedAccess::Read)?;
+        if file_identity(&file)? != expected {
+            return Err(confined_identity_changed_error(&self.path));
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn validate_for_metadata(
+        &self,
+        expected: FileIdentity,
+    ) -> std::io::Result<std::fs::File> {
+        self.validate_namespace()?;
+        let file = self.open_regular_with_access(ConfinedAccess::Metadata)?;
         if file_identity(&file)? != expected {
             return Err(confined_identity_changed_error(&self.path));
         }
@@ -333,7 +351,7 @@ impl ConfinedPath {
         &self.name
     }
 
-    fn open_regular_read(&self) -> std::io::Result<std::fs::File> {
+    fn open_regular_with_access(&self, access: ConfinedAccess) -> std::io::Result<std::fs::File> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -353,6 +371,7 @@ impl ConfinedPath {
             if !file.metadata()?.file_type().is_file() {
                 return Err(non_regular_error(&self.path));
             }
+            let _ = access;
             Ok(file)
         }
         #[cfg(windows)]
@@ -360,14 +379,17 @@ impl ConfinedPath {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{
                 FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES,
-                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
             };
 
             let probe = open_windows_entry_attributes(&self.path)?;
             ensure_windows_regular(&probe, &self.path)?;
             drop(probe);
             let file = std::fs::OpenOptions::new()
-                .access_mode(FILE_GENERIC_READ | FILE_READ_ATTRIBUTES)
+                .access_mode(match access {
+                    ConfinedAccess::Read => FILE_GENERIC_READ | FILE_READ_ATTRIBUTES,
+                    ConfinedAccess::Metadata => FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES,
+                })
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&self.path)?;
@@ -914,6 +936,24 @@ fn open_confined_regular_file_platform(
         modified_secs,
         file,
     }))
+}
+
+/// Normalize path spelling for platform-specific collision checks.
+pub(crate) fn normalized_path(path: &Path) -> std::borrow::Cow<'_, str> {
+    let s = path.to_string_lossy();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        std::borrow::Cow::Owned(s.to_ascii_lowercase())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        s
+    }
+}
+
+/// Build the shared absolute ownership key without accepting parent traversal.
+pub(crate) fn confined_path_key(path: &Path) -> std::io::Result<String> {
+    Ok(normalized_path(&absolute_confined_path(path)?).into_owned())
 }
 
 /// Resolve a confined path without changing parent-component semantics.
