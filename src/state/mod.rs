@@ -16,8 +16,9 @@ pub mod types;
 pub use db::ImportedRecord;
 pub(crate) use db::{
     AssetVerificationState, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
-    OwnedTempFile, ReconciliationCatalogPath, ReconciliationPathKey, ReconciliationReservation,
-    ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken, TempFileOwnershipStore,
+    OwnedTempFile, ReconciliationCatalogPath, ReconciliationContent, ReconciliationPathKey,
+    ReconciliationReservation, ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken,
+    TempFileOwnershipStore,
 };
 pub use db::{
     DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,

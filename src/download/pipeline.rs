@@ -413,28 +413,28 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
     planned_tasks: &[DownloadTask],
     evidence: PendingRetryFileEvidence<'_>,
 ) -> PendingRetryAdoption {
+    // A content change can leave historical catalog evidence after the new
+    // reserved sibling was published but finalization failed. Its immutable
+    // content-specific reservation and verified bytes permit adoption; the old
+    // recorded file still cannot stand in for the new provider generation.
+    for task in planned_tasks.iter().filter(|task| {
+        task.version_size == evidence.version_size
+            && task.checksum.as_ref() == evidence.checksum
+            && task.size == evidence.size
+    }) {
+        if task_planner.has_durable_destination(task)
+            && let Some(adoption) =
+                adopt_pending_task_path(db, config, asset, task_planner, task, None).await
+        {
+            return adoption.into();
+        }
+    }
     if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
         return PendingRetryAdoption::NotFound;
     }
 
     if let PendingRetryLocalPath::Current(recorded_file) = evidence.local_path {
         let local_path = &recorded_file.path;
-        // A failed finalization can leave the old source in SQLite after the
-        // reserved sibling was published. Verify that sibling before retrying
-        // the recorded source or choosing another destination.
-        for task in planned_tasks.iter().filter(|task| {
-            task.version_size == evidence.version_size
-                && task.checksum.as_ref() == evidence.checksum
-                && task.size == evidence.size
-                && task.download_path != *local_path
-        }) {
-            if task_planner.has_durable_destination(task)
-                && let Some(adoption) =
-                    adopt_pending_task_path(db, config, asset, task_planner, task, None).await
-            {
-                return adoption.into();
-            }
-        }
         let recorded_filename_matches = local_path
             .file_name()
             .and_then(|filename| filename.to_str())
@@ -653,6 +653,8 @@ async fn adopt_pending_task_path(
         &task.library,
         &task.asset_id,
         task.version_size,
+        &task.checksum,
+        task.size,
         &existing_path,
     ) {
         return None;
@@ -727,6 +729,8 @@ async fn adopt_pending_derived_path_at(
         library,
         asset.state_id(),
         derived.version_size,
+        &derived.checksum,
+        derived.size,
         &existing_path,
     ) {
         return None;

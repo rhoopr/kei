@@ -304,6 +304,8 @@ impl PendingRetryPlanning<'_> {
                         &task.library,
                         &task.asset_id,
                         task.version_size,
+                        &task.checksum,
+                        task.size,
                         local_path,
                     )
                 {

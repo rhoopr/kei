@@ -14729,6 +14729,386 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn reserved_content_update_full() {
+        Box::pin(assert_reserved_content_update(
+            ReservedDownloadPass::Full,
+            2048,
+            ReservedDownloadFailure::None,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reserved_content_update_streaming() {
+        Box::pin(assert_reserved_content_update(
+            ReservedDownloadPass::IncrementalStreaming,
+            2048,
+            ReservedDownloadFailure::None,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reserved_content_update_collecting() {
+        Box::pin(assert_reserved_content_update(
+            ReservedDownloadPass::IncrementalCollecting,
+            2048,
+            ReservedDownloadFailure::None,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reserved_content_update_same_size() {
+        Box::pin(assert_reserved_content_update(
+            ReservedDownloadPass::IncrementalStreaming,
+            1024,
+            ReservedDownloadFailure::None,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reserved_content_update_finalization_retry() {
+        Box::pin(assert_reserved_content_update(
+            ReservedDownloadPass::Full,
+            2048,
+            ReservedDownloadFailure::Finalization,
+        ))
+        .await;
+    }
+
+    async fn assert_reserved_content_update(
+        pass: ReservedDownloadPass,
+        updated_size: usize,
+        failure: ReservedDownloadFailure,
+    ) {
+        let mode = if matches!(pass, ReservedDownloadPass::Full) {
+            SyncMode::Full
+        } else {
+            SyncMode::Incremental {
+                zone_sync_token: "before".into(),
+            }
+        };
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = crate::start_wiremock_or_skip!();
+        let mut bytes = vec![3u8; 1024];
+        bytes[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
+        Mock::given(method("GET"))
+            .and(path("/new.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&server)
+            .await;
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let source = root.path().join("reserved.jpg");
+        std::fs::write(&source, vec![1u8; 1024]).unwrap();
+        let source_checksum = file::compute_sha256(&source).await.unwrap();
+        let mut a = mock_photo_records_for_zone_with_filename("A", "PrimarySync", "reserved.jpg");
+        a[1]["fields"]["resJPEGFullRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/edited.jpg", "size": 1024,
+            "fileChecksum": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        }});
+        a[1]["fields"]["resJPEGFullFileType"] = json!({"value": "public.jpeg"});
+        let asset_a = PhotoAsset::new(a[0].clone(), a[1].clone());
+        let mut b = incremental_photo_records_with_url(
+            "B",
+            "reserved_edited.JPG",
+            &format!("{}/new.jpg", server.uri()),
+            1024,
+        );
+        b[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        b[1]["fields"]["resJPEGFullRes"] = json!({"value": {
+            "downloadURL": format!("{}/edited.jpg", server.uri()), "size": 1024,
+            "fileChecksum": checksum
+        }});
+        b[1]["fields"]["resJPEGFullFileType"] = json!({"value": "public.jpeg"});
+        Mock::given(method("GET"))
+            .and(path("/edited.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&server)
+            .await;
+        db.upsert_seen(
+            &TestAssetRecord::new("A")
+                .filename("reserved.jpg")
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "A",
+            "original",
+            &source,
+            &source_checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-A", "A")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "before")
+            .await
+            .unwrap();
+        let lookup_pass = |records| {
+            vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(records),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }]
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(root.path().join("new"));
+        std::fs::create_dir_all(&config.directory).unwrap();
+        config.edited = true;
+        config.state_db = Some(db.clone());
+        config.sync_mode = mode;
+        let reserved = filter::expected_paths_for(&asset_a, &config)
+            .into_iter()
+            .find(|item| item.version_size != VersionSizeKey::Original)
+            .unwrap()
+            .path;
+        let first = reconcile_catalog_paths(
+            &lookup_pass(a.clone()),
+            Arc::new(config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(first.complete, "initial reconciliation: {first:?}");
+        assert_eq!(first.stats.downloaded, 1);
+        assert!(!reserved.exists());
+        assert!(
+            db.get_pending().await.unwrap().is_empty(),
+            "B must not enter through pending recovery"
+        );
+        let downloaded = run_reserved_download_cycle(
+            pass,
+            b.clone(),
+            Arc::new(config.clone()),
+            DownloadRunMode::Download,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(downloaded.outcome, DownloadOutcome::Success),
+            "{downloaded:?}"
+        );
+        assert_eq!(downloaded.stats.downloaded, 2);
+        let initial = db.get_downloaded_page(0, 10).await.unwrap();
+        let old_path = initial
+            .iter()
+            .find(|row| row.id.as_ref() != "A" && row.version_size == VersionSizeKey::Adjusted)
+            .unwrap()
+            .local_path
+            .clone()
+            .unwrap();
+        let original_b = b.clone();
+        let mut updated = vec![4u8; updated_size];
+        updated[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+        let updated_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&updated));
+        Mock::given(method("GET"))
+            .and(path("/updated.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(updated.clone()))
+            .mount(&server)
+            .await;
+        b[1]["fields"]["resJPEGFullRes"] = json!({"value": {
+            "downloadURL": format!("{}/updated.jpg", server.uri()), "size": updated_size,
+            "fileChecksum": updated_checksum
+        }});
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        config.state_db = Some(db.clone());
+        let original_reservations = db.get_reconciliation_reservations().await.unwrap();
+        if matches!(failure, ReservedDownloadFailure::Finalization) {
+            db.acquire_lock("inject generation finalization failure").unwrap().execute_batch(
+                "CREATE TEMP TRIGGER fail_generation BEFORE UPDATE OF status ON assets WHEN NEW.id = 'asset-B' AND NEW.version_size = 'adjusted' AND NEW.status = 'downloaded' BEGIN SELECT RAISE(FAIL, 'injected finalization failure'); END;"
+            ).unwrap();
+        }
+        let changed = run_reserved_download_cycle(
+            pass,
+            b.clone(),
+            Arc::new(config.clone()),
+            DownloadRunMode::Download,
+        )
+        .await
+        .unwrap();
+        let reservations = db.get_reconciliation_reservations().await.unwrap();
+        assert_eq!(reservations.len(), original_reservations.len() + 1);
+        assert!(
+            original_reservations
+                .iter()
+                .all(|old| reservations.contains(old))
+        );
+        let choice = reservations
+            .iter()
+            .find(|r| {
+                r.asset_id.as_ref() == "asset-B"
+                    && r.version_size == VersionSizeKey::Adjusted
+                    && r.content
+                        .as_ref()
+                        .is_some_and(|c| c.checksum.as_ref() == updated_checksum)
+            })
+            .unwrap();
+        let new_path = choice.destination_path.clone();
+        assert_ne!(new_path, old_path);
+        assert_eq!(std::fs::read(&new_path).unwrap(), updated);
+        assert_eq!(std::fs::read(&old_path).unwrap(), bytes);
+        let request_count = server.received_requests().await.unwrap().len();
+        assert_eq!(request_count, 3);
+        if matches!(failure, ReservedDownloadFailure::Finalization) {
+            assert!(changed.stats.state_write_failures > 0, "{changed:?}");
+            let mut retryable = db.get_pending().await.unwrap();
+            retryable.extend(db.get_failed().await.unwrap());
+            assert!(retryable.iter().any(|r| r.id.as_ref() == "asset-B"
+                && r.version_size == VersionSizeKey::Adjusted
+                && r.checksum.as_ref() == updated_checksum));
+            db.acquire_lock("remove generation failure")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_generation")
+                .unwrap();
+        } else {
+            assert!(
+                matches!(changed.outcome, DownloadOutcome::Success),
+                "{changed:?}"
+            );
+            assert_eq!(changed.stats.downloaded, 1);
+        }
+        config.state_db = Some(Arc::new(SqliteStateDb::open(&db_path).await.unwrap()));
+        // Targeted recovery must adopt the new reserved sibling, not the old
+        // catalog path, after publication succeeded but finalization failed.
+        let restarted = run_reserved_download_cycle(
+            ReservedDownloadPass::Pending,
+            b.clone(),
+            Arc::new(config.clone()),
+            DownloadRunMode::Download,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(restarted.outcome, DownloadOutcome::Success),
+            "{restarted:?}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            request_count
+        );
+        let rows = config
+            .state_db
+            .as_ref()
+            .unwrap()
+            .get_downloaded_page(0, 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id.as_ref() == "asset-B" && r.version_size == VersionSizeKey::Adjusted)
+            .unwrap();
+        assert_eq!(row.local_path.as_ref(), Some(&new_path));
+        assert_eq!(row.checksum.as_ref(), updated_checksum);
+        assert_eq!(row.size_bytes, updated_size as u64);
+        assert_eq!(
+            config
+                .state_db
+                .as_ref()
+                .unwrap()
+                .get_reconciliation_reservations()
+                .await
+                .unwrap()
+                .len(),
+            reservations.len()
+        );
+        let count = std::fs::read_dir(new_path.parent().unwrap())
+            .unwrap()
+            .count();
+        let steady = run_reserved_download_cycle(
+            pass,
+            b,
+            Arc::new(config.clone()),
+            DownloadRunMode::Download,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(steady.outcome, DownloadOutcome::Success),
+            "{steady:?}"
+        );
+        assert_eq!(steady.stats.downloaded, 0);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            request_count
+        );
+        assert_eq!(
+            std::fs::read_dir(new_path.parent().unwrap())
+                .unwrap()
+                .count(),
+            count
+        );
+        assert_eq!(std::fs::read(&new_path).unwrap(), updated);
+        assert_eq!(std::fs::read(&old_path).unwrap(), bytes);
+        // A provider revert reuses the first generation's immutable choice;
+        // it must not discard the newer generation's reservation or bytes.
+        let reverted = run_reserved_download_cycle(
+            pass,
+            original_b,
+            Arc::new(config.clone()),
+            DownloadRunMode::Download,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(reverted.outcome, DownloadOutcome::Success),
+            "{reverted:?}"
+        );
+        let rows = config
+            .state_db
+            .as_ref()
+            .unwrap()
+            .get_downloaded_page(0, 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id.as_ref() == "asset-B" && r.version_size == VersionSizeKey::Adjusted)
+            .unwrap();
+        assert_eq!(row.local_path.as_ref(), Some(&old_path));
+        assert_eq!(row.checksum.as_ref(), checksum);
+        assert_eq!(
+            config
+                .state_db
+                .as_ref()
+                .unwrap()
+                .get_reconciliation_reservations()
+                .await
+                .unwrap()
+                .len(),
+            reservations.len()
+        );
+        assert_eq!(
+            std::fs::read_dir(new_path.parent().unwrap())
+                .unwrap()
+                .count(),
+            count
+        );
+        assert_eq!(std::fs::read(&new_path).unwrap(), updated);
+        assert_eq!(std::fs::read(&old_path).unwrap(), bytes);
+    }
+
     async fn run_reserved_download_cycle(
         pass: ReservedDownloadPass,
         records: Vec<serde_json::Value>,
@@ -15279,6 +15659,10 @@ mod tests {
                     .key(&owned_path)
                     .unwrap();
                 db.reserve_reconciliation_paths(&[crate::state::ReconciliationReservation {
+                    content: Some(crate::state::ReconciliationContent {
+                        checksum: checksum.clone().into(),
+                        size: 1024,
+                    }),
                     library: Arc::from("PrimarySync"),
                     asset_id: "B".into(),
                     version_size: VersionSizeKey::Original,

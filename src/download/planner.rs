@@ -11,7 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::icloud::photos::PhotoAsset;
 use crate::state::{
     AssetRecord, DownloadStateStore, MembershipStore, ReconciliationCatalogPath,
-    ReconciliationPathKey, ReconciliationReservation, VersionSizeKey,
+    ReconciliationContent, ReconciliationPathKey, ReconciliationReservation, VersionSizeKey,
 };
 
 use super::filter::{
@@ -33,7 +33,9 @@ struct ReconciliationOwner {
 struct ReconciliationPlanning {
     claims: FxHashMap<ReconciliationOwner, FxHashMap<NormalizedPath, u64>>,
     path_owners: FxHashMap<NormalizedPath, FxHashSet<ReconciliationOwner>>,
-    destinations: FxHashMap<(ReconciliationOwner, NormalizedPath), std::path::PathBuf>,
+    destinations:
+        FxHashMap<(ReconciliationOwner, ReconciliationContent, NormalizedPath), std::path::PathBuf>,
+    path_contents: FxHashMap<NormalizedPath, FxHashSet<Option<ReconciliationContent>>>,
     reservations: Vec<ReconciliationReservation>,
     durable_destinations: FxHashSet<NormalizedPath>,
 }
@@ -93,10 +95,20 @@ impl TaskPlanner {
                 .durable_destinations
                 .insert(destination.clone());
             // Reconciliation uses occupancy, not sizes, for collision decisions.
-            planner.add_reconciliation_claim(owner.clone(), destination, 0);
+            planner.add_reconciliation_claim(owner.clone(), destination.clone(), 0);
+            planner
+                .reconciliation
+                .path_contents
+                .entry(destination)
+                .or_default()
+                .insert(reservation.content.clone());
+            let Some(content) = reservation.content else {
+                continue;
+            };
             planner.reconciliation.destinations.insert(
                 (
                     owner,
+                    content,
                     NormalizedPath::from_key(reservation.requested_path_key),
                 ),
                 reservation.destination_path,
@@ -142,23 +154,40 @@ impl TaskPlanner {
         library: &str,
         asset_id: &str,
         version_size: VersionSizeKey,
+        checksum: &str,
+        size: u64,
         path: &Path,
     ) -> bool {
         if matches!(self.path_mode, PathPlanningMode::Download) {
             return true;
         }
         self.path_mode.key(path).is_ok_and(|key| {
-            self.reconciliation
-                .path_owners
-                .get(&key)
-                .is_none_or(|owners| {
-                    owners.iter().all(|owner| {
-                        owner.library.as_ref() == library
-                            && owner.asset_id.as_ref() == asset_id
-                            && owner.version_size == version_size
+            self.content_path_allowed(&key, checksum, size)
+                && self
+                    .reconciliation
+                    .path_owners
+                    .get(&key)
+                    .is_none_or(|owners| {
+                        owners.iter().all(|owner| {
+                            owner.library.as_ref() == library
+                                && owner.asset_id.as_ref() == asset_id
+                                && owner.version_size == version_size
+                        })
+                    })
+        })
+    }
+
+    fn content_path_allowed(&self, key: &NormalizedPath, checksum: &str, size: u64) -> bool {
+        self.reconciliation
+            .path_contents
+            .get(key)
+            .is_none_or(|contents| {
+                contents.iter().all(|content| {
+                    content.as_ref().is_some_and(|content| {
+                        content.checksum.as_ref() == checksum && content.size == size
                     })
                 })
-        })
+            })
     }
 
     /// A committed choice wins over an older recorded source path on restart.
@@ -171,6 +200,8 @@ impl TaskPlanner {
                 &task.library,
                 &task.asset_id,
                 task.version_size,
+                &task.checksum,
+                task.size,
                 &task.download_path,
             )
     }
@@ -230,6 +261,16 @@ impl TaskPlanner {
         if !reservations.is_empty() {
             db.reserve_reconciliation_paths(&reservations).await?;
             for reservation in reservations {
+                let Some(content) = reservation.content else {
+                    continue;
+                };
+                self.reconciliation
+                    .path_contents
+                    .entry(NormalizedPath::from_key(
+                        reservation.destination_path_key.clone(),
+                    ))
+                    .or_default()
+                    .insert(Some(content.clone()));
                 self.reconciliation
                     .durable_destinations
                     .insert(NormalizedPath::from_key(reservation.destination_path_key));
@@ -240,6 +281,7 @@ impl TaskPlanner {
                             asset_id: reservation.asset_id,
                             version_size: reservation.version_size,
                         },
+                        content,
                         NormalizedPath::from_key(reservation.requested_path_key),
                     ),
                     reservation.destination_path,
@@ -304,6 +346,7 @@ impl TaskPlanner {
                     .path_owners
                     .get(path)
                     .is_some_and(|owners| owners.len() == 1)
+                    && self.content_path_allowed(path, &requested.checksum, requested.size)
                 {
                     self.claimed_paths.remove(path);
                 }
@@ -327,7 +370,11 @@ impl TaskPlanner {
                         asset_id: task.asset_id.as_ref().into(),
                         version_size: task.version_size,
                     };
-                    let slot = (owner.clone(), requested_key.clone());
+                    let content = ReconciliationContent {
+                        checksum: task.checksum.clone(),
+                        size: task.size,
+                    };
+                    let slot = (owner.clone(), content.clone(), requested_key.clone());
                     if let Some(destination) = self.reconciliation.destinations.get(&slot) {
                         let planned_key =
                             PathPlanningMode::Reconciliation.key(&task.download_path)?;
@@ -351,6 +398,11 @@ impl TaskPlanner {
                     }
                     let destination_key =
                         PathPlanningMode::Reconciliation.key(&task.download_path)?;
+                    self.reconciliation
+                        .path_contents
+                        .entry(destination_key.clone())
+                        .or_default()
+                        .insert(Some(content.clone()));
                     self.claimed_paths
                         .insert(destination_key.clone(), task.size);
                     owned
@@ -363,6 +415,7 @@ impl TaskPlanner {
                     self.reconciliation
                         .reservations
                         .push(ReconciliationReservation {
+                            content: Some(content),
                             library: Arc::clone(&task.library),
                             asset_id: task.asset_id.as_ref().into(),
                             version_size: task.version_size,
@@ -453,11 +506,17 @@ impl TaskPlanner {
     }
 
     fn retry_claim_available(&self, task: &DownloadTask, path: &Path) -> bool {
-        self.retry_path_allowed(&task.library, &task.asset_id, task.version_size, path)
-            && self.path_mode.key(path).is_ok_and(|key| {
-                !self.claimed_paths.contains_key(&key)
-                    || self.reconciliation.path_owners.contains_key(&key)
-            })
+        self.retry_path_allowed(
+            &task.library,
+            &task.asset_id,
+            task.version_size,
+            &task.checksum,
+            task.size,
+            path,
+        ) && self.path_mode.key(path).is_ok_and(|key| {
+            !self.claimed_paths.contains_key(&key)
+                || self.reconciliation.path_owners.contains_key(&key)
+        })
     }
 
     pub(super) fn retain_retry_claim(&mut self, task: &DownloadTask) -> Result<()> {
@@ -1016,6 +1075,67 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.policy_excluded, 0);
         assert_eq!(summary.pending, 1);
+    }
+
+    #[tokio::test]
+    async fn download_reservations_keep_unknown_legacy_content_occupied() {
+        use crate::state::ReconciliationStateStore;
+
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let config = test_config(root.path());
+        let asset = TestPhotoAsset::new("LEGACY").filename("legacy.JPG").build();
+        let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
+        let initial = planner
+            .plan_reconciliation_asset(&asset, &config)
+            .await
+            .unwrap();
+        let task = &initial.tasks[0];
+        let legacy_path = task.download_path.clone();
+        let mut legacy = planner.reconciliation_reservations()[0].clone();
+        legacy.content = None;
+        db.reserve_reconciliation_paths(std::slice::from_ref(&legacy))
+            .await
+            .unwrap();
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, b"older content without provenance").unwrap();
+        let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+        assert!(!planner.retry_path_allowed(
+            &task.library,
+            &task.asset_id,
+            task.version_size,
+            &task.checksum,
+            task.size,
+            &legacy_path
+        ));
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        let new_path = plan.tasks[0].download_path.clone();
+        assert_ne!(new_path, legacy_path);
+        planner
+            .persist_download_reservations(&db, &plan.tasks)
+            .await
+            .unwrap();
+        let choices = db.get_reconciliation_reservations().await.unwrap();
+        assert_eq!(choices.len(), 2);
+        assert!(choices.contains(&legacy));
+        drop(db);
+        for _ in 0..2 {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+            let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+            assert_eq!(plan.tasks[0].download_path, new_path);
+            assert!(planner.has_durable_destination(&plan.tasks[0]));
+            planner
+                .persist_download_reservations(&db, &plan.tasks)
+                .await
+                .unwrap();
+            assert_eq!(db.get_reconciliation_reservations().await.unwrap(), choices);
+        }
+        assert_eq!(
+            std::fs::read(legacy_path).unwrap(),
+            b"older content without provenance"
+        );
     }
 
     #[tokio::test]
