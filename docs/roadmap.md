@@ -1,20 +1,22 @@
 # kei roadmap
 
 This roadmap is directional. Versioned GitHub milestones track committed
-release work. The `later` milestone categorizes deferred work without promising
-a release.
+release work. Deferred issues retain their own scope and release disposition.
 
 ## Current focus
 
 Backup correctness, with safe recovery as the user-visible proof.
 
-v0.24 closes the known P0, P1, and P2 correctness gaps before kei expands its
-product surface. The work centers on provider metadata, durable retry evidence,
-stable asset identity, local metadata convergence, and truthful headless
-authentication behavior.
+v0.24 has a frozen backup-correctness scope: safe path reconciliation,
+metadata ownership and recovery, provider checkpoint and identity fixes, and
+truthful headless authentication. The safe HEIF writer is already merged.
+Remaining release work includes documentation and validation, including HEIF
+memory measurements. This is not a promise to close every correctness issue.
+See [candidate limitations](v0.24-upgrade.md#known-limitations).
 
-Headless automation follows in v0.25. Catalog and scale work follows in v0.26,
-then media fidelity in v0.27.
+The milestone order is v0.24 backup correctness, v0.25 internal consolidation,
+v0.26 headless automation, v0.27 catalog and scale, and v0.28 media fidelity.
+Milestones describe planned work, not published releases.
 
 ## Roadmap themes
 
@@ -30,10 +32,8 @@ Candidate work:
 - Guard against unsafe sync-token advancement.
 - Show active sync work in `kei status`.
 - Detect missing or damaged local files during incremental sync.
-- Add manifest export as reliability/support tooling once core sync and
-  reporting feel solid.
-- Add `kei doctor` or a redacted support bundle once core sync and reporting
-  feel solid.
+- Extend the shipped manifest export and `kei doctor` diagnostics.
+- Add a redacted support bundle.
 - Expand `kei doctor` from the first local checks into backup-confidence
   diagnostics once status and reports can say whether the last run was safe.
 
@@ -97,8 +97,8 @@ Preserve the media users expect.
 Candidate work:
 
 - Handle edited-photo naming better.
-- Add safe HEIC, HEIF, and AVIF embedded metadata writes when the write path is
-  proven safe.
+- Extend the shipped opt-in HEIC, HEIF, and AVIF writer to more proven layouts
+  and reduce whole-file memory use.
 - Improve cross-library deduplication.
 - Research shared albums separately from shared libraries.
 

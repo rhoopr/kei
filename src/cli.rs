@@ -266,6 +266,7 @@ pub struct SyncArgs {
 
     /// One-shot full-library repair that refreshes metadata for every downloaded version without re-downloading media.
     /// Requires a complete selected-library sweep and rewrites EXIF/XMP per the configured metadata outputs.
+    /// Use with sync, not service run. A configured watch interval is ignored.
     #[arg(
         long,
         conflicts_with_all = ["dry_run", "retry_failed", "only_print_filenames", "recent"]
@@ -273,12 +274,14 @@ pub struct SyncArgs {
     pub refresh_metadata: bool,
 
     /// Replace existing embedded capture timestamps with Apple's capture-local timestamp and
-    /// matching offset. This can overwrite camera metadata and requires --refresh-metadata.
+    /// matching offset. This can overwrite camera metadata and requires --refresh-metadata
+    /// and metadata.set_exif_datetime = true.
     #[arg(long, requires = "refresh_metadata")]
     pub repair_capture_timestamps: bool,
 
     /// Replace a recorded local file only when reconcile marked it truncated.
     /// The replacement is verified before it atomically takes the recorded path.
+    /// Use with sync, not service run. A configured watch interval is ignored.
     #[arg(
         long,
         conflicts_with_all = ["dry_run", "only_print_filenames", "refresh_metadata"]

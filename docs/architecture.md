@@ -209,6 +209,8 @@ Debug builds can set `KEI_REQUEST_DUMP_DIR` to capture Photos session
 bodies as `000001.req.<epoch-ms>.json` and `000001.res.<epoch-ms>.json`.
 The counter pairs requests and responses; timestamps are captured separately.
 Bodies are unredacted and private; request URLs and headers are not captured.
+Use private local storage and redact bodies manually before sharing. This dump
+is not a redacted doctor bundle.
 HTTP error bodies retain the existing size bound and may contain non-JSON text.
 Successful responses are serialized from parsed JSON without pretty-printing.
 Writes are best-effort, with no run subfolder or cleanup.

@@ -403,6 +403,58 @@ fn behavioral_helper_schema_matches_production() {
     );
 }
 
+#[test]
+fn repair_help_explains_one_shot_scope_and_datetime_requirement() {
+    for command in [vec!["sync", "--help"], vec!["service", "run", "--help"]] {
+        let output = clean_cmd().args(command).output().expect("run help");
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).expect("UTF-8 help");
+        assert_eq!(help.matches("Use with sync, not service run.").count(), 2);
+        assert_eq!(
+            help.matches("A configured watch interval is ignored")
+                .count(),
+            2
+        );
+        assert!(help.contains("metadata.set_exif_datetime = true"));
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn maintenance_refresh_example_accepts_complete_sweep() {
+    let guide = include_str!("../docs/backup-maintenance.md");
+    let filters = guide
+        .split_once("```toml\n")
+        .expect("maintenance guide has a TOML example")
+        .1
+        .split_once("```")
+        .expect("TOML example has a closing fence")
+        .0;
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let report_path = dir.path().join("report.json");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[auth]\nusername = \"offline-refresh@example.com\"\n[download]\ndirectory = {}\n{}\n[report]\njson = {}\n",
+            common::toml_string(&dir.path().join("photos").to_string_lossy()),
+            filters,
+            common::toml_string(&report_path.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+    clean_cmd()
+        .env("KEI_UNSTABLE_FAKE_SYNC_REPORT_FOR_TESTS", "1")
+        .args(["sync", "--refresh-metadata", "--config"])
+        .arg(&config_path)
+        .assert()
+        .success();
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["version"], "3");
+    assert_eq!(report["options"]["library"], "all");
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn sync_report_json_offline_binary_boundary_writes_current_schema() {
