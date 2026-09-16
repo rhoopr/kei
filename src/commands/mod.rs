@@ -14,6 +14,8 @@ mod verify;
 pub(crate) use config_cmd::run_config_show;
 pub(crate) use doctor::run_doctor;
 pub(crate) use import::run_import_existing;
+#[cfg(test)]
+pub(crate) use import::{ImportRunOptions, import_assets};
 pub(crate) use list::run_list;
 pub(crate) use login::run_login;
 pub(crate) use manifest::run_manifest;

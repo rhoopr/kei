@@ -9580,6 +9580,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_refusal_preserves_reserved_retry_across_restart() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = crate::start_wiremock_or_skip!();
+        let mut bytes = vec![3u8; 1024];
+        bytes[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
+        Mock::given(method("GET"))
+            .and(path("/media.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&server)
+            .await;
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let source = root.path().join("source.jpg");
+        std::fs::write(&source, &bytes).unwrap();
+        let local_checksum = file::compute_sha256(&source).await.unwrap();
+        let records = |id| {
+            let mut records = incremental_photo_records_with_url(
+                id,
+                "same.jpg",
+                &format!("{}/media.jpg", server.uri()),
+                1024,
+            );
+            records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+            records
+        };
+        let a = records("A");
+        db.upsert_seen(
+            &TestAssetRecord::new("A")
+                .filename("same.jpg")
+                .checksum(&checksum)
+                .size(1024)
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "A",
+            "original",
+            &source,
+            &local_checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-A", "A")
+            .await
+            .unwrap();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(a),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(root.path().join("new"));
+        std::fs::create_dir_all(&config.directory).unwrap();
+        config.state_db = Some(db.clone());
+        let reconciled =
+            reconcile_catalog_paths(&passes, Arc::new(config.clone()), CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(reconciled.complete, "{reconciled:?}");
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        let reserved = rows[0].local_path.clone().unwrap();
+        let b = records("B");
+        let asset_b =
+            PhotoAsset::new(b[0].clone(), b[1].clone()).with_state_record_name(Arc::from("B"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(tx);
+        let stats = crate::commands::import_assets(
+            futures_util::stream::iter(vec![Ok::<_, anyhow::Error>(asset_b)]),
+            rx,
+            db.as_ref(),
+            &config,
+            "PrimarySync",
+            &mut paths::DirCache::new(),
+            crate::commands::ImportRunOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.unmatched, 0);
+        assert_eq!(stats.filtered, 0);
+        assert_eq!(stats.hash_errors, 0);
+        assert_eq!(stats.matched, 0);
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(db.get_summary().await.unwrap().total_assets, 1);
+        assert!(
+            rows.iter()
+                .all(|row| row.local_path.as_ref() == Some(&reserved))
+        );
+        std::fs::remove_file(&reserved).unwrap();
+        db.mark_failed("PrimarySync", "A", "original", "local file missing")
+            .await
+            .unwrap();
+        config.state_db = None;
+        drop(db);
+        for cycle in 0..2 {
+            config.state_db = None;
+            config.state_db = Some(Arc::new(SqliteStateDb::open(&db_path).await.unwrap()));
+            let repaired = download_photos_with_sync(
+                &Client::new(),
+                &passes,
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(repaired.outcome, DownloadOutcome::Success),
+                "{repaired:?}"
+            );
+            assert_eq!(repaired.stats.downloaded, usize::from(cycle == 0));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            let rows = config
+                .state_db
+                .as_ref()
+                .unwrap()
+                .get_downloaded_page(0, 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].local_path.as_ref(), Some(&reserved));
+            assert_eq!(std::fs::read(&reserved).unwrap(), bytes);
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert_eq!(std::fs::read(&reserved).unwrap(), bytes);
+    }
+
+    #[tokio::test]
     async fn incremental_multi_page_unfiled_streams_through_bounded_pipeline() {
         let session = MockPhotosFlow::new()
             .changes_zone_page(

@@ -344,6 +344,10 @@ version and that its filename matches the recorded task filename.
 `src/commands/import.rs` shares configuration, selection, pass planning, and
 path derivation with normal sync. It optionally compares remote prefix bytes,
 hashes the local candidate, and calls `ImportStateStore::import_adopt`.
+Adoption checks durable destination reservations in the same transaction as
+catalog updates. A different asset, rendition, or provider content generation
+cannot adopt a reserved path. Unknown legacy content remains occupied.
+A refused adoption logs a warning and does not count as a match.
 Size/mtime snapshots may skip later rehashing only while path, size, and mtime
 still match.
 

@@ -938,6 +938,24 @@ fn open_confined_regular_file_platform(
     }))
 }
 
+/// Normalize path spelling for platform-specific collision checks.
+pub(crate) fn normalized_path(path: &Path) -> std::borrow::Cow<'_, str> {
+    let s = path.to_string_lossy();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        std::borrow::Cow::Owned(s.to_ascii_lowercase())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        s
+    }
+}
+
+/// Build the shared absolute ownership key without accepting parent traversal.
+pub(crate) fn confined_path_key(path: &Path) -> std::io::Result<String> {
+    Ok(normalized_path(&absolute_confined_path(path)?).into_owned())
+}
+
 /// Resolve a confined path without changing parent-component semantics.
 ///
 /// Returns `InvalidInput` for any `..` component: removing it lexically can

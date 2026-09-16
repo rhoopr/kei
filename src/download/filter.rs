@@ -393,15 +393,7 @@ impl NormalizedPath {
     /// Use with `claimed_paths.contains_key(NormalizedPath::normalize(&path).as_ref())`
     /// to avoid allocating a `PathBuf` just for the lookup.
     pub(super) fn normalize(path: &Path) -> Cow<'_, str> {
-        let s = path.to_string_lossy();
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            Cow::Owned(s.to_ascii_lowercase())
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            s
-        }
+        crate::fs_util::normalized_path(path)
     }
 }
 
@@ -1494,10 +1486,7 @@ impl PathPlanningMode {
         match self {
             Self::Download => Ok(NormalizedPath::normalize(path)),
             Self::ReservedDownload | Self::Reconciliation => {
-                let absolute = crate::fs_util::absolute_confined_path(path)?;
-                Ok(Cow::Owned(
-                    NormalizedPath::normalize(&absolute).into_owned(),
-                ))
+                crate::fs_util::confined_path_key(path).map(Cow::Owned)
             }
         }
     }

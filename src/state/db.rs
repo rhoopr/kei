@@ -2216,6 +2216,38 @@ impl SqliteStateDb {
                 .transaction()
                 .map_err(|e| StateError::query("import_adopt::begin", e))?;
 
+            let has_reservations: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reconciliation_paths)",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_reservations {
+                // Check before any catalog or metadata mutation, in the same transaction.
+                let path_key = crate::fs_util::confined_path_key(&local_path).map_err(|error| {
+                    StateError::Invariant {
+                        operation: "import_adopt",
+                        detail: format!("invalid import destination: {error}"),
+                    }
+                })?;
+                let foreign_owner: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM reconciliation_paths \
+                     WHERE destination_path_key = ?1 AND (library != ?2 OR id != ?3 OR version_size != ?4 \
+                     OR provider_checksum != ?5 OR ?6 IS NULL OR provider_size != ?6))",
+                    rusqlite::params![
+                        path_key, record.library.as_ref(), record.id.as_ref(),
+                        record.version_size.as_str(), record.checksum.as_ref(),
+                        i64::try_from(record.size_bytes).ok(),
+                    ],
+                    |row| row.get(0),
+                )?;
+                if foreign_owner {
+                    return Err(StateError::Invariant {
+                        operation: "import_adopt",
+                        detail: "import destination is reserved for another asset, rendition, or content generation".into(),
+                    });
+                }
+            }
+
             let now = Utc::now().timestamp();
             upsert_asset_row(&tx, &record, now)?;
             let rows = update_status_to_downloaded(
@@ -10742,6 +10774,118 @@ mod tests {
     }
 
     // ── import_adopt: atomic upsert + mark-downloaded ───────────────────
+
+    #[tokio::test]
+    async fn import_adopt_respects_reservation_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("photo.jpg");
+        let owner = TestAssetRecord::new("owner")
+            .checksum("provider")
+            .size(1024)
+            .build();
+        let reservation = ReconciliationReservation {
+            content: Some(ReconciliationContent {
+                checksum: owner.checksum.clone(),
+                size: owner.size_bytes,
+            }),
+            library: owner.library.clone(),
+            asset_id: owner.id.clone(),
+            version_size: owner.version_size,
+            requested_path_key: ReconciliationPathKey("requested".into()),
+            destination_path_key: ReconciliationPathKey(
+                crate::fs_util::confined_path_key(&destination).unwrap(),
+            ),
+            destination_path: destination.clone(),
+        };
+        let candidates = [
+            owner.clone(),
+            AssetRecord {
+                id: "other".into(),
+                ..owner.clone()
+            },
+            AssetRecord {
+                library: Arc::from("SharedSync"),
+                ..owner.clone()
+            },
+            AssetRecord {
+                version_size: VersionSizeKey::Medium,
+                ..owner.clone()
+            },
+            AssetRecord {
+                checksum: "changed".into(),
+                ..owner.clone()
+            },
+            AssetRecord {
+                size_bytes: 2048,
+                ..owner.clone()
+            },
+            AssetRecord {
+                size_bytes: u64::MAX,
+                ..owner.clone()
+            },
+        ];
+        for legacy in [false, true] {
+            for (index, candidate) in candidates.iter().enumerate() {
+                let db = SqliteStateDb::open_in_memory().unwrap();
+                let mut reservation = reservation.clone();
+                if legacy {
+                    reservation.content = None;
+                }
+                db.reserve_reconciliation_paths(std::slice::from_ref(&reservation))
+                    .await
+                    .unwrap();
+                let allowed = index == 0 && !legacy;
+                // Equivalent root spelling must not bypass the ownership check.
+                let alias = root.path().join(".").join("photo.jpg");
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                let alias = alias.with_file_name("PHOTO.JPG");
+                let adopted = db
+                    .import_adopt(candidate, &alias, "local", 1024, Some(1))
+                    .await;
+                assert_eq!(
+                    adopted.is_ok(),
+                    allowed,
+                    "legacy={legacy}, candidate={index}"
+                );
+                assert_eq!(
+                    db.get_summary().await.unwrap().total_assets,
+                    u64::from(allowed)
+                );
+                assert_eq!(
+                    db.get_reconciliation_catalog_paths().await.unwrap().len(),
+                    usize::from(allowed)
+                );
+                assert_eq!(
+                    db.get_reconciliation_reservations().await.unwrap(),
+                    vec![reservation]
+                );
+                if allowed {
+                    db.import_adopt(candidate, &alias, "local", 1024, Some(1))
+                        .await
+                        .unwrap();
+                    assert_eq!(db.get_summary().await.unwrap().total_assets, 1);
+                } else {
+                    // Refusal must also preserve an existing imported row and its historical path.
+                    let previous = root.path().join("previous.jpg");
+                    db.import_adopt(candidate, &previous, "previous-hash", 1024, Some(2))
+                        .await
+                        .unwrap();
+                    assert!(
+                        db.import_adopt(candidate, &alias, "replacement", 1024, Some(3))
+                            .await
+                            .is_err()
+                    );
+                    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].local_path.as_ref(), Some(&previous));
+                    assert_eq!(rows[0].local_checksum.as_deref(), Some("previous-hash"));
+                    let paths = db.get_reconciliation_catalog_paths().await.unwrap();
+                    assert_eq!(paths.len(), 1);
+                    assert_eq!(paths[0].path, previous);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn import_adopt_persists_downloaded_row_in_one_call() {
