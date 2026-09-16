@@ -230,7 +230,10 @@ impl PendingRetryPlanning<'_> {
         let mut state_write_failed_targets = FxHashSet::default();
         let mut filter_reasons = Vec::<filter::FilterReason>::new();
         for (pass_index, pass_config) in self.pass_configs.iter().enumerate() {
-            let plan = self.task_planner.plan_asset(asset, pass_config).await;
+            let plan = self
+                .task_planner
+                .plan_pending_retry_asset(asset, pass_config)
+                .await?;
             let targets: Vec<PendingRetryTarget> = self
                 .pending_targets
                 .iter()
@@ -294,6 +297,12 @@ impl PendingRetryPlanning<'_> {
                 let target = PendingRetryTarget::from_task(&task);
                 if let Some(evidence) = self.pending_evidence.get(&target)
                     && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
+                    && self.task_planner.retry_path_allowed(
+                        &task.library,
+                        &task.asset_id,
+                        task.version_size,
+                        local_path,
+                    )
                 {
                     if evidence.matches_provider_version(&task)
                         && let Some(fingerprint) = evidence
@@ -302,7 +311,7 @@ impl PendingRetryPlanning<'_> {
                     {
                         if !self
                             .task_planner
-                            .claim_recorded_repair_path(local_path, &task.download_path, task.size)
+                            .claim_recorded_repair_path(local_path, &task)
                             .await
                         {
                             tracing::warn!(
@@ -318,12 +327,7 @@ impl PendingRetryPlanning<'_> {
                     } else {
                         let Some(retry_path) = self
                             .task_planner
-                            .resolve_recorded_retry_path(
-                                local_path,
-                                &task.download_path,
-                                task.size,
-                                &task.asset_id,
-                            )
+                            .resolve_recorded_retry_path(local_path, &task)
                             .await
                         else {
                             tracing::warn!(
@@ -337,6 +341,7 @@ impl PendingRetryPlanning<'_> {
                         task.download_path = retry_path;
                     }
                 }
+                self.task_planner.retain_retry_claim(&task)?;
                 retry_tasks.push(task);
             }
             let queued_targets: Vec<PendingRetryTarget> = retry_tasks
@@ -663,7 +668,7 @@ pub(super) async fn build_pending_retry_download_tasks(
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested);
     let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
-    let mut task_planner = planner::TaskPlanner::new();
+    let mut task_planner = planner::TaskPlanner::for_pending_retry(db.as_ref()).await?;
     let pending_state_ids: Vec<&str> = pending
         .iter()
         .filter(|record| record.library.as_ref() == config.library.as_ref())

@@ -633,6 +633,14 @@ async fn adopt_pending_task_path(
     let version_size = task.version_size.as_str();
     let (existing_path, existing_size) =
         task_planner.existing_path_with_size(&task.download_path)?;
+    if !task_planner.retry_path_allowed(
+        &task.library,
+        &task.asset_id,
+        task.version_size,
+        &existing_path,
+    ) {
+        return None;
+    }
     if !pending_file_size_allows_adoption(
         asset,
         version_size,
@@ -699,6 +707,14 @@ async fn adopt_pending_derived_path_at(
     let library = effective_asset_library(asset, config);
     let version_size = derived.version_size.as_str();
     let (existing_path, existing_size) = task_planner.existing_path_with_size(path)?;
+    if !task_planner.retry_path_allowed(
+        library,
+        asset.state_id(),
+        derived.version_size,
+        &existing_path,
+    ) {
+        return None;
+    }
     if !pending_file_size_allows_adoption(
         asset,
         version_size,

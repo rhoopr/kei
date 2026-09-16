@@ -14602,6 +14602,310 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_retry_preserves_reconciliation_reservations_across_restart() {
+        assert_pending_retry_reservations(PendingReservationEntry::Absent).await;
+    }
+
+    #[tokio::test]
+    async fn pending_retry_reservations_reject_foreign_adoption() {
+        assert_pending_retry_reservations(PendingReservationEntry::ForeignIdentical).await;
+    }
+
+    #[tokio::test]
+    async fn pending_retry_reservations_reuse_owned_file() {
+        assert_pending_retry_reservations(PendingReservationEntry::Owned).await;
+    }
+
+    #[tokio::test]
+    async fn pending_retry_reservations_allow_owned_truncation_repair() {
+        assert_pending_retry_reservations(PendingReservationEntry::OwnedTruncated).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum PendingReservationEntry {
+        Absent,
+        ForeignIdentical,
+        Owned,
+        OwnedTruncated,
+    }
+
+    async fn assert_pending_retry_reservations(entry: PendingReservationEntry) {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let mut body = vec![3u8; 1024];
+        body[..3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/pending.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(if matches!(entry, PendingReservationEntry::Owned) {
+                0
+            } else {
+                1
+            })
+            .mount(&server)
+            .await;
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let source = root.path().join("reserved.jpg");
+        std::fs::write(&source, vec![1u8; 1024]).unwrap();
+        let local_checksum = file::compute_sha256(&source).await.unwrap();
+        let mut a = mock_photo_records_for_zone_with_filename("A", "PrimarySync", "reserved.jpg");
+        a[1]["fields"]["resJPEGFullRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/edited.jpg",
+            "size": 1024, "fileChecksum": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        }});
+        a[1]["fields"]["resJPEGFullFileType"] = json!({"value": "public.jpeg"});
+        let mut b = incremental_photo_records_with_url(
+            "B",
+            "reserved_edited.JPG",
+            &format!("{}/pending.jpg", server.uri()),
+            1024,
+        );
+        b[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        for (id, filename, provider_checksum) in [
+            (
+                "A",
+                "reserved.jpg",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            ),
+            ("B", "reserved_edited.JPG", checksum.as_str()),
+        ] {
+            db.upsert_seen(
+                &TestAssetRecord::new(id)
+                    .filename(filename)
+                    .checksum(provider_checksum)
+                    .size(1024)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", &format!("asset-{id}"), id)
+                .await
+                .unwrap();
+        }
+        db.mark_downloaded(
+            "PrimarySync",
+            "A",
+            "original",
+            &source,
+            &local_checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "saved-token")
+            .await
+            .unwrap();
+        let make_passes = |records| {
+            vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(records),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }]
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(root.path().join("new"));
+        std::fs::create_dir_all(&config.directory).unwrap();
+        config.edited = true;
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "saved-token".into(),
+        };
+        let first = reconcile_catalog_paths(
+            &make_passes(a.clone()),
+            Arc::new(config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(first.complete, "{first:?}");
+        assert_eq!(first.stats.downloaded, 1);
+        let reservations = db.get_reconciliation_reservations().await.unwrap();
+        assert_eq!(reservations.len(), 2);
+        let edited_path = reservations
+            .iter()
+            .find(|reservation| reservation.version_size != VersionSizeKey::Original)
+            .unwrap()
+            .destination_path
+            .clone();
+        assert!(
+            !edited_path.exists(),
+            "undownloaded rendition must still own its leaf"
+        );
+        let owned_filename = paths::insert_asset_identity_suffix(
+            edited_path.file_name().unwrap().to_str().unwrap(),
+            "B",
+        );
+        let owned_path = edited_path.with_file_name(&owned_filename);
+        match entry {
+            PendingReservationEntry::Absent => {}
+            PendingReservationEntry::ForeignIdentical => {
+                std::fs::write(&edited_path, &body).unwrap();
+            }
+            PendingReservationEntry::Owned | PendingReservationEntry::OwnedTruncated => {
+                let requested_key = filter::PathPlanningMode::Reconciliation
+                    .key(&edited_path)
+                    .unwrap();
+                let destination_key = filter::PathPlanningMode::Reconciliation
+                    .key(&owned_path)
+                    .unwrap();
+                db.reserve_reconciliation_paths(&[crate::state::ReconciliationReservation {
+                    library: Arc::from("PrimarySync"),
+                    asset_id: "B".into(),
+                    version_size: VersionSizeKey::Original,
+                    requested_path_key: crate::state::ReconciliationPathKey(
+                        requested_key.as_ref().into(),
+                    ),
+                    destination_path_key: crate::state::ReconciliationPathKey(
+                        destination_key.as_ref().into(),
+                    ),
+                    destination_path: owned_path.clone(),
+                }])
+                .await
+                .unwrap();
+                db.upsert_seen(
+                    &TestAssetRecord::new("B")
+                        .filename(&owned_filename)
+                        .checksum(&checksum)
+                        .size(1024)
+                        .build(),
+                )
+                .await
+                .unwrap();
+                std::fs::write(&owned_path, &body).unwrap();
+                let local = file::compute_sha256(&owned_path).await.unwrap();
+                db.mark_downloaded(
+                    "PrimarySync",
+                    "B",
+                    "original",
+                    &owned_path,
+                    &local,
+                    Some(&local),
+                )
+                .await
+                .unwrap();
+                let reason = if matches!(entry, PendingReservationEntry::OwnedTruncated) {
+                    std::fs::write(&owned_path, &body[..4]).unwrap();
+                    config.repair_truncated = true;
+                    crate::commands::reconcile::FILE_TRUNCATED_REASON
+                } else {
+                    "retry finalization"
+                };
+                db.mark_failed("PrimarySync", "B", "original", reason)
+                    .await
+                    .unwrap();
+            }
+        }
+        // Retry must load the ledger from durable state, not a previous planner.
+        config.state_db = Some(Arc::new(
+            crate::state::SqliteStateDb::open(&db_path).await.unwrap(),
+        ));
+        let retry = download_photos_with_sync(
+            &Client::new(),
+            &make_passes(b.clone()),
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(retry.outcome, DownloadOutcome::Success),
+            "{retry:?}"
+        );
+        assert_eq!(
+            retry.stats.downloaded,
+            usize::from(!matches!(entry, PendingReservationEntry::Owned))
+        );
+        config.state_db = Some(Arc::new(
+            crate::state::SqliteStateDb::open(&db_path).await.unwrap(),
+        ));
+        let reopened = config.state_db.as_ref().unwrap();
+        let downloaded = reopened.get_downloaded_page(0, 10).await.unwrap();
+        let b_path = downloaded
+            .iter()
+            .find(|row| row.id.as_ref() == "B")
+            .unwrap()
+            .local_path
+            .clone()
+            .unwrap();
+        if matches!(
+            entry,
+            PendingReservationEntry::Owned | PendingReservationEntry::OwnedTruncated
+        ) {
+            assert_eq!(b_path, owned_path, "retry must reuse its saved destination");
+        }
+        let all_records = a.into_iter().chain(b).collect();
+        let passes = make_passes(all_records);
+        for _ in 0..2 {
+            let repeated = reconcile_catalog_paths(
+                &passes,
+                Arc::new(config.clone()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(repeated.complete, "{repeated:?}");
+            assert_eq!(repeated.stats.failed, 0);
+            assert_eq!(repeated.stats.downloaded, 0);
+            assert_eq!(repeated.stats.disk_bytes_written, 0);
+        }
+        assert_ne!(b_path, edited_path);
+        if matches!(entry, PendingReservationEntry::ForeignIdentical) {
+            assert_eq!(std::fs::read(&edited_path).unwrap(), body);
+        } else {
+            assert!(!edited_path.exists());
+        }
+        if matches!(
+            entry,
+            PendingReservationEntry::Owned | PendingReservationEntry::OwnedTruncated
+        ) {
+            assert_eq!(b_path, owned_path);
+        }
+        assert_eq!(std::fs::read(&b_path).unwrap(), body);
+        assert_eq!(std::fs::read(&source).unwrap(), vec![1u8; 1024]);
+        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(reopened.get_pending().await.unwrap().is_empty());
+        assert_eq!(
+            reopened
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("saved-token")
+        );
+        for row in rows {
+            let path = row.local_path.unwrap();
+            if row.id.as_ref() == "B" {
+                assert_eq!(path, b_path);
+            } else {
+                assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 1024]);
+            }
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                if matches!(entry, PendingReservationEntry::ForeignIdentical) {
+                    3
+                } else {
+                    2
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn path_reconciliation_live_resolution_change_preserves_rendition_ownership() {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("state.db");

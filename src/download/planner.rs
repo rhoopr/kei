@@ -14,12 +14,12 @@ use crate::state::{
     ReconciliationPathKey, ReconciliationReservation, VersionSizeKey,
 };
 
-use super::DownloadConfig;
 use super::filter::{
     DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, PathPlanningMode,
     determine_media_type, filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
 };
 use super::paths;
+use super::{DownloadConfig, DownloadStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReconciliationOwner {
@@ -28,7 +28,7 @@ struct ReconciliationOwner {
     version_size: VersionSizeKey,
 }
 
-/// Keep reconciliation-only state off the stack of the shared async planner.
+/// Keep durable path ownership off the stack of the shared async planner.
 #[derive(Debug, Default)]
 struct ReconciliationPlanning {
     claims: FxHashMap<ReconciliationOwner, FxHashMap<NormalizedPath, u64>>,
@@ -41,6 +41,7 @@ struct ReconciliationPlanning {
 #[derive(Debug)]
 pub(super) struct TaskPlanner {
     claimed_paths: FxHashMap<NormalizedPath, u64>,
+    path_mode: PathPlanningMode,
     reconciliation: Box<ReconciliationPlanning>,
     dir_cache: paths::DirCache,
 }
@@ -49,6 +50,7 @@ impl TaskPlanner {
     pub(super) fn new() -> Self {
         Self {
             claimed_paths: FxHashMap::default(),
+            path_mode: PathPlanningMode::Download,
             reconciliation: Box::default(),
             dir_cache: paths::DirCache::new(),
         }
@@ -61,6 +63,7 @@ impl TaskPlanner {
         reservations: Vec<ReconciliationReservation>,
     ) -> Result<Self> {
         let mut planner = Self::new();
+        planner.path_mode = PathPlanningMode::Reconciliation;
         for record in records {
             planner.add_reconciliation_claim(
                 ReconciliationOwner {
@@ -97,6 +100,58 @@ impl TaskPlanner {
         Ok(planner)
     }
 
+    /// Preserve ordinary retry behavior until reconciliation has reserved paths.
+    pub(super) async fn for_pending_retry(db: &dyn DownloadStore) -> Result<Self> {
+        let reservations = db.get_reconciliation_reservations().await?;
+        if reservations.is_empty() {
+            return Ok(Self::new());
+        }
+        let mut planner =
+            Self::for_reconciliation(db.get_reconciliation_catalog_paths().await?, reservations)?;
+        planner.path_mode = PathPlanningMode::PendingRetry;
+        Ok(planner)
+    }
+
+    pub(super) async fn plan_pending_retry_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Result<AssetTaskPlan> {
+        match self.path_mode {
+            PathPlanningMode::Download => Ok(self.plan_asset(asset, config).await),
+            // Pending adoption verifies existing files separately. Reuse the
+            // ownership-aware plan, including exact saved destination choices.
+            mode => self.plan_owned_asset(asset, config, mode).await,
+        }
+    }
+
+    /// Reject foreign ownership before adoption or recorded-path overrides.
+    /// An invalid confined path is never permission to claim a reservation.
+    #[must_use]
+    pub(super) fn retry_path_allowed(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+        path: &Path,
+    ) -> bool {
+        if matches!(self.path_mode, PathPlanningMode::Download) {
+            return true;
+        }
+        self.path_mode.key(path).is_ok_and(|key| {
+            self.reconciliation
+                .path_owners
+                .get(&key)
+                .is_none_or(|owners| {
+                    owners.iter().all(|owner| {
+                        owner.library.as_ref() == library
+                            && owner.asset_id.as_ref() == asset_id
+                            && owner.version_size == version_size
+                    })
+                })
+        })
+    }
+
     fn add_reconciliation_claim(
         &mut self,
         owner: ReconciliationOwner,
@@ -129,7 +184,7 @@ impl TaskPlanner {
     ) -> AssetTaskPlan {
         #[expect(
             clippy::expect_used,
-            reason = "only reconciliation keys perform fallible path resolution"
+            reason = "ordinary download keys never perform fallible path resolution"
         )]
         self.plan_asset_with_mode(asset, config, PathPlanningMode::Download)
             .await
@@ -140,6 +195,16 @@ impl TaskPlanner {
         &mut self,
         asset: &PhotoAsset,
         config: &DownloadConfig,
+    ) -> Result<AssetTaskPlan> {
+        self.plan_owned_asset(asset, config, PathPlanningMode::Reconciliation)
+            .await
+    }
+
+    async fn plan_owned_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        mode: PathPlanningMode,
     ) -> Result<AssetTaskPlan> {
         let expected = super::filter::expected_paths_for(asset, config);
         let mut owned = FxHashMap::default();
@@ -168,7 +233,7 @@ impl TaskPlanner {
             owned.insert(owner, claims);
         }
         let plan = self
-            .plan_asset_with_mode(asset, config, PathPlanningMode::Reconciliation)
+            .plan_asset_with_mode(asset, config, mode)
             .await
             .and_then(|mut plan| {
                 for task in &mut plan.tasks {
@@ -309,38 +374,65 @@ impl TaskPlanner {
         }
     }
 
+    fn retry_claim_available(&self, task: &DownloadTask, path: &Path) -> bool {
+        self.retry_path_allowed(&task.library, &task.asset_id, task.version_size, path)
+            && self.path_mode.key(path).is_ok_and(|key| {
+                !self.claimed_paths.contains_key(&key)
+                    || self.reconciliation.path_owners.contains_key(&key)
+            })
+    }
+
+    pub(super) fn retain_retry_claim(&mut self, task: &DownloadTask) -> Result<()> {
+        if !matches!(self.path_mode, PathPlanningMode::Download) {
+            self.add_reconciliation_claim(
+                ReconciliationOwner {
+                    library: Arc::clone(&task.library),
+                    asset_id: task.asset_id.as_ref().into(),
+                    version_size: task.version_size,
+                },
+                self.path_mode.key(&task.download_path)?,
+                task.size,
+            );
+        }
+        Ok(())
+    }
+
     pub(super) async fn claim_recorded_repair_path(
         &mut self,
         recorded_path: &Path,
-        planned_path: &Path,
-        expected_size: u64,
+        task: &DownloadTask,
     ) -> bool {
-        let planned = NormalizedPath::normalize(planned_path);
-        if self.claimed_paths.get(planned.as_ref()) == Some(&expected_size) {
+        let Ok(planned) = self.path_mode.key(&task.download_path) else {
+            return false;
+        };
+        if matches!(self.path_mode, PathPlanningMode::Download)
+            && self.claimed_paths.get(planned.as_ref()) == Some(&task.size)
+        {
             self.claimed_paths.remove(planned.as_ref());
         }
 
-        let recorded = NormalizedPath::normalize(recorded_path);
-        if self.claimed_paths.contains_key(recorded.as_ref()) {
+        let Ok(recorded) = self.path_mode.key(recorded_path) else {
+            return false;
+        };
+        if !self.retry_claim_available(task, recorded_path) {
             return false;
         }
         self.prepare_path_parent(recorded_path).await;
-        self.claimed_paths
-            .insert(NormalizedPath::new(recorded_path), expected_size);
+        self.claimed_paths.insert(recorded, task.size);
         true
     }
 
     pub(super) async fn resolve_recorded_retry_path(
         &mut self,
         recorded_path: &Path,
-        planned_path: &Path,
-        expected_size: u64,
-        asset_id: &str,
+        task: &DownloadTask,
     ) -> Option<std::path::PathBuf> {
-        // `plan_asset` reserved this path for the current task. Release that
-        // reservation before the task chooses its recorded retry destination.
-        let planned = NormalizedPath::normalize(planned_path);
-        if self.claimed_paths.get(planned.as_ref()) == Some(&expected_size) {
+        // Release ordinary in-flight claims when choosing a recorded path.
+        // Durable reservations stay occupied even if this task chooses a sibling.
+        let planned = self.path_mode.key(&task.download_path).ok()?;
+        if matches!(self.path_mode, PathPlanningMode::Download)
+            && self.claimed_paths.get(planned.as_ref()) == Some(&task.size)
+        {
             self.claimed_paths.remove(planned.as_ref());
         }
 
@@ -349,27 +441,26 @@ impl TaskPlanner {
         self.dir_cache.ensure_dir_async(parent).await;
 
         let existing_size = self.dir_cache.file_size(recorded_path);
-        let normalized = NormalizedPath::normalize(recorded_path);
-        if existing_size.is_none() && !self.claimed_paths.contains_key(normalized.as_ref()) {
-            self.claimed_paths
-                .insert(NormalizedPath::new(recorded_path), expected_size);
+        let normalized = self.path_mode.key(recorded_path).ok()?;
+        if existing_size.is_none() && self.retry_claim_available(task, recorded_path) {
+            self.claimed_paths.insert(normalized, task.size);
             return Some(recorded_path.to_path_buf());
         }
 
         let mut tried = Vec::<Box<str>>::with_capacity(4);
-        let preferred = if existing_size == Some(expected_size) {
-            paths::insert_asset_identity_suffix(filename, asset_id)
+        let preferred = if existing_size == Some(task.size) {
+            paths::insert_asset_identity_suffix(filename, &task.asset_id)
         } else {
-            paths::add_dedup_suffix(filename, expected_size)
+            paths::add_dedup_suffix(filename, task.size)
         };
         for candidate in [
             preferred,
-            paths::insert_asset_identity_suffix(filename, asset_id),
+            paths::insert_asset_identity_suffix(filename, &task.asset_id),
         ] {
             if let Some(path) = self.available_recorded_retry_sibling(parent, candidate, &mut tried)
             {
                 self.claimed_paths
-                    .insert(NormalizedPath::new(&path), expected_size);
+                    .insert(self.path_mode.key(&path).ok()?, task.size);
                 return Some(path);
             }
         }
@@ -377,11 +468,11 @@ impl TaskPlanner {
         let mut ordinal = 2u64;
         loop {
             let candidate =
-                paths::insert_asset_identity_ordinal_suffix(filename, asset_id, ordinal);
+                paths::insert_asset_identity_ordinal_suffix(filename, &task.asset_id, ordinal);
             if let Some(path) = self.available_recorded_retry_sibling(parent, candidate, &mut tried)
             {
                 self.claimed_paths
-                    .insert(NormalizedPath::new(&path), expected_size);
+                    .insert(self.path_mode.key(&path).ok()?, task.size);
                 return Some(path);
             }
             ordinal = ordinal.checked_add(1)?;
@@ -395,13 +486,16 @@ impl TaskPlanner {
         tried: &mut Vec<Box<str>>,
     ) -> Option<std::path::PathBuf> {
         let path = parent.join(filename);
-        let normalized = NormalizedPath::normalize(&path).into_owned();
-        if tried.iter().any(|seen| seen.as_ref() == normalized) {
+        let normalized = self.path_mode.key(&path).ok()?;
+        if tried
+            .iter()
+            .any(|seen| seen.as_ref() == normalized.as_ref())
+        {
             return None;
         }
-        tried.push(normalized.clone().into_boxed_str());
+        tried.push(normalized.as_ref().into());
 
-        (!self.dir_cache.exists(&path) && !self.claimed_paths.contains_key(normalized.as_str()))
+        (!self.dir_cache.exists(&path) && !self.claimed_paths.contains_key(normalized.as_ref()))
             .then_some(path)
     }
 }

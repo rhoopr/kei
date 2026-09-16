@@ -1483,6 +1483,7 @@ enum CollisionStrategy {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum PathPlanningMode {
     Download,
+    PendingRetry,
     Reconciliation,
 }
 
@@ -1492,7 +1493,7 @@ impl PathPlanningMode {
     fn normalize(self, path: &Path) -> std::io::Result<Cow<'_, str>> {
         match self {
             Self::Download => Ok(NormalizedPath::normalize(path)),
-            Self::Reconciliation => {
+            Self::PendingRetry | Self::Reconciliation => {
                 let absolute = crate::fs_util::absolute_confined_path(path)?;
                 Ok(Cow::Owned(
                     NormalizedPath::normalize(&absolute).into_owned(),
@@ -1502,6 +1503,9 @@ impl PathPlanningMode {
     }
 
     pub(super) fn key(self, path: &Path) -> std::io::Result<NormalizedPath> {
+        if matches!(self, Self::Download) {
+            return Ok(NormalizedPath::new(path));
+        }
         Ok(NormalizedPath(
             self.normalize(path)?.into_owned().into_boxed_str(),
         ))
@@ -1636,7 +1640,8 @@ fn available_collision_path(
     }
 
     let unavailable = ctx.claimed_paths.contains_key(normalized.as_str())
-        || (matches!(ctx.planning_mode, PathPlanningMode::Download) && ctx.dir_cache.exists(&path));
+        || (!matches!(ctx.planning_mode, PathPlanningMode::Reconciliation)
+            && ctx.dir_cache.exists(&path));
     tried.push(normalized.into_boxed_str());
     Ok(if unavailable { None } else { Some(path) })
 }
@@ -1666,13 +1671,16 @@ fn resolve_download_path(
     // publication but before metadata/state completion. The confined copy
     // owner compares bytes and rejects conflicts instead of inventing a new
     // filename on every retry. Ordinary downloads retain collision naming.
-    if matches!(ctx.planning_mode, PathPlanningMode::Reconciliation) {
-        let normalized = ctx.planning_mode.normalize(download_path)?;
+    let normalized = ctx.planning_mode.normalize(download_path)?;
+    if matches!(ctx.planning_mode, PathPlanningMode::Reconciliation)
+        || (matches!(ctx.planning_mode, PathPlanningMode::PendingRetry)
+            && ctx.claimed_paths.contains_key(normalized.as_ref()))
+    {
         if !ctx.claimed_paths.contains_key(normalized.as_ref()) {
             return Ok(PathResolution::Download(download_path.to_path_buf()));
         }
-        // Another catalog asset owns this path. Ignore on-disk existence when
-        // choosing its stable sibling: the copy owner validates retry bytes.
+        // Another catalog asset owns this path. Reconciliation ignores disk
+        // existence for stable retries; downloads still avoid occupied siblings.
         return Ok(PathResolution::Download(first_available_collision_path(
             ctx,
             CollisionFilenameKind::AssetIdentity,
@@ -2043,6 +2051,15 @@ mod tests {
         assert_eq!(
             PathPlanningMode::Reconciliation.key(relative).unwrap(),
             PathPlanningMode::Reconciliation.key(&absolute).unwrap()
+        );
+        assert_eq!(
+            PathPlanningMode::PendingRetry.key(relative).unwrap(),
+            PathPlanningMode::Reconciliation.key(&absolute).unwrap()
+        );
+        assert!(
+            PathPlanningMode::PendingRetry
+                .key(Path::new("photos/../IMG.JPG"))
+                .is_err()
         );
         assert_ne!(
             PathPlanningMode::Download.key(relative).unwrap(),
