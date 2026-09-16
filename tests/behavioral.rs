@@ -422,37 +422,41 @@ fn repair_help_explains_one_shot_scope_and_datetime_requirement() {
 #[cfg(debug_assertions)]
 #[test]
 fn maintenance_refresh_example_accepts_complete_sweep() {
-    let guide = include_str!("../docs/backup-maintenance.md");
-    let filters = guide
-        .split_once("```toml\n")
-        .expect("maintenance guide has a TOML example")
-        .1
-        .split_once("```")
-        .expect("TOML example has a closing fence")
-        .0;
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    let report_path = dir.path().join("report.json");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[auth]\nusername = \"offline-refresh@example.com\"\n[download]\ndirectory = {}\n{}\n[report]\njson = {}\n",
-            common::toml_string(&dir.path().join("photos").to_string_lossy()),
-            filters,
-            common::toml_string(&report_path.to_string_lossy()),
-        ),
-    )
-    .unwrap();
-    clean_cmd()
-        .env("KEI_UNSTABLE_FAKE_SYNC_REPORT_FOR_TESTS", "1")
-        .args(["sync", "--refresh-metadata", "--config"])
-        .arg(&config_path)
-        .assert()
-        .success();
-    let report: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
-    assert_eq!(report["version"], "3");
-    assert_eq!(report["options"]["library"], "all");
+    let guide = include_str!("../docs/backup-maintenance.md").replace("\r\n", "\n");
+    // Exercise the documented command with both Unix and Windows checkout text.
+    for line_ending in ["\n", "\r\n"] {
+        let guide = guide.replace('\n', line_ending);
+        let filters = guide
+            .split_once("```toml")
+            .expect("maintenance guide has a TOML example")
+            .1
+            .split_once("```")
+            .expect("TOML example has a closing fence")
+            .0;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let report_path = dir.path().join("report.json");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[auth]\nusername = \"offline-refresh@example.com\"\n[download]\ndirectory = {}\n{}\n[report]\njson = {}\n",
+                common::toml_string(&dir.path().join("photos").to_string_lossy()),
+                filters,
+                common::toml_string(&report_path.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        clean_cmd()
+            .env("KEI_UNSTABLE_FAKE_SYNC_REPORT_FOR_TESTS", "1")
+            .args(["sync", "--refresh-metadata", "--config"])
+            .arg(&config_path)
+            .assert()
+            .success();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["version"], "3");
+        assert_eq!(report["options"]["library"], "all");
+    }
 }
 
 #[cfg(debug_assertions)]
