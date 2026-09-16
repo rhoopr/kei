@@ -44,6 +44,12 @@ the local state DB:
 ]
 ```
 
+This is an illustrative inventory, not a sync-report sample. Capture/addition
+dates can include milliseconds. `checksum` is provider MMCS identity, not a
+local content hash. `local_checksum` describes local bytes; historical
+`download_checksum` is not verified original-source provenance. Manifest output
+is not proof of backup completeness. See [maintenance](backup-maintenance.md).
+
 Fields may be `null` when kei doesn't have that value. The schema may grow in
 later releases, so consumers should ignore fields they don't recognize.
 

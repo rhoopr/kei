@@ -12,7 +12,7 @@
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgithub.com%2Fipitio%2Fbackage%2Fraw%2Findex%2Frhoopr%2Fkei%2Fkei.json&query=%24.downloads&logo=docker&label=pulls" alt="Pulls"></a></p>
 
-kei copies cloud-hosted photos and videos into folders you control. Today that includes iCloud Photos. The goal is a fast, parallel local backup you can run once, keep as a mirror, or leave unattended in Docker.
+kei copies cloud-hosted photos and videos into folders you control. Today that includes iCloud Photos. The goal is a fast, parallel local backup you can run once, keep up to date, or leave unattended in Docker.
 
 It handles the parts that make photo backups annoying: big libraries, shared libraries, albums, Live Photos, RAW files, edited versions, retries, interrupted downloads, and existing archives you don't want to download twice.
 
@@ -34,20 +34,6 @@ docker pull ghcr.io/rhoopr/kei:latest
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, source builds, FreeBSD, and NAS setup, see [Install](https://github.com/rhoopr/kei/wiki/Install).
 
 ## Start
-
-> [!IMPORTANT]
-> **v0.20 moved durable sync settings into TOML.**
->
-> Keep CLI flags for one run, env vars for secrets and service glue, and saved settings in `config.toml`.
->
-> If an old command fails with a removed flag such as `--download-dir`, move that value into the config file:
->
-> ```toml
-> [download]
-> directory = "/photos"
-> ```
->
-> Use the [v0.20 migration guide](docs/v0.20-migration.md) and [example.config.toml](example.config.toml) for the full option-by-option TOML reference, including defaults and valid values.
 
 ```sh
 kei config setup
@@ -74,26 +60,8 @@ kei sync --recent 30d
 kei list albums
 ```
 
-### Headless authentication
-
-Use a password file or password command when stdin is not a terminal. To copy
-a password from a file into kei's credential store, run:
-
-```sh
-kei password --password-file /run/secrets/icloud_password set
-```
-
-If a foreground `login` or one-shot `sync` needs 2FA, kei exits with auth code
-`3` and prints the recovery commands. Complete the login, then retry the
-foreground command:
-
-```sh
-kei login get-code
-kei login submit-code 123456
-```
-
-Watch and service processes stay running while they wait for the submitted
-code. They resume from the saved authentication state.
+For unattended login and two-factor recovery, see [Authentication](https://github.com/rhoopr/kei/wiki/Authentication).
+Keep saved settings in TOML; use [example.config.toml](example.config.toml) for defaults and supported options.
 
 ## What kei gives you
 
@@ -105,23 +73,12 @@ code. They resume from the saved authentication state.
 - One-shot sync, watch mode, Docker, systemd, launchd, and Windows service support.
 - Maintenance commands for status checks, local diagnostics, manifest export, verification, reconcile, reset, and existing-file import.
 
-Today kei syncs iCloud Photos. Immich, Google Takeout, Nextcloud, and Ente support are on the roadmap.
-
 > [!IMPORTANT]
 > kei needs iCloud Photos web access. If `Advanced Data Protection` is on, turn it off and enable "Access iCloud Data on the Web" in your Apple ID settings. See [Authentication](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
 
-## Product direction
-
-kei is built around reliable local backup: safe file writes, explainable state,
-service-friendly operation, and no destructive behavior unless you explicitly
-ask for it.
-
-Read the [product charter](docs/product-charter.md) and
-[roadmap](docs/roadmap.md) for current priorities.
-
 ## Common setups
 
-### Keep a daily mirror
+### Run a daily backup
 
 ```toml
 [auth]
@@ -159,79 +116,24 @@ kei import-existing
 kei sync
 ```
 
-### Refresh metadata after a fix
+### Check or repair a backup
 
-If a kei upgrade fixes a metadata decode or capture bug, re-apply the corrected
-metadata to media you already downloaded, without downloading it again:
+Use `kei status` to inspect recorded progress and `kei verify --checksums` to
+check local bytes. Repair commands can change state or replace recorded files.
+Read [Backup maintenance](docs/backup-maintenance.md) before using them.
 
-```sh
-kei sync --refresh-metadata
-```
-
-This one-shot repair re-enumerates the selected libraries from the provider and
-refreshes every downloaded version it encounters before current resolution,
-filename, or live-photo download policy is applied. Embedded and sidecar tags
-follow your configured metadata outputs. The repair requires a complete library
-sweep, cannot use album, smart-folder, media, or date/recent filters, and does
-not run under `kei service run`. It is a manual recovery step; the permanent
-automatic fix is tracked in [#687](https://github.com/rhoopr/kei/issues/687).
-
-Capture and addition dates now retain Apple's milliseconds in the catalogue.
-Run this refresh to recover fractions lost by older versions; enable
-`metadata.xmp_sidecar` to correct sidecar capture dates too. Disable embedded
-metadata outputs if media bytes must remain untouched. This requires no schema
-migration or automatic precision-backfill sweep. Older kei binaries cannot read
-catalogue rows containing the new fractional timestamps; do not downgrade after
-they have been written. Native embedded subsecond writing is unchanged.
-
-Use this command after upgrading from a version that rendered capture times in
-the backup host's timezone. It rewrites XMP sidecars in full. For a timestamp
-already present in a file, it adds the capture offset only where the timestamp
-reads as capture-local, because an offset attached to a host-local timestamp
-would state a capture time the photo never had. When embedded datetime output
-is configured, a file with no capture timestamp receives one, with the offset
-when Apple supplied it. The command does not move existing media between date
-folders.
-
-To replace embedded timestamps written by an older kei version, run:
-
-```sh
-kei sync --refresh-metadata --repair-capture-timestamps
-```
-
-Set `metadata.set_exif_datetime = true` before you run this command. It can
-overwrite a camera-supplied timestamp. It changes only downloaded files that
-kei tracks in state and for which Apple supplies a usable capture offset. The
-rewrite uses kei's checksum and stable-input guards. It writes the capture-local
-timestamp and matching offset together. Files without a usable offset keep
-their existing timestamp.
-
-### Replace a truncated local file
-
-First, mark missing and truncated files for retry:
-
-```sh
-kei reconcile
-```
-
-Use an explicit repair sync when a truncated file should keep its recorded
-path instead of producing a size-suffixed sibling:
-
-```sh
-kei sync --repair-truncated
-```
-
-This one-shot option applies only to a recorded path that `reconcile` marked
-truncated. Kei verifies the new download and confirms that the existing bytes
-did not change before it atomically replaces the file. Normal downloads and
-missing-file retries still use no-overwrite publication. This option does not
-run under `kei service run`.
+Metadata capture in the catalogue is automatic. Embedded metadata and XMP
+sidecars are opt-in. See [Metadata output](docs/metadata.md) for supported
+formats, safe refusals, and explicit timestamp repair.
 
 Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
 
 ## Docs
 
 - [Install](https://github.com/rhoopr/kei/wiki/Install)
+- [Upgrade and compatibility](docs/v0.24-upgrade.md)
+- [Backup maintenance](docs/backup-maintenance.md)
+- [Metadata output](docs/metadata.md)
 - [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
 - [Docker](https://github.com/rhoopr/kei/wiki/Docker)
 - [Service mode](https://github.com/rhoopr/kei/wiki/Service)

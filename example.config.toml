@@ -80,7 +80,7 @@ folder_structure_smart_folders = "{smart-folder}"
 # Option: download.threads
 # Default value: 10; default becomes 1 when bandwidth_limit is set and threads is unset
 # Valid values: integer 1..64
-# Description: Maximum parallel download workers.
+# Description: Intended maximum parallel download workers. Concurrent full-enumeration passes can exceed this budget; see issue #817.
 threads = 10
 
 # Option: download.bandwidth_limit
@@ -92,7 +92,7 @@ threads = 10
 # Option: download.temp_suffix
 # Default value: .kei-tmp
 # Valid values: non-empty filename suffix string
-# Description: Suffix used for partial downloads and metadata rewrite temp files before atomic rename.
+# Description: Suffix for partial media downloads. Metadata writers use separate unique temporary names. Publication is guarded; suffix and age alone never authorize cleanup.
 temp_suffix = ".kei-tmp"
 
 [download.retry]
@@ -234,7 +234,7 @@ keep_unicode_in_filenames = false
 # Option: metadata.set_exif_datetime
 # Default value: false
 # Valid values: true, false
-# Description: Writes capture date metadata into supported JPEG/TIFF EXIF fields.
+# Description: Writes missing capture dates in supported embedded formats, including HEIF XMP with the xmp feature. Ordinary writes preserve native timestamps; explicit capture repair can replace them.
 set_exif_datetime = false
 
 # Option: metadata.set_exif_rating
