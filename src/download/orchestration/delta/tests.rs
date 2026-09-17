@@ -13,12 +13,14 @@ use crate::state::{SqliteStateDb, VersionSizeKey};
 use crate::test_helpers::{MockPhotosFlow, TestAssetRecord};
 
 use super::super::dispatch::download_photos_with_sync;
-use super::super::incremental::download_photos_incremental;
+use super::super::incremental::{
+    download_photos_incremental, download_photos_incremental_collecting_inner,
+};
 use super::super::models::{
-    ASSET_DELTA_HYDRATION_INCOMPLETE_REASON, DownloadControls, DownloadOutcome, DownloadReporting,
-    DownloadRunMode, DownloadStore, INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON,
-    INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON, SyncMode, SyncResult,
-    UNKNOWN_ALBUM_RELATION_ASSET_REASON, UNPARSABLE_RELATION_DELTA_REASON,
+    ASSET_DELTA_HYDRATION_INCOMPLETE_REASON, ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON,
+    DownloadControls, DownloadOutcome, DownloadReporting, DownloadRunMode, DownloadStore,
+    INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON, INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON,
+    SyncMode, SyncResult, UNKNOWN_ALBUM_RELATION_ASSET_REASON, UNPARSABLE_RELATION_DELTA_REASON,
 };
 use super::super::test_support::{
     album_with_session_and_container, changes_album, changes_album_with_container,
@@ -27,6 +29,7 @@ use super::super::test_support::{
     relation_delete_record, relation_delta_record, seed_complete_album_snapshot,
     seed_downloaded_metadata_asset, test_config, unused_unfiled_changes_pass,
 };
+use super::super::url_refresh::INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER;
 
 #[derive(Clone)]
 struct RelationHydrationSession {
@@ -1401,4 +1404,322 @@ async fn unparsable_relation_delete_blocks_incremental_token() {
         result.stats.sync_token_blocked_reason,
         Some(UNPARSABLE_RELATION_DELTA_REASON)
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DeltaExecution {
+    Streaming,
+    Collecting,
+}
+
+impl DeltaExecution {
+    async fn run(
+        self,
+        db: &Arc<SqliteStateDb>,
+        dir: &TempDir,
+        records: Vec<Value>,
+        shutdown: CancellationToken,
+    ) -> SyncResult {
+        let session = changes_zone_session_with_query_page(
+            Arc::new(AtomicUsize::new(0)),
+            records,
+            json!({"records": []}),
+            0,
+        );
+        let passes = [AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+        let client = Client::new();
+        match self {
+            Self::Streaming => {
+                download_photos_incremental(
+                    &client,
+                    &passes,
+                    &config,
+                    "zone-token-prev",
+                    DownloadControls::download_hidden(),
+                    shutdown,
+                )
+                .await
+            }
+            Self::Collecting => {
+                download_photos_incremental_collecting_inner(
+                    &client,
+                    &passes,
+                    &config,
+                    "zone-token-prev",
+                    DownloadControls::download_hidden(),
+                    shutdown,
+                    INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER,
+                )
+                .await
+            }
+        }
+        .unwrap_or_else(|error| panic!("{self:?}: {error:#}"))
+    }
+}
+
+#[tokio::test]
+async fn shared_delta_state_preserves_transitions_relations_and_unchanged_cycle() {
+    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        for id in ["SOFT", "HARD", "HIDDEN"] {
+            db.upsert_seen(&TestAssetRecord::new(id).build())
+                .await
+                .unwrap();
+        }
+        let media_path = dir.path().join("existing.jpg");
+        tokio::fs::write(&media_path, b"existing local media")
+            .await
+            .unwrap();
+        db.import_adopt(
+            &TestAssetRecord::new("LOCAL").build(),
+            &media_path,
+            "local-checksum",
+            20,
+            None,
+        )
+        .await
+        .unwrap();
+        let initial_downloaded = db.get_downloaded_ids().await.unwrap();
+        let mut records = vec![
+            relation_delta_record("container-shared", "asset-HIDDEN"),
+            album_delta_record("container-shared", "Shared"),
+            hard_deleted_change_record("HARD"),
+        ];
+        records.extend(flagged_incremental_records("SOFT", ("isDeleted", 1)));
+        records.extend(flagged_incremental_records("HIDDEN", ("isHidden", 1)));
+
+        for delta in [records, Vec::new()] {
+            let result = execution
+                .run(&db, &dir, delta, CancellationToken::new())
+                .await;
+            assert!(
+                matches!(result.outcome, DownloadOutcome::Success),
+                "{execution:?}"
+            );
+            assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+            assert!(!result.stats.sync_token_blocked);
+            assert_eq!(result.stats.state_write_failures, 0);
+            let pending = db.get_pending().await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_source_flags(&pending, "HIDDEN", false, true);
+            assert_eq!(
+                db.get_master_record_name_for_asset("PrimarySync", "asset-HIDDEN")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("HIDDEN")
+            );
+            let memberships = db
+                .get_live_selected_album_memberships_for_asset(
+                    "PrimarySync",
+                    "asset-HIDDEN",
+                    &["container-shared"],
+                )
+                .await
+                .unwrap();
+            assert_eq!(memberships.len(), 1);
+            assert_eq!(memberships[0].container_id, "container-shared");
+            assert_eq!(db.get_downloaded_ids().await.unwrap(), initial_downloaded);
+            assert_eq!(
+                tokio::fs::read(&media_path).await.unwrap(),
+                b"existing local media"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_delta_state_failed_write_replays_then_stays_unchanged() {
+    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+        for (write, reason, hidden_after_failure) in [
+            (
+                "UPDATE ON assets",
+                INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON,
+                false,
+            ),
+            (
+                "INSERT ON asset_master_mappings",
+                ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON,
+                true,
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let db = Arc::new(
+                SqliteStateDb::open(&dir.path().join("state.db"))
+                    .await
+                    .unwrap(),
+            );
+            db.upsert_seen(&TestAssetRecord::new("HIDDEN").build())
+                .await
+                .unwrap();
+            db.acquire_lock("reject delta write")
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER reject_delta BEFORE {write}
+             BEGIN SELECT RAISE(FAIL, 'injected delta state failure'); END;"
+                ))
+                .unwrap();
+            let records = flagged_incremental_records("HIDDEN", ("isHidden", 1));
+            let failed = execution
+                .run(&db, &dir, records.clone(), CancellationToken::new())
+                .await;
+            assert_eq!(failed.sync_token, None);
+            assert!(failed.stats.sync_token_blocked);
+            assert_eq!(failed.stats.sync_token_blocked_reason, Some(reason));
+            assert_eq!(failed.stats.state_write_failures, 1);
+            assert!(matches!(
+                failed.outcome,
+                DownloadOutcome::PartialFailure { failed_count: 1 }
+            ));
+            assert_source_flags(
+                &db.get_pending().await.unwrap(),
+                "HIDDEN",
+                false,
+                hidden_after_failure,
+            );
+            db.acquire_lock("restore writes")
+                .unwrap()
+                .execute_batch("DROP TRIGGER reject_delta;")
+                .unwrap();
+            for delta in [records, Vec::new()] {
+                let result = execution
+                    .run(&db, &dir, delta, CancellationToken::new())
+                    .await;
+                assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+                assert_eq!(result.stats.state_write_failures, 0);
+                assert!(!result.stats.sync_token_blocked);
+                assert_source_flags(&db.get_pending().await.unwrap(), "HIDDEN", false, true);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_delta_state_malformed_and_unresolved_events_keep_token_unsafe() {
+    use crate::icloud::photos::asset::MALFORMED_REQUIRED_ASSET_FIELDS_REASON;
+
+    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        db.upsert_seen(&TestAssetRecord::new("HIDDEN").build())
+            .await
+            .unwrap();
+        let mut malformed = incremental_photo_records("MALFORMED");
+        malformed[1]["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("assetDate");
+        let unresolved = vec![incremental_photo_records("UNRESOLVED")[1].clone()];
+        for (invalid, reason) in [
+            (malformed, MALFORMED_REQUIRED_ASSET_FIELDS_REASON),
+            (unresolved, ASSET_DELTA_HYDRATION_INCOMPLETE_REASON),
+        ] {
+            let mut records = invalid;
+            records.extend(flagged_incremental_records("HIDDEN", ("isHidden", 1)));
+            for _ in 0..2 {
+                let result = execution
+                    .run(&db, &dir, records.clone(), CancellationToken::new())
+                    .await;
+                assert_eq!(result.sync_token, None, "{execution:?}: {reason}");
+                assert!(result.stats.sync_token_blocked);
+                assert_eq!(result.stats.sync_token_blocked_reason, Some(reason));
+                let pending = db.get_pending().await.unwrap();
+                assert_eq!(pending.len(), 1);
+                assert_source_flags(&pending, "HIDDEN", false, true);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_delta_state_interrupted_before_consumption_preserves_state() {
+    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        db.upsert_seen(&TestAssetRecord::new("HIDDEN").build())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let result = execution
+            .run(
+                &db,
+                &dir,
+                flagged_incremental_records("HIDDEN", ("isHidden", 1)),
+                shutdown,
+            )
+            .await;
+        assert!(result.stats.interrupted);
+        assert_source_flags(&db.get_pending().await.unwrap(), "HIDDEN", false, false);
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-HIDDEN")
+                .await
+                .unwrap(),
+            None
+        );
+        // Cycle-level checkpoint gating consumes `interrupted`; delta completion
+        // alone is not permission to commit the token.
+    }
+}
+
+#[tokio::test]
+async fn shared_delta_state_preserves_strategy_failure_precedence() {
+    use crate::icloud::photos::asset::MALFORMED_REQUIRED_ASSET_FIELDS_REASON;
+
+    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        db.upsert_seen(&TestAssetRecord::new("HIDDEN").build())
+            .await
+            .unwrap();
+        db.acquire_lock("reject hidden transition")
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_hidden BEFORE UPDATE ON assets
+             BEGIN SELECT RAISE(FAIL, 'injected delta state failure'); END;",
+            )
+            .unwrap();
+        let mut records = flagged_incremental_records("HIDDEN", ("isHidden", 1));
+        let mut malformed = incremental_photo_records("MALFORMED");
+        malformed[1]["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("assetDate");
+        records.extend(malformed);
+        let result = execution
+            .run(&db, &dir, records, CancellationToken::new())
+            .await;
+        // Streaming encounters the write failure first. Collecting observes
+        // every provider event before writing, so the malformed event wins.
+        let reason = match execution {
+            DeltaExecution::Streaming => INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON,
+            DeltaExecution::Collecting => MALFORMED_REQUIRED_ASSET_FIELDS_REASON,
+        };
+        assert_eq!(result.sync_token, None);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(result.stats.sync_token_blocked_reason, Some(reason));
+        assert_eq!(result.stats.state_write_failures, 1);
+        assert_source_flags(&db.get_pending().await.unwrap(), "HIDDEN", false, false);
+    }
 }

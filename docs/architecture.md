@@ -34,7 +34,7 @@ changing behavior.
 | Download models and configuration | `src/download/orchestration/models.rs`, `src/download/orchestration/config.rs` | Owns controls, results, reporting, checkpoint reasons, coverage fingerprints, and configuration hashes. |
 | Download context and selection | `src/download/orchestration/context.rs`, `src/download/orchestration/selection.rs` | Loads library-scoped state and identity evidence, derives pass configurations, and checks incremental routing eligibility. |
 | Full enumeration | `src/download/orchestration/full.rs` | Owns bounded enumeration, album snapshots, pass counts, and token evidence. |
-| Incremental enumeration | `src/download/orchestration/incremental.rs`, `src/download/orchestration/delta.rs` | Runs streaming and collecting passes, applies source-state transitions, and hydrates asset and relation deltas. |
+| Incremental enumeration | `src/download/orchestration/incremental.rs`, `src/download/orchestration/delta.rs` | Runs separate streaming and collecting strategies with one shared delta-state owner for provider-event bookkeeping and routing facts. |
 | Download recovery | `src/download/orchestration/recovery.rs`, `src/download/orchestration/url_refresh.rs` | Runs durable pending recovery and refreshes exact download tasks with current provider URLs. |
 | Local catalog maintenance | `src/download/orchestration/reconciliation.rs`, `src/download/orchestration/cleanup.rs`, `src/download/orchestration/maintenance.rs` | Reconciles catalog paths, removes durably owned stale temporary files, and repairs metadata-capture revisions. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
@@ -244,6 +244,14 @@ master through `masterRef`, the durable mapping, or a targeted identity lookup
 before routing; an inconclusive lookup preserves the prior zone checkpoint.
 Album snapshots and smart folders may require targeted refresh work before or
 alongside the incremental stream.
+
+Both strategies use `IncrementalDeltaState` in `orchestration/delta.rs` for
+identity mappings, source-state transitions, album and relation bookkeeping,
+event counts, and completion tokens. The streaming strategy emits created
+assets through a bounded channel and defers album, relation, and unpaired-asset
+work. The collecting strategy observes all events before state writes, hydrates
+missing identities, and applies relations before routing created assets.
+These orders preserve each strategy's token-safety and selected-album behavior.
 
 Downloadable photo records require non-blank `CPLMaster` and `CPLAsset` record names
 and a usable `assetDate` before they enter filtering or path planning. Full
