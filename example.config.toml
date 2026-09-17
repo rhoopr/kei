@@ -80,7 +80,7 @@ folder_structure_smart_folders = "{smart-folder}"
 # Option: download.threads
 # Default value: 10; default becomes 1 when bandwidth_limit is set and threads is unset
 # Valid values: integer 1..64
-# Description: Intended maximum parallel download workers. Concurrent full-enumeration passes can exceed this budget; see issue #817.
+# Description: Maximum parallel download workers across all active passes. Full enumeration divides this limit equally between concurrent passes, rounds down, and leaves any remainder unused.
 threads = 10
 
 # Option: download.bandwidth_limit
