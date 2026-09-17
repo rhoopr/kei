@@ -1,14 +1,23 @@
+#[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use reqwest::Client;
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
 use crate::state::SqliteStateDb;
 
+#[cfg(unix)]
 use super::super::dispatch::download_photos_with_sync;
+#[cfg(unix)]
 use super::super::models::{DownloadControls, DownloadOutcome};
+#[cfg(unix)]
 use super::super::test_support::test_config;
-use super::{remove_owned_orphan_parts, remove_owned_orphan_parts_with};
+use super::remove_owned_orphan_parts;
+#[cfg(unix)]
+use super::remove_owned_orphan_parts_with;
 
 #[test]
 fn owned_orphan_cleanup_removes_only_the_exact_recorded_path() {
