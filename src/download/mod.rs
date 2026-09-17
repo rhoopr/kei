@@ -6095,10 +6095,10 @@ async fn download_photos_full_with_token_policy(
             ..StreamingResult::default()
         };
         let pass_parallelism = passes.len().min(config.concurrent_downloads).max(1);
-        let per_pass_download_concurrency = config
-            .concurrent_downloads
-            .div_ceil(pass_parallelism)
-            .max(1);
+        // Round down so every set of active passes, including replacement
+        // passes, fits the total worker budget. Leave the remainder unused
+        // rather than introducing a second worker-admission mechanism.
+        let per_pass_download_concurrency = (config.concurrent_downloads / pass_parallelism).max(1);
         let pass_configs = build_pass_configs_with_download_concurrency(
             passes,
             config,
@@ -10840,6 +10840,283 @@ mod tests {
             1,
             "threads=1 should prevent multi-pass enumeration from consuming multiple cores at once"
         );
+    }
+
+    const WORKER_BUDGET_ASSETS_PER_PASS: usize = 4;
+    const WORKER_BUDGET_TIMEOUT: Duration = Duration::from_secs(15);
+    const WORKER_BUDGET_JPEG: &[u8] = &[
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+    ];
+
+    #[derive(Default)]
+    struct WorkerBudgetProbe {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        requests: AtomicUsize,
+        release: CancellationToken,
+    }
+
+    struct WorkerBudgetServer(tokio::task::JoinHandle<()>);
+
+    impl Drop for WorkerBudgetServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    async fn worker_budget_media(
+        axum::extract::State(probe): axum::extract::State<Arc<WorkerBudgetProbe>>,
+    ) -> Vec<u8> {
+        let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+        probe.peak.fetch_max(active, Ordering::SeqCst);
+        probe.requests.fetch_add(1, Ordering::SeqCst);
+        // Hold the first wave until the test has observed concurrent admission.
+        probe.release.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        probe.active.fetch_sub(1, Ordering::SeqCst);
+        WORKER_BUDGET_JPEG.to_vec()
+    }
+
+    fn worker_budget_passes(pass_count: usize, url: &str) -> Vec<AlbumPass> {
+        use base64::Engine as _;
+
+        (0..pass_count)
+            .map(|pass| {
+                let records = (0..WORKER_BUDGET_ASSETS_PER_PASS)
+                    .flat_map(|asset| {
+                        let id = format!("budget-{pass}-{asset}");
+                        let mut records = incremental_photo_records_with_url(
+                            &id,
+                            &format!("{id}.jpg"),
+                            url,
+                            WORKER_BUDGET_JPEG.len() as u64,
+                        );
+                        // Provider checksums are opaque resource identities,
+                        // not content hashes. Give each resource its own temp path.
+                        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                            json!(base64::engine::general_purpose::STANDARD.encode(&id));
+                        records
+                    })
+                    .collect();
+                AlbumPass {
+                    kind: PassKind::Album,
+                    album: mock_album(
+                        &format!("album-{pass}"),
+                        MockPhotosFlow::new()
+                            .album_count(WORKER_BUDGET_ASSETS_PER_PASS as u64)
+                            .query_page(records, Some("budget-token"))
+                            .empty_query_page(Some("budget-token"))
+                            .build(),
+                    ),
+                    exclude_ids: Arc::new(FxHashSet::default()),
+                }
+            })
+            .collect()
+    }
+
+    enum WorkerBudgetRun {
+        Complete,
+        CancelFirstWave,
+    }
+
+    async fn check_full_sync_worker_budget(
+        workers: usize,
+        pass_count: usize,
+        run: WorkerBudgetRun,
+    ) {
+        let probe = Arc::new(WorkerBudgetProbe::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind controlled media endpoint");
+        let url = format!("http://{}/media.jpg", listener.local_addr().unwrap());
+        let app = axum::Router::new()
+            .route("/media.jpg", axum::routing::get(worker_budget_media))
+            .with_state(Arc::clone(&probe));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let server = WorkerBudgetServer(server);
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.folder_structure_albums = Arc::from("{album}");
+        config.concurrent_downloads = workers;
+        #[cfg(feature = "xmp")]
+        {
+            config.metadata.xmp_sidecar = true;
+        }
+        config.state_db = Some(db.clone());
+        let mut config = Arc::new(config);
+        let shutdown = CancellationToken::new();
+        let client = Client::new();
+        let passes = worker_budget_passes(pass_count, &url);
+        let download = Box::pin(download_photos_full_with_token(
+            &client,
+            &passes,
+            &config,
+            DownloadControls::download_hidden(),
+            shutdown.clone(),
+        ));
+        let control = async {
+            let parallel_passes = workers.min(pass_count);
+            let first_wave =
+                parallel_passes * (workers / parallel_passes).min(WORKER_BUDGET_ASSETS_PER_PASS);
+            while probe.active.load(Ordering::SeqCst) < first_wave {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // Keep responses blocked so an over-admitting scheduler can expose
+            // all its workers instead of hiding them behind fast responses.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if matches!(run, WorkerBudgetRun::CancelFirstWave) {
+                shutdown.cancel();
+            }
+            probe.release.cancel();
+        };
+        let (result, ()) = tokio::time::timeout(WORKER_BUDGET_TIMEOUT, async {
+            tokio::join!(download, control)
+        })
+        .await
+        .expect("full enumeration must not deadlock");
+        let result = result.unwrap();
+        let peak = probe.peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 0 && peak <= workers,
+            "workers={workers}, passes={pass_count}, peak={peak}"
+        );
+        let total = pass_count * WORKER_BUDGET_ASSETS_PER_PASS;
+        if matches!(run, WorkerBudgetRun::CancelFirstWave) {
+            assert_eq!(result.sync_token, None);
+            let summary = db.get_summary().await.unwrap();
+            assert_eq!(summary.downloaded, 0);
+            assert!(
+                summary.pending + summary.failed > 0,
+                "retain dispatched work"
+            );
+            assert_eq!(summary.total_assets, summary.pending + summary.failed);
+        } else {
+            assert!(
+                matches!(result.outcome, DownloadOutcome::Success),
+                "workers={workers}, passes={pass_count}: {result:?}; failed={:?}",
+                db.get_failed().await.unwrap()
+            );
+            assert_eq!(result.stats.downloaded, total);
+            assert_eq!(result.sync_token.as_deref(), Some("budget-token"));
+            assert_eq!(probe.requests.load(Ordering::SeqCst), total);
+        }
+
+        // Reopen file-backed state, recover interrupted work, then prove that
+        // an unchanged full cycle does not request or rewrite completed media.
+        Arc::get_mut(&mut config).unwrap().state_db = None;
+        drop(db);
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        Arc::get_mut(&mut config).unwrap().state_db = Some(db.clone());
+        let mut completed_files = Vec::new();
+        for cycle in 0..2 {
+            let before = probe.requests.load(Ordering::SeqCst);
+            let result = tokio::time::timeout(
+                WORKER_BUDGET_TIMEOUT,
+                Box::pin(download_photos_full_with_token(
+                    &client,
+                    &worker_budget_passes(pass_count, &url),
+                    &config,
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
+                )),
+            )
+            .await
+            .expect("restarted full enumeration must make progress")
+            .unwrap();
+            assert!(matches!(result.outcome, DownloadOutcome::Success));
+            assert_eq!(result.sync_token.as_deref(), Some("budget-token"));
+            if cycle > 0 || matches!(run, WorkerBudgetRun::Complete) {
+                assert_eq!(result.stats.downloaded, 0);
+                assert_eq!(probe.requests.load(Ordering::SeqCst), before);
+            }
+            let summary = db.get_summary().await.unwrap();
+            assert_eq!(summary.downloaded, total as u64);
+            assert_eq!(summary.total_assets, total as u64);
+            assert_eq!(summary.pending + summary.failed, 0);
+            let albums = std::fs::read_dir(&config.directory).unwrap();
+            let mut directory_count = 0;
+            for album in albums {
+                let entries = std::fs::read_dir(album.unwrap().path()).unwrap();
+                assert_eq!(
+                    entries.count(),
+                    WORKER_BUDGET_ASSETS_PER_PASS * (1 + usize::from(cfg!(feature = "xmp"))),
+                    "only completed media and configured sidecars may remain"
+                );
+                directory_count += 1;
+            }
+            assert_eq!(directory_count, pass_count);
+            let rows = db.get_downloaded_page(0, total as u32).await.unwrap();
+            let mut files = Vec::new();
+            for row in rows {
+                let path = row.local_path.unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), WORKER_BUDGET_JPEG);
+                assert_eq!(
+                    row.local_checksum,
+                    Some(file::compute_sha256(&path).await.unwrap())
+                );
+                assert_eq!(row.download_checksum, row.local_checksum);
+                let mut paths = vec![path.clone()];
+                if cfg!(feature = "xmp") {
+                    let mut name = path.file_name().unwrap().to_os_string();
+                    name.push(".xmp");
+                    let sidecar = path.with_file_name(name);
+                    assert!(
+                        sidecar.exists(),
+                        "configured metadata must finish: {sidecar:?}"
+                    );
+                    paths.push(sidecar);
+                }
+                for path in paths {
+                    files.push((
+                        path.clone(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ));
+                }
+            }
+            files.sort();
+            if cycle == 0 {
+                completed_files = files;
+            } else {
+                assert_eq!(files, completed_files);
+            }
+            assert!(
+                db.get_owned_temp_files_before(i64::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(probe.peak.load(Ordering::SeqCst) <= workers);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn full_sync_worker_budget_ten_workers_nine_passes() {
+        check_full_sync_worker_budget(10, 9, WorkerBudgetRun::Complete).await;
+    }
+
+    #[tokio::test]
+    async fn full_sync_worker_budget_ten_workers_six_passes() {
+        check_full_sync_worker_budget(10, 6, WorkerBudgetRun::Complete).await;
+    }
+
+    #[tokio::test]
+    async fn full_sync_worker_budget_bounds_serial_divisible_and_replacement_passes() {
+        for (workers, passes) in [(1, 3), (2, 5), (10, 1), (6, 3)] {
+            check_full_sync_worker_budget(workers, passes, WorkerBudgetRun::Complete).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn full_sync_worker_budget_cancellation_retains_work_and_recovers() {
+        for (workers, passes) in [(10, 9), (2, 5)] {
+            check_full_sync_worker_budget(workers, passes, WorkerBudgetRun::CancelFirstWave).await;
+        }
     }
 
     #[tokio::test]

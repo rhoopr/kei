@@ -265,6 +265,11 @@ Only producer-dispatched work becomes pending through `upsert_seen`. Filtered
 or skipped assets must not be left as retryable work unless a dedicated state
 transition owns that result.
 
+Full enumeration divides the configured download-worker limit across concurrent
+album passes. Each pass gets the same allocation, rounded down. The remainder
+stays unused so replacement passes cannot exceed the total limit. Passes keep
+their existing cancellation, publication, and state-finalization paths.
+
 Asset dates used for filtering, path rendering, file metadata, and sidecars are
 resolved from Apple's UTC instant plus the asset's `timeZoneOffset` when that
 offset is usable. Missing or invalid offsets retain host-local rendering,
