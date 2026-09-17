@@ -28,8 +28,8 @@ use super::context::{
     legacy_owner_claim_mode_for_configs, preload_download_context,
 };
 use super::delta::{
-    IncrementalAssetHydrationContext, IncrementalDeltaSummary, apply_incremental_album_delta,
-    apply_incremental_relation_delta, hydrate_missing_selected_relation_assets,
+    IncrementalAssetHydrationContext, IncrementalDeltaRouting, IncrementalDeltaState,
+    IncrementalDeltaSummary, hydrate_missing_selected_relation_assets,
     hydrate_unpaired_created_asset_deltas,
 };
 use super::models::{
@@ -84,11 +84,8 @@ fn stream_incremental_assets_for_single_unfiled_pass(
     let (asset_tx, asset_rx) = mpsc::channel::<Result<PhotoAsset>>(capacity);
     let (mut change_stream, token_rx) = pass.album.changes_stream(&zone_sync_token);
     let handle = tokio::spawn(async move {
-        let mut summary = IncrementalDeltaSummary::default();
+        let mut delta = IncrementalDeltaState::new(std::slice::from_ref(&pass));
         let routing = IncrementalPassRouting::from_passes(std::slice::from_ref(&pass));
-        let planned_album_containers: FxHashMap<&str, &str> = FxHashMap::default();
-        let mut ensured_planned_containers: FxHashSet<String> = FxHashSet::default();
-        let mut asset_to_master: FxHashMap<String, String> = FxHashMap::default();
         let mut album_events = Vec::new();
         let mut relation_events = Vec::new();
         let mut unpaired_asset_events = Vec::new();
@@ -98,36 +95,21 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                 break;
             }
             let event = result?;
-            summary.observe_event(&event);
-            IncrementalDeltaSummary::remember_asset_mapping(&event, &mut asset_to_master);
-            summary.persist_asset_mapping(&event, &config).await;
-
-            if event.album.is_some() {
-                album_events.push(event);
-                continue;
-            }
-            if event.relation.is_some() {
-                relation_events.push(event);
-                continue;
-            }
-            if event.token_unsafe_reason.is_some() {
-                continue;
-            }
-
-            match event.reason {
-                ChangeReason::Created => {
-                    summary.record_created();
+            delta.observe_event(&event);
+            delta.persist_asset_mapping(&event, &config).await;
+            match delta.apply_event(&event, &config).await {
+                IncrementalDeltaRouting::Album => album_events.push(event),
+                IncrementalDeltaRouting::Relation => relation_events.push(event),
+                IncrementalDeltaRouting::Created => {
                     if let Some(asset) = event.asset {
                         if asset_tx.send(Ok(asset)).await.is_err() {
-                            return Ok(summary);
+                            return Ok(delta.summary);
                         }
                     } else if matches!(event.record_type.as_deref(), Some("CPLAsset")) {
                         unpaired_asset_events.push(event);
                     }
                 }
-                ChangeReason::SoftDeleted | ChangeReason::HardDeleted | ChangeReason::Hidden => {
-                    summary.apply_source_state_event(&event, &config).await;
-                }
+                IncrementalDeltaRouting::None => {}
             }
         }
 
@@ -135,7 +117,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             &mut unpaired_asset_events,
             Some(&pass),
             &config,
-            &mut summary,
+            &mut delta.summary,
         )
         .await;
         let download_ctx = if run_mode.downloads_files() && !unpaired_asset_events.is_empty() {
@@ -152,7 +134,8 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                         &asset,
                         std::iter::once(config.as_ref()),
                     );
-                    let Some(selected_asset) = summary
+                    let Some(selected_asset) = delta
+                        .summary
                         .select_asset_state_identity(
                             asset,
                             &config,
@@ -165,35 +148,29 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                         continue;
                     };
                     asset = selected_asset;
-                    apply_changed_provider_metadata(&config, &asset, download_ctx, &mut summary)
-                        .await;
+                    apply_changed_provider_metadata(
+                        &config,
+                        &asset,
+                        download_ctx,
+                        &mut delta.summary,
+                    )
+                    .await;
                 }
                 if asset_tx.send(Ok(asset)).await.is_err() {
-                    return Ok(summary);
+                    return Ok(delta.summary);
                 }
             }
         }
 
         for event in &album_events {
-            apply_incremental_album_delta(event, &config, &mut summary.token_unsafe_reason).await;
+            delta.apply_album_event(event, &config).await;
         }
         for event in &relation_events {
-            apply_incremental_relation_delta(
-                event,
-                &config,
-                &routing,
-                &planned_album_containers,
-                &mut ensured_planned_containers,
-                &asset_to_master,
-                &mut summary.token_unsafe_reason,
-            )
-            .await;
+            delta.apply_relation_event(event, &config, &routing).await;
         }
 
-        if let Ok(token) = token_rx.await {
-            summary.sync_token = Some(token);
-        }
-        Ok(summary)
+        delta.record_completion(token_rx.await.ok());
+        Ok(delta.summary)
     });
 
     (ReceiverStream::new(asset_rx), handle)
@@ -439,7 +416,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     let mut downloadable_assets: Vec<(PhotoAsset, usize)> = Vec::new();
     let mut change_events = Vec::new();
     let mut first_download_url_obtained_at: Option<Instant> = None;
-    let mut delta_summary = IncrementalDeltaSummary::default();
+    let mut delta = IncrementalDeltaState::new(passes);
     let routing = IncrementalPassRouting::from_passes(passes);
     let selected_container_ids = routing.selected_container_refs();
 
@@ -460,13 +437,11 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             if first_download_url_obtained_at.is_none() && event.asset.is_some() {
                 first_download_url_obtained_at = Some(Instant::now());
             }
-            delta_summary.observe_event(&event);
+            delta.observe_event(&event);
             change_events.push(event);
         }
 
-        if let Ok(token) = token_rx.await {
-            delta_summary.sync_token = Some(token);
-        }
+        delta.record_completion(token_rx.await.ok());
         tracing::debug!(
             phase_elapsed = %format_duration(phase_started.elapsed()),
             elapsed = %format_duration(started.elapsed()),
@@ -476,7 +451,6 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     }
 
     let phase_started = Instant::now();
-    let mut asset_to_master: FxHashMap<String, String> = FxHashMap::default();
     let mut download_ctx = if change_events
         .iter()
         .any(|event| event.reason == ChangeReason::Created)
@@ -486,14 +460,13 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         None
     };
     for event in &change_events {
-        IncrementalDeltaSummary::remember_asset_mapping(event, &mut asset_to_master);
-        delta_summary.persist_asset_mapping(event, config).await;
+        delta.persist_asset_mapping(event, config).await;
     }
     hydrate_unpaired_created_asset_deltas(
         &mut change_events,
         passes.first(),
         config,
-        &mut delta_summary,
+        &mut delta.summary,
     )
     .await;
     let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
@@ -510,7 +483,8 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 &asset,
                 pass_configs.iter().map(AsRef::as_ref),
             );
-            event.asset = delta_summary
+            event.asset = delta
+                .summary
                 .select_asset_state_identity(
                     asset,
                     config,
@@ -523,30 +497,14 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     }
     let mut complete_delta_assets: Vec<PhotoAsset> = change_events
         .iter()
-        .filter(|event| {
-            event.reason == ChangeReason::Created
-                && event.album.is_none()
-                && event.relation.is_none()
-                && event.token_unsafe_reason.is_none()
-        })
-        .filter_map(|event| event.asset.clone())
+        .filter_map(IncrementalDeltaState::created_asset)
+        .cloned()
         .collect();
     for event in &change_events {
-        IncrementalDeltaSummary::remember_asset_mapping(event, &mut asset_to_master);
+        delta.remember_asset_mapping(event);
     }
-    let planned_album_containers: FxHashMap<&str, &str> = passes
-        .iter()
-        .filter(|pass| pass.kind == crate::commands::PassKind::Album)
-        .filter_map(|pass| {
-            pass.album
-                .container_id()
-                .map(|container_id| (container_id, pass.album.name.as_ref()))
-        })
-        .collect();
-    let mut ensured_planned_containers: FxHashSet<String> = FxHashSet::default();
-
     for event in &change_events {
-        apply_incremental_album_delta(event, config, &mut delta_summary.token_unsafe_reason).await;
+        delta.apply_album_event(event, config).await;
     }
     tracing::debug!(
         phase_elapsed = %format_duration(phase_started.elapsed()),
@@ -558,7 +516,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     let downloadable_before_relation_hydration = downloadable_assets.len();
     {
         let mut hydration_context = IncrementalAssetHydrationContext {
-            asset_to_master: &mut asset_to_master,
+            asset_to_master: &mut delta.asset_to_master,
             complete_delta_assets: &mut complete_delta_assets,
             downloadable_assets: &mut downloadable_assets,
             download_ctx: download_ctx.as_deref(),
@@ -572,7 +530,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             config,
             &routing,
             &mut hydration_context,
-            &mut delta_summary,
+            &mut delta.summary,
         )
         .await;
     }
@@ -601,63 +559,42 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             if !refreshed_assets.insert(asset.state_id_arc()) {
                 continue;
             }
-            apply_changed_provider_metadata(config, asset, &context, &mut delta_summary).await;
+            apply_changed_provider_metadata(config, asset, &context, &mut delta.summary).await;
         }
         download_ctx = Some(context);
     }
 
     let phase_started = Instant::now();
     for event in &change_events {
-        apply_incremental_relation_delta(
-            event,
-            config,
-            &routing,
-            &planned_album_containers,
-            &mut ensured_planned_containers,
-            &asset_to_master,
-            &mut delta_summary.token_unsafe_reason,
-        )
-        .await;
+        delta.apply_relation_event(event, config, &routing).await;
     }
 
     for event in &change_events {
-        if event.album.is_some() || event.relation.is_some() || event.token_unsafe_reason.is_some()
-        {
+        if delta.apply_event(event, config).await != IncrementalDeltaRouting::Created {
             continue;
         }
-        match event.reason {
-            ChangeReason::Created => {
-                delta_summary.record_created();
-                if let Some(asset) = &event.asset {
-                    match route_incremental_asset_to_passes(
-                        asset,
-                        &routing,
-                        &selected_container_ids,
-                        config,
-                    )
-                    .await
-                    {
-                        Ok(pass_indices) => {
-                            for pass_index in pass_indices {
-                                downloadable_assets.push((asset.clone(), pass_index));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                asset_record_name = %asset.asset_record_name(),
-                                asset_id = %asset.id(),
-                                error = %e,
-                                "Failed to route incremental asset through album membership state"
-                            );
-                            delta_summary
-                                .token_unsafe_reason
-                                .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
-                        }
-                    }
+        let Some(asset) = &event.asset else {
+            continue;
+        };
+        match route_incremental_asset_to_passes(asset, &routing, &selected_container_ids, config)
+            .await
+        {
+            Ok(pass_indices) => {
+                for pass_index in pass_indices {
+                    downloadable_assets.push((asset.clone(), pass_index));
                 }
             }
-            ChangeReason::SoftDeleted | ChangeReason::HardDeleted | ChangeReason::Hidden => {
-                delta_summary.apply_source_state_event(event, config).await;
+            Err(e) => {
+                tracing::warn!(
+                    asset_record_name = %asset.asset_record_name(),
+                    asset_id = %asset.id(),
+                    error = %e,
+                    "Failed to route incremental asset through album membership state"
+                );
+                delta
+                    .summary
+                    .token_unsafe_reason
+                    .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
             }
         }
     }
@@ -668,6 +605,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         "Incremental routing phase complete"
     );
 
+    let delta_summary = delta.summary;
     delta_summary.log_debug();
 
     if downloadable_assets.is_empty() {

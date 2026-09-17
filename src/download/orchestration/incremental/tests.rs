@@ -2289,3 +2289,45 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
         "the prior provider bytes must remain on disk"
     );
 }
+
+#[tokio::test]
+async fn shared_delta_state_streaming_receiver_drop_keeps_completion_uncommitted() {
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path());
+    config.state_db = Some(db.clone());
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: changes_album(
+            "",
+            changes_zone_session(
+                Arc::new(AtomicUsize::new(0)),
+                incremental_photo_records("UNCONSUMED"),
+            ),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let (assets, producer) = super::stream_incremental_assets_for_single_unfiled_pass(
+        pass,
+        Arc::new(config),
+        "zone-token-prev".to_string(),
+        DownloadRunMode::Download,
+        CancellationToken::new(),
+    );
+    drop(assets);
+    let summary = producer.await.unwrap().unwrap();
+    assert_eq!(summary.sync_token, None);
+    assert_eq!(summary.total_events, 1);
+    assert_eq!(summary.created_count, 1);
+    assert_eq!(summary.state_transition_failures, 0);
+    assert_eq!(
+        db.get_master_record_name_for_asset("PrimarySync", "asset-UNCONSUMED")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("UNCONSUMED"),
+    );
+    assert!(db.get_pending().await.unwrap().is_empty());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}

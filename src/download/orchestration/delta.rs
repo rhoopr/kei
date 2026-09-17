@@ -268,6 +268,136 @@ async fn hard_delete_state_transition_key<'a>(
     })
 }
 
+/// Routing work left to the execution strategy after shared delta bookkeeping.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(super) enum IncrementalDeltaRouting {
+    Album,
+    Relation,
+    Created,
+    None,
+}
+
+/// Shared facts for one zone delta. Callers retain their buffering and ordering:
+/// streaming persists identity and applies source changes as events arrive;
+/// collecting observes the whole delta before writes and applies relations before
+/// routing. Hydration must not observe an event again or count it twice.
+pub(super) struct IncrementalDeltaState<'a> {
+    pub(super) summary: IncrementalDeltaSummary,
+    pub(super) asset_to_master: FxHashMap<String, String>,
+    planned_album_containers: FxHashMap<&'a str, &'a str>,
+    ensured_planned_containers: FxHashSet<String>,
+}
+
+impl<'a> IncrementalDeltaState<'a> {
+    pub(super) fn new(passes: &'a [crate::commands::AlbumPass]) -> Self {
+        Self {
+            summary: IncrementalDeltaSummary::default(),
+            asset_to_master: FxHashMap::default(),
+            planned_album_containers: passes
+                .iter()
+                .filter(|pass| pass.kind == crate::commands::PassKind::Album)
+                .filter_map(|pass| {
+                    pass.album
+                        .container_id()
+                        .map(|id| (id, pass.album.name.as_ref()))
+                })
+                .collect(),
+            ensured_planned_containers: FxHashSet::default(),
+        }
+    }
+
+    pub(super) fn observe_event(&mut self, event: &ChangeEvent) {
+        self.summary.total_events += 1;
+        if let Some(reason) = event.token_unsafe_reason {
+            self.summary.token_unsafe_reason.get_or_insert(reason);
+        }
+    }
+
+    pub(super) fn remember_asset_mapping(&mut self, event: &ChangeEvent) {
+        if let Some(asset) = &event.asset {
+            self.asset_to_master.insert(
+                asset.asset_record_name().to_string(),
+                asset.id().to_string(),
+            );
+        }
+    }
+
+    pub(super) async fn persist_asset_mapping(
+        &mut self,
+        event: &ChangeEvent,
+        config: &DownloadConfig,
+    ) {
+        self.remember_asset_mapping(event);
+        if let Some(asset) = &event.asset {
+            self.summary
+                .persist_asset_mapping_for_asset(asset, config)
+                .await;
+        }
+    }
+
+    fn routing_input(event: &ChangeEvent) -> IncrementalDeltaRouting {
+        if event.album.is_some() {
+            IncrementalDeltaRouting::Album
+        } else if event.relation.is_some() {
+            IncrementalDeltaRouting::Relation
+        } else if event.token_unsafe_reason.is_some() || event.reason != ChangeReason::Created {
+            IncrementalDeltaRouting::None
+        } else {
+            IncrementalDeltaRouting::Created
+        }
+    }
+
+    pub(super) fn created_asset(event: &ChangeEvent) -> Option<&PhotoAsset> {
+        if Self::routing_input(event) != IncrementalDeltaRouting::Created {
+            return None;
+        }
+        event.asset.as_ref()
+    }
+
+    pub(super) async fn apply_event(
+        &mut self,
+        event: &ChangeEvent,
+        config: &DownloadConfig,
+    ) -> IncrementalDeltaRouting {
+        let routing = Self::routing_input(event);
+        match routing {
+            IncrementalDeltaRouting::Created => self.summary.created_count += 1,
+            IncrementalDeltaRouting::None if event.token_unsafe_reason.is_none() => {
+                self.summary.apply_source_state_event(event, config).await;
+            }
+            _ => {}
+        }
+        routing
+    }
+
+    pub(super) async fn apply_album_event(&mut self, event: &ChangeEvent, config: &DownloadConfig) {
+        apply_incremental_album_delta(event, config, &mut self.summary.token_unsafe_reason).await;
+    }
+
+    pub(super) async fn apply_relation_event(
+        &mut self,
+        event: &ChangeEvent,
+        config: &DownloadConfig,
+        routing: &IncrementalPassRouting,
+    ) {
+        apply_incremental_relation_delta(
+            event,
+            config,
+            routing,
+            &self.planned_album_containers,
+            &mut self.ensured_planned_containers,
+            &self.asset_to_master,
+            &mut self.summary.token_unsafe_reason,
+        )
+        .await;
+    }
+
+    pub(super) fn record_completion(&mut self, token: Option<String>) {
+        self.summary.sync_token = token;
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct IncrementalDeltaSummary {
     pub(super) sync_token: Option<String>,
@@ -281,36 +411,6 @@ pub(super) struct IncrementalDeltaSummary {
 }
 
 impl IncrementalDeltaSummary {
-    pub(super) fn observe_event(&mut self, event: &ChangeEvent) {
-        self.total_events += 1;
-        if let Some(reason) = event.token_unsafe_reason {
-            self.token_unsafe_reason.get_or_insert(reason);
-        }
-    }
-
-    pub(super) fn remember_asset_mapping(
-        event: &ChangeEvent,
-        asset_to_master: &mut FxHashMap<String, String>,
-    ) {
-        if let Some(asset) = &event.asset {
-            asset_to_master.insert(
-                asset.asset_record_name().to_string(),
-                asset.id().to_string(),
-            );
-        }
-    }
-
-    pub(super) async fn persist_asset_mapping(
-        &mut self,
-        event: &ChangeEvent,
-        config: &DownloadConfig,
-    ) {
-        let Some(asset) = &event.asset else {
-            return;
-        };
-        self.persist_asset_mapping_for_asset(asset, config).await;
-    }
-
     pub(super) async fn persist_asset_mapping_for_asset(
         &mut self,
         asset: &PhotoAsset,
@@ -396,15 +496,7 @@ impl IncrementalDeltaSummary {
         }
     }
 
-    pub(super) fn record_created(&mut self) {
-        self.created_count += 1;
-    }
-
-    pub(super) async fn apply_source_state_event(
-        &mut self,
-        event: &ChangeEvent,
-        config: &DownloadConfig,
-    ) {
+    async fn apply_source_state_event(&mut self, event: &ChangeEvent, config: &DownloadConfig) {
         match event.reason {
             ChangeReason::Created => {}
             ChangeReason::SoftDeleted => {
@@ -538,7 +630,7 @@ impl IncrementalDeltaSummary {
     }
 }
 
-pub(super) async fn apply_incremental_album_delta(
+async fn apply_incremental_album_delta(
     event: &ChangeEvent,
     config: &DownloadConfig,
     token_unsafe_reason: &mut Option<&'static str>,
@@ -578,7 +670,7 @@ pub(super) async fn apply_incremental_album_delta(
     }
 }
 
-pub(super) async fn apply_incremental_relation_delta(
+async fn apply_incremental_relation_delta(
     event: &ChangeEvent,
     config: &DownloadConfig,
     routing: &IncrementalPassRouting,
