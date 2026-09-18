@@ -38,7 +38,13 @@ changing behavior.
 | Download recovery | `src/download/orchestration/recovery.rs`, `src/download/orchestration/url_refresh.rs` | Runs durable pending recovery and refreshes exact download tasks with current provider URLs. |
 | Local catalog maintenance | `src/download/orchestration/reconciliation.rs`, `src/download/orchestration/cleanup.rs`, `src/download/orchestration/maintenance.rs` | Reconciles catalog paths, removes durably owned stale temporary files, and repairs metadata-capture revisions. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
-| Streaming workers | `src/download/pipeline.rs` | Runs bounded producers and consumers, coordinates file transfer, metadata writes, adoption, and outcome aggregation. |
+| Download pipeline facade | `src/download/pipeline.rs`, `src/download/pipeline/streaming.rs` | Preserves entry points and composes run modes, producer execution, consumer execution, and pass finalization. |
+| Local-file adoption | `src/download/pipeline/adoption.rs` | Validates current and pending local-file evidence before adoption or an on-disk skip. |
+| Streaming producer | `src/download/pipeline/producer.rs` | Plans assets, forecasts disk space, records skip counts, and dispatches pending tasks. |
+| Streaming consumer | `src/download/pipeline/consumer.rs` | Runs bounded workers and accumulates transfer results and deferred state writes. |
+| Single-task execution | `src/download/pipeline/task.rs` | Coordinates one transfer, metadata completion, temporary-file ownership, and worker error classification. |
+| Download pass and outcome | `src/download/pipeline/pass.rs`, `src/download/pipeline/outcome.rs` | Executes explicit task passes, finalizes streaming state, retries failed tasks, and aggregates sync outcomes. |
+| Download progress and summary | `src/download/pipeline/progress.rs` | Formats durations and sync summaries and reports rate-limit pressure. |
 | File transfer | `src/download/file.rs` | Downloads, resumes, validates, and publishes one media file. |
 | State finalization | `src/download/finalize.rs` | Persists downloaded or failed outcomes and retries deferred state writes. |
 | Durable retry resolution | `src/download/retry.rs` | Revalidates pending provider identity and builds exact retry tasks. |
@@ -49,6 +55,12 @@ changing behavior.
 | Service integration | `src/service/` | Owns install, uninstall, status, service execution, and platform renderers. |
 | Operator surfaces | `src/commands/status.rs`, `src/commands/doctor.rs`, `src/commands/manifest.rs` | Read local state for status, redacted diagnostics, and catalog export. |
 | Reports and monitoring | `src/cycle_reporter.rs`, `src/report.rs`, `src/health.rs`, `src/metrics.rs`, `src/notifications.rs` | Converts cycle facts into reports, health, metrics, and notifications. |
+
+Pipeline tests use `download::pipeline::<owner>::tests::<test_name>` instead
+of `download::pipeline::tests::<test_name>`. The owners are `adoption`,
+`consumer`, `outcome`, `pass`, `producer`, `progress`, `streaming`, and `task`.
+Test names and assertions are unchanged. Shared test fixtures stay in
+`src/download/pipeline/test_support.rs`.
 
 ## Main flows
 
