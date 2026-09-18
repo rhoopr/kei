@@ -97,6 +97,9 @@ CloudKit HTTP 401, 403, and 421 failures during enumeration or metadata
 hydration return a session-expired outcome. The cycle preserves its provider
 checkpoint and pending capture work. It does not treat these failures as a
 reason to fall back to full enumeration or retry incomplete pass tokens.
+Incremental producers pass session failures to the download pipeline before
+stream completion. The pipeline records the interrupted run before status
+commands read its outcome.
 Before bounded mid-cycle reauthentication, the watch loop removes the cached
 validation result and resets the HTTP connection pool. A recovered session
 replays the retained checkpoint. Ambiguous provider identities remain pending;

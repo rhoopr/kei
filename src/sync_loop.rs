@@ -7593,6 +7593,36 @@ mod tests {
                             "provider recovery must not change local media"
                         );
                         assert_eq!(result.stats.downloaded, 0);
+                        if recent.is_none()
+                            && matches!(
+                                stage,
+                                Stage::Incremental | Stage::AssetPair | Stage::AssetIdentity
+                            )
+                        {
+                            let summary = inner.get_summary().await.unwrap();
+                            let status = crate::commands::backup_status_line(&summary);
+                            assert_eq!(summary.last_sync_interrupted, cycle == 0);
+                            assert_eq!(
+                                summary.last_sync_status.as_deref(),
+                                Some(if cycle == 0 {
+                                    "interrupted"
+                                } else {
+                                    "complete"
+                                })
+                            );
+                            assert_eq!(summary.last_sync_enumeration_errors, u64::from(cycle == 0));
+                            if cycle == 0 {
+                                assert_eq!(
+                                    status,
+                                    "Backup status: unsafe - last sync was interrupted; 1 enumeration error occurred in the last sync"
+                                );
+                            } else {
+                                assert_eq!(
+                                    status,
+                                    "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+                                );
+                            }
+                        }
                         if cycle == 0 {
                             assert!(!result.db_sync_token_advance_safe);
                             assert_eq!(

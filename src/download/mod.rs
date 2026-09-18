@@ -7016,9 +7016,17 @@ struct IncrementalDeltaSummary {
     total_events: u64,
     state_transition_failures: usize,
     auth_errors: usize,
+    first_auth_error: Option<anyhow::Error>,
 }
 
 impl IncrementalDeltaSummary {
+    fn record_provider_error(&mut self, error: anyhow::Error) {
+        if is_provider_session_error(&error) {
+            self.auth_errors += 1;
+            self.first_auth_error.get_or_insert(error);
+        }
+    }
+
     fn observe_event(&mut self, event: &ChangeEvent) {
         self.total_events += 1;
         if let Some(reason) = event.token_unsafe_reason {
@@ -7573,7 +7581,6 @@ async fn hydrate_unpaired_created_asset_deltas(
                     );
                 }
                 RecordResolution::TransientFailure(error) => {
-                    summary.auth_errors += usize::from(error.is_authentication());
                     summary
                         .token_unsafe_reason
                         .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
@@ -7581,6 +7588,7 @@ async fn hydrate_unpaired_created_asset_deltas(
                         diagnostic = error.diagnostic(),
                         "Failed to recover master identity for asset-only delta"
                     );
+                    summary.record_provider_error(error.into());
                 }
                 RecordResolution::Present(_)
                 | RecordResolution::MasterPresent
@@ -7680,7 +7688,6 @@ async fn hydrate_unpaired_created_asset_deltas(
                 }
             }
             RecordResolution::TransientFailure(error) => {
-                summary.auth_errors += usize::from(error.is_authentication());
                 summary
                     .token_unsafe_reason
                     .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
@@ -7688,6 +7695,7 @@ async fn hydrate_unpaired_created_asset_deltas(
                     diagnostic = error.diagnostic(),
                     "Provider lookup could not hydrate an asset-only delta"
                 );
+                summary.record_provider_error(error.into());
             }
             RecordResolution::Present(_)
             | RecordResolution::AssetPresent { .. }
@@ -7784,12 +7792,12 @@ async fn hydrate_missing_selected_relation_assets(
         {
             Ok(assets) => assets,
             Err(e) => {
-                delta_summary.auth_errors += usize::from(is_provider_session_error(&e));
                 tracing::warn!(
                     pass_index,
                     error = %e,
                     "Failed to hydrate missing selected album relation assets"
                 );
+                delta_summary.record_provider_error(e);
                 delta_summary
                     .token_unsafe_reason
                     .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
@@ -7875,6 +7883,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             let event = match result {
                 Err(error) if is_provider_session_error(&error) => {
                     summary.auth_errors += 1;
+                    let _ = asset_tx.send(Err(error)).await;
                     return Ok(summary);
                 }
                 other => other?,
@@ -7971,6 +7980,12 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             .await;
         }
 
+        // Send hydration failures before EOF so the pipeline persists an
+        // interrupted run instead of recording a successful enumeration.
+        if let Some(error) = summary.first_auth_error.take() {
+            let _ = asset_tx.send(Err(error)).await;
+            return Ok(summary);
+        }
         if let Ok(token) = token_rx.await {
             summary.sync_token = Some(token);
         }
@@ -8018,7 +8033,11 @@ async fn download_photos_incremental_streaming(
         .context("incremental changes producer task panicked")??;
 
     delta_summary.log_debug();
-    streaming_result.provider_auth_errors += delta_summary.auth_errors;
+    // The pipeline already counted the representative error sent by the
+    // producer. Preserve the full lookup failure count without counting twice.
+    streaming_result.provider_auth_errors = streaming_result
+        .provider_auth_errors
+        .max(delta_summary.auth_errors);
     if delta_summary.auth_errors > 0 {
         streaming_result.enumeration_complete = false;
     }
