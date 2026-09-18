@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::download::metadata_rewrite::CaptureTimestampRepair;
 use crate::download::pipeline::MetadataFlags;
 use crate::download::{filter, metadata_rewrite};
+use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 use crate::icloud::photos::{PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution};
 use crate::state::VersionSizeKey;
 
@@ -87,6 +88,7 @@ const METADATA_CAPTURE_BATCH: usize = 500;
 pub(super) struct MetadataCaptureRepair {
     pub(super) stats: SyncStats,
     pub(super) failures: usize,
+    pub(super) auth_errors: usize,
 }
 
 fn metadata_capture_candidate_matches(
@@ -328,6 +330,7 @@ pub(super) async fn run_metadata_capture_repair(
                 .await;
             }
             RecordResolution::TransientFailure(error) => {
+                repair.auth_errors += usize::from(error.is_authentication());
                 let message = error.to_string();
                 record_metadata_capture_failure(
                     db.as_ref(),
@@ -340,7 +343,7 @@ pub(super) async fn run_metadata_capture_repair(
         }
     }
 
-    if !legacy_masters.is_empty() && !shutdown_token.is_cancelled() {
+    if !legacy_masters.is_empty() && !shutdown_token.is_cancelled() && repair.auth_errors == 0 {
         match provider_pass
             .album
             .hydrate_matching_master_assets_from_changes(&legacy_masters, shutdown_token)
@@ -430,6 +433,7 @@ pub(super) async fn run_metadata_capture_repair(
                 }
             }
             Err(error) => {
+                repair.auth_errors += usize::from(is_provider_session_error(&error));
                 let message = error.to_string();
                 let unresolved: Vec<String> = candidates_by_id
                     .iter()
@@ -453,7 +457,7 @@ pub(super) async fn run_metadata_capture_repair(
 
     if shutdown_token.is_cancelled() {
         repair.stats.interrupted = true;
-    } else {
+    } else if repair.auth_errors == 0 {
         for (_, candidate) in candidates_by_id {
             record_metadata_capture_failure(
                 db.as_ref(),

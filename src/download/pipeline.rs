@@ -17,6 +17,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::PhotoAsset;
+use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 use crate::retry::RetryConfig;
 use crate::state::{AssetRecord, SyncRunStats, VersionSizeKey};
 
@@ -210,6 +211,8 @@ pub(super) struct StreamingResult {
     pub(super) exif_failures: usize,
     pub(super) failed: Vec<DownloadTask>,
     pub(super) auth_errors: usize,
+    /// CloudKit session failures require recovery even without failed CDN transfers.
+    pub(super) provider_auth_errors: usize,
     pub(super) state_write_failures: usize,
     pub(super) enumeration_errors: usize,
     pub(super) assets_seen: u64,
@@ -1194,6 +1197,7 @@ impl StreamRuntime {
 struct StreamProducerMetrics {
     assets_seen: Arc<std::sync::atomic::AtomicU64>,
     enum_errors: Arc<std::sync::atomic::AtomicUsize>,
+    provider_auth_errors: Arc<std::sync::atomic::AtomicUsize>,
     state_write_failures: Arc<std::sync::atomic::AtomicUsize>,
     enumeration_complete: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1319,6 +1323,7 @@ where
     if controls.run_mode.only_print_filenames() {
         tokio::pin!(combined);
         let mut enum_errors = 0usize;
+        let mut provider_auth_errors = 0usize;
         let mut task_planner = TaskPlanner::for_download(config.state_db.as_deref()).await?;
         let mut shutdown_break = false;
         #[cfg(test)]
@@ -1383,15 +1388,20 @@ where
                 }
                 Err(e) => {
                     enum_errors += 1;
+                    if is_provider_session_error(&e) {
+                        provider_auth_errors += 1;
+                        break;
+                    }
                     tracing::error!(error = %e, "Error fetching asset");
                 }
             }
         }
         return Ok(StreamingResult {
             enumeration_errors: enum_errors,
+            provider_auth_errors,
             // Same gate as dry-run — `--only-print-filenames` drains
             // the API stream and can clear the marker on a clean exit.
-            enumeration_complete: !shutdown_break,
+            enumeration_complete: !shutdown_break && provider_auth_errors == 0,
             #[cfg(test)]
             printed_filenames,
             ..StreamingResult::default()
@@ -1402,6 +1412,7 @@ where
         tokio::pin!(combined);
         let mut count = 0usize;
         let mut enum_errors = 0usize;
+        let mut provider_auth_errors = 0usize;
         let mut task_planner = TaskPlanner::for_download(config.state_db.as_deref()).await?;
         let mut shutdown_break = false;
         while let Some(result) = combined.next().await {
@@ -1433,6 +1444,10 @@ where
                 }
                 Err(e) => {
                     enum_errors += 1;
+                    if is_provider_session_error(&e) {
+                        provider_auth_errors += 1;
+                        break;
+                    }
                     tracing::error!(error = %e, "Error fetching asset");
                 }
             }
@@ -1440,10 +1455,11 @@ where
         return Ok(StreamingResult {
             downloaded: count,
             enumeration_errors: enum_errors,
+            provider_auth_errors,
             // Dry-run still drains the API stream; mirror the
             // non-dry-run gate so the enum_in_progress marker can be
             // cleared on a clean dry-run.
-            enumeration_complete: !shutdown_break,
+            enumeration_complete: !shutdown_break && provider_auth_errors == 0,
             ..StreamingResult::default()
         });
     }
@@ -1568,6 +1584,7 @@ where
     let producer_pb = shared.pb;
     let assets_seen_producer = Arc::clone(&metrics.assets_seen);
     let enum_errors_producer = Arc::clone(&metrics.enum_errors);
+    let provider_auth_errors = Arc::clone(&metrics.provider_auth_errors);
     let state_write_failures_producer = Arc::clone(&metrics.state_write_failures);
     let enumeration_complete_producer = Arc::clone(&metrics.enumeration_complete);
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2132,6 +2149,13 @@ where
                 }
                 Err(e) => {
                     enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if is_provider_session_error(&e) {
+                        provider_auth_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            "Provider session expired during enumeration; retaining checkpoint for reauthentication"
+                        );
+                        break;
+                    }
                     // Single-line `tracing::error!` doesn't need the
                     // progress bar suspended; the bar redraws cleanly after
                     // a one-line emit and the suspend was just paying a
@@ -2147,7 +2171,9 @@ where
         // entirely. Mark enumeration complete only when shutdown wasn't
         // the trigger so the cycle's `enum_in_progress:<zone>` marker is
         // cleared even when downstream downloads partially failed.
-        if !producer_shutdown.is_cancelled() {
+        if !producer_shutdown.is_cancelled()
+            && provider_auth_errors.load(std::sync::atomic::Ordering::Relaxed) == 0
+        {
             enumeration_complete_producer.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
@@ -2518,6 +2544,10 @@ async fn finalize_streaming_download(
             .unwrap_or(u64::MAX),
             interrupted: pipeline_shutdown.is_cancelled()
                 || consumer.auth_errors >= AUTH_ERROR_THRESHOLD
+                || metrics
+                    .provider_auth_errors
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
                 || producer_panicked
                 || consumer.url_expired_abort,
             ..Default::default()
@@ -2621,6 +2651,9 @@ async fn finalize_streaming_download(
         exif_failures: consumer.exif_failures,
         failed: consumer.failed,
         auth_errors: consumer.auth_errors,
+        provider_auth_errors: metrics
+            .provider_auth_errors
+            .load(std::sync::atomic::Ordering::Relaxed),
         state_write_failures,
         enumeration_errors: metrics
             .enum_errors
@@ -2687,6 +2720,7 @@ pub(super) async fn build_download_outcome(
     let downloaded = streaming_result.downloaded;
     let mut exif_failures = streaming_result.exif_failures;
     let auth_errors = streaming_result.auth_errors;
+    let provider_auth_errors = streaming_result.provider_auth_errors;
     let mut state_write_failures = streaming_result.state_write_failures;
     let enumeration_errors = streaming_result.enumeration_errors;
     let enumeration_incomplete =
@@ -2694,7 +2728,7 @@ pub(super) async fn build_download_outcome(
     let failed_tasks = streaming_result.failed;
     let skip_breakdown: super::SkipBreakdown = streaming_result.skip_summary.into();
 
-    if auth_errors >= AUTH_ERROR_THRESHOLD {
+    if auth_errors >= AUTH_ERROR_THRESHOLD || provider_auth_errors > 0 {
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
@@ -2720,7 +2754,7 @@ pub(super) async fn build_download_outcome(
         };
         return Ok((
             DownloadOutcome::SessionExpired {
-                auth_error_count: auth_errors,
+                auth_error_count: auth_errors + provider_auth_errors,
             },
             stats,
         ));
@@ -9857,6 +9891,55 @@ mod tests {
             "expected PartialFailure with failed_count=3, got {outcome:?}"
         );
         assert_eq!(stats.enumeration_errors, 3);
+    }
+
+    #[tokio::test]
+    async fn provider_session_failure_stops_all_stream_run_modes() {
+        for controls in [
+            DownloadControls::download_hidden(),
+            DownloadControls::dry_run_hidden(),
+            DownloadControls::new(
+                crate::download::DownloadRunMode::PrintFilenames,
+                DownloadReporting::hidden(),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(directory.path());
+            let config = Arc::new(config);
+            let errors = (0..2).map(|_| {
+                Err::<PhotoAsset, _>(anyhow::Error::new(
+                    crate::icloud::photos::session::HttpStatusError {
+                        status: 421,
+                        url: "https://example.invalid/private?token=secret".into(),
+                        retry_after: None,
+                        body: None,
+                    },
+                ))
+            });
+            let result = stream_and_download_from_stream(
+                &Client::new(),
+                stream::iter(errors),
+                &config,
+                controls,
+                0,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.provider_auth_errors, 1);
+            assert_eq!(result.enumeration_errors, 1);
+            assert!(!result.enumeration_complete);
+            let (outcome, _) = build_zero_download_outcome(result, controls).await;
+            assert!(matches!(
+                outcome,
+                DownloadOutcome::SessionExpired {
+                    auth_error_count: 1
+                }
+            ));
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
     }
 
     #[tokio::test]

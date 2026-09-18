@@ -1296,7 +1296,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     let mut same_cycle_recovery_attempts = 0usize;
     let mut same_cycle_recovery_successes = 0usize;
     let mut checkpoint_retry_passes = Vec::new();
-    let sync_token = if token_attempt_allowed {
+    let sync_token = if token_attempt_allowed && streaming_result.provider_auth_errors == 0 {
         let expected_token_count = token_receivers.len();
         token_expected_receivers = Some(expected_token_count);
         let mut observations = Vec::with_capacity(expected_token_count);

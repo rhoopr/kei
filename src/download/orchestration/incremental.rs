@@ -20,6 +20,7 @@ use crate::download::pipeline::{
 };
 use crate::download::{filter, metadata_rewrite, planner};
 use crate::icloud::photos::PhotoAsset;
+use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 use crate::types::ChangeReason;
 
 use super::config::DownloadConfig;
@@ -94,7 +95,14 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             if shutdown_token.is_cancelled() {
                 break;
             }
-            let event = result?;
+            let event = match result {
+                Err(error) if is_provider_session_error(&error) => {
+                    delta.summary.auth_errors += 1;
+                    let _ = asset_tx.send(Err(error)).await;
+                    return Ok(delta.summary);
+                }
+                other => other?,
+            };
             delta.observe_event(&event);
             delta.persist_asset_mapping(&event, &config).await;
             match delta.apply_event(&event, &config).await {
@@ -169,6 +177,12 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             delta.apply_relation_event(event, &config, &routing).await;
         }
 
+        // Send hydration failures before EOF so the pipeline persists an
+        // interrupted run instead of recording a successful enumeration.
+        if let Some(error) = delta.summary.first_auth_error.take() {
+            let _ = asset_tx.send(Err(error)).await;
+            return Ok(delta.summary);
+        }
         delta.record_completion(token_rx.await.ok());
         Ok(delta.summary)
     });
@@ -192,7 +206,7 @@ async fn download_photos_incremental_streaming(
         controls.run_mode,
         shutdown_token.clone(),
     );
-    let streaming_result = match stream_and_download_from_stream(
+    let mut streaming_result = match stream_and_download_from_stream(
         download_client,
         asset_stream,
         &pass_config,
@@ -214,6 +228,14 @@ async fn download_photos_incremental_streaming(
         .context("incremental changes producer task panicked")??;
 
     delta_summary.log_debug();
+    // The pipeline already counted the representative error sent by the
+    // producer. Preserve the full lookup failure count without counting twice.
+    streaming_result.provider_auth_errors = streaming_result
+        .provider_auth_errors
+        .max(delta_summary.auth_errors);
+    if delta_summary.auth_errors > 0 {
+        streaming_result.enumeration_complete = false;
+    }
 
     let (mut outcome, mut stats) = build_download_outcome(
         download_client,
@@ -243,7 +265,7 @@ async fn download_photos_incremental_streaming(
     let sync_token = if controls.run_mode.only_print_filenames() || controls.run_mode.is_dry_run() {
         None
     } else {
-        (!stats.sync_token_blocked)
+        (!stats.sync_token_blocked && delta_summary.auth_errors == 0)
             .then_some(delta_summary.sync_token)
             .flatten()
     };
@@ -607,6 +629,25 @@ pub(super) async fn download_photos_incremental_collecting_inner(
 
     let delta_summary = delta.summary;
     delta_summary.log_debug();
+
+    if delta_summary.auth_errors > 0 {
+        let mut stats = SyncStats {
+            state_write_failures: delta_summary.state_transition_failures,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            ..SyncStats::default()
+        };
+        if let Some(reason) = delta_summary.token_unsafe_reason {
+            block_sync_token_for_incremental_delta(&mut stats, reason);
+        }
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::SessionExpired {
+                auth_error_count: delta_summary.auth_errors,
+            },
+            sync_token: None,
+            stats,
+            full_enumeration_ran: false,
+        });
+    }
 
     if downloadable_assets.is_empty() {
         let rewrite_failures =

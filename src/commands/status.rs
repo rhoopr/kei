@@ -162,7 +162,7 @@ pub(crate) async fn run_status(
     Ok(())
 }
 
-fn backup_status_line(summary: &state::types::SyncSummary) -> String {
+pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String {
     if summary.active_sync_started.is_some() {
         return "Backup status: unsafe - sync is currently in progress".to_string();
     }

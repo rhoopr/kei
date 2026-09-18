@@ -7,6 +7,7 @@ use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::SyncTokenError;
+use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 
 use super::cleanup::cleanup_orphan_part_files;
 use super::config::DownloadConfig;
@@ -19,7 +20,7 @@ use super::incremental::download_photos_incremental;
 use super::maintenance::{has_metadata_backfill_work, run_metadata_capture_repair};
 use super::models::{
     DownloadControls, DownloadOutcome, FullEnumerationReason, SMART_FOLDER_REFRESH_FAILED_REASON,
-    SyncMode, SyncResult, TARGETED_ALBUM_BACKFILL_FAILED_REASON,
+    SyncMode, SyncResult, SyncStats, TARGETED_ALBUM_BACKFILL_FAILED_REASON,
     block_sync_token_for_incremental_delta, clear_full_query_token_block_stats,
     merge_download_outcomes,
 };
@@ -32,6 +33,7 @@ use super::selection::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncrementalErrorClass {
     TokenFallback,
+    SessionExpired,
     TransientFailure,
     StaticFallback,
 }
@@ -44,6 +46,9 @@ enum IncrementalErrorClass {
 /// would likely hit the same service condition. Other static/decode errors
 /// fall back so malformed token responses do not strand the user.
 fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
+    if is_provider_session_error(error) {
+        return IncrementalErrorClass::SessionExpired;
+    }
     if error
         .downcast_ref::<SyncTokenError>()
         .is_some_and(SyncTokenError::should_fallback_to_full)
@@ -308,6 +313,16 @@ pub async fn download_photos_with_sync(
     }
     let metadata_capture_repair =
         run_metadata_capture_repair(passes, &config, controls, &shutdown_token).await;
+    if metadata_capture_repair.auth_errors > 0 {
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::SessionExpired {
+                auth_error_count: metadata_capture_repair.auth_errors,
+            },
+            sync_token: None,
+            stats: metadata_capture_repair.stats,
+            full_enumeration_ran: false,
+        });
+    }
 
     // Give every non-downloaded asset a fresh start this sync:
     // failed -> pending (with attempts reset), and stale attempt counts on
@@ -465,13 +480,31 @@ pub async fn download_photos_with_sync(
                                 )
                                 .await
                             }
-                            IncrementalErrorClass::TransientFailure => Err(e),
+                            IncrementalErrorClass::SessionExpired
+                            | IncrementalErrorClass::TransientFailure => Err(e),
                         },
                     }
                 }
             }
         }
-    }?;
+    }
+    .or_else(|error| {
+        if !is_provider_session_error(&error) {
+            return Err(error);
+        }
+        Ok(SyncResult {
+            outcome: DownloadOutcome::SessionExpired {
+                auth_error_count: 1,
+            },
+            sync_token: None,
+            stats: SyncStats {
+                enumeration_errors: 1,
+                enumeration_incomplete: true,
+                ..SyncStats::default()
+            },
+            full_enumeration_ran: matches!(config.sync_mode, SyncMode::Full),
+        })
+    })?;
 
     let mut result = append_targeted_recovery_to_sync_result(
         download_client,

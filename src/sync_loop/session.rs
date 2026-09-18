@@ -184,6 +184,16 @@ async fn reauth_after_session_error(
     }
 }
 
+/// A provider rejection invalidates the cached validation, not durable sync state.
+async fn prepare_mid_cycle_reauth(
+    shared_session: &auth::SharedSession,
+    config: &config::Config,
+) -> anyhow::Result<()> {
+    clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
+    shared_session.write().await.reset_http_clients()?;
+    Ok(())
+}
+
 async fn clear_validation_cache_for_reauth(cookie_dir: &std::path::Path, username: &str) {
     let cache_path = auth::validation_cache_file_path(cookie_dir, username);
     match tokio::fs::remove_file(&cache_path).await {
@@ -469,6 +479,7 @@ pub(super) async fn recover_expired_cycle(
         max_attempts = MAX_REAUTH_ATTEMPTS,
         "Session expired, attempting re-auth"
     );
+    prepare_mid_cycle_reauth(shared_session, config).await?;
     match attempt_reauth(
         shared_session,
         &config.auth.cookie_directory,
@@ -533,11 +544,13 @@ mod tests {
     use crate::auth;
     use crate::sync_loop::session::{
         SyncAuthErrorClass, classify_sync_auth_error, clear_validation_cache_for_reauth,
-        is_session_error, reacquire_session_lock_after_idle, should_retry_session_init,
-        take_pending_auth,
+        is_session_error, prepare_mid_cycle_reauth, reacquire_session_lock_after_idle,
+        should_retry_session_init, take_pending_auth,
     };
     use crate::sync_loop::should_wait_for_2fa;
-    use crate::sync_loop::test_support::make_shared_session_for_run_cycle;
+    use crate::sync_loop::test_support::{
+        make_run_cycle_config, make_shared_session_for_run_cycle,
+    };
 
     #[tokio::test]
     async fn watch_reacquire_lock_failure_stops_before_next_cycle() {
@@ -1035,6 +1048,31 @@ mod tests {
             lock_error
                 .downcast_ref::<auth::error::AuthError>()
                 .is_some_and(auth::error::AuthError::is_lock_contention)
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_cycle_reauth_invalidates_cached_success_without_resetting_state() {
+        let (dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let mut config = make_run_cycle_config();
+        config.auth.cookie_directory = dir.path().to_path_buf();
+        let cache = auth::validation_cache_file_path(dir.path(), &config.auth.username);
+        tokio::fs::write(&cache, b"cached successful validation")
+            .await
+            .unwrap();
+        let generation = shared_session.read().await.generation();
+        let state_path = dir.path().join("state-sentinel");
+        tokio::fs::write(&state_path, b"durable checkpoint")
+            .await
+            .unwrap();
+        prepare_mid_cycle_reauth(&shared_session, &config)
+            .await
+            .unwrap();
+        assert!(!cache.exists());
+        assert_eq!(shared_session.read().await.generation(), generation);
+        assert_eq!(
+            tokio::fs::read(&state_path).await.unwrap(),
+            b"durable checkpoint"
         );
     }
 }

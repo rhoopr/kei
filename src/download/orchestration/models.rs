@@ -743,6 +743,7 @@ pub(super) fn merge_streaming_result(combined: &mut StreamingResult, result: Str
     combined.exif_failures += result.exif_failures;
     combined.failed.extend(result.failed);
     combined.auth_errors += result.auth_errors;
+    combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;
     combined.enumeration_errors += result.enumeration_errors;
     combined.assets_seen += result.assets_seen;
@@ -761,6 +762,7 @@ pub(super) fn merge_token_recovery_result(combined: &mut StreamingResult, result
     combined.exif_failures += result.exif_failures;
     combined.failed.extend(result.failed);
     combined.auth_errors += result.auth_errors;
+    combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;
     combined.enumeration_errors += result.enumeration_errors;
     combined.bytes_downloaded += result.bytes_downloaded;

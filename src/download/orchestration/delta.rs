@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::icloud::photos::asset::ChangeEvent;
+use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 use crate::icloud::photos::{PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution};
 use crate::types::ChangeReason;
 
@@ -408,9 +409,18 @@ pub(super) struct IncrementalDeltaSummary {
     pub(super) hidden_count: u64,
     pub(super) total_events: u64,
     pub(super) state_transition_failures: usize,
+    pub(super) auth_errors: usize,
+    pub(super) first_auth_error: Option<anyhow::Error>,
 }
 
 impl IncrementalDeltaSummary {
+    fn record_provider_error(&mut self, error: anyhow::Error) {
+        if is_provider_session_error(&error) {
+            self.auth_errors += 1;
+            self.first_auth_error.get_or_insert(error);
+        }
+    }
+
     pub(super) async fn persist_asset_mapping_for_asset(
         &mut self,
         asset: &PhotoAsset,
@@ -915,11 +925,10 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
                         .token_unsafe_reason
                         .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
                     tracing::warn!(
-                        asset_record_name = state_id.as_str(),
-                        library = %config.library,
-                        error = %error,
+                        diagnostic = error.diagnostic(),
                         "Failed to recover master identity for asset-only delta"
                     );
+                    summary.record_provider_error(error.into());
                 }
                 RecordResolution::Present(_)
                 | RecordResolution::MasterPresent
@@ -946,7 +955,7 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
         }
     }
 
-    if pending.is_empty() {
+    if pending.is_empty() || summary.auth_errors > 0 {
         return;
     }
     let requests: Vec<RecordLookupRequest> = pending
@@ -1018,18 +1027,25 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
                     );
                 }
             }
-            RecordResolution::Present(_)
-            | RecordResolution::AssetPresent { .. }
-            | RecordResolution::MasterPresent
-            | RecordResolution::Unknown
-            | RecordResolution::TransientFailure(_) => {
+            RecordResolution::TransientFailure(error) => {
                 summary
                     .token_unsafe_reason
                     .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
                 tracing::warn!(
-                    asset_record_name = %event.record_name,
-                    master_record_name,
-                    library = %config.library,
+                    diagnostic = error.diagnostic(),
+                    "Provider lookup could not hydrate an asset-only delta"
+                );
+                summary.record_provider_error(error.into());
+            }
+            RecordResolution::Present(_)
+            | RecordResolution::AssetPresent { .. }
+            | RecordResolution::MasterPresent
+            | RecordResolution::Unknown => {
+                summary
+                    .token_unsafe_reason
+                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                tracing::warn!(
+                    diagnostic = "incomplete_record_pair",
                     "Could not hydrate a complete asset-only delta"
                 );
             }
@@ -1121,6 +1137,7 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
                     error = %e,
                     "Failed to hydrate missing selected album relation assets"
                 );
+                delta_summary.record_provider_error(e);
                 delta_summary
                     .token_unsafe_reason
                     .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
