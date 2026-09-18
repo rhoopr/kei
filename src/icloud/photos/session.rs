@@ -181,6 +181,21 @@ pub(crate) struct HttpStatusError {
     pub body: Option<String>,
 }
 
+/// Recognize provider session failures without inspecting provider text or URLs.
+/// Callers must retain their checkpoint and route these through bounded reauthentication.
+#[must_use]
+pub(crate) fn is_session_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<HttpStatusError>()
+        .is_some_and(|http| matches!(http.status, 401 | 403 | 421))
+        || error
+            .downcast_ref::<super::album::ProviderLookupError>()
+            .is_some_and(super::album::ProviderLookupError::is_authentication)
+        || error
+            .downcast_ref::<crate::icloud::error::ICloudError>()
+            .is_some_and(crate::icloud::error::ICloudError::is_session_error)
+}
+
 /// Maximum number of bytes preserved from an HTTP error body. Apple's
 /// CloudKit error JSON is typically a few hundred bytes; HTML error pages
 /// and stack traces are occasionally much larger. Cap it so a degenerate
@@ -524,6 +539,31 @@ pub fn check_changes_zone_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_session_error_classification_uses_typed_status_not_body() {
+        for status in [400, 401, 403, 404, 410, 421, 429, 500, 503] {
+            let error = anyhow::Error::new(HttpStatusError {
+                status,
+                url: "https://example.invalid/private?token=secret".into(),
+                retry_after: None,
+                body: Some("Invalid global session HTTP 421".into()),
+            })
+            .context("wrapped provider request");
+            assert_eq!(is_session_error(&error), matches!(status, 401 | 403 | 421));
+        }
+        assert!(!is_session_error(&anyhow::anyhow!(
+            "HTTP 421 Invalid global session"
+        )));
+        let error = super::super::album::ProviderLookupError::Authentication {
+            status: 421,
+            message: "private response".into(),
+        };
+        assert_eq!(error.diagnostic(), "authentication");
+        assert!(is_session_error(
+            &anyhow::Error::new(error).context("lookup")
+        ));
+    }
 
     #[test]
     fn test_classify_non_reqwest_error_aborts() {
