@@ -11,3 +11,4 @@ run_scenario_test lib send_2fa_push_treats_fresh_validation_cache_as_authenticat
 run_scenario_test lib send_2fa_push_treats_live_validate_success_as_authenticated
 run_scenario_test lib get_code
 run_scenario_test lib reauth
+run_scenario_test lib provider_session

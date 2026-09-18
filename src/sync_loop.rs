@@ -1489,6 +1489,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     max_attempts = MAX_REAUTH_ATTEMPTS,
                     "Session expired, attempting re-auth"
                 );
+                prepare_mid_cycle_reauth(&shared_session, &config).await?;
                 match attempt_reauth(
                     &shared_session,
                     &config.auth.cookie_directory,
@@ -1829,6 +1830,16 @@ async fn reauth_after_session_error(
         }
         Err(e) => Err(e),
     }
+}
+
+/// A provider rejection invalidates the cached validation, not durable sync state.
+async fn prepare_mid_cycle_reauth(
+    shared_session: &auth::SharedSession,
+    config: &config::Config,
+) -> anyhow::Result<()> {
+    clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
+    shared_session.write().await.reset_http_clients()?;
+    Ok(())
 }
 
 async fn clear_validation_cache_for_reauth(cookie_dir: &std::path::Path, username: &str) {
@@ -7322,6 +7333,366 @@ mod tests {
                 .as_deref(),
             Some("zone-tok-new"),
             "durable provider state must allow the zone checkpoint to advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let snapshot_files = |directory: &std::path::Path| {
+            let mut files = std::collections::BTreeMap::new();
+            let mut directories = vec![directory.to_path_buf()];
+            while let Some(directory) = directories.pop() {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if entry.file_type().unwrap().is_dir() {
+                        directories.push(path);
+                    } else {
+                        files.insert(path.clone(), std::fs::read(path).unwrap());
+                    }
+                }
+            }
+            files
+        };
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Stage {
+            Incremental,
+            Full,
+            FullPerPass,
+            Capture,
+            LegacyCapture,
+            AssetPair,
+            AssetIdentity,
+        }
+
+        #[derive(Clone, Debug)]
+        struct RecoverySession {
+            stage: Stage,
+            status: u16,
+            failing: Arc<AtomicBool>,
+            queries: Arc<AtomicUsize>,
+            lookups: Arc<AtomicUsize>,
+            records: Vec<serde_json::Value>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::icloud::photos::PhotosSession for RecoverySession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                let lookup = url.contains("/records/lookup?");
+                let changes = url.contains("/changes/zone?");
+                let query = url.contains("/records/query?");
+                if lookup {
+                    self.lookups.fetch_add(1, Ordering::SeqCst);
+                }
+                if query {
+                    self.queries.fetch_add(1, Ordering::SeqCst);
+                }
+                if matches!(self.stage, Stage::Full | Stage::FullPerPass) && changes {
+                    return Err(crate::icloud::photos::SyncTokenError::InvalidToken {
+                        reason: "test requires full enumeration".into(),
+                    }
+                    .into());
+                }
+                let reject = match self.stage {
+                    Stage::Incremental | Stage::LegacyCapture => changes,
+                    Stage::Full | Stage::FullPerPass => query,
+                    Stage::Capture | Stage::AssetPair | Stage::AssetIdentity => lookup,
+                };
+                if reject && self.failing.load(Ordering::SeqCst) {
+                    return Err(crate::icloud::photos::session::HttpStatusError {
+                        status: self.status,
+                        url: "https://example.invalid/private?token=secret".into(),
+                        retry_after: None,
+                        body: Some("Invalid global session".into()),
+                    }
+                    .into());
+                }
+                if lookup {
+                    return Ok(serde_json::json!({"records": self.records}));
+                }
+                if changes {
+                    let records = match self.stage {
+                        Stage::AssetPair => vec![self.records[1].clone()],
+                        Stage::AssetIdentity => {
+                            let mut child = self.records[1].clone();
+                            child["fields"].as_object_mut().unwrap().remove("masterRef");
+                            vec![child]
+                        }
+                        Stage::LegacyCapture => self.records.clone(),
+                        _ => Vec::new(),
+                    };
+                    return Ok(serde_json::json!({"zones": [{
+                        "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                        "syncToken": "zone-after", "moreComing": false, "records": records
+                    }]}));
+                }
+                if url.contains("/internal/records/query/batch") {
+                    return Ok(album_count_response(1));
+                }
+                let request: serde_json::Value = serde_json::from_str(&body)?;
+                let offset = request["query"]["filterBy"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|filter| filter["fieldName"] == "startRank")
+                    .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                    .unwrap_or(0);
+                let records = if offset == 0 {
+                    self.records.clone()
+                } else {
+                    Vec::new()
+                };
+                Ok(serde_json::json!({"records": records, "syncToken": "zone-after"}))
+            }
+
+            fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        for stage in [
+            Stage::Incremental,
+            Stage::Full,
+            Stage::FullPerPass,
+            Stage::Capture,
+            Stage::LegacyCapture,
+            Stage::AssetPair,
+            Stage::AssetIdentity,
+        ] {
+            for status in [401, 403, 421] {
+                for recent in [None, Some(10)] {
+                    // A bounded full inventory deliberately cannot advance its checkpoint.
+                    if matches!(stage, Stage::Full | Stage::FullPerPass) && recent.is_some() {
+                        continue;
+                    }
+                    let mut config = make_run_cycle_config();
+                    config.filters.recent = recent;
+                    let dir = tempfile::tempdir().unwrap();
+                    let inner = Arc::new(
+                        state::SqliteStateDb::open(&dir.path().join("state.db"))
+                            .await
+                            .unwrap(),
+                    );
+                    let db = inner.clone() as Arc<dyn download::DownloadStore>;
+                    let media_dir = dir.path().join("media");
+                    seed_run_cycle_metadata_drift_asset(&db, &media_dir).await;
+                    if stage != Stage::AssetIdentity {
+                        inner
+                            .upsert_asset_master_mapping(
+                                "PrimarySync",
+                                "asset-master-PrimarySync",
+                                "master-PrimarySync",
+                            )
+                            .await
+                            .unwrap();
+                        if stage != Stage::LegacyCapture {
+                            assert!(
+                                inner
+                                    .claim_legacy_master_state_owner(
+                                        "PrimarySync",
+                                        "master-PrimarySync",
+                                        "asset-master-PrimarySync"
+                                    )
+                                    .await
+                                    .unwrap()
+                            );
+                        }
+                    }
+                    let capture_pending = matches!(stage, Stage::Capture | Stage::LegacyCapture);
+                    inner.set_metadata_capture_revision_for_test(
+                        "PrimarySync",
+                        "master-PrimarySync",
+                        if capture_pending {
+                            0
+                        } else {
+                            state::METADATA_CAPTURE_REVISION
+                        },
+                    );
+                    inner
+                        .set_metadata("sync_token:PrimarySync", "zone-before")
+                        .await
+                        .unwrap();
+                    let before = snapshot_files(&media_dir);
+                    let failing = Arc::new(AtomicBool::new(true));
+                    let queries = Arc::new(AtomicUsize::new(0));
+                    let lookups = Arc::new(AtomicUsize::new(0));
+                    let album = make_full_album_with_boxed_session(
+                        "PrimarySync",
+                        Box::new(RecoverySession {
+                            stage,
+                            status,
+                            failing: failing.clone(),
+                            queries: queries.clone(),
+                            lookups: lookups.clone(),
+                            records: run_cycle_favourited_asset_page()["records"]
+                                .as_array()
+                                .unwrap()
+                                .clone(),
+                        }),
+                    );
+                    let library = make_run_cycle_library_state_with_album(
+                        "PrimarySync",
+                        "sync_token:PrimarySync",
+                        album,
+                    );
+                    let builder = make_run_cycle_download_config_builder_with_options(
+                        &media_dir,
+                        db.clone(),
+                        RunCycleDownloadConfigOptions {
+                            media: media_without_photo_downloads(),
+                            per_pass_paths: stage == Stage::FullPerPass,
+                            recent,
+                            ..RunCycleDownloadConfigOptions::default()
+                        },
+                    );
+                    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+                    for cycle in 0..3 {
+                        if cycle > 0 {
+                            failing.store(false, Ordering::SeqCst);
+                        }
+                        let result = run_cycle(
+                            &[&library],
+                            &config,
+                            Some(db.as_ref()),
+                            false,
+                            &builder,
+                            download::DownloadControls::download_hidden(),
+                            &shared_session,
+                            &CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            result.session_expired,
+                            cycle == 0,
+                            "{stage:?} HTTP {status} recent={recent:?} cycle={cycle}"
+                        );
+                        assert_eq!(
+                            inner
+                                .get_metadata("sync_token:PrimarySync")
+                                .await
+                                .unwrap()
+                                .as_deref(),
+                            Some(if cycle == 0 {
+                                "zone-before"
+                            } else {
+                                "zone-after"
+                            })
+                        );
+                        assert_eq!(
+                            snapshot_files(&media_dir),
+                            before,
+                            "provider recovery must not change local media"
+                        );
+                        assert_eq!(result.stats.downloaded, 0);
+                        if recent.is_none()
+                            && matches!(
+                                stage,
+                                Stage::Incremental | Stage::AssetPair | Stage::AssetIdentity
+                            )
+                        {
+                            let summary = inner.get_summary().await.unwrap();
+                            let status = crate::commands::backup_status_line(&summary);
+                            assert_eq!(summary.last_sync_interrupted, cycle == 0);
+                            assert_eq!(
+                                summary.last_sync_status.as_deref(),
+                                Some(if cycle == 0 {
+                                    "interrupted"
+                                } else {
+                                    "complete"
+                                })
+                            );
+                            assert_eq!(summary.last_sync_enumeration_errors, u64::from(cycle == 0));
+                            if cycle == 0 {
+                                assert_eq!(
+                                    status,
+                                    "Backup status: unsafe - last sync was interrupted; 1 enumeration error occurred in the last sync"
+                                );
+                            } else {
+                                assert_eq!(
+                                    status,
+                                    "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+                                );
+                            }
+                        }
+                        if cycle == 0 {
+                            assert!(!result.db_sync_token_advance_safe);
+                            assert_eq!(
+                                inner
+                                    .get_metadata("last_recovery_action")
+                                    .await
+                                    .unwrap()
+                                    .as_deref(),
+                                Some("reauthenticate")
+                            );
+                            if !matches!(stage, Stage::Full | Stage::FullPerPass) {
+                                assert_eq!(queries.load(Ordering::SeqCst), 0);
+                            }
+                            if capture_pending {
+                                assert!(
+                                    inner
+                                        .has_metadata_capture_work(
+                                            &["PrimarySync"],
+                                            state::METADATA_CAPTURE_REVISION
+                                        )
+                                        .await
+                                        .unwrap()
+                                );
+                            }
+                        } else {
+                            assert_eq!(result.failed_count, 0);
+                            if capture_pending {
+                                assert_eq!(
+                                    result.stats.metadata_capture_refreshed,
+                                    usize::from(cycle == 1)
+                                );
+                                assert_eq!(result.stats.metadata_capture_remaining, 0);
+                                assert!(
+                                    inner.get_downloaded_page(0, 1).await.unwrap()[0]
+                                        .metadata
+                                        .is_favorite
+                                );
+                            }
+                        }
+                    }
+                    if stage == Stage::Capture {
+                        assert_eq!(lookups.load(Ordering::SeqCst), 2);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_cycle_reauth_invalidates_cached_success_without_resetting_state() {
+        let (dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let mut config = make_run_cycle_config();
+        config.auth.cookie_directory = dir.path().to_path_buf();
+        let cache = auth::validation_cache_file_path(dir.path(), &config.auth.username);
+        tokio::fs::write(&cache, b"cached successful validation")
+            .await
+            .unwrap();
+        let generation = shared_session.read().await.generation();
+        let state_path = dir.path().join("state-sentinel");
+        tokio::fs::write(&state_path, b"durable checkpoint")
+            .await
+            .unwrap();
+        prepare_mid_cycle_reauth(&shared_session, &config)
+            .await
+            .unwrap();
+        assert!(!cache.exists());
+        assert_eq!(shared_session.read().await.generation(), generation);
+        assert_eq!(
+            tokio::fs::read(&state_path).await.unwrap(),
+            b"durable checkpoint"
         );
     }
 

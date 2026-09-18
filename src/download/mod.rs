@@ -54,6 +54,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::asset::{ChangeEvent, MALFORMED_REQUIRED_ASSET_FIELDS_REASON};
+use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 use crate::icloud::photos::{
     PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution, SyncTokenError,
 };
@@ -151,6 +152,7 @@ impl FullEnumerationReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncrementalErrorClass {
     TokenFallback,
+    SessionExpired,
     TransientFailure,
     StaticFallback,
 }
@@ -163,6 +165,9 @@ enum IncrementalErrorClass {
 /// would likely hit the same service condition. Other static/decode errors
 /// fall back so malformed token responses do not strand the user.
 fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
+    if is_provider_session_error(error) {
+        return IncrementalErrorClass::SessionExpired;
+    }
     if error
         .downcast_ref::<SyncTokenError>()
         .is_some_and(SyncTokenError::should_fallback_to_full)
@@ -3297,6 +3302,7 @@ fn merge_streaming_result(combined: &mut StreamingResult, result: StreamingResul
     combined.exif_failures += result.exif_failures;
     combined.failed.extend(result.failed);
     combined.auth_errors += result.auth_errors;
+    combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;
     combined.enumeration_errors += result.enumeration_errors;
     combined.assets_seen += result.assets_seen;
@@ -3315,6 +3321,7 @@ fn merge_token_recovery_result(combined: &mut StreamingResult, result: Streaming
     combined.exif_failures += result.exif_failures;
     combined.failed.extend(result.failed);
     combined.auth_errors += result.auth_errors;
+    combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;
     combined.enumeration_errors += result.enumeration_errors;
     combined.bytes_downloaded += result.bytes_downloaded;
@@ -4388,6 +4395,7 @@ const METADATA_CAPTURE_BATCH: usize = 500;
 struct MetadataCaptureRepair {
     stats: SyncStats,
     failures: usize,
+    auth_errors: usize,
 }
 
 fn metadata_capture_candidate_matches(
@@ -4629,6 +4637,7 @@ async fn run_metadata_capture_repair(
                 .await;
             }
             RecordResolution::TransientFailure(error) => {
+                repair.auth_errors += usize::from(error.is_authentication());
                 let message = error.to_string();
                 record_metadata_capture_failure(
                     db.as_ref(),
@@ -4641,7 +4650,7 @@ async fn run_metadata_capture_repair(
         }
     }
 
-    if !legacy_masters.is_empty() && !shutdown_token.is_cancelled() {
+    if !legacy_masters.is_empty() && !shutdown_token.is_cancelled() && repair.auth_errors == 0 {
         match provider_pass
             .album
             .hydrate_matching_master_assets_from_changes(&legacy_masters, shutdown_token)
@@ -4731,6 +4740,7 @@ async fn run_metadata_capture_repair(
                 }
             }
             Err(error) => {
+                repair.auth_errors += usize::from(is_provider_session_error(&error));
                 let message = error.to_string();
                 let unresolved: Vec<String> = candidates_by_id
                     .iter()
@@ -4754,7 +4764,7 @@ async fn run_metadata_capture_repair(
 
     if shutdown_token.is_cancelled() {
         repair.stats.interrupted = true;
-    } else {
+    } else if repair.auth_errors == 0 {
         for (_, candidate) in candidates_by_id {
             record_metadata_capture_failure(
                 db.as_ref(),
@@ -5651,6 +5661,16 @@ pub async fn download_photos_with_sync(
     }
     let metadata_capture_repair =
         run_metadata_capture_repair(passes, &config, controls, &shutdown_token).await;
+    if metadata_capture_repair.auth_errors > 0 {
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::SessionExpired {
+                auth_error_count: metadata_capture_repair.auth_errors,
+            },
+            sync_token: None,
+            stats: metadata_capture_repair.stats,
+            full_enumeration_ran: false,
+        });
+    }
 
     // Give every non-downloaded asset a fresh start this sync:
     // failed -> pending (with attempts reset), and stale attempt counts on
@@ -5808,13 +5828,31 @@ pub async fn download_photos_with_sync(
                                 )
                                 .await
                             }
-                            IncrementalErrorClass::TransientFailure => Err(e),
+                            IncrementalErrorClass::SessionExpired
+                            | IncrementalErrorClass::TransientFailure => Err(e),
                         },
                     }
                 }
             }
         }
-    }?;
+    }
+    .or_else(|error| {
+        if !is_provider_session_error(&error) {
+            return Err(error);
+        }
+        Ok(SyncResult {
+            outcome: DownloadOutcome::SessionExpired {
+                auth_error_count: 1,
+            },
+            sync_token: None,
+            stats: SyncStats {
+                enumeration_errors: 1,
+                enumeration_incomplete: true,
+                ..SyncStats::default()
+            },
+            full_enumeration_ran: matches!(config.sync_mode, SyncMode::Full),
+        })
+    })?;
 
     let mut result = append_targeted_recovery_to_sync_result(
         download_client,
@@ -6515,7 +6553,7 @@ async fn download_photos_full_with_token_policy(
     let mut same_cycle_recovery_attempts = 0usize;
     let mut same_cycle_recovery_successes = 0usize;
     let mut checkpoint_retry_passes = Vec::new();
-    let sync_token = if token_attempt_allowed {
+    let sync_token = if token_attempt_allowed && streaming_result.provider_auth_errors == 0 {
         let expected_token_count = token_receivers.len();
         token_expected_receivers = Some(expected_token_count);
         let mut observations = Vec::with_capacity(expected_token_count);
@@ -6977,9 +7015,18 @@ struct IncrementalDeltaSummary {
     hidden_count: u64,
     total_events: u64,
     state_transition_failures: usize,
+    auth_errors: usize,
+    first_auth_error: Option<anyhow::Error>,
 }
 
 impl IncrementalDeltaSummary {
+    fn record_provider_error(&mut self, error: anyhow::Error) {
+        if is_provider_session_error(&error) {
+            self.auth_errors += 1;
+            self.first_auth_error.get_or_insert(error);
+        }
+    }
+
     fn observe_event(&mut self, event: &ChangeEvent) {
         self.total_events += 1;
         if let Some(reason) = event.token_unsafe_reason {
@@ -7538,11 +7585,10 @@ async fn hydrate_unpaired_created_asset_deltas(
                         .token_unsafe_reason
                         .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
                     tracing::warn!(
-                        asset_record_name = state_id.as_str(),
-                        library = %config.library,
-                        error = %error,
+                        diagnostic = error.diagnostic(),
                         "Failed to recover master identity for asset-only delta"
                     );
+                    summary.record_provider_error(error.into());
                 }
                 RecordResolution::Present(_)
                 | RecordResolution::MasterPresent
@@ -7569,7 +7615,7 @@ async fn hydrate_unpaired_created_asset_deltas(
         }
     }
 
-    if pending.is_empty() {
+    if pending.is_empty() || summary.auth_errors > 0 {
         return;
     }
     let requests: Vec<RecordLookupRequest> = pending
@@ -7641,18 +7687,25 @@ async fn hydrate_unpaired_created_asset_deltas(
                     );
                 }
             }
-            RecordResolution::Present(_)
-            | RecordResolution::AssetPresent { .. }
-            | RecordResolution::MasterPresent
-            | RecordResolution::Unknown
-            | RecordResolution::TransientFailure(_) => {
+            RecordResolution::TransientFailure(error) => {
                 summary
                     .token_unsafe_reason
                     .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
                 tracing::warn!(
-                    asset_record_name = %event.record_name,
-                    master_record_name,
-                    library = %config.library,
+                    diagnostic = error.diagnostic(),
+                    "Provider lookup could not hydrate an asset-only delta"
+                );
+                summary.record_provider_error(error.into());
+            }
+            RecordResolution::Present(_)
+            | RecordResolution::AssetPresent { .. }
+            | RecordResolution::MasterPresent
+            | RecordResolution::Unknown => {
+                summary
+                    .token_unsafe_reason
+                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                tracing::warn!(
+                    diagnostic = "incomplete_record_pair",
                     "Could not hydrate a complete asset-only delta"
                 );
             }
@@ -7744,6 +7797,7 @@ async fn hydrate_missing_selected_relation_assets(
                     error = %e,
                     "Failed to hydrate missing selected album relation assets"
                 );
+                delta_summary.record_provider_error(e);
                 delta_summary
                     .token_unsafe_reason
                     .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
@@ -7826,7 +7880,14 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             if shutdown_token.is_cancelled() {
                 break;
             }
-            let event = result?;
+            let event = match result {
+                Err(error) if is_provider_session_error(&error) => {
+                    summary.auth_errors += 1;
+                    let _ = asset_tx.send(Err(error)).await;
+                    return Ok(summary);
+                }
+                other => other?,
+            };
             summary.observe_event(&event);
             IncrementalDeltaSummary::remember_asset_mapping(&event, &mut asset_to_master);
             summary.persist_asset_mapping(&event, &config).await;
@@ -7919,6 +7980,12 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             .await;
         }
 
+        // Send hydration failures before EOF so the pipeline persists an
+        // interrupted run instead of recording a successful enumeration.
+        if let Some(error) = summary.first_auth_error.take() {
+            let _ = asset_tx.send(Err(error)).await;
+            return Ok(summary);
+        }
         if let Ok(token) = token_rx.await {
             summary.sync_token = Some(token);
         }
@@ -7944,7 +8011,7 @@ async fn download_photos_incremental_streaming(
         controls.run_mode,
         shutdown_token.clone(),
     );
-    let streaming_result = match stream_and_download_from_stream(
+    let mut streaming_result = match stream_and_download_from_stream(
         download_client,
         asset_stream,
         &pass_config,
@@ -7966,6 +8033,14 @@ async fn download_photos_incremental_streaming(
         .context("incremental changes producer task panicked")??;
 
     delta_summary.log_debug();
+    // The pipeline already counted the representative error sent by the
+    // producer. Preserve the full lookup failure count without counting twice.
+    streaming_result.provider_auth_errors = streaming_result
+        .provider_auth_errors
+        .max(delta_summary.auth_errors);
+    if delta_summary.auth_errors > 0 {
+        streaming_result.enumeration_complete = false;
+    }
 
     let (mut outcome, mut stats) = build_download_outcome(
         download_client,
@@ -7995,7 +8070,7 @@ async fn download_photos_incremental_streaming(
     let sync_token = if controls.run_mode.only_print_filenames() || controls.run_mode.is_dry_run() {
         None
     } else {
-        (!stats.sync_token_blocked)
+        (!stats.sync_token_blocked && delta_summary.auth_errors == 0)
             .then_some(delta_summary.sync_token)
             .flatten()
     };
@@ -8398,6 +8473,25 @@ async fn download_photos_incremental_collecting_inner(
     );
 
     delta_summary.log_debug();
+
+    if delta_summary.auth_errors > 0 {
+        let mut stats = SyncStats {
+            state_write_failures: delta_summary.state_transition_failures,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            ..SyncStats::default()
+        };
+        if let Some(reason) = delta_summary.token_unsafe_reason {
+            block_sync_token_for_incremental_delta(&mut stats, reason);
+        }
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::SessionExpired {
+                auth_error_count: delta_summary.auth_errors,
+            },
+            sync_token: None,
+            stats,
+            full_enumeration_ran: false,
+        });
+    }
 
     if downloadable_assets.is_empty() {
         let rewrite_failures =

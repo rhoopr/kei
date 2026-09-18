@@ -117,6 +117,23 @@ pub(crate) enum ProviderLookupError {
     Malformed(String),
 }
 
+impl ProviderLookupError {
+    #[must_use]
+    pub(crate) fn is_authentication(&self) -> bool {
+        matches!(self, Self::Authentication { .. })
+    }
+
+    /// Bounded diagnostic safe for normal logs; excludes provider response text.
+    pub(crate) fn diagnostic(&self) -> &'static str {
+        match self {
+            Self::Authentication { .. } => "authentication",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Request(_) => "request_failed",
+            Self::Malformed(_) => "malformed_response",
+        }
+    }
+}
+
 fn classify_provider_lookup_error(error: &anyhow::Error) -> ProviderLookupError {
     let message = error.to_string();
     let Some(http) = error.downcast_ref::<super::session::HttpStatusError>() else {
