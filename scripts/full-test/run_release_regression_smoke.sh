@@ -31,7 +31,7 @@ echo "--- failed rows use targeted retry without full enumeration ---"
 run_lib_test download::orchestration::recovery::tests::incremental_with_failed_rows_uses_targeted_retry_not_full_enumeration
 
 echo "--- pending rows with existing files are adopted ---"
-run_lib_test download::pipeline::tests::producer_adopts_pending_on_disk_skip_as_downloaded
+run_lib_test download::pipeline::adoption::tests::producer_adopts_pending_on_disk_skip_as_downloaded
 
 echo "--- pagination shortfall fixtures remain diagnostic warnings ---"
 run_lib_test download::orchestration::full::tests::classify_pagination_shortfall_issue_498_fixture_reports_shortfall
