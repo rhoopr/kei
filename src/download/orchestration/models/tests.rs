@@ -65,6 +65,7 @@ fn test_sync_result_session_expired() {
 #[test]
 fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     let lib_a = SyncStats {
+        identity_incomplete: true,
         assets_seen: 10,
         api_total_at_start: Some(12),
         api_total_at_start_partial: false,
@@ -137,6 +138,7 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     };
 
     let lib_b = SyncStats {
+        identity_incomplete: false,
         assets_seen: 20,
         api_total_at_start: Some(22),
         api_total_at_start_partial: true,
@@ -209,6 +211,7 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     let mut acc = SyncStats::default();
     acc.accumulate(&lib_a);
     acc.accumulate(&lib_b);
+    assert!(acc.identity_incomplete);
 
     assert_eq!(acc.assets_seen, 30, "assets_seen must sum");
     assert_eq!(

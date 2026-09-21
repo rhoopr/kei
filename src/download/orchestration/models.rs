@@ -245,6 +245,9 @@ pub struct SyncStats {
     /// Whether sync-token advancement was blocked for safety despite no
     /// download failure.
     pub sync_token_blocked: bool,
+    /// Unresolved asset hydration, independent of intentional checkpoint holds.
+    #[serde(skip)]
+    pub(crate) identity_incomplete: bool,
     /// Structured reason for `sync_token_blocked`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_blocked_reason: Option<&'static str>,
@@ -396,6 +399,7 @@ impl SyncStats {
             self.inventory_drop_current_total = other.inventory_drop_current_total;
             self.inventory_drop_library = other.inventory_drop_library.clone();
         }
+        self.identity_incomplete |= other.identity_incomplete;
         self.sync_token_blocked = self.sync_token_blocked || other.sync_token_blocked;
         if self.sync_token_blocked_reason.is_none() {
             self.sync_token_blocked_reason = other.sync_token_blocked_reason;
@@ -779,6 +783,11 @@ pub(super) fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullE
     if result.full_enumeration_ran && result.stats.full_enumeration_reason.is_none() {
         result.stats.full_enumeration_reason = Some(reason);
     }
+}
+
+pub(crate) fn block_sync_token_for_unresolved_identity(stats: &mut SyncStats) {
+    stats.identity_incomplete = true;
+    block_sync_token_for_incremental_delta(stats, ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
 }
 
 pub(super) fn block_sync_token_for_incremental_delta(stats: &mut SyncStats, reason: &'static str) {

@@ -42,6 +42,50 @@ type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send 
 
 const RECORD_LOOKUP_BATCH_SIZE: usize = 100;
 
+// Only fixed labels leave this trust boundary. Never log provider record types,
+// error messages, identifiers, reference values, or response bodies here.
+fn asset_identity_diagnostic(
+    record: Option<&Value>,
+    lookup_zone: &Value,
+) -> (&'static str, &'static str) {
+    let Some(record) = record else {
+        return ("record_omitted", "absent");
+    };
+    let reference = record.pointer("/fields/masterRef/value");
+    let reference_zone = match reference.and_then(|value| value.get("zoneID")) {
+        None => "absent",
+        Some(zone) if !zone.is_object() => "malformed",
+        Some(zone) if zone == lookup_zone => "same_zone",
+        Some(_) => "different_or_partial_zone",
+    };
+    let reason = if record
+        .get("serverErrorCode")
+        .is_some_and(|code| !code.is_null())
+    {
+        match record.get("serverErrorCode").and_then(Value::as_str) {
+            Some("UNKNOWN_ITEM" | "NOT_FOUND") => "record_not_found",
+            Some("ACCESS_DENIED" | "AUTHENTICATION_REQUIRED") => "record_access_denied",
+            Some("ZONE_NOT_FOUND") => "record_zone_not_found",
+            _ => "record_provider_error",
+        }
+    } else if record.get("recordType").and_then(Value::as_str) != Some("CPLAsset") {
+        "unexpected_record_type"
+    } else if serde_json::from_value::<super::cloudkit::Record>(record.clone()).is_err() {
+        "record_decode_failed"
+    } else if reference.is_none() {
+        "master_reference_missing"
+    } else if reference
+        .and_then(|value| value.get("recordName"))
+        .and_then(Value::as_str)
+        .is_none_or(|name| name.trim().is_empty())
+    {
+        "master_reference_malformed"
+    } else {
+        "master_reference_present"
+    };
+    (reason, reference_zone)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ProviderRecordId(Arc<str>);
 
@@ -978,6 +1022,7 @@ impl PhotoAlbum {
         requests: &[RecordLookupRequest],
     ) -> RecordResolutionBatch {
         let mut results = Vec::with_capacity(requests.len());
+        let mut identity_diagnostics = std::collections::BTreeMap::new();
         let mut rate_limit_observations = 0usize;
         let url = format!(
             "{}/records/lookup?{}",
@@ -1088,6 +1133,16 @@ impl PhotoAlbum {
                         master_family: primary_deleted
                             && request.target == RecordLookupTarget::Master,
                     }
+                } else if master.is_some_and(|record| {
+                    record
+                        .get("serverErrorCode")
+                        .is_some_and(|code| !code.is_null())
+                }) || asset.is_some_and(|record| {
+                    record
+                        .get("serverErrorCode")
+                        .is_some_and(|code| !code.is_null())
+                }) {
+                    RecordResolution::Unknown
                 } else if let Some(master) = master {
                     match (
                         serde_json::from_value::<super::cloudkit::Record>(master.clone()),
@@ -1129,18 +1184,27 @@ impl PhotoAlbum {
                             if request.target == RecordLookupTarget::Asset
                                 && asset.record_type == "CPLAsset" =>
                         {
-                            extract_master_ref(&asset.fields).map_or(
-                                RecordResolution::Unknown,
-                                |master_record_name| RecordResolution::AssetPresent {
-                                    master_record_name: ProviderRecordId::new(master_record_name),
-                                },
-                            )
+                            extract_master_ref(&asset.fields)
+                                .filter(|name| !name.trim().is_empty())
+                                .map_or(RecordResolution::Unknown, |master_record_name| {
+                                    RecordResolution::AssetPresent {
+                                        master_record_name: ProviderRecordId::new(
+                                            master_record_name,
+                                        ),
+                                    }
+                                })
                         }
                         _ => RecordResolution::Unknown,
                     }
                 } else {
                     RecordResolution::Unknown
                 };
+                if request.target == RecordLookupTarget::Asset
+                    && !matches!(resolution, RecordResolution::Deleted { .. })
+                {
+                    let diagnostic = asset_identity_diagnostic(master, &self.zone_id);
+                    *identity_diagnostics.entry(diagnostic).or_insert(0usize) += 1;
+                }
                 let outcome = match &resolution {
                     RecordResolution::Present(_) => "present",
                     RecordResolution::AssetPresent { .. } => "asset_present",
@@ -1152,6 +1216,32 @@ impl PhotoAlbum {
                 crate::metrics::record_targeted_lookup(outcome, 1);
                 results.push((request.state_id.clone(), resolution));
             }
+        }
+
+        let lookup_zone = match self.zone_id.get("zoneName").and_then(Value::as_str) {
+            Some("PrimarySync") => "primary",
+            Some(name) if name.starts_with("SharedSync") => "shared",
+            _ => "other",
+        };
+        // One line per fixed diagnostic class per lookup, not one per asset.
+        for ((diagnostic, reference_zone), count) in identity_diagnostics {
+            if diagnostic == "master_reference_present" {
+                tracing::info!(
+                    diagnostic,
+                    reference_zone,
+                    lookup_zone,
+                    count,
+                    "Asset identity lookup returned a master reference"
+                );
+                continue;
+            }
+            tracing::warn!(
+                diagnostic,
+                reference_zone,
+                lookup_zone,
+                count,
+                "Asset identity lookup was inconclusive"
+            );
         }
 
         let mut grouped: Vec<(ProviderRecordId, RecordResolution)> =
@@ -3187,10 +3277,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asset_identity_diagnostics_use_only_bounded_redacted_labels() {
+        let log_dir = tempfile::tempdir().unwrap();
+        let log_path = log_dir.path().join("lookup.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::sync::Mutex::new(
+                std::fs::File::create(&log_path).unwrap(),
+            ))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let zone = json!({"zoneName": "PrimarySync"});
+        let mut missing = test_asset_record_for("private-child", "private-master");
+        missing["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("masterRef");
+        let mut malformed = missing.clone();
+        malformed["fields"]["masterRef"] = json!({"value": {"recordName": 42}});
+        let mut blank = missing.clone();
+        blank["fields"]["masterRef"] = json!({"value": {"recordName": " "}});
+        let mut errored = test_asset_record_for("private-child", "private-master");
+        errored["serverErrorCode"] = json!("ACCESS_DENIED");
+        let mut decode = missing.clone();
+        decode["deleted"] = json!("private-invalid-boolean");
+        let cases = [
+            (None, "record_omitted"),
+            (
+                Some(json!({"recordName": "private-child", "recordType": "private-type"})),
+                "unexpected_record_type",
+            ),
+            (
+                Some(
+                    json!({"recordName": "private-child", "serverErrorCode": "private-error", "reason": "private-account https://private?token=secret"}),
+                ),
+                "record_provider_error",
+            ),
+            (Some(errored), "record_access_denied"),
+            (Some(decode), "record_decode_failed"),
+            (Some(missing), "master_reference_missing"),
+            (Some(malformed), "master_reference_malformed"),
+            (Some(blank), "master_reference_malformed"),
+        ];
+        for (record, expected) in cases {
+            let diagnostic = asset_identity_diagnostic(record.as_ref(), &zone);
+            assert_eq!(diagnostic.0, expected);
+            assert_eq!(
+                diagnostic.1,
+                if expected == "record_access_denied" {
+                    "same_zone"
+                } else {
+                    "absent"
+                }
+            );
+            assert!(!format!("{diagnostic:?}").contains("private"));
+            let album = make_album_with_session(
+                100,
+                Box::new(
+                    MockPhotosSession::new()
+                        .ok(json!({"records": record.into_iter().collect::<Vec<_>>()})),
+                ),
+            );
+            let batch = album
+                .resolve_records(&[RecordLookupRequest::asset_only(ProviderRecordId::new(
+                    "private-child",
+                ))])
+                .await;
+            assert!(matches!(
+                batch.results.as_slice(),
+                [(_, RecordResolution::Unknown)]
+            ));
+        }
+        let logs = std::fs::read_to_string(&log_path).unwrap();
+        assert!(logs.contains("record_omitted"));
+        assert!(logs.contains("record_decode_failed"));
+        assert!(logs.contains("count=1"));
+        for secret in ["private", "https://", "secret"] {
+            assert!(!logs.contains(secret), "diagnostic leaked {secret}: {logs}");
+        }
+        let mut asset = test_asset_record_for("private-child", "private-master");
+        for (reference_zone, expected) in [
+            (zone.clone(), "same_zone"),
+            (
+                json!({"zoneName": "SharedSync-private-owner"}),
+                "different_or_partial_zone",
+            ),
+            (json!("private-zone"), "malformed"),
+        ] {
+            asset["fields"]["masterRef"]["value"]["zoneID"] = reference_zone;
+            assert_eq!(
+                asset_identity_diagnostic(Some(&asset), &zone),
+                ("master_reference_present", expected)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn asset_only_delta_targeted_lookup_recovers_master_identity() {
-        let response = json!({
-            "records": [test_asset_record_for("asset-present", "master-present")]
-        });
+        let mut record = test_asset_record_for("asset-present", "master-present");
+        record["serverErrorCode"] = Value::Null;
+        let response = json!({"records": [record]});
         let album = make_album_with_session(100, Box::new(MockPhotosSession::new().ok(response)));
 
         let batch = album

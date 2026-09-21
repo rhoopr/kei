@@ -9,7 +9,7 @@ use crate::password::{ExposeSecret, SecretString};
 use crate::sync_cycle::{LibraryState, run_cycle};
 use crate::sync_loop::planning::{maybe_notify_shared_libraries, refresh_needed_library_plans};
 use crate::sync_loop::precheck::{
-    DbPrecheckScope, WatchPrecheck, check_changes_database, include_pending_metadata_work,
+    DbPrecheckScope, WatchPrecheck, check_changes_database, include_pending_local_work,
     store_scoped_db_sync_token,
 };
 use crate::sync_loop::reconcile::{run_bounded_local_drift_probe, run_periodic_reconcile};
@@ -587,13 +587,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             && !config.runtime.only_print_filenames
             && let Some(db) = state_db.as_deref()
         {
-            include_pending_metadata_work(
-                &mut watch_precheck,
-                db,
-                &config.metadata,
-                &library_states,
-            )
-            .await;
+            include_pending_local_work(&mut watch_precheck, db, &config.metadata, &library_states)
+                .await;
         }
 
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {

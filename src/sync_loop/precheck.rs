@@ -78,7 +78,7 @@ impl WatchPrecheck {
     }
 }
 
-pub(super) async fn include_pending_metadata_work(
+pub(super) async fn include_pending_local_work(
     watch_precheck: &mut WatchPrecheck,
     db: &dyn download::DownloadStore,
     metadata: &config::MetadataConfig,
@@ -112,14 +112,21 @@ pub(super) async fn include_pending_metadata_work(
         } else {
             false
         };
-        if capture_pending || rewrite_pending {
+        let identity_pending = match db.get_metadata(&state::unresolved_identity_key(zone)).await {
+            Ok(marker) => marker.is_some(),
+            Err(error) => {
+                tracing::warn!(error = %error, "Could not inspect unresolved identity work before watch pre-check");
+                true
+            }
+        };
+        if capture_pending || rewrite_pending || identity_pending {
             local_work_zones.insert(library.zone_name.clone());
         }
     }
     if !local_work_zones.is_empty() {
         tracing::debug!(
             libraries = local_work_zones.len(),
-            "Pending metadata work bypassed the watch no-change shortcut"
+            "Pending local work bypassed the watch no-change shortcut"
         );
         watch_precheck.include_local_work_zones(local_work_zones);
     }

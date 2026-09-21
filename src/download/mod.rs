@@ -40,7 +40,8 @@ use orchestration::models::PENDING_RETRY_UNMATCHED_REASON;
 pub(super) use orchestration::models::PRODUCER_ENUMERATION_INCOMPLETE_REASON;
 pub(crate) use orchestration::models::{
     DownloadControls, DownloadReporting, DownloadRunMode, DownloadStore, RecoveryAction,
-    sync_token_blocked_explanation, sync_token_blocked_source,
+    block_sync_token_for_unresolved_identity, sync_token_blocked_explanation,
+    sync_token_blocked_source,
 };
 pub use orchestration::models::{
     DownloadOutcome, FullEnumerationReason, SkipBreakdown, SyncMode, SyncResult, SyncStats,

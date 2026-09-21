@@ -4,7 +4,7 @@ use crate::sync_cycle::LibraryState;
 use crate::sync_loop::precheck::{
     DB_SYNC_TOKEN_KEY, DbPrecheckScope, SCOPED_DB_SYNC_TOKEN_PROVIDER,
     SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION, WatchPrecheck, check_changes_database,
-    include_pending_metadata_work,
+    include_pending_local_work,
 };
 use crate::sync_loop::test_support::{
     FailingMetadataSetDb, MetadataSetFailure, SCOPED_DB_SYNC_TOKEN_FAILURE_KEY, make_library_state,
@@ -115,6 +115,25 @@ async fn seed_watch_metadata_work(
 }
 
 #[tokio::test]
+async fn unresolved_identity_bypasses_watch_no_change_shortcut() {
+    let db = state::SqliteStateDb::open_in_memory().unwrap();
+    let marker = state::unresolved_identity_key("PrimarySync");
+    db.set_metadata(&marker, "1").await.unwrap();
+    let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
+    let mut precheck = WatchPrecheck::SkipAll;
+    include_pending_local_work(
+        &mut precheck,
+        &db,
+        &config::MetadataConfig::default(),
+        &[library],
+    )
+    .await;
+    assert!(precheck.should_sync_zone("PrimarySync"));
+    assert!(!precheck.should_sync_zone("SharedSync-other"));
+    assert!(precheck.db_sync_token_after_success().is_none());
+}
+
+#[tokio::test]
 async fn disabled_metadata_writers_leave_rewrite_marker_out_of_watch_work() {
     let db = state::SqliteStateDb::open_in_memory().expect("state db");
     seed_watch_metadata_work(
@@ -130,7 +149,7 @@ async fn disabled_metadata_writers_leave_rewrite_marker_out_of_watch_work() {
     let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
     let mut precheck = WatchPrecheck::SkipAll;
 
-    include_pending_metadata_work(
+    include_pending_local_work(
         &mut precheck,
         &db,
         &config::MetadataConfig::default(),
@@ -168,7 +187,7 @@ async fn enabled_metadata_writer_forces_only_selected_rewrite_zone() {
     };
     let mut precheck = WatchPrecheck::SkipAll;
 
-    include_pending_metadata_work(&mut precheck, &db, &metadata, &[selected]).await;
+    include_pending_local_work(&mut precheck, &db, &metadata, &[selected]).await;
 
     assert!(precheck.should_sync_zone("PrimarySync"));
     assert!(!precheck.should_sync_zone("SharedSync-OTHER"));
@@ -187,7 +206,7 @@ async fn capture_revision_forces_watch_work_with_metadata_writers_disabled() {
     let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
     let mut precheck = WatchPrecheck::SkipAll;
 
-    include_pending_metadata_work(
+    include_pending_local_work(
         &mut precheck,
         &db,
         &config::MetadataConfig::default(),

@@ -126,6 +126,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             Some(&pass),
             &config,
             &mut delta.summary,
+            run_mode,
         )
         .await;
         let download_ctx = if run_mode.downloads_files() && !unpaired_asset_events.is_empty() {
@@ -250,6 +251,7 @@ async fn download_photos_incremental_streaming(
 
     stats.state_write_failures += delta_summary.state_transition_failures;
     stats.interrupted = stats.interrupted || shutdown_token.is_cancelled();
+    stats.identity_incomplete = delta_summary.identity_incomplete;
     if let Some(reason) = delta_summary.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason);
     }
@@ -489,6 +491,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         passes.first(),
         config,
         &mut delta.summary,
+        controls.run_mode,
     )
     .await;
     let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
@@ -636,6 +639,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
+        stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -659,6 +663,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
+        stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -881,6 +886,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
+        stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -927,6 +933,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
+        stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -1095,6 +1102,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         recap: pass_result.recap.clone(),
         ..SyncStats::default()
     };
+    stats.identity_incomplete = delta_summary.identity_incomplete;
     if let Some(reason) = delta_summary.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason);
     }

@@ -1817,6 +1817,55 @@ fn status_shows_safe_backup_summary_after_clean_sync() {
 }
 
 #[test]
+fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    conn.execute("INSERT INTO sync_runs (started_at, completed_at, status) VALUES (1700000000, 1700000010, 'complete')", []).unwrap();
+    for (key, value) in [
+        ("unresolved_asset_identity:PrimarySync", "1"),
+        ("last_checkpoint_status", "current"),
+        ("last_recovery_action", "none"),
+        ("sync_token:SharedSync-private", "shared-current"),
+    ] {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+            [key, value],
+        )
+        .unwrap();
+    }
+    let output = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Backup status: unsafe - unresolved asset identity in 1 provider zone"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("preserved"), "{stdout}");
+    assert!(!stdout.contains("SharedSync-private"), "{stdout}");
+    conn.execute(
+        "DELETE FROM metadata WHERE key = 'unresolved_asset_identity:PrimarySync'",
+        [],
+    )
+    .unwrap();
+    let output = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Backup status: safe"));
+}
+
+#[test]
 fn status_treats_policy_excluded_assets_as_safe_and_visible() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";

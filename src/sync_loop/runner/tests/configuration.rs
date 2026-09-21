@@ -1582,3 +1582,64 @@ async fn download_config_legacy_hash_migrates_without_reconciliation() {
         Some("tok-keep")
     );
 }
+
+#[tokio::test]
+async fn unresolved_identity_inventory_requires_a_delta_bridge() {
+    for prior_token in [None, Some("retained-before")] {
+        let inner = make_state_db();
+        let marker = state::unresolved_identity_key("PrimarySync");
+        inner.set_metadata(&marker, "1").await.unwrap();
+        inner
+            .set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "old-config")
+            .await
+            .unwrap();
+        if let Some(token) = prior_token {
+            inner
+                .set_metadata("sync_token:PrimarySync", token)
+                .await
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let album = make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(ConfigBridgeSession::new(
+                "PrimarySync",
+                "inventory-only",
+                "bridged-after",
+            )),
+        );
+        let library =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let builder = make_run_cycle_download_config_builder(dir.path(), inner.clone());
+        let config = make_run_cycle_config();
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        for _ in 0..2 {
+            let result = run_cycle(
+                &[&library],
+                &config,
+                Some(inner.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &shared_session,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.failed_count > 0, prior_token.is_none());
+            assert_eq!(
+                inner.get_metadata(&marker).await.unwrap().is_some(),
+                prior_token.is_none()
+            );
+            assert_eq!(
+                inner
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                prior_token.map(|_| "bridged-after")
+            );
+            assert_eq!(result.stats.downloaded, 0);
+        }
+    }
+}

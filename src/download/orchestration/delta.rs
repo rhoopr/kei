@@ -20,7 +20,7 @@ use super::context::{
 use super::models::{
     ALBUM_DELTA_STATE_WRITE_FAILED_REASON, ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON,
     ASSET_DELTA_HYDRATION_INCOMPLETE_REASON, ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON,
-    DownloadStore, INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON,
+    DownloadRunMode, DownloadStore, INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON,
     INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON, UNKNOWN_ALBUM_RELATION_ASSET_REASON,
     UNKNOWN_ALBUM_RELATION_CONTAINER_REASON,
 };
@@ -401,6 +401,7 @@ impl<'a> IncrementalDeltaState<'a> {
 
 #[derive(Debug, Default)]
 pub(super) struct IncrementalDeltaSummary {
+    pub(super) identity_incomplete: bool,
     pub(super) sync_token: Option<String>,
     pub(super) token_unsafe_reason: Option<&'static str>,
     pub(super) created_count: u64,
@@ -414,6 +415,12 @@ pub(super) struct IncrementalDeltaSummary {
 }
 
 impl IncrementalDeltaSummary {
+    fn block_identity(&mut self) {
+        self.identity_incomplete = true;
+        self.token_unsafe_reason
+            .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+    }
+
     fn record_provider_error(&mut self, error: anyhow::Error) {
         if is_provider_session_error(&error) {
             self.auth_errors += 1;
@@ -819,6 +826,28 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
     pass: Option<&crate::commands::AlbumPass>,
     config: &DownloadConfig,
     summary: &mut IncrementalDeltaSummary,
+    run_mode: DownloadRunMode,
+) {
+    hydrate_unpaired_created_asset_deltas_inner(events, pass, config, summary).await;
+    // Persist before the producer closes the stream and finalizes its run.
+    // A restart or a successful sync in another zone must not hide this work.
+    if run_mode.downloads_files()
+        && summary.identity_incomplete
+        && let Some(db) = &config.state_db
+        && let Err(error) = db
+            .set_metadata(&crate::state::unresolved_identity_key(&config.library), "1")
+            .await
+    {
+        summary.state_transition_failures += 1;
+        tracing::warn!(error = %error, "Failed to retain unresolved asset identity evidence");
+    }
+}
+
+async fn hydrate_unpaired_created_asset_deltas_inner(
+    events: &mut [ChangeEvent],
+    pass: Option<&crate::commands::AlbumPass>,
+    config: &DownloadConfig,
+    summary: &mut IncrementalDeltaSummary,
 ) {
     let mut pending = Vec::new();
     let mut unresolved: FxHashMap<String, Vec<usize>> = FxHashMap::default();
@@ -840,9 +869,7 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
                 Ok(master) => master,
                 Err(e) => {
                     summary.state_transition_failures += 1;
-                    summary
-                        .token_unsafe_reason
-                        .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                    summary.block_identity();
                     tracing::warn!(
                         asset_record_name = %event.record_name,
                         library = %config.library,
@@ -871,9 +898,7 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
         return;
     }
     let Some(pass) = pass else {
-        summary
-            .token_unsafe_reason
-            .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+        summary.block_identity();
         return;
     };
 
@@ -887,9 +912,7 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
         let identity_resolutions = pass.album.resolve_records(&requests).await;
         for (state_id, resolution) in identity_resolutions.results {
             let Some(indices) = unresolved.remove(state_id.as_str()) else {
-                summary
-                    .token_unsafe_reason
-                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                summary.block_identity();
                 continue;
             };
             match resolution {
@@ -921,9 +944,7 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
                     );
                 }
                 RecordResolution::TransientFailure(error) => {
-                    summary
-                        .token_unsafe_reason
-                        .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                    summary.block_identity();
                     tracing::warn!(
                         diagnostic = error.diagnostic(),
                         "Failed to recover master identity for asset-only delta"
@@ -937,21 +958,16 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
                     ..
                 }
                 | RecordResolution::Unknown => {
-                    summary
-                        .token_unsafe_reason
-                        .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
-                    tracing::warn!(
-                        asset_record_name = state_id.as_str(),
-                        library = %config.library,
-                        "Asset-only delta had no usable master identity"
+                    summary.block_identity();
+                    tracing::debug!(
+                        diagnostic = "asset_delta_identity_unresolved",
+                        "Asset-only delta had no usable master identity; see targeted lookup diagnostics"
                     );
                 }
             }
         }
         if !unresolved.is_empty() {
-            summary
-                .token_unsafe_reason
-                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+            summary.block_identity();
         }
     }
 
@@ -975,15 +991,11 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
     let resolutions = pass.album.resolve_records(&requests).await;
     for (state_id, resolution) in resolutions.results {
         let Some((index, master_record_name)) = event_by_record_name.get(state_id.as_str()) else {
-            summary
-                .token_unsafe_reason
-                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+            summary.block_identity();
             continue;
         };
         let Some(event) = events.get_mut(*index) else {
-            summary
-                .token_unsafe_reason
-                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+            summary.block_identity();
             continue;
         };
         match resolution {
@@ -1028,9 +1040,7 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
                 }
             }
             RecordResolution::TransientFailure(error) => {
-                summary
-                    .token_unsafe_reason
-                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                summary.block_identity();
                 tracing::warn!(
                     diagnostic = error.diagnostic(),
                     "Provider lookup could not hydrate an asset-only delta"
@@ -1041,9 +1051,7 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
             | RecordResolution::AssetPresent { .. }
             | RecordResolution::MasterPresent
             | RecordResolution::Unknown => {
-                summary
-                    .token_unsafe_reason
-                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                summary.block_identity();
                 tracing::warn!(
                     diagnostic = "incomplete_record_pair",
                     "Could not hydrate a complete asset-only delta"
@@ -1052,9 +1060,7 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
         }
     }
     if !resolutions.complete {
-        summary
-            .token_unsafe_reason
-            .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+        summary.block_identity();
     }
 }
 
