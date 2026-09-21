@@ -581,6 +581,8 @@ pub struct MetadataCaptureStatus {
 /// Summary of the current state database.
 #[derive(Debug, Clone)]
 pub struct SyncSummary {
+    /// Zones retaining unresolved asset delta identity evidence.
+    pub(crate) unresolved_identity_zones: u64,
     /// Total number of assets tracked.
     pub total_assets: u64,
     /// Number of assets successfully downloaded.

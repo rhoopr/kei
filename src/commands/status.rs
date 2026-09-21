@@ -172,6 +172,13 @@ pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String 
     }
 
     let mut reasons = Vec::new();
+    if summary.unresolved_identity_zones > 0 {
+        reasons.push(format!(
+            "unresolved asset identity in {}; checkpoint replay is required",
+            count_phrase(summary.unresolved_identity_zones, "provider zone")
+        ));
+    }
+
     if summary.last_sync_interrupted
         || summary
             .last_sync_status
