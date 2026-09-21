@@ -138,7 +138,7 @@ pub(crate) fn classify_cycle(
         CycleStatus::SessionExpired
     } else if stats.interrupted {
         CycleStatus::Interrupted
-    } else if failed_count > 0 {
+    } else if failed_count > 0 || stats.identity_incomplete {
         CycleStatus::Failed
     } else {
         CycleStatus::Success
@@ -167,7 +167,22 @@ where
     /// gauges and `health.json` need fresh timestamps, but cycle counters,
     /// duration, reports, and completion notifications must not change.
     pub(crate) async fn report_skipped_watch_cycle(&self, health: &mut HealthStatus) {
-        health.record_success();
+        let unresolved = if let Some(db) = self.state_db {
+            db.get_summary()
+                .await
+                .map(|summary| summary.unresolved_identity_zones > 0)
+        } else {
+            Ok(false)
+        };
+        match unresolved {
+            Ok(false) => health.record_success(),
+            Ok(true) => health
+                .record_failure("unresolved asset identity; provider checkpoint replay required"),
+            Err(error) => {
+                tracing::warn!(error = %error, "Could not inspect durable identity evidence for idle health");
+                health.record_failure("could not inspect unresolved asset identity evidence");
+            }
+        }
         health.write(self.health_dir);
         if let Some(handle) = self.metrics_handle {
             handle.update_health_only(health).await;
@@ -235,6 +250,11 @@ where
     fn update_health(&self, health: &mut HealthStatus, input: &CycleFacts<'_>) {
         match input.status {
             CycleStatus::Success => health.record_success(),
+            CycleStatus::Failed if input.stats.identity_incomplete => {
+                health.record_failure(
+                    "unresolved asset identity; provider checkpoint replay required",
+                );
+            }
             CycleStatus::Failed => {
                 health.record_failure(&format!("{} sync failures", input.failed_count));
             }
@@ -440,6 +460,36 @@ mod tests {
     fn parse_json(path: &Path) -> serde_json::Value {
         let contents = std::fs::read_to_string(path).unwrap();
         serde_json::from_str(&contents).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unresolved_identity_does_not_advance_health_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let notifier = Notifier::new(None);
+        let reporter = reporter_with_surfaces(dir.path(), None, &notifier, None, None);
+        let mut health = HealthStatus::new();
+        health.record_success();
+        let previous = health.last_success_at;
+        let mut stats = SyncStats {
+            identity_incomplete: true,
+            sync_token_blocked: true,
+            ..SyncStats::default()
+        };
+        report_cycle(&reporter, &mut health, &stats, 0, false).await;
+        assert_eq!(health.last_success_at, previous);
+        assert_eq!(health.consecutive_failures, 1);
+        assert!(
+            health
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("unresolved asset identity")
+        );
+        // Intentional bounded holds remain successful.
+        stats.identity_incomplete = false;
+        report_cycle(&reporter, &mut health, &stats, 0, false).await;
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_error.is_none());
     }
 
     #[test]
@@ -1005,6 +1055,30 @@ mod tests {
         assert_eq!(health_json["last_error"], "sync interrupted");
         let report_json = parse_json(&report_path);
         assert_eq!(report_json["status"], "interrupted");
+    }
+
+    #[tokio::test]
+    async fn skipped_watch_cycle_retains_unselected_zone_identity_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = state::SqliteStateDb::open_in_memory().unwrap();
+        db.set_metadata(&state::unresolved_identity_key("unselected-zone"), "1")
+            .await
+            .unwrap();
+        let notifier = Notifier::new(None);
+        let reporter = reporter_with_surfaces(dir.path(), None, &notifier, Some(&db), None);
+        let mut health = HealthStatus::new();
+        health.record_success();
+        let previous = health.last_success_at;
+        reporter.report_skipped_watch_cycle(&mut health).await;
+        assert_eq!(health.last_success_at, previous);
+        assert_eq!(health.consecutive_failures, 1);
+        assert!(
+            health
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("unresolved asset identity")
+        );
     }
 
     #[tokio::test]

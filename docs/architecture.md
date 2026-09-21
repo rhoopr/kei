@@ -105,6 +105,24 @@ validation result and resets the HTTP connection pool. A recovered session
 replays the retained checkpoint. Ambiguous provider identities remain pending;
 authentication recovery does not authorize choosing a child or discarding work.
 
+Unresolved asset-only delta hydration is incomplete work, even when no media
+transfer fails. The producer records `unresolved_asset_identity:<zone> = 1` in
+the existing metadata table before stream completion. The cycle owner clears
+that zone's marker atomically with a proven incremental checkpoint, including
+an inventory followed by a successful delta bridge. An inventory alone cannot
+clear it. Another zone's success and process restart retain the marker.
+Status aggregates all markers; cycle reporting does not advance health's last
+success while any remain. Selected zones with markers bypass watch-mode
+no-change shortcuts. Idle health also checks markers in unselected zones.
+Intentional bounded checkpoint holds alone are not failures. These keys do not
+change schema 25 or JSON report version 3.
+
+The Photos adapter emits aggregate, fixed-label identity lookup diagnostics.
+They distinguish omitted records, unexpected types, decode failures, invalid
+master references, and record-level provider errors. Reference-zone context is
+classified without logging provider identifiers or response bodies. These
+observations do not authorize identity guesses or cross-zone retries.
+
 The per-zone provider checkpoint and the scoped database pre-check token have
 different gates:
 

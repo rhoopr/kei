@@ -153,7 +153,7 @@ impl WatchPrecheck {
     }
 }
 
-async fn include_pending_metadata_work(
+async fn include_pending_local_work(
     watch_precheck: &mut WatchPrecheck,
     db: &dyn download::DownloadStore,
     metadata: &config::MetadataConfig,
@@ -187,14 +187,21 @@ async fn include_pending_metadata_work(
         } else {
             false
         };
-        if capture_pending || rewrite_pending {
+        let identity_pending = match db.get_metadata(&state::unresolved_identity_key(zone)).await {
+            Ok(marker) => marker.is_some(),
+            Err(error) => {
+                tracing::warn!(error = %error, "Could not inspect unresolved identity work before watch pre-check");
+                true
+            }
+        };
+        if capture_pending || rewrite_pending || identity_pending {
             local_work_zones.insert(library.zone_name.clone());
         }
     }
     if !local_work_zones.is_empty() {
         tracing::debug!(
             libraries = local_work_zones.len(),
-            "Pending metadata work bypassed the watch no-change shortcut"
+            "Pending local work bypassed the watch no-change shortcut"
         );
         watch_precheck.include_local_work_zones(local_work_zones);
     }
@@ -1324,13 +1331,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             && !config.runtime.only_print_filenames
             && let Some(db) = state_db.as_deref()
         {
-            include_pending_metadata_work(
-                &mut watch_precheck,
-                db,
-                &config.metadata,
-                &library_states,
-            )
-            .await;
+            include_pending_local_work(&mut watch_precheck, db, &config.metadata, &library_states)
+                .await;
         }
 
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
@@ -2821,6 +2823,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unresolved_identity_bypasses_watch_no_change_shortcut() {
+        let db = state::SqliteStateDb::open_in_memory().unwrap();
+        let marker = state::unresolved_identity_key("PrimarySync");
+        db.set_metadata(&marker, "1").await.unwrap();
+        let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
+        let mut precheck = WatchPrecheck::SkipAll;
+        include_pending_local_work(
+            &mut precheck,
+            &db,
+            &config::MetadataConfig::default(),
+            &[library],
+        )
+        .await;
+        assert!(precheck.should_sync_zone("PrimarySync"));
+        assert!(!precheck.should_sync_zone("SharedSync-other"));
+        assert!(precheck.db_sync_token_after_success().is_none());
+    }
+
+    #[tokio::test]
     async fn disabled_metadata_writers_leave_rewrite_marker_out_of_watch_work() {
         let db = state::SqliteStateDb::open_in_memory().expect("state db");
         seed_watch_metadata_work(
@@ -2836,7 +2857,7 @@ mod tests {
         let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
         let mut precheck = WatchPrecheck::SkipAll;
 
-        include_pending_metadata_work(
+        include_pending_local_work(
             &mut precheck,
             &db,
             &config::MetadataConfig::default(),
@@ -2875,7 +2896,7 @@ mod tests {
         };
         let mut precheck = WatchPrecheck::SkipAll;
 
-        include_pending_metadata_work(&mut precheck, &db, &metadata, &[selected]).await;
+        include_pending_local_work(&mut precheck, &db, &metadata, &[selected]).await;
 
         assert!(precheck.should_sync_zone("PrimarySync"));
         assert!(!precheck.should_sync_zone("SharedSync-OTHER"));
@@ -2894,7 +2915,7 @@ mod tests {
         let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
         let mut precheck = WatchPrecheck::SkipAll;
 
-        include_pending_metadata_work(
+        include_pending_local_work(
             &mut precheck,
             &db,
             &config::MetadataConfig::default(),
@@ -7172,6 +7193,297 @@ mod tests {
         page
     }
 
+    #[tokio::test]
+    async fn unresolved_identity_inventory_requires_a_delta_bridge() {
+        for prior_token in [None, Some("retained-before")] {
+            let inner = make_state_db();
+            let marker = state::unresolved_identity_key("PrimarySync");
+            inner.set_metadata(&marker, "1").await.unwrap();
+            inner
+                .set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "old-config")
+                .await
+                .unwrap();
+            if let Some(token) = prior_token {
+                inner
+                    .set_metadata("sync_token:PrimarySync", token)
+                    .await
+                    .unwrap();
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let album = make_full_album_with_boxed_session(
+                "PrimarySync",
+                Box::new(ConfigBridgeSession::new(
+                    "PrimarySync",
+                    "inventory-only",
+                    "bridged-after",
+                )),
+            );
+            let library = make_run_cycle_library_state_with_album(
+                "PrimarySync",
+                "sync_token:PrimarySync",
+                album,
+            );
+            let builder = make_run_cycle_download_config_builder(dir.path(), inner.clone());
+            let config = make_run_cycle_config();
+            let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+            for _ in 0..2 {
+                let result = run_cycle(
+                    &[&library],
+                    &config,
+                    Some(inner.as_ref()),
+                    false,
+                    &builder,
+                    download::DownloadControls::download_hidden(),
+                    &shared_session,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.failed_count > 0, prior_token.is_none());
+                assert_eq!(
+                    inner.get_metadata(&marker).await.unwrap().is_some(),
+                    prior_token.is_none()
+                );
+                assert_eq!(
+                    inner
+                        .get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    prior_token.map(|_| "bridged-after")
+                );
+                assert_eq!(result.stats.downloaded, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_identity_survives_restart_and_other_zone_success_then_recovers() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        #[derive(Clone, Debug)]
+        struct IdentitySession {
+            unresolved: bool,
+            records: Vec<serde_json::Value>,
+            valid: Vec<serde_json::Value>,
+        }
+        #[async_trait::async_trait]
+        impl crate::icloud::photos::PhotosSession for IdentitySession {
+            async fn post(
+                &self,
+                url: &str,
+                _body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                if url.contains("/records/lookup?") {
+                    return Ok(
+                        serde_json::json!({"records": if self.unresolved { Vec::new() } else { vec![serde_json::json!({"recordName": "unresolved-child", "serverErrorCode": "UNKNOWN_ITEM"})] }}),
+                    );
+                }
+                if url.contains("/changes/zone?") {
+                    let mut child = self.records[1].clone();
+                    child["recordName"] = serde_json::json!("unresolved-child");
+                    child["fields"].as_object_mut().unwrap().remove("masterRef");
+                    let mut records = self.valid.clone();
+                    records.push(child);
+                    return Ok(serde_json::json!({"zones": [{
+                        "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                        "syncToken": "zone-after", "moreComing": false, "records": records
+                    }]}));
+                }
+                panic!("identity replay must not fall back to full enumeration: {url}");
+            }
+            fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        let snapshot_files = |directory: &std::path::Path| {
+            let mut files = std::collections::BTreeMap::new();
+            let mut directories = vec![directory.to_path_buf()];
+            while let Some(directory) = directories.pop() {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if entry.file_type().unwrap().is_dir() {
+                        directories.push(path);
+                    } else {
+                        files.insert(path.clone(), std::fs::read(path).unwrap());
+                    }
+                }
+            }
+            files
+        };
+
+        for recent in [None, Some(10)] {
+            let server = crate::start_wiremock_or_skip!();
+            // Valid JPEG framing; no optional metadata writer is needed.
+            let bytes = vec![
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+                0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+            ];
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
+            Mock::given(method("GET"))
+                .and(path("/valid.jpg"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let valid = full_album_page_with_download(
+                "PrimarySync",
+                "valid-new",
+                "zone-after",
+                &format!("{}/valid.jpg", server.uri()),
+                bytes.len() as u64,
+                &checksum,
+            )["records"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("state.db");
+            let media = dir.path().join("media");
+            {
+                let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                let db = inner.clone() as Arc<dyn download::DownloadStore>;
+                seed_run_cycle_metadata_drift_asset(&db, &media).await;
+                let run = inner.start_sync_run().await.unwrap();
+                inner
+                    .complete_sync_run(run, &state::SyncRunStats::default())
+                    .await
+                    .unwrap();
+                inner.set_metadata_capture_revision_for_test(
+                    "PrimarySync",
+                    "master-PrimarySync",
+                    state::METADATA_CAPTURE_REVISION,
+                );
+                for zone in ["PrimarySync", "SharedSync-test"] {
+                    inner
+                        .set_metadata(&crate::sync_cycle::sync_token_key(zone), "zone-before")
+                        .await
+                        .unwrap();
+                }
+            }
+            let before = snapshot_files(&media);
+            let mut after_download = None;
+            let mut config = make_run_cycle_config();
+            config.filters.recent = recent;
+            let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+            // Reopen SQLite each time. Cycle 1 only selects the clean shared zone.
+            for cycle in 0..4 {
+                let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                let db = inner.clone() as Arc<dyn download::DownloadStore>;
+                let primary = make_run_cycle_library_state_with_album(
+                    "PrimarySync",
+                    "sync_token:PrimarySync",
+                    make_full_album_with_boxed_session(
+                        "PrimarySync",
+                        Box::new(IdentitySession {
+                            unresolved: cycle < 2,
+                            records: run_cycle_favourited_asset_page()["records"]
+                                .as_array()
+                                .unwrap()
+                                .clone(),
+                            valid: valid.clone(),
+                        }),
+                    ),
+                );
+                let shared = make_run_cycle_library_state(
+                    "SharedSync-test",
+                    "sync_token:SharedSync-test",
+                    "shared-after",
+                );
+                let libraries = if cycle == 1 {
+                    vec![&shared]
+                } else {
+                    vec![&primary, &shared]
+                };
+                let builder = make_run_cycle_download_config_builder_with_options(
+                    &media,
+                    db.clone(),
+                    RunCycleDownloadConfigOptions {
+                        recent,
+                        ..RunCycleDownloadConfigOptions::default()
+                    },
+                );
+                let result = run_cycle(
+                    &libraries,
+                    &config,
+                    Some(db.as_ref()),
+                    false,
+                    &builder,
+                    download::DownloadControls::download_hidden(),
+                    &shared_session,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.stats.identity_incomplete,
+                    cycle < 2,
+                    "recent={recent:?} cycle={cycle}"
+                );
+                assert_eq!(result.failed_count > 0, cycle < 2);
+                assert_eq!(
+                    crate::cycle_reporter::classify_cycle(
+                        &result.stats,
+                        result.failed_count,
+                        result.session_expired
+                    ),
+                    if cycle < 2 {
+                        crate::cycle_reporter::CycleStatus::Failed
+                    } else {
+                        crate::cycle_reporter::CycleStatus::Success
+                    }
+                );
+                let summary = inner.get_summary().await.unwrap();
+                assert_eq!(summary.unresolved_identity_zones, u64::from(cycle < 2));
+                assert_eq!(
+                    crate::commands::backup_status_line(&summary)
+                        .contains("unresolved asset identity"),
+                    cycle < 2,
+                    "recent={recent:?} cycle={cycle}: {}",
+                    crate::commands::backup_status_line(&summary)
+                );
+                assert_eq!(
+                    inner
+                        .get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(if cycle < 2 {
+                        "zone-before"
+                    } else {
+                        "zone-after"
+                    })
+                );
+                assert_eq!(
+                    inner
+                        .get_metadata("sync_token:SharedSync-test")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("shared-after")
+                );
+                assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+                let files = snapshot_files(&media);
+                for (path, contents) in &before {
+                    assert_eq!(files.get(path), Some(contents));
+                }
+                if cycle == 0 {
+                    assert!(files.values().any(|contents| contents == &bytes));
+                    after_download = Some(files);
+                } else {
+                    assert_eq!(Some(files), after_download);
+                }
+            }
+            server.verify().await;
+        }
+    }
+
     /// #707: the paired single-pass streaming path must gate the zone
     /// checkpoint on provider-metadata durability exactly as the collecting
     /// path does. Identical to the collecting regression above but without
@@ -7614,7 +7926,11 @@ mod tests {
                             if cycle == 0 {
                                 assert_eq!(
                                     status,
-                                    "Backup status: unsafe - last sync was interrupted; 1 enumeration error occurred in the last sync"
+                                    if matches!(stage, Stage::AssetPair | Stage::AssetIdentity) {
+                                        "Backup status: unsafe - unresolved asset identity in 1 provider zone; checkpoint replay is required; last sync was interrupted; 1 enumeration error occurred in the last sync"
+                                    } else {
+                                        "Backup status: unsafe - last sync was interrupted; 1 enumeration error occurred in the last sync"
+                                    }
                                 );
                             } else {
                                 assert_eq!(

@@ -1296,6 +1296,7 @@ mod tests {
         downloaded_bytes: u64,
     ) -> SyncSummary {
         SyncSummary {
+            unresolved_identity_zones: 0,
             total_assets: downloaded + pending + failed,
             downloaded,
             pending,

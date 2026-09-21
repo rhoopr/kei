@@ -162,3 +162,30 @@ download hashes are not proof of unmodified source bytes. Adoption/import have
 evidence limits; integrity commands cannot prove completeness against iCloud or
 restore damaged media. Never remove temporary files by suffix and age alone:
 cleanup requires durable ownership evidence.
+
+## Unresolved provider identities
+
+If logs show `asset_delta_hydration_incomplete`, keep the state database and
+media. Kei retains the provider checkpoint so a later cycle can retry the
+unresolved records. Other valid assets can still download. Do not reset state
+or use a metadata refresh to bypass this guard.
+
+Kei marks unresolved asset identity cycles incomplete. Status
+remains unsafe across restarts and successful syncs in other libraries until
+the affected checkpoint can advance safely. Health does not update
+`last_success_at` for incomplete cycles. A deployment that previously looked
+healthy can therefore start reporting unhealthy without a new transfer error.
+
+For a diagnostic retest, disable automatic restarts driven by `/healthz`.
+Keep health monitoring enabled. Do not use this sync-health endpoint as a
+Kubernetes liveness probe during the retest. Repeated provider failures can
+produce HTTP 503 while the process is still running and able to retry.
+
+Record `kei --version`, the Docker image ID when applicable, `kei status`,
+health output, and the aggregate `Asset identity lookup` log lines from one
+cycle. Include whether the accounts use a Shared Photo
+Library. Redact account details and local paths from other logs. Do not upload
+the state database, session files, or raw provider responses.
+
+The diagnostics do not establish why Apple omitted an identity. Ambiguous
+metadata-capture matches are a separate condition and remain pending.

@@ -350,6 +350,9 @@ pub struct SyncStats {
     /// Whether sync-token advancement was blocked for safety despite no
     /// download failure.
     pub sync_token_blocked: bool,
+    /// Unresolved asset hydration, independent of intentional checkpoint holds.
+    #[serde(skip)]
+    pub(crate) identity_incomplete: bool,
     /// Structured reason for `sync_token_blocked`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_blocked_reason: Option<&'static str>,
@@ -500,6 +503,7 @@ impl SyncStats {
             self.inventory_drop_current_total = other.inventory_drop_current_total;
             self.inventory_drop_library = other.inventory_drop_library.clone();
         }
+        self.identity_incomplete |= other.identity_incomplete;
         self.sync_token_blocked = self.sync_token_blocked || other.sync_token_blocked;
         if self.sync_token_blocked_reason.is_none() {
             self.sync_token_blocked_reason = other.sync_token_blocked_reason;
@@ -4807,6 +4811,11 @@ fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullEnumerationR
     }
 }
 
+pub(crate) fn block_sync_token_for_unresolved_identity(stats: &mut SyncStats) {
+    stats.identity_incomplete = true;
+    block_sync_token_for_incremental_delta(stats, ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+}
+
 fn block_sync_token_for_incremental_delta(stats: &mut SyncStats, reason: &'static str) {
     if stats.sync_token_blocked_reason.is_none() {
         stats.sync_token_blocked_reason = Some(reason);
@@ -7007,6 +7016,7 @@ async fn download_photos_full_with_token_policy(
 
 #[derive(Debug, Default)]
 struct IncrementalDeltaSummary {
+    identity_incomplete: bool,
     sync_token: Option<String>,
     token_unsafe_reason: Option<&'static str>,
     created_count: u64,
@@ -7020,6 +7030,12 @@ struct IncrementalDeltaSummary {
 }
 
 impl IncrementalDeltaSummary {
+    fn block_identity(&mut self) {
+        self.identity_incomplete = true;
+        self.token_unsafe_reason
+            .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+    }
+
     fn record_provider_error(&mut self, error: anyhow::Error) {
         if is_provider_session_error(&error) {
             self.auth_errors += 1;
@@ -7479,6 +7495,28 @@ async fn hydrate_unpaired_created_asset_deltas(
     pass: Option<&crate::commands::AlbumPass>,
     config: &DownloadConfig,
     summary: &mut IncrementalDeltaSummary,
+    run_mode: DownloadRunMode,
+) {
+    hydrate_unpaired_created_asset_deltas_inner(events, pass, config, summary).await;
+    // Persist before the producer closes the stream and finalizes its run.
+    // A restart or a successful sync in another zone must not hide this work.
+    if run_mode.downloads_files()
+        && summary.identity_incomplete
+        && let Some(db) = &config.state_db
+        && let Err(error) = db
+            .set_metadata(&crate::state::unresolved_identity_key(&config.library), "1")
+            .await
+    {
+        summary.state_transition_failures += 1;
+        tracing::warn!(error = %error, "Failed to retain unresolved asset identity evidence");
+    }
+}
+
+async fn hydrate_unpaired_created_asset_deltas_inner(
+    events: &mut [ChangeEvent],
+    pass: Option<&crate::commands::AlbumPass>,
+    config: &DownloadConfig,
+    summary: &mut IncrementalDeltaSummary,
 ) {
     let mut pending = Vec::new();
     let mut unresolved: FxHashMap<String, Vec<usize>> = FxHashMap::default();
@@ -7500,9 +7538,7 @@ async fn hydrate_unpaired_created_asset_deltas(
                 Ok(master) => master,
                 Err(e) => {
                     summary.state_transition_failures += 1;
-                    summary
-                        .token_unsafe_reason
-                        .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                    summary.block_identity();
                     tracing::warn!(
                         asset_record_name = %event.record_name,
                         library = %config.library,
@@ -7531,9 +7567,7 @@ async fn hydrate_unpaired_created_asset_deltas(
         return;
     }
     let Some(pass) = pass else {
-        summary
-            .token_unsafe_reason
-            .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+        summary.block_identity();
         return;
     };
 
@@ -7547,9 +7581,7 @@ async fn hydrate_unpaired_created_asset_deltas(
         let identity_resolutions = pass.album.resolve_records(&requests).await;
         for (state_id, resolution) in identity_resolutions.results {
             let Some(indices) = unresolved.remove(state_id.as_str()) else {
-                summary
-                    .token_unsafe_reason
-                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                summary.block_identity();
                 continue;
             };
             match resolution {
@@ -7581,9 +7613,7 @@ async fn hydrate_unpaired_created_asset_deltas(
                     );
                 }
                 RecordResolution::TransientFailure(error) => {
-                    summary
-                        .token_unsafe_reason
-                        .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                    summary.block_identity();
                     tracing::warn!(
                         diagnostic = error.diagnostic(),
                         "Failed to recover master identity for asset-only delta"
@@ -7597,21 +7627,16 @@ async fn hydrate_unpaired_created_asset_deltas(
                     ..
                 }
                 | RecordResolution::Unknown => {
-                    summary
-                        .token_unsafe_reason
-                        .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
-                    tracing::warn!(
-                        asset_record_name = state_id.as_str(),
-                        library = %config.library,
-                        "Asset-only delta had no usable master identity"
+                    summary.block_identity();
+                    tracing::debug!(
+                        diagnostic = "asset_delta_identity_unresolved",
+                        "Asset-only delta had no usable master identity; see targeted lookup diagnostics"
                     );
                 }
             }
         }
         if !unresolved.is_empty() {
-            summary
-                .token_unsafe_reason
-                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+            summary.block_identity();
         }
     }
 
@@ -7635,15 +7660,11 @@ async fn hydrate_unpaired_created_asset_deltas(
     let resolutions = pass.album.resolve_records(&requests).await;
     for (state_id, resolution) in resolutions.results {
         let Some((index, master_record_name)) = event_by_record_name.get(state_id.as_str()) else {
-            summary
-                .token_unsafe_reason
-                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+            summary.block_identity();
             continue;
         };
         let Some(event) = events.get_mut(*index) else {
-            summary
-                .token_unsafe_reason
-                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+            summary.block_identity();
             continue;
         };
         match resolution {
@@ -7688,9 +7709,7 @@ async fn hydrate_unpaired_created_asset_deltas(
                 }
             }
             RecordResolution::TransientFailure(error) => {
-                summary
-                    .token_unsafe_reason
-                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                summary.block_identity();
                 tracing::warn!(
                     diagnostic = error.diagnostic(),
                     "Provider lookup could not hydrate an asset-only delta"
@@ -7701,9 +7720,7 @@ async fn hydrate_unpaired_created_asset_deltas(
             | RecordResolution::AssetPresent { .. }
             | RecordResolution::MasterPresent
             | RecordResolution::Unknown => {
-                summary
-                    .token_unsafe_reason
-                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                summary.block_identity();
                 tracing::warn!(
                     diagnostic = "incomplete_record_pair",
                     "Could not hydrate a complete asset-only delta"
@@ -7712,9 +7729,7 @@ async fn hydrate_unpaired_created_asset_deltas(
         }
     }
     if !resolutions.complete {
-        summary
-            .token_unsafe_reason
-            .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+        summary.block_identity();
     }
 }
 
@@ -7926,6 +7941,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             Some(&pass),
             &config,
             &mut summary,
+            run_mode,
         )
         .await;
         let download_ctx = if run_mode.downloads_files() && !unpaired_asset_events.is_empty() {
@@ -8055,6 +8071,7 @@ async fn download_photos_incremental_streaming(
 
     stats.state_write_failures += delta_summary.state_transition_failures;
     stats.interrupted = stats.interrupted || shutdown_token.is_cancelled();
+    stats.identity_incomplete = delta_summary.identity_incomplete;
     if let Some(reason) = delta_summary.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason);
     }
@@ -8298,6 +8315,7 @@ async fn download_photos_incremental_collecting_inner(
         passes.first(),
         config,
         &mut delta_summary,
+        controls.run_mode,
     )
     .await;
     let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
@@ -8480,6 +8498,7 @@ async fn download_photos_incremental_collecting_inner(
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
+        stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -8503,6 +8522,7 @@ async fn download_photos_incremental_collecting_inner(
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
+        stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -8725,6 +8745,7 @@ async fn download_photos_incremental_collecting_inner(
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
+        stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -8771,6 +8792,7 @@ async fn download_photos_incremental_collecting_inner(
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
+        stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -8939,6 +8961,7 @@ async fn download_photos_incremental_collecting_inner(
         recap: pass_result.recap.clone(),
         ..SyncStats::default()
     };
+    stats.identity_incomplete = delta_summary.identity_incomplete;
     if let Some(reason) = delta_summary.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason);
     }
@@ -23678,6 +23701,7 @@ mod tests {
     #[test]
     fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         let lib_a = SyncStats {
+            identity_incomplete: true,
             assets_seen: 10,
             api_total_at_start: Some(12),
             api_total_at_start_partial: false,
@@ -23750,6 +23774,7 @@ mod tests {
         };
 
         let lib_b = SyncStats {
+            identity_incomplete: false,
             assets_seen: 20,
             api_total_at_start: Some(22),
             api_total_at_start_partial: true,
@@ -23822,6 +23847,7 @@ mod tests {
         let mut acc = SyncStats::default();
         acc.accumulate(&lib_a);
         acc.accumulate(&lib_b);
+        assert!(acc.identity_incomplete);
 
         assert_eq!(acc.assets_seen, 30, "assets_seen must sum");
         assert_eq!(

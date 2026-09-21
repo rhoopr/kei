@@ -231,7 +231,7 @@ fn source_checkpoint_decision(
         };
         return preserve(CheckpointHoldReason::TokenProofIncomplete, recovery);
     };
-    if result.stats.sync_token_blocked {
+    if result.stats.sync_token_blocked || result.stats.identity_incomplete {
         let recovery = if result.stats.checkpoint_retry_passes.is_empty() {
             RecoveryAction::ReplayFromPriorToken
         } else {
@@ -893,7 +893,15 @@ pub(crate) async fn run_cycle(
         // replaying the prior cursor then bridges changes that occurred while
         // that inventory was running. Only the bridged token may replace the
         // active checkpoint.
-        if matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
+        let unresolved_identity = if let Some(db) = state_db {
+            db.get_metadata(&state::unresolved_identity_key(&lib_state.zone_name))
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        if (matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
+            || unresolved_identity)
             && sync_result.full_enumeration_ran
             && checkpoint_transition_state_safe
         {
@@ -968,12 +976,19 @@ pub(crate) async fn run_cycle(
             }
         }
 
+        if unresolved_identity && matches!(checkpoint_basis, CheckpointBasis::CompleteInventory) {
+            // An inventory cannot prove that the previously ambiguous deltas
+            // were resolved. Require replay from the retained cursor.
+            download::block_sync_token_for_unresolved_identity(&mut sync_result.stats);
+        }
+
         if sync_result.full_enumeration_ran && sync_result.stats.full_enumeration_reason.is_none() {
             sync_result.stats.full_enumeration_reason = sync_mode_decision.full_enumeration_reason;
         }
 
         let library_completed_without_errors =
             matches!(&sync_result.outcome, download::DownloadOutcome::Success)
+                && !sync_result.stats.identity_incomplete
                 && !sync_result.stats.interrupted
                 && sync_result.stats.enumeration_errors == 0
                 && !shutdown_token.is_cancelled();
@@ -1076,7 +1091,9 @@ pub(crate) async fn run_cycle(
                         if let Err(e) = db
                             .commit_checkpoint_transition(state::CheckpointTransition {
                                 metadata_updates,
-                                metadata_deletes: Vec::new(),
+                                metadata_deletes: vec![state::unresolved_identity_key(
+                                    &lib_state.zone_name,
+                                )],
                             })
                             .await
                         {
@@ -1161,6 +1178,10 @@ pub(crate) async fn run_cycle(
             sync_result.stats.sync_token_blocked_zone = Some(lib_state.zone_name.clone());
         }
 
+        if sync_result.stats.identity_incomplete {
+            cycle_failed_count += 1;
+        }
+
         // Accumulate stats across libraries.
         cycle_stats.accumulate(&sync_result.stats);
 
@@ -1211,6 +1232,7 @@ pub(crate) async fn run_cycle(
                 };
                 metadata_updates.push((lib_state.sync_token_key.clone(), token));
                 metadata_deletes.push(candidate_key);
+                metadata_deletes.push(state::unresolved_identity_key(&lib_state.zone_name));
             }
             if db_sync_token_advance_safe {
                 metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));
@@ -1248,6 +1270,14 @@ pub(crate) async fn run_cycle(
             .await
     {
         tracing::warn!(error = %e, "Failed to promote completed local path reconciliation");
+    }
+
+    if let Some(db) = state_db
+        && db.get_summary().await?.unresolved_identity_zones > 0
+    {
+        download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
+        cycle_failed_count = cycle_failed_count.max(1);
+        db_sync_token_advance_safe = false;
     }
 
     Ok(CycleResult {
@@ -1523,7 +1553,7 @@ mod tests {
     #[test]
     fn contract_source_checkpoint_requires_durable_recovery_exhaustive() {
         let tokens = [Some("zone-token"), None, Some("   ")];
-        for mask in 0u16..512 {
+        for mask in 0u16..1024 {
             let dry_run = mask & 1 != 0;
             let stale_pass_plan = mask & 2 != 0;
             let session_expired = mask & 4 != 0;
@@ -1533,7 +1563,8 @@ mod tests {
             let state_not_durable = mask & 64 != 0;
             let token_proof_blocked = mask & 128 != 0;
             let durable_transfer_failure = mask & 256 != 0;
-            let has_safety_blocker = mask & 255 != 0;
+            let identity_incomplete = mask & 512 != 0;
+            let has_safety_blocker = mask & 255 != 0 || identity_incomplete;
             for token in tokens {
                 let result = download::SyncResult {
                     outcome: if session_expired {
@@ -1552,6 +1583,7 @@ mod tests {
                         enumeration_incomplete,
                         state_write_failures: usize::from(state_not_durable),
                         sync_token_blocked: token_proof_blocked,
+                        identity_incomplete,
                         ..download::SyncStats::default()
                     },
                     full_enumeration_ran: false,
