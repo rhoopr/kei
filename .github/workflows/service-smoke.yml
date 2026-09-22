@@ -27,6 +27,7 @@ on:
       - 'src/commands/service.rs'
       - 'src/cli.rs'
       - 'src/config.rs'
+      - 'src/config/**'
       - 'src/lib.rs'
       - 'src/commands/status.rs'
       - 'Cargo.toml'
