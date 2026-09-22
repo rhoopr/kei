@@ -14,8 +14,8 @@ use crate::state::VersionSizeKey;
 
 use super::config::DownloadConfig;
 use super::models::{
-    DownloadControls, DownloadStore, METADATA_CAPTURE_REPAIR_FAILED_REASON, SyncStats,
-    block_sync_token_for_incremental_delta,
+    CheckpointEvidence, DownloadControls, DownloadStore, METADATA_CAPTURE_REPAIR_FAILED_REASON,
+    SyncStats, block_sync_token_for_incremental_delta,
 };
 
 /// Drain pending metadata-rewrite markers in bounded batches so a
@@ -87,6 +87,7 @@ const METADATA_CAPTURE_BATCH: usize = 500;
 #[derive(Default)]
 pub(super) struct MetadataCaptureRepair {
     pub(super) stats: SyncStats,
+    pub(super) checkpoint: CheckpointEvidence,
     pub(super) failures: usize,
     pub(super) auth_errors: usize,
 }
@@ -117,7 +118,8 @@ async fn record_metadata_capture_failure(
         .record_metadata_capture_failure(library, crate::state::METADATA_CAPTURE_REVISION, error)
         .await
     {
-        repair.stats.state_write_failures = repair.stats.state_write_failures.saturating_add(1);
+        repair.checkpoint.state_write_failures =
+            repair.checkpoint.state_write_failures.saturating_add(1);
         tracing::warn!(error = %state_error, "Failed to persist metadata-capture repair failure");
     }
 }
@@ -176,6 +178,18 @@ pub(super) async fn run_metadata_capture_repair(
     controls: DownloadControls,
     shutdown_token: &CancellationToken,
 ) -> MetadataCaptureRepair {
+    let mut repair =
+        collect_metadata_capture_repair(passes, config, controls, shutdown_token).await;
+    repair.checkpoint.project(&mut repair.stats);
+    repair
+}
+
+async fn collect_metadata_capture_repair(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    shutdown_token: &CancellationToken,
+) -> MetadataCaptureRepair {
     // CONTRACT: METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE
     let mut repair = MetadataCaptureRepair::default();
     repair.stats.metadata_capture_revision = Some(crate::state::METADATA_CAPTURE_REVISION);
@@ -194,8 +208,9 @@ pub(super) async fn run_metadata_capture_repair(
         Err(error) => {
             repair.failures = 1;
             repair.stats.metadata_capture_failures = 1;
-            repair.stats.state_write_failures = 1;
+            repair.checkpoint.state_write_failures = 1;
             tracing::warn!(error = %error, library, "Could not initialize metadata-capture repair");
+            repair.checkpoint.sync_token_blocked = true;
             block_sync_token_for_incremental_delta(
                 &mut repair.stats,
                 METADATA_CAPTURE_REPAIR_FAILED_REASON,
@@ -215,6 +230,7 @@ pub(super) async fn run_metadata_capture_repair(
             &mut repair,
         )
         .await;
+        repair.checkpoint.sync_token_blocked = true;
         block_sync_token_for_incremental_delta(
             &mut repair.stats,
             METADATA_CAPTURE_REPAIR_FAILED_REASON,
@@ -233,6 +249,7 @@ pub(super) async fn run_metadata_capture_repair(
         Err(error) => {
             let message = error.to_string();
             record_metadata_capture_failure(db.as_ref(), library, &message, &mut repair).await;
+            repair.checkpoint.sync_token_blocked = true;
             block_sync_token_for_incremental_delta(
                 &mut repair.stats,
                 METADATA_CAPTURE_REPAIR_FAILED_REASON,
@@ -456,7 +473,7 @@ pub(super) async fn run_metadata_capture_repair(
     }
 
     if shutdown_token.is_cancelled() {
-        repair.stats.interrupted = true;
+        repair.checkpoint.interrupted = true;
     } else if repair.auth_errors == 0 {
         for (_, candidate) in candidates_by_id {
             record_metadata_capture_failure(
@@ -478,14 +495,16 @@ pub(super) async fn run_metadata_capture_repair(
             repair.stats.metadata_capture_remaining = status.remaining_assets;
         }
         Err(error) => {
-            repair.stats.state_write_failures = repair.stats.state_write_failures.saturating_add(1);
+            repair.checkpoint.state_write_failures =
+                repair.checkpoint.state_write_failures.saturating_add(1);
             repair.failures = repair.failures.saturating_add(1);
             repair.stats.metadata_capture_failures =
                 repair.stats.metadata_capture_failures.saturating_add(1);
             tracing::warn!(error = %error, library, "Could not finalize metadata-capture repair state");
         }
     }
-    if repair.failures > 0 || repair.stats.interrupted {
+    if repair.failures > 0 || repair.checkpoint.interrupted {
+        repair.checkpoint.sync_token_blocked = true;
         block_sync_token_for_incremental_delta(
             &mut repair.stats,
             METADATA_CAPTURE_REPAIR_FAILED_REASON,

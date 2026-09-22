@@ -272,12 +272,7 @@ async fn download_photos_incremental_streaming(
             .flatten()
     };
 
-    Ok(SyncResult {
-        outcome,
-        sync_token,
-        stats,
-        full_enumeration_ran: false,
-    })
+    Ok(SyncResult::from_execution(outcome, sync_token, stats))
 }
 
 /// Incremental delta sync via `changes_stream`.
@@ -643,14 +638,13 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
-        return Ok(SyncResult {
-            outcome: DownloadOutcome::SessionExpired {
+        return Ok(SyncResult::from_execution(
+            DownloadOutcome::SessionExpired {
                 auth_error_count: delta_summary.auth_errors,
             },
-            sync_token: None,
+            None,
             stats,
-            full_enumeration_ran: false,
-        });
+        ));
     }
 
     if downloadable_assets.is_empty() {
@@ -676,8 +670,8 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .then_some(delta_summary.sync_token)
                 .flatten()
         };
-        return Ok(SyncResult {
-            outcome: if delta_summary.state_transition_failures > 0 || rewrite_failures > 0 {
+        return Ok(SyncResult::from_execution(
+            if delta_summary.state_transition_failures > 0 || rewrite_failures > 0 {
                 DownloadOutcome::PartialFailure {
                     failed_count: delta_summary
                         .state_transition_failures
@@ -688,8 +682,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             },
             sync_token,
             stats,
-            full_enumeration_ran: false,
-        });
+        ));
     }
 
     let download_ctx = match download_ctx {
@@ -908,12 +901,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .then_some(delta_summary.sync_token)
                 .flatten()
         };
-        return Ok(SyncResult {
-            outcome,
-            sync_token,
-            stats,
-            full_enumeration_ran: false,
-        });
+        return Ok(SyncResult::from_execution(outcome, sync_token, stats));
     }
 
     if controls.run_mode.only_print_filenames() {
@@ -938,18 +926,17 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
         // Don't advance the sync token — this is a read-only operation.
-        return Ok(SyncResult {
-            outcome: if enumeration_errors > 0 || delta_summary.state_transition_failures > 0 {
+        return Ok(SyncResult::from_execution(
+            if enumeration_errors > 0 || delta_summary.state_transition_failures > 0 {
                 DownloadOutcome::PartialFailure {
                     failed_count: enumeration_errors + delta_summary.state_transition_failures,
                 }
             } else {
                 DownloadOutcome::Success
             },
-            sync_token: None,
+            None,
             stats,
-            full_enumeration_ran: false,
-        });
+        ));
     }
 
     if controls.run_mode.downloads_files() {
@@ -1112,16 +1099,15 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     );
 
     if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
-        return Ok(SyncResult {
-            outcome: DownloadOutcome::SessionExpired {
+        return Ok(SyncResult::from_execution(
+            DownloadOutcome::SessionExpired {
                 auth_error_count: pass_result.auth_errors,
             },
-            sync_token: (!stats.sync_token_blocked)
+            (!stats.sync_token_blocked)
                 .then_some(delta_summary.sync_token)
                 .flatten(),
             stats,
-            full_enumeration_ran: false,
-        });
+        ));
     }
 
     let outcome = if failed > 0
@@ -1143,14 +1129,13 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         DownloadOutcome::Success
     };
 
-    Ok(SyncResult {
+    Ok(SyncResult::from_execution(
         outcome,
-        sync_token: (enumeration_errors == 0 && !stats.sync_token_blocked)
+        (enumeration_errors == 0 && !stats.sync_token_blocked)
             .then_some(delta_summary.sync_token)
             .flatten(),
         stats,
-        full_enumeration_ran: false,
-    })
+    ))
 }
 
 #[cfg(test)]

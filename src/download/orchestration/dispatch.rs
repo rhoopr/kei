@@ -21,7 +21,6 @@ use super::maintenance::{has_metadata_backfill_work, run_metadata_capture_repair
 use super::models::{
     DownloadControls, DownloadOutcome, FullEnumerationReason, SMART_FOLDER_REFRESH_FAILED_REASON,
     SyncMode, SyncResult, SyncStats, TARGETED_ALBUM_BACKFILL_FAILED_REASON,
-    block_sync_token_for_incremental_delta, clear_full_query_token_block_stats,
     merge_download_outcomes,
 };
 use super::recovery::append_targeted_recovery_to_sync_result;
@@ -116,7 +115,7 @@ async fn download_photos_incremental_with_targeted_album_backfill(
         .iter()
         .filter_map(|index| passes.get(*index).cloned())
         .collect();
-    let backfill_result = download_photos_full_with_reason(
+    let mut backfill_result = download_photos_full_with_reason(
         download_client,
         &backfill_passes,
         config,
@@ -126,35 +125,21 @@ async fn download_photos_incremental_with_targeted_album_backfill(
     )
     .await?;
     let backfill_failed = !matches!(backfill_result.outcome, DownloadOutcome::Success)
-        || backfill_result.stats.interrupted
-        || backfill_result.stats.enumeration_errors > 0
+        || backfill_result.checkpoint.interrupted
+        || backfill_result.checkpoint.enumeration_errors > 0
         || shutdown_token.is_cancelled()
         || !targeted_backfill_snapshots_complete(&backfill_passes, config).await;
 
-    let SyncResult {
-        outcome: backfill_outcome,
-        sync_token: _,
-        stats: mut combined_stats,
-        full_enumeration_ran: backfill_full_enumeration_ran,
-    } = backfill_result;
-
     if backfill_failed {
-        block_sync_token_for_incremental_delta(
-            &mut combined_stats,
-            TARGETED_ALBUM_BACKFILL_FAILED_REASON,
-        );
-        return Ok(SyncResult {
-            outcome: backfill_outcome,
-            sync_token: None,
-            stats: combined_stats,
-            full_enumeration_ran: backfill_full_enumeration_ran,
-        });
+        backfill_result.block_incremental_token(TARGETED_ALBUM_BACKFILL_FAILED_REASON);
+        backfill_result.sync_token = None;
+        return Ok(backfill_result);
     }
 
     // Full album queries may report their own query sync-token telemetry, but
     // targeted backfill does not use that token. The zone token may advance
     // only after the following /changes/zone pass completes safely.
-    clear_full_query_token_block_stats(&mut combined_stats);
+    backfill_result.clear_full_query_token_block();
 
     let incremental_result = if passes
         .iter()
@@ -181,24 +166,13 @@ async fn download_photos_incremental_with_targeted_album_backfill(
         .await?
     };
 
-    let SyncResult {
-        outcome: incremental_outcome,
-        sync_token,
-        stats: incremental_stats,
-        full_enumeration_ran: incremental_full_enumeration_ran,
-    } = incremental_result;
-    combined_stats.accumulate(&incremental_stats);
-    let outcome = merge_download_outcomes(&backfill_outcome, &incremental_outcome);
-    let sync_token = (!combined_stats.sync_token_blocked)
-        .then_some(sync_token)
+    backfill_result.outcome =
+        merge_download_outcomes(&backfill_result.outcome, &incremental_result.outcome);
+    backfill_result.accumulate(&incremental_result);
+    backfill_result.sync_token = (!backfill_result.checkpoint.sync_token_blocked)
+        .then_some(incremental_result.sync_token)
         .flatten();
-
-    Ok(SyncResult {
-        outcome,
-        sync_token,
-        stats: combined_stats,
-        full_enumeration_ran: backfill_full_enumeration_ran || incremental_full_enumeration_ran,
-    })
+    Ok(backfill_result)
 }
 
 async fn download_photos_incremental_with_smart_folder_refresh(
@@ -223,7 +197,7 @@ async fn download_photos_incremental_with_smart_folder_refresh(
         .await;
     }
 
-    let incremental_result = download_photos_incremental(
+    let mut incremental_result = download_photos_incremental(
         download_client,
         &incremental_passes,
         config,
@@ -256,8 +230,8 @@ async fn download_photos_incremental_with_smart_folder_refresh(
 
     let smart_folder_refresh_failed =
         !matches!(smart_folder_result.outcome, DownloadOutcome::Success)
-            || smart_folder_result.stats.interrupted
-            || smart_folder_result.stats.enumeration_errors > 0;
+            || smart_folder_result.checkpoint.interrupted
+            || smart_folder_result.checkpoint.enumeration_errors > 0;
     if !smart_folder_refresh_failed {
         // The token that matters for this mixed incremental cycle is the
         // `/changes/zone` token captured below. A selected smart-folder
@@ -265,36 +239,21 @@ async fn download_photos_incremental_with_smart_folder_refresh(
         // full-enumeration query token, especially under bounded modes. Keep
         // refresh failures conservative, but do not let query-token telemetry
         // veto the safe incremental zone checkpoint.
-        clear_full_query_token_block_stats(&mut smart_folder_result.stats);
+        smart_folder_result.clear_full_query_token_block();
     }
 
-    let SyncResult {
-        outcome: incremental_outcome,
-        sync_token: incremental_sync_token,
-        stats: mut combined_stats,
-        full_enumeration_ran: incremental_full_enumeration_ran,
-    } = incremental_result;
-    combined_stats.accumulate(&smart_folder_result.stats);
+    incremental_result.outcome =
+        merge_download_outcomes(&incremental_result.outcome, &smart_folder_result.outcome);
+    incremental_result.accumulate(&smart_folder_result);
 
     if smart_folder_refresh_failed {
-        block_sync_token_for_incremental_delta(
-            &mut combined_stats,
-            SMART_FOLDER_REFRESH_FAILED_REASON,
-        );
+        incremental_result.block_incremental_token(SMART_FOLDER_REFRESH_FAILED_REASON);
     }
 
-    let sync_token = (!combined_stats.sync_token_blocked)
-        .then_some(incremental_sync_token)
-        .flatten();
-    let outcome = merge_download_outcomes(&incremental_outcome, &smart_folder_result.outcome);
-
-    Ok(SyncResult {
-        outcome,
-        sync_token,
-        stats: combined_stats,
-        full_enumeration_ran: incremental_full_enumeration_ran
-            || smart_folder_result.full_enumeration_ran,
-    })
+    if incremental_result.checkpoint.sync_token_blocked {
+        incremental_result.sync_token = None;
+    }
+    Ok(incremental_result)
 }
 
 pub async fn download_photos_with_sync(
@@ -320,6 +279,7 @@ pub async fn download_photos_with_sync(
             },
             sync_token: None,
             stats: metadata_capture_repair.stats,
+            checkpoint: metadata_capture_repair.checkpoint,
             full_enumeration_ran: false,
         });
     }
@@ -493,16 +453,18 @@ pub async fn download_photos_with_sync(
             return Err(error);
         }
         Ok(SyncResult {
-            outcome: DownloadOutcome::SessionExpired {
-                auth_error_count: 1,
-            },
-            sync_token: None,
-            stats: SyncStats {
-                enumeration_errors: 1,
-                enumeration_incomplete: true,
-                ..SyncStats::default()
-            },
             full_enumeration_ran: matches!(config.sync_mode, SyncMode::Full),
+            ..SyncResult::from_execution(
+                DownloadOutcome::SessionExpired {
+                    auth_error_count: 1,
+                },
+                None,
+                SyncStats {
+                    enumeration_errors: 1,
+                    enumeration_incomplete: true,
+                    ..SyncStats::default()
+                },
+            )
         })
     })?;
 
@@ -516,16 +478,25 @@ pub async fn download_photos_with_sync(
     )
     .await?;
 
-    result.stats.accumulate(&metadata_capture_repair.stats);
+    let repair_outcome = if metadata_capture_repair.failures > 0 {
+        DownloadOutcome::PartialFailure {
+            failed_count: metadata_capture_repair.failures,
+        }
+    } else {
+        DownloadOutcome::Success
+    };
+    let repair = SyncResult {
+        outcome: repair_outcome,
+        sync_token: None,
+        stats: metadata_capture_repair.stats,
+        checkpoint: metadata_capture_repair.checkpoint,
+        full_enumeration_ran: false,
+    };
     if metadata_capture_repair.failures > 0 {
-        result.outcome = merge_download_outcomes(
-            &result.outcome,
-            &DownloadOutcome::PartialFailure {
-                failed_count: metadata_capture_repair.failures,
-            },
-        );
+        result.outcome = merge_download_outcomes(&result.outcome, &repair.outcome);
     }
-    if metadata_capture_repair.stats.sync_token_blocked {
+    result.accumulate(&repair);
+    if repair.checkpoint.sync_token_blocked {
         result.sync_token = None;
     }
 

@@ -29,7 +29,7 @@ pub(super) use adoption::{
     adopt_pending_on_disk_for_retry, recorded_current_path_exists,
     state_confirmed_current_path_exists,
 };
-pub(super) use outcome::{StreamingResult, build_download_outcome};
+pub(super) use outcome::{StreamingResult, build_download_outcome, build_download_result};
 pub(super) use pass::{PassConfig, PassResult, run_download_pass};
 #[expect(
     unused_imports,

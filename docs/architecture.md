@@ -31,7 +31,7 @@ changing behavior.
 | Library and pass planning | `src/commands/service.rs` | Resolves libraries, collection scope, album plans, smart folders, unfiled passes, and cross-zone hydration. |
 | iCloud Photos adapter | `src/icloud/photos/` | Owns CloudKit records, queries, change streams, provider identity, albums, smart folders, and metadata decoding. |
 | Download facade and dispatch | `src/download/mod.rs`, `src/download/orchestration/dispatch.rs` | Preserves download entry points and composes full, incremental, targeted-backfill, and durable-retry work. |
-| Download models and configuration | `src/download/orchestration/models.rs`, `src/download/orchestration/config.rs` | Owns controls, results, reporting, checkpoint reasons, coverage fingerprints, and configuration hashes. |
+| Download models and configuration | `src/download/orchestration/models.rs`, `src/download/orchestration/config.rs` | Owns controls, results, per-zone checkpoint evidence, reporting projections, checkpoint reasons, coverage fingerprints, and configuration hashes. |
 | Download context and selection | `src/download/orchestration/context.rs`, `src/download/orchestration/selection.rs` | Loads library-scoped state and identity evidence, derives pass configurations, and checks incremental routing eligibility. |
 | Full enumeration | `src/download/orchestration/full.rs` | Owns bounded enumeration, album snapshots, pass counts, and token evidence. |
 | Incremental enumeration | `src/download/orchestration/incremental.rs`, `src/download/orchestration/delta.rs` | Runs separate streaming and collecting strategies with one shared delta-state owner for provider-event bookkeeping and routing facts. |
@@ -460,6 +460,25 @@ not weaken deferred state-write handling or infer that a visible final file
 means the database transition succeeded.
 
 ### Checkpoint advancement
+
+`SyncResult.checkpoint` carries the per-zone completion, interruption, state
+durability, identity, and token-block evidence. The source-checkpoint classifier
+reads this evidence and the result's source token and outcome. It does not read
+the reporting snapshot in `SyncResult.stats`.
+
+Full enumeration obtains evidence directly from pipeline finalization. Attached
+pending recovery and metadata-capture repair also supply execution evidence.
+Same-zone composition combines this evidence once, then projects its counters
+into the report. Recovery pass and record lists stay in the per-zone evidence;
+cycle reports do not accumulate them. Report fields and reason values keep
+their existing JSON representation.
+
+Incremental result assemblers still use `SyncResult::from_execution` to capture
+their execution statistics at the result boundary. This is the boundary of the
+pilot, not a second authority after result assembly. Later composition must use
+the captured evidence, never reconstruct it from a reporting snapshot. Query
+token holds, inventory/delta bridges, and unresolved identities update the
+evidence in their existing policy owners.
 
 Preserve the zone checkpoint on:
 

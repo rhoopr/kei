@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::download::metadata_rewrite;
 use crate::download::pipeline::{
-    MetadataFlags, StreamRuntime, StreamingResult, build_download_outcome, format_duration,
+    MetadataFlags, StreamRuntime, StreamingResult, build_download_result, format_duration,
     stream_and_download_from_stream,
 };
 use crate::icloud::photos::PhotoAsset;
@@ -1603,7 +1603,7 @@ pub(super) async fn download_photos_full_with_token_policy(
         && streaming_result.enumeration_errors == 0;
 
     // Capture the enumeration-complete signal before
-    // `build_download_outcome` consumes `streaming_result`. The marker
+    // `build_download_result` consumes `streaming_result`. The marker
     // gate below uses this signal directly so a partial-failure run
     // whose enumeration phase finished still clears the marker.
     let enumeration_complete = streaming_result.enumeration_complete;
@@ -1641,7 +1641,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     }
 
     // Build the outcome using the same logic as download_photos
-    let (outcome, mut stats) = build_download_outcome(
+    let mut result = build_download_result(
         download_client,
         passes,
         config,
@@ -1651,6 +1651,8 @@ pub(super) async fn download_photos_full_with_token_policy(
         shutdown_token,
     )
     .await?;
+    let stats = &mut result.stats;
+    let checkpoint = &mut result.checkpoint;
     stats.pagination_shortfall_warnings = pagination_shortfall_warnings;
     stats.pagination_shortfall_assets = pagination_shortfall_assets;
     stats.tail_probes = tail_probes;
@@ -1659,7 +1661,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     stats.api_total_at_start = api_total_at_start;
     stats.same_cycle_recovery_attempts = same_cycle_recovery_attempts;
     stats.same_cycle_recovery_successes = same_cycle_recovery_successes;
-    stats.checkpoint_retry_passes = checkpoint_retry_passes;
+    checkpoint.retry_passes = checkpoint_retry_passes;
     if token_attempt_allowed {
         stats.sync_token_expected_receivers = token_expected_receivers;
         stats.sync_token_receivers_with_token = token_receivers_with_token;
@@ -1681,7 +1683,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                         | None
                 )));
     if count_lookup_failed && token_eligible && sync_token.is_some() {
-        if !stats.sync_token_blocked {
+        if !checkpoint.sync_token_blocked {
             tracing::warn!(
                 count_probe_failures = len_errors,
                 "Count probes failed, but records/query completed naturally with a usable \
@@ -1698,18 +1700,18 @@ pub(super) async fn download_photos_full_with_token_policy(
         } else {
             DATE_BOUNDED_FULL_ENUMERATION_REASON
         };
-        stats.sync_token_blocked = true;
+        checkpoint.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some(bounded_reason);
         stats.sync_token_blocked_source = Some(sync_token_blocked_source(bounded_reason));
         stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(bounded_reason));
     } else if token_eligible && sync_token.is_none() {
         let reason = token_block_reason.unwrap_or("sync_token_unavailable");
-        stats.sync_token_blocked = true;
+        checkpoint.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some(reason);
         stats.sync_token_blocked_source = Some(sync_token_blocked_source(reason));
         stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(reason));
-    } else if count_lookup_failed && !stats.sync_token_blocked {
-        stats.sync_token_blocked = true;
+    } else if count_lookup_failed && !checkpoint.sync_token_blocked {
+        checkpoint.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some(ICLOUD_ALBUM_COUNT_ERROR_REASON);
         stats.sync_token_blocked_source =
             Some(sync_token_blocked_source(ICLOUD_ALBUM_COUNT_ERROR_REASON));
@@ -1720,7 +1722,7 @@ pub(super) async fn download_photos_full_with_token_policy(
         && sync_token.is_none()
         && let Some(reason) = token_block_reason
     {
-        stats.sync_token_blocked = true;
+        checkpoint.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some(reason);
         stats.sync_token_blocked_source = Some(sync_token_blocked_source(reason));
         stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(reason));
@@ -1740,12 +1742,10 @@ pub(super) async fn download_photos_full_with_token_policy(
         }
     }
 
-    Ok(SyncResult {
-        outcome,
-        sync_token,
-        stats,
-        full_enumeration_ran: true,
-    })
+    checkpoint.project(stats);
+    result.sync_token = sync_token;
+    result.full_enumeration_ran = true;
+    Ok(result)
 }
 
 #[cfg(test)]

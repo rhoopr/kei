@@ -569,7 +569,12 @@ fn sync_loop_stale_plan_combines_with_existing_gates() {
 #[tokio::test]
 async fn run_cycle_clean_zone_advances_despite_other_stale_plan() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let state_dir = tempfile::tempdir().expect("state directory");
+    let db: Arc<dyn download::DownloadStore> = Arc::new(
+        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
+            .await
+            .expect("file-backed state"),
+    );
     db.set_metadata("sync_token:PrimarySync", "primary-prev")
         .await
         .expect("seed primary token");
@@ -630,7 +635,12 @@ async fn run_cycle_clean_zone_advances_despite_other_stale_plan() {
 #[tokio::test]
 async fn run_cycle_stale_plan_blocks_database_precheck_token() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let state_dir = tempfile::tempdir().expect("state directory");
+    let db: Arc<dyn download::DownloadStore> = Arc::new(
+        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
+            .await
+            .expect("file-backed state"),
+    );
     db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
@@ -735,7 +745,12 @@ async fn run_cycle_published_file_state_write_failure_blocks_token() {
 
     let server = crate::start_wiremock_or_skip!();
     let config = make_run_cycle_config();
-    let inner = make_state_db();
+    let state_dir = tempfile::tempdir().expect("state directory");
+    let inner: Arc<dyn download::DownloadStore> = Arc::new(
+        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
+            .await
+            .expect("file-backed state"),
+    );
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
@@ -1017,7 +1032,12 @@ async fn run_cycle_durable_expired_url_failure_advances_zone_checkpoint() {
         .await;
 
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let state_dir = tempfile::tempdir().expect("state directory");
+    let db: Arc<dyn download::DownloadStore> = Arc::new(
+        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
+            .await
+            .expect("file-backed state"),
+    );
     db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
@@ -1080,7 +1100,12 @@ async fn run_cycle_expired_url_without_durable_retry_preserves_zone_checkpoint()
         .await;
 
     let config = make_run_cycle_config();
-    let inner = make_state_db();
+    let state_dir = tempfile::tempdir().expect("state directory");
+    let inner: Arc<dyn download::DownloadStore> = Arc::new(
+        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
+            .await
+            .expect("file-backed state"),
+    );
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
@@ -1214,7 +1239,12 @@ async fn run_cycle_durable_retry_survives_checkpoint_commit_failure() {
 #[tokio::test]
 async fn run_cycle_failed_token_repair_preserves_prior_sqlite_checkpoint() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let state_dir = tempfile::tempdir().expect("state directory");
+    let db: Arc<dyn download::DownloadStore> = Arc::new(
+        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
+            .await
+            .expect("file-backed state"),
+    );
     db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
         .await
         .unwrap();
@@ -1389,7 +1419,12 @@ async fn run_cycle_multi_zone_status_preserves_an_earlier_checkpoint_hold() {
 #[tokio::test]
 async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() {
     let config = make_run_cycle_config();
-    let inner = make_state_db();
+    let state_dir = tempfile::tempdir().expect("state directory");
+    let inner: Arc<dyn download::DownloadStore> = Arc::new(
+        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
+            .await
+            .expect("file-backed state"),
+    );
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
@@ -1450,4 +1485,151 @@ async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() 
             .exists(),
         "test must not pass by completing the download before cancellation"
     );
+}
+
+#[tokio::test]
+async fn checkpoint_pilot_holds_preserve_file_backed_state_across_cycles() {
+    for hold in ["dry_run", "missing_token", "stale_plan"] {
+        let mut config = make_run_cycle_config();
+        config.runtime.dry_run = hold == "dry_run";
+        let state_dir = tempfile::tempdir().unwrap();
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
+            state::SqliteStateDb::open(&state_dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "prior-token")
+            .await
+            .unwrap();
+        let download_dir = tempfile::tempdir().unwrap();
+        let existing_path = download_dir.path().join("unrelated.jpg");
+        std::fs::write(&existing_path, b"existing media must not change").unwrap();
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+        let controls = if config.runtime.dry_run {
+            download::DownloadControls::dry_run_hidden()
+        } else {
+            download::DownloadControls::download_hidden()
+        };
+        for _ in 0..2 {
+            let mut library = make_run_cycle_library_state_with_album(
+                "PrimarySync",
+                "sync_token:PrimarySync",
+                make_empty_full_album(if hold == "missing_token" {
+                    ""
+                } else {
+                    "candidate-token"
+                }),
+            );
+            library.plan_is_stale = hold == "stale_plan";
+            let result = run_cycle(
+                &[&library],
+                &config,
+                Some(db.as_ref()),
+                false,
+                &build_download_config,
+                controls,
+                &shared_session,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.db_sync_token_advance_safe, "{hold}");
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("prior-token"),
+                "{hold}"
+            );
+            assert_eq!(
+                db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("old-enum-hash"),
+                "{hold}"
+            );
+            assert_eq!(
+                std::fs::read(&existing_path).unwrap(),
+                b"existing media must not change"
+            );
+            assert_eq!(std::fs::read_dir(download_dir.path()).unwrap().count(), 1);
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn full_checkpoint_pilot_advances_with_durable_transfer_failure() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/expired.jpg"))
+        .respond_with(ResponseTemplate::new(410))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let config = make_run_cycle_config();
+    let state_dir = tempfile::tempdir().unwrap();
+    let db: Arc<dyn download::DownloadStore> = Arc::new(
+        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let download_dir = tempfile::tempdir().unwrap();
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let body = b"expired-body";
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+    let album = make_full_album_with_session(
+        "PrimarySync",
+        crate::test_helpers::MockPhotosSession::new()
+            .ok(album_count_response(1))
+            .ok(full_album_page_with_download(
+                "PrimarySync",
+                "master-full-expired",
+                "full-token",
+                &format!("{}/expired.jpg", server.uri()),
+                body.len() as u64,
+                &checksum,
+            )),
+    );
+    let library =
+        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let builder = make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+    let result = run_cycle(
+        &[&library],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 1);
+    assert_eq!(result.stats.state_write_failures, 0);
+    assert!(!result.can_advance_database_checkpoint());
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("full-token")
+    );
+    let summary = db.get_summary().await.unwrap();
+    assert_eq!(summary.pending + summary.failed, 1);
+    assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
 }
