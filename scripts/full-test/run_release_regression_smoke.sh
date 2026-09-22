@@ -44,10 +44,10 @@ echo "--- inactive album and smart-folder templates do not force full enumeratio
 run_lib_test download::orchestration::dispatch::tests::unfiled_only_incremental_ignores_inactive_album_path_templates
 
 echo "--- dotted config path handling ---"
-run_lib_test config::tests::test_expand_tilde_with_injected_home_uses_path_join
+run_lib_test config::paths::tests::test_expand_tilde_with_injected_home_uses_path_join
 host=$(rustc -vV | awk '/^host:/ { print $2 }')
 if [[ "$host" == *windows* ]]; then
-    run_lib_test config::tests::test_expand_tilde_windows_home_keeps_separator_before_dot_config
+    run_lib_test config::paths::tests::test_expand_tilde_windows_home_keeps_separator_before_dot_config
 else
     echo "skipping cfg(windows) dotted path smoke on host $host"
 fi

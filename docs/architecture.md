@@ -24,7 +24,13 @@ changing behavior.
 |------|-------|----------|
 | Process startup and dispatch | `src/lib.rs` | Starts the runtime, resolves bootstrap paths, configures logging, dispatches commands, and maps exit codes. |
 | CLI shape | `src/cli.rs` | Defines clap arguments and parsing. It does not execute command behavior. |
-| Runtime configuration | `src/config.rs` | Resolves TOML, environment, and command inputs into runtime policy. |
+| Runtime configuration facade | `src/config.rs` | Preserves configuration types, entry points, and visibility. |
+| Configuration input | `src/config/input.rs` | Owns the TOML schema and file loading. |
+| Runtime policy types | `src/config/runtime.rs` | Owns resolved configuration types, media selection, and date-bound semantics. |
+| Configuration resolution | `src/config/resolve.rs` | Resolves TOML, environment, and command inputs into runtime policy, including shared sync/import path fields. |
+| Configuration paths | `src/config/paths.rs` | Resolves bootstrap, data, and credential paths and validates download directories. |
+| Folder-template validation | `src/config/templates.rs` | Owns default category templates and validates token placement. |
+| Configuration persistence | `src/config/persistence.rs` | Projects runtime policy to TOML and writes first-run configuration. |
 | Selection grammar | `src/selection.rs` | Parses album, smart-folder, library, exclusion, and unfiled selectors. |
 | Sync/watch loop | `src/sync_loop.rs` | Owns authentication recovery, watch cadence, library/pass refresh, database pre-checks, and cycle-level reporting. |
 | One sync cycle | `src/sync_cycle.rs` | Chooses source enumeration, reconciles config drift, dispatches each library, and advances or preserves provider checkpoints. |

@@ -1354,6 +1354,7 @@ fn service_smoke_path_filters_cover_shared_dispatch() {
         "src/commands/service.rs",
         "src/cli.rs",
         "src/config.rs",
+        "src/config/**",
         "src/lib.rs",
         "src/commands/status.rs",
     ] {
