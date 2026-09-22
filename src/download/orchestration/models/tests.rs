@@ -21,12 +21,11 @@ use super::{
 
 #[test]
 fn test_sync_result_partial_failure() {
-    let result = SyncResult {
-        outcome: DownloadOutcome::PartialFailure { failed_count: 3 },
-        sync_token: Some("tok".to_string()),
-        stats: SyncStats::default(),
-        full_enumeration_ran: false,
-    };
+    let result = SyncResult::from_execution(
+        DownloadOutcome::PartialFailure { failed_count: 3 },
+        Some("tok".to_string()),
+        SyncStats::default(),
+    );
     match result.outcome {
         DownloadOutcome::PartialFailure { failed_count } => {
             assert_eq!(failed_count, 3);
@@ -37,14 +36,13 @@ fn test_sync_result_partial_failure() {
 
 #[test]
 fn test_sync_result_session_expired() {
-    let result = SyncResult {
-        outcome: DownloadOutcome::SessionExpired {
+    let result = SyncResult::from_execution(
+        DownloadOutcome::SessionExpired {
             auth_error_count: 5,
         },
-        sync_token: None,
-        stats: SyncStats::default(),
-        full_enumeration_ran: false,
-    };
+        None,
+        SyncStats::default(),
+    );
     match result.outcome {
         DownloadOutcome::SessionExpired { auth_error_count } => {
             assert_eq!(auth_error_count, 5);
@@ -122,12 +120,6 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         sync_token_unique_values: Some(1),
         same_cycle_recovery_attempts: 1,
         same_cycle_recovery_successes: 1,
-        checkpoint_retry_passes: vec![PassKey {
-            index: 0,
-            kind: PassKind::Album,
-            label: "album".to_string(),
-        }],
-        checkpoint_revalidate_records: vec![ProviderRecordId::new("master-a")],
         full_enumeration_reason: Some(FullEnumerationReason::NoStoredToken),
         elapsed_secs: 1.5,
         interrupted: false,
@@ -193,12 +185,6 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         sync_token_unique_values: Some(1),
         same_cycle_recovery_attempts: 2,
         same_cycle_recovery_successes: 1,
-        checkpoint_retry_passes: vec![PassKey {
-            index: 1,
-            kind: PassKind::Unfiled,
-            label: "unfiled".to_string(),
-        }],
-        checkpoint_revalidate_records: vec![ProviderRecordId::new("master-b")],
         full_enumeration_reason: Some(FullEnumerationReason::MetadataBackfill),
         elapsed_secs: 0.75,
         interrupted: true,
@@ -291,8 +277,6 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     assert_eq!(acc.sync_token_unique_values, Some(1));
     assert_eq!(acc.same_cycle_recovery_attempts, 3);
     assert_eq!(acc.same_cycle_recovery_successes, 2);
-    assert_eq!(acc.checkpoint_retry_passes.len(), 2);
-    assert_eq!(acc.checkpoint_revalidate_records.len(), 2);
     assert_eq!(
         acc.full_enumeration_reason,
         Some(FullEnumerationReason::NoStoredToken)
@@ -431,4 +415,89 @@ fn sync_stats_accumulate_into_empty_is_copy() {
     assert_eq!(dst.skipped.duplicates, 7);
     assert_eq!(dst.rate_limited, 4);
     assert!(dst.interrupted);
+}
+
+#[test]
+fn checkpoint_recovery_work_is_zone_local_not_report_state() {
+    let mut first =
+        SyncResult::from_execution(DownloadOutcome::Success, None, SyncStats::default());
+    let mut second =
+        SyncResult::from_execution(DownloadOutcome::Success, None, SyncStats::default());
+    for (index, result) in [&mut first, &mut second].into_iter().enumerate() {
+        result.checkpoint.retry_passes.push(PassKey {
+            index,
+            kind: PassKind::Album,
+            label: format!("album-{index}"),
+        });
+        result
+            .checkpoint
+            .revalidate_records
+            .push(ProviderRecordId::new(format!("master-{index}")));
+    }
+    first.accumulate(&second);
+    assert_eq!(first.checkpoint.retry_passes.len(), 2);
+    assert_eq!(first.checkpoint.revalidate_records.len(), 2);
+    assert_eq!(first.checkpoint.retry_passes[1].index, 1);
+    assert_eq!(
+        first.checkpoint.revalidate_records[1],
+        ProviderRecordId::new("master-1")
+    );
+    let mut cycle_report = SyncStats::default();
+    cycle_report.accumulate(&first.stats);
+    let report = serde_json::to_value(&cycle_report).unwrap();
+    assert!(report.get("checkpoint_retry_passes").is_none());
+    assert!(report.get("checkpoint_revalidate_records").is_none());
+    assert_eq!(first.checkpoint.retry_passes.len(), 2);
+}
+
+#[test]
+fn zone_composition_projects_evidence_without_reading_report_safety_counters() {
+    let mut source = SyncResult::from_execution(
+        DownloadOutcome::Success,
+        Some("token".into()),
+        SyncStats {
+            downloaded: 2,
+            state_write_failures: 2,
+            enumeration_errors: 3,
+            ..SyncStats::default()
+        },
+    );
+    let mut recovery = SyncResult::from_execution(
+        DownloadOutcome::Success,
+        None,
+        SyncStats {
+            downloaded: 3,
+            state_write_failures: 5,
+            enumeration_incomplete: true,
+            interrupted: true,
+            sync_token_blocked: true,
+            ..SyncStats::default()
+        },
+    );
+    // Simulate independent presentation edits after both results are assembled.
+    source.stats.state_write_failures = 0;
+    source.stats.enumeration_errors = 0;
+    recovery.stats.state_write_failures = 0;
+    recovery.stats.enumeration_incomplete = false;
+    recovery.stats.interrupted = false;
+    recovery.stats.sync_token_blocked = false;
+    source.accumulate(&recovery);
+    let expected = SyncStats {
+        downloaded: 5,
+        state_write_failures: 7,
+        enumeration_errors: 3,
+        enumeration_incomplete: true,
+        interrupted: true,
+        sync_token_blocked: true,
+        ..SyncStats::default()
+    };
+    assert_eq!(source.checkpoint.state_write_failures, 7);
+    assert!(source.checkpoint.enumeration_incomplete);
+    assert!(source.checkpoint.interrupted);
+    assert!(source.checkpoint.sync_token_blocked);
+    assert_eq!(source.sync_token.as_deref(), Some("token"));
+    assert_eq!(
+        serde_json::to_value(source.stats).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
 }

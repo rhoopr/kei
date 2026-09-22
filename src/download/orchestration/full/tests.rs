@@ -2095,13 +2095,26 @@ async fn full_sync_repairs_missing_pass_token_in_same_cycle() {
     config.concurrent_downloads = 1;
     config.file_match_policy = FileMatchPolicy::NameId7;
 
+    let state_dir = TempDir::new().unwrap();
+    let db: Arc<dyn DownloadStore> = Arc::new(
+        SqliteStateDb::open(&state_dir.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    config.state_db = Some(Arc::clone(&db));
     let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
     seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
 
-    let result = download_photos_full_with_token(
+    let expected_path = filter::expected_paths_for(&asset, &config.with_pass(&passes[0]))
+        .remove(0)
+        .path;
+    let original_bytes = std::fs::read(&expected_path).unwrap();
+    let before_rows = db.get_downloaded_page(0, 10).await.unwrap();
+    let config = Arc::new(config);
+    let mut result = download_photos_full_with_token(
         &Client::new(),
         &passes,
-        &Arc::new(config),
+        &config,
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
@@ -2115,6 +2128,38 @@ async fn full_sync_repairs_missing_pass_token_in_same_cycle() {
     assert_eq!(result.stats.sync_token_receivers_with_token, Some(1));
     assert_eq!(result.stats.sync_token_receivers_missing, Some(0));
     assert_eq!(query_calls.load(Ordering::SeqCst), 12);
+    let report = serde_json::to_value(&result.stats).unwrap();
+    result.stats.state_write_failures = 42;
+    result.stats.enumeration_errors = 42;
+    result.stats.sync_token_blocked = true;
+    assert_eq!(result.checkpoint.state_write_failures, 0);
+    assert_eq!(result.checkpoint.enumeration_errors, 0);
+    assert!(!result.checkpoint.sync_token_blocked);
+    result.checkpoint.project(&mut result.stats);
+    assert_eq!(serde_json::to_value(&result.stats).unwrap(), report);
+
+    let unchanged = download_photos_full_with_token(
+        &Client::new(),
+        &passes,
+        &config,
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        unchanged.sync_token.as_deref(),
+        Some("zone-token-recovered")
+    );
+    assert_eq!(unchanged.stats.same_cycle_recovery_attempts, 0);
+    assert_eq!(unchanged.stats.downloaded, 0);
+    assert_eq!(query_calls.load(Ordering::SeqCst), 18);
+    assert_eq!(std::fs::read(&expected_path).unwrap(), original_bytes);
+    let after_rows = db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(after_rows.len(), before_rows.len());
+    assert_eq!(after_rows[0].local_path, before_rows[0].local_path);
+    assert_eq!(after_rows[0].local_checksum, before_rows[0].local_checksum);
+    assert_eq!(after_rows[0].downloaded_at, before_rows[0].downloaded_at);
 }
 
 #[tokio::test]

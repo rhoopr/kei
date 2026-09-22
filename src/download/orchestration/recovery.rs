@@ -18,8 +18,8 @@ use crate::icloud::photos::ProviderRecordId;
 
 use super::config::DownloadConfig;
 use super::models::{
-    DownloadControls, DownloadOutcome, PENDING_RETRY_UNMATCHED_REASON, SyncResult, SyncStats,
-    merge_download_outcomes,
+    CheckpointEvidence, DownloadControls, DownloadOutcome, PENDING_RETRY_UNMATCHED_REASON,
+    SyncResult, SyncStats, merge_download_outcomes,
 };
 use super::url_refresh::{
     RetryTaskKey, build_incremental_expired_url_retry_tasks, merge_expired_url_retry_result,
@@ -198,44 +198,43 @@ async fn run_targeted_recovery_pass(
         .map(|target| ProviderRecordId::new(target.asset_id.to_string()))
         .collect();
 
-    let stats = SyncStats {
+    let checkpoint = CheckpointEvidence {
+        state_write_failures: pass_result.state_write_failures,
+        interrupted: shutdown_token.is_cancelled()
+            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
+        revalidate_records: checkpoint_revalidate_records,
+        ..CheckpointEvidence::default()
+    };
+    let mut stats = SyncStats {
         downloaded: pass_result.downloaded,
         failed: failed.saturating_add(remaining_unmatched),
         bytes_downloaded: pass_result.bytes_downloaded,
         disk_bytes_written: pass_result.disk_bytes_written,
         exif_failures: pass_result.exif_failures,
-        state_write_failures: pass_result.state_write_failures,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        interrupted: shutdown_token.is_cancelled()
-            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
         rate_limited: pass_result.rate_limit_observations,
         photos_downloaded: pass_result.photos_downloaded,
         videos_downloaded: pass_result.videos_downloaded,
         recap: pass_result.recap.clone(),
-        checkpoint_revalidate_records,
         ..SyncStats::default()
     };
-    if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
-        return Ok(SyncResult {
-            outcome: DownloadOutcome::SessionExpired {
-                auth_error_count: pass_result.auth_errors,
-            },
-            sync_token: None,
-            stats,
-            full_enumeration_ran: false,
-        });
-    }
-
     let failed_count =
         failed + remaining_unmatched + pass_result.exif_failures + pass_result.state_write_failures;
+    let outcome = if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
+        DownloadOutcome::SessionExpired {
+            auth_error_count: pass_result.auth_errors,
+        }
+    } else if failed_count > 0 {
+        DownloadOutcome::PartialFailure { failed_count }
+    } else {
+        DownloadOutcome::Success
+    };
+    checkpoint.project(&mut stats);
     Ok(SyncResult {
-        outcome: if failed_count > 0 {
-            DownloadOutcome::PartialFailure { failed_count }
-        } else {
-            DownloadOutcome::Success
-        },
+        outcome,
         sync_token: None,
         stats,
+        checkpoint,
         full_enumeration_ran: false,
     })
 }
@@ -247,23 +246,29 @@ fn pending_retry_no_download_result(
     downloaded: usize,
 ) -> SyncResult {
     let remaining_unmatched = unmatched;
-    let stats = SyncStats {
+    let checkpoint = CheckpointEvidence {
+        interrupted: shutdown_token.is_cancelled(),
+        ..CheckpointEvidence::default()
+    };
+    let mut stats = SyncStats {
         downloaded,
         failed: remaining_unmatched,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        interrupted: shutdown_token.is_cancelled(),
         ..SyncStats::default()
     };
+    let outcome = if remaining_unmatched > 0 {
+        DownloadOutcome::PartialFailure {
+            failed_count: remaining_unmatched,
+        }
+    } else {
+        DownloadOutcome::Success
+    };
+    checkpoint.project(&mut stats);
     SyncResult {
-        outcome: if remaining_unmatched > 0 {
-            DownloadOutcome::PartialFailure {
-                failed_count: remaining_unmatched,
-            }
-        } else {
-            DownloadOutcome::Success
-        },
+        outcome,
         sync_token: None,
         stats,
+        checkpoint,
         full_enumeration_ran: false,
     }
 }
@@ -274,10 +279,10 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
     config: &Arc<DownloadConfig>,
     controls: DownloadControls,
     shutdown_token: CancellationToken,
-    sync_result: SyncResult,
+    mut sync_result: SyncResult,
 ) -> Result<SyncResult> {
     if !matches!(sync_result.outcome, DownloadOutcome::Success)
-        || sync_result.stats.interrupted
+        || sync_result.checkpoint.interrupted
         || shutdown_token.is_cancelled()
     {
         return Ok(sync_result);
@@ -304,39 +309,24 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
                 diagnostic = PENDING_RETRY_UNMATCHED_REASON,
                 "Targeted recovery failed before downloads; retaining durable state for a later cycle"
             );
-            SyncResult {
-                outcome: DownloadOutcome::PartialFailure { failed_count: 1 },
-                sync_token: None,
+            SyncResult::from_execution(
+                DownloadOutcome::PartialFailure { failed_count: 1 },
+                None,
                 stats,
-                full_enumeration_ran: false,
-            }
+            )
         }
     };
 
-    let SyncResult {
-        outcome: source_outcome,
-        sync_token: source_sync_token,
-        stats: mut combined_stats,
-        full_enumeration_ran: source_full_enumeration_ran,
-    } = sync_result;
-    let outcome = merge_download_outcomes(&source_outcome, &retry_result.outcome);
-    combined_stats.accumulate(&retry_result.stats);
-    let sync_token = if !combined_stats.sync_token_blocked
-        && !combined_stats.interrupted
-        && !controls.run_mode.is_dry_run()
-        && !controls.run_mode.only_print_filenames()
+    sync_result.outcome = merge_download_outcomes(&sync_result.outcome, &retry_result.outcome);
+    sync_result.accumulate(&retry_result);
+    if sync_result.checkpoint.sync_token_blocked
+        || sync_result.checkpoint.interrupted
+        || controls.run_mode.is_dry_run()
+        || controls.run_mode.only_print_filenames()
     {
-        source_sync_token
-    } else {
-        None
-    };
-
-    Ok(SyncResult {
-        outcome,
-        sync_token,
-        stats: combined_stats,
-        full_enumeration_ran: source_full_enumeration_ran || retry_result.full_enumeration_ran,
-    })
+        sync_result.sync_token = None;
+    }
+    Ok(sync_result)
 }
 
 #[cfg(test)]

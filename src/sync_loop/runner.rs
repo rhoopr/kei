@@ -674,11 +674,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             .await;
 
             if let Some(token) = watch_precheck.db_sync_token_after_success() {
-                if !cycle_result.session_expired
-                    && cycle_result.failed_count == 0
-                    && !cycle_result.stats.interrupted
-                    && cycle_result.db_sync_token_advance_safe
-                {
+                if cycle_result.can_advance_database_checkpoint() {
                     if let Some(db) = state_db.as_deref() {
                         store_scoped_db_sync_token(
                             db as &dyn state::SyncTokenStore,

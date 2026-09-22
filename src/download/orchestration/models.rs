@@ -179,6 +179,107 @@ pub struct SyncResult {
     pub stats: SyncStats,
     /// Whether this result came from a full records/query enumeration.
     pub(crate) full_enumeration_ran: bool,
+    /// Per-zone safety evidence. Reporting snapshots never authorize a checkpoint.
+    pub(crate) checkpoint: CheckpointEvidence,
+}
+
+/// Execution facts used by the existing source-checkpoint classifier.
+///
+/// Recovery work stays zone-local and is not accumulated into cycle reports.
+/// Reported counters are projections, not another checkpoint permission source.
+#[derive(Debug, Default)]
+#[must_use]
+pub(crate) struct CheckpointEvidence {
+    pub(crate) state_write_failures: usize,
+    pub(crate) enumeration_errors: usize,
+    pub(crate) enumeration_incomplete: bool,
+    pub(crate) interrupted: bool,
+    pub(crate) identity_incomplete: bool,
+    pub(crate) sync_token_blocked: bool,
+    pub(crate) retry_passes: Vec<PassKey>,
+    pub(crate) revalidate_records: Vec<ProviderRecordId>,
+}
+
+impl CheckpointEvidence {
+    /// Boundary adapter for result producers outside the full-enumeration pilot.
+    /// Call only when execution finishes, never to refresh an existing result
+    /// from its report. Full enumeration supplies pipeline evidence directly.
+    fn from_execution_stats(stats: &SyncStats) -> Self {
+        Self {
+            state_write_failures: stats.state_write_failures,
+            enumeration_errors: stats.enumeration_errors,
+            enumeration_incomplete: stats.enumeration_incomplete,
+            interrupted: stats.interrupted,
+            identity_incomplete: stats.identity_incomplete,
+            sync_token_blocked: stats.sync_token_blocked,
+            ..Self::default()
+        }
+    }
+
+    fn accumulate(&mut self, other: &Self) {
+        self.state_write_failures += other.state_write_failures;
+        self.enumeration_errors += other.enumeration_errors;
+        self.enumeration_incomplete |= other.enumeration_incomplete;
+        self.interrupted |= other.interrupted;
+        self.identity_incomplete |= other.identity_incomplete;
+        self.sync_token_blocked |= other.sync_token_blocked;
+        self.retry_passes.extend(other.retry_passes.iter().cloned());
+        self.revalidate_records
+            .extend(other.revalidate_records.iter().cloned());
+    }
+
+    pub(crate) fn project(&self, stats: &mut SyncStats) {
+        stats.state_write_failures = self.state_write_failures;
+        stats.enumeration_errors = self.enumeration_errors;
+        stats.enumeration_incomplete = self.enumeration_incomplete;
+        stats.interrupted = self.interrupted;
+        stats.identity_incomplete = self.identity_incomplete;
+        stats.sync_token_blocked = self.sync_token_blocked;
+    }
+}
+
+impl SyncResult {
+    /// Finish an existing non-pilot result producer. Subsequent composition
+    /// must use the evidence, not re-read the reporting snapshot.
+    pub(crate) fn from_execution(
+        outcome: DownloadOutcome,
+        sync_token: Option<String>,
+        stats: SyncStats,
+    ) -> Self {
+        let checkpoint = CheckpointEvidence::from_execution_stats(&stats);
+        Self {
+            outcome,
+            sync_token,
+            stats,
+            full_enumeration_ran: false,
+            checkpoint,
+        }
+    }
+
+    /// Compose evidence and reports in one zone. The caller retains ownership
+    /// of outcome precedence and source-token selection.
+    pub(crate) fn accumulate(&mut self, other: &Self) {
+        self.stats.accumulate_report_counters(&other.stats);
+        self.checkpoint.accumulate(&other.checkpoint);
+        self.checkpoint.project(&mut self.stats);
+        self.full_enumeration_ran |= other.full_enumeration_ran;
+    }
+
+    pub(crate) fn block_for_unresolved_identity(&mut self) {
+        self.checkpoint.identity_incomplete = true;
+        self.checkpoint.sync_token_blocked = true;
+        block_sync_token_for_unresolved_identity(&mut self.stats);
+    }
+
+    pub(super) fn block_incremental_token(&mut self, reason: &'static str) {
+        self.checkpoint.sync_token_blocked = true;
+        block_sync_token_for_incremental_delta(&mut self.stats, reason);
+    }
+
+    pub(super) fn clear_full_query_token_block(&mut self) {
+        self.checkpoint.sync_token_blocked = false;
+        clear_full_query_token_block_stats(&mut self.stats);
+    }
 }
 
 /// Accumulated statistics from a sync run, used for JSON reports and notifications.
@@ -299,10 +400,6 @@ pub struct SyncStats {
     pub same_cycle_recovery_attempts: usize,
     /// Pass-token recovery rounds that completed checkpoint proof.
     pub same_cycle_recovery_successes: usize,
-    #[serde(skip)]
-    pub(crate) checkpoint_retry_passes: Vec<PassKey>,
-    #[serde(skip)]
-    pub(crate) checkpoint_revalidate_records: Vec<ProviderRecordId>,
     pub elapsed_secs: f64,
     pub interrupted: bool,
     /// Number of tasks that observed at least one HTTP 429 / 503 response
@@ -357,6 +454,18 @@ impl SyncStats {
     /// otherwise the new counter silently zeros out across multi-library
     /// syncs.
     pub fn accumulate(&mut self, other: &SyncStats) {
+        self.accumulate_report_counters(other);
+        self.state_write_failures += other.state_write_failures;
+        self.enumeration_errors += other.enumeration_errors;
+        self.enumeration_incomplete = self.enumeration_incomplete || other.enumeration_incomplete;
+        self.identity_incomplete |= other.identity_incomplete;
+        self.sync_token_blocked = self.sync_token_blocked || other.sync_token_blocked;
+        self.interrupted = self.interrupted || other.interrupted;
+    }
+
+    // Per-zone composition folds safety fields only in CheckpointEvidence.
+    // Cycle reports separately aggregate their projected counters above.
+    fn accumulate_report_counters(&mut self, other: &SyncStats) {
         self.assets_seen += other.assets_seen;
         let had_api_total = self.api_total_at_start.is_some();
         let other_has_api_total = other.api_total_at_start.is_some();
@@ -382,15 +491,12 @@ impl SyncStats {
         self.metadata_capture_failures += other.metadata_capture_failures;
         self.metadata_capture_remaining += other.metadata_capture_remaining;
         self.metadata_capture_progressed |= other.metadata_capture_progressed;
-        self.state_write_failures += other.state_write_failures;
-        self.enumeration_errors += other.enumeration_errors;
         self.count_probe_failures += other.count_probe_failures;
         self.stale_pending_pruned += other.stale_pending_pruned;
         self.pagination_shortfall_warnings += other.pagination_shortfall_warnings;
         self.pagination_shortfall_assets += other.pagination_shortfall_assets;
         self.tail_probes += other.tail_probes;
         self.count_undercount_assets += other.count_undercount_assets;
-        self.enumeration_incomplete = self.enumeration_incomplete || other.enumeration_incomplete;
         self.inventory_drop_warnings += other.inventory_drop_warnings;
         if other.inventory_drop_assets > self.inventory_drop_assets {
             self.inventory_drop_assets = other.inventory_drop_assets;
@@ -399,8 +505,6 @@ impl SyncStats {
             self.inventory_drop_current_total = other.inventory_drop_current_total;
             self.inventory_drop_library = other.inventory_drop_library.clone();
         }
-        self.identity_incomplete |= other.identity_incomplete;
-        self.sync_token_blocked = self.sync_token_blocked || other.sync_token_blocked;
         if self.sync_token_blocked_reason.is_none() {
             self.sync_token_blocked_reason = other.sync_token_blocked_reason;
         }
@@ -436,12 +540,7 @@ impl SyncStats {
         }
         self.same_cycle_recovery_attempts += other.same_cycle_recovery_attempts;
         self.same_cycle_recovery_successes += other.same_cycle_recovery_successes;
-        self.checkpoint_retry_passes
-            .extend(other.checkpoint_retry_passes.iter().cloned());
-        self.checkpoint_revalidate_records
-            .extend(other.checkpoint_revalidate_records.iter().cloned());
         self.elapsed_secs += other.elapsed_secs;
-        self.interrupted = self.interrupted || other.interrupted;
         self.rate_limited += other.rate_limited;
         self.photos_downloaded += other.photos_downloaded;
         self.videos_downloaded += other.videos_downloaded;

@@ -15,7 +15,10 @@ use crate::download::finalize::{
     state_write_circuit_breaker_tripped,
 };
 use crate::download::metadata_rewrite::MetadataFlags;
-use crate::download::{DownloadConfig, DownloadControls, DownloadOutcome, metadata_rewrite};
+use crate::download::{
+    CheckpointEvidence, DownloadConfig, DownloadControls, DownloadOutcome, SyncResult,
+    metadata_rewrite,
+};
 use crate::state::SyncRunStats;
 
 use super::StreamPipelineShared;
@@ -254,12 +257,17 @@ fn producer_enumeration_incomplete(
         && !result.url_expired_abort
 }
 
-fn mark_producer_enumeration_incomplete(stats: &mut crate::download::SyncStats, incomplete: bool) {
+fn mark_producer_enumeration_incomplete(
+    stats: &mut crate::download::SyncStats,
+    checkpoint: &mut CheckpointEvidence,
+    incomplete: bool,
+) {
+    checkpoint.enumeration_incomplete = incomplete;
+    checkpoint.sync_token_blocked |= incomplete;
+    checkpoint.project(stats);
     if !incomplete {
         return;
     }
-    stats.enumeration_incomplete = true;
-    stats.sync_token_blocked = true;
     if stats.sync_token_blocked_reason.is_none() {
         stats.sync_token_blocked_reason =
             Some(crate::download::PRODUCER_ENUMERATION_INCOMPLETE_REASON);
@@ -289,6 +297,29 @@ pub(in crate::download) async fn build_download_outcome(
     started: Instant,
     shutdown_token: CancellationToken,
 ) -> Result<(DownloadOutcome, crate::download::SyncStats)> {
+    let result = build_download_result(
+        download_client,
+        passes,
+        config,
+        controls,
+        streaming_result,
+        started,
+        shutdown_token,
+    )
+    .await?;
+    Ok((result.outcome, result.stats))
+}
+
+/// Finalize execution evidence before deriving its reporting snapshot.
+pub(in crate::download) async fn build_download_result(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    streaming_result: StreamingResult,
+    started: Instant,
+    shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
     let run_mode = controls.run_mode;
     let downloaded = streaming_result.downloaded;
     let mut exif_failures = streaming_result.exif_failures;
@@ -298,10 +329,18 @@ pub(in crate::download) async fn build_download_outcome(
     let enumeration_errors = streaming_result.enumeration_errors;
     let enumeration_incomplete =
         producer_enumeration_incomplete(&streaming_result, &shutdown_token);
+    let mut checkpoint = CheckpointEvidence {
+        state_write_failures,
+        enumeration_errors,
+        interrupted: shutdown_token.is_cancelled(),
+        ..CheckpointEvidence::default()
+    };
     let failed_tasks = streaming_result.failed;
     let skip_breakdown: crate::download::SkipBreakdown = streaming_result.skip_summary.into();
 
     if auth_errors >= AUTH_ERROR_THRESHOLD || provider_auth_errors > 0 {
+        checkpoint.interrupted = true;
+        checkpoint.enumeration_incomplete = enumeration_incomplete;
         let stats = crate::download::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
@@ -310,26 +349,21 @@ pub(in crate::download) async fn build_download_outcome(
             bytes_downloaded: streaming_result.bytes_downloaded,
             disk_bytes_written: streaming_result.disk_bytes_written,
             exif_failures,
-            state_write_failures,
-            enumeration_errors,
             pagination_shortfall_warnings: 0,
             pagination_shortfall_assets: 0,
-            enumeration_incomplete,
-            sync_token_blocked: false,
-            sync_token_blocked_reason: None,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            interrupted: true,
             rate_limited: streaming_result.rate_limit_observations,
             photos_downloaded: streaming_result.photos_downloaded,
             videos_downloaded: streaming_result.videos_downloaded,
             recap: streaming_result.recap.clone(),
             ..crate::download::SyncStats::default()
         };
-        return Ok((
+        return Ok(finish_download_result(
             DownloadOutcome::SessionExpired {
                 auth_error_count: auth_errors + provider_auth_errors,
             },
             stats,
+            checkpoint,
         ));
     }
 
@@ -339,13 +373,10 @@ pub(in crate::download) async fn build_download_outcome(
             assets_seen: streaming_result.assets_seen,
             skipped: skip_breakdown,
             exif_failures,
-            state_write_failures,
-            enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            interrupted: shutdown_token.is_cancelled(),
             ..crate::download::SyncStats::default()
         };
-        mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
+        mark_producer_enumeration_incomplete(&mut stats, &mut checkpoint, enumeration_incomplete);
         if run_mode.is_dry_run() {
             tracing::info!(target: "kei::download::pipeline", "── Dry Run Summary ──");
             tracing::info!(target: "kei::download::pipeline", "  0 files would be downloaded");
@@ -365,22 +396,29 @@ pub(in crate::download) async fn build_download_outcome(
             + usize::from(streaming_result.url_expired_abort)
             + usize::from(enumeration_incomplete);
         if failed_count > 0 {
-            return Ok((DownloadOutcome::PartialFailure { failed_count }, stats));
+            return Ok(finish_download_result(
+                DownloadOutcome::PartialFailure { failed_count },
+                stats,
+                checkpoint,
+            ));
         }
-        return Ok((DownloadOutcome::Success, stats));
+        return Ok(finish_download_result(
+            DownloadOutcome::Success,
+            stats,
+            checkpoint,
+        ));
     }
 
     if run_mode.is_dry_run() {
+        checkpoint.state_write_failures = 0;
         let mut stats = crate::download::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
-            enumeration_errors,
             skipped: skip_breakdown,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            interrupted: shutdown_token.is_cancelled(),
             ..crate::download::SyncStats::default()
         };
-        mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
+        mark_producer_enumeration_incomplete(&mut stats, &mut checkpoint, enumeration_incomplete);
         tracing::info!(target: "kei::download::pipeline", "── Dry Run Summary ──");
         if shutdown_token.is_cancelled() {
             tracing::info!(target: "kei::download::pipeline", scanned = downloaded, "  Interrupted before shutdown");
@@ -391,9 +429,17 @@ pub(in crate::download) async fn build_download_outcome(
         tracing::info!(target: "kei::download::pipeline", concurrency = config.concurrent_downloads, "  concurrency");
         let failed_count = enumeration_errors + usize::from(enumeration_incomplete);
         if failed_count > 0 {
-            return Ok((DownloadOutcome::PartialFailure { failed_count }, stats));
+            return Ok(finish_download_result(
+                DownloadOutcome::PartialFailure { failed_count },
+                stats,
+                checkpoint,
+            ));
         }
-        return Ok((DownloadOutcome::Success, stats));
+        return Ok(finish_download_result(
+            DownloadOutcome::Success,
+            stats,
+            checkpoint,
+        ));
     }
 
     if streaming_result.url_expired_abort {
@@ -406,24 +452,18 @@ pub(in crate::download) async fn build_download_outcome(
             bytes_downloaded: streaming_result.bytes_downloaded,
             disk_bytes_written: streaming_result.disk_bytes_written,
             exif_failures,
-            state_write_failures,
-            enumeration_errors,
             pagination_shortfall_warnings: 0,
             pagination_shortfall_assets: 0,
-            enumeration_incomplete,
-            sync_token_blocked: false,
-            sync_token_blocked_reason: None,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            interrupted: shutdown_token.is_cancelled(),
             rate_limited: streaming_result.rate_limit_observations,
             photos_downloaded: streaming_result.photos_downloaded,
             videos_downloaded: streaming_result.videos_downloaded,
             recap: streaming_result.recap.clone(),
             ..crate::download::SyncStats::default()
         };
-        mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
+        mark_producer_enumeration_incomplete(&mut stats, &mut checkpoint, enumeration_incomplete);
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
-        return Ok((
+        return Ok(finish_download_result(
             DownloadOutcome::PartialFailure {
                 failed_count: failed_tasks.len()
                     + state_write_failures
@@ -433,6 +473,7 @@ pub(in crate::download) async fn build_download_outcome(
                     + 1,
             },
             stats,
+            checkpoint,
         ));
     }
 
@@ -446,21 +487,16 @@ pub(in crate::download) async fn build_download_outcome(
             bytes_downloaded: streaming_result.bytes_downloaded,
             disk_bytes_written: streaming_result.disk_bytes_written,
             exif_failures,
-            state_write_failures,
-            enumeration_errors,
             pagination_shortfall_warnings: 0,
             pagination_shortfall_assets: 0,
-            sync_token_blocked: false,
-            sync_token_blocked_reason: None,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            interrupted: shutdown_token.is_cancelled(),
             rate_limited: streaming_result.rate_limit_observations,
             photos_downloaded: streaming_result.photos_downloaded,
             videos_downloaded: streaming_result.videos_downloaded,
             recap: streaming_result.recap.clone(),
             ..crate::download::SyncStats::default()
         };
-        mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
+        mark_producer_enumeration_incomplete(&mut stats, &mut checkpoint, enumeration_incomplete);
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
         if state_write_failures > 0
             || enumeration_errors > 0
@@ -468,7 +504,7 @@ pub(in crate::download) async fn build_download_outcome(
             || retry_exhausted > 0
             || enumeration_incomplete
         {
-            return Ok((
+            return Ok(finish_download_result(
                 DownloadOutcome::PartialFailure {
                     failed_count: state_write_failures
                         + enumeration_errors
@@ -477,9 +513,14 @@ pub(in crate::download) async fn build_download_outcome(
                         + usize::from(enumeration_incomplete),
                 },
                 stats,
+                checkpoint,
             ));
         }
-        return Ok((DownloadOutcome::Success, stats));
+        return Ok(finish_download_result(
+            DownloadOutcome::Success,
+            stats,
+            checkpoint,
+        ));
     }
 
     // Phase 2: cleanup pass with fresh CDN URLs
@@ -528,9 +569,12 @@ pub(in crate::download) async fn build_download_outcome(
     let phase2_auth_errors = pass_result.auth_errors;
     exif_failures += pass_result.exif_failures;
     state_write_failures += pass_result.state_write_failures;
+    checkpoint.state_write_failures = state_write_failures;
+    checkpoint.interrupted = shutdown_token.is_cancelled();
     let total_auth_errors = auth_errors + phase2_auth_errors;
 
     if total_auth_errors >= AUTH_ERROR_THRESHOLD {
+        checkpoint.interrupted = true;
         let mut merged_recap = streaming_result.recap.clone();
         merged_recap.merge(pass_result.recap.clone());
         let stats = crate::download::SyncStats {
@@ -542,14 +586,9 @@ pub(in crate::download) async fn build_download_outcome(
             disk_bytes_written: streaming_result.disk_bytes_written
                 + pass_result.disk_bytes_written,
             exif_failures,
-            state_write_failures,
-            enumeration_errors,
             pagination_shortfall_warnings: 0,
             pagination_shortfall_assets: 0,
-            sync_token_blocked: false,
-            sync_token_blocked_reason: None,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            interrupted: true,
             rate_limited: streaming_result.rate_limit_observations
                 + pass_result.rate_limit_observations,
             photos_downloaded: streaming_result.photos_downloaded + pass_result.photos_downloaded,
@@ -557,11 +596,12 @@ pub(in crate::download) async fn build_download_outcome(
             recap: merged_recap,
             ..crate::download::SyncStats::default()
         };
-        return Ok((
+        return Ok(finish_download_result(
             DownloadOutcome::SessionExpired {
                 auth_error_count: total_auth_errors,
             },
             stats,
+            checkpoint,
         ));
     }
 
@@ -595,15 +635,9 @@ pub(in crate::download) async fn build_download_outcome(
         bytes_downloaded: streaming_result.bytes_downloaded + pass_result.bytes_downloaded,
         disk_bytes_written: streaming_result.disk_bytes_written + pass_result.disk_bytes_written,
         exif_failures,
-        state_write_failures,
-        enumeration_errors,
         pagination_shortfall_warnings: 0,
         pagination_shortfall_assets: 0,
-        enumeration_incomplete,
-        sync_token_blocked: false,
-        sync_token_blocked_reason: None,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        interrupted: shutdown_token.is_cancelled(),
         rate_limited: streaming_result.rate_limit_observations
             + pass_result.rate_limit_observations,
         photos_downloaded: streaming_result.photos_downloaded + pass_result.photos_downloaded,
@@ -611,20 +645,41 @@ pub(in crate::download) async fn build_download_outcome(
         recap: merged_recap,
         ..crate::download::SyncStats::default()
     };
-    mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
+    mark_producer_enumeration_incomplete(&mut stats, &mut checkpoint, enumeration_incomplete);
     maybe_warn_rate_limit_pressure(&stats);
     log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
 
     if total_failures > 0 {
-        return Ok((
+        return Ok(finish_download_result(
             DownloadOutcome::PartialFailure {
                 failed_count: total_failures,
             },
             stats,
+            checkpoint,
         ));
     }
 
-    Ok((DownloadOutcome::Success, stats))
+    Ok(finish_download_result(
+        DownloadOutcome::Success,
+        stats,
+        checkpoint,
+    ))
+}
+
+#[must_use]
+fn finish_download_result(
+    outcome: DownloadOutcome,
+    mut stats: crate::download::SyncStats,
+    checkpoint: CheckpointEvidence,
+) -> SyncResult {
+    checkpoint.project(&mut stats);
+    SyncResult {
+        outcome,
+        sync_token: None,
+        stats,
+        checkpoint,
+        full_enumeration_ran: false,
+    }
 }
 
 #[cfg(test)]
