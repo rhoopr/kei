@@ -354,3 +354,20 @@ Manual real-install coverage:
 exists, and it uninstalls the service before returning. The installer may
 temporarily enable user linger; uninstall restores the prior linger state when
 that state was recorded during install.
+
+## Sparse-share identity regression
+
+`tests/data/sparse_shared_asset.json` is synthetic, with invented identifiers.
+It reproduces the reported sparse record structure, not an authenticated Apple
+fixture. Parser and lookup tests preserve opaque share evidence and check
+malformed fields, redacted output, requested fields, and no linked-target
+requests. The full-cycle unresolved-identity test also runs with this record
+pointing to a zone absent from the selected libraries. It reopens SQLite,
+checks another zone's success, preserves seeded media, and proves explicit
+source-deletion recovery and an unchanged follow-up cycle. It covers malformed
+and changed links, rejects unrelated durable identity mappings, and injects an
+unresolved-marker write failure before replay. The source checkpoint stays
+unchanged until recovery. A DEBUG-level capture checks that changed-link
+diagnostics contain no record, zone, or owner identifiers. Exact-master
+recovery tests also run with sparse linkage present. These tests do not prove
+a safe remapping rule for photos retained after shared-library removal.

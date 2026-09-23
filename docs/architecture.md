@@ -123,6 +123,21 @@ master references, and record-level provider errors. Reference-zone context is
 classified without logging provider identifiers or response bodies. These
 observations do not authorize identity guesses or cross-zone retries.
 
+Unpaired asset deltas retain typed sparse-share evidence from
+`isSparsePrivateRecord` and the `linkedShare*` fields. Targeted record lookups
+request these fields too; ordinary media enumeration keeps its existing field
+projection. A structurally valid link remains unverified. Malformed links and
+valid links without a usable master remain unresolved. Link identifiers are
+opaque and their debug output is redacted. Lookup changes do not overwrite the
+original delta evidence or authorize a target lookup.
+
+This evidence lives on the event and lookup result, not in a new SQLite table.
+The existing unresolved marker and retained checkpoint preserve the retry
+obligation across restart. Exact source asset/master mappings still use the
+normal recovery path. A linked record name, missing/deleted shared zone, or
+history of removing a Shared Photo Library is not a source deletion or master
+identity. No automatic cross-zone recovery or checkpoint relaxation is added.
+
 The per-zone provider checkpoint and the scoped database pre-check token have
 different gates:
 

@@ -46,6 +46,99 @@ pub(crate) enum MalformedRequiredAssetField {
     AssetDate,
 }
 
+/// Sparse-share metadata is evidence, not a resolved master or deletion proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SparseShareEvidence {
+    /// A sparse marker and structurally valid share link. The target is unverified.
+    Linked(SparseShareLink),
+    /// Share metadata was present but its marker, field types, or link was invalid.
+    Malformed,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SparseShareId(Box<str>);
+
+/// An opaque, unverified share link. Debug output never includes provider IDs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SparseShareLink {
+    record_name: SparseShareId,
+    zone_name: SparseShareId,
+    owner_record_name: SparseShareId,
+}
+
+impl std::fmt::Debug for SparseShareLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SparseShareLink(<redacted>)")
+    }
+}
+
+impl SparseShareEvidence {
+    pub(crate) fn from_fields(fields: &Value) -> Option<Self> {
+        let has_link = [
+            "linkedShareRecordName",
+            "linkedShareZoneName",
+            "linkedShareZoneOwner",
+        ]
+        .iter()
+        .any(|key| fields.get(key).is_some());
+        let marker = fields.get("isSparsePrivateRecord");
+        if !has_link
+            && (marker.is_none()
+                || (marker.and_then(|v| v.get("value")).and_then(Value::as_i64) == Some(0)
+                    && marker
+                        .and_then(|v| v.get("type"))
+                        .is_none_or(|kind| kind.as_str() == Some("INT64"))))
+        {
+            return None;
+        }
+        fn field<'a>(fields: &'a Value, key: &str, kind: &str) -> Option<&'a Value> {
+            let field = fields.get(key)?;
+            if field
+                .get("type")
+                .is_some_and(|value| value.as_str() != Some(kind))
+            {
+                return None;
+            }
+            field.get("value")
+        }
+        fn identifier(value: Option<&Value>) -> Option<SparseShareId> {
+            value
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| SparseShareId(s.into()))
+        }
+        let link = (|| {
+            if field(fields, "isSparsePrivateRecord", "INT64").and_then(Value::as_i64) != Some(1) {
+                return None;
+            }
+            let record_name = identifier(field(fields, "linkedShareRecordName", "STRING"))?;
+            let zone_name = identifier(field(fields, "linkedShareZoneName", "STRING"))?;
+            let owner_record_name =
+                identifier(field(fields, "linkedShareZoneOwner", "REFERENCE")?.get("recordName"))?;
+            if zone_name
+                .0
+                .strip_prefix("SharedSync-")
+                .is_none_or(str::is_empty)
+            {
+                return None;
+            }
+            Some(SparseShareLink {
+                record_name,
+                zone_name,
+                owner_record_name,
+            })
+        })();
+        Some(link.map_or(Self::Malformed, Self::Linked))
+    }
+
+    pub(crate) const fn diagnostic(&self) -> &'static str {
+        match self {
+            Self::Linked(_) => "sparse_share_reference_unresolved",
+            Self::Malformed => "sparse_share_reference_malformed",
+        }
+    }
+}
+
 /// A change event from the `changes/zone` delta API.
 #[derive(Debug)]
 pub struct ChangeEvent {
@@ -60,6 +153,9 @@ pub struct ChangeEvent {
     /// reference so state transitions can resolve unpaired asset deltas
     /// against the same key family that normal downloads use.
     pub master_record_name: Option<Box<str>>,
+    /// Unverified sparse-share evidence retained from an unpaired asset delta.
+    /// This must never be used as a master identity or permission to skip work.
+    pub sparse_share: Option<SparseShareEvidence>,
     /// Why this record changed
     pub reason: ChangeReason,
     /// The photo asset, if this is a CPLMaster+CPLAsset pair that was successfully paired.
@@ -80,6 +176,7 @@ impl ChangeEvent {
             record_name,
             record_type,
             master_record_name: None,
+            sparse_share: None,
             reason,
             asset: None,
             album: None,
@@ -902,12 +999,15 @@ impl DeltaRecordBuffer {
                                     .push(record);
                             }
                         } else {
-                            // CPLAsset with no masterRef -- metadata-only change
-                            events.push(ChangeEvent::new(
+                            // Missing master identity may be a sparse-share reference.
+                            let sparse_share = SparseShareEvidence::from_fields(&record.fields);
+                            let mut event = ChangeEvent::new(
                                 record.record_name.into_boxed_str(),
                                 Some("CPLAsset".into()),
                                 reason,
-                            ));
+                            );
+                            event.sparse_share = sparse_share;
+                            events.push(event);
                         }
                     }
                     "CPLAlbum" => {
@@ -950,6 +1050,7 @@ impl DeltaRecordBuffer {
                     reason,
                 );
                 event.master_record_name = Some(master_ref.clone().into_boxed_str());
+                event.sparse_share = SparseShareEvidence::from_fields(&record.fields);
                 events.push(event);
             }
         }
@@ -1044,6 +1145,97 @@ impl Drop for DeltaRecordBuffer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sparse_share_evidence_is_preserved_without_guessing_a_master() {
+        let raw = crate::test_helpers::sparse_shared_asset_record();
+        let mut buffer = DeltaRecordBuffer::new();
+        let events = buffer.process_records(vec![serde_json::from_value(raw.clone()).unwrap()]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, ChangeReason::Created);
+        assert!(events[0].asset.is_none());
+        assert!(events[0].master_record_name.is_none());
+        let evidence = events[0].sparse_share.as_ref().unwrap();
+        let SparseShareEvidence::Linked(link) = evidence else {
+            panic!("expected linked evidence")
+        };
+        assert_eq!(&*link.record_name.0, "private-linked-child");
+        assert_eq!(&*link.zone_name.0, "SharedSync-private-removed");
+        assert_eq!(&*link.owner_record_name.0, "private-owner");
+        assert_eq!(
+            format!("{evidence:?}"),
+            "Linked(SparseShareLink(<redacted>))"
+        );
+        assert_eq!(evidence.diagnostic(), "sparse_share_reference_unresolved");
+        // An unpaired asset with an authoritative master still retains share evidence.
+        let mut paired = raw;
+        paired["fields"]["masterRef"] = json!({"value":{"recordName":"personal-master"}});
+        assert!(
+            buffer
+                .process_records(vec![serde_json::from_value(paired).unwrap()])
+                .is_empty()
+        );
+        let flushed = buffer.flush();
+        assert_eq!(
+            flushed[0].master_record_name.as_deref(),
+            Some("personal-master")
+        );
+        assert_eq!(flushed[0].sparse_share.as_ref(), Some(evidence));
+    }
+
+    #[test]
+    fn malformed_sparse_share_fields_remain_unverified() {
+        let original = crate::test_helpers::sparse_shared_asset_record();
+        for (pointer, value) in [
+            ("/isSparsePrivateRecord/value", json!("1")),
+            ("/isSparsePrivateRecord/value", json!(0)),
+            ("/isSparsePrivateRecord/type", json!("STRING")),
+            ("/linkedShareRecordName/value", json!(" ")),
+            ("/linkedShareRecordName/type", json!("REFERENCE")),
+            ("/linkedShareZoneName/value", json!("SharedSync-")),
+            ("/linkedShareZoneName/value", json!("PrimarySync")),
+            ("/linkedShareZoneOwner/value", json!("private-owner")),
+            ("/linkedShareZoneOwner/value/recordName", json!(null)),
+        ] {
+            let mut record = original.clone();
+            *record["fields"].pointer_mut(pointer).unwrap() = value;
+            let mut buffer = DeltaRecordBuffer::new();
+            let events = buffer.process_records(vec![serde_json::from_value(record).unwrap()]);
+            assert_eq!(
+                events[0].sparse_share,
+                Some(SparseShareEvidence::Malformed),
+                "{pointer}"
+            );
+            assert!(events[0].asset.is_none());
+            assert!(events[0].master_record_name.is_none());
+        }
+        for key in [
+            "isSparsePrivateRecord",
+            "linkedShareRecordName",
+            "linkedShareZoneName",
+            "linkedShareZoneOwner",
+        ] {
+            let mut fields = original["fields"].clone();
+            fields.as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                SparseShareEvidence::from_fields(&fields),
+                Some(SparseShareEvidence::Malformed)
+            );
+        }
+        assert_eq!(SparseShareEvidence::from_fields(&json!({})), None);
+        assert_eq!(
+            SparseShareEvidence::from_fields(
+                &json!({"isSparsePrivateRecord":{"value":0,"type":"INT64"}})
+            ),
+            None
+        );
+        assert_eq!(
+            SparseShareEvidence::from_fields(
+                &json!({"isSparsePrivateRecord":{"value":0,"type":"STRING"}})
+            ),
+            Some(SparseShareEvidence::Malformed)
+        );
+    }
 
     fn make_asset(master: Value, asset: Value) -> PhotoAsset {
         PhotoAsset::new(master, asset)

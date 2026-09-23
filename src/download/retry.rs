@@ -775,7 +775,9 @@ pub(super) async fn build_pending_retry_download_tasks(
                     "Pending asset cleared: provider confirmed source deletion"
                 );
             }
-            RecordResolution::AssetPresent { .. } | RecordResolution::Unknown => {
+            RecordResolution::AssetPresent { .. }
+            | RecordResolution::SparseShareUnresolved(_)
+            | RecordResolution::Unknown => {
                 // CONTRACT: UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING
                 set_verification_for_state_id(
                     db.as_ref(),
@@ -1048,7 +1050,14 @@ mod tests {
     #[tokio::test]
     async fn contract_policy_excluded_requires_explicit_source_deletion() {
         let db = crate::state::SqliteStateDb::open_in_memory().unwrap();
-        for id in ["PRESENT", "OMITTED", "MALFORMED", "TRANSIENT", "DELETED"] {
+        for id in [
+            "PRESENT",
+            "OMITTED",
+            "MALFORMED",
+            "TRANSIENT",
+            "SPARSE",
+            "DELETED",
+        ] {
             let record = TestAssetRecord::new(id).build();
             db.upsert_seen(&record).await.unwrap();
             assert!(
@@ -1058,6 +1067,15 @@ mod tests {
             );
         }
         let resolutions = vec![
+            (
+                ProviderRecordId::new("SPARSE"),
+                RecordResolution::SparseShareUnresolved(
+                    crate::icloud::photos::asset::SparseShareEvidence::from_fields(
+                        &crate::test_helpers::sparse_shared_asset_record()["fields"],
+                    )
+                    .unwrap(),
+                ),
+            ),
             (
                 ProviderRecordId::new("PRESENT"),
                 RecordResolution::Present(candidate(
@@ -1105,7 +1123,7 @@ mod tests {
 
         assert_eq!(source_deleted, 1);
         let summary = db.get_summary().await.unwrap();
-        assert_eq!(summary.policy_excluded, 4);
+        assert_eq!(summary.policy_excluded, 5);
         assert_eq!(summary.source_deleted, 1);
     }
 

@@ -13,10 +13,13 @@ use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 
 use super::asset::{
-    ChangeEvent, DeltaRecordBuffer, PhotoAsset, RequiredAssetFields, extract_master_ref,
+    ChangeEvent, DeltaRecordBuffer, PhotoAsset, RequiredAssetFields, SparseShareEvidence,
+    extract_master_ref,
 };
 use super::cloudkit::ChangesZoneResponse;
-use super::queries::{DESIRED_KEYS_VALUES, build_changes_zone_request, encode_params};
+use super::queries::{
+    DESIRED_KEYS_VALUES, IDENTITY_LOOKUP_KEYS_VALUES, build_changes_zone_request, encode_params,
+};
 use super::session::{PhotosSession, check_changes_zone_error};
 use crate::retry::RetryConfig;
 
@@ -73,7 +76,10 @@ fn asset_identity_diagnostic(
     } else if serde_json::from_value::<super::cloudkit::Record>(record.clone()).is_err() {
         "record_decode_failed"
     } else if reference.is_none() {
-        "master_reference_missing"
+        record
+            .get("fields")
+            .and_then(SparseShareEvidence::from_fields)
+            .map_or("master_reference_missing", |evidence| evidence.diagnostic())
     } else if reference
         .and_then(|value| value.get("recordName"))
         .and_then(Value::as_str)
@@ -203,6 +209,7 @@ pub(crate) enum RecordResolution {
         master_record_name: ProviderRecordId,
     },
     MasterPresent,
+    SparseShareUnresolved(SparseShareEvidence),
     Deleted {
         deleted_at: Option<chrono::DateTime<chrono::Utc>>,
         master_family: bool,
@@ -237,9 +244,9 @@ fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
             master_family: true,
             ..
         } => ResolutionEvidence::MasterDeleted,
-        RecordResolution::Unknown | RecordResolution::TransientFailure(_) => {
-            ResolutionEvidence::Inconclusive
-        }
+        RecordResolution::SparseShareUnresolved(_)
+        | RecordResolution::Unknown
+        | RecordResolution::TransientFailure(_) => ResolutionEvidence::Inconclusive,
         RecordResolution::Deleted {
             master_family: false,
             ..
@@ -251,7 +258,10 @@ fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
 // conservatively: a present sibling resolves the work, a missing master proves
 // family deletion, and any inconclusive sibling blocks child-only deletion.
 fn merge_record_resolution(existing: &mut RecordResolution, incoming: RecordResolution) {
-    if resolution_evidence(&incoming) > resolution_evidence(existing) {
+    if resolution_evidence(&incoming) > resolution_evidence(existing)
+        || (matches!(existing, RecordResolution::Unknown)
+            && matches!(incoming, RecordResolution::SparseShareUnresolved(_)))
+    {
         *existing = incoming;
     }
 }
@@ -1047,7 +1057,7 @@ impl PhotoAlbum {
             let body = json!({
                 "records": records,
                 "zoneID": self.zone_id.as_ref(),
-                "desiredKeys": &*DESIRED_KEYS_VALUES,
+                "desiredKeys": &*IDENTITY_LOOKUP_KEYS_VALUES,
             });
             let response = match super::session::retry_post_allowing_record_errors(
                 self.session.as_ref(),
@@ -1186,13 +1196,19 @@ impl PhotoAlbum {
                         {
                             extract_master_ref(&asset.fields)
                                 .filter(|name| !name.trim().is_empty())
-                                .map_or(RecordResolution::Unknown, |master_record_name| {
-                                    RecordResolution::AssetPresent {
+                                .map_or_else(
+                                    || {
+                                        SparseShareEvidence::from_fields(&asset.fields).map_or(
+                                            RecordResolution::Unknown,
+                                            RecordResolution::SparseShareUnresolved,
+                                        )
+                                    },
+                                    |master_record_name| RecordResolution::AssetPresent {
                                         master_record_name: ProviderRecordId::new(
                                             master_record_name,
                                         ),
-                                    }
-                                })
+                                    },
+                                )
                         }
                         _ => RecordResolution::Unknown,
                     }
@@ -1210,7 +1226,9 @@ impl PhotoAlbum {
                     RecordResolution::AssetPresent { .. } => "asset_present",
                     RecordResolution::MasterPresent => "master_present_unpaired",
                     RecordResolution::Deleted { .. } => "deleted",
-                    RecordResolution::Unknown => "unknown",
+                    RecordResolution::SparseShareUnresolved(_) | RecordResolution::Unknown => {
+                        "unknown"
+                    }
                     RecordResolution::TransientFailure(_) => "transient_failure",
                 };
                 crate::metrics::record_targeted_lookup(outcome, 1);
@@ -3303,7 +3321,13 @@ mod tests {
         errored["serverErrorCode"] = json!("ACCESS_DENIED");
         let mut decode = missing.clone();
         decode["deleted"] = json!("private-invalid-boolean");
+        let mut sparse = crate::test_helpers::sparse_shared_asset_record();
+        sparse["recordName"] = json!("private-child");
+        let mut sparse_malformed = sparse.clone();
+        sparse_malformed["fields"]["linkedShareZoneOwner"]["value"] = json!("private-owner");
         let cases = [
+            (Some(sparse), "sparse_share_reference_unresolved"),
+            (Some(sparse_malformed), "sparse_share_reference_malformed"),
             (None, "record_omitted"),
             (
                 Some(json!({"recordName": "private-child", "recordType": "private-type"})),
@@ -3345,12 +3369,21 @@ mod tests {
                     "private-child",
                 ))])
                 .await;
-            assert!(matches!(
-                batch.results.as_slice(),
-                [(_, RecordResolution::Unknown)]
-            ));
+            if expected.starts_with("sparse_share_reference_") {
+                assert!(matches!(
+                    batch.results.as_slice(),
+                    [(_, RecordResolution::SparseShareUnresolved(_))]
+                ));
+            } else {
+                assert!(matches!(
+                    batch.results.as_slice(),
+                    [(_, RecordResolution::Unknown)]
+                ));
+            }
         }
         let logs = std::fs::read_to_string(&log_path).unwrap();
+        assert!(logs.contains("sparse_share_reference_unresolved"));
+        assert!(logs.contains("sparse_share_reference_malformed"));
         assert!(logs.contains("record_omitted"));
         assert!(logs.contains("record_decode_failed"));
         assert!(logs.contains("count=1"));
@@ -3372,6 +3405,105 @@ mod tests {
                 ("master_reference_present", expected)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sparse_share_lookup_requests_evidence_but_never_follows_the_link() {
+        #[derive(Debug, Clone)]
+        struct SparseSession {
+            master: Option<&'static str>,
+        }
+        #[async_trait::async_trait]
+        impl PhotosSession for SparseSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                assert!(url.contains("/records/lookup?"));
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["zoneID"]["zoneName"], "PrimarySync");
+                assert_eq!(
+                    body["records"],
+                    json!([{"recordName":"private-sparse-child"}])
+                );
+                let keys = body["desiredKeys"].as_array().unwrap();
+                for key in [
+                    "isSparsePrivateRecord",
+                    "linkedShareRecordName",
+                    "linkedShareZoneName",
+                    "linkedShareZoneOwner",
+                    "masterRef",
+                ] {
+                    assert!(keys.contains(&json!(key)), "{key}");
+                    if key != "masterRef" {
+                        assert!(!DESIRED_KEYS_VALUES.contains(&json!(key)), "{key}");
+                    }
+                }
+                let mut record = crate::test_helpers::sparse_shared_asset_record();
+                if let Some(master) = self.master {
+                    record["fields"]["masterRef"] = json!({"value":{"recordName":master}});
+                }
+                Ok(json!({"records":[record]}))
+            }
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+        for master in [None, Some("personal-master")] {
+            let album = make_album_with_session(100, Box::new(SparseSession { master }));
+            let batch = album
+                .resolve_records(&[RecordLookupRequest::asset_only(ProviderRecordId::new(
+                    "private-sparse-child",
+                ))])
+                .await;
+            match &batch.results[0].1 {
+                RecordResolution::SparseShareUnresolved(SparseShareEvidence::Linked(_)) => {
+                    assert_eq!(master, None)
+                }
+                RecordResolution::AssetPresent { master_record_name } => {
+                    assert_eq!(Some(master_record_name.as_str()), master)
+                }
+                other => panic!("unexpected resolution: {other:?}"),
+            }
+            assert!(
+                !batch.complete,
+                "identity evidence alone is not a downloadable asset"
+            );
+        }
+        let evidence = SparseShareEvidence::from_fields(
+            &crate::test_helpers::sparse_shared_asset_record()["fields"],
+        )
+        .unwrap();
+        let mut merged = RecordResolution::Unknown;
+        merge_record_resolution(
+            &mut merged,
+            RecordResolution::SparseShareUnresolved(evidence),
+        );
+        merge_record_resolution(&mut merged, RecordResolution::Unknown);
+        assert!(matches!(merged, RecordResolution::SparseShareUnresolved(_)));
+        // Inconclusive share evidence must beat child-only deletion in either merge order.
+        let evidence = SparseShareEvidence::from_fields(
+            &crate::test_helpers::sparse_shared_asset_record()["fields"],
+        )
+        .unwrap();
+        let mut merged = RecordResolution::Deleted {
+            deleted_at: None,
+            master_family: false,
+        };
+        merge_record_resolution(
+            &mut merged,
+            RecordResolution::SparseShareUnresolved(evidence),
+        );
+        merge_record_resolution(
+            &mut merged,
+            RecordResolution::Deleted {
+                deleted_at: None,
+                master_family: false,
+            },
+        );
+        assert!(matches!(merged, RecordResolution::SparseShareUnresolved(_)));
     }
 
     #[tokio::test]

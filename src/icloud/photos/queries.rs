@@ -124,6 +124,25 @@ pub(crate) static DESIRED_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::new(|| {
         .collect()
 });
 
+// Identity lookups must not lose sparse-share evidence returned by the delta API.
+// Keep these fields out of the ordinary media enumeration projection.
+pub(crate) static IDENTITY_LOOKUP_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::new(|| {
+    DESIRED_KEYS_VALUES
+        .iter()
+        .cloned()
+        .chain(
+            [
+                "isSparsePrivateRecord",
+                "linkedShareRecordName",
+                "linkedShareZoneName",
+                "linkedShareZoneOwner",
+            ]
+            .into_iter()
+            .map(|key| Value::String(key.to_owned())),
+        )
+        .collect()
+});
+
 pub(crate) fn item_type_from_str(s: &str) -> Option<AssetItemType> {
     match s {
         "public.heic"

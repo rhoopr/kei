@@ -13,6 +13,13 @@ use crate::icloud::photos::PhotoAsset;
 use crate::icloud::photos::session::PhotosSession;
 use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
 
+/// Synthetic sparse-share shape reported in #765, with invented identifiers.
+#[cfg(test)]
+pub(crate) fn sparse_shared_asset_record() -> Value {
+    serde_json::from_str(include_str!("../tests/data/sparse_shared_asset.json"))
+        .expect("synthetic sparse-share fixture must be valid JSON")
+}
+
 #[cfg(test)]
 fn loopback_bind_unavailable_reason() -> Option<String> {
     static RESULT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();

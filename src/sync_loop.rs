@@ -7264,9 +7264,19 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum EvidenceCase {
+            Ordinary,
+            Sparse,
+            Malformed,
+            Changed,
+            MarkerWriteFailure,
+        }
+
         #[derive(Clone, Debug)]
         struct IdentitySession {
             unresolved: bool,
+            evidence: EvidenceCase,
             records: Vec<serde_json::Value>,
             valid: Vec<serde_json::Value>,
         }
@@ -7275,16 +7285,53 @@ mod tests {
             async fn post(
                 &self,
                 url: &str,
-                _body: String,
+                body: String,
                 _headers: &[(&str, &str)],
             ) -> anyhow::Result<serde_json::Value> {
                 if url.contains("/records/lookup?") {
-                    return Ok(
-                        serde_json::json!({"records": if self.unresolved { Vec::new() } else { vec![serde_json::json!({"recordName": "unresolved-child", "serverErrorCode": "UNKNOWN_ITEM"})] }}),
+                    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(body["zoneID"]["zoneName"], "PrimarySync");
+                    assert_eq!(
+                        body["records"],
+                        serde_json::json!([{"recordName":"unresolved-child"}])
                     );
+                    let records = if self.unresolved && self.evidence != EvidenceCase::Ordinary {
+                        let mut record = crate::test_helpers::sparse_shared_asset_record();
+                        record["recordName"] = serde_json::json!("unresolved-child");
+                        match self.evidence {
+                            EvidenceCase::Malformed => {
+                                record["fields"]["linkedShareZoneOwner"]["value"] =
+                                    serde_json::json!(null)
+                            }
+                            EvidenceCase::Changed => {
+                                record["fields"]["linkedShareRecordName"]["value"] =
+                                    serde_json::json!("different-private-child");
+                                record["fields"]["linkedShareZoneName"]["value"] =
+                                    serde_json::json!("SharedSync-different-private-zone");
+                                record["fields"]["linkedShareZoneOwner"]["value"]["recordName"] =
+                                    serde_json::json!("different-private-owner");
+                            }
+                            _ => {}
+                        }
+                        vec![record]
+                    } else if self.unresolved {
+                        Vec::new()
+                    } else {
+                        vec![
+                            serde_json::json!({"recordName":"unresolved-child","serverErrorCode":"UNKNOWN_ITEM"}),
+                        ]
+                    };
+                    return Ok(serde_json::json!({"records":records}));
                 }
                 if url.contains("/changes/zone?") {
-                    let mut child = self.records[1].clone();
+                    let mut child = if self.evidence != EvidenceCase::Ordinary {
+                        crate::test_helpers::sparse_shared_asset_record()
+                    } else {
+                        self.records[1].clone()
+                    };
+                    if self.evidence == EvidenceCase::Malformed {
+                        child["fields"]["linkedShareZoneOwner"]["value"] = serde_json::json!(null);
+                    }
                     child["recordName"] = serde_json::json!("unresolved-child");
                     child["fields"].as_object_mut().unwrap().remove("masterRef");
                     let mut records = self.valid.clone();
@@ -7318,7 +7365,16 @@ mod tests {
             files
         };
 
-        for recent in [None, Some(10)] {
+        for (recent, evidence) in [None, Some(10)].into_iter().flat_map(|recent| {
+            [
+                EvidenceCase::Ordinary,
+                EvidenceCase::Sparse,
+                EvidenceCase::Malformed,
+                EvidenceCase::Changed,
+                EvidenceCase::MarkerWriteFailure,
+            ]
+            .map(|evidence| (recent, evidence))
+        }) {
             let server = crate::start_wiremock_or_skip!();
             // Valid JPEG framing; no optional metadata writer is needed.
             let bytes = vec![
@@ -7360,6 +7416,22 @@ mod tests {
                     "master-PrimarySync",
                     state::METADATA_CAPTURE_REVISION,
                 );
+                inner
+                    .upsert_asset_master_mapping(
+                        "PrimarySync",
+                        "private-linked-child",
+                        "master-PrimarySync",
+                    )
+                    .await
+                    .unwrap();
+                inner
+                    .upsert_asset_master_mapping(
+                        "PrimarySync",
+                        "different-private-child",
+                        "master-PrimarySync",
+                    )
+                    .await
+                    .unwrap();
                 for zone in ["PrimarySync", "SharedSync-test"] {
                     inner
                         .set_metadata(&crate::sync_cycle::sync_token_key(zone), "zone-before")
@@ -7372,17 +7444,30 @@ mod tests {
             let mut config = make_run_cycle_config();
             config.filters.recent = recent;
             let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-            // Reopen SQLite each time. Cycle 1 only selects the clean shared zone.
-            for cycle in 0..4 {
+            // Reopen SQLite each time. After marker failure, replay once to persist it
+            // before selecting only the clean zone, recovering, and checking steady state.
+            let marker_failure = evidence == EvidenceCase::MarkerWriteFailure;
+            for cycle in 0..(4 + usize::from(marker_failure)) {
+                let phase = cycle.saturating_sub(usize::from(marker_failure));
+                let fail_marker = marker_failure && cycle == 0;
                 let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
-                let db = inner.clone() as Arc<dyn download::DownloadStore>;
+                let db: Arc<dyn download::DownloadStore> = if fail_marker {
+                    Arc::new(FailingMetadataSetDb::new(
+                        inner.clone(),
+                        MetadataSetFailure::Prefix(state::UNRESOLVED_IDENTITY_PREFIX),
+                        "injected unresolved marker write failure",
+                    ))
+                } else {
+                    inner.clone()
+                };
                 let primary = make_run_cycle_library_state_with_album(
                     "PrimarySync",
                     "sync_token:PrimarySync",
                     make_full_album_with_boxed_session(
                         "PrimarySync",
                         Box::new(IdentitySession {
-                            unresolved: cycle < 2,
+                            unresolved: phase < 2,
+                            evidence,
                             records: run_cycle_favourited_asset_page()["records"]
                                 .as_array()
                                 .unwrap()
@@ -7396,7 +7481,7 @@ mod tests {
                     "sync_token:SharedSync-test",
                     "shared-after",
                 );
-                let libraries = if cycle == 1 {
+                let libraries = if phase == 1 {
                     vec![&shared]
                 } else {
                     vec![&primary, &shared]
@@ -7423,29 +7508,49 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     result.stats.identity_incomplete,
-                    cycle < 2,
-                    "recent={recent:?} cycle={cycle}"
+                    phase < 2,
+                    "recent={recent:?} evidence={evidence:?} cycle={cycle}"
                 );
-                assert_eq!(result.failed_count > 0, cycle < 2);
+                assert_eq!(result.failed_count > 0, phase < 2);
                 assert_eq!(
                     crate::cycle_reporter::classify_cycle(
                         &result.stats,
                         result.failed_count,
                         result.session_expired
                     ),
-                    if cycle < 2 {
+                    if phase < 2 {
                         crate::cycle_reporter::CycleStatus::Failed
                     } else {
                         crate::cycle_reporter::CycleStatus::Success
                     }
                 );
+                assert_eq!(result.stats.state_write_failures > 0, fail_marker);
+                assert!(
+                    inner
+                        .get_master_record_name_for_asset("PrimarySync", "unresolved-child")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let marker_expected = phase < 2 && !fail_marker;
+                assert_eq!(
+                    inner
+                        .get_metadata(&state::unresolved_identity_key("PrimarySync"))
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    marker_expected.then_some("1")
+                );
                 let summary = inner.get_summary().await.unwrap();
-                assert_eq!(summary.unresolved_identity_zones, u64::from(cycle < 2));
+                assert_eq!(
+                    summary.unresolved_identity_zones,
+                    u64::from(marker_expected)
+                );
                 assert_eq!(
                     crate::commands::backup_status_line(&summary)
                         .contains("unresolved asset identity"),
-                    cycle < 2,
-                    "recent={recent:?} cycle={cycle}: {}",
+                    marker_expected,
+                    "recent={recent:?} evidence={evidence:?} cycle={cycle}: {}",
                     crate::commands::backup_status_line(&summary)
                 );
                 assert_eq!(
@@ -7454,7 +7559,7 @@ mod tests {
                         .await
                         .unwrap()
                         .as_deref(),
-                    Some(if cycle < 2 {
+                    Some(if phase < 2 {
                         "zone-before"
                     } else {
                         "zone-after"
