@@ -583,6 +583,8 @@ pub struct MetadataCaptureStatus {
 pub struct SyncSummary {
     /// Zones retaining unresolved asset delta identity evidence.
     pub(crate) unresolved_identity_zones: u64,
+    pub(crate) unresolved_sparse_records: u64,
+    pub(crate) deferred_sparse_records: u64,
     /// Total number of assets tracked.
     pub total_assets: u64,
     /// Number of assets successfully downloaded.

@@ -582,6 +582,7 @@ where
         Ok(Some(stored)) if stored == legacy_hash => {
             if let Err(e) = db
                 .commit_checkpoint_transition(state::CheckpointTransition {
+                    sparse_identity_proofs: Vec::new(),
                     metadata_updates: vec![(
                         download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
                         current_hash.to_owned(),
@@ -1090,6 +1091,10 @@ pub(crate) async fn run_cycle(
                         }
                         if let Err(e) = db
                             .commit_checkpoint_transition(state::CheckpointTransition {
+                                sparse_identity_proofs: sync_result
+                                    .stats
+                                    .sparse_identity_proofs
+                                    .clone(),
                                 metadata_updates,
                                 metadata_deletes: vec![state::unresolved_identity_key(
                                     &lib_state.zone_name,
@@ -1137,6 +1142,7 @@ pub(crate) async fn run_cycle(
                 if let Some(db) = state_db
                     && let Err(e) = db
                         .commit_checkpoint_transition(state::CheckpointTransition {
+                            sparse_identity_proofs: Vec::new(),
                             metadata_updates: vec![
                                 (
                                     LAST_CHECKPOINT_STATUS_KEY.to_owned(),
@@ -1244,6 +1250,7 @@ pub(crate) async fn run_cycle(
             metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
             if let Err(e) = db
                 .commit_checkpoint_transition(state::CheckpointTransition {
+                    sparse_identity_proofs: cycle_stats.sparse_identity_proofs.clone(),
                     metadata_updates,
                     metadata_deletes,
                 })
@@ -1261,6 +1268,7 @@ pub(crate) async fn run_cycle(
         && let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash)
         && let Err(e) = db
             .commit_checkpoint_transition(state::CheckpointTransition {
+                sparse_identity_proofs: Vec::new(),
                 metadata_updates: vec![(
                     download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
                     download_config_hash,

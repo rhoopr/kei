@@ -17,6 +17,9 @@ pub(crate) mod pipeline;
 pub(crate) mod planner;
 pub(crate) mod recap;
 mod retry;
+mod sparse_identity;
+use crate::state::{SparseAttemptOutcome, SparseIdentityProof, SparseIdentityStore};
+use sparse_identity::SparseRetryContext;
 
 pub(crate) use limiter::BandwidthLimiter;
 pub(crate) use metadata_rewrite::CaptureTimestampRepair;
@@ -95,7 +98,8 @@ pub enum SyncMode {
 }
 
 pub(crate) trait DownloadStore:
-    DownloadContextStateStore
+    SparseIdentityStore
+    + DownloadContextStateStore
     + DownloadStateStore
     + MembershipStore
     + MetadataRewriteStore
@@ -107,7 +111,8 @@ pub(crate) trait DownloadStore:
 }
 
 impl<T> DownloadStore for T where
-    T: DownloadContextStateStore
+    T: SparseIdentityStore
+        + DownloadContextStateStore
         + DownloadStateStore
         + MembershipStore
         + MetadataRewriteStore
@@ -353,6 +358,8 @@ pub struct SyncStats {
     /// Unresolved asset hydration, independent of intentional checkpoint holds.
     #[serde(skip)]
     pub(crate) identity_incomplete: bool,
+    #[serde(skip)]
+    pub(crate) sparse_identity_proofs: Vec<SparseIdentityProof>,
     /// Structured reason for `sync_token_blocked`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_blocked_reason: Option<&'static str>,
@@ -504,6 +511,8 @@ impl SyncStats {
             self.inventory_drop_library = other.inventory_drop_library.clone();
         }
         self.identity_incomplete |= other.identity_incomplete;
+        self.sparse_identity_proofs
+            .extend(other.sparse_identity_proofs.iter().cloned());
         self.sync_token_blocked = self.sync_token_blocked || other.sync_token_blocked;
         if self.sync_token_blocked_reason.is_none() {
             self.sync_token_blocked_reason = other.sync_token_blocked_reason;
@@ -7019,6 +7028,7 @@ async fn download_photos_full_with_token_policy(
 
 #[derive(Debug, Default)]
 struct IncrementalDeltaSummary {
+    sparse_identity_proofs: Vec<SparseIdentityProof>,
     identity_incomplete: bool,
     sync_token: Option<String>,
     token_unsafe_reason: Option<&'static str>,
@@ -7494,13 +7504,28 @@ async fn apply_incremental_relation_delta(
 }
 
 async fn hydrate_unpaired_created_asset_deltas(
-    events: &mut [ChangeEvent],
+    events: &mut Vec<ChangeEvent>,
     pass: Option<&crate::commands::AlbumPass>,
     config: &DownloadConfig,
     summary: &mut IncrementalDeltaSummary,
     run_mode: DownloadRunMode,
 ) {
-    hydrate_unpaired_created_asset_deltas_inner(events, pass, config, summary).await;
+    let mut retry = SparseRetryContext::prepare(events, config, summary, run_mode).await;
+    hydrate_unpaired_created_asset_deltas_inner(
+        events, pass, config, summary, &mut retry, run_mode,
+    )
+    .await;
+    for event in events.iter().filter(|event| {
+        event.asset.is_some()
+            || event.reason == ChangeReason::HardDeleted
+            || (event.reason == ChangeReason::SoftDeleted
+                && event.record_type.as_deref() == Some("CPLAsset"))
+    }) {
+        // Only retained source IDs receive receipts. Explicit source deletion
+        // still requires the ordinary state-write and checkpoint gates; linked
+        // zone failure never proves source deletion.
+        retry.prove(&event.record_name, summary);
+    }
     // Persist before the producer closes the stream and finalizes its run.
     // A restart or a successful sync in another zone must not hide this work.
     if run_mode.downloads_files()
@@ -7520,6 +7545,8 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
     pass: Option<&crate::commands::AlbumPass>,
     config: &DownloadConfig,
     summary: &mut IncrementalDeltaSummary,
+    retry: &mut SparseRetryContext,
+    run_mode: DownloadRunMode,
 ) {
     let mut pending = Vec::new();
     let mut unresolved: FxHashMap<String, Vec<usize>> = FxHashMap::default();
@@ -7574,6 +7601,14 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
         return;
     };
 
+    retry.select_due(&unresolved);
+    unresolved.retain(|source, indices| {
+        if retry.permits(source, events, indices) {
+            return true;
+        }
+        summary.block_identity();
+        false
+    });
     if !unresolved.is_empty() {
         let requests: Vec<RecordLookupRequest> = unresolved
             .keys()
@@ -7587,6 +7622,21 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                 summary.block_identity();
                 continue;
             };
+            let attempt = match &resolution {
+                RecordResolution::SparseShareUnresolved(evidence) => evidence.durable_key().map_or(
+                    SparseAttemptOutcome::Inconclusive,
+                    SparseAttemptOutcome::Unresolved,
+                ),
+                RecordResolution::AssetPresent { .. }
+                | RecordResolution::Deleted {
+                    master_family: false,
+                    ..
+                } => SparseAttemptOutcome::Recovered,
+                _ => SparseAttemptOutcome::Inconclusive,
+            };
+            retry
+                .record(state_id.as_str(), attempt, config, summary, run_mode)
+                .await;
             match resolution {
                 RecordResolution::AssetPresent { master_record_name } => {
                     summary
@@ -7627,6 +7677,7 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                     master_family: false,
                     ..
                 } => {
+                    retry.prove(state_id.as_str(), summary);
                     tracing::debug!(
                         asset_record_name = state_id.as_str(),
                         library = %config.library,
@@ -7657,6 +7708,17 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
             }
         }
         if !unresolved.is_empty() {
+            for source in unresolved.keys() {
+                retry
+                    .record(
+                        source,
+                        SparseAttemptOutcome::Inconclusive,
+                        config,
+                        summary,
+                        run_mode,
+                    )
+                    .await;
+            }
             summary.block_identity();
         }
     }
@@ -7701,6 +7763,7 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                 deleted_at,
                 master_family,
             } => {
+                retry.prove(state_id.as_str(), summary);
                 if let Some(db) = &config.state_db {
                     let update = SourceStateUpdate::SoftDeleted { deleted_at };
                     let (result, state_key) = if master_family {
@@ -7954,6 +8017,12 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                 }
                 ChangeReason::SoftDeleted | ChangeReason::HardDeleted | ChangeReason::Hidden => {
                     summary.apply_source_state_event(&event, &config).await;
+                    if event.reason == ChangeReason::HardDeleted
+                        || (event.reason == ChangeReason::SoftDeleted
+                            && event.record_type.as_deref() == Some("CPLAsset"))
+                    {
+                        unpaired_asset_events.push(event);
+                    }
                 }
             }
         }
@@ -7966,13 +8035,20 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             run_mode,
         )
         .await;
-        let download_ctx = if run_mode.downloads_files() && !unpaired_asset_events.is_empty() {
+        let download_ctx = if run_mode.downloads_files()
+            && unpaired_asset_events
+                .iter()
+                .any(|event| event.reason == ChangeReason::Created)
+        {
             Some(preload_download_context(&config).await)
         } else {
             None
         };
         let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
-        for event in unpaired_asset_events {
+        for event in unpaired_asset_events
+            .into_iter()
+            .filter(|event| event.reason == ChangeReason::Created)
+        {
             if let Some(mut asset) = event.asset {
                 if let Some(download_ctx) = download_ctx.as_deref() {
                     let claim_mode = legacy_owner_claim_mode_for_configs(
@@ -8094,6 +8170,7 @@ async fn download_photos_incremental_streaming(
     stats.state_write_failures += delta_summary.state_transition_failures;
     stats.interrupted = stats.interrupted || shutdown_token.is_cancelled();
     stats.identity_incomplete = delta_summary.identity_incomplete;
+    stats.sparse_identity_proofs = delta_summary.sparse_identity_proofs.clone();
     if let Some(reason) = delta_summary.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason);
     }
@@ -8521,6 +8598,7 @@ async fn download_photos_incremental_collecting_inner(
             ..SyncStats::default()
         };
         stats.identity_incomplete = delta_summary.identity_incomplete;
+        stats.sparse_identity_proofs = delta_summary.sparse_identity_proofs.clone();
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -8545,6 +8623,7 @@ async fn download_photos_incremental_collecting_inner(
             ..SyncStats::default()
         };
         stats.identity_incomplete = delta_summary.identity_incomplete;
+        stats.sparse_identity_proofs = delta_summary.sparse_identity_proofs.clone();
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -8768,6 +8847,7 @@ async fn download_photos_incremental_collecting_inner(
             ..SyncStats::default()
         };
         stats.identity_incomplete = delta_summary.identity_incomplete;
+        stats.sparse_identity_proofs = delta_summary.sparse_identity_proofs.clone();
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -8815,6 +8895,7 @@ async fn download_photos_incremental_collecting_inner(
             ..SyncStats::default()
         };
         stats.identity_incomplete = delta_summary.identity_incomplete;
+        stats.sparse_identity_proofs = delta_summary.sparse_identity_proofs.clone();
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
@@ -8984,6 +9065,7 @@ async fn download_photos_incremental_collecting_inner(
         ..SyncStats::default()
     };
     stats.identity_incomplete = delta_summary.identity_incomplete;
+    stats.sparse_identity_proofs = delta_summary.sparse_identity_proofs.clone();
     if let Some(reason) = delta_summary.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason);
     }
@@ -23868,6 +23950,7 @@ mod tests {
     #[test]
     fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         let lib_a = SyncStats {
+            sparse_identity_proofs: Vec::new(),
             identity_incomplete: true,
             assets_seen: 10,
             api_total_at_start: Some(12),
@@ -23941,6 +24024,7 @@ mod tests {
         };
 
         let lib_b = SyncStats {
+            sparse_identity_proofs: Vec::new(),
             identity_incomplete: false,
             assets_seen: 20,
             api_total_at_start: Some(22),

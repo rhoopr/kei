@@ -15,6 +15,12 @@ use super::types::{
     MetadataCaptureCandidate, MetadataCaptureStatus, MetadataCaptureVersionEvidence, SyncRunStats,
     SyncSummary, VersionSizeKey,
 };
+mod sparse_identity;
+
+pub(crate) use sparse_identity::{
+    SparseAttemptOutcome, SparseEvidence, SparseIdentity, SparseIdentityProof, SparseIdentityStore,
+    SparseSourceId,
+};
 
 /// Fallback source identifier when `AssetMetadata::source` is unset.
 ///
@@ -442,6 +448,7 @@ pub(crate) struct ScopedDbSyncToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointTransition {
+    pub(crate) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(crate) metadata_updates: Vec<(String, String)>,
     pub(crate) metadata_deletes: Vec<String>,
 }
@@ -2637,13 +2644,18 @@ impl SqliteStateDb {
             };
             let unresolved_identity_zones: u64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM metadata WHERE substr(key, 1, length(?1)) = ?1",
+                    "SELECT COUNT(*) FROM (SELECT substr(key,length(?1)+1) AS library FROM metadata WHERE substr(key,1,length(?1))=?1 UNION SELECT library FROM unresolved_sparse_identities)",
                     [super::UNRESOLVED_IDENTITY_PREFIX],
                     |row| row.get::<_, i64>(0),
                 )
                 .map_err(|e| StateError::query("get_summary::unresolved_identity", e))?
                 .try_into()
                 .unwrap_or(0);
+            let (unresolved_sparse_records, deferred_sparse_records) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(next_retry_at > ?1),0) FROM unresolved_sparse_identities",
+                [Utc::now().timestamp()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+            let unresolved_sparse_records = unresolved_sparse_records.try_into().unwrap_or(0);
+            let deferred_sparse_records = deferred_sparse_records.try_into().unwrap_or(0);
             let mut provider_checkpoint_status = metadata_value("last_checkpoint_status")
                 .map_err(|e| StateError::query("get_summary::checkpoint_status", e))?;
             if provider_checkpoint_status.is_none() {
@@ -2805,6 +2817,8 @@ impl SqliteStateDb {
 
             Ok(SyncSummary {
                 unresolved_identity_zones,
+                unresolved_sparse_records,
+                deferred_sparse_records,
                 total_assets,
                 downloaded,
                 pending,
@@ -3576,6 +3590,13 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("commit_checkpoint_transition::update", e))?;
             }
             for key in transition.metadata_deletes {
+                if let Some(library) = key.strip_prefix(super::UNRESOLVED_IDENTITY_PREFIX) {
+                    sparse_identity::clear_proven(
+                        &tx,
+                        library,
+                        &transition.sparse_identity_proofs,
+                    )?;
+                }
                 tx.execute("DELETE FROM metadata WHERE key = ?1", [key])
                     .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
             }
@@ -9549,6 +9570,7 @@ mod tests {
 
         let result = db
             .commit_checkpoint_transition(CheckpointTransition {
+                sparse_identity_proofs: Vec::new(),
                 metadata_updates: vec![
                     ("sync_token:zone".into(), "new-token".into()),
                     ("enum_config_hash".into(), "new-hash".into()),

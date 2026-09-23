@@ -1297,6 +1297,8 @@ mod tests {
     ) -> SyncSummary {
         SyncSummary {
             unresolved_identity_zones: 0,
+            unresolved_sparse_records: 0,
+            deferred_sparse_records: 0,
             total_assets: downloaded + pending + failed,
             downloaded,
             pending,

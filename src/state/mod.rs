@@ -11,6 +11,10 @@ pub mod db;
 pub mod error;
 pub mod schema;
 pub mod types;
+pub(crate) use db::{
+    SparseAttemptOutcome, SparseEvidence, SparseIdentity, SparseIdentityProof, SparseIdentityStore,
+    SparseSourceId,
+};
 
 #[cfg(test)]
 pub use db::ImportedRecord;
