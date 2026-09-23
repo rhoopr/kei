@@ -378,16 +378,6 @@ pub(super) fn resolve_download_path(
 
 #[cfg(test)]
 mod tests {
-    use crate::download::{DownloadConfig, paths};
-
-    use super::super::tasks::filter_asset_to_tasks;
-    use super::super::test_support::{filter_asset_fresh, test_config, test_live_photo_asset};
-    use super::{NormalizedPath, PathPlanningMode};
-    #[cfg(unix)]
-    use crate::icloud::photos::{PRIMARY_ZONE_NAME, PhotoAsset};
-    #[cfg(unix)]
-    use crate::state::SqliteStateDb;
-    #[cfg(unix)]
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -395,8 +385,21 @@ mod tests {
     use rustc_hash::{FxHashMap, FxHashSet};
     use tempfile::TempDir;
 
-    use crate::test_helpers::{TestAssetRecord, TestPhotoAsset};
+    #[cfg(unix)]
+    use crate::download::DownloadConfig;
+    use crate::download::paths;
+    #[cfg(unix)]
+    use crate::icloud::photos::{PRIMARY_ZONE_NAME, PhotoAsset};
+    #[cfg(unix)]
+    use crate::state::SqliteStateDb;
+    #[cfg(unix)]
+    use crate::test_helpers::TestAssetRecord;
+    use crate::test_helpers::TestPhotoAsset;
     use crate::types::FileMatchPolicy;
+
+    use super::super::tasks::filter_asset_to_tasks;
+    use super::super::test_support::{filter_asset_fresh, test_config, test_live_photo_asset};
+    use super::{NormalizedPath, PathPlanningMode};
 
     #[cfg(unix)]
     fn post_rename_pre_state_final_path_for(download_dir: &std::path::Path) -> std::path::PathBuf {
