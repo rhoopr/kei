@@ -5634,6 +5634,7 @@ mod tests {
             record_name: "MODIFIED_ASSET_1".into(),
             record_type: Some("CPLAsset".into()),
             master_record_name: None,
+            sparse_share: None,
             reason: ChangeReason::Created,
             asset: Some(modified_asset),
             album: None,
