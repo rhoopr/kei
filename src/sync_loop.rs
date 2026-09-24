@@ -4515,7 +4515,7 @@ mod tests {
         let build_download_config =
             make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
 
-        run_cycle(
+        Box::pin(run_cycle(
             &states,
             &config,
             Some(db.as_ref()),
@@ -4524,7 +4524,7 @@ mod tests {
             controls,
             &shared_session,
             &CancellationToken::new(),
-        )
+        ))
         .await
         .expect("run cycle")
     }
@@ -5076,6 +5076,7 @@ mod tests {
         cancel_on_upsert: Option<CancellationToken>,
         replace_download_dir_on_upsert: Option<std::path::PathBuf>,
         fail_upsert_seen: bool,
+        fail_source_delete: bool,
         fail_mark_downloaded: bool,
         fail_refresh_downloaded_metadata: bool,
         /// Stands in for a concurrent pass: refreshes the row to this snapshot
@@ -5116,6 +5117,7 @@ mod tests {
                 cancel_on_upsert: None,
                 replace_download_dir_on_upsert: None,
                 fail_upsert_seen: false,
+                fail_source_delete: false,
                 fail_mark_downloaded: false,
                 fail_refresh_downloaded_metadata: false,
                 refresh_on_mark_downloaded: None,
@@ -5174,6 +5176,43 @@ mod tests {
         fn with_upsert_seen_failure(mut self) -> Self {
             self.fail_upsert_seen = true;
             self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::state::SparseIdentityStore for FailingMetadataSetDb {
+        async fn sparse_identities(
+            &self,
+            library: &str,
+        ) -> Result<Vec<crate::state::SparseIdentity>, crate::state::error::StateError> {
+            self.inner.sparse_identities(library).await
+        }
+        async fn observe_sparse_identity(
+            &self,
+            library: &str,
+            source: &crate::state::SparseSourceId,
+            evidence: &crate::state::SparseEvidence,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<crate::state::SparseIdentity, crate::state::error::StateError> {
+            if self
+                .failure
+                .matches(&state::unresolved_identity_key(library))
+            {
+                return Err(state::error::StateError::LockPoisoned(self.message.into()));
+            }
+            self.inner
+                .observe_sparse_identity(library, source, evidence, now)
+                .await
+        }
+        async fn record_sparse_attempt(
+            &self,
+            identity: &crate::state::SparseIdentity,
+            outcome: crate::state::SparseAttemptOutcome,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<crate::state::SparseIdentity, crate::state::error::StateError> {
+            self.inner
+                .record_sparse_attempt(identity, outcome, now)
+                .await
         }
     }
 
@@ -5447,6 +5486,9 @@ mod tests {
             asset_id: &str,
             deleted_at: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<(), state::error::StateError> {
+            if self.fail_source_delete {
+                return Err(state::error::StateError::LockPoisoned(self.message.into()));
+            }
             self.inner
                 .mark_soft_deleted(library, asset_id, deleted_at)
                 .await
@@ -7195,9 +7237,36 @@ mod tests {
 
     #[tokio::test]
     async fn unresolved_identity_inventory_requires_a_delta_bridge() {
-        for prior_token in [None, Some("retained-before")] {
+        use crate::state::{SparseAttemptOutcome, SparseEvidence, SparseSourceId};
+        for (prior_token, sparse) in [None, Some("retained-before")]
+            .into_iter()
+            .flat_map(|token| [false, true].map(|sparse| (token, sparse)))
+        {
             let inner = make_state_db();
             let marker = state::unresolved_identity_key("PrimarySync");
+            if sparse {
+                let key = SparseEvidence::new(
+                    r#"[1,"private-child","SharedSync-absent","private-owner"]"#.into(),
+                );
+                let row = inner
+                    .observe_sparse_identity(
+                        "PrimarySync",
+                        &SparseSourceId::new("private-source"),
+                        &key,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+                inner
+                    .record_sparse_attempt(
+                        &row,
+                        SparseAttemptOutcome::Unresolved(key),
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let blocked = prior_token.is_none() || sparse;
             inner.set_metadata(&marker, "1").await.unwrap();
             inner
                 .set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "old-config")
@@ -7239,10 +7308,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(result.failed_count > 0, prior_token.is_none());
+                assert_eq!(result.failed_count > 0, blocked);
                 assert_eq!(
                     inner.get_metadata(&marker).await.unwrap().is_some(),
-                    prior_token.is_none()
+                    blocked
                 );
                 assert_eq!(
                     inner
@@ -7250,15 +7319,673 @@ mod tests {
                         .await
                         .unwrap()
                         .as_deref(),
-                    prior_token.map(|_| "bridged-after")
+                    if sparse {
+                        prior_token
+                    } else {
+                        prior_token.map(|_| "bridged-after")
+                    }
                 );
                 assert_eq!(result.stats.downloaded, 0);
+                assert_eq!(
+                    inner.sparse_identities("PrimarySync").await.unwrap().len(),
+                    usize::from(sparse)
+                );
+                if blocked {
+                    assert_eq!(
+                        inner
+                            .get_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("old-config")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
+        use crate::state::{SparseIdentityStore, SparseSourceId};
+        #[derive(Clone, Debug)]
+        struct DeletedSession {
+            lookups: Arc<std::sync::atomic::AtomicUsize>,
+            replay: bool,
+            count: usize,
+            snapshot: Arc<std::sync::atomic::AtomicUsize>,
+            changing_snapshot: bool,
+        }
+        #[async_trait::async_trait]
+        impl crate::icloud::photos::PhotosSession for DeletedSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                if url.contains("/changes/zone?") {
+                    let mut records = Vec::new();
+                    if self.replay && body["zones"][0]["syncToken"] == "before" {
+                        for index in 0..self.count {
+                            let mut record = crate::test_helpers::sparse_shared_asset_record();
+                            record["recordName"] = serde_json::json!(format!("source-{index:03}"));
+                            records.push(record);
+                        }
+                    }
+                    let snapshot = if self.changing_snapshot {
+                        format!(
+                            "after-{}",
+                            self.snapshot.load(std::sync::atomic::Ordering::Relaxed)
+                        )
+                    } else {
+                        "after".into()
+                    };
+                    // Unrelated activity changes the zone token, not the source facts.
+                    if self.changing_snapshot {
+                        records.push(serde_json::json!({"recordName":format!("unrelated-{snapshot}"),"deleted":true}));
+                    }
+                    return Ok(
+                        serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":snapshot,"moreComing":false,"records":records}]}),
+                    );
+                }
+                assert!(url.contains("/records/lookup?"));
+                let records: Vec<_> = body["records"].as_array().unwrap().iter().map(|r| {
+                    self.lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    serde_json::json!({"recordName": r["recordName"], "serverErrorCode":"UNKNOWN_ITEM"})
+                }).collect();
+                Ok(serde_json::json!({"records":records}))
+            }
+            fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+        for recent in [None, Some(10)] {
+            for replay in [false, true] {
+                for changing_snapshot in [false, true] {
+                    let count = 101;
+                    let directory = tempfile::tempdir().unwrap();
+                    let media = directory.path().join("media");
+                    let database = directory.path().join("state.db");
+                    {
+                        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                        let db = inner.clone() as Arc<dyn download::DownloadStore>;
+                        seed_run_cycle_metadata_drift_asset(&db, &media).await;
+                        inner.set_metadata_capture_revision_for_test(
+                            "PrimarySync",
+                            "master-PrimarySync",
+                            state::METADATA_CAPTURE_REVISION,
+                        );
+                        let run = db.start_sync_run().await.unwrap();
+                        db.complete_sync_run(run, &state::SyncRunStats::default())
+                            .await
+                            .unwrap();
+                        db.set_metadata("sync_token:PrimarySync", "before")
+                            .await
+                            .unwrap();
+                        let evidence =
+                            crate::icloud::photos::asset::SparseShareEvidence::from_fields(
+                                &crate::test_helpers::sparse_shared_asset_record()["fields"],
+                            )
+                            .unwrap()
+                            .durable_key()
+                            .unwrap();
+                        for index in 0..count {
+                            db.observe_sparse_identity(
+                                "PrimarySync",
+                                &SparseSourceId::new(&format!("source-{index:03}")),
+                                &evidence,
+                                chrono::Utc::now(),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        // Force the cached deletion through the real source-state update after restart.
+                        let record =
+                            crate::test_helpers::TestAssetRecord::new("source-000").build();
+                        db.upsert_seen(&record).await.unwrap();
+                        inner.set_metadata_capture_revision_for_test(
+                            "PrimarySync",
+                            "source-000",
+                            state::METADATA_CAPTURE_REVISION,
+                        );
+                    }
+                    let sentinel = media.join("keep.bin");
+                    std::fs::write(&sentinel, b"unchanged private media").unwrap();
+                    let mut config = make_run_cycle_config();
+                    config.filters.recent = recent;
+                    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+                    let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let snapshot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let library = make_run_cycle_library_state_with_album(
+                        "PrimarySync",
+                        "sync_token:PrimarySync",
+                        make_full_album_with_boxed_session(
+                            "PrimarySync",
+                            Box::new(DeletedSession {
+                                lookups: lookups.clone(),
+                                replay,
+                                count,
+                                snapshot: snapshot.clone(),
+                                changing_snapshot,
+                            }),
+                        ),
+                    );
+                    for cycle in 0..4 {
+                        snapshot.store(cycle.min(2), std::sync::atomic::Ordering::Relaxed);
+                        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                        let db: Arc<dyn download::DownloadStore> = if cycle == 1 {
+                            let mut failing = FailingMetadataSetDb::without_set_failure(
+                                inner.clone(),
+                                "injected cached deletion state failure",
+                            );
+                            failing.fail_source_delete = true;
+                            Arc::new(failing)
+                        } else {
+                            inner.clone()
+                        };
+                        let builder = make_run_cycle_download_config_builder_with_options(
+                            &media,
+                            db.clone(),
+                            RunCycleDownloadConfigOptions {
+                                recent,
+                                ..RunCycleDownloadConfigOptions::default()
+                            },
+                        );
+                        let result = run_cycle(
+                            &[&library],
+                            &config,
+                            Some(db.as_ref()),
+                            false,
+                            &builder,
+                            download::DownloadControls::download_hidden(),
+                            &shared_session,
+                            &CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap();
+                        let held = cycle < 2;
+                        let expected_token = if held {
+                            "before"
+                        } else if changing_snapshot {
+                            "after-2"
+                        } else {
+                            "after"
+                        };
+                        assert_eq!(
+                            inner
+                                .get_metadata("sync_token:PrimarySync")
+                                .await
+                                .unwrap()
+                                .as_deref(),
+                            Some(expected_token),
+                            "recent={recent:?} replay={replay} changing_snapshot={changing_snapshot} cycle={cycle}"
+                        );
+                        assert_eq!(
+                            inner.sparse_identities("PrimarySync").await.unwrap().len(),
+                            if held { count } else { 0 }
+                        );
+                        assert_eq!(result.stats.state_write_failures > 0, cycle == 1);
+                        assert_eq!(result.failed_count > 0, held);
+                        assert_eq!(inner.get_summary().await.unwrap().source_deleted, 1);
+                        assert_eq!(
+                            lookups.load(std::sync::atomic::Ordering::Relaxed),
+                            if cycle == 0 { 100 } else { 101 }
+                        );
+                        assert_eq!(
+                            std::fs::read(&sentinel).unwrap(),
+                            b"unchanged private media"
+                        );
+                        if !held {
+                            assert_eq!(
+                                inner.get_summary().await.unwrap().unresolved_identity_zones,
+                                0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
+        use crate::state::SparseSourceId;
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum ValidationChange {
+            Restored,
+            Incomplete,
+            Cancelled,
+        }
+        #[derive(Clone, Debug)]
+        struct ValidationSession {
+            change: ValidationChange,
+            cycle: usize,
+            lookups: Arc<std::sync::atomic::AtomicUsize>,
+            validations: Arc<std::sync::atomic::AtomicUsize>,
+            shutdown: CancellationToken,
+        }
+        #[async_trait::async_trait]
+        impl crate::icloud::photos::PhotosSession for ValidationSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+                if url.contains("/changes/zone?") {
+                    let from = request["zones"][0]["syncToken"].as_str().unwrap();
+                    let mut records = Vec::new();
+                    let mut token = format!("after-{}", self.cycle.min(2));
+                    let mut more = false;
+                    if from != "before" && self.cycle == 1 {
+                        self.validations
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if from != "validation-tail" {
+                            token = "validation-tail".into();
+                            more = true;
+                        } else {
+                            match self.change {
+                                ValidationChange::Restored => {
+                                    let mut restored =
+                                        crate::test_helpers::sparse_shared_asset_record();
+                                    restored["recordName"] = serde_json::json!("source-000");
+                                    records.push(restored);
+                                }
+                                ValidationChange::Incomplete => {
+                                    anyhow::bail!("injected validation tail failure")
+                                }
+                                ValidationChange::Cancelled => self.shutdown.cancel(),
+                            }
+                        }
+                    }
+                    return Ok(
+                        serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":token,"moreComing":more,"records":records}]}),
+                    );
+                }
+                assert!(url.contains("/records/lookup?"));
+                let records: Vec<_> = request["records"].as_array().unwrap().iter().map(|record| {
+                    self.lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if self.change == ValidationChange::Restored && self.cycle == 1 && record["recordName"] == "source-000" {
+                        let mut restored = crate::test_helpers::sparse_shared_asset_record();
+                        restored["recordName"] = record["recordName"].clone();
+                        restored
+                    } else {
+                        serde_json::json!({"recordName":record["recordName"],"serverErrorCode":"UNKNOWN_ITEM"})
+                    }
+                }).collect();
+                Ok(serde_json::json!({"records":records}))
+            }
+            fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+        for recent in [None, Some(10)] {
+            for change in [
+                ValidationChange::Restored,
+                ValidationChange::Incomplete,
+                ValidationChange::Cancelled,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let media = directory.path().join("media");
+                let database = directory.path().join("state.db");
+                {
+                    let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                    let db = inner.clone() as Arc<dyn download::DownloadStore>;
+                    seed_run_cycle_metadata_drift_asset(&db, &media).await;
+                    inner.set_metadata_capture_revision_for_test(
+                        "PrimarySync",
+                        "master-PrimarySync",
+                        state::METADATA_CAPTURE_REVISION,
+                    );
+                    let run = db.start_sync_run().await.unwrap();
+                    db.complete_sync_run(run, &state::SyncRunStats::default())
+                        .await
+                        .unwrap();
+                    db.set_metadata("sync_token:PrimarySync", "before")
+                        .await
+                        .unwrap();
+                    let evidence = crate::icloud::photos::asset::SparseShareEvidence::from_fields(
+                        &crate::test_helpers::sparse_shared_asset_record()["fields"],
+                    )
+                    .unwrap()
+                    .durable_key()
+                    .unwrap();
+                    for index in 0..101 {
+                        db.observe_sparse_identity(
+                            "PrimarySync",
+                            &SparseSourceId::new(&format!("source-{index:03}")),
+                            &evidence,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                let sentinel = media.join("keep.bin");
+                std::fs::write(&sentinel, b"unchanged media").unwrap();
+                let mut config = make_run_cycle_config();
+                config.filters.recent = recent;
+                let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+                let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let validations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let cycles = if change == ValidationChange::Restored {
+                    2
+                } else {
+                    4
+                };
+                for cycle in 0..cycles {
+                    let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                    let db = inner.clone() as Arc<dyn download::DownloadStore>;
+                    let shutdown = CancellationToken::new();
+                    let library = make_run_cycle_library_state_with_album(
+                        "PrimarySync",
+                        "sync_token:PrimarySync",
+                        make_full_album_with_boxed_session(
+                            "PrimarySync",
+                            Box::new(ValidationSession {
+                                change,
+                                cycle,
+                                lookups: lookups.clone(),
+                                validations: validations.clone(),
+                                shutdown: shutdown.clone(),
+                            }),
+                        ),
+                    );
+                    let builder = make_run_cycle_download_config_builder_with_options(
+                        &media,
+                        db.clone(),
+                        RunCycleDownloadConfigOptions {
+                            recent,
+                            ..RunCycleDownloadConfigOptions::default()
+                        },
+                    );
+                    let result = run_cycle(
+                        &[&library],
+                        &config,
+                        Some(db.as_ref()),
+                        false,
+                        &builder,
+                        download::DownloadControls::download_hidden(),
+                        &shared_session,
+                        &shutdown,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        db.get_metadata("sync_token:PrimarySync")
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some(if cycle < 2 { "before" } else { "after-2" }),
+                        "{recent:?} {change:?} cycle {cycle}"
+                    );
+                    let retained = db.sparse_identities("PrimarySync").await.unwrap();
+                    assert_eq!(retained.len(), if cycle < 2 { 101 } else { 0 });
+                    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged media");
+                    assert_eq!(result.stats.state_write_failures, 0);
+                    if cycle == 0 {
+                        assert_eq!(lookups.load(std::sync::atomic::Ordering::Relaxed), 100);
+                    } else if cycle >= 2 {
+                        assert_eq!(result.failed_count, 0);
+                        assert_eq!(
+                            lookups.load(std::sync::atomic::Ordering::Relaxed),
+                            if change == ValidationChange::Incomplete {
+                                200
+                            } else {
+                                101
+                            }
+                        );
+                        assert_eq!(
+                            inner.get_summary().await.unwrap().unresolved_identity_zones,
+                            0
+                        );
+                    } else {
+                        assert_eq!(validations.load(std::sync::atomic::Ordering::Relaxed), 2);
+                        match change {
+                            ValidationChange::Restored => {
+                                let row = retained
+                                    .iter()
+                                    .find(|row| row.source.as_str() == "source-000")
+                                    .unwrap();
+                                assert!(row.deletion_checkpoint.is_none());
+                                assert!(row.next_retry.is_some());
+                                assert_eq!(lookups.load(std::sync::atomic::Ordering::Relaxed), 102);
+                                assert!(result.stats.identity_incomplete);
+                            }
+                            ValidationChange::Incomplete => {
+                                assert_eq!(lookups.load(std::sync::atomic::Ordering::Relaxed), 200);
+                                assert!(result.stats.identity_incomplete);
+                            }
+                            ValidationChange::Cancelled => assert!(result.stats.interrupted),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media() {
+        use crate::state::{
+            SparseAttemptOutcome, SparseEvidence, SparseIdentityStore, SparseSourceId,
+        };
+        use base64::Engine as _;
+        use chrono::Utc;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        #[derive(Clone, Debug)]
+        struct RecoveredSession {
+            records: serde_json::Value,
+            lookups: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::icloud::photos::PhotosSession for RecoveredSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                if url.contains("/changes/zone?") {
+                    return Ok(
+                        serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":[]}]}),
+                    );
+                }
+                assert!(url.contains("/records/lookup?"));
+                let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(request["zoneID"]["zoneName"], "PrimarySync");
+                let mut names: Vec<_> = request["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|record| record["recordName"].as_str().unwrap())
+                    .collect();
+                names.sort_unstable();
+                assert_eq!(names, ["asset-recovered", "recovered"]);
+                self.lookups
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(serde_json::json!({"records":self.records}))
+            }
+            fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        for recent in [None, Some(10)] {
+            for interrupted in [false, true] {
+                let server = crate::start_wiremock_or_skip!();
+                let bytes =
+                    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9";
+                let checksum =
+                    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+                Mock::given(method("GET"))
+                    .and(path("/recovered.jpg"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                    .expect(1..=2)
+                    .mount(&server)
+                    .await;
+                let records = full_album_page_with_download(
+                    "PrimarySync",
+                    "recovered",
+                    "after",
+                    &format!("{}/recovered.jpg", server.uri()),
+                    bytes.len() as u64,
+                    &checksum,
+                )["records"]
+                    .clone();
+                let dir = tempfile::tempdir().unwrap();
+                let database = dir.path().join("state.db");
+                let media = dir.path().join("media");
+                let source = SparseSourceId::new("asset-recovered");
+                let evidence = SparseEvidence::new(
+                    r#"[1,"unverified-target","SharedSync-absent","private-owner"]"#.into(),
+                );
+                {
+                    let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                    seed_run_cycle_metadata_drift_asset(
+                        &(db.clone() as Arc<dyn download::DownloadStore>),
+                        &media,
+                    )
+                    .await;
+                    db.set_metadata_capture_revision_for_test(
+                        "PrimarySync",
+                        "master-PrimarySync",
+                        state::METADATA_CAPTURE_REVISION,
+                    );
+                    let run = db.start_sync_run().await.unwrap();
+                    db.complete_sync_run(run, &state::SyncRunStats::default())
+                        .await
+                        .unwrap();
+                    db.set_metadata("sync_token:PrimarySync", "before")
+                        .await
+                        .unwrap();
+                    let row = db
+                        .observe_sparse_identity("PrimarySync", &source, &evidence, Utc::now())
+                        .await
+                        .unwrap();
+                    db.record_sparse_attempt(
+                        &row,
+                        SparseAttemptOutcome::Unresolved(evidence.clone()),
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+                    // Exact source identity bypasses a future deadline. The absent
+                    // linked zone is never queried and supplies no identity proof.
+                    db.upsert_asset_master_mapping("PrimarySync", source.as_str(), "recovered")
+                        .await
+                        .unwrap();
+                }
+                let sentinel = media.join("keep-private.bin");
+                std::fs::write(&sentinel, b"keep these bytes").unwrap();
+                let mut config = make_run_cycle_config();
+                config.filters.recent = recent;
+                let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+                let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut completed_requests = 0;
+                for cycle in 0..3 {
+                    let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                    let cancel = CancellationToken::new();
+                    let db: Arc<dyn download::DownloadStore> = if cycle == 0 {
+                        let failing = FailingMetadataSetDb::without_set_failure(
+                            inner.clone(),
+                            "injected sparse recovery state failure",
+                        );
+                        Arc::new(if interrupted {
+                            failing.with_cancel_on_upsert(cancel.clone())
+                        } else {
+                            failing.with_upsert_seen_failure()
+                        })
+                    } else {
+                        inner.clone()
+                    };
+                    let primary = make_run_cycle_library_state_with_album(
+                        "PrimarySync",
+                        "sync_token:PrimarySync",
+                        make_full_album_with_boxed_session(
+                            "PrimarySync",
+                            Box::new(RecoveredSession {
+                                records: records.clone(),
+                                lookups: lookups.clone(),
+                            }),
+                        ),
+                    );
+                    let builder = make_run_cycle_download_config_builder_with_options(
+                        &media,
+                        db.clone(),
+                        RunCycleDownloadConfigOptions {
+                            recent,
+                            ..RunCycleDownloadConfigOptions::default()
+                        },
+                    );
+                    let result = run_cycle(
+                        &[&primary],
+                        &config,
+                        Some(db.as_ref()),
+                        false,
+                        &builder,
+                        download::DownloadControls::download_hidden(),
+                        &shared_session,
+                        &cancel,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep these bytes");
+                    assert_eq!(
+                        inner
+                            .get_metadata("sync_token:PrimarySync")
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some(if cycle == 0 { "before" } else { "after" }),
+                        "recent={recent:?} interrupted={interrupted} cycle={cycle}"
+                    );
+                    assert_eq!(
+                        inner.sparse_identities("PrimarySync").await.unwrap().len(),
+                        usize::from(cycle == 0)
+                    );
+                    assert_eq!(
+                        inner.get_summary().await.unwrap().unresolved_identity_zones,
+                        u64::from(cycle == 0)
+                    );
+                    let requests = server.received_requests().await.unwrap().len();
+                    if cycle == 1 {
+                        completed_requests = requests;
+                    }
+                    if cycle == 2 {
+                        assert_eq!(requests, completed_requests);
+                    }
+                    if cycle == 0 {
+                        assert!(result.stats.interrupted || result.stats.state_write_failures > 0);
+                    } else {
+                        assert_eq!(result.failed_count, 0);
+                        assert!(!result.stats.identity_incomplete);
+                        let row = inner
+                            .get_downloaded_page(0, 20)
+                            .await
+                            .unwrap()
+                            .into_iter()
+                            .find(|row| row.id.as_ref() == source.as_str())
+                            .unwrap();
+                        assert_eq!(std::fs::read(row.local_path.unwrap()).unwrap(), bytes);
+                        if cycle == 2 {
+                            assert_eq!(result.stats.downloaded, 0);
+                        }
+                    }
+                }
+                assert_eq!(lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
+                server.verify().await;
             }
         }
     }
 
     #[tokio::test]
     async fn unresolved_identity_survives_restart_and_other_zone_success_then_recovers() {
+        use crate::state::SparseIdentityStore as _;
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
         use wiremock::matchers::{method, path};
@@ -7268,6 +7995,8 @@ mod tests {
         enum EvidenceCase {
             Ordinary,
             Sparse,
+            DeletedDelta,
+            HardDeletedDelta,
             Malformed,
             Changed,
             MarkerWriteFailure,
@@ -7276,6 +8005,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct IdentitySession {
             unresolved: bool,
+            lookups: Arc<std::sync::atomic::AtomicUsize>,
             evidence: EvidenceCase,
             records: Vec<serde_json::Value>,
             valid: Vec<serde_json::Value>,
@@ -7289,6 +8019,8 @@ mod tests {
                 _headers: &[(&str, &str)],
             ) -> anyhow::Result<serde_json::Value> {
                 if url.contains("/records/lookup?") {
+                    self.lookups
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
                     assert_eq!(body["zoneID"]["zoneName"], "PrimarySync");
                     assert_eq!(
@@ -7334,6 +8066,13 @@ mod tests {
                     }
                     child["recordName"] = serde_json::json!("unresolved-child");
                     child["fields"].as_object_mut().unwrap().remove("masterRef");
+                    if self.evidence == EvidenceCase::DeletedDelta && !self.unresolved {
+                        child["fields"]["isDeleted"] =
+                            serde_json::json!({"value":1,"type":"INT64"});
+                    }
+                    if self.evidence == EvidenceCase::HardDeletedDelta && !self.unresolved {
+                        child["deleted"] = serde_json::json!(true);
+                    }
                     let mut records = self.valid.clone();
                     records.push(child);
                     return Ok(serde_json::json!({"zones": [{
@@ -7365,10 +8104,12 @@ mod tests {
             files
         };
 
-        for (recent, evidence) in [None, Some(10)].into_iter().flat_map(|recent| {
+        for (recent, evidence) in [Some(10), None].into_iter().flat_map(|recent| {
             [
                 EvidenceCase::Ordinary,
                 EvidenceCase::Sparse,
+                EvidenceCase::DeletedDelta,
+                EvidenceCase::HardDeletedDelta,
                 EvidenceCase::Malformed,
                 EvidenceCase::Changed,
                 EvidenceCase::MarkerWriteFailure,
@@ -7447,16 +8188,36 @@ mod tests {
             // Reopen SQLite each time. After marker failure, replay once to persist it
             // before selecting only the clean zone, recovering, and checking steady state.
             let marker_failure = evidence == EvidenceCase::MarkerWriteFailure;
-            for cycle in 0..(4 + usize::from(marker_failure)) {
+            let deletion_delta = matches!(
+                evidence,
+                EvidenceCase::DeletedDelta | EvidenceCase::HardDeletedDelta
+            );
+            let recovery_phase = 3 + usize::from(deletion_delta);
+            for cycle in 0..(5 + usize::from(marker_failure) + usize::from(deletion_delta)) {
                 let phase = cycle.saturating_sub(usize::from(marker_failure));
                 let fail_marker = marker_failure && cycle == 0;
+                let fail_deletion = deletion_delta && phase == 3;
                 let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                if phase == 3 {
+                    // Simulate the retry deadline without sleeping or changing production time.
+                    rusqlite::Connection::open(&database).unwrap().execute(
+                        "UPDATE unresolved_sparse_identities SET next_retry_at=0 WHERE library='PrimarySync'", []
+                    ).unwrap();
+                }
+                let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let db: Arc<dyn download::DownloadStore> = if fail_marker {
                     Arc::new(FailingMetadataSetDb::new(
                         inner.clone(),
                         MetadataSetFailure::Prefix(state::UNRESOLVED_IDENTITY_PREFIX),
                         "injected unresolved marker write failure",
                     ))
+                } else if fail_deletion {
+                    let mut failing = FailingMetadataSetDb::without_set_failure(
+                        inner.clone(),
+                        "injected source deletion write failure",
+                    );
+                    failing.fail_source_delete = true;
+                    Arc::new(failing)
                 } else {
                     inner.clone()
                 };
@@ -7466,7 +8227,8 @@ mod tests {
                     make_full_album_with_boxed_session(
                         "PrimarySync",
                         Box::new(IdentitySession {
-                            unresolved: phase < 2,
+                            unresolved: phase < 3,
+                            lookups: lookups.clone(),
                             evidence,
                             records: run_cycle_favourited_asset_page()["records"]
                                 .as_array()
@@ -7508,23 +8270,54 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     result.stats.identity_incomplete,
-                    phase < 2,
+                    phase < recovery_phase,
                     "recent={recent:?} evidence={evidence:?} cycle={cycle}"
                 );
-                assert_eq!(result.failed_count > 0, phase < 2);
+                assert_eq!(result.failed_count > 0, phase < recovery_phase);
+                let deferred = phase == 2
+                    && matches!(
+                        evidence,
+                        EvidenceCase::Sparse
+                            | EvidenceCase::DeletedDelta
+                            | EvidenceCase::HardDeletedDelta
+                            | EvidenceCase::MarkerWriteFailure
+                    );
+                assert_eq!(
+                    lookups.load(std::sync::atomic::Ordering::Relaxed),
+                    usize::from(phase != 1 && !deferred && !(phase >= 3 && deletion_delta))
+                );
+                let retained = inner.sparse_identities("PrimarySync").await.unwrap();
+                let stable_link = matches!(
+                    evidence,
+                    EvidenceCase::Sparse
+                        | EvidenceCase::DeletedDelta
+                        | EvidenceCase::HardDeletedDelta
+                        | EvidenceCase::Changed
+                        | EvidenceCase::MarkerWriteFailure
+                );
+                assert_eq!(
+                    retained.len(),
+                    usize::from(phase < recovery_phase && !fail_marker && stable_link)
+                );
+                if deferred {
+                    assert!(retained[0].next_retry.is_some());
+                }
                 assert_eq!(
                     crate::cycle_reporter::classify_cycle(
                         &result.stats,
                         result.failed_count,
                         result.session_expired
                     ),
-                    if phase < 2 {
+                    if phase < recovery_phase {
                         crate::cycle_reporter::CycleStatus::Failed
                     } else {
                         crate::cycle_reporter::CycleStatus::Success
                     }
                 );
-                assert_eq!(result.stats.state_write_failures > 0, fail_marker);
+                assert_eq!(
+                    result.stats.state_write_failures > 0,
+                    fail_marker || fail_deletion
+                );
                 assert!(
                     inner
                         .get_master_record_name_for_asset("PrimarySync", "unresolved-child")
@@ -7532,7 +8325,7 @@ mod tests {
                         .unwrap()
                         .is_none()
                 );
-                let marker_expected = phase < 2 && !fail_marker;
+                let marker_expected = phase < recovery_phase && !fail_marker;
                 assert_eq!(
                     inner
                         .get_metadata(&state::unresolved_identity_key("PrimarySync"))
@@ -7559,7 +8352,7 @@ mod tests {
                         .await
                         .unwrap()
                         .as_deref(),
-                    Some(if phase < 2 {
+                    Some(if phase < recovery_phase {
                         "zone-before"
                     } else {
                         "zone-after"

@@ -82,7 +82,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 25;
+const HELPER_SCHEMA_VERSION: i32 = 26;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -345,6 +345,23 @@ CREATE INDEX IF NOT EXISTS idx_asset_metadata_paths_retry
         ",
     )
     .unwrap();
+    conn.execute_batch(r"
+CREATE TABLE IF NOT EXISTS unresolved_sparse_identities (
+    library TEXT NOT NULL,
+    source_record_name TEXT NOT NULL,
+    original_evidence TEXT NOT NULL,
+    observed_evidence TEXT NOT NULL,
+    lookup_evidence TEXT,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    first_seen_at INTEGER NOT NULL,
+    last_attempt_at INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    next_retry_at INTEGER,
+    last_outcome TEXT,
+    PRIMARY KEY (library, source_record_name)
+);
+CREATE INDEX IF NOT EXISTS idx_sparse_identity_retry ON unresolved_sparse_identities(library, next_retry_at);
+").unwrap();
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();
     conn
@@ -375,7 +392,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 25). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 26). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -393,7 +410,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 25;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 26;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -1834,6 +1851,7 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         )
         .unwrap();
     }
+    conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at,next_retry_at) VALUES ('PrimarySync','private-source',?1,?1,1,1700000000,?2)", rusqlite::params![r#"[1,"private-target","SharedSync-private","private-owner"]"#, chrono::Utc::now().timestamp()+3600]).unwrap();
     let output = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
@@ -1848,6 +1866,13 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         "{stdout}"
     );
     assert!(stdout.contains("preserved"), "{stdout}");
+    assert!(
+        stdout.contains("Sparse identity recovery: 1 unresolved, 1 deferred until retry"),
+        "{stdout}"
+    );
+    for private in ["private-source", "private-target", "private-owner"] {
+        assert!(!stdout.contains(private), "{stdout}");
+    }
     assert!(!stdout.contains("SharedSync-private"), "{stdout}");
     conn.execute(
         "DELETE FROM metadata WHERE key = 'unresolved_asset_identity:PrimarySync'",
@@ -1862,7 +1887,21 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         .success()
         .get_output()
         .clone();
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Backup status: safe"));
+    // A missing marker must not hide retained per-source work.
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Backup status: unsafe"));
+    conn.execute("DELETE FROM unresolved_sparse_identities", [])
+        .unwrap();
+    let output = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Backup status: safe"));
+    assert!(!stdout.contains("Sparse identity recovery:"));
 }
 
 #[test]

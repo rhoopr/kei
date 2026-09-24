@@ -131,6 +131,38 @@ impl SparseShareEvidence {
         Some(link.map_or(Self::Malformed, Self::Linked))
     }
 
+    pub(crate) fn durable_key(&self) -> Option<crate::state::SparseEvidence> {
+        let Self::Linked(link) = self else {
+            return None;
+        };
+        Some(crate::state::SparseEvidence::new(
+            serde_json::json!([
+                1,
+                link.record_name.0,
+                link.zone_name.0,
+                link.owner_record_name.0
+            ])
+            .to_string(),
+        ))
+    }
+
+    pub(crate) fn from_durable_key(key: &crate::state::SparseEvidence) -> Option<Self> {
+        let (version, record, zone, owner): (u8, String, String, String) =
+            serde_json::from_str(key.as_str()).ok()?;
+        if version != 1
+            || record.trim().is_empty()
+            || owner.trim().is_empty()
+            || zone.strip_prefix("SharedSync-").is_none_or(str::is_empty)
+        {
+            return None;
+        }
+        Some(Self::Linked(SparseShareLink {
+            record_name: SparseShareId(record.into()),
+            zone_name: SparseShareId(zone.into()),
+            owner_record_name: SparseShareId(owner.into()),
+        }))
+    }
+
     pub(crate) const fn diagnostic(&self) -> &'static str {
         match self {
             Self::Linked(_) => "sparse_share_reference_unresolved",
@@ -1181,6 +1213,41 @@ mod tests {
             Some("personal-master")
         );
         assert_eq!(flushed[0].sparse_share.as_ref(), Some(evidence));
+    }
+
+    #[test]
+    fn sparse_share_durable_key_roundtrip_and_validation() {
+        let raw = crate::test_helpers::sparse_shared_asset_record();
+        let mut buffer = DeltaRecordBuffer::new();
+        let events = buffer.process_records(vec![serde_json::from_value(raw).unwrap()]);
+        let evidence = events[0].sparse_share.as_ref().unwrap();
+        let key = evidence.durable_key().unwrap();
+        assert_eq!(
+            SparseShareEvidence::from_durable_key(&key).as_ref(),
+            Some(evidence)
+        );
+        assert_eq!(
+            SparseShareEvidence::from_durable_key(&key)
+                .unwrap()
+                .durable_key(),
+            Some(key)
+        );
+        assert!(SparseShareEvidence::Malformed.durable_key().is_none());
+        for invalid in [
+            r#"[2,"child","SharedSync-zone","owner"]"#,
+            r#"[1,"","SharedSync-zone","owner"]"#,
+            r#"[1,"child","PrimarySync","owner"]"#,
+            r#"[1,"child","SharedSync-","owner"]"#,
+            r#"[1,"child","SharedSync-zone"," "]"#,
+            "corrupt",
+        ] {
+            assert!(
+                SparseShareEvidence::from_durable_key(&crate::state::SparseEvidence::new(
+                    invalid.into()
+                ))
+                .is_none()
+            );
+        }
     }
 
     #[test]

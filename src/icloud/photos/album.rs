@@ -44,6 +44,7 @@ pub(crate) const QUERY_FOLDER_LIST: &str = "CPLContainerRelationLiveByAssetDate"
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
 
 const RECORD_LOOKUP_BATCH_SIZE: usize = 100;
+const DELETION_VALIDATION_PAGE_SIZE: u32 = 200;
 
 // Only fixed labels leave this trust boundary. Never log provider record types,
 // error messages, identifiers, reference values, or response bodies here.
@@ -1843,6 +1844,107 @@ impl PhotoAlbum {
             if !more_coming {
                 return Ok(());
             }
+        }
+    }
+
+    /// Return candidates absent from a complete raw zone delta since `sync_token`.
+    /// Any source record change invalidates prior deletion evidence, including a
+    /// restored record with the same share link. This never advances a checkpoint.
+    /// Errors, cancellation, malformed pages and non-progressing pagination yield
+    /// no evidence. IDs are inspected before media pairing or record filtering.
+    pub(crate) async fn unchanged_records_since(
+        &self,
+        sync_token: &str,
+        candidates: &[ProviderRecordId],
+        shutdown_token: &CancellationToken,
+    ) -> anyhow::Result<FxHashSet<ProviderRecordId>> {
+        anyhow::ensure!(
+            !sync_token.trim().is_empty(),
+            "Missing validation checkpoint"
+        );
+        let mut unchanged: FxHashSet<_> = candidates.iter().cloned().collect();
+        let url = format!(
+            "{}/changes/zone?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        );
+        let mut current_token = sync_token.to_owned();
+        let mut visited = FxHashSet::default();
+        loop {
+            anyhow::ensure!(
+                visited.insert(current_token.clone()),
+                "Repeated validation checkpoint"
+            );
+            let body = build_changes_zone_request(
+                &self.zone_id,
+                Some(&current_token),
+                DELETION_VALIDATION_PAGE_SIZE,
+            )
+            .to_string();
+            let response = tokio::select! {
+                biased;
+                () = shutdown_token.cancelled() => anyhow::bail!("Source validation cancelled"),
+                response = super::session::retry_post(self.session.as_ref(), &url, &body,
+                    &[("Content-type", "text/plain")], &self.retry_config) => response?,
+            };
+            // Missing records must not deserialize to an authoritative empty page.
+            // Per-record errors are not proof of absence either.
+            let zones = response
+                .get("zones")
+                .and_then(Value::as_array)
+                .filter(|zones| zones.len() == 1)
+                .context("Invalid source validation zone response")?;
+            let zone = zones.first().context("Missing source validation zone")?;
+            let zone_id = zone
+                .get("zoneID")
+                .context("Missing source validation zone identity")?;
+            anyhow::ensure!(
+                zone_id.get("zoneName") == self.zone_id.get("zoneName")
+                    && self
+                        .zone_id
+                        .get("ownerRecordName")
+                        .is_none_or(|owner| zone_id.get("ownerRecordName") == Some(owner)),
+                "Unexpected source validation zone"
+            );
+            let records = zone
+                .get("records")
+                .and_then(Value::as_array)
+                .context("Missing source validation records")?;
+            for record in records {
+                anyhow::ensure!(
+                    record.get("serverErrorCode").is_none_or(Value::is_null),
+                    "Source validation record failed"
+                );
+                let name = record
+                    .get("recordName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .context("Missing source validation record identity")?;
+                unchanged.remove(&ProviderRecordId::new(name));
+            }
+            let response: ChangesZoneResponse = serde_json::from_value(response)?;
+            let zone = response
+                .zones
+                .into_iter()
+                .next()
+                .context("Missing source validation zone")?;
+            check_changes_zone_error(
+                zone.server_error_code.as_deref(),
+                zone.reason.as_deref(),
+                &zone.zone_id.zone_name,
+            )?;
+            anyhow::ensure!(
+                !zone.sync_token.trim().is_empty(),
+                "Missing validation end checkpoint"
+            );
+            anyhow::ensure!(
+                !shutdown_token.is_cancelled(),
+                "Source validation cancelled"
+            );
+            if !zone.more_coming {
+                return Ok(unchanged);
+            }
+            current_token = zone.sync_token;
         }
     }
 
@@ -5204,6 +5306,135 @@ mod tests {
                 "records": records
             }]
         })
+    }
+
+    #[tokio::test]
+    async fn source_deletion_validation_checks_raw_ids_across_all_pages() {
+        #[derive(Clone)]
+        struct ValidationSession(Arc<Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl PhotosSession for ValidationSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                assert!(url.contains("/changes/zone?"));
+                let body: Value = serde_json::from_str(&body).unwrap();
+                let token = body["zones"][0]["syncToken"].as_str().unwrap();
+                self.0.lock().unwrap().push(token.to_owned());
+                Ok(match token {
+                    "saved" => canned_changes_page(
+                        &[
+                            changes_master("master"),
+                            changes_asset("restored", "master"),
+                        ],
+                        "page-1",
+                        true,
+                    ),
+                    "page-1" => canned_changes_page(
+                        &[
+                            json!({"recordName":"deleted","deleted":true}),
+                            json!({"recordName":"unrelated","recordType":"CPLAlbum"}),
+                        ],
+                        "latest",
+                        false,
+                    ),
+                    _ => panic!("unexpected validation request"),
+                })
+            }
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let album = make_album_with_session(100, Box::new(ValidationSession(calls.clone())));
+        let candidates: Vec<_> = ["absent", "restored", "deleted"]
+            .into_iter()
+            .map(ProviderRecordId::new)
+            .collect();
+        let unchanged = album
+            .unchanged_records_since("saved", &candidates, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged,
+            FxHashSet::from_iter([ProviderRecordId::new("absent")])
+        );
+        assert_eq!(*calls.lock().unwrap(), ["saved", "page-1"]);
+    }
+
+    #[tokio::test]
+    async fn source_deletion_validation_rejects_incomplete_or_invalid_evidence() {
+        let valid = canned_changes_page(&[], "latest", false);
+        let mut bad_pages = Vec::new();
+        for (key, value) in [
+            ("records", Value::Null),
+            ("syncToken", json!("")),
+            ("moreComing", Value::Null),
+            ("serverErrorCode", json!("ZONE_NOT_FOUND")),
+        ] {
+            let mut page = valid.clone();
+            page["zones"][0][key] = value;
+            bad_pages.push(page);
+        }
+        for field in ["zoneName", "ownerRecordName"] {
+            let mut page = valid.clone();
+            page["zones"][0]["zoneID"][field] = json!("wrong-zone");
+            bad_pages.push(page);
+        }
+        bad_pages.push(canned_changes_page(
+            &[json!({"recordType":"CPLAsset"})],
+            "latest",
+            false,
+        ));
+        bad_pages.push(canned_changes_page(
+            &[json!({"recordName":"source","serverErrorCode":"UNKNOWN_ITEM"})],
+            "latest",
+            false,
+        ));
+        bad_pages.push(canned_changes_page(&[], "page-1", true)); // cyclic cursor
+        bad_pages.push(json!({"zones":[]}));
+        for page in bad_pages {
+            let mock = MockPhotosSession::new()
+                .ok(canned_changes_page(&[], "page-1", true))
+                .ok(page);
+            let album = make_album_with_session(100, Box::new(mock));
+            assert!(
+                album
+                    .unchanged_records_since(
+                        "saved",
+                        &[ProviderRecordId::new("source")],
+                        &CancellationToken::new()
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let mock = MockPhotosSession::new()
+            .ok(canned_changes_page(&[], "page-1", true))
+            .err("injected tail error");
+        let album = make_album_with_session(100, Box::new(mock));
+        assert!(
+            album
+                .unchanged_records_since(
+                    "saved",
+                    &[ProviderRecordId::new("source")],
+                    &CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let album = make_album_with_session(100, Box::new(MockPhotosSession::new().ok(valid)));
+        assert!(
+            album
+                .unchanged_records_since("saved", &[ProviderRecordId::new("source")], &cancelled)
+                .await
+                .is_err()
+        );
     }
 
     /// Build a CPLMaster record for changes/zone tests.

@@ -114,8 +114,8 @@ clear it. Another zone's success and process restart retain the marker.
 Status aggregates all markers; cycle reporting does not advance health's last
 success while any remain. Selected zones with markers bypass watch-mode
 no-change shortcuts. Idle health also checks markers in unselected zones.
-Intentional bounded checkpoint holds alone are not failures. These keys do not
-change schema 25 or JSON report version 3.
+Intentional bounded checkpoint holds alone are not failures. The marker keys
+remain in metadata; JSON report version 3 is unchanged.
 
 The Photos adapter emits aggregate, fixed-label identity lookup diagnostics.
 They distinguish omitted records, unexpected types, decode failures, invalid
@@ -131,12 +131,57 @@ valid links without a usable master remain unresolved. Link identifiers are
 opaque and their debug output is redacted. Lookup changes do not overwrite the
 original delta evidence or authorize a target lookup.
 
-This evidence lives on the event and lookup result, not in a new SQLite table.
-The existing unresolved marker and retained checkpoint preserve the retry
-obligation across restart. Exact source asset/master mappings still use the
-normal recovery path. A linked record name, missing/deleted shared zone, or
-history of removing a Shared Photo Library is not a source deletion or master
-identity. No automatic cross-zone recovery or checkpoint relaxation is added.
+Schema 26 adds `unresolved_sparse_identities`, keyed by library and source
+record in the account-scoped database. `src/state/db/sparse_identity.rs` stores
+the first observed link, latest delta link, separate lookup evidence, attempt
+time, and retry deadline. The Photos adapter owns the versioned link encoding.
+Observation and the existing unresolved marker commit in one transaction.
+The `sparse_identity_generation` metadata counter assigns monotonically
+increasing generations, including when a cleared source reappears.
+
+`src/download/sparse_identity.rs` owns retry selection for both incremental
+paths. A matching valid sparse lookup starts a one-hour delay. Repeated
+matching results double the delay to a 24-hour maximum. Each library execution
+selects at most 100 due, identified sparse source-only lookups, ordered by
+retry deadline or last attempt, then generation and source key. Exact
+source/master mappings bypass suppression and do not consume that budget. Malformed or changed
+incoming evidence cannot inherit a cached negative result. Unclassified
+sources still need an initial lookup before sparse retry policy can apply.
+A deferred source remains unresolved and blocks the checkpoint. Retained
+sources absent from replay re-enter normal hydration and media planning.
+
+Authoritative source-only deletion lookups retain the completed delta token in
+`last_outcome` as `["source_deleted_v1", token]`. This is provider evidence,
+not a persisted claim that local processing completed. On restart or the next
+batch, the same complete delta snapshot and unchanged source evidence can
+reuse that result. The ordinary source-state transition runs again before a
+current receipt is issued. A missing delta token, changed link, or authoritative
+master mapping requires normal recovery.
+For a different token, the Photos adapter scans the complete raw zone delta
+since each saved deletion checkpoint. One scan validates a whole batch.
+Any source change, including restoration with the same link, invalidates its
+cached deletion. Sources absent from a complete scan retain their deletion
+evidence at the current boundary with fresh generation fences. Missing tokens,
+invalid pages, incomplete scans, and cancellation supply no reuse evidence.
+Normal source lookups can still establish fresh results after a failed scan.
+Validation does not advance the sync checkpoint or complete local processing.
+This lets more than 100 deleted sources complete over bounded lookup batches
+while unrelated zone records change, without relaxing checkpoint or state-write
+guards. Existing schema-26 outcome labels remain readable.
+
+Hydration, explicitly soft-deleted source `CPLAsset` deltas, and exact-source
+hard-deletion tombstones supply generation-fenced receipts, not permission to
+advance a checkpoint. The cycle owner still requires normal processing and checkpoint
+proof. The checkpoint transaction validates every retained source receipt
+before clearing its row and zone marker. Missing, changed, or stale receipts
+roll back the transition. Inventory alone, interruption, failed state writes,
+and another library's success cannot clear the obligation. Configuration
+reconciliation uses the same fence when publishing its staged checkpoints.
+Status reports unresolved and deferred counts without provider identifiers.
+
+A linked record name, missing/deleted shared zone, or history of removing a
+Shared Photo Library is not a source deletion or master identity. No automatic
+cross-zone recovery or checkpoint relaxation is added.
 
 The per-zone provider checkpoint and the scoped database pre-check token have
 different gates:

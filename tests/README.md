@@ -364,10 +364,38 @@ malformed fields, redacted output, requested fields, and no linked-target
 requests. The full-cycle unresolved-identity test also runs with this record
 pointing to a zone absent from the selected libraries. It reopens SQLite,
 checks another zone's success, preserves seeded media, and proves explicit
-source-deletion recovery and an unchanged follow-up cycle. It covers malformed
+source-deletion recovery through lookups, typed soft-deletion deltas, and
+exact-source hard-deletion tombstones,
+then an unchanged follow-up cycle. It covers malformed
 and changed links, rejects unrelated durable identity mappings, and injects an
-unresolved-marker write failure before replay. The source checkpoint stays
+unresolved-marker write failure before replay. A source-deletion write failure
+retains the sparse row and checkpoint until the next successful cycle. The source checkpoint stays
 unchanged until recovery. A DEBUG-level capture checks that changed-link
 diagnostics contain no record, zone, or owner identifiers. Exact-master
 recovery tests also run with sparse linkage present. These tests do not prove
 a safe remapping rule for photos retained after shared-library removal.
+
+Durable retry tests cover schema-25 migration, restart, preserved original and
+separate lookup evidence, capped backoff, fair batches, and stale or missing
+completion receipts. The checkpoint test injects transaction failure and checks
+that token, marker, and retained rows roll back together. Full-cycle tests run
+both streaming and collecting paths. They check a deferred replay, other-zone
+success, new valid media downloads, and exact source recovery when replay omits
+the source. Recovery retains seeded files and retries after interruption or a
+state-write failure before an unchanged follow-up cycle. Parser tests round-trip
+the versioned link encoding and reject corrupt or unsupported evidence.
+
+The sparse-deletion batch regression seeds 101 retained sources and local
+media, then runs streaming and collecting cycles against explicit source
+`UNKNOWN_ITEM` responses. It reopens SQLite between cycles, tests replayed
+and omitted source deltas, injects a cached-deletion state-write failure, and
+checks that recovery uses 101 total lookups and stops querying after completion.
+The same test changes the zone snapshot between batches with unrelated records.
+Additional streaming and collecting cycles restore a source with the same link,
+fail a validation tail page, or cancel validation. Each case retains unresolved
+work and the old checkpoint. Provider tests check raw source IDs across pages,
+including paired assets, and reject malformed, wrong-zone, and cyclic responses.
+Failed or cancelled validation is followed by recovery and an unchanged cycle
+with no repeated source lookups.
+Snapshot-token, changed-link, stale-generation, redaction, and versioned
+completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.

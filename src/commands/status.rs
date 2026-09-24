@@ -61,6 +61,13 @@ pub(crate) async fn run_status(
     {
         println!("Last recovery action: {action}");
     }
+    if summary.unresolved_sparse_records > 0 {
+        println!();
+        println!(
+            "Sparse identity recovery: {} unresolved, {} deferred until retry",
+            summary.unresolved_sparse_records, summary.deferred_sparse_records
+        );
+    }
     if !summary.metadata_capture.is_empty() {
         println!("Metadata capture:");
         for capture in &summary.metadata_capture {
