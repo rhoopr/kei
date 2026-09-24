@@ -50,6 +50,41 @@ impl std::fmt::Debug for SparseEvidence {
     }
 }
 
+/// Authoritative source deletion scoped to a complete provider delta snapshot.
+/// A different snapshot must revalidate the source, even if its link is unchanged.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SparseDeletionCheckpoint(Box<str>);
+
+impl SparseDeletionCheckpoint {
+    pub(crate) fn new(token: &str) -> Option<Self> {
+        (!token.trim().is_empty()).then(|| Self(token.into()))
+    }
+
+    fn to_outcome(&self) -> String {
+        serde_json::json!(["source_deleted_v1", self.0]).to_string()
+    }
+
+    fn from_outcome(outcome: Option<&str>) -> Result<Option<Self>, StateError> {
+        let Some(encoded) = outcome.filter(|value| value.starts_with('[')) else {
+            return Ok(None);
+        };
+        let (kind, token): (String, String) = serde_json::from_str(encoded)
+            .map_err(|_invalid_evidence| invariant("invalid sparse deletion evidence"))?;
+        if kind != "source_deleted_v1" {
+            return Err(invariant("unsupported sparse deletion evidence"));
+        }
+        Self::new(&token)
+            .map(Some)
+            .ok_or_else(|| invariant("empty sparse deletion checkpoint"))
+    }
+}
+
+impl std::fmt::Debug for SparseDeletionCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SparseDeletionCheckpoint(<redacted>)")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SparseGeneration(i64);
 
@@ -64,6 +99,7 @@ pub(crate) struct SparseIdentity {
     pub(crate) first_seen: DateTime<Utc>,
     pub(crate) last_attempt: Option<DateTime<Utc>>,
     pub(crate) next_retry: Option<DateTime<Utc>>,
+    pub(crate) deletion_checkpoint: Option<SparseDeletionCheckpoint>,
 }
 
 impl SparseIdentity {
@@ -95,6 +131,7 @@ pub(crate) enum SparseAttemptOutcome {
     Unresolved(SparseEvidence),
     Inconclusive,
     Recovered,
+    SourceDeleted(SparseDeletionCheckpoint),
 }
 
 #[async_trait]
@@ -152,7 +189,7 @@ fn read_rows(
     library: &str,
     source: Option<&str>,
 ) -> Result<Vec<SparseIdentity>, StateError> {
-    let mut stmt = conn.prepare("SELECT source_record_name, original_evidence, observed_evidence, lookup_evidence, generation, first_seen_at, next_retry_at, last_attempt_at FROM unresolved_sparse_identities WHERE library=?1 AND (?2 IS NULL OR source_record_name=?2) ORDER BY COALESCE(next_retry_at, first_seen_at), source_record_name")?;
+    let mut stmt = conn.prepare("SELECT source_record_name, original_evidence, observed_evidence, lookup_evidence, generation, first_seen_at, next_retry_at, last_attempt_at, last_outcome FROM unresolved_sparse_identities WHERE library=?1 AND (?2 IS NULL OR source_record_name=?2) ORDER BY COALESCE(next_retry_at, first_seen_at), source_record_name")?;
     let rows = stmt.query_map(params![library, source], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -163,11 +200,12 @@ fn read_rows(
             row.get::<_, i64>(5)?,
             row.get::<_, Option<i64>>(6)?,
             row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     })?;
     let mut identities = Vec::new();
     for row in rows {
-        let (source, original, observed, lookup, generation, first, next, last) = row?;
+        let (source, original, observed, lookup, generation, first, next, last, outcome) = row?;
         if source.trim().is_empty() || generation < 1 {
             return Err(invariant("invalid sparse identity row"));
         }
@@ -194,6 +232,7 @@ fn read_rows(
                 })
                 .transpose()?,
             next_retry,
+            deletion_checkpoint: SparseDeletionCheckpoint::from_outcome(outcome.as_deref())?,
         });
     }
     Ok(identities)
@@ -223,7 +262,7 @@ impl SparseIdentityStore for SqliteStateDb {
             }
             let tx = conn.transaction()?;
             let generation = next_generation(&tx)?;
-            tx.execute("INSERT INTO unresolved_sparse_identities (library, source_record_name, original_evidence, observed_evidence, generation, first_seen_at) VALUES (?1,?2,?3,?3,?5,?4) ON CONFLICT(library,source_record_name) DO UPDATE SET observed_evidence=excluded.observed_evidence, generation=excluded.generation, attempts=0, next_retry_at=NULL WHERE observed_evidence <> excluded.observed_evidence", params![library, source.as_str(), evidence.as_str(), now.timestamp(), generation])?;
+            tx.execute("INSERT INTO unresolved_sparse_identities (library, source_record_name, original_evidence, observed_evidence, generation, first_seen_at) VALUES (?1,?2,?3,?3,?5,?4) ON CONFLICT(library,source_record_name) DO UPDATE SET observed_evidence=excluded.observed_evidence, generation=excluded.generation, attempts=0, next_retry_at=NULL, last_outcome=NULL WHERE observed_evidence <> excluded.observed_evidence", params![library, source.as_str(), evidence.as_str(), now.timestamp(), generation])?;
             tx.execute("INSERT INTO metadata (key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'", [crate::state::unresolved_identity_key(&library)])?;
             let row = read_rows(&tx, &library, Some(source.as_str()))?
                 .into_iter()
@@ -256,10 +295,11 @@ impl SparseIdentityStore for SqliteStateDb {
                     } else {
                         None
                     };
-                    (Some(evidence), if same { "unresolved" } else { "changed" }, next)
+                    (Some(evidence), String::from(if same { "unresolved" } else { "changed" }), next)
                 }
-                SparseAttemptOutcome::Inconclusive => (None, "inconclusive", None),
-                SparseAttemptOutcome::Recovered => (None, "recovered", None),
+                SparseAttemptOutcome::Inconclusive => (None, "inconclusive".into(), None),
+                SparseAttemptOutcome::Recovered => (None, "recovered".into(), None),
+                SparseAttemptOutcome::SourceDeleted(checkpoint) => (None, checkpoint.to_outcome(), None),
             };
             let attempts = if label == "unresolved" {
                 attempts.saturating_add(1)
@@ -308,6 +348,32 @@ mod tests {
         SparseEvidence::new(format!(
             r#"[1,"{target}","SharedSync-private","private-owner"]"#
         ))
+    }
+
+    #[test]
+    fn sparse_deletion_checkpoint_roundtrip_is_versioned_and_redacted() {
+        use super::SparseDeletionCheckpoint;
+        let checkpoint = SparseDeletionCheckpoint::new("private-token").unwrap();
+        assert_eq!(
+            SparseDeletionCheckpoint::from_outcome(Some(&checkpoint.to_outcome())).unwrap(),
+            Some(checkpoint.clone())
+        );
+        assert!(!format!("{checkpoint:?}").contains("private-token"));
+        for old in [
+            None,
+            Some("recovered"),
+            Some("unresolved"),
+            Some("inconclusive"),
+        ] {
+            assert_eq!(SparseDeletionCheckpoint::from_outcome(old).unwrap(), None);
+        }
+        for invalid in [
+            "[",
+            r#"["source_deleted_v2","token"]"#,
+            r#"["source_deleted_v1"," "]"#,
+        ] {
+            assert!(SparseDeletionCheckpoint::from_outcome(Some(invalid)).is_err());
+        }
     }
 
     #[tokio::test]

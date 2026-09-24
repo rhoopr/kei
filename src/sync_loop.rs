@@ -7345,6 +7345,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
+        use crate::state::{SparseIdentityStore, SparseSourceId};
+        #[derive(Clone, Debug)]
+        struct DeletedSession {
+            lookups: Arc<std::sync::atomic::AtomicUsize>,
+            replay: bool,
+            count: usize,
+        }
+        #[async_trait::async_trait]
+        impl crate::icloud::photos::PhotosSession for DeletedSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                if url.contains("/changes/zone?") {
+                    let mut records = Vec::new();
+                    if self.replay && body["zones"][0]["syncToken"] != "after" {
+                        for index in 0..self.count {
+                            let mut record = crate::test_helpers::sparse_shared_asset_record();
+                            record["recordName"] = serde_json::json!(format!("source-{index:03}"));
+                            records.push(record);
+                        }
+                    }
+                    return Ok(
+                        serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":records}]}),
+                    );
+                }
+                assert!(url.contains("/records/lookup?"));
+                let records: Vec<_> = body["records"].as_array().unwrap().iter().map(|r| {
+                    self.lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    serde_json::json!({"recordName": r["recordName"], "serverErrorCode":"UNKNOWN_ITEM"})
+                }).collect();
+                Ok(serde_json::json!({"records":records}))
+            }
+            fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+        for recent in [None, Some(10)] {
+            for replay in [false, true] {
+                let count = 101;
+                let directory = tempfile::tempdir().unwrap();
+                let media = directory.path().join("media");
+                let database = directory.path().join("state.db");
+                {
+                    let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                    let db = inner.clone() as Arc<dyn download::DownloadStore>;
+                    seed_run_cycle_metadata_drift_asset(&db, &media).await;
+                    inner.set_metadata_capture_revision_for_test(
+                        "PrimarySync",
+                        "master-PrimarySync",
+                        state::METADATA_CAPTURE_REVISION,
+                    );
+                    let run = db.start_sync_run().await.unwrap();
+                    db.complete_sync_run(run, &state::SyncRunStats::default())
+                        .await
+                        .unwrap();
+                    db.set_metadata("sync_token:PrimarySync", "before")
+                        .await
+                        .unwrap();
+                    let evidence = crate::icloud::photos::asset::SparseShareEvidence::from_fields(
+                        &crate::test_helpers::sparse_shared_asset_record()["fields"],
+                    )
+                    .unwrap()
+                    .durable_key()
+                    .unwrap();
+                    for index in 0..count {
+                        db.observe_sparse_identity(
+                            "PrimarySync",
+                            &SparseSourceId::new(&format!("source-{index:03}")),
+                            &evidence,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    // Force the cached deletion through the real source-state update after restart.
+                    let record = crate::test_helpers::TestAssetRecord::new("source-000").build();
+                    db.upsert_seen(&record).await.unwrap();
+                    inner.set_metadata_capture_revision_for_test(
+                        "PrimarySync",
+                        "source-000",
+                        state::METADATA_CAPTURE_REVISION,
+                    );
+                }
+                let sentinel = media.join("keep.bin");
+                std::fs::write(&sentinel, b"unchanged private media").unwrap();
+                let mut config = make_run_cycle_config();
+                config.filters.recent = recent;
+                let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+                let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let library = make_run_cycle_library_state_with_album(
+                    "PrimarySync",
+                    "sync_token:PrimarySync",
+                    make_full_album_with_boxed_session(
+                        "PrimarySync",
+                        Box::new(DeletedSession {
+                            lookups: lookups.clone(),
+                            replay,
+                            count,
+                        }),
+                    ),
+                );
+                for cycle in 0..4 {
+                    let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                    let db: Arc<dyn download::DownloadStore> = if cycle == 1 {
+                        let mut failing = FailingMetadataSetDb::without_set_failure(
+                            inner.clone(),
+                            "injected cached deletion state failure",
+                        );
+                        failing.fail_source_delete = true;
+                        Arc::new(failing)
+                    } else {
+                        inner.clone()
+                    };
+                    let builder = make_run_cycle_download_config_builder_with_options(
+                        &media,
+                        db.clone(),
+                        RunCycleDownloadConfigOptions {
+                            recent,
+                            ..RunCycleDownloadConfigOptions::default()
+                        },
+                    );
+                    let result = run_cycle(
+                        &[&library],
+                        &config,
+                        Some(db.as_ref()),
+                        false,
+                        &builder,
+                        download::DownloadControls::download_hidden(),
+                        &shared_session,
+                        &CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                    let held = cycle < 2;
+                    assert_eq!(
+                        inner
+                            .get_metadata("sync_token:PrimarySync")
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some(if held { "before" } else { "after" }),
+                        "recent={recent:?} replay={replay} cycle={cycle}"
+                    );
+                    assert_eq!(
+                        inner.sparse_identities("PrimarySync").await.unwrap().len(),
+                        if held { count } else { 0 }
+                    );
+                    assert_eq!(result.stats.state_write_failures > 0, cycle == 1);
+                    assert_eq!(result.failed_count > 0, held);
+                    assert_eq!(inner.get_summary().await.unwrap().source_deleted, 1);
+                    assert_eq!(
+                        lookups.load(std::sync::atomic::Ordering::Relaxed),
+                        if cycle == 0 { 100 } else { 101 }
+                    );
+                    assert_eq!(
+                        std::fs::read(&sentinel).unwrap(),
+                        b"unchanged private media"
+                    );
+                    if !held {
+                        assert_eq!(
+                            inner.get_summary().await.unwrap().unresolved_identity_zones,
+                            0
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media() {
         use crate::state::{
             SparseAttemptOutcome, SparseEvidence, SparseIdentityStore, SparseSourceId,

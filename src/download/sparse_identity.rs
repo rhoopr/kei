@@ -5,7 +5,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{DownloadConfig, DownloadRunMode, IncrementalDeltaSummary};
 use crate::icloud::photos::asset::{ChangeEvent, SparseShareEvidence};
-use crate::state::{SparseAttemptOutcome, SparseIdentity, SparseSourceId};
+use crate::state::{
+    SparseAttemptOutcome, SparseDeletionCheckpoint, SparseIdentity, SparseSourceId,
+};
 use crate::types::ChangeReason;
 
 const SPARSE_LOOKUPS_PER_LIBRARY: usize = 100;
@@ -14,6 +16,7 @@ const SPARSE_LOOKUPS_PER_LIBRARY: usize = 100;
 pub(super) struct SparseRetryContext {
     rows: FxHashMap<SparseSourceId, SparseIdentity>,
     due: FxHashSet<SparseSourceId>,
+    checkpoint: Option<SparseDeletionCheckpoint>,
 }
 
 fn state_failure(summary: &mut IncrementalDeltaSummary) {
@@ -78,6 +81,10 @@ impl SparseRetryContext {
             }
             context.rows.insert(row.source.clone(), row);
         }
+        context.checkpoint = summary
+            .sync_token
+            .as_deref()
+            .and_then(SparseDeletionCheckpoint::new);
         let now = Utc::now();
         for event in events.iter() {
             if event.reason != ChangeReason::Created
@@ -112,6 +119,31 @@ impl SparseRetryContext {
             }
         }
         context
+    }
+
+    #[must_use]
+    pub(super) fn deletion_is_current(&self, event: &ChangeEvent) -> bool {
+        let Some(checkpoint) = &self.checkpoint else {
+            return false;
+        };
+        self.rows
+            .get(&SparseSourceId::new(&event.record_name))
+            .is_some_and(|row| {
+                row.deletion_checkpoint.as_ref() == Some(checkpoint)
+                    && event
+                        .sparse_share
+                        .as_ref()
+                        .and_then(SparseShareEvidence::durable_key)
+                        .as_ref()
+                        == Some(&row.observed)
+            })
+    }
+
+    pub(super) fn deletion_outcome(&self) -> SparseAttemptOutcome {
+        self.checkpoint.clone().map_or(
+            SparseAttemptOutcome::Recovered,
+            SparseAttemptOutcome::SourceDeleted,
+        )
     }
 
     // Select after authoritative mappings have been removed from the source-only
@@ -372,6 +404,84 @@ mod tests {
         assert_eq!(
             db.sparse_identities("PrimarySync").await.unwrap()[0].original,
             key()
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_deletion_requires_matching_snapshot_and_source_evidence() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let config = DownloadConfig {
+            library: "PrimarySync".into(),
+            state_db: Some(db.clone()),
+            ..DownloadConfig::test_default()
+        };
+        let row = db
+            .observe_sparse_identity(
+                "PrimarySync",
+                &SparseSourceId::new("source"),
+                &key(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let checkpoint = crate::state::SparseDeletionCheckpoint::new("snapshot").unwrap();
+        db.record_sparse_attempt(
+            &row,
+            SparseAttemptOutcome::SourceDeleted(checkpoint),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        for token in [None, Some("new-snapshot"), Some("snapshot")] {
+            let mut events = Vec::new();
+            let mut summary = IncrementalDeltaSummary {
+                sync_token: token.map(str::to_owned),
+                ..IncrementalDeltaSummary::default()
+            };
+            let retry = SparseRetryContext::prepare(
+                &mut events,
+                &config,
+                &mut summary,
+                DownloadRunMode::Download,
+            )
+            .await;
+            assert_eq!(
+                retry.deletion_is_current(&events[0]),
+                token == Some("snapshot")
+            );
+        }
+        let mut events = Vec::new();
+        let mut summary = IncrementalDeltaSummary {
+            sync_token: Some("snapshot".into()),
+            ..IncrementalDeltaSummary::default()
+        };
+        let retry = SparseRetryContext::prepare(
+            &mut events,
+            &config,
+            &mut summary,
+            DownloadRunMode::Download,
+        )
+        .await;
+        assert!(retry.deletion_is_current(&events[0]));
+        events[0].sparse_share = Some(SparseShareEvidence::Malformed);
+        assert!(!retry.deletion_is_current(&events[0]));
+        events[0].sparse_share = SparseShareEvidence::from_durable_key(&SparseEvidence::new(
+            r#"[1,"changed","SharedSync-private","owner"]"#.into(),
+        ));
+        let changed = SparseRetryContext::prepare(
+            &mut events,
+            &config,
+            &mut summary,
+            DownloadRunMode::Download,
+        )
+        .await;
+        assert!(!changed.deletion_is_current(&events[0]));
+        let changed_row = db.sparse_identities("PrimarySync").await.unwrap().remove(0);
+        assert_eq!(changed_row.deletion_checkpoint, None);
+        assert!(
+            db.record_sparse_attempt(&row, SparseAttemptOutcome::Recovered, Utc::now())
+                .await
+                .is_err()
         );
     }
 

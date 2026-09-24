@@ -12,8 +12,8 @@ pub mod error;
 pub mod schema;
 pub mod types;
 pub(crate) use db::{
-    SparseAttemptOutcome, SparseEvidence, SparseIdentity, SparseIdentityProof, SparseIdentityStore,
-    SparseSourceId,
+    SparseAttemptOutcome, SparseDeletionCheckpoint, SparseEvidence, SparseIdentity,
+    SparseIdentityProof, SparseIdentityStore, SparseSourceId,
 };
 
 #[cfg(test)]

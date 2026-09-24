@@ -150,6 +150,16 @@ sources still need an initial lookup before sparse retry policy can apply.
 A deferred source remains unresolved and blocks the checkpoint. Retained
 sources absent from replay re-enter normal hydration and media planning.
 
+Authoritative source-only deletion lookups retain the completed delta token in
+`last_outcome` as `["source_deleted_v1", token]`. This is provider evidence,
+not a persisted claim that local processing completed. On restart or the next
+batch, the same complete delta snapshot and unchanged source evidence can
+reuse that result. The ordinary source-state transition runs again before a
+current receipt is issued. A different or missing delta token, changed link,
+or authoritative master mapping requires normal recovery. This lets more than
+100 deleted sources complete over bounded batches without relaxing checkpoint
+or state-write guards. Existing schema-26 outcome labels remain readable.
+
 Hydration, explicitly soft-deleted source `CPLAsset` deltas, and exact-source
 hard-deletion tombstones supply generation-fenced receipts, not permission to
 advance a checkpoint. The cycle owner still requires normal processing and checkpoint

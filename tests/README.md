@@ -384,3 +384,11 @@ success, new valid media downloads, and exact source recovery when replay omits
 the source. Recovery retains seeded files and retries after interruption or a
 state-write failure before an unchanged follow-up cycle. Parser tests round-trip
 the versioned link encoding and reject corrupt or unsupported evidence.
+
+The sparse-deletion batch regression seeds 101 retained sources and local
+media, then runs streaming and collecting cycles against explicit source
+`UNKNOWN_ITEM` responses. It reopens SQLite between cycles, tests replayed
+and omitted source deltas, injects a cached-deletion state-write failure, and
+checks that recovery uses 101 total lookups and stops querying after completion.
+Snapshot-token, changed-link, stale-generation, redaction, and versioned
+completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.

@@ -18,8 +18,8 @@ use super::types::{
 mod sparse_identity;
 
 pub(crate) use sparse_identity::{
-    SparseAttemptOutcome, SparseEvidence, SparseIdentity, SparseIdentityProof, SparseIdentityStore,
-    SparseSourceId,
+    SparseAttemptOutcome, SparseDeletionCheckpoint, SparseEvidence, SparseIdentity,
+    SparseIdentityProof, SparseIdentityStore, SparseSourceId,
 };
 
 /// Fallback source identifier when `AssetMetadata::source` is unset.

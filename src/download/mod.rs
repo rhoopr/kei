@@ -7540,6 +7540,27 @@ async fn hydrate_unpaired_created_asset_deltas(
     }
 }
 
+// Reapply the ordinary durable source transition even for a cached provider
+// deletion. A failed prior state write must not become a completion receipt.
+async fn apply_sparse_source_deletion(
+    event: &ChangeEvent,
+    config: &DownloadConfig,
+    summary: &mut IncrementalDeltaSummary,
+) {
+    if let Some(db) = &config.state_db {
+        let update = SourceStateUpdate::SoftDeleted { deleted_at: None };
+        let (result, state_key) =
+            apply_source_state_update(db.as_ref(), config, event, update).await;
+        record_incremental_state_transition_result(
+            result,
+            update.transition(),
+            state_key,
+            &mut summary.state_transition_failures,
+            &mut summary.token_unsafe_reason,
+        );
+    }
+}
+
 async fn hydrate_unpaired_created_asset_deltas_inner(
     events: &mut [ChangeEvent],
     pass: Option<&crate::commands::AlbumPass>,
@@ -7586,6 +7607,10 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
             Some(master_record_name) => {
                 pending.push((index, event.record_name.to_string(), master_record_name));
             }
+            None if retry.deletion_is_current(event) => {
+                apply_sparse_source_deletion(event, config, summary).await;
+                retry.prove(&event.record_name, summary);
+            }
             None => unresolved
                 .entry(event.record_name.to_string())
                 .or_default()
@@ -7627,11 +7652,11 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                     SparseAttemptOutcome::Inconclusive,
                     SparseAttemptOutcome::Unresolved,
                 ),
-                RecordResolution::AssetPresent { .. }
-                | RecordResolution::Deleted {
+                RecordResolution::AssetPresent { .. } => SparseAttemptOutcome::Recovered,
+                RecordResolution::Deleted {
                     master_family: false,
                     ..
-                } => SparseAttemptOutcome::Recovered,
+                } => retry.deletion_outcome(),
                 _ => SparseAttemptOutcome::Inconclusive,
             };
             retry
@@ -7677,6 +7702,13 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                     master_family: false,
                     ..
                 } => {
+                    if run_mode.downloads_files() {
+                        for index in indices {
+                            if let Some(event) = events.get(index) {
+                                apply_sparse_source_deletion(event, config, summary).await;
+                            }
+                        }
+                    }
                     retry.prove(state_id.as_str(), summary);
                     tracing::debug!(
                         asset_record_name = state_id.as_str(),
@@ -8027,6 +8059,10 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             }
         }
 
+        // A cached source deletion is valid only for this completed delta snapshot.
+        if let Ok(token) = token_rx.await {
+            summary.sync_token = Some(token);
+        }
         hydrate_unpaired_created_asset_deltas(
             &mut unpaired_asset_events,
             Some(&pass),
@@ -8099,9 +8135,6 @@ fn stream_incremental_assets_for_single_unfiled_pass(
         if let Some(error) = summary.first_auth_error.take() {
             let _ = asset_tx.send(Err(error)).await;
             return Ok(summary);
-        }
-        if let Ok(token) = token_rx.await {
-            summary.sync_token = Some(token);
         }
         Ok(summary)
     });
