@@ -4425,6 +4425,36 @@ fn metadata_capture_candidate_matches(
     })
 }
 
+// Temporary #765 diagnostic. Full rendition agreement is observational only:
+// mutable provider renditions cannot establish a missing child identity.
+fn log_metadata_capture_ambiguity_counts(
+    candidate: &crate::state::MetadataCaptureCandidate,
+    matching_assets: impl Iterator<Item = PhotoAsset>,
+) {
+    let mut matching_children = 0_usize;
+    let mut full_evidence_matching_children = 0_usize;
+    for asset in matching_assets {
+        matching_children += 1;
+        if candidate.versions.iter().all(|evidence| {
+            asset.versions().iter().any(|(version_size, version)| {
+                VersionSizeKey::from(*version_size) == evidence.version_size
+                    && version.size == evidence.size_bytes
+                    && version.checksum.as_ref() == evidence.checksum
+            })
+        }) {
+            full_evidence_matching_children += 1;
+        }
+    }
+    // Counts only: never emit library/record names, paths, hashes, or metadata.
+    tracing::warn!(
+        diagnostic = "metadata_capture_ambiguity_counts_v1",
+        stored_renditions = candidate.versions.len(),
+        matching_children,
+        full_evidence_matching_children,
+        "Metadata capture repair found ambiguous provider children"
+    );
+}
+
 async fn record_metadata_capture_failure(
     db: &dyn DownloadStore,
     library: &str,
@@ -4704,7 +4734,13 @@ async fn run_metadata_capture_repair(
                         .await;
                         continue;
                     };
-                    if matches.next().is_some() {
+                    if let Some(second) = matches.next() {
+                        log_metadata_capture_ambiguity_counts(
+                            &candidate,
+                            std::iter::once(asset)
+                                .chain(std::iter::once(second))
+                                .chain(matches),
+                        );
                         record_metadata_capture_failure(
                             db.as_ref(),
                             &candidate.library,
@@ -18758,6 +18794,298 @@ mod tests {
         assert_eq!(capture.active_revision, 1);
         assert_eq!(capture.pending_revision, None);
         assert_eq!(capture.remaining_assets, 0);
+    }
+
+    #[test]
+    fn metadata_capture_ambiguity_counts_compare_all_stored_renditions() {
+        use crate::state::types::MetadataCaptureVersionEvidence;
+
+        let dir = TempDir::new().expect("temp dir");
+        let log_path = dir.path().join("counts.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(std::sync::Mutex::new(
+                std::fs::File::create(&log_path).expect("diagnostic log"),
+            ))
+            .finish();
+        let subscriber = tracing::Dispatch::new(subscriber);
+        let records = incremental_photo_records("private-master-765");
+        let mut complete_child = records[1].clone();
+        complete_child["fields"]["resJPEGMedRes"] = records[0]["fields"]["resOriginalRes"].clone();
+        complete_child["fields"]["resJPEGMedFileType"] = json!({"value": "public.jpeg"});
+        let complete_asset = PhotoAsset::new(records[0].clone(), complete_child.clone());
+        let candidate = crate::state::MetadataCaptureCandidate {
+            library: "private-library-765".into(),
+            asset_id: "private-state-765".into(),
+            master_record_name: "private-master-765".into(),
+            asset_record_name: None,
+            versions: complete_asset
+                .versions()
+                .iter()
+                .map(|(size, version)| MetadataCaptureVersionEvidence {
+                    version_size: VersionSizeKey::from(*size),
+                    checksum: version.checksum.to_string(),
+                    size_bytes: version.size,
+                })
+                .collect(),
+        };
+        assert_eq!(candidate.versions.len(), 2);
+        for full_matches in [0, 1, 3] {
+            let children = (0..3)
+                .map(|index| {
+                    let mut child = if index < full_matches {
+                        complete_child.clone()
+                    } else {
+                        records[1].clone()
+                    };
+                    if index >= full_matches && index == 1 {
+                        child["fields"]["resJPEGMedRes"] =
+                            complete_child["fields"]["resJPEGMedRes"].clone();
+                        child["fields"]["resJPEGMedFileType"] = json!({"value": "public.jpeg"});
+                        child["fields"]["resJPEGMedRes"]["value"]["size"] = json!(2048);
+                    }
+                    child["recordName"] = json!(format!("private-child-{index}"));
+                    PhotoAsset::new(records[0].clone(), child)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                children
+                    .iter()
+                    .all(|asset| metadata_capture_candidate_matches(asset, &candidate))
+            );
+            tracing::dispatcher::with_default(&subscriber, || {
+                log_metadata_capture_ambiguity_counts(&candidate, children.into_iter());
+            });
+        }
+        let logs = std::fs::read_to_string(&log_path).expect("read counts");
+        let lines: Vec<_> = logs.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for (line, full_matches) in lines.iter().zip([0, 1, 3]) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            assert!(fields.contains(&"stored_renditions=2"));
+            assert!(fields.contains(&"matching_children=3"));
+            assert!(
+                fields
+                    .contains(&format!("full_evidence_matching_children={full_matches}").as_str())
+            );
+        }
+        for private in ["private-", "changed.jpg", "icloud-content.com", "AAAAAAAA"] {
+            assert!(
+                !logs.contains(private),
+                "diagnostic leaked private evidence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_capture_legacy_siblings_require_distinguishing_evidence() {
+        use tracing::instrument::WithSubscriber;
+
+        // Identical originals do not establish which child's mutable metadata belongs
+        // to a legacy master-keyed row. Exercise the normal sync twice per case.
+        for case in ["ambiguous", "unique_rendition", "durable_owner"] {
+            let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+            let dir = TempDir::new().expect("temp dir");
+            let log_path = dir.path().join("repair.log");
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(std::sync::Mutex::new(
+                    std::fs::File::create(&log_path).expect("diagnostic log"),
+                ))
+                .finish();
+            let subscriber = tracing::Dispatch::new(subscriber);
+            let records = incremental_photo_records_with_favorite("CAPTURE_SIBLINGS", false);
+            let master = records[0].clone();
+            let first = records[1].clone();
+            let mut second = first.clone();
+            second["recordName"] = json!("asset-capture-sibling-b");
+            second["fields"]["isFavorite"]["value"] = json!(1);
+            if case == "unique_rendition" {
+                second["fields"]["resOriginalRes"] = master["fields"]["resOriginalRes"].clone();
+                second["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                    json!("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=");
+                second["fields"]["resOriginalFileType"] = json!({"value": "public.jpeg"});
+            }
+            let stored_asset = PhotoAsset::new(master.clone(), first.clone());
+            let sibling = PhotoAsset::new(master.clone(), second.clone());
+            let lookup_records = if case == "durable_owner" {
+                vec![master.clone(), second.clone()]
+            } else {
+                vec![master.clone()]
+            };
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path());
+            config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+            config.sync_mode = SyncMode::Incremental {
+                zone_sync_token: "zone-token-prev".to_string(),
+            };
+            let seed_pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(Vec::new()),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let path =
+                seed_downloaded_metadata_asset(db.as_ref(), &config, &seed_pass, &stored_asset)
+                    .await;
+            db.set_metadata_capture_revision_for_test("PrimarySync", "CAPTURE_SIBLINGS", 0);
+            let candidates = db
+                .get_metadata_capture_candidates("PrimarySync", 1, 1)
+                .await
+                .expect("read legacy evidence");
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].asset_record_name, None);
+            assert_eq!(candidates[0].versions.len(), 1);
+            assert!(metadata_capture_candidate_matches(
+                &stored_asset,
+                &candidates[0]
+            ));
+            assert_eq!(
+                metadata_capture_candidate_matches(&sibling, &candidates[0]),
+                case != "unique_rendition",
+            );
+            if case == "durable_owner" {
+                assert!(
+                    db.claim_legacy_master_state_owner(
+                        "PrimarySync",
+                        "CAPTURE_SIBLINGS",
+                        "asset-capture-sibling-b",
+                    )
+                    .await
+                    .expect("seed authoritative owner")
+                );
+            }
+            let before = tokio::fs::read(&path).await.expect("read seeded media");
+            let config = Arc::new(config);
+            for cycle in 0..2 {
+                let children = if cycle == 0 {
+                    vec![master.clone(), first.clone(), second.clone()]
+                } else {
+                    vec![master.clone(), second.clone(), first.clone()]
+                };
+                let pass = AlbumPass {
+                    kind: PassKind::Unfiled,
+                    album: album_with_session(
+                        "PrimarySync",
+                        "",
+                        Box::new(LegacyPendingHydrationSession {
+                            lookup_records: Arc::new(lookup_records.clone()),
+                            hydration_records: Arc::new(children),
+                            hydration_error: None,
+                        }),
+                    ),
+                    exclude_ids: Arc::new(FxHashSet::default()),
+                };
+                let result = download_photos_with_sync(
+                    &Client::new(),
+                    &[pass],
+                    Arc::clone(&config),
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
+                )
+                .with_subscriber(subscriber.clone())
+                .await
+                .expect("normal sync reports repair outcome");
+                let logs = std::fs::read_to_string(&log_path).expect("read diagnostics");
+                let diagnostics: Vec<_> = logs
+                    .lines()
+                    .filter(|line| line.contains("metadata_capture_ambiguity_counts_v1"))
+                    .collect();
+                if case == "ambiguous" {
+                    assert_eq!(
+                        diagnostics.len(),
+                        usize::try_from(cycle + 1).expect("cycle count")
+                    );
+                    for line in diagnostics {
+                        assert!(line.contains("stored_renditions=1"));
+                        assert!(line.contains("matching_children=2"));
+                        assert!(line.contains("full_evidence_matching_children=2"));
+                        for private in [
+                            "CAPTURE_SIBLINGS",
+                            "asset-capture-sibling-b",
+                            "PrimarySync",
+                            "changed.jpg",
+                            "AAAAAAAA",
+                        ] {
+                            assert!(
+                                !line.contains(private),
+                                "diagnostic leaked private evidence"
+                            );
+                        }
+                    }
+                } else {
+                    assert!(
+                        diagnostics.is_empty(),
+                        "non-ambiguous repair must not emit diagnostics"
+                    );
+                }
+                assert_eq!(result.stats.downloaded, 0, "{case}, cycle {cycle}");
+                let summary = db.get_summary().await.expect("durable summary");
+                let capture = summary
+                    .metadata_capture
+                    .iter()
+                    .find(|status| status.library == "PrimarySync")
+                    .expect("capture status");
+                if case == "ambiguous" {
+                    assert!(matches!(
+                        result.outcome,
+                        DownloadOutcome::PartialFailure { failed_count: 1 }
+                    ));
+                    assert_eq!(result.sync_token, None);
+                    assert!(result.stats.sync_token_blocked);
+                    assert_eq!(
+                        result.stats.sync_token_blocked_reason,
+                        Some(METADATA_CAPTURE_REPAIR_FAILED_REASON)
+                    );
+                    assert_eq!(result.stats.metadata_capture_refreshed, 0);
+                    assert_eq!(result.stats.metadata_capture_failures, 1);
+                    assert_eq!(
+                        capture.last_error.as_deref(),
+                        Some("multiple provider children matched durable catalogue evidence")
+                    );
+                    assert_eq!(capture.remaining_assets, 1);
+                    assert_eq!(capture.pending_revision, Some(1));
+                    assert_eq!(capture.active_revision, 0);
+                    assert_eq!(capture.failed_assets, cycle + 1);
+                    assert!(
+                        db.get_legacy_master_state_owners()
+                            .await
+                            .expect("owners")
+                            .is_empty()
+                    );
+                    assert!(
+                        db.get_asset_master_mappings()
+                            .await
+                            .expect("mappings")
+                            .is_empty()
+                    );
+                } else {
+                    assert!(matches!(result.outcome, DownloadOutcome::Success));
+                    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+                    assert!(!result.stats.sync_token_blocked);
+                    assert_eq!(result.stats.metadata_capture_failures, 0);
+                    assert_eq!(
+                        result.stats.metadata_capture_refreshed,
+                        usize::from(cycle == 0)
+                    );
+                    assert_eq!(capture.remaining_assets, 0);
+                    assert_eq!(capture.active_revision, 1);
+                    assert_eq!(capture.pending_revision, None);
+                }
+                let rows = db.get_downloaded_page(0, 10).await.expect("catalogue rows");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].metadata.is_favorite, case == "durable_owner");
+                assert_eq!(rows[0].local_path.as_deref(), Some(path.as_path()));
+                assert_eq!(tokio::fs::read(&path).await.expect("read media"), before);
+            }
+        }
     }
 
     #[tokio::test]
