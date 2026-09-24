@@ -91,7 +91,8 @@ pub(in crate::download) async fn publish_part_to_final(
 mod tests {
     use tempfile::TempDir;
 
-    use super::{FinalPathCollision, rename_part_to_final};
+    use super::super::rename_part_to_final;
+    use super::FinalPathCollision;
 
     #[tokio::test]
     async fn rename_part_to_final_happy_path() {
