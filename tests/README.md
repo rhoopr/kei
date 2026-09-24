@@ -390,5 +390,12 @@ media, then runs streaming and collecting cycles against explicit source
 `UNKNOWN_ITEM` responses. It reopens SQLite between cycles, tests replayed
 and omitted source deltas, injects a cached-deletion state-write failure, and
 checks that recovery uses 101 total lookups and stops querying after completion.
+The same test changes the zone snapshot between batches with unrelated records.
+Additional streaming and collecting cycles restore a source with the same link,
+fail a validation tail page, or cancel validation. Each case retains unresolved
+work and the old checkpoint. Provider tests check raw source IDs across pages,
+including paired assets, and reject malformed, wrong-zone, and cyclic responses.
+Failed or cancelled validation is followed by recovery and an unchanged cycle
+with no repeated source lookups.
 Snapshot-token, changed-link, stale-generation, redaction, and versioned
 completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.

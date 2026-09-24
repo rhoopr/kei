@@ -51,13 +51,17 @@ impl std::fmt::Debug for SparseEvidence {
 }
 
 /// Authoritative source deletion scoped to a complete provider delta snapshot.
-/// A different snapshot must revalidate the source, even if its link is unchanged.
-#[derive(Clone, PartialEq, Eq)]
+/// Reuse at a different snapshot requires a complete source-change validation.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SparseDeletionCheckpoint(Box<str>);
 
 impl SparseDeletionCheckpoint {
     pub(crate) fn new(token: &str) -> Option<Self> {
         (!token.trim().is_empty()).then(|| Self(token.into()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 
     fn to_outcome(&self) -> String {

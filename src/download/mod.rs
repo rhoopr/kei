@@ -7509,8 +7509,16 @@ async fn hydrate_unpaired_created_asset_deltas(
     config: &DownloadConfig,
     summary: &mut IncrementalDeltaSummary,
     run_mode: DownloadRunMode,
+    shutdown_token: &CancellationToken,
 ) {
     let mut retry = SparseRetryContext::prepare(events, config, summary, run_mode).await;
+    retry
+        .revalidate_deletions(pass, config, summary, shutdown_token)
+        .await;
+    if shutdown_token.is_cancelled() {
+        summary.block_identity();
+        return;
+    }
     hydrate_unpaired_created_asset_deltas_inner(
         events, pass, config, summary, &mut retry, run_mode,
     )
@@ -8059,7 +8067,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             }
         }
 
-        // A cached source deletion is valid only for this completed delta snapshot.
+        // Cross-snapshot deletion reuse requires a complete validation scan.
         if let Ok(token) = token_rx.await {
             summary.sync_token = Some(token);
         }
@@ -8069,6 +8077,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             &config,
             &mut summary,
             run_mode,
+            &shutdown_token,
         )
         .await;
         let download_ctx = if run_mode.downloads_files()
@@ -8448,6 +8457,7 @@ async fn download_photos_incremental_collecting_inner(
         config,
         &mut delta_summary,
         controls.run_mode,
+        &shutdown_token,
     )
     .await;
     let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
@@ -20699,6 +20709,7 @@ mod tests {
                 &config,
                 &mut summary,
                 DownloadRunMode::Download,
+                &CancellationToken::new(),
             )
             .with_subscriber(subscriber.clone())
             .await;

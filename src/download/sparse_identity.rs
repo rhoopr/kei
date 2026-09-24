@@ -2,8 +2,10 @@
 
 use chrono::{DateTime, Utc};
 use rustc_hash::{FxHashMap, FxHashSet};
+use tokio_util::sync::CancellationToken;
 
 use super::{DownloadConfig, DownloadRunMode, IncrementalDeltaSummary};
+use crate::icloud::photos::ProviderRecordId;
 use crate::icloud::photos::asset::{ChangeEvent, SparseShareEvidence};
 use crate::state::{
     SparseAttemptOutcome, SparseDeletionCheckpoint, SparseIdentity, SparseSourceId,
@@ -119,6 +121,67 @@ impl SparseRetryContext {
             }
         }
         context
+    }
+
+    // Validate raw source IDs, not paired media events: pairing can hide a
+    // restored child behind its master. One scan covers a whole saved batch.
+    pub(super) async fn revalidate_deletions(
+        &mut self,
+        pass: Option<&crate::commands::AlbumPass>,
+        config: &DownloadConfig,
+        summary: &mut IncrementalDeltaSummary,
+        shutdown_token: &CancellationToken,
+    ) {
+        let (Some(pass), Some(current)) = (pass, self.checkpoint.clone()) else {
+            return;
+        };
+        let mut groups: FxHashMap<SparseDeletionCheckpoint, Vec<ProviderRecordId>> =
+            FxHashMap::default();
+        for row in self.rows.values() {
+            if let Some(previous) = &row.deletion_checkpoint
+                && previous != &current
+            {
+                groups
+                    .entry(previous.clone())
+                    .or_default()
+                    .push(ProviderRecordId::new(row.source.as_str()));
+            }
+        }
+        for (previous, sources) in groups {
+            let unchanged = match pass
+                .album
+                .unchanged_records_since(previous.as_str(), &sources, shutdown_token)
+                .await
+            {
+                Ok(unchanged) => unchanged,
+                Err(_) => {
+                    // An incomplete validation supplies no evidence. Ordinary
+                    // bounded source lookups may still establish fresh results.
+                    tracing::debug!(
+                        diagnostic = "sparse_deletion_validation_failed",
+                        "Could not validate retained source deletions"
+                    );
+                    continue;
+                }
+            };
+            for source in sources {
+                let outcome = if unchanged.contains(&source) {
+                    SparseAttemptOutcome::SourceDeleted(current.clone())
+                } else {
+                    SparseAttemptOutcome::Inconclusive
+                };
+                // Refresh the generation and saved boundary transactionally.
+                // Neither validation nor persistence bypasses local processing.
+                self.record(
+                    source.as_str(),
+                    outcome,
+                    config,
+                    summary,
+                    DownloadRunMode::Download,
+                )
+                .await;
+            }
+        }
     }
 
     #[must_use]

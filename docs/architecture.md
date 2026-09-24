@@ -155,10 +155,19 @@ Authoritative source-only deletion lookups retain the completed delta token in
 not a persisted claim that local processing completed. On restart or the next
 batch, the same complete delta snapshot and unchanged source evidence can
 reuse that result. The ordinary source-state transition runs again before a
-current receipt is issued. A different or missing delta token, changed link,
-or authoritative master mapping requires normal recovery. This lets more than
-100 deleted sources complete over bounded batches without relaxing checkpoint
-or state-write guards. Existing schema-26 outcome labels remain readable.
+current receipt is issued. A missing delta token, changed link, or authoritative
+master mapping requires normal recovery.
+For a different token, the Photos adapter scans the complete raw zone delta
+since each saved deletion checkpoint. One scan validates a whole batch.
+Any source change, including restoration with the same link, invalidates its
+cached deletion. Sources absent from a complete scan retain their deletion
+evidence at the current boundary with fresh generation fences. Missing tokens,
+invalid pages, incomplete scans, and cancellation supply no reuse evidence.
+Normal source lookups can still establish fresh results after a failed scan.
+Validation does not advance the sync checkpoint or complete local processing.
+This lets more than 100 deleted sources complete over bounded lookup batches
+while unrelated zone records change, without relaxing checkpoint or state-write
+guards. Existing schema-26 outcome labels remain readable.
 
 Hydration, explicitly soft-deleted source `CPLAsset` deltas, and exact-source
 hard-deletion tombstones supply generation-fenced receipts, not permission to
