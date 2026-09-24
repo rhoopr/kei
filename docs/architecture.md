@@ -51,7 +51,11 @@ changing behavior.
 | Single-task execution | `src/download/pipeline/task.rs` | Coordinates one transfer, metadata completion, temporary-file ownership, and worker error classification. |
 | Download pass and outcome | `src/download/pipeline/pass.rs`, `src/download/pipeline/outcome.rs` | Executes explicit task passes, finalizes streaming state, retries failed tasks, and aggregates sync outcomes. |
 | Download progress and summary | `src/download/pipeline/progress.rs` | Formats durations and sync summaries and reports rate-limit pressure. |
-| File transfer | `src/download/file.rs` | Downloads, resumes, validates, and publishes one media file. |
+| File facade and transfer | `src/download/file.rs`, `src/download/file/transfer.rs` | Preserves entry points and owns HTTP retry, resume, stream writes, and temporary-file cleanup. |
+| File validation and fingerprints | `src/download/file/validation.rs`, `src/download/file/fingerprint.rs` | Validates response lengths and media, checks local size evidence, and captures same-read hashes and snapshots. |
+| File publication and replacement | `src/download/file/publication.rs`, `src/download/file/replacement.rs` | Handles no-overwrite collisions and conditional replacement with displaced-file verification and restoration. |
+| Confined local copies | `src/download/file/reconciliation.rs` | Retains verified files and parent-directory capabilities through local copy and state finalization. |
+| File platform primitives | `src/download/file/platform.rs` | Owns platform rename, exchange, hard-link, and directory durability operations. |
 | State finalization | `src/download/finalize.rs` | Persists downloaded or failed outcomes and retries deferred state writes. |
 | Durable retry resolution | `src/download/retry.rs` | Revalidates pending provider identity and builds exact retry tasks. |
 | Path rendering | `src/download/paths.rs` | Expands folder templates, normalizes names, and handles collision suffixes. |
@@ -61,6 +65,20 @@ changing behavior.
 | Service integration | `src/service/` | Owns install, uninstall, status, service execution, and platform renderers. |
 | Operator surfaces | `src/commands/status.rs`, `src/commands/doctor.rs`, `src/commands/manifest.rs` | Read local state for status, redacted diagnostics, and catalog export. |
 | Reports and monitoring | `src/cycle_reporter.rs`, `src/report.rs`, `src/health.rs`, `src/metrics.rs`, `src/notifications.rs` | Converts cycle facts into reports, health, metrics, and notifications. |
+
+File tests use `download::file::<owner>::tests::<test_name>` instead of
+`download::file::tests::<test_name>`. The owners are `transfer`, `validation`,
+`fingerprint`, `publication`, `replacement`, and `reconciliation`. HTTP tests
+retain their nested `wiremock_tests` module under `transfer::tests`. Test names
+and assertions are unchanged; the Windows partial-replacement test remains
+Windows-only. File tracing keeps the `kei::download::file` target.
+
+File-owner dependencies are one-way: transfer calls validation and publication;
+publication calls replacement, platform primitives, and fingerprinting;
+replacement calls platform primitives and fingerprinting; reconciliation calls
+platform primitives and fingerprinting; validation uses fingerprinting for
+local-size evidence. Platform primitives do not decide replacement or retry
+policy. In particular, Windows partial-exchange recovery stays in replacement.
 
 Pipeline tests use `download::pipeline::<owner>::tests::<test_name>` instead
 of `download::pipeline::tests::<test_name>`. The owners are `adoption`,
