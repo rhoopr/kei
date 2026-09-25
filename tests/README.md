@@ -28,26 +28,24 @@ tests/
 
 ## Test catalog
 
-| Target | Count | Network | Runs via |
-|--------|------:|:-------:|----------|
-| `cargo test --bin kei` | 1550 | no | `just test fast` |
-| `cargo test --test cli` | 95 | no | `just test fast` |
-| `cargo test --test behavioral` | 112 | no | `just test fast` |
-| `cargo test --all-features --test sync` | 43 `#[ignore]` | yes | `just test live` |
-| `cargo test --all-features --test state_auth` | 17 `#[ignore]` | yes | `just test live` |
-| `cargo test --all-features --test import_existing_live` | 9 `#[ignore]` | yes | `just test live` |
-| `tests/shell/concurrency.sh` | 8 | yes | `just test concurrency` |
-| `tests/shell/state-machine.sh` | 20 | yes | `just test state` |
-| `tests/shell/docker.sh` | 16 | yes | `just test docker` |
-| `scripts/full-test/run_live_import_rehearsal.sh` | 1 | yes | `just full-test` |
-| `scripts/full-test/run_cross_zone_album_hydration.sh` | 1 | yes | `just full-test` when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set |
-| `scripts/full-test/run_docker_puid_smoke.sh` | 1 | no | `just full-test` |
-| `scripts/full-test/run_release_archive_smoke.sh` | 1 | no | `just full-test` |
-| `scripts/test-scenarios/*.sh` | focused slices | no | `just test scenario NAME` or `just test scenarios` |
-| `scripts/full-test/run_release_regression_smoke.sh` | 8 | no | `just release-smoke` |
-| `.github/workflows/service-smoke.yml` | 3 (linux/macos/windows) | no | `just service-smoke` (linux/macOS) |
-
-Counts are approximate and drift as tests are added.
+| Target | Network | Runs via |
+|--------|:-------:|----------|
+| `cargo test --lib` | no | `just test fast` |
+| `cargo test --test cli` | no | `just test fast` |
+| `cargo test --test behavioral` | no | `just test fast` |
+| `cargo test --all-features --test sync` | yes | `just test live` |
+| `cargo test --all-features --test state_auth` | yes | `just test live` |
+| `cargo test --all-features --test import_existing_live` | yes | `just test live` |
+| `tests/shell/concurrency.sh` | yes | `just test concurrency` |
+| `tests/shell/state-machine.sh` | yes | `just test state` |
+| `tests/shell/docker.sh` | yes | `just test docker` |
+| `scripts/full-test/run_live_import_rehearsal.sh` | yes | `just full-test` |
+| `scripts/full-test/run_cross_zone_album_hydration.sh` | yes | `just full-test` when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set |
+| `scripts/full-test/run_docker_puid_smoke.sh` | no | `just full-test` |
+| `scripts/full-test/run_release_archive_smoke.sh` | no | `just full-test` |
+| `scripts/test-scenarios/*.sh` | no | `just test scenario NAME` or `just test scenarios` |
+| `scripts/full-test/run_release_regression_smoke.sh` | no | `just release-smoke` |
+| `.github/workflows/service-smoke.yml` | no | `just service-smoke` (linux/macOS) |
 
 ## Focused scenario slices
 
@@ -102,10 +100,71 @@ was checked.
 
 ## Running
 
+Choose the route by purpose:
+
+| Purpose | Command | Proof |
+|---------|---------|-------|
+| Focused iteration | `just test scenario NAME`, `just test fast`, or `just test PATTERN` | Relevant tests with default features; not a complete gate |
+| Complete offline gate | `just gate` | Static checks, all-feature and no-default suites, and focused-filter catalog checks |
+| Release and live validation | `just full-test` | The offline gate's checks plus nightly tools, package, Docker, live provider, release-binary, and service phases |
+
+`just test offline` runs the behavior and catalog portion of `just gate`.
+`just test` runs only the all-feature suite. Existing focused, packaging,
+Docker, service, and live commands remain available individually.
+
+### Route coverage
+
+The change from the `8f3467c` route removes replay, not distinct test setups:
+
+| Route | Before | Now |
+|-------|--------|-----|
+| `just gate` | Static checks; all-feature suite; no-default suite | Static checks; `just test offline` |
+| `just test offline` | All-feature suite; default-feature drift targets; no-default suite; default-feature scope-matrix filter | All-feature suite; no-default suite; default-feature scenario catalogs |
+| `just full-test` offline phases | Static checks; offline route; every scenario list and test invocation | Static checks; offline route, with no scenario execution replay |
+| Focused scenarios | Default-feature library and `branch_static` filters, listed before execution | Unchanged; empty filters now also fail |
+| Nightly tools | Optional fuzz build; required nightly unused-dependency check | Unchanged |
+| Package and Docker | Release archive; extracted binary; container build, PUID, multiarch, CLI, default command | Unchanged |
+| Live and service | Provider tests; shell suites; release-binary CLI and import rehearsal; service smoke | Unchanged, including opt-in cross-zone and real host-service checks |
+
+Both complete Rust suites include every integration target and the library
+scope matrix. At this baseline, the drift-target loop adds no targets.
+The no-default suite remains separate: it exercises disabled-XMP behavior
+and native EXIF paths.
+
+Default features enable `xmp`. All features also enable `__fuzz_internals`.
+The latter adds parser wrappers, re-exports, and extra HEIF preservation
+assertions. Its conditional sites do not replace default-feature production
+paths or remove default tests. This source-level comparison, together with
+the target and environment inventory, supports using the all-feature suite
+for the scenario and scope-matrix proof. Matching test names alone is not
+that argument. Revisit this equivalence if feature gates change.
+
+Scenarios add no fixtures, environment, or isolation beyond their underlying
+tests. `scripts/test-scenarios/check.sh` sources the same runners and checks
+each filter against cached default-feature catalogs, once per target. It
+fails on empty filters, stale filters, failed listings, or an empty catalog
+of scenarios. These catalog checks do not execute tests and are not counted
+as passing tests. Focused commands still list and execute each filter.
+
+Offline suites retain Cargo's test scheduling. `just test fast` retains its
+single-threaded library run. No repository-wide `RUST_TEST_THREADS` setting
+was found; caller overrides still apply. Live provider tests remain
+single-threaded. Full-test retains its temporary-directory setup, live skip
+and rate-limit records, child-failure handling, and start/end Git provenance.
+Finalization rejects missing or skipped required offline phases and failed
+phase records. Live and platform skips remain explicit, not test coverage.
+
+Linux tooling tests in `branch_static` require `just` on `PATH`; CI installs
+its pinned version before both complete Rust suites and coverage runs. Other
+platforms retain their existing Rust test coverage; executable dispatcher
+fixtures are Linux-only.
+
+### Commands
+
 ```sh
 just test fast                  # fast offline unit + key integration targets
 just test                       # all-feature offline tests
-just test offline               # offline all-feature/no-default/drift/scope checks
+just test offline               # all-feature/no-default suites + scenario catalog checks
 just test scenario NAME         # focused behavior slice from scripts/test-scenarios/
 just test scenarios             # every focused offline scenario slice
 just test live                  # live sync + state_auth + import-existing against iCloud
@@ -127,7 +186,7 @@ just full-test                  # grouped full battery with logs, live skips, me
 Without `just`, run the raw commands directly:
 
 ```sh
-cargo test --bin kei --test cli --test behavioral
+cargo test --lib --test cli --test behavioral
 cargo test --all-features --test sync --test state_auth -- --ignored --test-threads=1
 ./tests/shell/concurrency.sh
 ```

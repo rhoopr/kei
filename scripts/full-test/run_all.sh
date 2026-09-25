@@ -7,8 +7,7 @@
 #   begin_run    -- staging + concurrency guard, clears flag files
 #   prereqs      -- check_prereqs.sh; sets .live-skipped if .env / cookies bad
 #   static_checks    fmt, clippy, docs, audit, workflow/script lint, contracts, typos
-#   offline_core     offline all-feature/no-default tests, drift tests, scope matrix
-#   scenarios        named behavior slices from scripts/test-scenarios
+#   offline_core     all-feature/no-default tests + scenario catalog validation
 #   nightly_tools    fuzz build when available + cargo-udeps
 #   package          release build + archive smoke
 #   docker_full      Docker build, PUID smoke, multiarch, CLI/default-command smokes
@@ -102,7 +101,6 @@ run_live_phase() {
 # --- Static + offline behavior -------------------------------------------
 run_phase static_checks -- just static-checks
 run_phase offline_core -- just test offline
-run_phase scenarios -- just test scenarios
 run_phase nightly_tools -- just test nightly-tools
 
 # --- Build/package/container ----------------------------------------------

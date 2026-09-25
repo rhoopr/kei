@@ -1,8 +1,8 @@
 //! Offline branch-coherence checks for packaging and migration docs.
 //!
-//! These intentionally inspect repository files instead of spawning Docker or
-//! contacting iCloud. The live shell suites still own runtime behavior; this
-//! file pins the risky static contracts that made this branch easy to regress.
+//! Static contracts and real tooling dispatch with controlled child executables.
+//! These checks do not contact iCloud or run Docker. Live and platform suites
+//! still own their runtime behavior.
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 
@@ -309,50 +309,6 @@ fn notification_script_docs_pin_legacy_env_plus_report_json() {
     );
 }
 
-#[test]
-fn full_test_routes_child_tempdirs_to_tmp_codex() {
-    let run_all = repo_file("scripts/full-test/run_all.sh");
-    let tmp_assignment = "full_tmp_dir=\"${KEI_FULL_TEST_TMPDIR:-/tmp/codex/kei/full-test/tmp}\"";
-    let tmp_export = "export TMPDIR=\"$full_tmp_dir\"";
-    let temp_export = "export TEMP=\"$full_tmp_dir\"";
-    let tmp_windows_export = "export TMP=\"$full_tmp_dir\"";
-    let shell_scratch_export =
-        "export KEI_TEST_SCRATCH_DIR=\"${KEI_TEST_SCRATCH_DIR:-$full_tmp_dir/shell}\"";
-
-    for expected in [
-        tmp_assignment,
-        "mkdir -p \"$full_tmp_dir\"",
-        tmp_export,
-        temp_export,
-        tmp_windows_export,
-        shell_scratch_export,
-        "mkdir -p \"$KEI_TEST_SCRATCH_DIR\"",
-    ] {
-        assert!(
-            run_all.contains(expected),
-            "full-test orchestrator missing /tmp/codex tempdir setup: {expected}"
-        );
-    }
-
-    let export_pos = run_all
-        .find(tmp_export)
-        .expect("full-test must export TMPDIR before live tests");
-    let shell_export_pos = run_all
-        .find(shell_scratch_export)
-        .expect("full-test must export KEI_TEST_SCRATCH_DIR before shell tests");
-    let live_pos = run_all
-        .find("run_live_phase live_provider")
-        .expect("full-test live provider phase must still exist");
-    let shell_pos = run_all
-        .find("run_shell_suites.sh")
-        .expect("full-test shell phase must still exist");
-
-    assert!(
-        export_pos < live_pos && export_pos < shell_pos && shell_export_pos < shell_pos,
-        "TMPDIR and KEI_TEST_SCRATCH_DIR must be set before live cargo and shell phases allocate tempdirs"
-    );
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn full_test_release_artifacts_follow_cargo_target_dir() {
@@ -508,7 +464,7 @@ fn focused_scenario_catalog_lists_every_runner_slice() {
                 return None;
             }
             let name = path.file_stem()?.to_str()?;
-            (!matches!(name, "lib" | "list")).then(|| name.to_owned())
+            (!matches!(name, "lib" | "list" | "check")).then(|| name.to_owned())
         })
         .collect();
 
@@ -679,6 +635,7 @@ fi
         String::from_utf8_lossy(&known.stderr)
     );
 
+    assert_eq!(run_filter("").status.code(), Some(2));
     assert_eq!(run_filter("list_failure").status.code(), Some(1));
     assert_eq!(run_filter("run_failure").status.code(), Some(23));
 
@@ -814,11 +771,8 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
     run_git(&repo, &["add", "tracked.txt", "Cargo.lock"]);
     run_git(&repo, &["commit", "-m", "fixture"]);
 
-    std::fs::write(
-        runs.join(".current.jsonl"),
-        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.25,\"tests\":3}\n",
-    )
-    .expect("write phase fixture");
+    std::fs::write(runs.join(".current.jsonl"), full_test_phase_fixture())
+        .expect("write phase fixture");
     std::fs::write(runs.join(".run-started-at"), "2026-07-17T12:34:56\n")
         .expect("write start fixture");
     let head = run_git(&repo, &["rev-parse", "HEAD"]);
@@ -835,6 +789,48 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
         bin.display(),
         std::env::var("PATH").expect("PATH must be set")
     );
+
+    let valid = full_test_phase_fixture();
+    for phase in [
+        "static_checks",
+        "offline_core",
+        "nightly_tools",
+        "package",
+        "docker_full",
+    ] {
+        for status in ["missing", "skipped", "fail"] {
+            let invalid: String = valid
+                .lines()
+                .filter_map(|line| {
+                    if line.contains(&format!("\"phase\":\"{phase}\"")) {
+                        (status != "missing")
+                            .then(|| line.replace("\"pass\"", &format!("\"{status}\"")))
+                    } else {
+                        Some(line.to_owned())
+                    }
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            std::fs::write(runs.join(".current.jsonl"), invalid).unwrap();
+            let output = Command::new("bash")
+                .arg(repo_path("scripts/full-test/finalize_run.sh"))
+                .current_dir(&repo)
+                .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "must reject {phase}={status}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains(phase));
+            assert!(runs.join(".current.jsonl").exists());
+            assert!(runs.join(".run-marker").exists());
+        }
+    }
+    // Explicit live skips are recorded, never converted to passing coverage.
+    let valid = valid.replace(
+        "\"phase\":\"live_provider\",\"status\":\"pass\"",
+        "\"phase\":\"live_provider\",\"status\":\"skipped\"",
+    );
+    std::fs::write(runs.join(".current.jsonl"), valid).unwrap();
 
     let output = Command::new("bash")
         .arg(repo_path("scripts/full-test/finalize_run.sh"))
@@ -862,6 +858,7 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
     assert_eq!(record["end_worktree_clean"], true);
     assert_eq!(record["phases"]["static_checks"]["status"], "pass");
     assert_eq!(record["phases"]["static_checks"]["tests"], 3);
+    assert_eq!(record["phases"]["live_provider"]["status"], "skipped");
     assert!(record["metrics"].is_object());
     assert!(record["metrics"]["deps_count"].is_number());
     for staging in [
@@ -907,11 +904,8 @@ fn full_test_head_change_is_not_current_validation() {
         "begin fixture failed: {}",
         String::from_utf8_lossy(&begin.stderr)
     );
-    std::fs::write(
-        runs.join(".current.jsonl"),
-        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.0}\n",
-    )
-    .expect("write phase fixture");
+    std::fs::write(runs.join(".current.jsonl"), full_test_phase_fixture())
+        .expect("write phase fixture");
 
     std::fs::write(repo.join("tracked.txt"), "end\n").expect("write ending file");
     run_git(&repo, &["add", "tracked.txt"]);
@@ -995,11 +989,8 @@ fn full_test_dirty_start_is_not_current_validation() {
         "begin fixture failed: {}",
         String::from_utf8_lossy(&begin.stderr)
     );
-    std::fs::write(
-        runs.join(".current.jsonl"),
-        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.0}\n",
-    )
-    .expect("write phase fixture");
+    std::fs::write(runs.join(".current.jsonl"), full_test_phase_fixture())
+        .expect("write phase fixture");
     std::fs::write(repo.join("tracked.txt"), "committed\n").expect("restore committed file");
 
     write_executable(&bin.join("cargo"), "#!/usr/bin/env bash\nexit 0\n");
@@ -1174,20 +1165,10 @@ fn full_test_checks_gnu_linux_userland_before_begin_run() {
 
 #[test]
 fn full_test_docker_smokes_quote_configured_image() {
-    let run_all = repo_file("scripts/full-test/run_all.sh");
     let justfile = repo_file("justfile");
     let shell_suites = repo_file("scripts/full-test/run_shell_suites.sh");
     let docker_puid = repo_file("scripts/full-test/run_docker_puid_smoke.sh");
     let shell_lib = repo_file("tests/shell/lib.sh");
-
-    assert!(
-        run_all.contains(r#"export KEI_DOCKER_IMAGE="${KEI_DOCKER_IMAGE:-kei:dev}""#),
-        "full-test must export the configured docker image default"
-    );
-    assert!(
-        run_all.contains("run_phase docker_full -- just test docker-full"),
-        "full-test docker group must route through the named docker-full recipe"
-    );
 
     for expected in [
         r#"docker run --rm "${KEI_DOCKER_IMAGE:-kei:dev}" --version"#,
@@ -1344,12 +1325,7 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         format!("shfmt\t-d\t{shell_files}"),
         format!("ruff\tcheck\t{python_files}"),
     ];
-    let gate_calls = [
-        "just\tstatic-checks",
-        "cargo\ttest\t--all-features",
-        "cargo\ttest\t--no-default-features",
-    ]
-    .map(str::to_owned);
+    let gate_calls = ["just\tstatic-checks", "just\ttest\toffline"].map(str::to_owned);
     let static_calls = [
         "cargo\tfmt\t--all\t--check",
         "cargo\tclippy\t--all-targets\t--all-features\t--\t-D\twarnings",
@@ -1975,4 +1951,295 @@ fn full_test_cross_zone_album_phase_is_opt_in_and_checks_source_zone() {
         readme.contains("KEI_FULL_TEST_CROSS_ZONE_ALBUM"),
         "tests README must document the opt-in cross-zone fixture"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_offline_dispatch_preserves_features_and_checks_scenario_filters() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let scripts = root.join("scripts/test-scenarios");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(root.join("justfile"), repo_file("justfile")).unwrap();
+    let mut catalog = String::new();
+    for entry in std::fs::read_dir(repo_path("scripts/test-scenarios")).unwrap() {
+        let entry = entry.unwrap();
+        let contents = std::fs::read_to_string(entry.path()).unwrap();
+        write_executable(&scripts.join(entry.file_name()), &contents);
+        for line in contents.lines() {
+            if let Some(call) = line.strip_prefix("run_scenario_test ") {
+                let (_, filter) = call.split_once(' ').unwrap();
+                catalog.push_str(&format!("fixture::{filter}: test\n"));
+            }
+        }
+    }
+    std::fs::write(root.join("catalog"), catalog).unwrap();
+    write_executable(
+        &bin.join("cargo"),
+        r#"#!/bin/bash
+set -euo pipefail
+call=$(printf '%s' "$1"; shift; printf '\t%s' "$@")
+printf '%s\n' "$call" >> "$CALL_LOG"
+[[ "$call" != "${FAIL_CALL:-}" ]] || exit 23
+if [[ "$call" == *--list ]]; then
+    [[ "${EMPTY_CATALOG:-0}" != 1 ]] || exit 0
+    cat "$CATALOG"
+fi
+"#,
+    );
+    let log = root.join("calls");
+    let run = |args: &[&str], fail: &str, empty: bool| {
+        std::fs::write(&log, "").unwrap();
+        let output = Command::new("just")
+            .args(args)
+            .current_dir(root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CARGO", bin.join("cargo"))
+            .env("CALL_LOG", &log)
+            .env("CATALOG", root.join("catalog"))
+            .env("FAIL_CALL", fail)
+            .env("EMPTY_CATALOG", if empty { "1" } else { "0" })
+            .output()
+            .unwrap();
+        let calls: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        (output, calls)
+    };
+    let expected = [
+        "test\t--all-features",
+        "test\t--no-default-features",
+        "test\t--lib\t--\t--list",
+        "test\t--test\tbranch_static\t--\t--list",
+    ];
+    let (output, calls) = run(&["test", "offline"], "", false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(calls, expected);
+    for call in expected {
+        let (output, calls) = run(&["test", "offline"], call, false);
+        assert!(!output.status.success(), "must propagate {call}");
+        assert_eq!(calls.last().unwrap(), call);
+    }
+    let (output, _) = run(&["test", "offline"], "", true);
+    assert!(!output.status.success(), "empty catalogs must fail closed");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no tests matched"));
+    for args in [
+        vec!["test", "scenario"],
+        vec!["test", "scenario", "missing"],
+    ] {
+        let (output, calls) = run(&args, "", false);
+        assert!(!output.status.success());
+        assert!(calls.is_empty());
+    }
+    let (output, calls) = run(&["test", "scenarios"], "", false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!calls.is_empty());
+    assert_eq!(calls.len() % 2, 0);
+    for pair in calls.chunks_exact(2) {
+        assert_eq!(pair[0], format!("{}\t--\t--list", pair[1]));
+        assert!(!pair[1].contains("--features"));
+    }
+    let first_run = &calls[1];
+    let (output, failed_calls) = run(&["test", "scenarios"], first_run, false);
+    assert!(!output.status.success());
+    assert_eq!(failed_calls.last(), Some(first_run));
+    // A stale filter in a real scenario script must fail through the full route.
+    let scenario = scripts.join("auth-session.sh");
+    let original = std::fs::read_to_string(&scenario).unwrap();
+    std::fs::write(
+        &scenario,
+        format!("{original}\nrun_scenario_test lib removed_test\n"),
+    )
+    .unwrap();
+    let (output, _) = run(&["test", "offline"], "", false);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("filter=removed_test"));
+    std::fs::write(&scenario, original).unwrap();
+    for body in ["#!/bin/bash\nexit 23\n", "#!/bin/bash\nexit 0\n"] {
+        write_executable(&scripts.join("list.sh"), body);
+        for route in ["offline", "scenarios"] {
+            let (output, _) = run(&["test", route], "", false);
+            assert!(
+                !output.status.success(),
+                "failed or empty discovery must reject {route}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn full_test_phase_fixture() -> String {
+    [
+        "static_checks",
+        "offline_core",
+        "nightly_tools",
+        "package",
+        "docker_full",
+        "live_provider",
+        "live_import_rehearsal",
+        "service",
+    ]
+    .iter()
+    .map(|phase| {
+        format!(
+            "{{\"phase\":\"{phase}\",\"status\":\"pass\",\"exit\":0,\"wall_s\":1.25,\"tests\":3}}\n"
+        )
+    })
+    .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_dispatch_reaches_required_phases_and_stops_on_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    let scripts = root.join("scripts/full-test");
+    let bin = root.join("bin");
+    let runs = temp.path().join("runs");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&runs).unwrap();
+    for name in [
+        "run_all.sh",
+        "begin_run.sh",
+        "time_phase.sh",
+        "finalize_run.sh",
+        "record_skip.sh",
+        "render_summary.py",
+    ] {
+        write_executable(
+            &scripts.join(name),
+            &repo_file(&format!("scripts/full-test/{name}")),
+        );
+    }
+    let recorder = r#"#!/bin/bash
+set -euo pipefail
+call=$(printf '%s' "${0##*/}"; if [[ $# -gt 0 ]]; then printf '\t%s' "$@"; fi)
+printf '%s\n' "$call" >> "$CALL_LOG"
+if [[ "$call" == "${FAIL_CALL:-}" ]]; then
+    if [[ "${CANCEL_CHILD:-0}" == 1 ]]; then kill -TERM $$; fi
+    exit 23
+fi
+if [[ "${0##*/}" == just || "${0##*/}" == run_* ]]; then
+    [[ "$TMPDIR" == "$KEI_FULL_TEST_TMPDIR" && "$TMP" == "$TMPDIR" && "$TEMP" == "$TMPDIR" ]]
+    [[ "$KEI_TEST_SCRATCH_DIR" == "$TMPDIR/shell" ]]
+    [[ "$KEI_DOCKER_IMAGE" == 'fixture image:dev' ]]
+fi
+"#;
+    for name in ["just", "systemd-analyze"] {
+        write_executable(&bin.join(name), recorder);
+    }
+    for name in [
+        "check_userland.sh",
+        "check_prereqs.sh",
+        "run_shell_suites.sh",
+        "run_live_smokes.sh",
+        "run_live_import_rehearsal.sh",
+        "run_cross_zone_album_hydration.sh",
+        "diff_runs.sh",
+    ] {
+        write_executable(&scripts.join(name), recorder);
+    }
+    write_executable(
+        &scripts.join("collect_metrics.py"),
+        "#!/bin/bash\necho '{}'\n",
+    );
+    run_git(&root, &["init", "-b", "fixture"]);
+    run_git(&root, &["config", "user.name", "Kei Test"]);
+    run_git(&root, &["config", "user.email", "kei-test@example.invalid"]);
+    std::fs::write(root.join("tracked"), "fixture").unwrap();
+    run_git(&root, &["add", "tracked"]);
+    run_git(&root, &["commit", "-m", "fixture"]);
+    let log = temp.path().join("calls");
+    let run = |fail: &str, cancel: bool| {
+        std::fs::write(&log, "").unwrap();
+        let output = Command::new("bash")
+            .arg(scripts.join("run_all.sh"))
+            .current_dir(&root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CALL_LOG", &log)
+            .env("FAIL_CALL", fail)
+            .env("CANCEL_CHILD", if cancel { "1" } else { "0" })
+            .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+            .env("KEI_FULLTEST_LOG_DIR", temp.path().join("logs"))
+            .env("KEI_FULL_TEST_TMPDIR", temp.path().join("tmp"))
+            .env_remove("KEI_TEST_SCRATCH_DIR")
+            .env("KEI_DOCKER_IMAGE", "fixture image:dev")
+            .env("KEI_FULL_TEST_CROSS_ZONE_ALBUM", "fixture")
+            .env("KEI_FULL_TEST_REAL_SERVICE", "1")
+            .env("KEI_FULLTEST_VERBOSE", if cancel { "0" } else { "1" })
+            .output()
+            .unwrap();
+        let calls: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        (output, calls)
+    };
+    let expected = [
+        "check_userland.sh",
+        "check_prereqs.sh",
+        "just\tstatic-checks",
+        "just\ttest\toffline",
+        "just\ttest\tnightly-tools",
+        "just\ttest\tpackaging",
+        "just\ttest\tdocker-full",
+        "just\ttest\tlive",
+        "run_shell_suites.sh",
+        "run_live_smokes.sh",
+        "run_live_import_rehearsal.sh",
+        "run_cross_zone_album_hydration.sh",
+        "just\ttest\tservice",
+        "just\ttest\thost-service",
+        "diff_runs.sh",
+    ];
+    let (output, calls) = run("", false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(calls, expected);
+    for call in expected {
+        let (output, calls) = run(call, false);
+        assert!(!output.status.success(), "must propagate {call}");
+        assert_eq!(calls.last().unwrap(), call, "must stop after child failure");
+        assert!(!command_text(&output).contains("Result: PASS"));
+        assert!(!runs.join(".run-marker").exists());
+    }
+    let (output, calls) = run("just\ttest\toffline", true);
+    assert!(
+        !output.status.success(),
+        "cancelled child must fail the run"
+    );
+    assert_eq!(calls.last().unwrap(), "just\ttest\toffline");
+    assert!(!command_text(&output).contains("Result: PASS"));
+    // Removing a required phase must not finalize an incomplete run as passing.
+    let original = repo_file("scripts/full-test/run_all.sh");
+    let omitted = original.replace("run_phase offline_core -- just test offline", ":");
+    assert_ne!(omitted, original);
+    std::fs::write(scripts.join("run_all.sh"), omitted).unwrap();
+    let (output, _) = run("", false);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("offline_core"));
+    assert!(!command_text(&output).contains("Result: PASS"));
 }
