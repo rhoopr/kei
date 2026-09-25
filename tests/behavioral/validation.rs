@@ -1,6 +1,7 @@
 //! Command arguments, help, exit codes, and pre-authentication validation.
 
 use super::{clean_cmd, sync_cmd_for_config_body, sync_cmd_for_validation, write_sync_config};
+#[cfg(debug_assertions)]
 use crate::common;
 use predicates::prelude::predicate;
 

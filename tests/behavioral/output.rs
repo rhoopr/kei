@@ -1,6 +1,7 @@
 //! Read-only status output and the binary JSON report boundary.
 
 use super::{clean_cmd, create_state_db, insert_asset};
+#[cfg(debug_assertions)]
 use crate::common;
 use predicates::prelude::predicate;
 
