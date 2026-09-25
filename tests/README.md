@@ -3,7 +3,10 @@
 Everything under `tests/` is either a Rust integration target or a shell
 script that exercises scenarios easier to set up from shell than from
 Rust. The repo-root `justfile` is the entry point; the layout below
-explains what runs where.
+explains what runs where. Follow the
+[contribution and review rules](../CONTRIBUTING.md#tests) for test placement,
+behavior changes, and failure investigation. This guide owns the
+[state-transition proof](#state-transition-proof) and suite-specific setup.
 
 ## Layout
 

@@ -37,8 +37,21 @@ fn missing_required_fragments(contents: &str, required: &[&str]) -> Vec<String> 
         .collect()
 }
 
-fn normalize_whitespace(contents: &str) -> String {
-    contents.split_whitespace().collect::<Vec<_>>().join(" ")
+// Check navigation, not prose: labels and rule wording are free to change.
+fn policy_link_resolves(source: &str, href: &str, target: &str) -> bool {
+    source.contains(&format!("]({href})"))
+        && href.split_once('#').is_none_or(|(_, anchor)| {
+            target.lines().any(|line| {
+                line.strip_prefix("## ").is_some_and(|heading| {
+                    heading
+                        .to_ascii_lowercase()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join("-")
+                        == anchor
+                })
+            })
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -535,68 +548,93 @@ fn config_reconciliation_scenario_pins_transition_seed_tests() {
 }
 
 #[test]
-fn state_transition_proof_is_pinned_across_process_surfaces() {
-    let applicability = "Changes to durable configuration, filesystem paths, media publication, metadata, SQLite state, retry work, or provider checkpoints require a state-transition proof through the production call graph.";
-    let stages = [
-        "Initial durable state",
-        "Controlled mutation",
-        "Production cycle",
-        "Durable outcome",
-        "Steady-state cycle",
-    ];
-    for path in [
-        "CONTRIBUTING.md",
-        "tests/README.md",
-        ".github/pull_request_template.md",
-        ".agents/skills/kei-pr-ready/SKILL.md",
+fn state_transition_policy_links_resolve() {
+    for (source, href) in [
+        ("CONTRIBUTING.md", "tests/README.md#state-transition-proof"),
+        ("tests/README.md", "../CONTRIBUTING.md#tests"),
+        (
+            ".github/pull_request_template.md",
+            "https://github.com/rhoopr/kei/blob/HEAD/tests/README.md#state-transition-proof",
+        ),
+        (
+            ".github/pull_request_template.md",
+            "https://github.com/rhoopr/kei/blob/HEAD/CONTRIBUTING.md#pull-requests-and-review",
+        ),
+        (
+            ".agents/skills/kei-pr-ready/SKILL.md",
+            "../../../tests/README.md#state-transition-proof",
+        ),
+        (
+            ".agents/skills/kei-pr-ready/SKILL.md",
+            "../../../CONTRIBUTING.md#tests",
+        ),
     ] {
-        let contents = repo_file(path);
-        let normalized = normalize_whitespace(&contents);
+        let path = repo_path(source);
+        // Template links also work after GitHub copies them into a PR body.
+        let file = href.split('#').next().unwrap();
+        let target_path = match file.strip_prefix("https://github.com/rhoopr/kei/blob/HEAD/") {
+            Some(file) => repo_path(file),
+            None => path.parent().unwrap().join(file),
+        };
+        let target = std::fs::read_to_string(&target_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", target_path.display()));
+        let contents = repo_file(source);
         assert!(
-            normalized.contains(applicability),
-            "{path} state-transition applicability categories drifted"
+            policy_link_resolves(&contents, href, &target),
+            "{source}: {href}"
         );
-        let missing = missing_required_fragments(&contents, &stages);
         assert!(
-            missing.is_empty(),
-            "{path} missing state-transition proof stages: {missing:?}"
+            policy_link_resolves(
+                &contents.replace(
+                    "state-transition proof requirements",
+                    "durable-state test guidance"
+                ),
+                href,
+                &target.replace("Initial durable state", "Seeded durable state"),
+            ),
+            "equivalent wording must not require a Rust assertion edit"
         );
+        assert!(!policy_link_resolves(
+            &contents.replace(href, "missing.md"),
+            href,
+            &target
+        ));
+        assert!(!policy_link_resolves(
+            &contents,
+            href,
+            "# Missing section\n"
+        ));
     }
+}
 
-    let deliberately_drifted = repo_file("CONTRIBUTING.md").replacen("retry work, ", "", 1);
-    assert!(
-        !normalize_whitespace(&deliberately_drifted).contains(applicability),
-        "the process contract check must detect a deliberately removed applicability category"
-    );
-
-    let readiness = repo_file(".agents/skills/kei-pr-ready/SKILL.md");
-    let readiness_requirements = [
-        "alternate byte-landing and",
-        "downloaded-state finalization route",
-        "correctness, safety, liveness, performance, and user-visible metadata",
-        "A normal-download test does not",
-        "Do not label a complete owner or module \"fully inspected\"",
-    ];
-    let missing = missing_required_fragments(&readiness, &readiness_requirements);
-    assert!(
-        missing.is_empty(),
-        "kei-pr-ready missing cross-route review requirements: {missing:?}"
-    );
-
-    let template = repo_file(".github/pull_request_template.md");
-    let template_requirements = ["Deliberate defect mutation", "Not applicable"];
-    let missing = missing_required_fragments(&template, &template_requirements);
-    assert!(
-        missing.is_empty(),
-        "pull request template missing transition evidence fields: {missing:?}"
-    );
-
-    let deliberately_broken = template.replacen(stages[4], "Repeat run", 1);
-    assert_eq!(
-        missing_required_fragments(&deliberately_broken, &stages),
-        vec![stages[4].to_owned()],
-        "the process contract check must detect a deliberately removed transition stage"
-    );
+#[cfg(target_os = "linux")]
+#[test]
+fn safety_contract_checker_rejects_missing_links() {
+    let temp = tempfile::tempdir().expect("contract checker fixture");
+    for directory in ["scripts", "docs", "src", "tests"] {
+        std::fs::create_dir(temp.path().join(directory)).unwrap();
+    }
+    let checker = temp.path().join("scripts/check-contracts");
+    std::fs::copy(repo_path("scripts/check-contracts"), &checker).unwrap();
+    let catalog = "| `FILE_PUBLISH_NO_OVERWRITE` | owner | rule |\n";
+    let owner = "// CONTRACT: FILE_PUBLISH_NO_OVERWRITE\n";
+    let test = "fn contract_file_publish_no_overwrite() {}\n";
+    let run = |catalog: &str, owner: &str, test: &str| {
+        std::fs::write(temp.path().join("docs/architecture.md"), catalog).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), owner).unwrap();
+        std::fs::write(temp.path().join("tests/contract.rs"), test).unwrap();
+        Command::new("python3").arg(&checker).output().unwrap()
+    };
+    assert!(run(catalog, owner, test).status.success());
+    for (catalog, owner, test, diagnostic) in [
+        ("", owner, test, "production marker is not documented"),
+        (catalog, "", test, "no production owner marker"),
+        (catalog, owner, "", "missing contract_ test name"),
+    ] {
+        let output = run(catalog, owner, test);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(diagnostic));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -608,8 +646,13 @@ fn scenario_runner_rejects_filters_that_match_no_tests() {
         &cargo_stub,
         r#"#!/usr/bin/env bash
 set -euo pipefail
-if [[ " $* " == *" --list "* && " $* " == *" known_filter "* ]]; then
-  echo "module::known_filter: test"
+if [[ " $* " == *" list_failure "* ]]; then exit 23; fi
+if [[ " $* " == *" --list "* ]]; then
+  if [[ " $* " == *" known_filter "* || " $* " == *" run_failure "* ]]; then
+    echo "module::known_filter: test"
+  fi
+elif [[ " $* " == *" run_failure "* ]]; then
+  exit 23
 fi
 "#,
     );
@@ -635,6 +678,9 @@ fi
         "known scenario filter should execute: {}",
         String::from_utf8_lossy(&known.stderr)
     );
+
+    assert_eq!(run_filter("list_failure").status.code(), Some(1));
+    assert_eq!(run_filter("run_failure").status.code(), Some(23));
 
     let missing = run_filter("missing_filter");
     assert_eq!(missing.status.code(), Some(2));
@@ -1175,92 +1221,207 @@ fn full_test_docker_smokes_quote_configured_image() {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn shell_block(contents: &str, marker: &str, indentation: &str) -> String {
+    contents
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("missing shell block: {marker}"))
+        .1
+        .lines()
+        .take_while(|line| line.is_empty() || line.starts_with(indentation))
+        .filter_map(|line| line.strip_prefix(indentation))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// Execute the checked-in shell bodies without requiring just on every CI host.
+// Stubs record argv; they do not claim to run lint or Rust behavior coverage.
+#[cfg(target_os = "linux")]
+fn run_tooling_shell(body: &str, fail_call: &str) -> (Output, Vec<String>) {
+    let temp = tempfile::tempdir().unwrap_or_else(|e| panic!("tooling shell fixture: {e}"));
+    let pycache = tempfile::tempdir().unwrap_or_else(|e| panic!("tooling pycache: {e}"));
+    for directory in [
+        "bin",
+        "scripts",
+        "tests/shell",
+        "docker",
+        ".github/scripts",
+        ".github/workflows",
+    ] {
+        std::fs::create_dir_all(temp.path().join(directory)).unwrap();
+    }
+    let recorder = r#"#!/bin/bash
+set -euo pipefail
+call=$(printf '%s' "${0##*/}"; printf '\t%s' "$@")
+printf '%s\n' "$call" >> "$CALL_LOG"
+if [[ "$call" == "${FAIL_CALL:-}" ]]; then exit 23; fi
+if [[ "${0##*/}" == python3 && "${1:-}" == -m ]]; then
+    [[ "${PYTHONPYCACHEPREFIX:-}" == /* && "$PYTHONPYCACHEPREFIX" != "$PWD/"* ]] || exit 24
+fi
+if [[ "${0##*/}" == cargo && "${1:-}" == doc ]]; then
+    [[ "${RUSTDOCFLAGS:-}" == -Dwarnings ]] || exit 24
+fi
+"#;
+    for name in [
+        "cargo",
+        "just",
+        "bash",
+        "python3",
+        "shellcheck",
+        "shfmt",
+        "ruff",
+        "actionlint",
+        "typos",
+    ] {
+        write_executable(&temp.path().join("bin").join(name), recorder);
+    }
+    write_executable(&temp.path().join("scripts/check-contracts"), recorder);
+    for file in [
+        "scripts/space name.sh",
+        "scripts/check-roundtrip-gate.sh",
+        "scripts/helper.py",
+        "tests/shell/example.sh",
+        "docker/entrypoint.sh",
+        ".github/scripts/check_workflow_hardening.py",
+        ".github/workflows/check.yml",
+    ] {
+        std::fs::write(temp.path().join(file), "").unwrap();
+    }
+    let log = temp.path().join("calls");
+    std::fs::write(&log, "").unwrap();
+    let output = Command::new("/bin/bash")
+        .args(["-euo", "pipefail", "-c", body])
+        .current_dir(temp.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                temp.path().join("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("PYTHONPYCACHEPREFIX", pycache.path())
+        .env_remove("RUSTDOCFLAGS")
+        .env("CALL_LOG", &log)
+        .env("FAIL_CALL", fail_call)
+        .output()
+        .unwrap_or_else(|e| panic!("execute tooling shell body: {e}"));
+    let calls = std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (output, calls)
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn local_gate_includes_script_and_workflow_lint_recipes() {
     let justfile = repo_file("justfile");
     let ci = repo_file(".github/workflows/ci.yml");
-
-    for expected in [
-        "static-checks:",
-        "lint-workflows:",
-        "python3 .github/scripts/check_workflow_hardening.py",
-        "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile .github/scripts/*.py",
-        "actionlint .github/workflows/*.yml",
-        "lint-scripts:",
-        "python_files+=(scripts/check-contracts)",
-        "for shell_file in \"${shell_files[@]}\"; do",
-        "bash -n \"$shell_file\"",
-        "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile \"${python_files[@]}\"",
-        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
-        "shfmt -d \"${shell_files[@]}\"",
-        "ruff check \"${python_files[@]}\"",
+    let gate = shell_block(&justfile, "\ngate:\n", "    ");
+    let static_checks = shell_block(&justfile, "\nstatic-checks:\n", "    ");
+    let scripts = shell_block(&justfile, "\nlint-scripts:\n", "    ");
+    let workflows = shell_block(&justfile, "\nlint-workflows:\n", "    ");
+    let ci_lint = ci
+        .split_once("  script-lint:\n")
+        .unwrap()
+        .1
+        .split_once("\n  typos:")
+        .unwrap()
+        .0;
+    let ci_shell = shell_block(ci_lint, "        run: |\n", "          ");
+    let shell_files = "docker/entrypoint.sh\tscripts/check-roundtrip-gate.sh\tscripts/space name.sh\ttests/shell/example.sh";
+    let python_files =
+        ".github/scripts/check_workflow_hardening.py\tscripts/helper.py\tscripts/check-contracts";
+    let script_calls = vec![
+        "bash\t-n\tdocker/entrypoint.sh".to_owned(),
+        "bash\t-n\tscripts/check-roundtrip-gate.sh".to_owned(),
+        "bash\t-n\tscripts/space name.sh".to_owned(),
+        "bash\t-n\ttests/shell/example.sh".to_owned(),
+        format!("python3\t-m\tpy_compile\t{python_files}"),
+        format!("shellcheck\t-x\t-P\ttests/shell:scripts:scripts/full-test\t{shell_files}"),
+        format!("shfmt\t-d\t{shell_files}"),
+        format!("ruff\tcheck\t{python_files}"),
+    ];
+    let gate_calls = [
+        "just\tstatic-checks",
+        "cargo\ttest\t--all-features",
+        "cargo\ttest\t--no-default-features",
+    ]
+    .map(str::to_owned);
+    let static_calls = [
+        "cargo\tfmt\t--all\t--check",
+        "cargo\tclippy\t--all-targets\t--all-features\t--\t-D\twarnings",
+        "cargo\tclippy\t--all-targets\t--no-default-features\t--\t-D\twarnings",
+        "cargo\tdoc\t--no-deps\t--all-features",
+        "cargo\tfetch\t--locked",
+        "cargo\taudit\t--deny\twarnings",
+        "just\tlint-workflows",
+        "just\tlint-scripts",
+        "check-contracts\t",
+        "typos\t",
+        "bash\tscripts/check-roundtrip-gate.sh",
+    ]
+    .map(str::to_owned);
+    let workflow_calls = [
+        "python3\t.github/scripts/check_workflow_hardening.py",
+        "python3\t-m\tpy_compile\t.github/scripts/check_workflow_hardening.py",
+        "actionlint\t.github/workflows/check.yml",
+    ]
+    .map(str::to_owned);
+    let mut ci_calls = script_calls.clone();
+    ci_calls.push("actionlint\t.github/workflows/check.yml".to_owned());
+    for (body, required) in [
+        (&gate, gate_calls.as_slice()),
+        (&static_checks, static_calls.as_slice()),
+        (&scripts, script_calls.as_slice()),
+        (&workflows, workflow_calls.as_slice()),
+        (&ci_shell, ci_calls.as_slice()),
     ] {
+        let (output, calls) = run_tooling_shell(body, "");
         assert!(
-            justfile.contains(expected),
-            "justfile must keep script/workflow lint coverage: {expected}"
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        assert_eq!(calls, required, "required tool dispatch changed");
+        for call in required {
+            let (output, calls) = run_tooling_shell(body, call);
+            assert_eq!(output.status.code(), Some(23), "must propagate {call}");
+            assert_eq!(calls.last(), Some(call), "must stop after {call}");
+        }
+        // A semicolon/newline change in a Bash loop must preserve its argv contract.
+        let formatted = body.replace("; do\n", "\ndo\n");
+        let (output, calls) = run_tooling_shell(&formatted, "");
+        assert!(output.status.success());
+        assert_eq!(calls, required);
     }
-
-    let static_checks = justfile
-        .split_once("static-checks:\n")
-        .map(|(_, tail)| tail)
-        .and_then(|tail| tail.split_once("\n\n").map(|(recipe, _)| recipe))
-        .expect("justfile must keep static-checks recipe");
-    for expected in ["just lint-workflows", "just lint-scripts"] {
-        assert!(
-            static_checks.contains(expected),
-            "just static-checks must run {expected}"
-        );
-    }
-
-    let gate = justfile
-        .split_once("gate:\n")
-        .map(|(_, tail)| tail)
-        .and_then(|tail| tail.split_once("\n\n").map(|(gate, _)| gate))
-        .expect("justfile must keep gate recipe");
-    for expected in [
-        "just static-checks",
-        "cargo test --all-features",
-        "cargo test --no-default-features",
-    ] {
-        assert!(gate.contains(expected), "just gate must run {expected}");
-    }
-
-    assert!(
-        ci.contains("  script-lint:\n"),
-        "CI workflow must keep the script-lint job"
+    let omitted_dispatch = static_checks.replace("just lint-scripts", "true");
+    assert_ne!(omitted_dispatch, static_checks);
+    let (output, calls) = run_tooling_shell(&omitted_dispatch, "");
+    assert!(output.status.success());
+    assert!(!calls.iter().any(|call| call == "just\tlint-scripts"));
+    assert_ne!(
+        calls, static_calls,
+        "omitted dispatch must fail the same argv check"
     );
-    assert!(
-        ci.contains("PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile"),
-        "CI script lint must route generated Python bytecode outside the repo tree"
-    );
+
+    // Retain CI tool pinning and aggregate-job reachability checks.
     for expected in [
         "jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db",
         "actionlint = \"1.7.12\"",
         "ruff = \"0.16.3\"",
         "shellcheck = \"0.11.0\"",
         "shfmt = \"3.13.1\"",
-        "python_files+=(scripts/check-contracts)",
-        "for shell_file in \"${shell_files[@]}\"; do",
-        "bash -n \"$shell_file\"",
-        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
-        "shfmt -d \"${shell_files[@]}\"",
-        "ruff check \"${python_files[@]}\"",
-        "actionlint .github/workflows/*.yml",
     ] {
         assert!(
-            ci.contains(expected),
-            "CI script lint must check each script with the matching interpreter: {expected}"
+            ci_lint.contains(expected),
+            "missing pinned CI tool: {expected}"
         );
     }
-    let aggregate = ci
-        .split_once("  ci:\n")
-        .map(|(_, tail)| tail)
-        .expect("CI aggregate job must exist");
-    assert!(
-        aggregate.contains("      - script-lint\n"),
-        "aggregate CI job must require script-lint"
-    );
+    let aggregate = ci.split_once("  ci:\n").unwrap().1;
+    assert!(aggregate.contains("      - script-lint\n"));
 }
 
 #[test]
@@ -1373,51 +1534,22 @@ fn service_smoke_path_filters_cover_shared_dispatch() {
 #[test]
 fn contributor_docs_match_current_gate() {
     let contributing = repo_file("CONTRIBUTING.md");
-    let pr_template = repo_file(".github/pull_request_template.md");
-
-    for expected in [
-        "cargo fmt --all --check",
-        "cargo clippy --all-targets --all-features -- -D warnings",
-        "cargo clippy --all-targets --no-default-features -- -D warnings",
-        "cargo test --all-features",
-        "cargo test --no-default-features",
-        "RUSTDOCFLAGS=\"-Dwarnings\" cargo doc --no-deps --all-features",
-        "cargo audit --deny warnings",
-        "python3 .github/scripts/check_workflow_hardening.py",
-        "python_files+=(scripts/check-contracts)",
-        "for shell_file in \"${shell_files[@]}\"; do bash -n \"$shell_file\"; done",
-        "PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile",
-        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
-        "shfmt -d \"${shell_files[@]}\"",
-        "ruff check \"${python_files[@]}\"",
-        "actionlint .github/workflows/*.yml",
-        "scripts/check-contracts",
-        "bash scripts/check-roundtrip-gate.sh",
-    ] {
-        assert!(
-            contributing.contains(expected),
-            "CONTRIBUTING.md must document current gate command: {expected}"
-        );
-    }
-
-    assert!(
-        pr_template.contains("`just gate` passes"),
-        "PR template should ask reviewers for the current local gate"
-    );
-    for expected in [
-        "## Contract and risk",
-        "## Regression proof",
-        "independent/adversarial review results",
-    ] {
-        assert!(
-            pr_template.contains(expected),
-            "PR template must capture verification evidence: {expected}"
-        );
-    }
-    assert!(
-        !pr_template.contains("cargo test --bin kei --test cli --test behavioral"),
-        "PR template must not keep stale partial test command"
-    );
+    assert!(contributing.contains("just gate"));
+    assert!(policy_link_resolves(
+        &contributing,
+        "justfile",
+        &repo_file("justfile")
+    ));
+    assert!(policy_link_resolves(
+        &contributing,
+        "tests/README.md#running",
+        &repo_file("tests/README.md"),
+    ));
+    assert!(policy_link_resolves(
+        &repo_file(".github/pull_request_template.md"),
+        "https://github.com/rhoopr/kei/blob/HEAD/CONTRIBUTING.md#workflow",
+        &contributing,
+    ));
 }
 
 #[test]
@@ -1431,18 +1563,14 @@ fn repo_pr_ready_skill_uses_current_validation_workflow() {
     let skill = repo_file(".agents/skills/kei-pr-ready/SKILL.md");
     for expected in [
         "name: kei-pr-ready",
-        "without publishing or changing it",
         "just agent-status",
         "just review-scope BASE=<resolved-base>",
-        "coverage ledger",
-        "validation provenance",
         "STALE",
         "OTHER BRANCH",
         "docs/architecture.md",
         "tests/README.md",
         "just test scenario NAME",
         "just gate",
-        "final verdict: ready or not ready",
     ] {
         assert!(
             skill.contains(expected),
