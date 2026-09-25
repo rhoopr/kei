@@ -119,6 +119,15 @@ src/main.rs
   -> command owner, service owner, or src/sync_loop.rs
 ```
 
+`run` composes private phases in `src/lib.rs`: `load_startup_config`,
+`resolve_startup_output`, `initialize_logging`, and `dispatch_command`.
+Config loading retains the Docker fallback and passes parse errors to
+`doctor` without blocking its diagnostic report. Output resolution keeps the
+friendly-mode request separate from the mode allowed by the environment.
+The log-writer guard stays in `run` until dispatch returns. Startup injects
+the captured environment password before dispatch. Command dispatch retains
+the setup wizard's one-shot sync path and the service owner's entry point.
+
 The CLI requires a subcommand. `kei sync` enters the sync path. Commands such
 as `status`, `doctor`, and `manifest` read local state without entering the
 normal iCloud sync loop.

@@ -2850,6 +2850,65 @@ fn exit_1_for_missing_username_on_sync() {
 // Log level behavior
 // ═══════════════════════════════════════════════════════════════════════
 #[test]
+fn startup_logging_precedence_reaches_sync_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = write_fake_two_factor_config(dir.path(), "test@example.com");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, format!("log_level = 'error'\n{config}")).unwrap();
+
+    for (flags, rust_log, shows_start) in [
+        (vec![], None, false),
+        (vec!["--verbose"], None, true),
+        (vec!["--verbose", "--log-level", "error"], None, false),
+        (vec![], Some("kei=info"), true),
+    ] {
+        let mut cmd = clean_cmd();
+        cmd.env_remove("RUST_LOG")
+            .env("KEI_DATA_DIR", dir.path().join("data"))
+            .env("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS", "1")
+            .args(["sync", "--config", config_path.to_str().unwrap()])
+            .args(&flags);
+        if let Some(filter) = rust_log {
+            cmd.env("RUST_LOG", filter);
+        }
+        let output = cmd.assert().code(3).get_output().clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains("Starting kei"),
+            shows_start,
+            "{flags:?}: {stderr}"
+        );
+        assert!(stderr.contains("kei login get-code"), "{stderr}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_scrubs_password_before_dispatching_password_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "[auth]\nusername = 'startup@example.test'\n").unwrap();
+    // Empty output fails before storing credentials. The other branch reports
+    // a different failure if the child inherits the captured environment secret.
+    clean_cmd()
+        .env("ICLOUD_PASSWORD", "startup-environment-secret")
+        .env("KEI_DATA_DIR", dir.path().join("data"))
+        .args([
+            "password",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--password-command",
+            "test -z \"${ICLOUD_PASSWORD+x}\"",
+            "set",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("did not print a password"))
+        .stdout(predicate::str::contains("startup-environment-secret").not())
+        .stderr(predicate::str::contains("startup-environment-secret").not());
+}
+
+#[test]
 fn log_level_default_info() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
