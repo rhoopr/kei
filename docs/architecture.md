@@ -36,6 +36,13 @@ changing behavior.
 | One sync cycle | `src/sync_cycle.rs` | Chooses source enumeration, reconciles config drift, dispatches each library, and advances or preserves provider checkpoints. |
 | Library and pass planning | `src/commands/service.rs` | Resolves libraries, collection scope, album plans, smart folders, unfiled passes, and cross-zone hydration. |
 | iCloud Photos adapter | `src/icloud/photos/` | Owns CloudKit records, queries, change streams, provider identity, albums, smart folders, and metadata decoding. |
+| Album facade and counts | `src/icloud/photos/album.rs`, `src/icloud/photos/album/counts.rs` | Preserves album configuration and entry points; counts owns count queries and same-library batching. |
+| Targeted provider lookup | `src/icloud/photos/album/lookup.rs` | Resolves requested records and merges identity evidence conservatively. |
+| Provider enumeration | `src/icloud/photos/album/planning.rs`, `src/icloud/photos/album/enumeration.rs` | Planning selects rank ranges and page sizes; enumeration starts fetchers and delivers completion tokens. |
+| Provider page fetching | `src/icloud/photos/album/fetch.rs` | Owns query construction, empty-page probes, record pairing, deduplication, and asset emission. |
+| Enumeration completion | `src/icloud/photos/album/completion.rs` | Collects fetcher completion evidence and requires unanimous tokens before returning a checkpoint candidate. |
+| Album hydration | `src/icloud/photos/album/hydration.rs` | Matches named-album members across source zones and hydrates durable asset or master identities. |
+| Provider change streams | `src/icloud/photos/album/changes.rs` | Owns sequential change scans, delta buffering, and last-good-token delivery. |
 | Download facade and dispatch | `src/download/mod.rs`, `src/download/orchestration/dispatch.rs` | Preserves download entry points and composes full, incremental, targeted-backfill, and durable-retry work. |
 | Download models and configuration | `src/download/orchestration/models.rs`, `src/download/orchestration/config.rs` | Owns controls, results, per-zone checkpoint evidence, reporting projections, checkpoint reasons, coverage fingerprints, and configuration hashes. |
 | Download context and selection | `src/download/orchestration/context.rs`, `src/download/orchestration/selection.rs` | Loads library-scoped state and identity evidence, derives pass configurations, and checks incremental routing eligibility. |
@@ -65,6 +72,20 @@ changing behavior.
 | Service integration | `src/service/` | Owns install, uninstall, status, service execution, and platform renderers. |
 | Operator surfaces | `src/commands/status.rs`, `src/commands/doctor.rs`, `src/commands/manifest.rs` | Read local state for status, redacted diagnostics, and catalog export. |
 | Reports and monitoring | `src/cycle_reporter.rs`, `src/report.rs`, `src/health.rs`, `src/metrics.rs`, `src/notifications.rs` | Converts cycle facts into reports, health, metrics, and notifications. |
+
+Album tests use `icloud::photos::album::<owner>::tests::<test_name>` instead
+of `icloud::photos::album::tests::<test_name>`. The owners are `lookup`,
+`counts`, `planning`, `enumeration`, `fetch`, `completion`, `hydration`, and
+`changes`. All 88 original tests retain their names, attributes, and assertions,
+including the ignored live lookup test. Shared fixtures stay in
+`src/icloud/photos/album/test_support.rs`. Album tracing keeps the
+`kei::icloud::photos::album` target.
+
+Album-owner dependencies are one-way: hydration uses enumeration and change
+scans; enumeration uses planning, fetching, and completion; fetching uses
+planning types and completion evidence. Lookup, counts, planning, completion,
+and changes do not call sibling owners. The facade retains stream routing and
+public entry points. No album child owns durable checkpoint policy.
 
 File tests use `download::file::<owner>::tests::<test_name>` instead of
 `download::file::tests::<test_name>`. The owners are `transfer`, `validation`,
@@ -767,7 +788,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/orchestration/cleanup.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/orchestration/` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
-| `MALFORMED_REQUIRED_ASSET_FIELDS_BLOCK_CHECKPOINT` | `src/icloud/photos/asset.rs`, `src/icloud/photos/album.rs`, `src/download/orchestration/incremental.rs`, `src/sync_cycle.rs` | A live asset with a missing or invalid required identity or capture date blocks its zone checkpoint before filtering or path planning. |
+| `MALFORMED_REQUIRED_ASSET_FIELDS_BLOCK_CHECKPOINT` | `src/icloud/photos/asset.rs`, `src/icloud/photos/album/fetch.rs`, `src/icloud/photos/album/lookup.rs`, `src/download/orchestration/incremental.rs`, `src/sync_cycle.rs` | A live asset with a missing or invalid required identity or capture date blocks its zone checkpoint before filtering or path planning. |
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
 | `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
