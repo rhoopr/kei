@@ -155,8 +155,9 @@ Finalization rejects missing or skipped required offline phases and failed
 phase records. Live and platform skips remain explicit, not test coverage.
 
 Linux tooling tests in `branch_static` require `just` on `PATH`; CI installs
-its pinned version before both complete Rust suites. Other platforms retain
-their existing Rust test coverage; executable dispatcher fixtures are Linux-only.
+its pinned version before both complete Rust suites and coverage runs. Other
+platforms retain their existing Rust test coverage; executable dispatcher
+fixtures are Linux-only.
 
 ### Commands
 

@@ -266,6 +266,14 @@ jobs:
           key: coverage-head
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: taiki-e/install-action@9180ba819ebd9a5f78ccc0e64cb6b06f5917fdff # cargo-llvm-cov
+      - name: Install just for executable dispatcher tests
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            just = "1.50.0"
       - name: Run coverage
         run: |
           cargo llvm-cov --all-features --no-report
@@ -306,6 +314,14 @@ jobs:
           key: coverage-base
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: taiki-e/install-action@9180ba819ebd9a5f78ccc0e64cb6b06f5917fdff # cargo-llvm-cov
+      - name: Install just for executable dispatcher tests
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            just = "1.50.0"
       - name: Run coverage
         run: |
           cargo llvm-cov --all-features --no-report
