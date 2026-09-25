@@ -38,7 +38,7 @@ run_lib_test download::orchestration::full::tests::classify_pagination_shortfall
 run_lib_test download::orchestration::full::tests::classify_pagination_shortfall_billimek_sharedsync_fixture_reports_shortfall
 
 echo "--- valid JPEG bytes under .PNG are saved ---"
-run_lib_test download::file::tests::attempt_download_promotes_valid_jpeg_with_png_extension_issue_507
+run_lib_test download::file::transfer::tests::attempt_download_promotes_valid_jpeg_with_png_extension_issue_507
 
 echo "--- inactive album and smart-folder templates do not force full enumeration ---"
 run_lib_test download::orchestration::dispatch::tests::unfiled_only_incremental_ignores_inactive_album_path_templates
