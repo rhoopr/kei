@@ -27,8 +27,7 @@ static-checks:
 # Pre-push gate: static checks + offline behavior tests.
 gate:
     just static-checks
-    cargo test --all-features
-    cargo test --no-default-features
+    just test offline
 
 # Check GitHub workflow helpers with the repo hardening guard plus optional
 # actionlint when it is installed locally.
@@ -193,16 +192,6 @@ test MODE="" *ARGS="":
     _live_env() {
         source scripts/just/live-env.sh
     }
-    run_drift_tests() {
-        local covered_re='^(cli|behavioral|service_cli|service_linux|service_macos|service_status|service_windows|sync|state_auth|import_existing_live|branch_static)$'
-        local test_file t
-        while read -r test_file; do
-            t="${test_file%.rs}"
-            [[ -z "$t" ]] && continue
-            [[ "$t" =~ $covered_re ]] && continue
-            cargo test --test "$t"
-        done < <(find tests -maxdepth 1 -type f -name '*.rs' -printf '%f\n' | sort)
-    }
     run_scenario() {
         local name="$1"
         local script="scripts/test-scenarios/$name.sh"
@@ -244,14 +233,15 @@ test MODE="" *ARGS="":
             ;;
         offline)
             cargo test --all-features
-            run_drift_tests
             cargo test --no-default-features
-            cargo test scope_contract_matrix --lib
+            scripts/test-scenarios/check.sh
             ;;
         scenarios)
+            scenarios=$(scripts/test-scenarios/list.sh)
+            [[ -n "$scenarios" ]] || { echo "no scenarios found" >&2; exit 2; }
             while read -r scenario; do
                 run_scenario "$scenario"
-            done < <(scripts/test-scenarios/list.sh)
+            done <<<"$scenarios"
             ;;
         scenario)
             args=({{ARGS}})

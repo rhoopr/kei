@@ -62,6 +62,21 @@ with open(src) as f:
         rec = json.loads(line)
         phase = rec.pop("phase")
         phases[phase] = rec
+# Never publish incomplete required validation as a successful run. Live and
+# platform-dependent phases can skip explicitly; offline proof cannot.
+required = {
+    "static_checks", "offline_core", "nightly_tools", "package", "docker_full",
+    "live_provider", "live_import_rehearsal", "service",
+}
+may_skip = {"live_provider", "live_import_rehearsal", "service"}
+for phase in sorted(required):
+    result = phases.get(phase, {})
+    status = result.get("status")
+    allowed = {"pass", "skipped", "rate_limited"} if phase in may_skip else {"pass"}
+    if status not in allowed or result.get("exit", 0) != 0:
+        raise SystemExit(f"required phase {phase} did not complete: {status or 'missing'}")
+if any(result.get("status") == "fail" or result.get("exit", 0) != 0 for result in phases.values()):
+    raise SystemExit("cannot finalize a failed phase as a successful run")
 record = {
     "started_at": started_at,
     "branch": branch,
