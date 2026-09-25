@@ -1,3 +1,5 @@
+<!-- Follow [the contribution and review rules](https://github.com/rhoopr/kei/blob/HEAD/CONTRIBUTING.md#pull-requests-and-review). -->
+
 ## Summary
 
 <!-- What changed and why. Link related issues with "Fixes #123" or "Closes #123". -->
@@ -16,17 +18,8 @@
 
 ## State transition proof
 
-<!-- Changes to durable configuration, filesystem paths, media publication, metadata, SQLite state, retry work, or provider checkpoints require a state-transition proof through the production call graph. Fill in each item, or write "Not applicable" with a concrete reason. -->
-
-- Initial durable state:
-- Controlled mutation:
-- Production cycle:
-- Durable outcome:
-- Steady-state cycle:
-- Deliberate defect mutation:
+<!-- Apply the [state-transition proof requirements](https://github.com/rhoopr/kei/blob/HEAD/tests/README.md#state-transition-proof). Report the evidence for each required stage, or write "Not applicable" with a concrete reason. Include the deliberate defect mutation where applicable. -->
 
 ## Checklist
 
-- [ ] `just gate` passes, or the unchecked item is explained in the test plan
-- [ ] Behavior changes include focused tests
-- [ ] CLI, docs, workflow, Docker, systemd, or Homebrew surface changes were checked against their matching files
+- [ ] [Contribution checks](https://github.com/rhoopr/kei/blob/HEAD/CONTRIBUTING.md#workflow) completed; unchecked items are explained in the test plan

@@ -75,38 +75,11 @@ must cover interruption, retry, partial completion, and stale configuration.
    just gate
    ```
 
-   This runs formatting, clippy with default and no-default features, default
-   and no-default tests, doc lints, lockfile fetch, `cargo audit`, workflow and
-   script lint, contract markers, typos, and the serializer round-trip
-   detector. It stops on the first failure.
-
-   Without `just`, run the raw commands below. See `justfile` for the current
-   local commands and `.github/workflows/ci.yml` for the pinned CI tool
-   versions.
-
-   ```sh
-   cargo fmt --all --check
-   cargo clippy --all-targets --all-features -- -D warnings
-   cargo clippy --all-targets --no-default-features -- -D warnings
-   cargo test --all-features
-   cargo test --no-default-features
-   RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
-   cargo fetch --locked
-   cargo audit --deny warnings
-   python3 .github/scripts/check_workflow_hardening.py
-   mapfile -t shell_files < <(find scripts tests/shell docker -maxdepth 3 -type f \( -name '*.sh' -o -name 'entrypoint.sh' \) -print | sort)
-   mapfile -t python_files < <(find scripts .github/scripts -maxdepth 3 -type f -name '*.py' -print | sort)
-   python_files+=(scripts/check-contracts)
-   for shell_file in "${shell_files[@]}"; do bash -n "$shell_file"; done
-   PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile "${python_files[@]}"
-   shellcheck -x -P tests/shell:scripts:scripts/full-test "${shell_files[@]}"
-   shfmt -d "${shell_files[@]}"
-   ruff check "${python_files[@]}"
-   actionlint .github/workflows/*.yml
-   scripts/check-contracts
-   typos
-   bash scripts/check-roundtrip-gate.sh
-   ```
+   The [gate recipes](justfile) define the checks and commands. They include
+   static checks and offline tests with all features and without default
+   features. The gate stops on the first failure. Read
+   [the test guide](tests/README.md#running) for other test entry points.
+   CI tool versions are pinned in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 8. Open a pull request against `main`.
 
@@ -122,25 +95,9 @@ All changes go through pull requests. Do not commit directly to `main`.
   and documentation surfaces where applicable.
 - Do not dismiss a failing test as unrelated without investigating it.
 
-Changes to durable configuration, filesystem paths, media publication,
-metadata, SQLite state, retry work, or provider checkpoints require a
-state-transition proof through the production call graph. Prove these stages:
-
-1. **Initial durable state:** Seed or create the real SQLite and filesystem
-   state that exists before the change.
-2. **Controlled mutation:** Change one config value, provider fact, local
-   entry, or failure condition.
-3. **Production cycle:** Run the normal owner path instead of reconstructing
-   its decisions in the test.
-4. **Durable outcome:** Assert the file set and bytes, SQLite paths and status,
-   metadata, retry evidence, and checkpoint facts that apply.
-5. **Steady-state cycle:** Run an unchanged follow-up cycle and assert that it
-   does not repeat completed work or create new files or state transitions.
-
-List the applicable pass kinds, media families, destination entry types,
-metadata modes, interruption points, and state-write failures. A passing gate,
-coverage report, fuzz run, or fresh-workspace live test does not replace this
-transition proof. See [the test guide](tests/README.md#state-transition-proof).
+Apply the [state-transition proof requirements](tests/README.md#state-transition-proof)
+when the change affects durable behavior. That section defines applicability,
+the required stages, and the evidence to report.
 
 Some tests (`tests/sync.rs`, `tests/state_auth.rs`, and
 `tests/import_existing_live.rs`) contact the live iCloud API and need real
