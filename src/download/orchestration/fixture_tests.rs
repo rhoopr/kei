@@ -1,5 +1,11 @@
 //! Bundled media reaches provider decoding, planning, HTTP, publication and SQLite.
 
+mod metadata;
+mod naming;
+mod recovery;
+mod selection;
+mod support;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -51,12 +57,16 @@ fn records(name: &str, uti: &str, server: &MockServer, bytes: &[u8]) -> Vec<Valu
 }
 
 fn pass(records: Vec<Value>) -> AlbumPass {
+    let count = records
+        .iter()
+        .filter(|record| record["recordType"] == "CPLMaster")
+        .count() as u64;
     AlbumPass {
         kind: PassKind::Unfiled,
         album: mock_album(
             "",
             MockPhotosFlow::new()
-                .album_count(1)
+                .album_count(count)
                 .query_page(records, Some("fixture-token"))
                 .empty_query_page(Some("fixture-token"))
                 .build(),
@@ -66,9 +76,13 @@ fn pass(records: Vec<Value>) -> AlbumPass {
 }
 
 async fn cycle(config: &DownloadConfig, records: Vec<Value>) -> super::models::SyncResult {
+    cycle_passes(config, &[pass(records)]).await
+}
+
+async fn cycle_passes(config: &DownloadConfig, passes: &[AlbumPass]) -> super::models::SyncResult {
     download_photos_with_sync(
         &Client::new(),
-        &[pass(records)],
+        passes,
         Arc::new(config.clone()),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
@@ -81,6 +95,7 @@ async fn cycle(config: &DownloadConfig, records: Vec<Value>) -> super::models::S
 async fn bundled_media_download_finalize_reopen_and_second_sync() {
     for (name, uti, mime) in [
         ("media/pattern.jpg", "public.jpeg", "image/jpeg"),
+        ("media/icloud-still.heic", "public.heic", "image/heic"),
         ("media/metadata.jpg", "public.jpeg", "image/jpeg"),
         ("media/pattern.png", "public.png", "image/png"),
         ("media/pattern.heic", "public.heic", "image/heic"),
@@ -180,6 +195,7 @@ async fn bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles() {
     use xmp_toolkit::{XmpMeta, xmp_ns};
 
     for name in [
+        "media/icloud-still.heic",
         "media/apple-live.heic",
         "media/pattern.heic",
         "apple-hdr-gainmap.heic",

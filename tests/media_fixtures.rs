@@ -112,6 +112,8 @@ fn bundled_fixture_manifest_hashes_and_budget() -> Result<()> {
         "tests/data/media/encoders.json",
         "tests/data/media/sanitization.json",
         "scripts/fixtures/sanitize_live_photo.py",
+        "scripts/fixtures/sanitize_icloud_still.py",
+        "tests/data/media/icloud-sanitization.json",
         "scripts/fixtures/check-package.sh",
     ] {
         ensure!(

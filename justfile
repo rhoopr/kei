@@ -23,6 +23,7 @@ static-checks:
     scripts/check-contracts
     typos
     bash scripts/check-roundtrip-gate.sh
+    python3 scripts/fixtures/check_live_selection.py
 
 # Pre-push gate: static checks + offline behavior tests.
 gate:

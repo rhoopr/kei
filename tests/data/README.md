@@ -1,9 +1,9 @@
 # Media fixture corpus
 
-The 12 media files in `media-manifest.json` cover transfer and metadata without
+The 13 media files in `media-manifest.json` cover transfer and metadata without
 Apple credentials, external downloads, or encoders during tests. Their total
-size is 5,741,205 bytes. Four existing structural regression seeds add 2,747
-bytes. The enforced budget for all 16 files is 8 MiB.
+size is 7,959,356 bytes. Four existing structural regression seeds add 2,747
+bytes. The enforced budget for all 17 files is 8 MiB.
 
 ## Coverage
 
@@ -12,9 +12,13 @@ bytes. The enforced budget for all 16 files is 8 MiB.
 | `media/pattern.jpg`, `.png`, `.heic`, `.avif`, `.mov`, `.mp4`, `.dng` | Valid, independently encoded formats, no source location or personal content | `bundled_media_download_finalize_reopen_and_second_sync` |
 | `media/metadata.jpg` | Controlled capture time, orientation 6, rating 4, Unicode description, GPS at 0,0 | `bundled_media_download_finalize_reopen_and_second_sync` |
 | `media/apple-live.heic`, `media/apple-live.mov` | Authentic Apple still, HEVC motion, silent PCM audio, three timed metadata tracks, matching pairing identifiers | `bundled_live_photo_modes_preserve_pair_and_companion_naming` |
-| `media/apple-live.heic`, `media/pattern.heic`, `media/pattern.avif`, `apple-hdr-gainmap.heic` | XMP before publication, original/local checksum separation, unchanged non-XMP items | `bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles` |
+| `media/icloud-still.heic`, `media/apple-live.heic`, `media/pattern.heic`, `media/pattern.avif`, `apple-hdr-gainmap.heic` | XMP before publication, original/local checksum separation, unchanged non-XMP items | `bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles` |
 | `apple-hdr-gainmap.heic`, `white_1x1.avif` | Existing independent Apple HDR/tiled and AVIF layouts | HEIF owner tests and `bundled_media_download_finalize_reopen_and_second_sync` |
 | Derived damaged JPEG bytes | Malformed and truncated HTTP responses, durable retry after reopening SQLite | `bundled_invalid_download_retains_retry_evidence_then_recovers_after_restart` |
+
+The [live migration map](live-migration.md) lists filtering, naming, metadata,
+import, and failure replacements. Additional fixture tests prove interrupted
+HTTP work survives restart and conflicting local media is not overwritten.
 
 Each media transfer test uses controlled provider records, real enumeration
 and planning, local HTTP, file-backed SQLite, and the normal publication path.
@@ -70,6 +74,23 @@ under `LICENSE-libavif-white-1x1`.
 `sample.heic` remains a separate legacy fixture for existing owner tests.
 This corpus does not change its bytes or claim additional provenance for it.
 
+### Maintainer-contributed iCloud sample
+
+`media/icloud-still.heic` was downloaded from the maintainer's iCloud Photos
+shared library with kei on 2026-09-27. The maintainer confirmed ownership and explicitly
+authorized sanitized samples under MIT. `LICENSE-icloud-media` contains the
+licence. This is an iCloud-delivered Apple HEIC, not a synthetic encoding.
+
+The maintainer selected this Friday-evening sunset. It shows the sky, trees,
+and a yard, with no people, documents, or visible addresses.
+Sanitization removes Apple maker notes, identifiers, and primary XMP
+(including region tags and capture dates). It replaces EXIF capture timestamps
+with a fixed date. Technical auxiliary XMP values remain unchanged, as verified by ExifTool. The HEVC image data, auxiliary
+images, orientation, and HDR metadata remain. FFmpeg decoded the original and
+sanitized sample to identical pixels. The source hash and checks are in
+`media/icloud-sanitization.json`; original filenames and account metadata are
+not distributed. The pinned sanitizer needs the privately retained original.
+
 ## Reproduction
 
 Normal tests read the committed bytes. Regeneration is a maintainer operation
@@ -83,6 +104,7 @@ ExifTool 13.59.
 ```sh
 python3 scripts/fixtures/generate.py /tmp/kei-new-media --exiftool /path/to/exiftool
 python3 scripts/fixtures/sanitize_live_photo.py /path/to/pinned-originals /tmp/kei-new-live-photo --exiftool /path/to/exiftool
+python3 scripts/fixtures/sanitize_icloud_still.py /path/to/contributed-original.heic /tmp/kei-new-icloud --exiftool /path/to/exiftool
 ```
 
 The sanitizer rejects source hashes other than the pinned originals. It
@@ -98,7 +120,7 @@ To keep the actual HEIF pipeline outputs for an independent decoder, run:
 KEI_FIXTURE_INSPECT_DIR=/tmp/kei-rewritten-media cargo test --all-features --lib bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles -- --test-threads=1
 ```
 
-The four output paths match their paths under `tests/data/`. FFmpeg 8.1.1
+The five output paths match their paths under `tests/data/`. FFmpeg 8.1.1
 decoded each original and rewritten file to identical RGB24 pixels. ExifTool
 13.59 read rating 5 from each rewritten file. Repeat those checks after writer
 or fixture changes. For example, compare these hashes and check the rating:

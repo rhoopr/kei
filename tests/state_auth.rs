@@ -38,10 +38,10 @@ fn sync_config(
     filters_extra: &str,
 ) -> std::path::PathBuf {
     let body = format!(
-        "[download]\ndirectory = {}\n{download_extra}[filters]\nalbums = [\"none\"]\n{filters_extra}",
+        "[download]\ndirectory = {}\n{download_extra}[filters]\n{filters_extra}",
         common::toml_string(&dir.to_string_lossy())
     );
-    common::write_toml_config(data_dir, "state-auth-sync", &body)
+    common::live_selection::write_live_config(data_dir, "state-auth-sync", &body)
 }
 
 fn import_config(data_dir: &Path, dir: &Path, download_extra: &str) -> std::path::PathBuf {
@@ -49,7 +49,7 @@ fn import_config(data_dir: &Path, dir: &Path, download_extra: &str) -> std::path
         "[download]\ndirectory = {}\n{download_extra}",
         common::toml_string(&dir.to_string_lossy())
     );
-    common::write_toml_config(data_dir, "state-auth-import", &body)
+    common::live_selection::write_live_config(data_dir, "state-auth-import", &body)
 }
 
 fn sync_cmd(

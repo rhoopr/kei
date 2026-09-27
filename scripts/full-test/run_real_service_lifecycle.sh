@@ -29,9 +29,9 @@ source "$repo_root/tests/shell/lib.sh"
 
 kei_require_env
 kei_require_release_binary
+kei_preflight_selection
 
 binary=$(kei_release_bin)
-album=$(kei_album)
 cookies=$(kei_cookie_dir)
 work=$(mktemp -d "${TMPDIR:-/tmp/codex/kei/full-test/tmp}/kei-real-service-XXXXX")
 service_uninstalled=0
@@ -80,10 +80,7 @@ config="$work/config.toml"
     echo "[download]"
     printf 'directory = %s\n' "$(kei_toml_string "$photos")"
     echo
-    echo "[filters]"
-    printf 'albums = [%s]\n' "$(kei_toml_string "$album")"
-    echo "unfiled = false"
-    echo 'libraries = ["primary"]'
+    kei_live_filters
     echo
     echo "[watch]"
     echo "interval = 86400"

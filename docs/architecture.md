@@ -931,6 +931,10 @@ Stable IDs connect safety rules to production owners and focused tests.
 - `tests/data/media-manifest.json` owns the bundled media inventory and size
   budget. `download::orchestration::fixture_tests` exercises these bytes
   through enumeration, planning, download, publication, and reopened SQLite.
+  Its selection, naming, metadata, and recovery modules replace content-dependent
+  live assertions. `tests/data/live-migration.md` records the mapping. General
+  live entry points share `tests/data/live-selection.toml` and reject an empty
+  eligible selection before the suite.
   `scripts/fixtures/` owns maintainer-only generation and sanitization and
   the optimized extracted-source-package check. Tests do not fetch media.
 - Shell suites cover crash, concurrency, state-machine, and container behavior.

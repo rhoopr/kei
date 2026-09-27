@@ -46,10 +46,8 @@ use std::time::Duration;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
-const FIXTURE_TIMEOUT_SECS: u64 = 1800; // 30m: full sync of ~100 assets
+const FIXTURE_TIMEOUT_SECS: u64 = 1800; // Large media can need more time than metadata-only scans.
 const IMPORT_TIMEOUT_SECS: u64 = 300; // 5m: import-existing scans, no downloads
-const FIXTURE_RECENT: u32 = 100;
-const FIXTURE_FILTERS_TOML: &str = "[filters]\nalbums = [\"none\"]\nunfiled = true\n";
 
 /// Copy auth artifacts (cookie file + .session + .cache) from `src`
 /// into `dst`, deliberately skipping `.db` and `.lock` files. A state
@@ -121,14 +119,15 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
         let data_dir = prepare_fixture_data_dir(&download_dir, &cookie_dir);
 
         eprintln!(
-            "Building import-existing fixture: --recent {FIXTURE_RECENT} into {}",
+            "Building import-existing fixture: --recent {} into {}",
+            common::live_selection::live_recent(),
             download_dir.display()
         );
         // Keep the reusable fixture to one library-wide pass. The default
         // selection also walks every user album, which makes live accounts
         // with overlapping album memberships produce account-dependent
         // unmatched duplicate paths in import-existing smoke tests.
-        let config_path = write_kei_toml(&data_dir, &download_dir, FIXTURE_FILTERS_TOML);
+        let config_path = write_kei_toml(&data_dir, &download_dir, "");
         let output = common::cmd()
             .env("ICLOUD_USERNAME", &username)
             .env("KEI_DATA_DIR", &data_dir)
@@ -139,7 +138,7 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
                 "--config",
                 config_path.to_str().unwrap(),
                 "--recent",
-                &FIXTURE_RECENT.to_string(),
+                &common::live_selection::live_recent().to_string(),
                 "--no-progress-bar",
             ])
             .timeout(Duration::from_secs(FIXTURE_TIMEOUT_SECS))
@@ -234,8 +233,47 @@ fn import_cmd(
         password,
         "--no-progress-bar",
     ]);
+    // import-existing takes its scan cap from the CLI, not filters.recent.
+    if !extra.contains(&"--recent") {
+        cmd.args([
+            "--recent",
+            &common::live_selection::live_recent().to_string(),
+        ]);
+    }
     cmd.args(extra);
     cmd
+}
+
+#[test]
+fn import_command_uses_shared_bound_unless_scenario_overrides_it() {
+    let dir = tempdir().unwrap();
+    for (extra, expected) in [
+        (
+            Vec::new(),
+            common::live_selection::live_recent().to_string(),
+        ),
+        (vec!["--recent", "3"], "3".to_owned()),
+        (vec!["--recent", "30d"], "30d".to_owned()),
+    ] {
+        let command = import_cmd(
+            "test@example.invalid",
+            "test",
+            dir.path(),
+            dir.path(),
+            dir.path(),
+            &extra,
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let bounds: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--recent")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(bounds, [expected.as_str()]);
+    }
 }
 
 /// Parse the trailing summary printed by `import-existing`.
@@ -296,6 +334,24 @@ fn count_downloaded_rows(data_dir: &Path) -> u64 {
     .unwrap_or(0)
 }
 
+/// Use this run's selected rows, not unrelated files left in the reusable cache.
+fn selected_fixture_files(data_dir: &Path) -> Vec<PathBuf> {
+    let db_path = std::fs::read_dir(data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "db"))
+        .expect("fixture database");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut query = conn
+        .prepare("SELECT local_path FROM assets WHERE status = 'downloaded' ORDER BY local_path")
+        .unwrap();
+    query
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|path| PathBuf::from(path.unwrap()))
+        .collect()
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 /// Smoke test: import-existing against the fixture's download dir
@@ -318,8 +374,8 @@ fn import_matches_default_layout_after_sync() {
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
-        let recent = FIXTURE_RECENT.to_string();
-        let toml_path = write_kei_toml(test_data.path(), download_dir, FIXTURE_FILTERS_TOML);
+        let recent = common::live_selection::live_recent().to_string();
+        let toml_path = write_kei_toml(test_data.path(), download_dir, "");
         let output = import_cmd(
             &username,
             &password,
@@ -382,7 +438,7 @@ fn import_dry_run_writes_no_rows() {
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
-        let recent = FIXTURE_RECENT.to_string();
+        let recent = common::live_selection::live_recent().to_string();
         let output = import_cmd(
             &username,
             &password,
@@ -418,7 +474,7 @@ fn import_is_idempotent() {
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
-        let recent = FIXTURE_RECENT.to_string();
+        let recent = common::live_selection::live_recent().to_string();
         let run = || -> ImportSummary {
             let output = import_cmd(
                 &username,
@@ -451,14 +507,8 @@ fn import_is_idempotent() {
     });
 }
 
-/// `--recent N` caps the scan. Under v0.13's per-pass model the cap
-/// applies *per pass*, so this test pins both edges:
-/// - With `albums = ["none"]` + `unfiled = true` (one library-wide pass),
-///   `--recent 5` produces total <= 5 (the per-pass cap is the global cap).
-/// - The default no-flag selection (`-a all` + unfiled) runs many passes,
-///   each capped at 5, so total <= 5 * num_active_passes. We assert the
-///   loose upper bound there as a safety net against a regression that
-///   loses the cap entirely (total >> recent).
+/// The shared single pass honors a smaller per-scenario bound.
+/// Multiple-pass cap coverage lives in bundled_import_recent_caps_each_pass.
 #[test]
 #[ignore]
 fn import_recent_limit_caps_scan() {
@@ -499,32 +549,6 @@ fn import_recent_limit_caps_scan() {
             summary.total <= 5,
             "single-pass --recent 5 must scan at most 5 assets, got {summary:?}"
         );
-
-        // Multi-pass scenario: default selection runs many passes, each
-        // capped at 5. Loose upper bound (5 * 200 = 1000) catches a
-        // regression where the cap is dropped entirely (the test account
-        // has thousands of photos), without false-firing on accounts with
-        // a moderate album count.
-        let test_data2 = tempdir().unwrap();
-        let output2 = import_cmd(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir,
-            test_data2.path(),
-            &["--recent", "5"],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-        let summary2 = parse_summary(&String::from_utf8_lossy(&output2.stdout));
-        assert!(
-            summary2.total <= 1000,
-            "multi-pass --recent 5 produced total={total}; cap appears to be dropped entirely",
-            total = summary2.total,
-        );
     });
 }
 
@@ -564,27 +588,17 @@ fn import_recent_days_form_is_rejected() {
 #[ignore]
 fn import_unmatches_truncated_file() {
     let (username, password, cookie_dir) = common::require_preauth();
-    let (download_dir, _sync_data_dir) = fixture();
+    let (download_dir, sync_data_dir) = fixture();
 
     common::with_auth_retry(|| {
-        // Copy 3 files into a fresh dir, preserving the original parent
+        // Copy this bounded selection into a fresh dir, preserving the original parent
         // directory layout (Y/m/d/...) so import-existing's path
         // derivation lines up.
         let test_root = tempdir().unwrap();
         let test_dl = test_root.path().join("photos");
         std::fs::create_dir_all(&test_dl).unwrap();
-        let files: Vec<PathBuf> = common::walkdir(download_dir)
-            .into_iter()
-            .filter(|p| {
-                let s = p.to_string_lossy();
-                !s.contains("/_kei_data/") && !s.contains("/state.db")
-            })
-            .take(3)
-            .collect();
-        if files.len() < 3 {
-            eprintln!("Fixture only has {} files, skipping", files.len());
-            return;
-        }
+        let files = selected_fixture_files(sync_data_dir);
+        assert!(!files.is_empty(), "bounded fixture contains no media");
         for src in &files {
             let rel = src.strip_prefix(download_dir).unwrap();
             let dst = test_dl.join(rel);
@@ -611,7 +625,7 @@ fn import_unmatches_truncated_file() {
             &cookie_dir,
             &test_dl,
             test_data.path(),
-            &["--recent", "10"],
+            &[],
         )
         .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
         .assert()
@@ -620,9 +634,9 @@ fn import_unmatches_truncated_file() {
         .clone();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let summary = parse_summary(&stdout);
-        assert!(
-            summary.unmatched >= 1,
-            "expected ≥1 unmatched (truncated file), got {summary:?}\n{stdout}"
+        assert_eq!(
+            summary.unmatched, 1,
+            "only the truncated version should be unmatched: {summary:?}\n{stdout}"
         );
     });
 }
@@ -632,26 +646,16 @@ fn import_unmatches_truncated_file() {
 #[ignore]
 fn import_unmatches_missing_file() {
     let (username, password, cookie_dir) = common::require_preauth();
-    let (download_dir, _sync_data_dir) = fixture();
+    let (download_dir, sync_data_dir) = fixture();
 
     common::with_auth_retry(|| {
         let test_root = tempdir().unwrap();
         let test_dl = test_root.path().join("photos");
         std::fs::create_dir_all(&test_dl).unwrap();
-        let files: Vec<PathBuf> = common::walkdir(download_dir)
-            .into_iter()
-            .filter(|p| {
-                let s = p.to_string_lossy();
-                !s.contains("/_kei_data/") && !s.contains("/state.db")
-            })
-            .take(3)
-            .collect();
-        if files.len() < 3 {
-            eprintln!("Fixture only has {} files, skipping", files.len());
-            return;
-        }
-        // Copy only the first 2 of 3 -- the third will be "missing".
-        for src in &files[..2] {
+        let files = selected_fixture_files(sync_data_dir);
+        assert!(!files.is_empty(), "bounded fixture contains no media");
+        // Omit one known file, even when the library contains only one asset.
+        for src in &files[..files.len() - 1] {
             let rel = src.strip_prefix(download_dir).unwrap();
             let dst = test_dl.join(rel);
             if let Some(parent) = dst.parent() {
@@ -667,7 +671,7 @@ fn import_unmatches_missing_file() {
             &cookie_dir,
             &test_dl,
             test_data.path(),
-            &["--recent", "5"],
+            &[],
         )
         .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
         .assert()
@@ -676,9 +680,9 @@ fn import_unmatches_missing_file() {
         .clone();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let summary = parse_summary(&stdout);
-        assert!(
-            summary.unmatched >= 1,
-            "expected ≥1 unmatched (missing file), got {summary:?}\n{stdout}"
+        assert_eq!(
+            summary.unmatched, 1,
+            "only the missing version should be unmatched: {summary:?}\n{stdout}"
         );
     });
 }
@@ -754,7 +758,7 @@ force_resolution = false
             "--no-progress-bar",
             "--dry-run",
             "--recent",
-            "10",
+            &common::live_selection::live_recent().to_string(),
         ]);
         let output = cmd
             .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
@@ -782,8 +786,6 @@ force_resolution = false
 // fixture download dir + same data_dir. Sync must report
 // `<imported> already downloaded` (or equivalent) and `0 downloaded`.
 
-const ROUNDTRIP_RECENT: u32 = 10;
-
 /// Write a `kei.toml` under `dir` with `[download].directory` set to the
 /// fixture and the caller's extra TOML body appended. Returns the path.
 fn write_kei_toml(dir: &Path, download_dir: &Path, extra: &str) -> std::path::PathBuf {
@@ -792,7 +794,7 @@ fn write_kei_toml(dir: &Path, download_dir: &Path, extra: &str) -> std::path::Pa
         "[download]\ndirectory = {dl:?}\n{extra}",
         dl = download_dir.to_string_lossy(),
     );
-    std::fs::write(&path, body).unwrap();
+    std::fs::write(&path, common::live_selection::live_config(&body)).unwrap();
     path
 }
 
@@ -856,7 +858,7 @@ fn run_sync_against_fixture(
         "--config",
         config_path.to_str().unwrap(),
         "--recent",
-        &ROUNDTRIP_RECENT.to_string(),
+        &common::live_selection::live_recent().to_string(),
         "--no-progress-bar",
     ]);
     let output = cmd
@@ -901,8 +903,8 @@ fn roundtrip_default_layout_sync_skips_after_import() {
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
-        let recent = ROUNDTRIP_RECENT.to_string();
-        let toml_path = write_kei_toml(test_data.path(), download_dir, FIXTURE_FILTERS_TOML);
+        let recent = common::live_selection::live_recent().to_string();
+        let toml_path = write_kei_toml(test_data.path(), download_dir, "");
 
         let import = import_cmd(
             &username,
@@ -928,126 +930,12 @@ fn roundtrip_default_layout_sync_skips_after_import() {
         // (every asset rejected before the download phase) and >0 when
         // sync emits a per-asset skip tally; both are valid no-download
         // outcomes for the round-trip.
-        let (downloaded, _skipped) = run_sync_against_fixture(
-            &username,
-            &password,
-            download_dir,
-            test_data.path(),
-            FIXTURE_FILTERS_TOML,
-        );
+        let (downloaded, _skipped) =
+            run_sync_against_fixture(&username, &password, download_dir, test_data.path(), "");
         assert_eq!(
             downloaded, 0,
             "sync re-downloaded {downloaded} files after import-existing populated state DB; \
              matched={}",
-            summary.matched,
-        );
-    });
-}
-
-/// Import then sync under `name-id7` file_match_policy. Pins that the
-/// id7 suffix is consistent across both call sites so sync sees the
-/// imported rows by (id, version_size) and skips.
-#[test]
-#[ignore]
-fn roundtrip_name_id7_sync_skips_after_import() {
-    let (username, password, cookie_dir) = common::require_preauth();
-    let (download_dir, _sync_data_dir) = fixture();
-
-    common::with_auth_retry(|| {
-        // The fixture was synced with default policy, so id7-shaped paths
-        // probably don't exist on disk -- import-existing's NameId7 scan
-        // would match nothing. Skip cleanly with a note rather than fail
-        // the round-trip on a non-applicable layout.
-        let test_data = tempdir().unwrap();
-        let recent = ROUNDTRIP_RECENT.to_string();
-        let toml_path = write_kei_toml(
-            test_data.path(),
-            download_dir,
-            "[photos]\nfile_match_policy = \"name-id7\"\n",
-        );
-        let import_out = import_cmd(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir,
-            test_data.path(),
-            &["--recent", &recent, "--config", toml_path.to_str().unwrap()],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-        let summary = parse_summary(&String::from_utf8_lossy(&import_out.stdout));
-
-        if summary.matched == 0 {
-            eprintln!(
-                "skip: fixture has no name-id7-shaped files on disk; \
-                 round-trip not exercisable in this layout ({summary:?})"
-            );
-            return;
-        }
-
-        let (downloaded, _skipped) = run_sync_against_fixture(
-            &username,
-            &password,
-            download_dir,
-            test_data.path(),
-            "[photos]\nfile_match_policy = \"name-id7\"\n",
-        );
-        assert_eq!(
-            downloaded, 0,
-            "sync re-downloaded {downloaded} after name-id7 import; matched={}",
-            summary.matched,
-        );
-    });
-}
-
-/// Import and sync with videos disabled. Sync still must NOT re-download the
-/// photos imported under the media-filtered state DB.
-#[test]
-#[ignore]
-fn roundtrip_skip_videos_sync_skips_imported_photos() {
-    let (username, password, cookie_dir) = common::require_preauth();
-    let (download_dir, _sync_data_dir) = fixture();
-
-    common::with_auth_retry(|| {
-        // import-existing doesn't expose media selection as a flag. Use TOML
-        // to force it.
-        let test_data = tempdir().unwrap();
-        let media_filter_toml = "[filters]\nalbums = [\"none\"]\nunfiled = true\nmedia = [\"photos\", \"live-photos\"]\n";
-        let toml_path = write_kei_toml(test_data.path(), download_dir, media_filter_toml);
-
-        let recent = ROUNDTRIP_RECENT.to_string();
-        let import_out = import_cmd(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir,
-            test_data.path(),
-            &["--recent", &recent, "--config", toml_path.to_str().unwrap()],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-        let summary = parse_summary(&String::from_utf8_lossy(&import_out.stdout));
-        if summary.matched == 0 {
-            eprintln!("skip: media-filtered import matched nothing; round-trip not applicable");
-            return;
-        }
-
-        let (downloaded, _skipped) = run_sync_against_fixture(
-            &username,
-            &password,
-            download_dir,
-            test_data.path(),
-            media_filter_toml,
-        );
-        assert_eq!(
-            downloaded, 0,
-            "sync re-downloaded {downloaded} after media-filtered import; matched={}",
             summary.matched,
         );
     });
@@ -1098,7 +986,7 @@ fn verify_checksums_passes_after_import() {
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
-        let recent = ROUNDTRIP_RECENT.to_string();
+        let recent = common::live_selection::live_recent().to_string();
         let import_out = import_cmd(
             &username,
             &password,
@@ -1113,10 +1001,10 @@ fn verify_checksums_passes_after_import() {
         .get_output()
         .clone();
         let summary = parse_summary(&String::from_utf8_lossy(&import_out.stdout));
-        if summary.matched == 0 {
-            eprintln!("skip: import matched nothing; verify-after-import not applicable");
-            return;
-        }
+        assert!(
+            summary.matched > 0,
+            "import matched no bounded fixture files: {summary:?}"
+        );
 
         let verify_out = common::cmd()
             .env("ICLOUD_USERNAME", &username)
@@ -1175,7 +1063,7 @@ fn default_used_when_no_toml_no_cli_flag() {
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
-        let recent = ROUNDTRIP_RECENT.to_string();
+        let recent = common::live_selection::live_recent().to_string();
         let mut cmd = import_cmd(
             &username,
             &password,
@@ -1272,7 +1160,7 @@ fn import_sigint_then_rerun_is_idempotent() {
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
         copy_auth_artifacts(&cookie_dir, test_data.path());
-        let recent = ROUNDTRIP_RECENT.to_string();
+        let recent = common::live_selection::live_recent().to_string();
 
         let config_path = write_kei_toml(test_data.path(), download_dir, "");
         let mut child = kei_std_command()
@@ -1375,7 +1263,7 @@ fn two_concurrent_imports_do_not_both_succeed_silently() {
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
         copy_auth_artifacts(&cookie_dir, test_data.path());
-        let recent = ROUNDTRIP_RECENT.to_string();
+        let recent = common::live_selection::live_recent().to_string();
 
         let config_path = write_kei_toml(test_data.path(), download_dir, "");
         let spawn = || {

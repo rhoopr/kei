@@ -1338,6 +1338,7 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         "check-contracts\t",
         "typos\t",
         "bash\tscripts/check-roundtrip-gate.sh",
+        "python3\tscripts/fixtures/check_live_selection.py",
     ]
     .map(str::to_owned);
     let workflow_calls = [
@@ -1898,23 +1899,44 @@ fn live_import_smoke_uses_toml_directory() {
 }
 
 #[test]
-fn live_import_rehearsal_seeds_album_with_per_filter_recent_scope() {
+fn live_import_rehearsal_uses_shared_bounded_selection() {
     let rehearsal = repo_file("scripts/full-test/run_live_import_rehearsal.sh");
+    assert!(rehearsal.contains("recent=$(kei_live_recent)"));
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_live_recent"#,
+        ])
+        .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let selection: toml::Table = repo_file("tests/data/live-selection.toml").parse().unwrap();
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        selection["filters"]["recent"]
+            .as_integer()
+            .unwrap()
+            .to_string()
+    );
 
     assert!(
-        rehearsal.contains("sync --recent 10 --recent-scope per-filter --no-progress-bar"),
-        "live import rehearsal must seed from the selected album's recent window, not the global library frontier"
+        rehearsal.contains("sync --no-progress-bar --config")
+            && rehearsal.contains("kei_live_filters"),
+        "live import rehearsal must seed from the shared single-pass selection"
     );
     assert!(
         rehearsal.contains("set +e\n    \"$@\" >\"$out\" 2>\"$err\"\n    local rc=$?\n    set -e"),
         "live import rehearsal must print command tails before propagating a failed command"
     );
     assert!(
-        rehearsal.contains("import-existing --dry-run --recent 10 --force-empty --no-progress-bar"),
+        rehearsal.contains(
+            "import-existing --dry-run --force-empty --recent \"$recent\" --no-progress-bar"
+        ),
         "live import rehearsal dry-run should keep import-existing bounded to the same recent count"
     );
     assert!(
-        rehearsal.contains("import-existing --recent 10 --force-empty --no-progress-bar"),
+        rehearsal.contains("import-existing --force-empty --recent \"$recent\" --no-progress-bar"),
         "live import rehearsal real import should keep import-existing bounded to the same recent count"
     );
 }
@@ -2242,4 +2264,105 @@ fi
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("offline_core"));
     assert!(!command_text(&output).contains("Result: PASS"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_selection_guard_rejects_retired_album_consumers() {
+    let guard = repo_path("scripts/fixtures/check_live_selection.py");
+    let output = Command::new("python3")
+        .arg(&guard)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("tests")).unwrap();
+    std::fs::create_dir(dir.path().join("scripts")).unwrap();
+    std::fs::write(dir.path().join("justfile"), "").unwrap();
+    let key = ["KEI_TEST_", "ALBUM"].concat();
+    for (path, body) in [
+        (
+            "tests/consumer.rs",
+            format!("fn consumer() {{ std::env::var(\"{key}\"); }}"),
+        ),
+        ("scripts/consumer.sh", format!("export {key}=retired")),
+        (
+            "justfile",
+            format!("test:\n    env {key}=retired cargo test"),
+        ),
+    ] {
+        let path = dir.path().join(path);
+        std::fs::write(&path, body).unwrap();
+        let output = Command::new("python3")
+            .arg(&guard)
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "guard accepted {}",
+            path.display()
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("retired named-album consumer"));
+        std::fs::write(path, "").unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_shell_preflight_rejects_empty_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("kei");
+    for (output, success) in [("", false), ("controlled.JPG", true)] {
+        write_executable(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n"));
+        let result = Command::new("bash")
+            .args(["-c", r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_release_bin() { printf '%s' "$BINARY"; }; kei_copy_session_without_state() { mkdir -p "$1"; }; kei_preflight_selection"#])
+            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .env("BINARY", &binary)
+            .output().unwrap();
+        assert_eq!(
+            result.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if !success {
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("empty bounded live selection")
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_shell_sql_quotes_arbitrary_media_paths() {
+    for path in [
+        "/photos/Photo.JPG",
+        "/photos/Café's image.MOV",
+        "/photos/a\nb.JPG",
+    ] {
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_sql_string "$MEDIA_PATH""#,
+            ])
+            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .env("MEDIA_PATH", path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = format!("SELECT {}", String::from_utf8(output.stdout).unwrap());
+        assert_eq!(
+            db.query_row(&sql, [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            path
+        );
+    }
 }

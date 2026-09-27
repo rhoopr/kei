@@ -4,11 +4,8 @@
 )]
 //! Sync tests with behavioral assertions (live iCloud API).
 //!
-//! Uses a test album in iCloud (default `kei-test`, override with
-//! `KEI_TEST_ALBUM`) that must contain at least:
-//! - one regular JPEG
-//! - one standalone video (.MOV or .MP4)
-//! - one JPEG with a non-ASCII filename
+//! Uses the bounded selection in `data/live-selection.toml`. No named album
+//! or particular media format is required. Exact content lives in fixture tests.
 //!
 //! All tests are `#[ignore]` -- they require iCloud credentials and hit the
 //! live Apple API. Run with:
@@ -38,14 +35,6 @@ use tempfile::tempdir;
 const TIMEOUT_SECS: u64 = 180;
 const TIMEOUT_META: u64 = 90;
 
-/// Name of the iCloud album used for live tests. Defaults to `kei-test`.
-/// Override with `KEI_TEST_ALBUM=<name>` so a different account can run
-/// the suite.
-fn album() -> &'static str {
-    static A: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    A.get_or_init(|| std::env::var("KEI_TEST_ALBUM").unwrap_or_else(|_| "kei-test".to_string()))
-}
-
 #[derive(Debug, Default)]
 struct SyncToml<'a> {
     download: &'a str,
@@ -58,14 +47,14 @@ struct SyncToml<'a> {
     report: &'a str,
 }
 
-/// Build a sync command targeting the test album.
-fn album_cmd(
+/// Build a sync command with the shared bounded primary-library selection.
+fn library_cmd(
     username: &str,
     password: &str,
     cookie_dir: &std::path::Path,
     download_dir: &std::path::Path,
 ) -> assert_cmd::Command {
-    album_cmd_with_toml(
+    library_cmd_with_toml(
         username,
         password,
         cookie_dir,
@@ -74,20 +63,14 @@ fn album_cmd(
     )
 }
 
-fn album_cmd_with_toml(
+fn library_cmd_with_toml(
     username: &str,
     password: &str,
     cookie_dir: &std::path::Path,
     download_dir: &std::path::Path,
     toml: SyncToml<'_>,
 ) -> assert_cmd::Command {
-    // `[filters].unfiled = false` keeps these tests scoped to the album under test.
-    // v0.13's default is `--unfiled true` regardless of `--album`, which
-    // would also enumerate every unfiled photo in the live account on
-    // every test invocation -- both blowing up wall time and hitting Apple
-    // rate limits. Each individual test asserts album-specific behaviour;
-    // the unfiled pass is exercised separately by the no-flag tests.
-    let config_path = album_config(cookie_dir, download_dir, toml);
+    let config_path = library_config(cookie_dir, download_dir, toml);
     let mut cmd = common::cmd();
     cmd.env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", cookie_dir);
@@ -102,7 +85,7 @@ fn album_cmd_with_toml(
     cmd
 }
 
-fn album_config(
+fn library_config(
     data_dir: &std::path::Path,
     download_dir: &std::path::Path,
     toml: SyncToml<'_>,
@@ -112,12 +95,6 @@ fn album_config(
         common::toml_string(&download_dir.to_string_lossy()),
         toml.download,
     );
-    if !toml.filters.contains("albums") {
-        body.push_str(&format!("albums = [{}]\n", common::toml_string(album())));
-    }
-    if !toml.filters.contains("unfiled") {
-        body.push_str("unfiled = false\n");
-    }
     body.push_str(toml.filters);
     for (section, content) in [
         ("photos", toml.photos),
@@ -131,7 +108,7 @@ fn album_config(
             body.push_str(&format!("[{section}]\n{content}"));
         }
     }
-    common::write_toml_config(data_dir, "sync-live", &body)
+    common::live_selection::write_live_config(data_dir, "sync-live", &body)
 }
 
 fn config_for_download_dir(
@@ -142,7 +119,7 @@ fn config_for_download_dir(
         "[download]\ndirectory = {}\n",
         common::toml_string(&download_dir.to_string_lossy())
     );
-    common::write_toml_config(data_dir, "sync-live", &body)
+    common::live_selection::write_live_config(data_dir, "sync-live", &body)
 }
 
 fn reset_sync_tokens(cookie_dir: &std::path::Path) {
@@ -192,46 +169,28 @@ fn list_libraries_prints_output() {
 
 // ── Core download ───────────────────────────────────────────────────────
 
-/// Downloads the full test album and verifies all expected asset types are present.
+/// Downloads the bounded primary-library selection without format assumptions.
 #[test]
 #[ignore]
-fn sync_album_downloads_all_asset_types() {
+fn sync_bounded_library_downloads_media() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
         let files = common::walkdir(download_dir.path());
-        assert!(
-            files.len() >= 3,
-            "expected at least 3 files from test album, got {}",
-            files.len()
-        );
+        assert!(!files.is_empty(), "bounded selection downloaded no media");
 
         // All files should be non-empty
         for f in &files {
             let size = std::fs::metadata(f).unwrap().len();
             assert!(size > 0, "file should be non-empty: {}", f.display());
         }
-
-        // Verify expected file types are present
-        let has_ext = |target: &str| {
-            files.iter().any(|p: &std::path::PathBuf| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case(target))
-            })
-        };
-        assert!(
-            has_ext("jpg") || has_ext("jpeg"),
-            "expected a JPEG file in: {files:?}"
-        );
-        assert!(has_ext("mov"), "expected a MOV file in: {files:?}");
     });
 }
 
@@ -244,7 +203,7 @@ fn sync_dry_run_downloads_nothing() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--dry-run"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
@@ -268,7 +227,7 @@ fn sync_idempotent_second_run_noop() {
         let download_dir = tempdir().expect("tempdir");
 
         // First sync
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
@@ -282,7 +241,7 @@ fn sync_idempotent_second_run_noop() {
             .collect();
 
         // Second sync — should be a no-op
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
@@ -307,125 +266,6 @@ fn sync_idempotent_second_run_noop() {
 
 // ── Media filters ───────────────────────────────────────────────────────
 
-/// `[filters].media` without videos should exclude all .mov/.mp4 files but
-/// still download images.
-#[test]
-#[ignore]
-fn sync_skip_videos_excludes_video_files() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                filters: "media = [\"photos\", \"live-photos\"]\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-        assert!(
-            !files.is_empty(),
-            "should download files when skipping videos"
-        );
-
-        // No video files should be present (album has no Live Photo MOV companions)
-        let video_files: Vec<_> = files.iter().filter(|p| is_video_ext(p)).collect();
-        assert!(
-            video_files.is_empty(),
-            "media filter should exclude all video files, found: {video_files:?}"
-        );
-
-        let image_files: Vec<_> = files.iter().filter(|p| is_image_ext(p)).collect();
-        assert!(
-            !image_files.is_empty(),
-            "should still download image files when skipping videos"
-        );
-    });
-}
-
-/// `[filters].media` without photos should exclude all image files but still
-/// download videos.
-#[test]
-#[ignore]
-fn sync_skip_photos_excludes_image_files() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                filters: "media = [\"videos\", \"live-photos\"]\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-        let image_files: Vec<_> = files.iter().filter(|p| is_image_ext(p)).collect();
-        assert!(
-            image_files.is_empty(),
-            "media filter should exclude all image files, found: {image_files:?}"
-        );
-
-        let video_files: Vec<_> = files.iter().filter(|p| is_video_ext(p)).collect();
-        assert!(
-            !video_files.is_empty(),
-            "should still download video files when skipping photos"
-        );
-    });
-}
-
-/// --live-photo-mode skip should be accepted and sync should succeed.
-/// NOTE: test album has no Live Photos -- this only verifies the flag works.
-#[test]
-#[ignore]
-fn sync_skip_live_photos_excludes_companions() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                photos: "live_photo_mode = \"skip\"\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-
-        // Standalone video (IMG_0962.MOV) should still be present
-        let standalone_video = files.iter().any(|p| file_name_contains(p, "0962"));
-        assert!(
-            standalone_video,
-            "standalone video (IMG_0962) should still be downloaded"
-        );
-    });
-}
-
 /// A media filter that selects only live photos plus a live-photo mode that
 /// drops them is rejected at startup rather than silently completing with zero
 /// downloads.
@@ -436,7 +276,7 @@ fn sync_skip_all_media_rejected_at_startup() {
 
     let download_dir = tempdir().expect("tempdir");
 
-    album_cmd_with_toml(
+    library_cmd_with_toml(
         &username,
         &password,
         &cookie_dir,
@@ -453,726 +293,6 @@ fn sync_skip_all_media_rejected_at_startup() {
     .stderr(predicate::str::contains("would download nothing"));
 }
 
-/// Date filters with extreme values should filter everything out.
-/// Also verifies interval syntax (e.g., "1d") parses correctly.
-#[test]
-#[ignore]
-fn sync_date_filters_exclude_by_creation_date() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        // skip-created-before with far-future date — everything filtered
-        {
-            let dir = tempdir().expect("tempdir");
-            album_cmd(&username, &password, &cookie_dir, dir.path())
-                .args(["--skip-created-before", "2099-01-01"])
-                .timeout(Duration::from_secs(TIMEOUT_SECS))
-                .assert()
-                .success();
-            let files = common::walkdir(dir.path());
-            assert!(
-                files.is_empty(),
-                "--skip-created-before 2099 should filter everything, found: {files:?}"
-            );
-        }
-
-        // skip-created-after with far-past date — everything filtered
-        {
-            let dir = tempdir().expect("tempdir");
-            album_cmd(&username, &password, &cookie_dir, dir.path())
-                .args(["--skip-created-after", "2000-01-01"])
-                .timeout(Duration::from_secs(TIMEOUT_SECS))
-                .assert()
-                .success();
-            let files = common::walkdir(dir.path());
-            assert!(
-                files.is_empty(),
-                "--skip-created-after 2000 should filter everything, found: {files:?}"
-            );
-        }
-
-        // Interval syntax ("1d") should parse and succeed
-        {
-            let dir = tempdir().expect("tempdir");
-            album_cmd(&username, &password, &cookie_dir, dir.path())
-                .args(["--skip-created-before", "1d"])
-                .timeout(Duration::from_secs(TIMEOUT_SECS))
-                .assert()
-                .success();
-        }
-    });
-}
-
-// ── Size and naming ─────────────────────────────────────────────────────
-
-/// `[photos].resolution = "medium"` should produce photo files significantly smaller than originals.
-/// Medium photos (2048px longest edge) should be well under 2MB.
-#[test]
-#[ignore]
-fn sync_size_medium_produces_smaller_files() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                filters: "media = [\"photos\", \"live-photos\"]\n",
-                photos: "resolution = \"medium\"\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-        assert!(!files.is_empty(), "should download files at medium size");
-
-        // Medium photos should be well under 2MB (originals are typically 3-15MB).
-        // RAW files (.dng, .cr2, .nef) lack medium/thumb alternatives and silently
-        // fall back to the original size, so exclude them from the size check.
-        let non_raw_files: Vec<_> = files.iter().filter(|p| !is_raw_ext(p)).collect();
-        assert!(
-            !non_raw_files.is_empty(),
-            "should have non-RAW files at medium size"
-        );
-        for f in &non_raw_files {
-            let size = std::fs::metadata(f).unwrap().len();
-            assert!(
-                size < 2_097_152,
-                "medium-size file should be under 2MB, got {} bytes: {}",
-                size,
-                f.display()
-            );
-        }
-    });
-}
-
-/// `force_resolution = true` with an available resolution should succeed and download files.
-#[test]
-#[ignore]
-fn sync_force_resolution_succeeds_when_available() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                photos: "resolution = \"medium\"\nforce_resolution = true\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-        assert!(
-            !files.is_empty(),
-            "force_resolution with available resolution should download files"
-        );
-
-        // With forced medium resolution, non-RAW photo files should be smaller than originals.
-        // Videos don't have meaningful medium alternatives so exclude them too.
-        let non_raw_files: Vec<_> = files
-            .iter()
-            .filter(|p| !is_raw_ext(p) && !is_video_ext(p))
-            .collect();
-        for f in &non_raw_files {
-            let size = std::fs::metadata(f).unwrap().len();
-            assert!(
-                size < 2_097_152,
-                "forced medium resolution file should be under 2MB, got {} bytes: {}",
-                size,
-                f.display()
-            );
-        }
-    });
-}
-
-/// --file-match-policy name-id7 should append a 7-character asset ID to every filename.
-#[test]
-#[ignore]
-fn sync_name_id7_appends_asset_id() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                photos: "file_match_policy = \"name-id7\"\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-        assert!(!files.is_empty(), "name-id7 should download files");
-
-        // Every file should have a separator + 7-char alphanumeric suffix in its stem.
-        // Live Photo MOV companions may have an extra codec suffix (e.g., _HEVC)
-        // appended after the ID, so strip trailing _ALLCAPS before checking.
-        for f in &files {
-            let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let check_stem = match stem.rfind('_') {
-                Some(pos) => {
-                    let tail = &stem[pos + 1..];
-                    if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_uppercase()) {
-                        &stem[..pos]
-                    } else {
-                        stem
-                    }
-                }
-                None => stem,
-            };
-            let bytes = check_stem.as_bytes();
-            assert!(
-                bytes.len() >= 8,
-                "filename stem too short for name-id7 pattern: {stem}"
-            );
-            let sep = bytes[bytes.len() - 8];
-            assert!(
-                sep == b'_' || sep == b'-',
-                "expected separator (_/-) before 7-char ID suffix in: {stem}"
-            );
-            let suffix = &check_stem[check_stem.len() - 7..];
-            assert!(
-                suffix.chars().all(|c| c.is_ascii_alphanumeric()),
-                "expected 7-char alphanumeric ID suffix, got '{suffix}' in: {stem}"
-            );
-        }
-    });
-}
-
-/// `--folder-structure-albums %Y` should place files from an album pass in
-/// year-only directories (e.g., 2024/file.jpg). Album passes use the
-/// per-category template introduced in v0.13; bare `--folder-structure` only
-/// governs the unfiled pass.
-#[test]
-#[ignore]
-fn sync_custom_folder_structure() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                download: "folder_structure_albums = \"%Y\"\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-        assert!(!files.is_empty(), "should download files");
-
-        for f in &files {
-            let relative = f.strip_prefix(download_dir.path()).unwrap();
-            let components: Vec<_> = relative.components().collect();
-            assert_eq!(
-                components.len(),
-                2,
-                "expected year/filename structure with %Y, got: {}",
-                relative.display()
-            );
-            // First component should be a 4-digit year
-            let year_str = components[0].as_os_str().to_str().unwrap();
-            assert!(
-                year_str.len() == 4 && year_str.chars().all(|c| c.is_ascii_digit()),
-                "expected 4-digit year directory, got: {year_str}"
-            );
-        }
-    });
-}
-
-/// --keep-unicode-in-filenames should preserve non-ASCII characters
-/// (e.g., Café_🧠godzill.jpg retains the é and 🧠).
-#[test]
-#[ignore]
-fn sync_keep_unicode_preserves_special_chars() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                photos: "keep_unicode_in_filenames = true\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-        assert!(
-            !files.is_empty(),
-            "should download files to check for unicode filenames"
-        );
-        let has_unicode = files.iter().any(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| !n.is_ascii())
-                .unwrap_or(false)
-        });
-        assert!(
-            has_unicode,
-            "expected at least one filename with non-ASCII characters (Café_🧠godzill.jpg)"
-        );
-    });
-}
-
-// ── EXIF ────────────────────────────────────────────────────────────────
-
-/// [metadata].set_exif_datetime should embed DateTimeOriginal in downloaded JPEG files.
-#[cfg(feature = "xmp")]
-#[test]
-#[ignore]
-fn sync_set_exif_datetime_embeds_date() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                metadata: "set_exif_datetime = true\n",
-                filters: "media = [\"photos\", \"live-photos\"]\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-        let jpeg_files: Vec<_> = files
-            .iter()
-            .filter(|p| {
-                let ext = p
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                ext == "jpg" || ext == "jpeg"
-            })
-            .collect();
-        assert!(!jpeg_files.is_empty(), "should have at least one JPEG file");
-
-        // Read XMP from the first JPEG and verify DateTimeOriginal is present
-        use xmp_toolkit::{OpenFileOptions, XmpFile, xmp_ns};
-        let mut file = XmpFile::new().expect("xmp file handle");
-        file.open_file(jpeg_files[0], OpenFileOptions::default().for_read())
-            .expect("open JPEG for XMP read");
-        let meta = file
-            .xmp()
-            .expect("JPEG should have XMP after set_exif_datetime");
-        assert!(
-            meta.property(xmp_ns::EXIF, "DateTimeOriginal").is_some()
-                || meta.property(xmp_ns::XMP, "CreateDate").is_some(),
-            "DateTimeOriginal XMP property should be present after set_exif_datetime"
-        );
-    });
-}
-
-/// [metadata].set_exif_rating should add a Rating property (value depends on the
-/// source photo; we assert the sync succeeds and the resulting JPEG has
-/// a writable XMP packet).
-#[cfg(feature = "xmp")]
-#[test]
-#[ignore]
-fn sync_set_exif_rating_embeds_rating() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                metadata: "set_exif_rating = true\n",
-                filters: "media = [\"photos\", \"live-photos\"]\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let jpeg = first_jpeg(&download_dir.path());
-        use xmp_toolkit::{OpenFileOptions, XmpFile};
-        let mut file = XmpFile::new().expect("xmp file handle");
-        file.open_file(&jpeg, OpenFileOptions::default().for_read())
-            .expect("open JPEG for XMP read");
-        assert!(
-            file.xmp().is_some(),
-            "JPEG should carry an XMP packet after set_exif_rating"
-        );
-    });
-}
-
-/// [metadata].set_exif_gps embeds GPSLatitude/GPSLongitude when the source photo
-/// carries location data. Sync must succeed either way; we only assert
-/// an XMP packet exists.
-#[cfg(feature = "xmp")]
-#[test]
-#[ignore]
-fn sync_set_exif_gps_embeds_gps() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                metadata: "set_exif_gps = true\n",
-                filters: "media = [\"photos\", \"live-photos\"]\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let jpeg = first_jpeg(&download_dir.path());
-        use xmp_toolkit::{OpenFileOptions, XmpFile};
-        let mut file = XmpFile::new().expect("xmp file handle");
-        file.open_file(&jpeg, OpenFileOptions::default().for_read())
-            .expect("open JPEG for XMP read");
-        assert!(
-            file.xmp().is_some(),
-            "JPEG should carry an XMP packet after set_exif_gps"
-        );
-    });
-}
-
-/// [metadata].set_exif_description embeds a dc:description when the source has
-/// one. Sync must succeed either way; we only assert an XMP packet
-/// exists.
-#[cfg(feature = "xmp")]
-#[test]
-#[ignore]
-fn sync_set_exif_description_embeds_description() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                metadata: "set_exif_description = true\n",
-                filters: "media = [\"photos\", \"live-photos\"]\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let jpeg = first_jpeg(&download_dir.path());
-        use xmp_toolkit::{OpenFileOptions, XmpFile};
-        let mut file = XmpFile::new().expect("xmp file handle");
-        file.open_file(&jpeg, OpenFileOptions::default().for_read())
-            .expect("open JPEG for XMP read");
-        assert!(
-            file.xmp().is_some(),
-            "JPEG should carry an XMP packet after set_exif_description"
-        );
-    });
-}
-
-/// [metadata].embed_xmp writes a full kei-authored XMP packet into the JPEG. Verify
-/// the file carries XMP content that references kei's own namespace URI.
-#[cfg(feature = "xmp")]
-#[test]
-#[ignore]
-fn sync_embed_xmp_writes_xmp_packet() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                metadata: "embed_xmp = true\n",
-                filters: "media = [\"photos\", \"live-photos\"]\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let jpeg = first_jpeg(&download_dir.path());
-        use xmp_toolkit::{OpenFileOptions, XmpFile};
-        let mut file = XmpFile::new().expect("xmp file handle");
-        file.open_file(&jpeg, OpenFileOptions::default().for_read())
-            .expect("open JPEG for XMP read");
-        let meta = file.xmp().expect("JPEG should carry XMP after embed_xmp");
-        // kei registers its own namespace (github.com/rhoopr/kei/ns/1.0/)
-        // for hidden/archived/mediaSubtype/burstId. Serialize and look for
-        // it so we know the packet reached us, not just a remnant from
-        // Apple's source.
-        let serialized = meta.to_string();
-        assert!(
-            serialized.contains("xmpmeta") || serialized.contains("rdf:RDF"),
-            "XMP packet must serialize to an RDF tree: {serialized}"
-        );
-    });
-}
-
-/// [metadata].xmp_sidecar writes a .xmp sidecar next to every downloaded media file.
-/// Verify at least one `.xmp` sits next to a downloaded JPEG.
-#[cfg(feature = "xmp")]
-#[test]
-#[ignore]
-fn sync_xmp_sidecar_writes_sidecar_file() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                metadata: "xmp_sidecar = true\n",
-                filters: "media = [\"photos\", \"live-photos\"]\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let files = common::walkdir(download_dir.path());
-        let sidecars: Vec<_> = files
-            .iter()
-            .filter(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("xmp"))
-            })
-            .collect();
-        assert!(
-            !sidecars.is_empty(),
-            "xmp_sidecar should produce at least one .xmp sidecar, got files: {files:?}"
-        );
-
-        let bytes = std::fs::read(sidecars[0]).expect("read sidecar");
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(
-            text.contains("<x:xmpmeta") || text.contains("xmpmeta"),
-            "sidecar content must be an XMP packet: {text}"
-        );
-    });
-}
-
-/// [metadata].embed_xmp on a HEIC file drives the byte-preserving embedded XMP
-/// writer. A rejected item map fails the metadata write and the whole sync, so
-/// a successful run is evidence the writer accepted the album's HEIC, and the
-/// file must still be on disk with content afterwards.
-///
-/// The packet is not read back here. xmp_toolkit has no HEIF handler, which is
-/// why kei resolves HEIC XMP itself; the resolved packet is covered by the unit
-/// tests over `src/download/heif.rs`.
-#[cfg(feature = "xmp")]
-#[test]
-#[ignore]
-fn sync_embed_xmp_on_heic_succeeds_and_keeps_the_file() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        album_cmd_with_toml(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir.path(),
-            SyncToml {
-                metadata: "embed_xmp = true\nset_exif_rating = true\n",
-                ..SyncToml::default()
-            },
-        )
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .assert()
-        .success();
-
-        let heic = first_heic(&download_dir.path());
-        assert!(
-            std::fs::metadata(&heic).expect("stat HEIC").len() > 0,
-            "HEIC `{}` should still be downloaded when embed_xmp is enabled",
-            heic.display()
-        );
-    });
-}
-
-/// Find the first downloaded JPEG in `dir`. Panics with a clear message if
-/// none is present — the test album must contain at least one JPEG.
-#[cfg(feature = "xmp")]
-fn first_jpeg(dir: &&std::path::Path) -> std::path::PathBuf {
-    let files = common::walkdir(dir);
-    files
-        .into_iter()
-        .find(|p| {
-            let ext = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            ext == "jpg" || ext == "jpeg"
-        })
-        .unwrap_or_else(|| panic!("no JPEG in {}", dir.display()))
-}
-
-/// Find the first downloaded HEIC in `dir`. Panics with a clear message if none
-/// is present. The test album must contain a Live Photo, so a missing HEIC
-/// means the fixture is wrong rather than that the case does not apply.
-#[cfg(feature = "xmp")]
-fn first_heic(dir: &&std::path::Path) -> std::path::PathBuf {
-    let files = common::walkdir(dir);
-    files
-        .into_iter()
-        .find(|p| {
-            let ext = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            ext == "heic" || ext == "heif"
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "no HEIC in {}; test album `{}` must contain a Live Photo",
-                dir.display(),
-                album()
-            )
-        })
-}
-
-// ── RAW alignment ───────────────────────────────────────────────────────
-
-/// raw_policy variants should be accepted and sync should succeed.
-/// NOTE: test album has no RAW files -- this verifies the flag is accepted
-/// without errors rather than testing naming behavior.
-#[test]
-#[ignore]
-fn sync_raw_policy_controls_raw_naming() {
-    common::with_auth_retry(|| {
-        for variant in ["as-is", "prefer-raw", "prefer-jpeg"] {
-            let (username, password, cookie_dir) = common::require_preauth();
-            let dir = tempdir().expect("tempdir");
-            album_cmd_with_toml(
-                &username,
-                &password,
-                &cookie_dir,
-                dir.path(),
-                SyncToml {
-                    photos: &format!("raw_policy = {variant:?}\n"),
-                    ..SyncToml::default()
-                },
-            )
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
-
-            let files = common::walkdir(dir.path());
-            assert!(
-                files.len() >= 3,
-                "raw_policy {variant} should download files, got {}",
-                files.len()
-            );
-        }
-    });
-}
-
-// ── Live Photo MOV policy ───────────────────────────────────────────────
-
-/// --live-photo-mov-filename-policy flag should be accepted and sync should succeed.
-/// NOTE: test album has no Live Photos -- this only verifies the flag is accepted.
-/// Re-enable naming assertions when the album is repopulated with a Live Photo.
-#[test]
-#[ignore]
-fn sync_live_photo_mov_policy_controls_naming() {
-    common::with_auth_retry(|| {
-        for policy in ["suffix", "original"] {
-            let (username, password, cookie_dir) = common::require_preauth();
-            let dir = tempdir().expect("tempdir");
-            album_cmd_with_toml(
-                &username,
-                &password,
-                &cookie_dir,
-                dir.path(),
-                SyncToml {
-                    photos: &format!("live_photo_mov_filename_policy = {policy:?}\n"),
-                    ..SyncToml::default()
-                },
-            )
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
-
-            let files = common::walkdir(dir.path());
-            assert!(
-                files.len() >= 3,
-                "--live-photo-mov-filename-policy {policy} should download files, got {}",
-                files.len()
-            );
-        }
-    });
-}
-
 // ── Misc flags ──────────────────────────────────────────────────────────
 
 /// --temp-suffix .downloading should leave no temp files after a successful sync.
@@ -1184,7 +304,7 @@ fn sync_temp_suffix_leaves_no_remnants() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd_with_toml(
+        library_cmd_with_toml(
             &username,
             &password,
             &cookie_dir,
@@ -1223,7 +343,7 @@ fn sync_threads_reflected_in_log() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        let assertion = album_cmd_with_toml(
+        let assertion = library_cmd_with_toml(
             &username,
             &password,
             &cookie_dir,
@@ -1260,7 +380,7 @@ fn sync_only_print_filenames_emits_names_without_downloading() {
         // --dry-run makes the test state-independent: kei emits a
         // filename for every album member regardless of what the state
         // DB already considers downloaded.
-        let out = album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        let out = library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--only-print-filenames", "--dry-run"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
@@ -1314,7 +434,7 @@ fn sync_notification_script_fires_event() {
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        album_cmd_with_toml(
+        library_cmd_with_toml(
             &username,
             &password,
             &cookie_dir,
@@ -1355,7 +475,7 @@ fn sync_pid_file_cleaned_up_after_sync() {
         let pid_dir = tempdir().expect("tempdir");
         let pid_file = pid_dir.path().join("test.pid");
 
-        album_cmd_with_toml(
+        library_cmd_with_toml(
             &username,
             &password,
             &cookie_dir,
@@ -1396,7 +516,7 @@ fn sync_explicit_invocation_works() {
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
-        let config_path = album_config(&cookie_dir, download_dir.path(), SyncToml::default());
+        let config_path = library_config(&cookie_dir, download_dir.path(), SyncToml::default());
 
         common::cmd()
             .env("ICLOUD_USERNAME", &username)
@@ -1415,8 +535,8 @@ fn sync_explicit_invocation_works() {
 
         let files = common::walkdir(download_dir.path());
         assert!(
-            files.len() >= 3,
-            "sync invocation should download all test album files, got {}",
+            !files.is_empty(),
+            "sync invocation should download bounded media, got {}",
             files.len()
         );
         for f in &files {
@@ -1432,7 +552,7 @@ fn sync_explicit_invocation_works() {
 #[ignore]
 fn sync_without_directory_fails() {
     let (username, password, cookie_dir) = common::require_preauth();
-    let config_path = common::write_toml_config(&cookie_dir, "sync-live-empty", "");
+    let config_path = common::live_selection::write_live_config(&cookie_dir, "sync-live-empty", "");
 
     common::cmd()
         .env("ICLOUD_USERNAME", &username)
@@ -1462,7 +582,7 @@ fn sync_nonexistent_album_fails() {
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
-        let config_path = album_config(
+        let config_path = library_config(
             &cookie_dir,
             download_dir.path(),
             SyncToml {
@@ -1500,7 +620,8 @@ fn sync_nonexistent_library_fails() {
             "[download]\ndirectory = {}\n[filters]\nlibraries = [\"NonExistentLibrary-ZZZZZ\"]\n",
             common::toml_string(&download_dir.path().to_string_lossy())
         );
-        let config_path = common::write_toml_config(&cookie_dir, "sync-live", &body);
+        let config_path =
+            common::live_selection::write_live_config(&cookie_dir, "sync-live", &body);
 
         common::cmd()
             .env("ICLOUD_USERNAME", &username)
@@ -1555,7 +676,7 @@ fn list_albums_new_syntax() {
             .timeout(Duration::from_secs(60))
             .assert()
             .success()
-            .stdout(predicate::str::contains(album()));
+            .stdout(predicate::str::contains("Library:"));
     });
 }
 
@@ -1589,23 +710,41 @@ fn sync_retry_failed_flag() {
 
 #[test]
 #[ignore]
-fn sync_incremental_second_run_skips_download() {
+fn sync_bounded_second_run_preserves_checkpoint_and_skips_download() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
         // First sync: full enumeration
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
         let first_count = common::walkdir(download_dir.path()).len();
-        assert!(first_count >= 3, "first sync should download files");
+        assert!(first_count > 0, "first sync should download files");
 
-        // Second sync: incremental.
-        let output = album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        let db_path = std::fs::read_dir(cookie_dir.as_path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "db"))
+            .expect("first sync creates the state DB");
+        let db = rusqlite::Connection::open(db_path).unwrap();
+        let token = || {
+            use rusqlite::OptionalExtension;
+            db.query_row(
+                "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        let first_token = token();
+
+        // A bounded partial inventory must not manufacture an incremental token.
+        let output = library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--log-level", "debug"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .output()
@@ -1613,11 +752,22 @@ fn sync_incremental_second_run_skips_download() {
 
         assert!(output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Second run should use incremental sync
+        if first_token.is_some() {
+            assert!(stderr.contains("sync_mode=\"incremental\""), "{stderr}");
+        } else {
+            assert!(
+                stderr.contains("recent_limited_full_enumeration"),
+                "{stderr}"
+            );
+            assert!(token().is_none(), "partial inventory must not checkpoint");
+        }
         assert!(
-            stderr.contains("incremental") || stderr.contains("Stored sync token"),
-            "second run should be incremental, stderr: {stderr}"
+            stderr.contains("No new photos to download")
+                || stderr.contains("All incremental assets already downloaded")
+                || stderr.contains("0 downloaded"),
+            "second run must report no new downloads: {stderr}"
         );
+        assert_eq!(common::walkdir(download_dir.path()).len(), first_count);
     });
 }
 
@@ -1648,7 +798,7 @@ fn sync_watch_runs_multiple_cycles() {
         use std::time::Instant;
 
         let download_dir = tempdir().expect("tempdir");
-        let config_path = album_config(
+        let config_path = library_config(
             &cookie_dir,
             download_dir.path(),
             SyncToml {
@@ -1758,7 +908,7 @@ fn sync_report_json_writes_valid_schema() {
         let report_dir = tempdir().expect("tempdir");
         let report_path = report_dir.path().join("report.json");
 
-        album_cmd_with_toml(
+        library_cmd_with_toml(
             &username,
             &password,
             &cookie_dir,
@@ -1804,21 +954,18 @@ fn sync_recovers_deleted_file() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
         let before = common::walkdir(download_dir.path());
-        assert!(before.len() >= 3, "expected >=3 files after first sync");
+        assert!(!before.is_empty(), "expected media after first sync");
 
-        // Pick a JPEG (stable size/content), record its checksum, delete it.
-        let victim = before
-            .iter()
-            .find(|p| is_image_ext(p) && !is_video_ext(p))
-            .expect("at least one image file")
-            .clone();
-        let expected_size = std::fs::metadata(&victim).unwrap().len();
+        // Select any media format, retain its exact bytes, then delete it.
+        let victim = before.first().expect("at least one media file").clone();
+        let original_bytes = std::fs::read(&victim).unwrap();
+        let expected_size = original_bytes.len() as u64;
         std::fs::remove_file(&victim).expect("delete victim");
         assert!(!victim.exists(), "victim deleted");
 
@@ -1831,7 +978,7 @@ fn sync_recovers_deleted_file() {
         // Captured output is included in the assertion below so an intermittent
         // skip-where-recovery-was-expected leaves a usable trail (data-sacred
         // invariant: a silent skip here means kei "loses" the file).
-        let assert = album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        let assert = library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .env("RUST_LOG", "kei=debug")
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
@@ -1849,6 +996,7 @@ fn sync_recovers_deleted_file() {
             after_size, expected_size,
             "recovered file should match original size"
         );
+        assert_eq!(std::fs::read(&victim).unwrap(), original_bytes);
     });
 }
 
@@ -1865,17 +1013,13 @@ fn sync_truncated_file_does_not_cause_data_loss() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
 
         let files = common::walkdir(download_dir.path());
-        let victim = files
-            .iter()
-            .find(|p| is_image_ext(p) && !is_video_ext(p))
-            .expect("image file")
-            .clone();
+        let victim = files.first().expect("media file").clone();
         let expected_size = std::fs::metadata(&victim).unwrap().len();
         let original_bytes = std::fs::read(&victim).unwrap();
         let parent = victim.parent().unwrap().to_path_buf();
@@ -1896,7 +1040,7 @@ fn sync_truncated_file_does_not_cause_data_loss() {
         // intermittent skip-where-recovery-was-expected leaves a usable
         // trail (data-sacred invariant: zero-byte file must not mask the
         // real photo).
-        let assert = album_cmd(&username, &password, &cookie_dir, download_dir.path())
+        let assert = library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .env("RUST_LOG", "kei=debug")
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
@@ -1955,40 +1099,3 @@ fn zz_bad_credentials_fails() {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
-
-fn is_video_ext(p: &std::path::Path) -> bool {
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    ext == "mp4" || ext == "mov"
-}
-
-fn is_raw_ext(p: &std::path::Path) -> bool {
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    matches!(ext.as_str(), "dng" | "cr2" | "nef")
-}
-
-fn is_image_ext(p: &std::path::Path) -> bool {
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    matches!(
-        ext.as_str(),
-        "jpg" | "jpeg" | "heic" | "png" | "tiff" | "cr2" | "nef" | "dng"
-    )
-}
-
-fn file_name_contains(p: &std::path::Path, pattern: &str) -> bool {
-    p.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .contains(pattern)
-}

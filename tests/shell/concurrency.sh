@@ -29,10 +29,7 @@ kei_sync() {
     shift
     local config
     config="$(kei_write_sync_config "$COOKIES" "$download_dir")"
-    # `--unfiled false` keeps the suite scoped to the test album. v0.13's
-    # default `--unfiled true` would also enumerate every unfiled photo in
-    # the live account on every concurrency-test sync, blowing wall time
-    # past the suite's expected cadence.
+    # Shared single-pass primary-library selection bounds provider work.
     KEI_DATA_DIR="$COOKIES" "$KEI" sync \
         --password "$ICLOUD_PASSWORD" \
         --config "$config" \
@@ -48,7 +45,7 @@ reset_sync_state() {
     kei_db_exec "DELETE FROM assets"
 }
 
-kei_suite_banner "CONCURRENCY / RESUME / PARTIAL-FAILURE"
+kei_suite_banner "CONCURRENCY / RESUME"
 
 echo ""
 echo "--- Pre-flight ---"
@@ -81,15 +78,15 @@ kei_check "no duplicate DB entries"
 
 # Every file on disk must have a matching DB entry.
 ORPHANS=0
-while read -r f; do
+while IFS= read -r -d '' f; do
     [ -z "$f" ] && continue
     basename=$(basename "$f")
-    in_db=$(kei_db_query "SELECT COUNT(*) FROM assets WHERE filename='$basename' AND status='downloaded'")
+    in_db=$(kei_db_query "SELECT COUNT(*) FROM assets WHERE local_path=$(kei_sql_string "$f") AND status='downloaded'")
     if [ "$in_db" -eq 0 ]; then
         echo "  ORPHAN: $basename not in state DB"
         ORPHANS=$((ORPHANS + 1))
     fi
-done < <(find "$DIR1" -type f)
+done < <(find "$DIR1" -type f -print0)
 [ "$ORPHANS" -eq 0 ]
 kei_check "no orphan files (all tracked in DB)"
 rm -rf "$DIR1"
@@ -128,34 +125,8 @@ kei_check "all files complete after resume"
 kei_check "no .kei-tmp files remain"
 rm -rf "$DIR2"
 
-# ══════════════════════════════════════════════════════════════════════════
-# 3. Exit code 2 (partial sync failure)
-# ══════════════════════════════════════════════════════════════════════════
-echo ""
-echo "=== 3. Exit code 2 (partial failure) ==="
-DIR3=$(kei_scratch_dir partial-fail)
-reset_sync_state
-
-# Force one of the test album's files to land in a read-only directory.
-# Album passes default to `{album}/` since the per-category template
-# refactor (PR #288), so we explicitly request a date hierarchy and
-# pre-create one date dir as read-only. GOPR0558.JPG in kei-test
-# is dated 2019-11-09; making that path 555 makes its write fail while
-# the other dates succeed.
-mkdir -p "$DIR3/2019/11/09"
-chmod 555 "$DIR3/2019/11/09" "$DIR3/2019/11" "$DIR3/2019"
-
-KEI_SYNC_DOWNLOAD_TOML=$'threads = 1\nfolder_structure_albums = "%Y/%m/%d"\n' kei_sync "$DIR3"
-EC=$?
-echo "  Exit code: $EC"
-
-DOWNLOADED=$(find "$DIR3" -type f 2>/dev/null | wc -l | tr -d ' ')
-DB_FAILED=$(kei_db_query "SELECT COUNT(*) FROM assets WHERE status='failed'")
-echo "  Files downloaded: $DOWNLOADED, DB failed: $DB_FAILED"
-
-chmod -R 755 "$DIR3" 2>/dev/null
-[ "$EC" -eq 2 ]
-kei_check "exit code 2 (partial failure)"
-rm -rf "$DIR3"
+# Partial failure and exit-code mapping are deterministic fixture/library tests:
+# bundled_partial_failure_recovers_after_restart and
+# classify_exit_error_partial_sync_uses_exit_partial.
 
 kei_check_summary "CONCURRENCY RESULTS"

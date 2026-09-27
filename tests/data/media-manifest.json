@@ -165,6 +165,18 @@
       "license_file": "../../LICENSE",
       "coverage": "existing HEIF XMP replacement and ownership regression tests",
       "source_url": "https://github.com/rhoopr/kei/blob/a4e89dfd73d04028ad357a9c9a487aa39df6824c/fuzz/seeds/heif_rewrite/conflicting-tmap-xmp"
+    },
+    {
+      "path": "media/icloud-still.heic",
+      "bytes": 2218151,
+      "sha256": "7aaa1d5f87a58ea68827b9e5e0798a92b7ad128d26d05e6163304fdd6fef8ca0",
+      "origin": "Shared iCloud Photos download; maintainer-selected sunset; sanitized",
+      "license": "MIT",
+      "license_file": "LICENSE-icloud-media",
+      "recipe": "scripts/fixtures/sanitize_icloud_still.py",
+      "source_sha256": "57b8560b2abd3e49ecfbf73d9eb1a8ca453ab161966ec06124cf46698b6d86c9",
+      "permission": "Maintainer confirmed ownership and authorized MIT redistribution on 2026-09-27",
+      "coverage": "iCloud-delivered Apple HEIC with auxiliary images and HDR metadata; transfer, XMP rewrite and non-XMP item preservation"
     }
   ]
 }
