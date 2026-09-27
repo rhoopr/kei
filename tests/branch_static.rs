@@ -2366,3 +2366,31 @@ fn live_shell_sql_quotes_arbitrary_media_paths() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn docker_album_listing_drains_output_under_pipefail() {
+    let script = repo_file("tests/shell/docker.sh");
+    let section = script
+        .split_once("echo \"--- 9. List albums in container ---\"")
+        .unwrap()
+        .1;
+    let pipeline = section.split_once("kei_check").unwrap().0;
+    assert!(pipeline.contains("grep -F \"Library:\" >/dev/null"));
+    let early_close = pipeline.replace("grep -F \"Library:\" >/dev/null", "grep -qF \"Library:\"");
+    for (pipeline, success) in [(pipeline, true), (early_close.as_str(), false)] {
+        let command = format!(
+            "set -o pipefail\ndocker() {{ printf 'Library: controlled\\n'; printf 'album %s\\n' {{1..10000}}; }}\n{pipeline}"
+        );
+        let output = Command::new("bash")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

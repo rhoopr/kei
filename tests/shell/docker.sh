@@ -177,7 +177,7 @@ docker run --rm \
     -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" list albums \
-    2>&1 | grep -qF "Library:"
+    2>&1 | grep -F "Library:" >/dev/null
 kei_check "list-albums shows library output"
 
 echo ""
