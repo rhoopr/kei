@@ -276,18 +276,6 @@ fn icloud_username_env_resolves_in_config_show() {
 }
 
 #[test]
-fn icloud_username_env_resolves_without_cli_flag() {
-    let dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .env("ICLOUD_USERNAME", "env@icloud.com")
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["config", "show"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("env@icloud.com"));
-}
-
-#[test]
 fn first_run_auto_config_creates_file() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");

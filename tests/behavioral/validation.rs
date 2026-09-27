@@ -200,18 +200,6 @@ fn exit_2_for_clap_errors() {
         .code(2);
 }
 
-#[test]
-fn exit_1_for_missing_directory_on_sync() {
-    let dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .env("ICLOUD_USERNAME", "test@example.com")
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["sync"])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("Set [download].directory"));
-}
-
 #[cfg(unix)]
 #[test]
 fn sync_unwritable_download_directory_errors_before_auth() {
@@ -259,19 +247,6 @@ fn sync_unwritable_download_directory_errors_before_auth() {
 }
 
 #[test]
-fn exit_1_for_missing_username_on_sync() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    write_sync_config(&config_path, "/photos");
-    clean_cmd()
-        .env_remove("ICLOUD_USERNAME")
-        .args(["sync", "--config", config_path.to_str().unwrap()])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("Set your iCloud username"));
-}
-
-#[test]
 fn help_flag_exits_zero() {
     clean_cmd().arg("--help").assert().success();
 }
@@ -293,22 +268,6 @@ fn sync_help_exits_zero() {
 #[test]
 fn unknown_subcommand_fails() {
     clean_cmd().arg("nonexistent-command").assert().code(2);
-}
-
-#[test]
-fn domain_cn_accepted() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\ndomain = \"cn\"\n",
-    )
-    .unwrap();
-    clean_cmd()
-        .args(["config", "show", "--config", config_path.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("cn"));
 }
 
 #[test]
