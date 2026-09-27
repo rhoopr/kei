@@ -394,8 +394,8 @@ mod tests {
     #[test]
     fn fuzz_seeds_reach_existing_xmp_replacement_paths() {
         const MARKER: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>3</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
-        let fits = include_bytes!("../../../fuzz/seeds/heif_rewrite/replacement-fits");
-        let grows = include_bytes!("../../../fuzz/seeds/heif_rewrite/replacement-grows");
+        let fits = include_bytes!("../../../tests/data/heif-rewrite/replacement-fits");
+        let grows = include_bytes!("../../../tests/data/heif-rewrite/replacement-grows");
 
         let mut replaced_in_place = Vec::new();
         rewrite_xmp(fits, MARKER, &mut replaced_in_place).expect("fitting replacement seed");
@@ -414,7 +414,7 @@ mod tests {
 
         // The fuzzer will not synthesise a valid multi-image item map on its
         // own, so selection stays unreachable without a seed carrying one.
-        let multi = include_bytes!("../../../fuzz/seeds/heif_rewrite/multi-xmp");
+        let multi = include_bytes!("../../../tests/data/heif-rewrite/multi-xmp");
         assert_eq!(
             extract_xmp_raw(multi).as_deref(),
             Some(PRIMARY_XMP),
@@ -423,7 +423,7 @@ mod tests {
         #[cfg(feature = "__fuzz_internals")]
         fuzz_rewrite_xmp_preserves(multi);
 
-        let conflicting = include_bytes!("../../../fuzz/seeds/heif_rewrite/conflicting-tmap-xmp");
+        let conflicting = include_bytes!("../../../tests/data/heif-rewrite/conflicting-tmap-xmp");
         let mut rejected = Vec::new();
         assert!(rewrite_xmp(conflicting, MARKER, &mut rejected).is_err());
         assert!(
@@ -438,7 +438,7 @@ mod tests {
     fn rewrite_xmp_appends_when_existing_extent_includes_mdat_header() {
         const MARKER: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>3</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
         let mut input =
-            include_bytes!("../../../fuzz/seeds/heif_rewrite/replacement-fits").to_vec();
+            include_bytes!("../../../tests/data/heif-rewrite/replacement-fits").to_vec();
         let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(&input).unwrap();
         let (location, xmp_item_id, _, _, _, _, _) =
             locate_xmp(&input, iinf, iloc, iref, primary_item_id).unwrap();

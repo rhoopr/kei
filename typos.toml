@@ -22,3 +22,10 @@ Nd = "Nd"
 # The `mis-` prefix (mis-routing, mis-attributed, mis-directed) is grammatical
 # English; typos wants to "fix" it to `miss`/`mist`. Suppress those matches.
 extend-ignore-re = ["\\bmis-\\w+"]
+
+[type.cc-by-2]
+extend-glob = ["LICENSE-osxphotos-media"]
+
+[type.cc-by-2.extend-words]
+# Preserve the spelling in the verbatim upstream CC BY 2.0 legal text.
+MERCHANTIBILITY = "MERCHANTIBILITY"

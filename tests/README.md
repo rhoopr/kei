@@ -193,6 +193,10 @@ cargo test --all-features --test sync --test state_auth -- --ignored --test-thre
 
 ## Media fixtures
 
+The [fixture corpus guide](data/README.md) records the selected formats,
+provenance, sanitization, independent encoders, SHA-256 manifest, size budget,
+production-path tests, and extracted-source-package checks.
+
 `tests/data/` holds real camera and encoder outputs, not hand-built containers,
 so metadata writers are exercised against independently produced item maps.
 

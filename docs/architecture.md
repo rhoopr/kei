@@ -928,6 +928,11 @@ Stable IDs connect safety rules to production owners and focused tests.
 - Unit tests live near their owner module.
 - Cross-module and binary behavior lives under `tests/`.
 - Live iCloud tests are ignored by default and run single-threaded.
+- `tests/data/media-manifest.json` owns the bundled media inventory and size
+  budget. `download::orchestration::fixture_tests` exercises these bytes
+  through enumeration, planning, download, publication, and reopened SQLite.
+  `scripts/fixtures/` owns maintainer-only generation and sanitization and
+  the optimized extracted-source-package check. Tests do not fetch media.
 - Shell suites cover crash, concurrency, state-machine, and container behavior.
 - Fuzz targets cover parser and metadata trust boundaries.
 - `justfile` owns local script and workflow lint commands. Protected CI runs

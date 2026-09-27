@@ -284,6 +284,7 @@ test MODE="" *ARGS="":
         packaging|package)
             cargo build --release
             scripts/full-test/run_release_archive_smoke.sh
+            bash scripts/fixtures/check-package.sh
             ;;
         docker-full)
             run_docker_full
