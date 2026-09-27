@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::process::Command;
 #[cfg(target_os = "linux")]
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn repo_file(path: &str) -> String {
     let mut full = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1902,23 +1904,26 @@ fn live_import_smoke_uses_toml_directory() {
 fn live_import_rehearsal_uses_shared_bounded_selection() {
     let rehearsal = repo_file("scripts/full-test/run_live_import_rehearsal.sh");
     assert!(rehearsal.contains("recent=$(kei_live_recent)"));
-    let output = Command::new("bash")
-        .args([
-            "-c",
-            r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_live_recent"#,
-        ])
-        .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let selection: toml::Table = repo_file("tests/data/live-selection.toml").parse().unwrap();
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        selection["filters"]["recent"]
-            .as_integer()
-            .unwrap()
-            .to_string()
-    );
+    #[cfg(unix)]
+    {
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_live_recent"#,
+            ])
+            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let selection: toml::Table = repo_file("tests/data/live-selection.toml").parse().unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            selection["filters"]["recent"]
+                .as_integer()
+                .unwrap()
+                .to_string()
+        );
+    }
 
     assert!(
         rehearsal.contains("sync --no-progress-bar --config")
