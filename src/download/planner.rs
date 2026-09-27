@@ -38,6 +38,7 @@ struct ReconciliationPlanning {
     path_contents: FxHashMap<NormalizedPath, FxHashSet<Option<ReconciliationContent>>>,
     reservations: Vec<ReconciliationReservation>,
     durable_destinations: FxHashSet<NormalizedPath>,
+    downloaded_paths: FxHashMap<ReconciliationOwner, Vec<crate::state::DownloadedFileRecord>>,
 }
 
 /// Mutable path-planning state carried across assets in one pass.
@@ -117,19 +118,131 @@ impl TaskPlanner {
         Ok(planner)
     }
 
-    /// Preserve ordinary download behavior until reconciliation has reserved paths.
+    /// Load publication receipts without treating historical paths as new destinations.
     pub(super) async fn for_download(db: Option<&dyn DownloadStore>) -> Result<Self> {
         let Some(db) = db else {
             return Ok(Self::new());
         };
         let reservations = db.get_reconciliation_reservations().await?;
-        if reservations.is_empty() {
-            return Ok(Self::new());
+        let catalog = match db.get_reconciliation_catalog_paths().await {
+            Ok(catalog) => catalog,
+            Err(error) if reservations.is_empty() => {
+                tracing::warn!(%error, "Could not load publication ownership; recorded path reuse disabled");
+                return Ok(Self::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut planner = if reservations.is_empty() {
+            let mut planner = Self::new();
+            for record in catalog {
+                planner
+                    .reconciliation
+                    .path_owners
+                    .entry(PathPlanningMode::Reconciliation.key(&record.path)?)
+                    .or_default()
+                    .insert(ReconciliationOwner {
+                        library: record.library,
+                        asset_id: record.asset_id,
+                        version_size: record.version_size,
+                    });
+            }
+            planner
+        } else {
+            let mut planner = Self::for_reconciliation(catalog, reservations)?;
+            planner.path_mode = PathPlanningMode::ReservedDownload;
+            planner
+        };
+        let records = match db.get_downloaded_path_records().await {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error, "Could not load publication receipts; recorded path reuse disabled");
+                return Ok(planner);
+            }
+        };
+        for record in records {
+            planner
+                .reconciliation
+                .downloaded_paths
+                .entry(ReconciliationOwner {
+                    library: Arc::from(record.library.as_str()),
+                    asset_id: record.id.as_str().into(),
+                    version_size: record.version_size,
+                })
+                .or_default()
+                .push(record);
         }
-        let mut planner =
-            Self::for_reconciliation(db.get_reconciliation_catalog_paths().await?, reservations)?;
-        planner.path_mode = PathPlanningMode::ReservedDownload;
         Ok(planner)
+    }
+
+    /// Accept only a current-content receipt in this pass's filename family.
+    /// Additional copies and legacy numbered companions require exact local hashes.
+    pub(super) async fn verified_downloaded_path(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        version_size: VersionSizeKey,
+    ) -> Option<std::path::PathBuf> {
+        let owner = ReconciliationOwner {
+            library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
+            asset_id: asset.state_id().into(),
+            version_size,
+        };
+        let records = self.reconciliation.downloaded_paths.get(&owner)?;
+        let derived_paths = super::filter::derive_expected_paths(asset, config);
+        let derived = derived_paths
+            .iter()
+            .find(|path| path.version_size == version_size)?;
+        for record in records {
+            let (Some(path), Some(checksum)) = (&record.local_path, &record.local_checksum) else {
+                continue;
+            };
+            if record.checksum != derived.checksum.as_ref()
+                || !super::filter::stored_path_matches_download_family(
+                    asset.state_id(),
+                    derived,
+                    &derived_paths,
+                    config,
+                    path,
+                )
+                || !self.retry_path_allowed(
+                    &owner.library,
+                    &owner.asset_id,
+                    version_size,
+                    &derived.checksum,
+                    derived.size,
+                    path,
+                )
+            {
+                continue;
+            }
+            let Ok(key) = PathPlanningMode::Reconciliation.key(path) else {
+                continue;
+            };
+            if self
+                .reconciliation
+                .path_owners
+                .get(&key)
+                .is_none_or(|owners| owners.iter().any(|other| other != &owner))
+            {
+                continue;
+            }
+            let Ok(fingerprint) =
+                super::file::fingerprint_downloaded_path(&config.directory, path).await
+            else {
+                continue;
+            };
+            if data_encoding::HEXLOWER.encode(&fingerprint.sha256) != *checksum {
+                continue;
+            }
+            let metadata_changed_size = record
+                .download_checksum
+                .as_ref()
+                .is_some_and(|downloaded| downloaded != checksum);
+            if fingerprint.size == derived.size || metadata_changed_size {
+                return Some(path.clone());
+            }
+        }
+        None
     }
 
     pub(super) async fn plan_download_asset(
@@ -138,11 +251,46 @@ impl TaskPlanner {
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
         self.reconciliation.reservations.clear();
+        let derived = super::filter::derive_expected_paths(asset, config);
+        let primary_path = if derived
+            .iter()
+            .any(|path| path.version_size.is_live_photo_motion())
+        {
+            if let Some(primary) = derived
+                .iter()
+                .find(|path| path.version_size.is_primary_media())
+            {
+                self.verified_downloaded_path(asset, config, primary.version_size)
+                    .await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let primary_filename = primary_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str());
         match self.path_mode {
-            PathPlanningMode::Download => Ok(self.plan_asset(asset, config).await),
+            PathPlanningMode::Download if primary_filename.is_none() => {
+                Ok(self.plan_asset(asset, config).await)
+            }
+            PathPlanningMode::Download => {
+                self.plan_asset_with_mode(
+                    asset,
+                    config,
+                    PathPlanningMode::Download,
+                    primary_filename,
+                )
+                .await
+            }
             // Adoption verifies existing files separately. Reuse the
             // ownership-aware plan, including exact saved destination choices.
-            mode => self.plan_owned_asset(asset, config, mode).await,
+            mode => {
+                self.plan_owned_asset(asset, config, mode, primary_filename)
+                    .await
+            }
         }
     }
 
@@ -302,7 +450,7 @@ impl TaskPlanner {
             clippy::expect_used,
             reason = "ordinary download keys never perform fallible path resolution"
         )]
-        self.plan_asset_with_mode(asset, config, PathPlanningMode::Download)
+        self.plan_asset_with_mode(asset, config, PathPlanningMode::Download, None)
             .await
             .expect("ordinary download planning uses infallible spelling-only path keys")
     }
@@ -312,7 +460,7 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
-        self.plan_owned_asset(asset, config, PathPlanningMode::Reconciliation)
+        self.plan_owned_asset(asset, config, PathPlanningMode::Reconciliation, None)
             .await
     }
 
@@ -321,6 +469,7 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
         mode: PathPlanningMode,
+        primary_filename: Option<&str>,
     ) -> Result<AssetTaskPlan> {
         let expected = super::filter::expected_paths_for(asset, config);
         let library = asset
@@ -354,7 +503,7 @@ impl TaskPlanner {
             owned.insert(owner, claims);
         }
         let plan = self
-            .plan_asset_with_mode(asset, config, mode)
+            .plan_asset_with_mode(asset, config, mode, primary_filename)
             .await
             .and_then(|mut plan| {
                 for task in &mut plan.tasks {
@@ -445,6 +594,7 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
         planning_mode: PathPlanningMode,
+        primary_filename: Option<&str>,
     ) -> Result<AssetTaskPlan> {
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
             return Ok(AssetTaskPlan {
@@ -455,13 +605,24 @@ impl TaskPlanner {
         }
 
         pre_ensure_asset_dir(&mut self.dir_cache, asset, config).await;
-        let tasks = filter_asset_to_tasks(
-            asset,
-            config,
-            &mut self.claimed_paths,
-            &mut self.dir_cache,
-            planning_mode,
-        )?;
+        let tasks = if primary_filename.is_some() {
+            super::filter::filter_asset_to_tasks_with_primary(
+                asset,
+                config,
+                &mut self.claimed_paths,
+                &mut self.dir_cache,
+                planning_mode,
+                primary_filename,
+            )?
+        } else {
+            filter_asset_to_tasks(
+                asset,
+                config,
+                &mut self.claimed_paths,
+                &mut self.dir_cache,
+                planning_mode,
+            )?
+        };
         let malformed_resource = if tasks.is_empty() {
             super::filter::malformed_no_task_resource(asset, config)
         } else {
@@ -515,7 +676,9 @@ impl TaskPlanner {
             path,
         ) && self.path_mode.key(path).is_ok_and(|key| {
             !self.claimed_paths.contains_key(&key)
-                || self.reconciliation.path_owners.contains_key(&key)
+                // Ordinary catalog receipts must not release another in-flight claim.
+                || (!matches!(self.path_mode, PathPlanningMode::Download)
+                    && self.reconciliation.path_owners.contains_key(&key))
         })
     }
 
@@ -804,6 +967,28 @@ mod tests {
         config.folder_structure = "%Y/%m/%d".to_string();
         config.folder_structure_albums = Arc::from("{album}/%Y/%m/%d");
         config
+    }
+
+    #[tokio::test]
+    async fn ordinary_catalog_receipt_does_not_release_in_flight_claim() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let asset = TestPhotoAsset::new("CLAIMED").build();
+        let mut planner = TaskPlanner::new();
+        let plan = planner.plan_asset(&asset, &config).await;
+        let task = plan.tasks.first().expect("fixture must plan a download");
+        assert!(!planner.retry_claim_available(task, &task.download_path));
+        planner.reconciliation.path_owners.insert(
+            PathPlanningMode::Reconciliation
+                .key(&task.download_path)
+                .unwrap(),
+            FxHashSet::from_iter([ReconciliationOwner {
+                library: Arc::clone(&task.library),
+                asset_id: task.asset_id.as_ref().into(),
+                version_size: task.version_size,
+            }]),
+        );
+        assert!(!planner.retry_claim_available(task, &task.download_path));
     }
 
     fn make_pass(kind: PassKind, name: &str) -> AlbumPass {

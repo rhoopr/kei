@@ -226,6 +226,16 @@ the catalog still records the previous source. Dry runs and filename listings
 do not commit choices. Recorded retry paths follow the same ownership checks. Explicit truncated-file repair can still use its own path
 when the existing fingerprint and repair authorization pass.
 
+Download planning also loads current-content publication receipts from
+`asset_metadata_paths`. An additional album copy can satisfy a download only
+in that pass's destination and filename family. The planner rejects foreign
+catalog ownership, opens the file without following links, and checks its
+local SHA-256. Old provider generations cannot satisfy current downloads.
+These checks do not move the catalog's current path or change retry receipts.
+Live Photo planning uses a verified still filename for new companions. Existing
+companions with older numbered still stems remain usable after the same checks;
+Kei does not rename or delete them.
+
 Local path reconciliation opens source and destination leaf entries without
 following symlinks. It hashes the opened file and rechecks its identity before
 accepting a destination, including entries that appear during publication.
