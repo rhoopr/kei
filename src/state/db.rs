@@ -254,6 +254,8 @@ pub struct ImportedRecord {
 /// Compact downloaded-state projection used to preload sync decisions.
 #[derive(Debug)]
 pub(crate) struct DownloadedFileRecord {
+    /// This receipt is also the catalog's current path, not an additional copy.
+    pub(crate) is_current_path: bool,
     pub(crate) library: String,
     pub(crate) id: String,
     pub(crate) version_size: VersionSizeKey,
@@ -3349,6 +3351,7 @@ impl SqliteStateDb {
                 let version_size: String = row.get(2)?;
                 let local_path: Option<String> = row.get(4)?;
                 Ok(DownloadedFileRecord {
+                    is_current_path: true,
                     library: row.get(0)?,
                     id: row.get(1)?,
                     version_size: VersionSizeKey::from_str(&version_size)
@@ -6418,7 +6421,7 @@ impl DownloadContextStateStore for SqliteStateDb {
         self.with_conn("get_downloaded_path_records", |conn| {
             let mut statement = conn.prepare_cached(
                 "SELECT p.library, p.id, p.version_size, p.provider_checksum, p.local_path, \
-                        p.local_checksum, p.download_checksum \
+                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path) \
                  FROM asset_metadata_paths p JOIN assets a \
                    ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
                  WHERE a.status = 'downloaded' AND a.is_deleted = 0 \
@@ -6427,6 +6430,7 @@ impl DownloadContextStateStore for SqliteStateDb {
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DownloadedFileRecord {
+                    is_current_path: row.get(7)?,
                     library: row.get(0)?,
                     id: row.get(1)?,
                     version_size: VersionSizeKey::from_str(&row.get::<_, String>(2)?)

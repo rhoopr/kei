@@ -232,8 +232,12 @@ in that pass's destination and filename family. The planner rejects foreign
 catalog ownership, opens the file without following links, and checks its
 local SHA-256. Old provider generations cannot satisfy current downloads.
 These checks do not move the catalog's current path or change retry receipts.
-Live Photo planning uses a verified still filename for new companions. Existing
-companions with older numbered still stems remain usable after the same checks;
+Without reconciliation reservations, an unsafe historical path disables optional
+receipt reuse for that pass instead of blocking ordinary downloads. Reserved
+paths retain strict validation. Live Photo planning applies filters before file
+checks and does not hash the still when same-size current companions satisfy
+the existing skip rules. New companions use a verified still filename. Existing
+companions with older numbered still stems remain usable after hash verification;
 Kei does not rename or delete them.
 
 Local path reconciliation opens source and destination leaf entries without

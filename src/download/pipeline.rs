@@ -10205,6 +10205,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_parent_receipt_does_not_block_current_download_pass() {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let asset = TestPhotoAsset::new("CURRENT").orig_size(2000).build();
+        let legacy = TestPhotoAsset::new("LEGACY").build();
+        record_downloaded_test_version(
+            &db,
+            &legacy,
+            VersionSizeKey::Original,
+            "legacy",
+            2000,
+            &dir.path().join("old/../OLD.JPG"),
+        )
+        .await;
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let derived = derive_expected_paths(&asset, &config);
+        let current = &derived[0];
+        fs::create_dir_all(current.path.parent().unwrap()).unwrap();
+        let bytes = vec![1u8; 2000];
+        fs::write(&current.path, &bytes).unwrap();
+        record_verified_test_version(
+            &db,
+            &asset,
+            current.version_size,
+            &current.checksum,
+            &bytes,
+            &current.path,
+        )
+        .await;
+        let planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+        assert!(
+            planner
+                .verified_downloaded_path(&asset, &config, current.version_size)
+                .await
+                .is_none(),
+            "an incomplete ownership index must disable all receipt reuse"
+        );
+        for _ in 0..2 {
+            let result = stream_and_download_from_stream(
+                &reqwest::Client::new(),
+                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+                &Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.state_write_failures, 0);
+            assert_eq!(result.skip_summary.on_disk, 1);
+            assert_eq!(result.downloaded, 0);
+            assert!(result.failed.is_empty());
+            assert_eq!(fs::read(&current.path).unwrap(), bytes);
+            assert_eq!(
+                fs::read_dir(current.path.parent().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn numbered_live_photo_paths_remain_stable_across_restart() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};

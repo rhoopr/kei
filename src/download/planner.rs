@@ -39,6 +39,8 @@ struct ReconciliationPlanning {
     reservations: Vec<ReconciliationReservation>,
     durable_destinations: FxHashSet<NormalizedPath>,
     downloaded_paths: FxHashMap<ReconciliationOwner, Vec<crate::state::DownloadedFileRecord>>,
+    #[cfg(test)]
+    receipt_file_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// Mutable path-planning state carried across assets in one pass.
@@ -135,10 +137,16 @@ impl TaskPlanner {
         let mut planner = if reservations.is_empty() {
             let mut planner = Self::new();
             for record in catalog {
+                let Ok(key) = PathPlanningMode::Reconciliation.key(&record.path) else {
+                    tracing::warn!(
+                        "Could not index publication ownership; recorded path reuse disabled"
+                    );
+                    return Ok(Self::new());
+                };
                 planner
                     .reconciliation
                     .path_owners
-                    .entry(PathPlanningMode::Reconciliation.key(&record.path)?)
+                    .entry(key)
                     .or_default()
                     .insert(ReconciliationOwner {
                         library: record.library,
@@ -226,6 +234,10 @@ impl TaskPlanner {
             {
                 continue;
             }
+            #[cfg(test)]
+            self.reconciliation
+                .receipt_file_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let Ok(fingerprint) =
                 super::file::fingerprint_downloaded_path(&config.directory, path).await
             else {
@@ -245,16 +257,80 @@ impl TaskPlanner {
         None
     }
 
+    /// Only suppress still-name lookup; the pipeline still owns the media skip.
+    /// Additional copies and numbered legacy companions retain hash verification.
+    async fn current_motion_paths_exist(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        derived_paths: &[super::filter::DerivedPath],
+    ) -> bool {
+        for derived in derived_paths
+            .iter()
+            .filter(|path| path.version_size.is_live_photo_motion())
+        {
+            let owner = ReconciliationOwner {
+                library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
+                asset_id: asset.state_id().into(),
+                version_size: derived.version_size,
+            };
+            let Some(record) = self
+                .reconciliation
+                .downloaded_paths
+                .get(&owner)
+                .and_then(|records| records.iter().find(|record| record.is_current_path))
+            else {
+                return false;
+            };
+            let Some(path) = &record.local_path else {
+                return false;
+            };
+            if record.checksum != derived.checksum.as_ref()
+                || !super::filter::stored_path_matches_current_collision_family(
+                    asset.state_id(),
+                    derived,
+                    derived_paths,
+                    config,
+                    path,
+                )
+                || !self.retry_path_allowed(
+                    &owner.library,
+                    &owner.asset_id,
+                    owner.version_size,
+                    &derived.checksum,
+                    derived.size,
+                    path,
+                )
+                || !tokio::fs::symlink_metadata(path)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_file() && metadata.len() == derived.size)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(super) async fn plan_download_asset(
         &mut self,
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
         self.reconciliation.reservations.clear();
+        if let Some(filter_reason) = is_asset_filtered(asset, config) {
+            return Ok(AssetTaskPlan {
+                tasks: Vec::new(),
+                filter_reason: Some(filter_reason),
+                malformed_resource: None,
+            });
+        }
         let derived = super::filter::derive_expected_paths(asset, config);
         let primary_path = if derived
             .iter()
             .any(|path| path.version_size.is_live_photo_motion())
+            && !self
+                .current_motion_paths_exist(asset, config, &derived)
+                .await
         {
             if let Some(primary) = derived
                 .iter()
@@ -967,6 +1043,96 @@ mod tests {
         config.folder_structure = "%Y/%m/%d".to_string();
         config.folder_structure_albums = Arc::from("{album}/%Y/%m/%d");
         config
+    }
+
+    #[tokio::test]
+    async fn current_live_photo_and_filtered_assets_do_not_read_receipts() {
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::Ordering;
+        let dir = TempDir::new().unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let bytes = vec![1u8; 4096];
+        let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes));
+        let asset = TestPhotoAsset::new("STEADY_LIVE")
+            .filename("PHOTO.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(bytes.len() as u64)
+            .orig_checksum("still")
+            .live_photo(
+                "https://p01.icloud-content.com/motion",
+                "motion",
+                bytes.len() as u64,
+            )
+            .build();
+        let mut config = test_config(dir.path());
+        let derived = super::super::filter::derive_expected_paths(&asset, &config);
+        for path in &derived {
+            std::fs::create_dir_all(path.path.parent().unwrap()).unwrap();
+            std::fs::write(&path.path, &bytes).unwrap();
+            let record = crate::test_helpers::TestAssetRecord::new(asset.id())
+                .version_size(path.version_size)
+                .checksum(&path.checksum)
+                .filename(&path.filename)
+                .size(path.size)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                asset.id(),
+                path.version_size.as_str(),
+                &path.path,
+                &hash,
+                Some(&hash),
+            )
+            .await
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+            planner.plan_download_asset(&asset, &config).await.unwrap();
+            assert_eq!(
+                planner
+                    .reconciliation
+                    .receipt_file_reads
+                    .load(Ordering::Relaxed),
+                0
+            );
+        }
+        let motion = derived
+            .iter()
+            .find(|path| path.version_size.is_live_photo_motion())
+            .unwrap();
+        std::fs::remove_file(&motion.path).unwrap();
+        config.filename_exclude = vec![glob::Pattern::new("*").unwrap()].into();
+        let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+        let filtered = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert!(matches!(
+            filtered.filter_reason,
+            Some(FilterReason::Filename)
+        ));
+        assert_eq!(
+            planner
+                .reconciliation
+                .receipt_file_reads
+                .load(Ordering::Relaxed),
+            0
+        );
+        config.filename_exclude = Arc::from([]);
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_eq!(
+            planner
+                .reconciliation
+                .receipt_file_reads
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            plan.tasks
+                .iter()
+                .any(|task| task.version_size == motion.version_size
+                    && task.download_path == motion.path)
+        );
     }
 
     #[tokio::test]
