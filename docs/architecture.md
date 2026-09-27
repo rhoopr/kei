@@ -320,6 +320,13 @@ Successful responses are serialized from parsed JSON without pretty-printing.
 Writes are best-effort, with no run subfolder or cleanup.
 Release builds without debug assertions do not include this diagnostic code.
 
+A signed URL expiry stops the current full-download batch. The pipeline retains
+failed tasks and makes one cleanup attempt through targeted asset and master
+lookups. It does not enumerate albums again to refresh those URLs. Only exact
+asset, rendition, and destination matches can enter cleanup. Missing lookups,
+a second expiry, and cancelled tasks retain durable retry work. Successful
+cleanup does not convert incomplete enumeration into checkpoint proof.
+
 Full enumeration streams records/query results and gathers a provider token
 from every active pass. Natural stream completion and usable, unanimous pass
 tokens are the authoritative proof. Count probes and pagination differences
@@ -575,7 +582,11 @@ and pending repair state. A normal sync hydrates stale downloaded rows in
 bounded provider-lookup batches, independent of album, media, and date filters.
 Only an identity that cannot be resolved from durable asset/master evidence
 uses the bounded legacy hydration path. Unselected libraries keep separate
-pending state and do not force work in selected libraries.
+pending state and do not force work in selected libraries. The legacy missing-hash
+fallback checks only the selected library. While revision repair has pending
+work, it owns that backlog instead of forcing a second full enumeration.
+Ambiguous provider children remain pending and block the affected checkpoint;
+a matching rendition alone does not prove which child owns the metadata.
 
 Automatic repair processes at most 500 stale assets per library in one sync
 cycle. When a clean batch makes progress and work remains, watch and service

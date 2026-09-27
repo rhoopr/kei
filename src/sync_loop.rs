@@ -3975,11 +3975,12 @@ mod tests {
     fn make_one_photo_incremental_album_for_zone(
         zone: &str,
         zone_sync_token: &str,
+        download_url: &str,
     ) -> crate::icloud::photos::PhotoAlbum {
         make_one_photo_incremental_album_with_download(
             zone,
             zone_sync_token,
-            "https://p01.icloud-content.com/photo.jpg",
+            download_url,
             1024,
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         )
@@ -6023,8 +6024,11 @@ mod tests {
 
         async fn has_downloaded_without_metadata_hash(
             &self,
+            library: &str,
         ) -> Result<bool, state::error::StateError> {
-            self.inner.has_downloaded_without_metadata_hash().await
+            self.inner
+                .has_downloaded_without_metadata_hash(library)
+                .await
         }
 
         async fn begin_metadata_capture_revision(
@@ -11338,6 +11342,16 @@ mod tests {
 
     #[tokio::test]
     async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/cancelled.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 1024]))
+            .expect(0)
+            .mount(&server)
+            .await;
         let config = make_run_cycle_config();
         let inner = make_state_db();
         inner
@@ -11355,7 +11369,11 @@ mod tests {
         let lib_state = make_run_cycle_library_state_with_album(
             "PrimarySync",
             "sync_token:PrimarySync",
-            make_one_photo_incremental_album_for_zone("PrimarySync", "zone-tok-new"),
+            make_one_photo_incremental_album_for_zone(
+                "PrimarySync",
+                "zone-tok-new",
+                &format!("{}/cancelled.jpg", server.uri()),
+            ),
         );
         let states = vec![&lib_state];
         let build_download_config =

@@ -1064,7 +1064,12 @@ pub trait MetadataRewriteStore: Send + Sync {
         pre_rewrite_checksum: Option<&str>,
         completion: MetadataRewriteCompletion,
     ) -> Result<bool, StateError>;
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
+    /// Check for live downloaded rows without a metadata hash in `library`.
+    ///
+    /// # Errors
+    /// Returns a state error if the catalogue query fails.
+    async fn has_downloaded_without_metadata_hash(&self, library: &str)
+    -> Result<bool, StateError>;
     async fn begin_metadata_capture_revision(
         &self,
         _library: &str,
@@ -5455,13 +5460,17 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+    pub(crate) async fn has_downloaded_without_metadata_hash(
+        &self,
+        library: &str,
+    ) -> Result<bool, StateError> {
+        let library = library.to_owned();
         self.with_conn("has_downloaded_without_metadata_hash", move |conn| {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
-                     AND is_deleted = 0 AND metadata_hash IS NULL)",
-                    [],
+                     AND is_deleted = 0 AND metadata_hash IS NULL AND library = ?1)",
+                    [&library],
                     |row| row.get(0),
                 )
                 .map_err(|e| StateError::query("has_downloaded_without_metadata_hash", e))?;
@@ -6712,8 +6721,11 @@ impl MetadataRewriteStore for SqliteStateDb {
         .await
     }
 
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
-        SqliteStateDb::has_downloaded_without_metadata_hash(self).await
+    async fn has_downloaded_without_metadata_hash(
+        &self,
+        library: &str,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::has_downloaded_without_metadata_hash(self, library).await
     }
 
     async fn begin_metadata_capture_revision(
@@ -13137,7 +13149,11 @@ mod tests {
     #[tokio::test]
     async fn has_downloaded_without_metadata_hash_returns_false_on_empty() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            !db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -13145,7 +13161,11 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let rec = TestAssetRecord::new("P1").build();
         db.upsert_seen(&rec).await.unwrap();
-        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            !db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -13169,7 +13189,16 @@ mod tests {
             conn.execute("UPDATE assets SET metadata_hash = NULL WHERE id = 'D1'", [])
                 .unwrap();
         }
-        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.has_downloaded_without_metadata_hash("SharedSync-OTHER")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -13196,7 +13225,11 @@ mod tests {
             .await
             .unwrap();
         // A soft-deleted row is never re-enumerated, so its NULL hash must not drive full enumeration.
-        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            !db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

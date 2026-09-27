@@ -2376,6 +2376,7 @@ async fn consume_stream_download_tasks(
                                 "Download URL expired; aborting current URL batch"
                             );
                         });
+                        failed.push(task);
                         pipeline_shutdown.cancel();
                         continue;
                     }
@@ -2746,7 +2747,7 @@ pub(super) async fn build_download_outcome(
         return Ok((DownloadOutcome::Success, stats));
     }
 
-    if streaming_result.url_expired_abort {
+    if streaming_result.url_expired_abort && failed_tasks.is_empty() {
         let retry_exhausted = skip_breakdown.retry_exhausted;
         let mut stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
@@ -2841,9 +2842,19 @@ pub(super) async fn build_download_outcome(
         "── Cleanup pass: re-fetching URLs and retrying failed downloads ──"
     );
 
-    let fresh_tasks =
-        super::build_retry_download_tasks(passes, config, &failed_tasks, shutdown_token.clone())
-            .await?;
+    let refresh = if streaming_result.url_expired_abort {
+        super::CleanupUrlRefresh::Lookup
+    } else {
+        super::CleanupUrlRefresh::Enumerate
+    };
+    let fresh_tasks = super::build_retry_download_tasks(
+        passes,
+        config,
+        &failed_tasks,
+        refresh,
+        shutdown_token.clone(),
+    )
+    .await?;
     tracing::debug!(
         count = fresh_tasks.len(),
         "  Re-fetched failed tasks with fresh URLs"
@@ -2870,7 +2881,17 @@ pub(super) async fn build_download_outcome(
     let pass_result = run_download_pass(pass_config, fresh_tasks).await;
 
     let phase2_downloaded = pass_result.downloaded;
-    let remaining_failed = pass_result.failed;
+    // A lookup may be incomplete, or a second expired URL may cancel tasks that
+    // never started. Only a completed exact task retires the original failure.
+    let downloaded_keys: FxHashSet<_> = pass_result
+        .downloaded_tasks
+        .iter()
+        .map(super::RetryTaskKey::from)
+        .collect();
+    let remaining_failed: Vec<_> = failed_tasks
+        .into_iter()
+        .filter(|task| !downloaded_keys.contains(&super::RetryTaskKey::from(task)))
+        .collect();
     let phase2_auth_errors = pass_result.auth_errors;
     exif_failures += pass_result.exif_failures;
     state_write_failures += pass_result.state_write_failures;
@@ -2924,7 +2945,8 @@ pub(super) async fn build_download_outcome(
         + exif_failures
         + enumeration_errors
         + retry_exhausted
-        + usize::from(enumeration_incomplete);
+        + usize::from(enumeration_incomplete)
+        + usize::from(streaming_result.url_expired_abort && failed == 0);
     if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
@@ -3292,6 +3314,19 @@ async fn download_single_task<C: super::file::DownloadClient>(
     metadata_flags: MetadataFlags,
     context: DownloadSingleContext<'_>,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
+    // A producer can commit retry state immediately before cancellation. Do not
+    // start another HTTP request for its queued task while draining that batch.
+    if context.shutdown_token.is_cancelled() {
+        return Err(DownloadError::Interrupted {
+            path: task
+                .download_path
+                .to_string_lossy()
+                .into_owned()
+                .into_boxed_str(),
+            bytes_written: 0,
+        }
+        .into());
+    }
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -4977,7 +5012,7 @@ mod tests {
             ))
         }
 
-        async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+        async fn has_downloaded_without_metadata_hash(&self, _: &str) -> Result<bool, StateError> {
             Ok(false)
         }
 
@@ -6845,7 +6880,11 @@ mod tests {
         .await
         .unwrap();
         db.clear_metadata_hash_for_test("PrimarySync", "BACKFILL", "original");
-        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
 
         let client = reqwest::Client::new();
         let assets = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(existing_asset())]);
@@ -6866,7 +6905,9 @@ mod tests {
             "existing file should not be re-downloaded"
         );
         assert!(
-            !db.has_downloaded_without_metadata_hash().await.unwrap(),
+            !db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap(),
             "on-disk skip must backfill metadata_hash for existing downloaded rows"
         );
     }
