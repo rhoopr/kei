@@ -12,7 +12,8 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::print_stderr
+    clippy::print_stderr,
+    reason = "service assertions and shared test helpers fail with panics and print failure diagnostics"
 )]
 
 mod common;

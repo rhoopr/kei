@@ -20,7 +20,8 @@
     clippy::print_stderr,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    reason = "test fixtures and shared helpers use panics, diagnostics, and controlled numeric conversions"
 )]
 
 mod common;

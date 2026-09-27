@@ -16,6 +16,7 @@ tests/
   data/               media fixtures (see "Media fixtures" below)
   cli.rs                       argument parsing and help output
   behavioral.rs                offline end-to-end behavior (pre-seeded DB, real binary)
+  branch_static.rs             offline packaging, migration, and tooling checks
   sync.rs                      live sync flow against iCloud (#[ignore] live tests)
   state_auth.rs                live status / reset / verify / import commands
   import_existing_live.rs      live import-existing scenarios (#[ignore] live tests)
@@ -33,9 +34,10 @@ tests/
 | `cargo test --lib` | no | `just test fast` |
 | `cargo test --test cli` | no | `just test fast` |
 | `cargo test --test behavioral` | no | `just test fast` |
-| `cargo test --all-features --test sync` | yes | `just test live` |
-| `cargo test --all-features --test state_auth` | yes | `just test live` |
-| `cargo test --all-features --test import_existing_live` | yes | `just test live` |
+| `cargo test --test branch_static` | no | `just test offline`, selected scenario slices |
+| `cargo test --all-features --test sync -- --ignored --test-threads=1` | yes | `just test live` |
+| `cargo test --all-features --test state_auth -- --ignored --test-threads=1` | yes | `just test live` |
+| `cargo test --all-features --test import_existing_live -- --ignored --test-threads=1` | yes | `just test live` |
 | `tests/shell/concurrency.sh` | yes | `just test concurrency` |
 | `tests/shell/state-machine.sh` | yes | `just test state` |
 | `tests/shell/docker.sh` | yes | `just test docker` |
@@ -46,6 +48,15 @@ tests/
 | `scripts/test-scenarios/*.sh` | no | `just test scenario NAME` or `just test scenarios` |
 | `scripts/full-test/run_release_regression_smoke.sh` | no | `just release-smoke` |
 | `.github/workflows/service-smoke.yml` | no | `just service-smoke` (linux/macOS) |
+
+`branch_static` belongs to the complete offline routes, including `just gate`,
+rather than `just test fast`. Run it directly or through a relevant scenario
+slice when changing packaging, migration guidance, or validation tooling.
+
+The three live Rust targets also contain offline tests. Without `--ignored`,
+they run shared helper tests; `import_existing_live` also checks fixture
+isolation, command construction, and rejection of a removed CLI flag. These
+offline tests run in `just test offline` and `just gate` without credentials.
 
 ## Focused scenario slices
 

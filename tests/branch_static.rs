@@ -4,7 +4,11 @@
 //! These checks do not contact iCloud or run Docker. Live and platform suites
 //! still own their runtime behavior.
 
-#![allow(clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "tooling fixtures and assertions fail the test on setup or dispatch errors"
+)]
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
