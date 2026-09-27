@@ -117,25 +117,41 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                         unpaired_asset_events.push(event);
                     }
                 }
-                IncrementalDeltaRouting::None => {}
+                IncrementalDeltaRouting::None => {
+                    if event.reason == ChangeReason::HardDeleted
+                        || (event.reason == ChangeReason::SoftDeleted
+                            && event.record_type.as_deref() == Some("CPLAsset"))
+                    {
+                        unpaired_asset_events.push(event);
+                    }
+                }
             }
         }
 
+        delta.record_completion(token_rx.await.ok());
         hydrate_unpaired_created_asset_deltas(
             &mut unpaired_asset_events,
             Some(&pass),
             &config,
             &mut delta.summary,
             run_mode,
+            &shutdown_token,
         )
         .await;
-        let download_ctx = if run_mode.downloads_files() && !unpaired_asset_events.is_empty() {
+        let download_ctx = if run_mode.downloads_files()
+            && unpaired_asset_events
+                .iter()
+                .any(|event| event.reason == ChangeReason::Created)
+        {
             Some(preload_download_context(&config).await)
         } else {
             None
         };
         let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
-        for event in unpaired_asset_events {
+        for event in unpaired_asset_events
+            .into_iter()
+            .filter(|event| event.reason == ChangeReason::Created)
+        {
             if let Some(mut asset) = event.asset {
                 if let Some(download_ctx) = download_ctx.as_deref() {
                     let claim_mode = legacy_owner_claim_mode_for_configs(
@@ -184,7 +200,6 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             let _ = asset_tx.send(Err(error)).await;
             return Ok(delta.summary);
         }
-        delta.record_completion(token_rx.await.ok());
         Ok(delta.summary)
     });
 
@@ -272,7 +287,12 @@ async fn download_photos_incremental_streaming(
             .flatten()
     };
 
-    Ok(SyncResult::from_execution(outcome, sync_token, stats))
+    Ok(SyncResult::from_incremental_execution(
+        outcome,
+        sync_token,
+        stats,
+        delta_summary.sparse_identity_proofs,
+    ))
 }
 
 /// Incremental delta sync via `changes_stream`.
@@ -487,8 +507,16 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         config,
         &mut delta.summary,
         controls.run_mode,
+        &shutdown_token,
     )
     .await;
+    if download_ctx.is_none()
+        && change_events
+            .iter()
+            .any(|event| event.reason == ChangeReason::Created)
+    {
+        download_ctx = Some(preload_download_context(config).await);
+    }
     let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
     if let Some(download_ctx) = download_ctx.as_deref() {
         for event in &mut change_events {
@@ -638,12 +666,13 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
-        return Ok(SyncResult::from_execution(
+        return Ok(SyncResult::from_incremental_execution(
             DownloadOutcome::SessionExpired {
                 auth_error_count: delta_summary.auth_errors,
             },
             None,
             stats,
+            delta_summary.sparse_identity_proofs,
         ));
     }
 
@@ -670,7 +699,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .then_some(delta_summary.sync_token)
                 .flatten()
         };
-        return Ok(SyncResult::from_execution(
+        return Ok(SyncResult::from_incremental_execution(
             if delta_summary.state_transition_failures > 0 || rewrite_failures > 0 {
                 DownloadOutcome::PartialFailure {
                     failed_count: delta_summary
@@ -682,6 +711,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             },
             sync_token,
             stats,
+            delta_summary.sparse_identity_proofs,
         ));
     }
 
@@ -901,7 +931,12 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .then_some(delta_summary.sync_token)
                 .flatten()
         };
-        return Ok(SyncResult::from_execution(outcome, sync_token, stats));
+        return Ok(SyncResult::from_incremental_execution(
+            outcome,
+            sync_token,
+            stats,
+            delta_summary.sparse_identity_proofs,
+        ));
     }
 
     if controls.run_mode.only_print_filenames() {
@@ -926,7 +961,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
         // Don't advance the sync token — this is a read-only operation.
-        return Ok(SyncResult::from_execution(
+        return Ok(SyncResult::from_incremental_execution(
             if enumeration_errors > 0 || delta_summary.state_transition_failures > 0 {
                 DownloadOutcome::PartialFailure {
                     failed_count: enumeration_errors + delta_summary.state_transition_failures,
@@ -936,6 +971,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             },
             None,
             stats,
+            delta_summary.sparse_identity_proofs,
         ));
     }
 
@@ -1099,7 +1135,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     );
 
     if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
-        return Ok(SyncResult::from_execution(
+        return Ok(SyncResult::from_incremental_execution(
             DownloadOutcome::SessionExpired {
                 auth_error_count: pass_result.auth_errors,
             },
@@ -1107,6 +1143,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .then_some(delta_summary.sync_token)
                 .flatten(),
             stats,
+            delta_summary.sparse_identity_proofs,
         ));
     }
 
@@ -1129,12 +1166,13 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         DownloadOutcome::Success
     };
 
-    Ok(SyncResult::from_execution(
+    Ok(SyncResult::from_incremental_execution(
         outcome,
         (enumeration_errors == 0 && !stats.sync_token_blocked)
             .then_some(delta_summary.sync_token)
             .flatten(),
         stats,
+        delta_summary.sparse_identity_proofs,
     ))
 }
 

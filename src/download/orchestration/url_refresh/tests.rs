@@ -1,5 +1,12 @@
+use super::super::test_support::album_with_session_and_retry_config;
+use crate::download::pipeline;
+use crate::icloud::photos::PhotoAsset;
+use crate::retry::RetryConfig;
+use crate::test_helpers::TracingCapture;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use reqwest::Client;
 use rustc_hash::FxHashSet;
@@ -773,4 +780,298 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     let summary = db.get_summary().await.expect("summary");
     assert_eq!(summary.downloaded, 1);
     assert_eq!(summary.failed, 0);
+}
+
+#[tokio::test]
+async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    #[derive(Clone, Debug)]
+    struct LookupOnlySession {
+        records: Arc<Vec<Value>>,
+        lookups: Arc<AtomicUsize>,
+        recovery: &'static str,
+        shutdown: CancellationToken,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for LookupOnlySession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            assert!(
+                url.contains("/records/lookup?"),
+                "cleanup must not enumerate the library"
+            );
+            let call = self.lookups.fetch_add(1, Ordering::SeqCst);
+            if self.recovery == "shutdown_lookup" {
+                self.shutdown.cancel();
+            }
+            let status = match self.recovery {
+                "auth_asset" if call == 0 => Some(401),
+                "auth_master" if call == 1 => Some(421),
+                "rate_asset" if call == 0 => Some(429),
+                "rate_master" if call == 1 => Some(503),
+                "exhausted_asset" => Some(429),
+                "exhausted_master" if call >= 1 => Some(503),
+                _ => None,
+            };
+            if let Some(status) = status {
+                return Err(crate::icloud::photos::session::HttpStatusError {
+                    status,
+                    url: url.into(),
+                    body: Some("private-provider-response".into()),
+                    retry_after: None,
+                }
+                .into());
+            }
+            Ok(json!({"records": self.records.as_ref()}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    for recovery in [
+        "fresh",
+        "album_fresh",
+        "album_unfiled",
+        "album_cancelled",
+        "album_changed_checksum",
+        "album_changed_size",
+        "expired",
+        "missing",
+        "auth_asset",
+        "auth_master",
+        "rate_asset",
+        "rate_master",
+        "exhausted_asset",
+        "exhausted_master",
+        "shutdown_lookup",
+    ] {
+        let (capture, _guard) = TracingCapture::install();
+        let downloads = matches!(
+            recovery,
+            "fresh" | "album_fresh" | "album_unfiled" | "rate_asset" | "rate_master"
+        );
+        let shutdown = CancellationToken::new();
+        let server = crate::start_wiremock_or_skip!();
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        Mock::given(method("GET"))
+            .and(path("/old.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/new.jpg"))
+            .respond_with(if downloads {
+                ResponseTemplate::new(200).set_body_bytes(body.clone())
+            } else {
+                ResponseTemplate::new(410)
+            })
+            .expect(if downloads || recovery == "expired" {
+                1
+            } else {
+                0
+            })
+            .mount(&server)
+            .await;
+        let mut old = incremental_photo_records_with_url(
+            "FULL_EXPIRED",
+            "full-expired.jpg",
+            &format!("{}/old.jpg", server.uri()),
+            body.len() as u64,
+        );
+        old[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
+        let mut fresh = old.clone();
+        fresh[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+            json!(format!("{}/new.jpg", server.uri()));
+        if recovery == "album_changed_checksum" {
+            fresh[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("changed");
+        }
+        if recovery == "album_changed_size" {
+            fresh[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(body.len() + 1);
+        }
+        let old_asset = PhotoAsset::new(old[0].clone(), old[1].clone());
+        let fresh_asset = PhotoAsset::new(fresh[0].clone(), fresh[1].clone());
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let mut passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session_and_retry_config(
+                "PrimarySync",
+                "",
+                None,
+                RetryConfig {
+                    max_retries: 1,
+                    base_delay_secs: 0,
+                    max_delay_secs: 0,
+                },
+                Box::new(LookupOnlySession {
+                    records: Arc::new(if recovery == "missing" {
+                        Vec::new()
+                    } else {
+                        fresh
+                    }),
+                    lookups: Arc::clone(&lookups),
+                    recovery,
+                    shutdown: shutdown.clone(),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        if recovery.starts_with("album_") {
+            let mut album = passes[0].clone();
+            album.kind = PassKind::Album;
+            album.album.name = "Album A".into();
+            passes.insert(0, album);
+        }
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.state_db = Some(db.clone());
+        if recovery.starts_with("album_") {
+            config.folder_structure = "{album}".into();
+        }
+        let source_pass = if recovery == "album_unfiled" {
+            passes.last().unwrap()
+        } else {
+            &passes[0]
+        };
+        let stream_config = Arc::new(config.with_pass(source_pass));
+        let config = Arc::new(config);
+        let client = Client::new();
+        let controls = DownloadControls::download_hidden();
+        let streaming = pipeline::stream_and_download_from_stream(
+            &client,
+            futures_util::stream::iter(vec![Ok(old_asset)]),
+            &stream_config,
+            controls,
+            1,
+            CancellationToken::new(),
+            pipeline::StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert!(streaming.url_expired_abort);
+        let original_path = streaming.failed[0].download_path.clone();
+        if recovery == "album_cancelled" {
+            shutdown.cancel();
+        }
+        let (outcome, stats) = pipeline::build_download_outcome(
+            &client,
+            &passes,
+            &config,
+            controls,
+            streaming,
+            Instant::now(),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            if recovery.starts_with("auth_") {
+                matches!(outcome, DownloadOutcome::SessionExpired { .. })
+            } else {
+                matches!(outcome, DownloadOutcome::PartialFailure { .. })
+            },
+            "URL batch cancellation remains a partial run even after cleanup"
+        );
+        assert_eq!(stats.downloaded, usize::from(downloads));
+        assert_eq!(stats.failed, usize::from(!downloads));
+        assert_eq!(
+            stats.interrupted,
+            recovery.starts_with("auth_")
+                || matches!(recovery, "shutdown_lookup" | "album_cancelled")
+        );
+        assert_eq!(
+            stats.rate_limited,
+            match recovery {
+                "rate_asset" | "rate_master" => 1,
+                "exhausted_asset" | "exhausted_master" => 2,
+                _ => 0,
+            }
+        );
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            match recovery {
+                "album_cancelled" => 0,
+                "missing" | "auth_asset" | "shutdown_lookup" => 1,
+                "rate_asset" | "rate_master" | "exhausted_master" => 3,
+                _ => 2,
+            }
+        );
+        if recovery.starts_with("auth_") {
+            assert!(!crate::sync_cycle::should_store_sync_token(&outcome, false));
+        }
+        let diagnostics: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.field("diagnostic") == Some("expired_url_refresh_failed"))
+            .collect();
+        assert_eq!(
+            diagnostics.len(),
+            usize::from(recovery.starts_with("auth_") || recovery.starts_with("exhausted_"))
+        );
+        for event in diagnostics {
+            assert_eq!(event.fields.len(), 5);
+            for key in [
+                "message",
+                "diagnostic",
+                "failed_records",
+                "authentication_failures",
+                "rate_limit_observations",
+            ] {
+                assert!(event.fields.contains_key(key));
+            }
+            assert!(!format!("{:?}", event.fields).contains("private-provider-response"));
+        }
+        let reopened = SqliteStateDb::open(&db_path).await.unwrap();
+        let summary = reopened.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, u64::from(downloads));
+        if downloads {
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].local_path.as_ref(), Some(&original_path));
+            if recovery == "album_fresh" {
+                assert!(original_path.starts_with(config.directory.join("Album A")));
+                assert!(!config.directory.join("full-expired.jpg").exists());
+            }
+            if recovery == "album_unfiled" {
+                assert!(!config.directory.join("Album A").exists());
+            }
+            assert_eq!(
+                std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+                body
+            );
+            let stable = pipeline::stream_and_download_from_stream(
+                &client,
+                futures_util::stream::iter(vec![Ok(fresh_asset)]),
+                &stream_config,
+                controls,
+                1,
+                CancellationToken::new(),
+                pipeline::StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stable.downloaded, 0);
+            assert!(stable.failed.is_empty());
+        } else {
+            assert_eq!(
+                summary.pending + summary.failed,
+                1,
+                "unrefreshed work must survive restart"
+            );
+        }
+        server.verify().await;
+    }
 }

@@ -385,7 +385,7 @@ pub(super) async fn run_full_cycle_with_album(
     let build_download_config =
         make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
 
-    run_cycle(
+    Box::pin(run_cycle(
         &states,
         &config,
         Some(db.as_ref()),
@@ -394,7 +394,7 @@ pub(super) async fn run_full_cycle_with_album(
         controls,
         &shared_session,
         &CancellationToken::new(),
-    )
+    ))
     .await
     .expect("run cycle")
 }
@@ -436,6 +436,7 @@ pub(super) struct FailingMetadataSetDb {
     pub(super) cancel_on_upsert: Option<CancellationToken>,
     pub(super) replace_download_dir_on_upsert: Option<std::path::PathBuf>,
     pub(super) fail_upsert_seen: bool,
+    pub(super) fail_source_delete: bool,
     pub(super) fail_mark_downloaded: bool,
     pub(super) fail_refresh_downloaded_metadata: bool,
     /// Stands in for a concurrent pass: refreshes the row to this snapshot
@@ -476,6 +477,7 @@ impl FailingMetadataSetDb {
             cancel_on_upsert: None,
             replace_download_dir_on_upsert: None,
             fail_upsert_seen: false,
+            fail_source_delete: false,
             fail_mark_downloaded: false,
             fail_refresh_downloaded_metadata: false,
             refresh_on_mark_downloaded: None,
@@ -540,6 +542,42 @@ impl FailingMetadataSetDb {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::state::SparseIdentityStore for FailingMetadataSetDb {
+    async fn sparse_identities(
+        &self,
+        library: &str,
+    ) -> Result<Vec<crate::state::SparseIdentity>, crate::state::error::StateError> {
+        self.inner.sparse_identities(library).await
+    }
+    async fn observe_sparse_identity(
+        &self,
+        library: &str,
+        source: &crate::state::SparseSourceId,
+        evidence: &crate::state::SparseEvidence,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::state::SparseIdentity, crate::state::error::StateError> {
+        if self
+            .failure
+            .matches(&state::unresolved_identity_key(library))
+        {
+            return Err(state::error::StateError::LockPoisoned(self.message.into()));
+        }
+        self.inner
+            .observe_sparse_identity(library, source, evidence, now)
+            .await
+    }
+    async fn record_sparse_attempt(
+        &self,
+        identity: &crate::state::SparseIdentity,
+        outcome: crate::state::SparseAttemptOutcome,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::state::SparseIdentity, crate::state::error::StateError> {
+        self.inner
+            .record_sparse_attempt(identity, outcome, now)
+            .await
+    }
+}
 #[async_trait::async_trait]
 impl state::DownloadStateStore for FailingMetadataSetDb {
     #[cfg(test)]
@@ -804,6 +842,9 @@ impl state::DownloadStateStore for FailingMetadataSetDb {
         asset_id: &str,
         deleted_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), state::error::StateError> {
+        if self.fail_source_delete {
+            return Err(state::error::StateError::LockPoisoned(self.message.into()));
+        }
         self.inner
             .mark_soft_deleted(library, asset_id, deleted_at)
             .await
@@ -1320,8 +1361,13 @@ impl state::MetadataRewriteStore for FailingMetadataSetDb {
             .await
     }
 
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, state::error::StateError> {
-        self.inner.has_downloaded_without_metadata_hash().await
+    async fn has_downloaded_without_metadata_hash(
+        &self,
+        library: &str,
+    ) -> Result<bool, state::error::StateError> {
+        self.inner
+            .has_downloaded_without_metadata_hash(library)
+            .await
     }
 
     async fn begin_metadata_capture_revision(

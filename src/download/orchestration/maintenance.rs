@@ -70,7 +70,10 @@ pub(super) async fn has_metadata_backfill_work(config: &DownloadConfig) -> bool 
     let Some(db) = &config.state_db else {
         return false;
     };
-    match db.has_downloaded_without_metadata_hash().await {
+    match db
+        .has_downloaded_without_metadata_hash(&config.library)
+        .await
+    {
         Ok(needs_backfill) => needs_backfill,
         Err(e) => {
             tracing::warn!(
@@ -96,12 +99,20 @@ fn metadata_capture_candidate_matches(
     asset: &PhotoAsset,
     candidate: &crate::state::MetadataCaptureCandidate,
 ) -> bool {
-    candidate.versions.iter().any(|evidence| {
-        asset.versions().iter().any(|(version_size, version)| {
-            VersionSizeKey::from(*version_size) == evidence.version_size
-                && version.size == evidence.size_bytes
-                && version.checksum.as_ref() == evidence.checksum
-        })
+    candidate
+        .versions
+        .iter()
+        .any(|evidence| metadata_capture_version_matches(asset, evidence))
+}
+
+fn metadata_capture_version_matches(
+    asset: &PhotoAsset,
+    evidence: &crate::state::types::MetadataCaptureVersionEvidence,
+) -> bool {
+    asset.versions().iter().any(|(version_size, version)| {
+        VersionSizeKey::from(*version_size) == evidence.version_size
+            && version.size == evidence.size_bytes
+            && version.checksum.as_ref() == evidence.checksum
     })
 }
 
@@ -337,7 +348,9 @@ async fn collect_metadata_capture_repair(
                     }
                 }
             }
-            RecordResolution::AssetPresent { .. } | RecordResolution::Unknown => {
+            RecordResolution::AssetPresent { .. }
+            | RecordResolution::SparseShareUnresolved(_)
+            | RecordResolution::Unknown => {
                 record_metadata_capture_failure(
                     db.as_ref(),
                     &candidate.library,
@@ -398,7 +411,26 @@ async fn collect_metadata_capture_repair(
                         .await;
                         continue;
                     };
-                    if matches.next().is_some() {
+                    if let Some(other) = matches.next() {
+                        // Counts describe the ambiguity; even one full-rendition
+                        // match is not permission to choose among eligible children.
+                        let (matching_children, full_evidence_matching_children) =
+                            std::iter::once(asset)
+                                .chain(std::iter::once(other))
+                                .chain(matches)
+                                .fold((0usize, 0usize), |(matching, full), asset| {
+                                    let all_match = candidate.versions.iter().all(|evidence| {
+                                        metadata_capture_version_matches(&asset, evidence)
+                                    });
+                                    (matching + 1, full + usize::from(all_match))
+                                });
+                        tracing::warn!(
+                            diagnostic = "metadata_capture_ambiguity_counts_v1",
+                            stored_renditions = candidate.versions.len(),
+                            matching_children,
+                            full_evidence_matching_children,
+                            "Metadata capture remains ambiguous; retaining identity and checkpoint"
+                        );
                         record_metadata_capture_failure(
                             db.as_ref(),
                             &candidate.library,

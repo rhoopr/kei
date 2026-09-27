@@ -238,6 +238,7 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         )
         .unwrap();
     }
+    conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at,next_retry_at) VALUES ('PrimarySync','private-source',?1,?1,1,1700000000,?2)", rusqlite::params![r#"[1,"private-target","SharedSync-private","private-owner"]"#, chrono::Utc::now().timestamp()+3600]).unwrap();
     let output = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
@@ -252,6 +253,13 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         "{stdout}"
     );
     assert!(stdout.contains("preserved"), "{stdout}");
+    assert!(
+        stdout.contains("Sparse identity recovery: 1 unresolved, 1 deferred until retry"),
+        "{stdout}"
+    );
+    for private in ["private-source", "private-target", "private-owner"] {
+        assert!(!stdout.contains(private), "{stdout}");
+    }
     assert!(!stdout.contains("SharedSync-private"), "{stdout}");
     conn.execute(
         "DELETE FROM metadata WHERE key = 'unresolved_asset_identity:PrimarySync'",
@@ -266,7 +274,21 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         .success()
         .get_output()
         .clone();
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Backup status: safe"));
+    // A missing marker must not hide retained per-source work.
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Backup status: unsafe"));
+    conn.execute("DELETE FROM unresolved_sparse_identities", [])
+        .unwrap();
+    let output = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Backup status: safe"));
+    assert!(!stdout.contains("Sparse identity recovery:"));
 }
 
 #[test]

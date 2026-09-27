@@ -295,6 +295,7 @@ pub(crate) async fn reconcile_catalog_paths(
             }
             RecordResolution::AssetPresent { .. }
             | RecordResolution::MasterPresent
+            | RecordResolution::SparseShareUnresolved(_)
             | RecordResolution::Unknown
             | RecordResolution::TransientFailure(_) => {}
         }

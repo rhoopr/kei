@@ -142,6 +142,7 @@ async fn checkpoint_transition_is_atomic() {
 
     let result = db
         .commit_checkpoint_transition(CheckpointTransition {
+            sparse_identity_proofs: Vec::new(),
             metadata_updates: vec![
                 ("sync_token:zone".into(), "new-token".into()),
                 ("enum_config_hash".into(), "new-hash".into()),

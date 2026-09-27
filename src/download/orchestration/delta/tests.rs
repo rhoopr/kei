@@ -1,3 +1,4 @@
+use super::{IncrementalDeltaSummary, hydrate_unpaired_created_asset_deltas};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -764,16 +765,30 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
         ProviderLookup,
     }
 
-    for identity_source in [
+    for (identity_source, sparse) in [
         IdentitySource::Delta,
         IdentitySource::State,
         IdentitySource::ProviderLookup,
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|source| [false, true].map(|sparse| (source, sparse)))
+    {
         let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
         let dir = TempDir::new().expect("temp dir");
         let stored_records = incremental_photo_records_with_favorite("ASSET_ONLY", false);
         let stored_asset = PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
-        let changed_records = incremental_photo_records_with_favorite("ASSET_ONLY", true);
+        let mut changed_records = incremental_photo_records_with_favorite("ASSET_ONLY", true);
+        if sparse {
+            let evidence = crate::test_helpers::sparse_shared_asset_record();
+            for key in [
+                "isSparsePrivateRecord",
+                "linkedShareRecordName",
+                "linkedShareZoneName",
+                "linkedShareZoneOwner",
+            ] {
+                changed_records[1]["fields"][key] = evidence["fields"][key].clone();
+            }
+        }
         let mut delta_record = changed_records[1].clone();
         if !matches!(identity_source, IdentitySource::Delta) {
             delta_record["fields"]
@@ -844,7 +859,137 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
         assert!(media_path.exists());
     }
 }
-
+#[tokio::test]
+async fn sparse_share_hydration_retains_delta_evidence_and_blocks_unsafe_mapping() {
+    use crate::icloud::photos::asset::{DeltaRecordBuffer, SparseShareEvidence};
+    use tracing::instrument::WithSubscriber;
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("sparse-share.log");
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(std::sync::Mutex::new(
+            std::fs::File::create(&log_path).unwrap(),
+        ))
+        .finish();
+    let subscriber = tracing::Dispatch::new(subscriber);
+    for change in [
+        "unchanged",
+        "record_changed",
+        "zone_changed",
+        "owner_changed",
+        "malformed",
+        "lookup_only",
+    ] {
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        // A known linked child is not a mapping for the source child.
+        db.upsert_asset_master_mapping(
+            "PrimarySync",
+            "private-linked-child",
+            "unrelated-personal-master",
+        )
+        .await
+        .unwrap();
+        let mut delta = crate::test_helpers::sparse_shared_asset_record();
+        let mut lookup = delta.clone();
+        match change {
+            "record_changed" => {
+                lookup["fields"]["linkedShareRecordName"]["value"] =
+                    json!("different-private-child")
+            }
+            "zone_changed" => {
+                lookup["fields"]["linkedShareZoneName"]["value"] =
+                    json!("SharedSync-different-private-zone")
+            }
+            "owner_changed" => {
+                lookup["fields"]["linkedShareZoneOwner"]["value"]["recordName"] =
+                    json!("different-private-owner")
+            }
+            "malformed" => lookup["fields"]["linkedShareZoneOwner"]["value"] = json!(null),
+            "lookup_only" => {
+                delta["fields"] = json!({"assetDate":{"value":1700000000000i64}});
+            }
+            _ => {}
+        }
+        let mut buffer = DeltaRecordBuffer::new();
+        let mut events = buffer.process_records(vec![serde_json::from_value(delta).unwrap()]);
+        let original = events[0].sparse_share.clone();
+        let session = changes_zone_session_with_query_page(
+            Arc::new(AtomicUsize::new(0)),
+            vec![],
+            json!({"records":[lookup]}),
+            0,
+        );
+        let probe = session.clone();
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+        let mut summary = IncrementalDeltaSummary::default();
+        hydrate_unpaired_created_asset_deltas(
+            &mut events,
+            Some(&pass),
+            &config,
+            &mut summary,
+            DownloadRunMode::Download,
+            &CancellationToken::new(),
+        )
+        .with_subscriber(subscriber.clone())
+        .await;
+        assert!(summary.identity_incomplete);
+        assert_eq!(
+            summary.token_unsafe_reason,
+            Some(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON)
+        );
+        assert_eq!(
+            db.get_metadata(&crate::state::unresolved_identity_key("PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert!(
+            db.get_master_record_name_for_asset("PrimarySync", "private-sparse-child")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(probe.records_query_count(), 1);
+        assert!(events[0].asset.is_none());
+        assert!(events[0].master_record_name.is_none());
+        if original.is_some() {
+            assert_eq!(events[0].sparse_share, original);
+        } else {
+            assert!(matches!(
+                events[0].sparse_share,
+                Some(SparseShareEvidence::Linked(_))
+            ));
+        }
+    }
+    let logs = std::fs::read_to_string(log_path).unwrap();
+    assert_eq!(
+        logs.matches("diagnostic=\"sparse_share_reference_changed\"")
+            .count(),
+        4,
+        "{logs}"
+    );
+    for identifier in [
+        "private-sparse-child",
+        "private-linked-child",
+        "SharedSync-private-removed",
+        "private-owner",
+        "different-private-child",
+        "SharedSync-different-private-zone",
+        "different-private-owner",
+        "unrelated-personal-master",
+    ] {
+        assert!(!logs.contains(identifier), "leaked {identifier}: {logs}");
+    }
+}
 #[tokio::test]
 async fn unresolved_asset_only_delta_preserves_incremental_token() {
     let records = incremental_photo_records_with_favorite("ASSET_UNKNOWN", true);

@@ -1,10 +1,11 @@
 //! Bare expected paths shared by sync and import, before collision resolution.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset};
 
+use crate::download::DownloadConfig;
 use crate::download::paths;
 use crate::icloud::photos::types::AssetVersion;
 use crate::state::VersionSizeKey;
@@ -127,6 +128,142 @@ fn usable_asset_base_filename(
         first_version_asset_type(asset),
         ctx.base_filename.clone(),
     )
+}
+
+pub(in crate::download) fn stored_path_matches_current_collision_family(
+    asset_id: &str,
+    derived: &DerivedPath,
+    derived_paths: &[DerivedPath],
+    config: &DownloadConfig,
+    stored_path: &Path,
+) -> bool {
+    if stored_path.parent() != derived.path.parent() {
+        return false;
+    }
+
+    let Some(stored_filename) = stored_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    collision_family_base_filenames(asset_id, derived, derived_paths, config)
+        .iter()
+        .any(|base| stored_filename_matches_base_family(stored_filename, base, asset_id))
+}
+
+/// Also recognize the numbered still stems produced by older Live Photo plans.
+/// Callers must verify durable ownership and local bytes before using this match.
+pub(in crate::download) fn stored_path_matches_download_family(
+    asset_id: &str,
+    derived: &DerivedPath,
+    derived_paths: &[DerivedPath],
+    config: &DownloadConfig,
+    stored_path: &Path,
+) -> bool {
+    if stored_path_matches_current_collision_family(
+        asset_id,
+        derived,
+        derived_paths,
+        config,
+        stored_path,
+    ) {
+        return true;
+    }
+    if !derived.version_size.is_live_photo_motion() || stored_path.parent() != derived.path.parent()
+    {
+        return false;
+    }
+    let Some(primary) = primary_derived_path(derived_paths) else {
+        return false;
+    };
+    let Some((stem, extension)) = primary.filename.rsplit_once('.') else {
+        return false;
+    };
+    let Some(filename) = stored_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let prefix = paths::clean_filename(&format!(
+        "{stem}-{}-",
+        paths::asset_identity_suffix(asset_id)
+    ))
+    .into_owned();
+    let Some(tail) = filename.strip_prefix(&prefix) else {
+        return false;
+    };
+    let ordinal: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    if ordinal.parse::<u64>().is_err() {
+        return false;
+    }
+    let primary_filename = format!("{prefix}{ordinal}.{extension}");
+    stored_filename_matches_base_family(
+        filename,
+        &live_photo_motion_filename_for_primary(&primary_filename, config),
+        asset_id,
+    )
+}
+
+fn collision_family_base_filenames(
+    asset_id: &str,
+    derived: &DerivedPath,
+    derived_paths: &[DerivedPath],
+    config: &DownloadConfig,
+) -> Vec<String> {
+    let mut bases = vec![
+        derived.filename.clone(),
+        paths::add_dedup_suffix(&derived.filename, derived.size),
+        paths::insert_asset_identity_suffix(&derived.filename, asset_id),
+    ];
+
+    if derived.version_size.is_live_photo_motion()
+        && let Some(primary) = primary_derived_path(derived_paths)
+    {
+        let primary_collision_filenames = [
+            paths::add_dedup_suffix(&primary.filename, primary.size),
+            paths::insert_asset_identity_suffix(&primary.filename, asset_id),
+        ];
+        for primary_filename in primary_collision_filenames {
+            bases.push(live_photo_motion_filename_for_primary(
+                &primary_filename,
+                config,
+            ));
+        }
+    }
+
+    bases.sort();
+    bases.dedup();
+    bases
+}
+
+fn primary_derived_path(derived_paths: &[DerivedPath]) -> Option<&DerivedPath> {
+    derived_paths
+        .iter()
+        .find(|derived| derived.version_size.is_primary_media())
+}
+
+fn live_photo_motion_filename_for_primary(
+    primary_filename: &str,
+    config: &DownloadConfig,
+) -> String {
+    match config.live_photo_mov_filename_policy {
+        crate::types::LivePhotoMovFilenamePolicy::Suffix => {
+            paths::live_photo_mov_path_suffix(primary_filename)
+        }
+        crate::types::LivePhotoMovFilenamePolicy::Original => {
+            paths::live_photo_mov_path_original(primary_filename)
+        }
+    }
+}
+
+fn stored_filename_matches_base_family(stored_filename: &str, base: &str, asset_id: &str) -> bool {
+    let base = paths::clean_filename(base);
+    let base = base.as_ref();
+    (stored_filename == base
+        || paths::normalize_ampm(stored_filename) == paths::normalize_ampm(base))
+        || paths::filename_matches_identity_collision(base, asset_id, stored_filename)
+        || paths::filename_matches_identity_collision(
+            &paths::normalize_ampm(base),
+            asset_id,
+            &paths::normalize_ampm(stored_filename),
+        )
 }
 
 /// Per-asset inputs that don't change between primary and MOV companion

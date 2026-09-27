@@ -101,6 +101,18 @@ pub(in crate::download) fn filter_asset_to_tasks(
     dir_cache: &mut paths::DirCache,
     planning_mode: PathPlanningMode,
 ) -> std::io::Result<Vec<DownloadTask>> {
+    filter_asset_to_tasks_with_primary(asset, config, claimed_paths, dir_cache, planning_mode, None)
+}
+
+/// Use an ownership-verified still filename when deriving its companion.
+pub(in crate::download) fn filter_asset_to_tasks_with_primary(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
+    dir_cache: &mut paths::DirCache,
+    planning_mode: PathPlanningMode,
+    recorded_primary_filename: Option<&str>,
+) -> std::io::Result<Vec<DownloadTask>> {
     if !asset.has_valid_id() {
         return Ok(Vec::new());
     }
@@ -271,9 +283,12 @@ pub(in crate::download) fn filter_asset_to_tasks(
         }
     }
 
-    if let Some(d) =
-        derive_mov_companion(asset, config, &ctx, effective_primary_filename.as_deref())
-    {
+    if let Some(d) = derive_mov_companion(
+        asset,
+        config,
+        &ctx,
+        recorded_primary_filename.or(effective_primary_filename.as_deref()),
+    ) {
         let DerivedPath {
             path,
             filename,
@@ -1442,6 +1457,7 @@ mod tests {
             record_name: "MODIFIED_ASSET_1".into(),
             record_type: Some("CPLAsset".into()),
             master_record_name: None,
+            sparse_share: None,
             reason: ChangeReason::Created,
             asset: Some(modified_asset),
             album: None,

@@ -93,6 +93,32 @@ impl FailingDownloadStore {
 }
 
 #[async_trait::async_trait]
+impl crate::state::SparseIdentityStore for FailingDownloadStore {
+    async fn sparse_identities(
+        &self,
+        _library: &str,
+    ) -> Result<Vec<crate::state::SparseIdentity>, crate::state::error::StateError> {
+        unimplemented!()
+    }
+    async fn observe_sparse_identity(
+        &self,
+        _library: &str,
+        _source: &crate::state::SparseSourceId,
+        _evidence: &crate::state::SparseEvidence,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::state::SparseIdentity, crate::state::error::StateError> {
+        unimplemented!()
+    }
+    async fn record_sparse_attempt(
+        &self,
+        _identity: &crate::state::SparseIdentity,
+        _outcome: crate::state::SparseAttemptOutcome,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::state::SparseIdentity, crate::state::error::StateError> {
+        unimplemented!()
+    }
+}
+#[async_trait::async_trait]
 impl DownloadStateStore for FailingDownloadStore {
     #[cfg(test)]
     async fn should_download(
@@ -480,7 +506,7 @@ impl MetadataRewriteStore for FailingDownloadStore {
         ))
     }
 
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+    async fn has_downloaded_without_metadata_hash(&self, _: &str) -> Result<bool, StateError> {
         Ok(false)
     }
 

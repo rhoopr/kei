@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::OptionalExtension;
 
+use super::sparse_identity;
 use super::{CheckpointTransition, ScopedDbSyncToken, SqliteStateDb, SyncTokenStore};
 use crate::state::error::StateError;
 
@@ -116,6 +117,13 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("commit_checkpoint_transition::update", e))?;
             }
             for key in transition.metadata_deletes {
+                if let Some(library) = key.strip_prefix(crate::state::UNRESOLVED_IDENTITY_PREFIX) {
+                    sparse_identity::clear_proven(
+                        &tx,
+                        library,
+                        &transition.sparse_identity_proofs,
+                    )?;
+                }
                 tx.execute("DELETE FROM metadata WHERE key = ?1", [key])
                     .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
             }

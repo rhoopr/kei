@@ -1,9 +1,11 @@
 //! Targeted record lookup and conservative identity resolution.
 
 use super::PhotoAlbum;
+use crate::icloud::photos::asset::SparseShareEvidence;
 use crate::icloud::photos::asset::{PhotoAsset, RequiredAssetFields, extract_master_ref};
 use crate::icloud::photos::cloudkit;
-use crate::icloud::photos::queries::{DESIRED_KEYS_VALUES, encode_params};
+use crate::icloud::photos::queries::IDENTITY_LOOKUP_KEYS_VALUES;
+use crate::icloud::photos::queries::encode_params;
 use crate::icloud::photos::session;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
@@ -42,7 +44,10 @@ fn asset_identity_diagnostic(
     } else if serde_json::from_value::<cloudkit::Record>(record.clone()).is_err() {
         "record_decode_failed"
     } else if reference.is_none() {
-        "master_reference_missing"
+        record
+            .get("fields")
+            .and_then(SparseShareEvidence::from_fields)
+            .map_or("master_reference_missing", |evidence| evidence.diagnostic())
     } else if reference
         .and_then(|value| value.get("recordName"))
         .and_then(Value::as_str)
@@ -172,6 +177,7 @@ pub(crate) enum RecordResolution {
         master_record_name: ProviderRecordId,
     },
     MasterPresent,
+    SparseShareUnresolved(SparseShareEvidence),
     Deleted {
         deleted_at: Option<chrono::DateTime<chrono::Utc>>,
         master_family: bool,
@@ -206,9 +212,9 @@ fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
             master_family: true,
             ..
         } => ResolutionEvidence::MasterDeleted,
-        RecordResolution::Unknown | RecordResolution::TransientFailure(_) => {
-            ResolutionEvidence::Inconclusive
-        }
+        RecordResolution::SparseShareUnresolved(_)
+        | RecordResolution::Unknown
+        | RecordResolution::TransientFailure(_) => ResolutionEvidence::Inconclusive,
         RecordResolution::Deleted {
             master_family: false,
             ..
@@ -220,7 +226,10 @@ fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
 // conservatively: a present sibling resolves the work, a missing master proves
 // family deletion, and any inconclusive sibling blocks child-only deletion.
 fn merge_record_resolution(existing: &mut RecordResolution, incoming: RecordResolution) {
-    if resolution_evidence(&incoming) > resolution_evidence(existing) {
+    if resolution_evidence(&incoming) > resolution_evidence(existing)
+        || (matches!(existing, RecordResolution::Unknown)
+            && matches!(incoming, RecordResolution::SparseShareUnresolved(_)))
+    {
         *existing = incoming;
     }
 }
@@ -259,22 +268,20 @@ impl PhotoAlbum {
             let body = json!({
                 "records": records,
                 "zoneID": self.zone_id.as_ref(),
-                "desiredKeys": &*DESIRED_KEYS_VALUES,
+                "desiredKeys": &*IDENTITY_LOOKUP_KEYS_VALUES,
             });
-            let response = match session::retry_post_allowing_record_errors(
+            let retried = session::retry_post_allowing_record_errors(
                 self.session.as_ref(),
                 &url,
                 &body.to_string(),
                 &[("Content-type", "text/plain")],
                 &self.retry_config,
             )
-            .await
-            {
-                Ok(retried) => {
-                    rate_limit_observations =
-                        rate_limit_observations.saturating_add(retried.rate_limit_observations);
-                    retried.response
-                }
+            .await;
+            rate_limit_observations =
+                rate_limit_observations.saturating_add(retried.rate_limit_observations);
+            let response = match retried.response {
+                Ok(response) => response,
                 Err(error) => {
                     let error = classify_provider_lookup_error(&error);
                     crate::metrics::record_targeted_lookup("transient_failure", batch.len());
@@ -397,13 +404,19 @@ impl PhotoAlbum {
                         {
                             extract_master_ref(&asset.fields)
                                 .filter(|name| !name.trim().is_empty())
-                                .map_or(RecordResolution::Unknown, |master_record_name| {
-                                    RecordResolution::AssetPresent {
+                                .map_or_else(
+                                    || {
+                                        SparseShareEvidence::from_fields(&asset.fields).map_or(
+                                            RecordResolution::Unknown,
+                                            RecordResolution::SparseShareUnresolved,
+                                        )
+                                    },
+                                    |master_record_name| RecordResolution::AssetPresent {
                                         master_record_name: ProviderRecordId::new(
                                             master_record_name,
                                         ),
-                                    }
-                                })
+                                    },
+                                )
                         }
                         _ => RecordResolution::Unknown,
                     }
@@ -421,7 +434,9 @@ impl PhotoAlbum {
                     RecordResolution::AssetPresent { .. } => "asset_present",
                     RecordResolution::MasterPresent => "master_present_unpaired",
                     RecordResolution::Deleted { .. } => "deleted",
-                    RecordResolution::Unknown => "unknown",
+                    RecordResolution::SparseShareUnresolved(_) | RecordResolution::Unknown => {
+                        "unknown"
+                    }
                     RecordResolution::TransientFailure(_) => "transient_failure",
                 };
                 crate::metrics::record_targeted_lookup(outcome, 1);
