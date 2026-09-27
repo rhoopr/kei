@@ -2344,6 +2344,13 @@ async fn consume_stream_download_tasks(
                 match classify_download_task_error(&e) {
                     DownloadTaskErrorClass::Interrupted => {
                         log_interrupted_download(pb, &task, &e);
+                        // URL expiry cancels the whole bounded queue, not just
+                        // the task that saw 410. Keep its unstarted work for
+                        // the same cleanup attempt. User shutdown still gates
+                        // cleanup lookup and dispatch through the parent token.
+                        if url_expired_abort {
+                            failed.push(task);
+                        }
                         continue;
                     }
                     DownloadTaskErrorClass::SessionExpired => {
@@ -2847,7 +2854,7 @@ pub(super) async fn build_download_outcome(
     } else {
         super::CleanupUrlRefresh::Enumerate
     };
-    let fresh_tasks = super::build_retry_download_tasks(
+    let retry_plan = super::build_retry_download_tasks(
         passes,
         config,
         &failed_tasks,
@@ -2856,7 +2863,7 @@ pub(super) async fn build_download_outcome(
     )
     .await?;
     tracing::debug!(
-        count = fresh_tasks.len(),
+        count = retry_plan.tasks.len(),
         "  Re-fetched failed tasks with fresh URLs"
     );
 
@@ -2878,7 +2885,8 @@ pub(super) async fn build_download_outcome(
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
     };
-    let pass_result = run_download_pass(pass_config, fresh_tasks).await;
+    let mut pass_result = run_download_pass(pass_config, retry_plan.tasks).await;
+    pass_result.rate_limit_observations += retry_plan.rate_limit_observations;
 
     let phase2_downloaded = pass_result.downloaded;
     // A lookup may be incomplete, or a second expired URL may cancel tasks that
@@ -2895,9 +2903,9 @@ pub(super) async fn build_download_outcome(
     let phase2_auth_errors = pass_result.auth_errors;
     exif_failures += pass_result.exif_failures;
     state_write_failures += pass_result.state_write_failures;
-    let total_auth_errors = auth_errors + phase2_auth_errors;
+    let total_auth_errors = auth_errors + phase2_auth_errors + retry_plan.provider_auth_errors;
 
-    if total_auth_errors >= AUTH_ERROR_THRESHOLD {
+    if total_auth_errors >= AUTH_ERROR_THRESHOLD || retry_plan.provider_auth_errors > 0 {
         let mut merged_recap = streaming_result.recap.clone();
         merged_recap.merge(pass_result.recap.clone());
         let stats = super::SyncStats {
@@ -5569,6 +5577,144 @@ mod tests {
                 .is_some_and(|error| error.contains("verified bytes differ")),
             "collision must remain durable failed work"
         );
+    }
+
+    #[tokio::test]
+    async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for user_shutdown in [false, true] {
+            let server = crate::start_wiremock_or_skip!();
+            let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+            Mock::given(method("GET"))
+                .and(path("/expired.jpg"))
+                .respond_with(ResponseTemplate::new(410))
+                .expect(if user_shutdown { 0 } else { 1 })
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/fresh.jpg"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .expect(if user_shutdown { 0 } else { 2 })
+                .mount(&server)
+                .await;
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("state.db");
+            let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(dir.path().join("media"));
+            config.state_db = Some(db.clone());
+            let config = Arc::new(config);
+            let assets: Vec<_> = ["FIRST", "QUEUED"]
+                .into_iter()
+                .map(|id| {
+                    TestPhotoAsset::new(id)
+                        .filename(&format!("{id}.jpg"))
+                        .orig_size(body.len() as u64)
+                        .orig_url(&format!("{}/expired.jpg", server.uri()))
+                        .orig_checksum(&checksum)
+                        .build()
+                })
+                .collect();
+            let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+            let (tx, rx) = mpsc::channel(assets.len());
+            for asset in &assets {
+                let plan = planner.plan_download_asset(asset, &config).await.unwrap();
+                assert_eq!(plan.tasks.len(), 1);
+                for task in plan.tasks {
+                    planner::upsert_seen_for_task(db.as_ref(), &config, asset, &task)
+                        .await
+                        .unwrap();
+                    tx.send(task).await.unwrap();
+                }
+            }
+            drop(tx);
+            let shutdown = CancellationToken::new();
+            if user_shutdown {
+                shutdown.cancel();
+            }
+            let client = Client::new();
+            let result = consume_stream_download_tasks(
+                rx,
+                client.clone(),
+                StreamPipelineShared {
+                    config: config.clone(),
+                    state_db: config.state_db.clone(),
+                    pb: ProgressBar::hidden(),
+                    pipeline_shutdown: shutdown.child_token(),
+                },
+                StreamConsumerSettings {
+                    retry_config: config.retry,
+                    metadata_flags: MetadataFlags::default(),
+                    concurrency: 1,
+                    mode: crate::personality::Mode::Off,
+                    bytes_counter: Arc::new(AtomicU64::new(0)),
+                },
+            )
+            .await;
+            assert_eq!(result.url_expired_abort, !user_shutdown);
+            assert_eq!(result.failed.len(), if user_shutdown { 0 } else { 2 });
+            assert_eq!(db.get_summary().await.unwrap().pending, 2);
+            if user_shutdown {
+                server.verify().await;
+                continue;
+            }
+            assert!(
+                !shutdown.is_cancelled(),
+                "URL expiry must not cancel the user token"
+            );
+            let fresh = result
+                .failed
+                .into_iter()
+                .map(|task| DownloadTask {
+                    url: format!("{}/fresh.jpg", server.uri()).into(),
+                    ..task
+                })
+                .collect();
+            let recovered = run_download_pass(
+                PassConfig {
+                    client: &client,
+                    retry_config: &config.retry,
+                    metadata: MetadataFlags::default(),
+                    mark_capture_repair_after_download: false,
+                    concurrency: 1,
+                    reporting: DownloadReporting::hidden(),
+                    temp_suffix: config.temp_suffix.clone(),
+                    shutdown_token: shutdown.clone(),
+                    state_db: config.state_db.clone(),
+                    rate_limit_counter: Arc::new(AtomicUsize::new(0)),
+                    bandwidth_limiter: None,
+                    library: config.library.clone(),
+                },
+                fresh,
+            )
+            .await;
+            assert_eq!(recovered.downloaded, 2);
+            assert!(recovered.failed.is_empty());
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            assert_eq!(reopened.get_summary().await.unwrap().downloaded, 2);
+            for row in reopened.get_downloaded_page(0, 10).await.unwrap() {
+                assert_eq!(fs::read(row.local_path.as_ref().unwrap()).unwrap(), body);
+            }
+            let stable = stream_and_download_from_stream(
+                &client,
+                stream::iter(assets.into_iter().map(Ok)),
+                &config,
+                DownloadControls::download_hidden(),
+                2,
+                shutdown,
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stable.downloaded, 0);
+            assert!(stable.failed.is_empty());
+            server.verify().await;
+        }
     }
 
     #[tokio::test]

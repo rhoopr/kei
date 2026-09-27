@@ -321,11 +321,17 @@ Writes are best-effort, with no run subfolder or cleanup.
 Release builds without debug assertions do not include this diagnostic code.
 
 A signed URL expiry stops the current full-download batch. The pipeline retains
-failed tasks and makes one cleanup attempt through targeted asset and master
-lookups. It does not enumerate albums again to refresh those URLs. Only exact
-asset, rendition, and destination matches can enter cleanup. Missing lookups,
+failed tasks, including queued tasks cancelled by that expiry, and makes one
+cleanup attempt through targeted asset and master lookups. User shutdown stops
+cleanup lookup and download dispatch. It does not enumerate albums again to
+refresh those URLs. Only exact asset, rendition, and destination matches can
+enter cleanup. Missing lookups,
 a second expiry, and cancelled tasks retain durable retry work. Successful
 cleanup does not convert incomplete enumeration into checkpoint proof.
+Authentication failures during refresh stop cleanup and return a session-expired
+outcome. Refresh rate-limit observations contribute to the cycle count even
+when provider retries are exhausted. The `expired_url_refresh_failed` diagnostic
+reports failure, authentication, and rate-limit counts without provider details.
 
 Full enumeration streams records/query results and gathers a provider token
 from every active pass. Natural stream completion and usable, unanimous pass
@@ -587,6 +593,10 @@ fallback checks only the selected library. While revision repair has pending
 work, it owns that backlog instead of forcing a second full enumeration.
 Ambiguous provider children remain pending and block the affected checkpoint;
 a matching rendition alone does not prove which child owns the metadata.
+The `metadata_capture_ambiguity_counts_v1` diagnostic reports stored rendition,
+matching child, and full-evidence matching child counts. It contains no IDs,
+paths, checksums, or provider metadata. These counts do not authorize identity
+selection, even when only one child matches every stored rendition.
 
 Automatic repair processes at most 500 stale assets per library in one sync
 cycle. When a clean batch makes progress and work remains, watch and service
