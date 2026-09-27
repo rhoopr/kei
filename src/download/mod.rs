@@ -3885,6 +3885,98 @@ impl CleanupRetryPlan {
     }
 }
 
+/// Refresh only the URL on already-selected tasks. Their original destination,
+/// rendition, metadata and publication authorization retain the first pass's
+/// selection evidence, including deferred unfiled exclusions.
+async fn refresh_failed_download_urls(
+    passes: &[crate::commands::AlbumPass],
+    failed_tasks: &[DownloadTask],
+    shutdown_token: &CancellationToken,
+) -> CleanupRetryPlan {
+    let mut retry = CleanupRetryPlan::default();
+    let mut pending_keys: FxHashSet<_> = failed_tasks.iter().map(RetryTaskKey::from).collect();
+    let requested_count = pending_keys.len();
+    let mut refreshed_zones = FxHashSet::default();
+    for pass in passes {
+        if shutdown_token.is_cancelled() || pending_keys.is_empty() {
+            break;
+        }
+        let zone = pass.album.zone_name();
+        if !refreshed_zones.insert(zone) {
+            continue;
+        }
+        let requests: Vec<_> = failed_tasks
+            .iter()
+            .filter(|task| task.library.as_ref() == zone)
+            .map(|task| task.asset_record_name.as_ref())
+            .collect::<FxHashSet<_>>()
+            .into_iter()
+            .map(|name| RecordLookupRequest::asset_only(ProviderRecordId::new(name)))
+            .collect();
+        let resolutions = pass.album.resolve_records(&requests).await;
+        retry.observe_lookup(&resolutions);
+        if retry.provider_auth_errors > 0 {
+            retry.tasks.clear();
+            break;
+        }
+        let paired: Vec<_> = resolutions
+            .results
+            .into_iter()
+            .filter_map(|(source, resolution)| match resolution {
+                RecordResolution::AssetPresent { master_record_name } => Some(
+                    RecordLookupRequest::paired(source.clone(), master_record_name, source),
+                ),
+                _ => None,
+            })
+            .collect();
+        if shutdown_token.is_cancelled() {
+            break;
+        }
+        let resolutions = pass.album.resolve_records(&paired).await;
+        retry.observe_lookup(&resolutions);
+        if retry.provider_auth_errors > 0 {
+            retry.tasks.clear();
+            break;
+        }
+        for (_, resolution) in resolutions.results {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            let RecordResolution::Present(asset) = resolution else {
+                continue;
+            };
+            for task in failed_tasks.iter().filter(|task| {
+                task.library.as_ref() == zone
+                    && task.asset_record_name.as_ref() == asset.asset_record_name()
+            }) {
+                let Some((_, version)) = asset.versions().iter().find(|(size, version)| {
+                    VersionSizeKey::from(*size) == task.version_size
+                        && version.checksum == task.checksum
+                        && version.size == task.size
+                }) else {
+                    continue;
+                };
+                if pending_keys.remove(&RetryTaskKey::from(task)) {
+                    retry.tasks.push(DownloadTask {
+                        url: version.url.clone(),
+                        ..task.clone()
+                    });
+                }
+            }
+        }
+    }
+    let missing = requested_count.saturating_sub(retry.tasks.len());
+    if missing > 0 {
+        tracing::warn!(
+            requested = requested_count,
+            refreshed = retry.tasks.len(),
+            missing,
+            "Cleanup pass could not refresh every failed task; unmatched failures remain pending"
+        );
+    }
+    retry
+}
+
 /// Rebuild failed tasks with fresh CDN URLs, using targeted lookups after expiry.
 ///
 /// The first pass may fail because signed content URLs expired before the
@@ -3899,8 +3991,12 @@ async fn build_retry_download_tasks(
     refresh: CleanupUrlRefresh,
     shutdown_token: CancellationToken,
 ) -> Result<CleanupRetryPlan> {
-    if failed_tasks.is_empty() {
+    if failed_tasks.is_empty() || shutdown_token.is_cancelled() {
         return Ok(CleanupRetryPlan::default());
+    }
+
+    if matches!(refresh, CleanupUrlRefresh::Lookup) {
+        return Ok(refresh_failed_download_urls(passes, failed_tasks, &shutdown_token).await);
     }
 
     let mut pending_keys: FxHashSet<RetryTaskKey> =
@@ -3919,54 +4015,7 @@ async fn build_retry_download_tasks(
             break;
         }
 
-        let assets = match refresh {
-            CleanupUrlRefresh::Enumerate => pass.album.photos(config.recent).await?,
-            CleanupUrlRefresh::Lookup => {
-                let requests: Vec<_> = failed_tasks
-                    .iter()
-                    .filter(|task| task.library.as_ref() == pass.album.zone_name())
-                    .map(|task| task.asset_record_name.as_ref())
-                    .collect::<FxHashSet<_>>()
-                    .into_iter()
-                    .map(|name| RecordLookupRequest::asset_only(ProviderRecordId::new(name)))
-                    .collect();
-                let resolutions = pass.album.resolve_records(&requests).await;
-                retry.observe_lookup(&resolutions);
-                if retry.provider_auth_errors > 0 {
-                    retry.tasks.clear();
-                    break;
-                }
-                let paired: Vec<_> = resolutions
-                    .results
-                    .into_iter()
-                    .filter_map(|(source, resolution)| match resolution {
-                        RecordResolution::AssetPresent { master_record_name } => Some(
-                            RecordLookupRequest::paired(source.clone(), master_record_name, source),
-                        ),
-                        _ => None,
-                    })
-                    .collect();
-                if shutdown_token.is_cancelled() {
-                    break;
-                }
-                let resolutions = pass.album.resolve_records(&paired).await;
-                retry.observe_lookup(&resolutions);
-                if retry.provider_auth_errors > 0 {
-                    retry.tasks.clear();
-                    break;
-                }
-                resolutions
-                    .results
-                    .into_iter()
-                    .filter_map(|(_, resolution)| match resolution {
-                        RecordResolution::Present(asset) => {
-                            Some(asset.with_source_zone(Arc::from(pass.album.zone_name())))
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            }
-        };
+        let assets = pass.album.photos(config.recent).await?;
         #[allow(
             clippy::indexing_slicing,
             reason = "pass_index comes from enumerate() over `passes`; pass_configs is \
@@ -9480,6 +9529,11 @@ mod tests {
 
         for recovery in [
             "fresh",
+            "album_fresh",
+            "album_unfiled",
+            "album_cancelled",
+            "album_changed_checksum",
+            "album_changed_size",
             "expired",
             "missing",
             "auth_asset",
@@ -9491,7 +9545,10 @@ mod tests {
             "shutdown_lookup",
         ] {
             let (capture, _guard) = TracingCapture::install();
-            let downloads = matches!(recovery, "fresh" | "rate_asset" | "rate_master");
+            let downloads = matches!(
+                recovery,
+                "fresh" | "album_fresh" | "album_unfiled" | "rate_asset" | "rate_master"
+            );
             let shutdown = CancellationToken::new();
             let server = crate::start_wiremock_or_skip!();
             let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
@@ -9526,10 +9583,16 @@ mod tests {
             let mut fresh = old.clone();
             fresh[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
                 json!(format!("{}/new.jpg", server.uri()));
+            if recovery == "album_changed_checksum" {
+                fresh[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("changed");
+            }
+            if recovery == "album_changed_size" {
+                fresh[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(body.len() + 1);
+            }
             let old_asset = PhotoAsset::new(old[0].clone(), old[1].clone());
             let fresh_asset = PhotoAsset::new(fresh[0].clone(), fresh[1].clone());
             let lookups = Arc::new(AtomicUsize::new(0));
-            let passes = vec![AlbumPass {
+            let mut passes = vec![AlbumPass {
                 kind: PassKind::Unfiled,
                 album: album_with_session_and_retry_config(
                     "PrimarySync",
@@ -9553,19 +9616,34 @@ mod tests {
                 ),
                 exclude_ids: Arc::new(FxHashSet::default()),
             }];
+            if recovery.starts_with("album_") {
+                let mut album = passes[0].clone();
+                album.kind = PassKind::Album;
+                album.album.name = "Album A".into();
+                passes.insert(0, album);
+            }
             let dir = TempDir::new().unwrap();
             let db_path = dir.path().join("state.db");
             let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
             let mut config = test_config();
             config.directory = Arc::from(dir.path().join("media"));
             config.state_db = Some(db.clone());
+            if recovery.starts_with("album_") {
+                config.folder_structure = "{album}".into();
+            }
+            let source_pass = if recovery == "album_unfiled" {
+                passes.last().unwrap()
+            } else {
+                &passes[0]
+            };
+            let stream_config = Arc::new(config.with_pass(source_pass));
             let config = Arc::new(config);
             let client = Client::new();
             let controls = DownloadControls::download_hidden();
             let streaming = pipeline::stream_and_download_from_stream(
                 &client,
                 futures_util::stream::iter(vec![Ok(old_asset)]),
-                &config,
+                &stream_config,
                 controls,
                 1,
                 CancellationToken::new(),
@@ -9574,6 +9652,10 @@ mod tests {
             .await
             .unwrap();
             assert!(streaming.url_expired_abort);
+            let original_path = streaming.failed[0].download_path.clone();
+            if recovery == "album_cancelled" {
+                shutdown.cancel();
+            }
             let (outcome, stats) = pipeline::build_download_outcome(
                 &client,
                 &passes,
@@ -9597,7 +9679,8 @@ mod tests {
             assert_eq!(stats.failed, usize::from(!downloads));
             assert_eq!(
                 stats.interrupted,
-                recovery.starts_with("auth_") || recovery == "shutdown_lookup"
+                recovery.starts_with("auth_")
+                    || matches!(recovery, "shutdown_lookup" | "album_cancelled")
             );
             assert_eq!(
                 stats.rate_limited,
@@ -9610,6 +9693,7 @@ mod tests {
             assert_eq!(
                 lookups.load(Ordering::SeqCst),
                 match recovery {
+                    "album_cancelled" => 0,
                     "missing" | "auth_asset" | "shutdown_lookup" => 1,
                     "rate_asset" | "rate_master" | "exhausted_master" => 3,
                     _ => 2,
@@ -9645,6 +9729,15 @@ mod tests {
             assert_eq!(summary.downloaded, u64::from(downloads));
             if downloads {
                 let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].local_path.as_ref(), Some(&original_path));
+                if recovery == "album_fresh" {
+                    assert!(original_path.starts_with(config.directory.join("Album A")));
+                    assert!(!config.directory.join("full-expired.jpg").exists());
+                }
+                if recovery == "album_unfiled" {
+                    assert!(!config.directory.join("Album A").exists());
+                }
                 assert_eq!(
                     std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
                     body
@@ -9652,7 +9745,7 @@ mod tests {
                 let stable = pipeline::stream_and_download_from_stream(
                     &client,
                     futures_util::stream::iter(vec![Ok(fresh_asset)]),
-                    &config,
+                    &stream_config,
                     controls,
                     1,
                     CancellationToken::new(),

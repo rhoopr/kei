@@ -324,9 +324,11 @@ A signed URL expiry stops the current full-download batch. The pipeline retains
 failed tasks, including queued tasks cancelled by that expiry, and makes one
 cleanup attempt through targeted asset and master lookups. User shutdown stops
 cleanup lookup and download dispatch. It does not enumerate albums again to
-refresh those URLs. Only exact asset, rendition, and destination matches can
-enter cleanup. Missing lookups,
-a second expiry, and cancelled tasks retain durable retry work. Successful
+refresh those URLs or rebuild unfiled exclusions. Cleanup updates only the URL
+on an already-selected task, preserving its destination and publication
+authorization. The library, child identity, rendition, checksum, and size must
+still match. Changed resources, missing lookups, a second expiry, and cancelled
+tasks retain durable retry work. Successful
 cleanup does not convert incomplete enumeration into checkpoint proof.
 Authentication failures during refresh stop cleanup and return a session-expired
 outcome. Refresh rate-limit observations contribute to the cycle count even
