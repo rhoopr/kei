@@ -5,15 +5,16 @@
 //! Live `import-existing` tests against the real Apple CloudKit API.
 //!
 //! Strategy:
-//! 1. **Setup once per test run**: download a fixture set of recent photos
-//!    via the real `kei sync` command (default size, default folder
-//!    structure, default match policy). The fixture directory is reused
-//!    across every test in this file via a `OnceLock`.
-//! 2. **Per test**: each test runs `kei import-existing` against that
-//!    fixture (or a copy of a subset of it) with a fresh state DB to
-//!    isolate side-effects.
+//! 1. **Setup on first fixture use**: download recent media via the real
+//!    `kei sync` command with the bounded primary-library selection in
+//!    `data/live-selection.toml`. Use the default size, folder structure,
+//!    and match policy. A `OnceLock` shares the fixture within this binary.
+//! 2. **Live import cases**: run `kei import-existing` against that fixture
+//!    (or a copy of a subset of it) with a fresh state DB.
 //!
-//! All tests are gated `#[ignore]`. Run with:
+//! Live tests are `#[ignore]`. Fixture-helper, command-builder, CLI-removal,
+//! and shared helper tests run offline without `--ignored`.
+//! Run the live tests with:
 //!
 //! ```sh
 //! cargo test --all-features --test import_existing_live -- --ignored --test-threads=1
@@ -34,7 +35,8 @@
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    reason = "import assertions and shared helpers use panics, diagnostics, and bounded fixture casts and indexing"
 )]
 
 mod common;
@@ -366,18 +368,10 @@ fn selected_fixture_files(data_dir: &Path) -> Vec<PathBuf> {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
-/// Smoke test: import-existing against the fixture's download dir
-/// matches the same assets the fixture sync wrote. Constrains the scan
-/// to `--recent N` matching the fixture so the comparison is apples-to-
-/// apples — the user's full library can be far larger than the fixture.
-///
-/// Under v0.13's per-pass scan model, the same asset can be enumerated
-/// multiple times: once per album it belongs to, plus the unfiled pass
-/// (which excludes album-member assets, so an asset is never counted by
-/// both). `summary.matched` therefore counts version-enumerations, while
-/// the state DB has one row per unique `(library, id, version_size)`. The
-/// natural relation is `matched >= rows`, with the gap proportional to
-/// the average album-membership-per-asset.
+/// Smoke test: import media written by the fixture sync with the same
+/// bounded primary-library selection. The recent window can change between
+/// scans, so the match ratio and row-count bounds are broad smoke checks.
+/// This fixture does not exercise album overlap or shared libraries.
 #[test]
 #[ignore]
 fn import_matches_default_layout_after_sync() {
@@ -405,8 +399,8 @@ fn import_matches_default_layout_after_sync() {
         let summary = parse_summary(&stdout);
         assert!(summary.total > 0, "expected some assets, got {summary:?}");
         // CloudKit's recent window can change while the live suite runs.
-        // Keep this as a broad smoke threshold; the exact import policy matrix
-        // is covered by the wiremock tests below.
+        // Keep this as a broad smoke threshold. Offline import tests in
+        // src/commands/import.rs cover controlled matching cases.
         let eligible = summary.total.saturating_sub(summary.filtered);
         let match_ratio = if eligible > 0 {
             (summary.matched as f64) / (eligible as f64)
@@ -420,11 +414,9 @@ fn import_matches_default_layout_after_sync() {
 
         let rows = count_downloaded_rows(test_data.path());
         assert!(rows > 0, "no rows written to state DB");
-        // Multi-pass invariant: matched >= rows (each unique asset can be
-        // enumerated by multiple album passes, but writes one DB row).
-        // Generous upper bound (matched <= 10 * rows) catches a runaway
-        // duplicate write without false-firing on accounts where assets
-        // average several album memberships.
+        // Compare reported matches with durable rows. These broad bounds
+        // detect missing rows or excessive counts, not exact equality or
+        // multi-pass behavior.
         assert!(
             summary.matched >= rows,
             "matched ({matched}) < rows ({rows}); per-pass model expects matched >= rows",
@@ -1039,11 +1031,10 @@ fn verify_checksums_passes_after_import() {
     });
 }
 
-// ── TOML × CLI override matrix ──────────────────────────────────────────
+// ── Import policy configuration ────────────────────────────────────────
 //
-// CLI > env > TOML > default per CLAUDE.md. The existing
-// `import_reads_toml_for_path_derivation` covers the TOML-only happy
-// path. These cover precedence + invalid-input handling.
+// `import_reads_toml_for_path_derivation` covers the TOML-configured path.
+// These cases cover the removed CLI flag, the default, and invalid TOML.
 
 /// The old `--file-match-policy` import override is gone in v0.20. Import
 /// path matching now reads `[photos].file_match_policy` from TOML.
@@ -1061,8 +1052,7 @@ fn import_file_match_policy_cli_flag_is_removed() {
         .stderr(predicate::str::contains("unexpected argument"));
 }
 
-/// Default kicks in when neither TOML nor CLI specify a value. With no
-/// kei.toml and no flag, file_match_policy defaults to
+/// Without a TOML override, file_match_policy defaults to
 /// `name-size-dedup-with-suffix`, which matches the fixture.
 #[test]
 #[ignore]
@@ -1101,9 +1091,7 @@ fn default_used_when_no_toml_no_cli_flag() {
 }
 
 /// An invalid TOML value for a typed enum field must produce a clean
-/// error (non-success exit), not silently fall back to default. Pins
-/// CLAUDE.md "no silent failures": a typo in the TOML can't read as
-/// "use default" or you'd silently use a different policy than intended.
+/// error (non-success exit), not silently fall back to the default policy.
 #[test]
 #[ignore]
 fn toml_invalid_file_match_policy_errors_loudly() {

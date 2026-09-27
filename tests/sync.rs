@@ -7,8 +7,8 @@
 //! Uses the bounded selection in `data/live-selection.toml`. No named album
 //! or particular media format is required. Exact content lives in fixture tests.
 //!
-//! All tests are `#[ignore]` -- they require iCloud credentials and hit the
-//! live Apple API. Run with:
+//! Live tests are `#[ignore]` and require iCloud credentials. Shared helper
+//! tests run offline without `--ignored`. Run the live tests with:
 //!
 //! ```sh
 //! cargo test --all-features --test sync -- --ignored --test-threads=1
@@ -23,7 +23,8 @@
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    reason = "live assertions and shared helpers use panics, diagnostics, and bounded fixture casts and indexing"
 )]
 
 mod common;
