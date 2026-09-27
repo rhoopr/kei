@@ -19,11 +19,11 @@
 //! cargo test --all-features --test import_existing_live -- --ignored --test-threads=1
 //! ```
 //!
-//! The fixture is intentionally not cleaned up between runs — the next
-//! invocation can reuse it via `KEI_IMPORT_FIXTURE_DIR`. By default the
-//! fixture lives in `/tmp/codex/kei/import-fixture/`, so a re-run just
-//! polls for new photos via the same `kei sync` command (which is a no-op
-//! when nothing changed).
+//! Each invocation downloads one bounded fixture into a fresh run directory
+//! under `KEI_IMPORT_FIXTURE_DIR` (default `/tmp/codex/kei/import-fixture/`).
+//! Runs retain their media and seed DB for failure inspection. Reusing old
+//! media with a new seed DB can select collision paths that differ from the
+//! paths an import of the original files must match.
 
 #![allow(
     clippy::unwrap_used,
@@ -90,10 +90,7 @@ fn prepare_fixture_data_dir(download_dir: &Path, cookie_dir: &Path) -> PathBuf {
     data_dir
 }
 
-/// Dir where the fixture sync writes its files. Reused across tests in a
-/// single `cargo test` invocation, and persisted across invocations
-/// (allowing the second run to re-use the cache as long as the dir exists
-/// and has files).
+/// Parent directory for isolated, retained live import runs.
 fn fixture_root() -> PathBuf {
     if let Ok(dir) = std::env::var("KEI_IMPORT_FIXTURE_DIR") {
         return PathBuf::from(dir);
@@ -101,20 +98,35 @@ fn fixture_root() -> PathBuf {
     PathBuf::from("/tmp/codex/kei/import-fixture")
 }
 
-/// One-shot ensure-fixture: returns the fixture download dir + the data
-/// dir used during the sync.
-///
-/// `download_dir` is persisted across cargo invocations (so the next run
-/// re-uses the cached photos). `data_dir` is rebuilt fresh each
-/// invocation because state-DB schemas drift across branches -- a v8 DB
-/// from a prior main-branch run would refuse to open on a v7 PR branch
-/// and fail the fixture sync. Photos on disk don't carry that risk.
+fn fresh_fixture_download_dir(root: &Path) -> PathBuf {
+    std::fs::create_dir_all(root).unwrap();
+    tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(root)
+        .unwrap()
+        .keep()
+}
+
+#[test]
+fn fixture_download_tree_is_isolated_between_runs() {
+    let root = tempdir().unwrap();
+    let first = fresh_fixture_download_dir(root.path());
+    std::fs::write(first.join("existing.JPG"), b"retained prior media").unwrap();
+    let second = fresh_fixture_download_dir(root.path());
+    assert_ne!(first, second);
+    assert!(std::fs::read_dir(second).unwrap().next().is_none());
+    assert_eq!(
+        std::fs::read(first.join("existing.JPG")).unwrap(),
+        b"retained prior media"
+    );
+}
+
+/// Share one pristine bounded seed within this test binary, never across runs.
 fn fixture() -> &'static (PathBuf, PathBuf) {
     static FIX: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     FIX.get_or_init(|| {
         let (username, password, cookie_dir) = common::require_preauth();
-        let download_dir = fixture_root();
-        std::fs::create_dir_all(&download_dir).unwrap();
+        let download_dir = fresh_fixture_download_dir(&fixture_root());
 
         let data_dir = prepare_fixture_data_dir(&download_dir, &cookie_dir);
 
@@ -392,10 +404,7 @@ fn import_matches_default_layout_after_sync() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let summary = parse_summary(&stdout);
         assert!(summary.total > 0, "expected some assets, got {summary:?}");
-        // Filtered assets are album members correctly excluded from the
-        // unfiled pass. Some unmatched entries are expected in live accounts:
-        // the persisted fixture can contain older collision choices, and
-        // CloudKit's recent window can move while the cached fixture is reused.
+        // CloudKit's recent window can change while the live suite runs.
         // Keep this as a broad smoke threshold; the exact import policy matrix
         // is covered by the wiremock tests below.
         let eligible = summary.total.saturating_sub(summary.filtered);

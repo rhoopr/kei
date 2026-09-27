@@ -65,7 +65,8 @@ All general live paths use `live-selection.toml`. Explicit negative selector
 cases may override selectors; scan-limit tests may lower the shared bound.
 Preflight reports the bounded selection and observed eligible filename count,
 without exposing filenames or requiring specific formats. Empty selection is
-a failure, not a passing skip. Test state and download directories stay isolated.
+a failure, not a passing skip. Test state and download directories stay isolated. Live import seeds use fresh
+per-run trees, so previous cached media cannot change collision naming.
 
 ## Safety and validation
 
