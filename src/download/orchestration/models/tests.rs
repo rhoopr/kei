@@ -501,3 +501,73 @@ fn zone_composition_projects_evidence_without_reading_report_safety_counters() {
         serde_json::to_value(expected).unwrap()
     );
 }
+
+#[tokio::test]
+async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition() {
+    use crate::state::{
+        CheckpointTransition, SparseAttemptOutcome, SparseEvidence, SparseIdentityStore,
+        SparseSourceId, SqliteStateDb, unresolved_identity_key,
+    };
+
+    let db = SqliteStateDb::open_in_memory().unwrap();
+    let row = db
+        .observe_sparse_identity(
+            "PrimarySync",
+            &SparseSourceId::new("retained-source"),
+            &SparseEvidence::new("retained-evidence".into()),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    let recovered = db
+        .record_sparse_attempt(&row, SparseAttemptOutcome::Recovered, chrono::Utc::now())
+        .await
+        .unwrap();
+    let proof = recovered.proof();
+    let mut delta = SyncResult::from_incremental_execution(
+        DownloadOutcome::Success,
+        Some("after".into()),
+        SyncStats::default(),
+        vec![proof.clone()],
+    );
+    // Reporting snapshots cannot erase or create durable checkpoint receipts.
+    delta.stats = SyncStats::default();
+    let mut inventory =
+        SyncResult::from_execution(DownloadOutcome::Success, None, SyncStats::default());
+    inventory.accumulate(&delta);
+    assert_eq!(inventory.checkpoint.sparse_identity_proofs, vec![proof]);
+    assert!(
+        serde_json::to_value(&inventory.stats)
+            .unwrap()
+            .get("sparse_identity_proofs")
+            .is_none()
+    );
+    db.commit_checkpoint_transition(CheckpointTransition {
+        sparse_identity_proofs: inventory.checkpoint.sparse_identity_proofs,
+        metadata_updates: vec![("sync_token:PrimarySync".into(), "after".into())],
+        metadata_deletes: vec![unresolved_identity_key("PrimarySync")],
+    })
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        assert!(
+            db.sparse_identities("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("after")
+        );
+        assert!(
+            db.get_metadata(&unresolved_identity_key("PrimarySync"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}

@@ -339,7 +339,12 @@ pub async fn download_photos_with_sync(
             )
             .await
         }
-        SyncMode::Incremental { .. } if has_metadata_backfill_work(&config).await => {
+        // Revision repair already owns stale catalogue rows. Re-enumerating the
+        // library cannot resolve ambiguous identity and defeats its batch bound.
+        SyncMode::Incremental { .. }
+            if metadata_capture_repair.stats.metadata_capture_remaining == 0
+                && has_metadata_backfill_work(&config).await =>
+        {
             let reason = FullEnumerationReason::MetadataBackfill;
             tracing::info!(
                 full_enumeration_reason = reason.as_str(),

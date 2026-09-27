@@ -1,3 +1,4 @@
+use crate::state::SqliteStateDb;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1914,4 +1915,32 @@ async fn incremental_ignores_pending_rows_from_other_libraries() {
         "PrimarySync should remain incremental when only SharedSync has pending work"
     );
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+}
+
+#[tokio::test]
+async fn metadata_backfill_in_another_library_does_not_force_full_enumeration() {
+    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    let row = TestAssetRecord::new("OTHER_LIBRARY_BACKFILL")
+        .library("SharedSync-OTHER")
+        .build();
+    db.upsert_seen(&row).await.unwrap();
+    db.mark_downloaded(
+        "SharedSync-OTHER",
+        "OTHER_LIBRARY_BACKFILL",
+        "original",
+        Path::new("/other.jpg"),
+        "hash",
+        None,
+    )
+    .await
+    .unwrap();
+    db.clear_metadata_hash_for_test("SharedSync-OTHER", "OTHER_LIBRARY_BACKFILL", "original");
+    let result = run_bounded_incremental_sync(db.clone(), Vec::new()).await;
+    assert!(!result.full_enumeration_ran);
+    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+    assert!(
+        db.has_downloaded_without_metadata_hash("SharedSync-OTHER")
+            .await
+            .unwrap()
+    );
 }

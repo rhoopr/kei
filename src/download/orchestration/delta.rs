@@ -1,7 +1,12 @@
 //! Incremental source-state transitions, relation changes, and hydration.
 
+mod sparse_identity;
+
+use crate::state::{SparseAttemptOutcome, SparseIdentityProof};
+use sparse_identity::SparseRetryContext;
 use std::borrow::Cow;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -401,6 +406,7 @@ impl<'a> IncrementalDeltaState<'a> {
 
 #[derive(Debug, Default)]
 pub(super) struct IncrementalDeltaSummary {
+    pub(super) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(super) identity_incomplete: bool,
     pub(super) sync_token: Option<String>,
     pub(super) token_unsafe_reason: Option<&'static str>,
@@ -822,13 +828,36 @@ async fn apply_incremental_relation_delta(
 }
 
 pub(super) async fn hydrate_unpaired_created_asset_deltas(
-    events: &mut [ChangeEvent],
+    events: &mut Vec<ChangeEvent>,
     pass: Option<&crate::commands::AlbumPass>,
     config: &DownloadConfig,
     summary: &mut IncrementalDeltaSummary,
     run_mode: DownloadRunMode,
+    shutdown_token: &CancellationToken,
 ) {
-    hydrate_unpaired_created_asset_deltas_inner(events, pass, config, summary).await;
+    let mut retry = SparseRetryContext::prepare(events, config, summary, run_mode).await;
+    retry
+        .revalidate_deletions(pass, config, summary, shutdown_token)
+        .await;
+    if shutdown_token.is_cancelled() {
+        summary.block_identity();
+        return;
+    }
+    hydrate_unpaired_created_asset_deltas_inner(
+        events, pass, config, summary, &mut retry, run_mode,
+    )
+    .await;
+    for event in events.iter().filter(|event| {
+        event.asset.is_some()
+            || event.reason == ChangeReason::HardDeleted
+            || (event.reason == ChangeReason::SoftDeleted
+                && event.record_type.as_deref() == Some("CPLAsset"))
+    }) {
+        // Only retained source IDs receive receipts. Explicit source deletion
+        // still requires the ordinary state-write and checkpoint gates; linked
+        // zone failure never proves source deletion.
+        retry.prove(&event.record_name, summary);
+    }
     // Persist before the producer closes the stream and finalizes its run.
     // A restart or a successful sync in another zone must not hide this work.
     if run_mode.downloads_files()
@@ -842,12 +871,34 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
         tracing::warn!(error = %error, "Failed to retain unresolved asset identity evidence");
     }
 }
+// Reapply the ordinary durable source transition even for a cached provider
+// deletion. A failed prior state write must not become a completion receipt.
+async fn apply_sparse_source_deletion(
+    event: &ChangeEvent,
+    config: &DownloadConfig,
+    summary: &mut IncrementalDeltaSummary,
+) {
+    if let Some(db) = &config.state_db {
+        let update = SourceStateUpdate::SoftDeleted { deleted_at: None };
+        let (result, state_key) =
+            apply_source_state_update(db.as_ref(), config, event, update).await;
+        record_incremental_state_transition_result(
+            result,
+            update.transition(),
+            state_key,
+            &mut summary.state_transition_failures,
+            &mut summary.token_unsafe_reason,
+        );
+    }
+}
 
 async fn hydrate_unpaired_created_asset_deltas_inner(
     events: &mut [ChangeEvent],
     pass: Option<&crate::commands::AlbumPass>,
     config: &DownloadConfig,
     summary: &mut IncrementalDeltaSummary,
+    retry: &mut SparseRetryContext,
+    run_mode: DownloadRunMode,
 ) {
     let mut pending = Vec::new();
     let mut unresolved: FxHashMap<String, Vec<usize>> = FxHashMap::default();
@@ -887,6 +938,10 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
             Some(master_record_name) => {
                 pending.push((index, event.record_name.to_string(), master_record_name));
             }
+            None if retry.deletion_is_current(event) => {
+                apply_sparse_source_deletion(event, config, summary).await;
+                retry.prove(&event.record_name, summary);
+            }
             None => unresolved
                 .entry(event.record_name.to_string())
                 .or_default()
@@ -902,6 +957,14 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
         return;
     };
 
+    retry.select_due(&unresolved);
+    unresolved.retain(|source, indices| {
+        if retry.permits(source, events, indices) {
+            return true;
+        }
+        summary.block_identity();
+        false
+    });
     if !unresolved.is_empty() {
         let requests: Vec<RecordLookupRequest> = unresolved
             .keys()
@@ -915,6 +978,21 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                 summary.block_identity();
                 continue;
             };
+            let attempt = match &resolution {
+                RecordResolution::SparseShareUnresolved(evidence) => evidence.durable_key().map_or(
+                    SparseAttemptOutcome::Inconclusive,
+                    SparseAttemptOutcome::Unresolved,
+                ),
+                RecordResolution::AssetPresent { .. } => SparseAttemptOutcome::Recovered,
+                RecordResolution::Deleted {
+                    master_family: false,
+                    ..
+                } => retry.deletion_outcome(),
+                _ => SparseAttemptOutcome::Inconclusive,
+            };
+            retry
+                .record(state_id.as_str(), attempt, config, summary, run_mode)
+                .await;
             match resolution {
                 RecordResolution::AssetPresent { master_record_name } => {
                     summary
@@ -933,10 +1011,36 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                         )
                     }));
                 }
+                RecordResolution::SparseShareUnresolved(evidence) => {
+                    summary.block_identity();
+                    for index in indices {
+                        let Some(event) = events.get_mut(index) else {
+                            continue;
+                        };
+                        if let Some(previous) = &event.sparse_share {
+                            if previous != &evidence {
+                                tracing::debug!(
+                                    diagnostic = "sparse_share_reference_changed",
+                                    "Sparse-share evidence changed during identity lookup; identity remains unresolved"
+                                );
+                            }
+                        } else {
+                            event.sparse_share = Some(evidence.clone());
+                        }
+                    }
+                }
                 RecordResolution::Deleted {
                     master_family: false,
                     ..
                 } => {
+                    if run_mode.downloads_files() {
+                        for index in indices {
+                            if let Some(event) = events.get(index) {
+                                apply_sparse_source_deletion(event, config, summary).await;
+                            }
+                        }
+                    }
+                    retry.prove(state_id.as_str(), summary);
                     tracing::debug!(
                         asset_record_name = state_id.as_str(),
                         library = %config.library,
@@ -967,6 +1071,17 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
             }
         }
         if !unresolved.is_empty() {
+            for source in unresolved.keys() {
+                retry
+                    .record(
+                        source,
+                        SparseAttemptOutcome::Inconclusive,
+                        config,
+                        summary,
+                        run_mode,
+                    )
+                    .await;
+            }
             summary.block_identity();
         }
     }
@@ -1011,6 +1126,7 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                 deleted_at,
                 master_family,
             } => {
+                retry.prove(state_id.as_str(), summary);
                 if let Some(db) = &config.state_db {
                     let update = SourceStateUpdate::SoftDeleted { deleted_at };
                     let (result, state_key) = if master_family {
@@ -1050,6 +1166,7 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
             RecordResolution::Present(_)
             | RecordResolution::AssetPresent { .. }
             | RecordResolution::MasterPresent
+            | RecordResolution::SparseShareUnresolved(_)
             | RecordResolution::Unknown => {
                 summary.block_identity();
                 tracing::warn!(

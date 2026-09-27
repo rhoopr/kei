@@ -891,13 +891,17 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+    pub(crate) async fn has_downloaded_without_metadata_hash(
+        &self,
+        library: &str,
+    ) -> Result<bool, StateError> {
+        let library = library.to_owned();
         self.with_conn("has_downloaded_without_metadata_hash", move |conn| {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
-                     AND is_deleted = 0 AND metadata_hash IS NULL)",
-                    [],
+                     AND is_deleted = 0 AND metadata_hash IS NULL AND library = ?1)",
+                    [&library],
                     |row| row.get(0),
                 )
                 .map_err(|e| StateError::query("has_downloaded_without_metadata_hash", e))?;
@@ -1350,8 +1354,11 @@ impl MetadataRewriteStore for SqliteStateDb {
         .await
     }
 
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
-        SqliteStateDb::has_downloaded_without_metadata_hash(self).await
+    async fn has_downloaded_without_metadata_hash(
+        &self,
+        library: &str,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::has_downloaded_without_metadata_hash(self, library).await
     }
 
     async fn begin_metadata_capture_revision(

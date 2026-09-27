@@ -497,7 +497,11 @@ async fn record_and_clear_metadata_write_failure_roundtrip() {
 #[tokio::test]
 async fn has_downloaded_without_metadata_hash_returns_false_on_empty() {
     let db = SqliteStateDb::open_in_memory().unwrap();
-    assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+    assert!(
+        !db.has_downloaded_without_metadata_hash("PrimarySync")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -505,7 +509,11 @@ async fn has_downloaded_without_metadata_hash_skips_pending() {
     let db = SqliteStateDb::open_in_memory().unwrap();
     let rec = TestAssetRecord::new("P1").build();
     db.upsert_seen(&rec).await.unwrap();
-    assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+    assert!(
+        !db.has_downloaded_without_metadata_hash("PrimarySync")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -529,7 +537,16 @@ async fn has_downloaded_without_metadata_hash_detects_missing_hash() {
         conn.execute("UPDATE assets SET metadata_hash = NULL WHERE id = 'D1'", [])
             .unwrap();
     }
-    assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+    assert!(
+        db.has_downloaded_without_metadata_hash("PrimarySync")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.has_downloaded_without_metadata_hash("SharedSync-OTHER")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -556,7 +573,11 @@ async fn has_downloaded_without_metadata_hash_skips_soft_deleted() {
         .await
         .unwrap();
     // A soft-deleted row is never re-enumerated, so its NULL hash must not drive full enumeration.
-    assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+    assert!(
+        !db.has_downloaded_without_metadata_hash("PrimarySync")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

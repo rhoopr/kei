@@ -1585,9 +1585,36 @@ async fn download_config_legacy_hash_migrates_without_reconciliation() {
 
 #[tokio::test]
 async fn unresolved_identity_inventory_requires_a_delta_bridge() {
-    for prior_token in [None, Some("retained-before")] {
+    use crate::state::{SparseAttemptOutcome, SparseEvidence, SparseSourceId};
+    for (prior_token, sparse) in [None, Some("retained-before")]
+        .into_iter()
+        .flat_map(|token| [false, true].map(|sparse| (token, sparse)))
+    {
         let inner = make_state_db();
         let marker = state::unresolved_identity_key("PrimarySync");
+        if sparse {
+            let key = SparseEvidence::new(
+                r#"[1,"private-child","SharedSync-absent","private-owner"]"#.into(),
+            );
+            let row = inner
+                .observe_sparse_identity(
+                    "PrimarySync",
+                    &SparseSourceId::new("private-source"),
+                    &key,
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            inner
+                .record_sparse_attempt(
+                    &row,
+                    SparseAttemptOutcome::Unresolved(key),
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+        }
+        let blocked = prior_token.is_none() || sparse;
         inner.set_metadata(&marker, "1").await.unwrap();
         inner
             .set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "old-config")
@@ -1626,10 +1653,10 @@ async fn unresolved_identity_inventory_requires_a_delta_bridge() {
             )
             .await
             .unwrap();
-            assert_eq!(result.failed_count > 0, prior_token.is_none());
+            assert_eq!(result.failed_count > 0, blocked);
             assert_eq!(
                 inner.get_metadata(&marker).await.unwrap().is_some(),
-                prior_token.is_none()
+                blocked
             );
             assert_eq!(
                 inner
@@ -1637,9 +1664,27 @@ async fn unresolved_identity_inventory_requires_a_delta_bridge() {
                     .await
                     .unwrap()
                     .as_deref(),
-                prior_token.map(|_| "bridged-after")
+                if sparse {
+                    prior_token
+                } else {
+                    prior_token.map(|_| "bridged-after")
+                }
             );
             assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(
+                inner.sparse_identities("PrimarySync").await.unwrap().len(),
+                usize::from(sparse)
+            );
+            if blocked {
+                assert_eq!(
+                    inner
+                        .get_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY)
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("old-config")
+                );
+            }
         }
     }
 }

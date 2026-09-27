@@ -23,7 +23,7 @@ mod test_support;
 
 pub(super) use fingerprint::ExistingFileFingerprint;
 pub(crate) use fingerprint::compute_sha256;
-pub(super) use fingerprint::fingerprint_regular_file;
+pub(super) use fingerprint::{fingerprint_downloaded_path, fingerprint_regular_file};
 pub(super) use publication::publish_part_to_final;
 #[cfg(test)]
 pub(super) use publication::rename_part_to_final;

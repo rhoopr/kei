@@ -1,0 +1,29 @@
+{
+  "recordName": "private-sparse-child",
+  "recordType": "CPLAsset",
+  "deleted": false,
+  "fields": {
+    "assetDate": {
+      "type": "TIMESTAMP",
+      "value": 1700000000000
+    },
+    "isSparsePrivateRecord": {
+      "type": "INT64",
+      "value": 1
+    },
+    "linkedShareRecordName": {
+      "type": "STRING",
+      "value": "private-linked-child"
+    },
+    "linkedShareZoneName": {
+      "type": "STRING",
+      "value": "SharedSync-private-removed"
+    },
+    "linkedShareZoneOwner": {
+      "type": "REFERENCE",
+      "value": {
+        "recordName": "private-owner"
+      }
+    }
+  }
+}

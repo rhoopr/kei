@@ -21,6 +21,11 @@ mod membership;
 mod metadata;
 mod reconciliation;
 mod reports;
+mod sparse_identity;
+pub(crate) use sparse_identity::{
+    SparseAttemptOutcome, SparseDeletionCheckpoint, SparseEvidence, SparseIdentity,
+    SparseIdentityProof, SparseIdentityStore, SparseSourceId,
+};
 mod rows;
 mod temp_files;
 

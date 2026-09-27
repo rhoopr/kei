@@ -61,11 +61,12 @@ impl crate::icloud::photos::PhotosSession for LegacyPendingDeleteSession {
 fn make_one_photo_incremental_album_for_zone(
     zone: &str,
     zone_sync_token: &str,
+    download_url: &str,
 ) -> crate::icloud::photos::PhotoAlbum {
     make_one_photo_incremental_album_with_download(
         zone,
         zone_sync_token,
-        "https://p01.icloud-content.com/photo.jpg",
+        download_url,
         1024,
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     )
@@ -1418,13 +1419,18 @@ async fn run_cycle_multi_zone_status_preserves_an_earlier_checkpoint_hold() {
 
 #[tokio::test]
 async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/cancelled.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 1024]))
+        .expect(0)
+        .mount(&server)
+        .await;
     let config = make_run_cycle_config();
-    let state_dir = tempfile::tempdir().expect("state directory");
-    let inner: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
-            .await
-            .expect("file-backed state"),
-    );
+    let inner = make_state_db();
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
@@ -1440,7 +1446,11 @@ async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() 
     let lib_state = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
-        make_one_photo_incremental_album_for_zone("PrimarySync", "zone-tok-new"),
+        make_one_photo_incremental_album_for_zone(
+            "PrimarySync",
+            "zone-tok-new",
+            &format!("{}/cancelled.jpg", server.uri()),
+        ),
     );
     let states = vec![&lib_state];
     let build_download_config =
@@ -1486,7 +1496,6 @@ async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() 
         "test must not pass by completing the download before cancellation"
     );
 }
-
 #[tokio::test]
 async fn checkpoint_pilot_holds_preserve_file_backed_state_across_cycles() {
     for hold in ["dry_run", "missing_token", "stale_plan"] {

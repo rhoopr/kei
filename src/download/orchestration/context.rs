@@ -269,6 +269,7 @@ impl DownloadContext {
         let mut downloaded_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in downloaded_records {
             let crate::state::DownloadedFileRecord {
+                is_current_path: _,
                 library,
                 id,
                 version_size,

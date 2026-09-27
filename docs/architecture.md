@@ -64,6 +64,7 @@ changing behavior.
 | Confined local copies | `src/download/file/reconciliation.rs` | Retains verified files and parent-directory capabilities through local copy and state finalization. |
 | File platform primitives | `src/download/file/platform.rs` | Owns platform rename, exchange, hard-link, and directory durability operations. |
 | State finalization | `src/download/finalize.rs` | Persists downloaded or failed outcomes and retries deferred state writes. |
+| Sparse identity retries | `src/download/orchestration/delta/sparse_identity.rs`, `src/state/db/sparse_identity.rs` | Selects bounded source retries and persists generation-fenced evidence; the cycle owner retains checkpoint authority. |
 | Durable retry resolution | `src/download/retry.rs` | Revalidates pending provider identity and builds exact retry tasks. |
 | Path rendering | `src/download/paths.rs` | Expands folder templates, normalizes names, and handles collision suffixes. |
 | Metadata writing | `src/download/metadata.rs`, `src/download/heif.rs`, `src/download/metadata_rewrite.rs` | Probes and writes opt-in EXIF/XMP data and drains metadata-only retry markers. |
@@ -186,14 +187,76 @@ clear it. Another zone's success and process restart retain the marker.
 Status aggregates all markers; cycle reporting does not advance health's last
 success while any remain. Selected zones with markers bypass watch-mode
 no-change shortcuts. Idle health also checks markers in unselected zones.
-Intentional bounded checkpoint holds alone are not failures. These keys do not
-change schema 25 or JSON report version 3.
+Intentional bounded checkpoint holds alone are not failures. The marker keys
+remain in metadata; JSON report version 3 is unchanged.
 
 The Photos adapter emits aggregate, fixed-label identity lookup diagnostics.
 They distinguish omitted records, unexpected types, decode failures, invalid
 master references, and record-level provider errors. Reference-zone context is
 classified without logging provider identifiers or response bodies. These
 observations do not authorize identity guesses or cross-zone retries.
+
+Unpaired asset deltas retain typed sparse-share evidence from
+`isSparsePrivateRecord` and the `linkedShare*` fields. Targeted record lookups
+request these fields too; ordinary media enumeration keeps its existing field
+projection. A structurally valid link remains unverified. Malformed links and
+valid links without a usable master remain unresolved. Link identifiers are
+opaque and their debug output is redacted. Lookup changes do not overwrite the
+original delta evidence or authorize a target lookup.
+
+Schema 26 adds `unresolved_sparse_identities`, keyed by library and source
+record in the account-scoped database. `src/state/db/sparse_identity.rs` stores
+the first observed link, latest delta link, separate lookup evidence, attempt
+time, and retry deadline. The Photos adapter owns the versioned link encoding.
+Observation and the existing unresolved marker commit in one transaction.
+The `sparse_identity_generation` metadata counter assigns monotonically
+increasing generations, including when a cleared source reappears.
+
+`src/download/orchestration/delta/sparse_identity.rs` owns retry selection for both incremental
+paths. A matching valid sparse lookup starts a one-hour delay. Repeated
+matching results double the delay to a 24-hour maximum. Each library execution
+selects at most 100 due, identified sparse source-only lookups, ordered by
+retry deadline or last attempt, then generation and source key. Exact
+source/master mappings bypass suppression and do not consume that budget. Malformed or changed
+incoming evidence cannot inherit a cached negative result. Unclassified
+sources still need an initial lookup before sparse retry policy can apply.
+A deferred source remains unresolved and blocks the checkpoint. Retained
+sources absent from replay re-enter normal hydration and media planning.
+
+Authoritative source-only deletion lookups retain the completed delta token in
+`last_outcome` as `["source_deleted_v1", token]`. This is provider evidence,
+not a persisted claim that local processing completed. On restart or the next
+batch, the same complete delta snapshot and unchanged source evidence can
+reuse that result. The ordinary source-state transition runs again before a
+current receipt is issued. A missing delta token, changed link, or authoritative
+master mapping requires normal recovery.
+For a different token, the Photos adapter scans the complete raw zone delta
+since each saved deletion checkpoint. One scan validates a whole batch.
+Any source change, including restoration with the same link, invalidates its
+cached deletion. Sources absent from a complete scan retain their deletion
+evidence at the current boundary with fresh generation fences. Missing tokens,
+invalid pages, incomplete scans, and cancellation supply no reuse evidence.
+Normal source lookups can still establish fresh results after a failed scan.
+Validation does not advance the sync checkpoint or complete local processing.
+This lets more than 100 deleted sources complete over bounded lookup batches
+while unrelated zone records change, without relaxing checkpoint or state-write
+guards. Existing schema-26 outcome labels remain readable.
+
+Hydration, explicitly soft-deleted source `CPLAsset` deltas, and exact-source
+hard-deletion tombstones supply generation-fenced receipts, not permission to
+advance a checkpoint. Incremental results carry these receipts in
+`CheckpointEvidence`, not `SyncStats`. Inventory and delta-bridge composition
+retain the receipts in zone-local evidence. The cycle owner still requires
+normal processing and checkpoint proof. The checkpoint transaction validates every retained source receipt
+before clearing its row and zone marker. Missing, changed, or stale receipts
+roll back the transition. Inventory alone, interruption, failed state writes,
+and another library's success cannot clear the obligation. Configuration
+reconciliation uses the same fence when publishing its staged checkpoints.
+Status reports unresolved and deferred counts without provider identifiers.
+
+A linked record name, missing/deleted shared zone, or history of removing a
+Shared Photo Library is not a source deletion or master identity. No automatic
+cross-zone recovery or checkpoint relaxation is added.
 
 The per-zone provider checkpoint and the scoped database pre-check token have
 different gates:
@@ -237,6 +300,20 @@ failed finalization, retries can adopt a verified reserved sibling even when
 the catalog still records the previous source. Dry runs and filename listings
 do not commit choices. Recorded retry paths follow the same ownership checks. Explicit truncated-file repair can still use its own path
 when the existing fingerprint and repair authorization pass.
+
+Download planning also loads current-content publication receipts from
+`asset_metadata_paths`. An additional album copy can satisfy a download only
+in that pass's destination and filename family. The planner rejects foreign
+catalog ownership, opens the file without following links, and checks its
+local SHA-256. Old provider generations cannot satisfy current downloads.
+These checks do not move the catalog's current path or change retry receipts.
+Without reconciliation reservations, an unsafe historical path disables optional
+receipt reuse for that pass instead of blocking ordinary downloads. Reserved
+paths retain strict validation. Live Photo planning applies filters before file
+checks and does not hash the still when same-size current companions satisfy
+the existing skip rules. New companions use a verified still filename. Existing
+companions with older numbered still stems remain usable after hash verification;
+Kei does not rename or delete them.
 
 Local path reconciliation opens source and destination leaf entries without
 following symlinks. It hashes the opened file and rechecks its identity before
@@ -317,6 +394,21 @@ HTTP error bodies retain the existing size bound and may contain non-JSON text.
 Successful responses are serialized from parsed JSON without pretty-printing.
 Writes are best-effort, with no run subfolder or cleanup.
 Release builds without debug assertions do not include this diagnostic code.
+
+A signed URL expiry stops the current full-download batch. The pipeline retains
+failed tasks, including queued tasks cancelled by that expiry, and makes one
+cleanup attempt through targeted asset and master lookups. User shutdown stops
+cleanup lookup and download dispatch. It does not enumerate albums again to
+refresh those URLs or rebuild unfiled exclusions. Cleanup updates only the URL
+on an already-selected task, preserving its destination and publication
+authorization. The library, child identity, rendition, checksum, and size must
+still match. Changed resources, missing lookups, a second expiry, and cancelled
+tasks retain durable retry work. Successful
+cleanup does not convert incomplete enumeration into checkpoint proof.
+Authentication failures during refresh stop cleanup and return a session-expired
+outcome. Refresh rate-limit observations contribute to the cycle count even
+when provider retries are exhausted. The `expired_url_refresh_failed` diagnostic
+reports failure, authentication, and rate-limit counts without provider details.
 
 Full enumeration streams records/query results and gathers a provider token
 from every active pass. Natural stream completion and usable, unanimous pass
@@ -605,7 +697,15 @@ and pending repair state. A normal sync hydrates stale downloaded rows in
 bounded provider-lookup batches, independent of album, media, and date filters.
 Only an identity that cannot be resolved from durable asset/master evidence
 uses the bounded legacy hydration path. Unselected libraries keep separate
-pending state and do not force work in selected libraries.
+pending state and do not force work in selected libraries. The legacy missing-hash
+fallback checks only the selected library. While revision repair has pending
+work, it owns that backlog instead of forcing a second full enumeration.
+Ambiguous provider children remain pending and block the affected checkpoint;
+a matching rendition alone does not prove which child owns the metadata.
+The `metadata_capture_ambiguity_counts_v1` diagnostic reports stored rendition,
+matching child, and full-evidence matching child counts. It contains no IDs,
+paths, checksums, or provider metadata. These counts do not authorize identity
+selection, even when only one child matches every stored rendition.
 
 Automatic repair processes at most 500 stale assets per library in one sync
 cycle. When a clean batch makes progress and work remains, watch and service

@@ -1,3 +1,4 @@
+use crate::test_helpers::TracingCapture;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -52,7 +53,11 @@ async fn incremental_with_metadata_backfill_records_full_enumeration_reason() {
     .await
     .expect("mark downloaded");
     db.clear_metadata_hash_for_test("PrimarySync", "BACKFILL_BEFORE_SYNC", "original");
-    assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+    assert!(
+        db.has_downloaded_without_metadata_hash("PrimarySync")
+            .await
+            .unwrap()
+    );
 
     let session = MockPhotosFlow::new()
         .album_count(0)
@@ -586,6 +591,141 @@ async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
 }
 
 #[tokio::test]
+async fn ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_backfill() {
+    #[derive(Clone, Debug)]
+    struct AmbiguousCaptureSession(Arc<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl PhotosSession for AmbiguousCaptureSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/lookup?") {
+                return Ok(json!({"records": [self.0[0].clone()]}));
+            }
+            assert!(
+                url.contains("/changes/zone?"),
+                "ambiguous capture must not force album enumeration"
+            );
+            let request: Value = serde_json::from_str(&body).unwrap();
+            let records = if request["zones"][0]["syncToken"].is_string() {
+                Vec::new()
+            } else {
+                self.0.as_ref().clone()
+            };
+            Ok(changes_zone_response(records, "zone-token-next"))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+    let mut records = incremental_photo_records_with_favorite("CAPTURE_AMBIGUOUS", false);
+    let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+    let mut sibling = records[1].clone();
+    sibling["recordName"] = json!("asset-other-child");
+    sibling["fields"]["isFavorite"]["value"] = json!(1);
+    records.push(sibling);
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: album_with_session(
+            "PrimarySync",
+            "",
+            Box::new(AmbiguousCaptureSession(Arc::new(records))),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path().join("media"));
+    config.sync_mode = SyncMode::Incremental {
+        zone_sync_token: "zone-token-prev".into(),
+    };
+    let media_path = {
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let path = seed_downloaded_metadata_asset(&db, &config, &pass, &asset).await;
+        db.set_metadata_capture_revision_for_test("PrimarySync", "CAPTURE_AMBIGUOUS", 0);
+        db.clear_metadata_hash_for_test("PrimarySync", "CAPTURE_AMBIGUOUS", "original");
+        path
+    };
+    let original_bytes = std::fs::read(&media_path).unwrap();
+    for cycle in 1..=2 {
+        let (capture, _guard) = TracingCapture::install();
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let mut config = config.clone();
+        config.state_db = Some(db.clone());
+        let result = download_photos_with_sync(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.full_enumeration_ran);
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { .. }
+        ));
+        assert_eq!(result.sync_token, None);
+        assert_eq!(result.stats.metadata_capture_remaining, 1);
+        assert_eq!(result.stats.metadata_capture_failures, 1);
+        assert_eq!(result.stats.metadata_capture_refreshed, 0);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(METADATA_CAPTURE_REPAIR_FAILED_REASON)
+        );
+        assert!(
+            db.get_legacy_master_state_owners()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let summary = db.get_summary().await.unwrap();
+        let status = summary
+            .metadata_capture
+            .iter()
+            .find(|status| status.library == "PrimarySync")
+            .unwrap();
+        assert_eq!(status.failed_assets, cycle);
+        assert_eq!(
+            status.pending_revision,
+            Some(crate::state::METADATA_CAPTURE_REVISION)
+        );
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("multiple provider children matched durable catalogue evidence")
+        );
+        assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
+        let diagnostics: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.field("diagnostic") == Some("metadata_capture_ambiguity_counts_v1")
+            })
+            .collect();
+        assert_eq!(diagnostics.len(), 1);
+        let event = &diagnostics[0];
+        assert_eq!(event.field("stored_renditions"), Some("1"));
+        assert_eq!(event.field("matching_children"), Some("2"));
+        assert_eq!(event.field("full_evidence_matching_children"), Some("2"));
+        assert_eq!(event.fields.len(), 5);
+        for key in [
+            "message",
+            "diagnostic",
+            "stored_renditions",
+            "matching_children",
+            "full_evidence_matching_children",
+        ] {
+            assert!(event.fields.contains_key(key));
+        }
+    }
+}
+
+#[tokio::test]
 async fn failed_capture_lookup_preserves_incremental_checkpoint_and_retries() {
     #[derive(Clone, Debug)]
     struct FailingCaptureLookupSession;
@@ -632,37 +772,46 @@ async fn failed_capture_lookup_preserves_incremental_checkpoint_and_retries() {
         .await
         .unwrap();
     db.set_metadata_capture_revision_for_test("PrimarySync", "CAPTURE_RETRY", 0);
+    db.clear_metadata_hash_for_test("PrimarySync", "CAPTURE_RETRY", "original");
 
-    let result = download_photos_with_sync(
-        &Client::new(),
-        &[pass],
-        Arc::new(config),
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("lookup failure should remain a reported durable repair");
+    for _ in 0..2 {
+        let result = download_photos_with_sync(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("lookup failure should remain a reported durable repair");
 
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
-    assert_eq!(result.sync_token, None);
-    assert!(result.stats.sync_token_blocked);
-    assert_eq!(
-        result.stats.sync_token_blocked_reason,
-        Some(METADATA_CAPTURE_REPAIR_FAILED_REASON)
-    );
-    assert_eq!(result.stats.metadata_capture_failures, 1);
-    assert_eq!(result.stats.metadata_capture_remaining, 1);
-    assert!(
-        db.has_metadata_capture_work(&["PrimarySync"], crate::state::METADATA_CAPTURE_REVISION,)
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert!(
+            !result.full_enumeration_ran,
+            "stalled capture repair must not enumerate the library"
+        );
+        assert_eq!(result.sync_token, None);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(METADATA_CAPTURE_REPAIR_FAILED_REASON)
+        );
+        assert_eq!(result.stats.metadata_capture_failures, 1);
+        assert_eq!(result.stats.metadata_capture_remaining, 1);
+        assert!(
+            db.has_metadata_capture_work(
+                &["PrimarySync"],
+                crate::state::METADATA_CAPTURE_REVISION,
+            )
             .await
             .unwrap(),
-        "failed lookup must leave durable retry work"
-    );
+            "failed lookup must leave durable retry work"
+        );
+    }
 }
-
 #[tokio::test]
 async fn interrupted_capture_repair_keeps_unprocessed_rows_pending_without_failure() {
     let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));

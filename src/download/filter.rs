@@ -38,11 +38,12 @@ pub(crate) use eligibility::{FilterReason, determine_media_type, is_asset_filter
 pub(super) use expected_paths::{
     DerivationContext, DerivedPath, MalformedTaskResource, derive_alternative_extra,
     derive_edited_extra, derive_expected_paths, derive_live_edited_extra, derive_mov_companion,
-    derive_primary, malformed_no_task_resource,
+    derive_primary, malformed_no_task_resource, stored_path_matches_current_collision_family,
+    stored_path_matches_download_family,
 };
 pub(crate) use expected_paths::{ExpectedAssetPath, expected_paths_for};
 pub(crate) use metadata::AssetGroupings;
 pub(super) use metadata::MetadataPayload;
-pub(super) use tasks::{DownloadTask, filter_asset_to_tasks};
+pub(super) use tasks::{DownloadTask, filter_asset_to_tasks, filter_asset_to_tasks_with_primary};
 pub(super) use versions::{VersionsView, extract_skip_candidates};
 pub(crate) use versions::{metadata_capture, metadata_for_selected_version};

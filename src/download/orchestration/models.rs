@@ -4,6 +4,7 @@ use crate::download::pipeline::StreamingResult;
 use crate::download::{filter, recap};
 use crate::icloud::photos::ProviderRecordId;
 use crate::icloud::photos::asset::MALFORMED_REQUIRED_ASSET_FIELDS_REASON;
+use crate::state::SparseIdentityStore;
 use crate::state::{
     DownloadContextStateStore, DownloadStateStore, MembershipStore, MetadataRewriteStore,
     ReconciliationStateStore, ReportStateStore, SyncTokenStore, TempFileOwnershipStore,
@@ -35,7 +36,8 @@ pub enum SyncMode {
 }
 
 pub(crate) trait DownloadStore:
-    DownloadContextStateStore
+    SparseIdentityStore
+    + DownloadContextStateStore
     + DownloadStateStore
     + MembershipStore
     + MetadataRewriteStore
@@ -47,7 +49,8 @@ pub(crate) trait DownloadStore:
 }
 
 impl<T> DownloadStore for T where
-    T: DownloadContextStateStore
+    T: SparseIdentityStore
+        + DownloadContextStateStore
         + DownloadStateStore
         + MembershipStore
         + MetadataRewriteStore
@@ -198,6 +201,7 @@ pub(crate) struct CheckpointEvidence {
     pub(crate) sync_token_blocked: bool,
     pub(crate) retry_passes: Vec<PassKey>,
     pub(crate) revalidate_records: Vec<ProviderRecordId>,
+    pub(crate) sparse_identity_proofs: Vec<crate::state::SparseIdentityProof>,
 }
 
 impl CheckpointEvidence {
@@ -226,6 +230,8 @@ impl CheckpointEvidence {
         self.retry_passes.extend(other.retry_passes.iter().cloned());
         self.revalidate_records
             .extend(other.revalidate_records.iter().cloned());
+        self.sparse_identity_proofs
+            .extend(other.sparse_identity_proofs.iter().cloned());
     }
 
     pub(crate) fn project(&self, stats: &mut SyncStats) {
@@ -239,6 +245,19 @@ impl CheckpointEvidence {
 }
 
 impl SyncResult {
+    /// Carry durable sparse receipts with zone-local execution evidence.
+    #[must_use]
+    pub(super) fn from_incremental_execution(
+        outcome: DownloadOutcome,
+        sync_token: Option<String>,
+        stats: SyncStats,
+        proofs: Vec<crate::state::SparseIdentityProof>,
+    ) -> Self {
+        let mut result = Self::from_execution(outcome, sync_token, stats);
+        result.checkpoint.sparse_identity_proofs = proofs;
+        result
+    }
+
     /// Finish an existing non-pilot result producer. Subsequent composition
     /// must use the evidence, not re-read the reporting snapshot.
     pub(crate) fn from_execution(

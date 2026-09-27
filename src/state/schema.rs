@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 25;
+pub(crate) const SCHEMA_VERSION: i32 = 26;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -40,6 +40,25 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     assets_failed INTEGER DEFAULT 0,
     interrupted INTEGER DEFAULT 0
 );
+";
+
+/// Sparse evidence does not authorize checkpoint advancement. Existing zone markers survive.
+const SCHEMA_V26: &str = r"
+CREATE TABLE IF NOT EXISTS unresolved_sparse_identities (
+    library TEXT NOT NULL,
+    source_record_name TEXT NOT NULL,
+    original_evidence TEXT NOT NULL,
+    observed_evidence TEXT NOT NULL,
+    lookup_evidence TEXT,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    first_seen_at INTEGER NOT NULL,
+    last_attempt_at INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    next_retry_at INTEGER,
+    last_outcome TEXT,
+    PRIMARY KEY (library, source_record_name)
+);
+CREATE INDEX IF NOT EXISTS idx_sparse_identity_retry ON unresolved_sparse_identities(library, next_retry_at);
 ";
 
 /// Get the current schema version from the database.
@@ -780,6 +799,7 @@ fn migrate_to_version(
         }
         24 => conn.execute_batch(SCHEMA_V24)?,
         25 => conn.execute_batch(SCHEMA_V25)?,
+        26 => conn.execute_batch(SCHEMA_V26)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -795,6 +815,63 @@ fn migrate_to_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v26_sparse_retry_migration_preserves_catalog_and_checkpoints() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=25 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute_batch("INSERT INTO metadata(key,value) VALUES ('sync_token:PrimarySync','before'),('unresolved_asset_identity:PrimarySync','1');
+            INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum) VALUES ('PrimarySync','child','original','provider','image.jpg',1,10,'photo','downloaded',1,'/photos/image.jpg','local');").unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 26);
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "before"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key='unresolved_asset_identity:PrimarySync'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT local_path,local_checksum,status FROM assets WHERE id='child'",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                ))
+            )
+            .unwrap(),
+            (
+                "/photos/image.jpg".into(),
+                "local".into(),
+                "downloaded".into()
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM unresolved_sparse_identities",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn v22_indexes_existing_legacy_owners_without_changing_them() {

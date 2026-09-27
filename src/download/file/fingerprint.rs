@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use crate::fs_util::{ConfinedParents, ConfinedPath};
 use anyhow::Context;
 use tokio::fs;
 
@@ -34,6 +35,24 @@ pub(in crate::download) async fn fingerprint_file(
 ) -> anyhow::Result<ExistingFileFingerprint> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || fingerprint_file_blocking(&path)).await?
+}
+
+/// Read a recorded destination without following leaf or ancestor links.
+pub(in crate::download) async fn fingerprint_downloaded_path(
+    root: &Path,
+    path: &Path,
+) -> anyhow::Result<ExistingFileFingerprint> {
+    let root = root.to_path_buf();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let confined = ConfinedPath::open(&root, &path, ConfinedParents::Existing)?;
+        let mut file = confined.open_regular()?;
+        let identity = crate::fs_util::file_identity(&file)?;
+        let fingerprint = fingerprint_open_file_snapshot_blocking(&mut file, &path)?.fingerprint;
+        confined.validate_identity(identity)?;
+        Ok(fingerprint)
+    })
+    .await?
 }
 
 fn fingerprint_file_blocking(path: &Path) -> anyhow::Result<ExistingFileFingerprint> {

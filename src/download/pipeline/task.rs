@@ -93,6 +93,19 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
     metadata_flags: MetadataFlags,
     context: DownloadSingleContext<'_>,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
+    // A producer can commit retry state immediately before cancellation. Do not
+    // start another HTTP request for its queued task while draining that batch.
+    if context.shutdown_token.is_cancelled() {
+        return Err(DownloadError::Interrupted {
+            path: task
+                .download_path
+                .to_string_lossy()
+                .into_owned()
+                .into_boxed_str(),
+            bytes_written: 0,
+        }
+        .into());
+    }
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await

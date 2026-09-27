@@ -1,6 +1,10 @@
+use super::merge_record_resolution;
+use crate::icloud::photos::asset::SparseShareEvidence;
+
 use crate::icloud::photos::album::test_support::{
     default_zone, make_album_with_session, test_asset_record_for, test_master_record,
 };
+use crate::icloud::photos::queries::DESIRED_KEYS_VALUES;
 use crate::icloud::photos::session::PhotosSession;
 use crate::retry::RetryConfig;
 use crate::test_helpers::MockPhotosSession;
@@ -247,7 +251,13 @@ async fn asset_identity_diagnostics_use_only_bounded_redacted_labels() {
     errored["serverErrorCode"] = json!("ACCESS_DENIED");
     let mut decode = missing.clone();
     decode["deleted"] = json!("private-invalid-boolean");
+    let mut sparse = crate::test_helpers::sparse_shared_asset_record();
+    sparse["recordName"] = json!("private-child");
+    let mut sparse_malformed = sparse.clone();
+    sparse_malformed["fields"]["linkedShareZoneOwner"]["value"] = json!("private-owner");
     let cases = [
+        (Some(sparse), "sparse_share_reference_unresolved"),
+        (Some(sparse_malformed), "sparse_share_reference_malformed"),
         (None, "record_omitted"),
         (
             Some(json!({"recordName": "private-child", "recordType": "private-type"})),
@@ -289,12 +299,21 @@ async fn asset_identity_diagnostics_use_only_bounded_redacted_labels() {
                 "private-child",
             ))])
             .await;
-        assert!(matches!(
-            batch.results.as_slice(),
-            [(_, RecordResolution::Unknown)]
-        ));
+        if expected.starts_with("sparse_share_reference_") {
+            assert!(matches!(
+                batch.results.as_slice(),
+                [(_, RecordResolution::SparseShareUnresolved(_))]
+            ));
+        } else {
+            assert!(matches!(
+                batch.results.as_slice(),
+                [(_, RecordResolution::Unknown)]
+            ));
+        }
     }
     let logs = std::fs::read_to_string(&log_path).unwrap();
+    assert!(logs.contains("sparse_share_reference_unresolved"));
+    assert!(logs.contains("sparse_share_reference_malformed"));
     assert!(logs.contains("record_omitted"));
     assert!(logs.contains("record_decode_failed"));
     assert!(logs.contains("count=1"));
@@ -318,6 +337,104 @@ async fn asset_identity_diagnostics_use_only_bounded_redacted_labels() {
     }
 }
 
+#[tokio::test]
+async fn sparse_share_lookup_requests_evidence_but_never_follows_the_link() {
+    #[derive(Debug, Clone)]
+    struct SparseSession {
+        master: Option<&'static str>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for SparseSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            assert!(url.contains("/records/lookup?"));
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["zoneID"]["zoneName"], "PrimarySync");
+            assert_eq!(
+                body["records"],
+                json!([{"recordName":"private-sparse-child"}])
+            );
+            let keys = body["desiredKeys"].as_array().unwrap();
+            for key in [
+                "isSparsePrivateRecord",
+                "linkedShareRecordName",
+                "linkedShareZoneName",
+                "linkedShareZoneOwner",
+                "masterRef",
+            ] {
+                assert!(keys.contains(&json!(key)), "{key}");
+                if key != "masterRef" {
+                    assert!(!DESIRED_KEYS_VALUES.contains(&json!(key)), "{key}");
+                }
+            }
+            let mut record = crate::test_helpers::sparse_shared_asset_record();
+            if let Some(master) = self.master {
+                record["fields"]["masterRef"] = json!({"value":{"recordName":master}});
+            }
+            Ok(json!({"records":[record]}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    for master in [None, Some("personal-master")] {
+        let album = make_album_with_session(100, Box::new(SparseSession { master }));
+        let batch = album
+            .resolve_records(&[RecordLookupRequest::asset_only(ProviderRecordId::new(
+                "private-sparse-child",
+            ))])
+            .await;
+        match &batch.results[0].1 {
+            RecordResolution::SparseShareUnresolved(SparseShareEvidence::Linked(_)) => {
+                assert_eq!(master, None)
+            }
+            RecordResolution::AssetPresent { master_record_name } => {
+                assert_eq!(Some(master_record_name.as_str()), master)
+            }
+            other => panic!("unexpected resolution: {other:?}"),
+        }
+        assert!(
+            !batch.complete,
+            "identity evidence alone is not a downloadable asset"
+        );
+    }
+    let evidence = SparseShareEvidence::from_fields(
+        &crate::test_helpers::sparse_shared_asset_record()["fields"],
+    )
+    .unwrap();
+    let mut merged = RecordResolution::Unknown;
+    merge_record_resolution(
+        &mut merged,
+        RecordResolution::SparseShareUnresolved(evidence),
+    );
+    merge_record_resolution(&mut merged, RecordResolution::Unknown);
+    assert!(matches!(merged, RecordResolution::SparseShareUnresolved(_)));
+    // Inconclusive share evidence must beat child-only deletion in either merge order.
+    let evidence = SparseShareEvidence::from_fields(
+        &crate::test_helpers::sparse_shared_asset_record()["fields"],
+    )
+    .unwrap();
+    let mut merged = RecordResolution::Deleted {
+        deleted_at: None,
+        master_family: false,
+    };
+    merge_record_resolution(
+        &mut merged,
+        RecordResolution::SparseShareUnresolved(evidence),
+    );
+    merge_record_resolution(
+        &mut merged,
+        RecordResolution::Deleted {
+            deleted_at: None,
+            master_family: false,
+        },
+    );
+    assert!(matches!(merged, RecordResolution::SparseShareUnresolved(_)));
+}
 #[tokio::test]
 async fn asset_only_delta_targeted_lookup_recovers_master_identity() {
     let mut record = test_asset_record_for("asset-present", "master-present");

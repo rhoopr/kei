@@ -48,7 +48,9 @@ pub use orchestration::models::{
 };
 pub(crate) use orchestration::reconciliation::reconcile_catalog_paths;
 use orchestration::selection::build_pass_configs_resolving_deferred_excludes;
-use orchestration::url_refresh::{RetryTaskKey, UrlRetrySource, build_retry_download_tasks};
+use orchestration::url_refresh::{
+    CleanupUrlRefresh, RetryTaskKey, UrlRetrySource, build_retry_download_tasks,
+};
 
 #[expect(
     unused_imports,

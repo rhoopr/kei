@@ -1,5 +1,8 @@
 //! Exact-task retry matching and stale download URL hydration.
 
+use crate::icloud::photos::{
+    ProviderRecordId, RecordLookupRequest, RecordResolution, RecordResolutionBatch,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -86,7 +89,138 @@ fn take_matching_retry_tasks<I>(
     }
 }
 
-/// Re-enumerate iCloud and rebuild only the failed tasks with fresh CDN URLs.
+#[derive(Clone, Copy)]
+pub(in crate::download) enum CleanupUrlRefresh {
+    Enumerate,
+    Lookup,
+}
+
+#[derive(Default)]
+pub(in crate::download) struct CleanupRetryPlan {
+    pub(in crate::download) tasks: Vec<DownloadTask>,
+    pub(in crate::download) provider_auth_errors: usize,
+    pub(in crate::download) rate_limit_observations: usize,
+}
+
+impl CleanupRetryPlan {
+    fn observe_lookup(&mut self, batch: &RecordResolutionBatch) {
+        self.rate_limit_observations = self
+            .rate_limit_observations
+            .saturating_add(batch.rate_limit_observations);
+        let mut failed_records = 0usize;
+        let mut authentication_failures = 0usize;
+        for (_, resolution) in &batch.results {
+            if let RecordResolution::TransientFailure(error) = resolution {
+                failed_records += 1;
+                authentication_failures += usize::from(error.is_authentication());
+            }
+        }
+        self.provider_auth_errors += authentication_failures;
+        if failed_records > 0 {
+            tracing::warn!(
+                diagnostic = "expired_url_refresh_failed",
+                failed_records,
+                authentication_failures,
+                rate_limit_observations = batch.rate_limit_observations,
+                "Provider lookup failed while refreshing expired download URLs"
+            );
+        }
+    }
+}
+
+/// Refresh only the URL on already-selected tasks. Their original destination,
+/// rendition, metadata and publication authorization retain the first pass's
+/// selection evidence, including deferred unfiled exclusions.
+async fn refresh_failed_download_urls(
+    passes: &[crate::commands::AlbumPass],
+    failed_tasks: &[DownloadTask],
+    shutdown_token: &CancellationToken,
+) -> CleanupRetryPlan {
+    let mut retry = CleanupRetryPlan::default();
+    let mut pending_keys: FxHashSet<_> = failed_tasks.iter().map(RetryTaskKey::from).collect();
+    let requested_count = pending_keys.len();
+    let mut refreshed_zones = FxHashSet::default();
+    for pass in passes {
+        if shutdown_token.is_cancelled() || pending_keys.is_empty() {
+            break;
+        }
+        let zone = pass.album.zone_name();
+        if !refreshed_zones.insert(zone) {
+            continue;
+        }
+        let requests: Vec<_> = failed_tasks
+            .iter()
+            .filter(|task| task.library.as_ref() == zone)
+            .map(|task| task.asset_record_name.as_ref())
+            .collect::<FxHashSet<_>>()
+            .into_iter()
+            .map(|name| RecordLookupRequest::asset_only(ProviderRecordId::new(name)))
+            .collect();
+        let resolutions = pass.album.resolve_records(&requests).await;
+        retry.observe_lookup(&resolutions);
+        if retry.provider_auth_errors > 0 {
+            retry.tasks.clear();
+            break;
+        }
+        let paired: Vec<_> = resolutions
+            .results
+            .into_iter()
+            .filter_map(|(source, resolution)| match resolution {
+                RecordResolution::AssetPresent { master_record_name } => Some(
+                    RecordLookupRequest::paired(source.clone(), master_record_name, source),
+                ),
+                _ => None,
+            })
+            .collect();
+        if shutdown_token.is_cancelled() {
+            break;
+        }
+        let resolutions = pass.album.resolve_records(&paired).await;
+        retry.observe_lookup(&resolutions);
+        if retry.provider_auth_errors > 0 {
+            retry.tasks.clear();
+            break;
+        }
+        for (_, resolution) in resolutions.results {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            let RecordResolution::Present(asset) = resolution else {
+                continue;
+            };
+            for task in failed_tasks.iter().filter(|task| {
+                task.library.as_ref() == zone
+                    && task.asset_record_name.as_ref() == asset.asset_record_name()
+            }) {
+                let Some((_, version)) = asset.versions().iter().find(|(size, version)| {
+                    VersionSizeKey::from(*size) == task.version_size
+                        && version.checksum == task.checksum
+                        && version.size == task.size
+                }) else {
+                    continue;
+                };
+                if pending_keys.remove(&RetryTaskKey::from(task)) {
+                    retry.tasks.push(DownloadTask {
+                        url: version.url.clone(),
+                        ..task.clone()
+                    });
+                }
+            }
+        }
+    }
+    let missing = requested_count.saturating_sub(retry.tasks.len());
+    if missing > 0 {
+        tracing::warn!(
+            requested = requested_count,
+            refreshed = retry.tasks.len(),
+            missing,
+            "Cleanup pass could not refresh every failed task; unmatched failures remain pending"
+        );
+    }
+    retry
+}
+
+/// Rebuild failed tasks with fresh CDN URLs, using targeted lookups after expiry.
 ///
 /// The first pass may fail because signed content URLs expired before the
 /// worker reached them. Retrying the complete library after that is both slow
@@ -97,10 +231,15 @@ pub(in crate::download) async fn build_retry_download_tasks(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
     failed_tasks: &[DownloadTask],
+    refresh: CleanupUrlRefresh,
     shutdown_token: CancellationToken,
-) -> Result<Vec<DownloadTask>> {
-    if failed_tasks.is_empty() {
-        return Ok(Vec::new());
+) -> Result<CleanupRetryPlan> {
+    if failed_tasks.is_empty() || shutdown_token.is_cancelled() {
+        return Ok(CleanupRetryPlan::default());
+    }
+
+    if matches!(refresh, CleanupUrlRefresh::Lookup) {
+        return Ok(refresh_failed_download_urls(passes, failed_tasks, &shutdown_token).await);
     }
 
     let mut pending_keys: FxHashSet<RetryTaskKey> =
@@ -108,7 +247,10 @@ pub(in crate::download) async fn build_retry_download_tasks(
     let retry_state_ids = retry_state_ids_by_asset_record(failed_tasks);
     let requested_count = pending_keys.len();
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
-    let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested_count);
+    let mut retry = CleanupRetryPlan {
+        tasks: Vec::with_capacity(requested_count),
+        ..CleanupRetryPlan::default()
+    };
     let mut task_planner = planner::TaskPlanner::for_download(config.state_db.as_deref()).await?;
 
     for (pass_index, pass) in passes.iter().enumerate() {
@@ -138,20 +280,20 @@ pub(in crate::download) async fn build_retry_download_tasks(
             if plan.filter_reason.is_some() {
                 continue;
             }
-            take_matching_retry_tasks(plan.tasks, &mut pending_keys, &mut tasks);
+            take_matching_retry_tasks(plan.tasks, &mut pending_keys, &mut retry.tasks);
         }
     }
 
     if !pending_keys.is_empty() {
         tracing::warn!(
             requested = requested_count,
-            refreshed = tasks.len(),
+            refreshed = retry.tasks.len(),
             missing = pending_keys.len(),
             "Cleanup pass could not refresh every failed task; unmatched failures remain pending"
         );
     }
 
-    Ok(tasks)
+    Ok(retry)
 }
 
 /// Hydrate current incremental asset records and rebuild only the task tuples

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use super::SparseIdentityProof;
 use crate::state::error::StateError;
 use crate::state::types::{
     AssetRecord, MetadataCapture, MetadataCaptureCandidate, MetadataCaptureStatus, SyncRunStats,
@@ -40,6 +41,8 @@ pub struct ImportedRecord {
 /// Compact downloaded-state projection used to preload sync decisions.
 #[derive(Debug)]
 pub(crate) struct DownloadedFileRecord {
+    /// This receipt is also the catalog's current path, not an additional copy.
+    pub(crate) is_current_path: bool,
     pub(crate) library: String,
     pub(crate) id: String,
     pub(crate) version_size: VersionSizeKey,
@@ -176,10 +179,15 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
     ) -> Result<(), StateError>;
 }
 
-/// State operation used only to preload the download context.
+/// State projections used to preload download decisions and publication receipts.
 #[async_trait]
 pub(crate) trait DownloadContextStateStore: Send + Sync {
     async fn get_downloaded_file_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError>;
+
+    /// Current-content publication receipts, including additional album paths.
+    async fn get_downloaded_path_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
+        Ok(Vec::new())
+    }
 }
 
 /// State operations for the temporary-file ownership ledger.
@@ -234,6 +242,7 @@ pub(crate) struct ScopedDbSyncToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointTransition {
+    pub(crate) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(crate) metadata_updates: Vec<(String, String)>,
     pub(crate) metadata_deletes: Vec<String>,
 }
@@ -842,7 +851,12 @@ pub trait MetadataRewriteStore: Send + Sync {
         pre_rewrite_checksum: Option<&str>,
         completion: MetadataRewriteCompletion,
     ) -> Result<bool, StateError>;
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
+    /// Check for live downloaded rows without a metadata hash in `library`.
+    ///
+    /// # Errors
+    /// Returns a state error if the catalogue query fails.
+    async fn has_downloaded_without_metadata_hash(&self, library: &str)
+    -> Result<bool, StateError>;
     async fn begin_metadata_capture_revision(
         &self,
         _library: &str,

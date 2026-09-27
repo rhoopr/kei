@@ -170,6 +170,20 @@ media. Kei retains the provider checkpoint so a later cycle can retry the
 unresolved records. Other valid assets can still download. Do not reset state
 or use a metadata refresh to bypass this guard.
 
+For valid sparse-share records, kei retains per-source retry evidence across
+restarts. An unchanged unresolved lookup retries after one hour, then doubles
+the delay up to 24 hours. Each library execution selects up to 100 due sparse
+source lookups. Exact saved source/master mappings can recover immediately;
+malformed or changed evidence does not reuse the negative result. `kei status`
+shows how many retained sparse records are unresolved and deferred. A deferred
+lookup does not mean that the record was skipped safely or deleted. These
+limits reduce repeated lookups; they do not repair a missing provider identity.
+
+This state uses schema 26. Stop workers and back up the state database before
+trying this build. Older binaries that support only schema 25 cannot open the
+upgraded database. Keep a compatible backup if you need to return to an older
+build. Do not reset state or lower its schema version to bypass this check.
+
 Kei marks unresolved asset identity cycles incomplete. Status
 remains unsafe across restarts and successful syncs in other libraries until
 the affected checkpoint can advance safely. Health does not update

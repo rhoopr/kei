@@ -6,6 +6,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashSet;
 
 use crate::download::file::{LocalFileSizeExpectation, local_file_size_matches_state};
+use crate::download::filter::stored_path_matches_current_collision_family;
 use crate::download::filter::{
     DerivedPath, DownloadTask, derive_expected_paths, determine_media_type,
 };
@@ -629,94 +630,6 @@ async fn state_path_size_allows_skip(
     }
 }
 
-fn stored_path_matches_current_collision_family(
-    asset_id: &str,
-    derived: &DerivedPath,
-    derived_paths: &[DerivedPath],
-    config: &DownloadConfig,
-    stored_path: &Path,
-) -> bool {
-    if stored_path.parent() != derived.path.parent() {
-        return false;
-    }
-
-    let Some(stored_filename) = stored_path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-
-    collision_family_base_filenames(asset_id, derived, derived_paths, config)
-        .iter()
-        .any(|base| stored_filename_matches_base_family(stored_filename, base, asset_id))
-}
-
-fn collision_family_base_filenames(
-    asset_id: &str,
-    derived: &DerivedPath,
-    derived_paths: &[DerivedPath],
-    config: &DownloadConfig,
-) -> Vec<String> {
-    let mut bases = vec![
-        derived.filename.clone(),
-        crate::download::paths::add_dedup_suffix(&derived.filename, derived.size),
-        crate::download::paths::insert_asset_identity_suffix(&derived.filename, asset_id),
-    ];
-
-    if derived.version_size.is_live_photo_motion()
-        && let Some(primary) = primary_derived_path(derived_paths)
-    {
-        let primary_collision_filenames = [
-            crate::download::paths::add_dedup_suffix(&primary.filename, primary.size),
-            crate::download::paths::insert_asset_identity_suffix(&primary.filename, asset_id),
-        ];
-        for primary_filename in primary_collision_filenames {
-            bases.push(live_photo_motion_filename_for_primary(
-                &primary_filename,
-                config,
-            ));
-        }
-    }
-
-    bases.sort();
-    bases.dedup();
-    bases
-}
-
-fn primary_derived_path(derived_paths: &[DerivedPath]) -> Option<&DerivedPath> {
-    derived_paths
-        .iter()
-        .find(|derived| derived.version_size.is_primary_media())
-}
-
-fn live_photo_motion_filename_for_primary(
-    primary_filename: &str,
-    config: &DownloadConfig,
-) -> String {
-    match config.live_photo_mov_filename_policy {
-        crate::types::LivePhotoMovFilenamePolicy::Suffix => {
-            crate::download::paths::live_photo_mov_path_suffix(primary_filename)
-        }
-        crate::types::LivePhotoMovFilenamePolicy::Original => {
-            crate::download::paths::live_photo_mov_path_original(primary_filename)
-        }
-    }
-}
-
-fn stored_filename_matches_base_family(stored_filename: &str, base: &str, asset_id: &str) -> bool {
-    let base = crate::download::paths::clean_filename(base);
-    let base = base.as_ref();
-    filenames_match_ampm_equivalent(stored_filename, base)
-        || crate::download::paths::filename_matches_identity_collision(
-            base,
-            asset_id,
-            stored_filename,
-        )
-        || crate::download::paths::filename_matches_identity_collision(
-            &crate::download::paths::normalize_ampm(base),
-            asset_id,
-            &crate::download::paths::normalize_ampm(stored_filename),
-        )
-}
-
 fn filenames_match_ampm_equivalent(a: &str, b: &str) -> bool {
     a == b || crate::download::paths::normalize_ampm(a) == crate::download::paths::normalize_ampm(b)
 }
@@ -796,16 +709,22 @@ pub(in crate::download) async fn state_confirmed_current_path_exists(
     task: &DownloadTask,
     task_planner: &mut TaskPlanner,
 ) -> Option<PathBuf> {
-    let recorded_file = ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)?;
-    recorded_current_path_exists(
-        config,
-        asset,
-        task.version_size,
-        task_planner,
-        recorded_file,
-    )
-    .await
+    if let Some(recorded_file) =
+        ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)
+        && let Some(path) = recorded_current_path_exists(
+            config,
+            asset,
+            task.version_size,
+            task_planner,
+            recorded_file,
+        )
+        .await
+    {
+        return Some(path);
+    }
+    task_planner
+        .verified_downloaded_path(asset, config, task.version_size)
+        .await
 }
-
 #[cfg(test)]
 mod tests;
