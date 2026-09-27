@@ -2,9 +2,10 @@
 //!
 //! This remains one Cargo integration target: `cargo test --test behavioral`.
 //! Test paths change from `<name>` to `<area>::<name>` for `configuration`,
-//! `authentication`, `validation`, `output`, and `state`. Leaf names, assertions,
-//! and platform or feature attributes are unchanged. `common::` tests keep their
-//! paths. Existing leaf-name filters still work; exact filters need the area.
+//! `authentication`, `validation`, `output`, and `state`. Retained tests keep their
+//! leaf names, assertions, and platform or feature attributes. Approved exact
+//! duplicates were removed in #793. `common::` tests keep their paths. Leaf-name
+//! filters for retained tests still work; exact filters need the area.
 //!
 //! Each area owns its assertions and local helpers. Areas do not import each
 //! other. Only fixtures used across areas live in `support`; the facade retains

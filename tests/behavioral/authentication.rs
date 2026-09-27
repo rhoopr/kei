@@ -182,18 +182,6 @@ fn password_backend_shows_a_backend_name() {
 }
 
 #[test]
-fn password_clear_without_stored_credential_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .env("ICLOUD_USERNAME", "test@example.com")
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["password", "clear"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("No stored credential"));
-}
-
-#[test]
 fn password_backend_with_empty_data_dir_reports_none() {
     // Fresh data dir with no keyring entry (keyring may still report for the
     // username if it was set outside this test), so we use an unlikely
