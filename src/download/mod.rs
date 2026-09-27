@@ -59,7 +59,8 @@ use tokio_util::sync::CancellationToken;
 use crate::icloud::photos::asset::{ChangeEvent, MALFORMED_REQUIRED_ASSET_FIELDS_REASON};
 use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 use crate::icloud::photos::{
-    PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution, SyncTokenError,
+    PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution, RecordResolutionBatch,
+    SyncTokenError,
 };
 use crate::retry::RetryConfig;
 use crate::state::{
@@ -1680,6 +1681,7 @@ impl DownloadContext {
         let mut downloaded_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in downloaded_records {
             let crate::state::DownloadedFileRecord {
+                is_current_path: _,
                 library,
                 id,
                 version_size,
@@ -3844,7 +3846,138 @@ pub(crate) async fn reconcile_catalog_paths(
     Ok(PathReconciliationResult { complete, stats })
 }
 
-/// Re-enumerate iCloud and rebuild only the failed tasks with fresh CDN URLs.
+#[derive(Clone, Copy)]
+enum CleanupUrlRefresh {
+    Enumerate,
+    Lookup,
+}
+
+#[derive(Default)]
+struct CleanupRetryPlan {
+    tasks: Vec<DownloadTask>,
+    provider_auth_errors: usize,
+    rate_limit_observations: usize,
+}
+
+impl CleanupRetryPlan {
+    fn observe_lookup(&mut self, batch: &RecordResolutionBatch) {
+        self.rate_limit_observations = self
+            .rate_limit_observations
+            .saturating_add(batch.rate_limit_observations);
+        let mut failed_records = 0usize;
+        let mut authentication_failures = 0usize;
+        for (_, resolution) in &batch.results {
+            if let RecordResolution::TransientFailure(error) = resolution {
+                failed_records += 1;
+                authentication_failures += usize::from(error.is_authentication());
+            }
+        }
+        self.provider_auth_errors += authentication_failures;
+        if failed_records > 0 {
+            tracing::warn!(
+                diagnostic = "expired_url_refresh_failed",
+                failed_records,
+                authentication_failures,
+                rate_limit_observations = batch.rate_limit_observations,
+                "Provider lookup failed while refreshing expired download URLs"
+            );
+        }
+    }
+}
+
+/// Refresh only the URL on already-selected tasks. Their original destination,
+/// rendition, metadata and publication authorization retain the first pass's
+/// selection evidence, including deferred unfiled exclusions.
+async fn refresh_failed_download_urls(
+    passes: &[crate::commands::AlbumPass],
+    failed_tasks: &[DownloadTask],
+    shutdown_token: &CancellationToken,
+) -> CleanupRetryPlan {
+    let mut retry = CleanupRetryPlan::default();
+    let mut pending_keys: FxHashSet<_> = failed_tasks.iter().map(RetryTaskKey::from).collect();
+    let requested_count = pending_keys.len();
+    let mut refreshed_zones = FxHashSet::default();
+    for pass in passes {
+        if shutdown_token.is_cancelled() || pending_keys.is_empty() {
+            break;
+        }
+        let zone = pass.album.zone_name();
+        if !refreshed_zones.insert(zone) {
+            continue;
+        }
+        let requests: Vec<_> = failed_tasks
+            .iter()
+            .filter(|task| task.library.as_ref() == zone)
+            .map(|task| task.asset_record_name.as_ref())
+            .collect::<FxHashSet<_>>()
+            .into_iter()
+            .map(|name| RecordLookupRequest::asset_only(ProviderRecordId::new(name)))
+            .collect();
+        let resolutions = pass.album.resolve_records(&requests).await;
+        retry.observe_lookup(&resolutions);
+        if retry.provider_auth_errors > 0 {
+            retry.tasks.clear();
+            break;
+        }
+        let paired: Vec<_> = resolutions
+            .results
+            .into_iter()
+            .filter_map(|(source, resolution)| match resolution {
+                RecordResolution::AssetPresent { master_record_name } => Some(
+                    RecordLookupRequest::paired(source.clone(), master_record_name, source),
+                ),
+                _ => None,
+            })
+            .collect();
+        if shutdown_token.is_cancelled() {
+            break;
+        }
+        let resolutions = pass.album.resolve_records(&paired).await;
+        retry.observe_lookup(&resolutions);
+        if retry.provider_auth_errors > 0 {
+            retry.tasks.clear();
+            break;
+        }
+        for (_, resolution) in resolutions.results {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            let RecordResolution::Present(asset) = resolution else {
+                continue;
+            };
+            for task in failed_tasks.iter().filter(|task| {
+                task.library.as_ref() == zone
+                    && task.asset_record_name.as_ref() == asset.asset_record_name()
+            }) {
+                let Some((_, version)) = asset.versions().iter().find(|(size, version)| {
+                    VersionSizeKey::from(*size) == task.version_size
+                        && version.checksum == task.checksum
+                        && version.size == task.size
+                }) else {
+                    continue;
+                };
+                if pending_keys.remove(&RetryTaskKey::from(task)) {
+                    retry.tasks.push(DownloadTask {
+                        url: version.url.clone(),
+                        ..task.clone()
+                    });
+                }
+            }
+        }
+    }
+    let missing = requested_count.saturating_sub(retry.tasks.len());
+    if missing > 0 {
+        tracing::warn!(
+            requested = requested_count,
+            refreshed = retry.tasks.len(),
+            missing,
+            "Cleanup pass could not refresh every failed task; unmatched failures remain pending"
+        );
+    }
+    retry
+}
+
+/// Rebuild failed tasks with fresh CDN URLs, using targeted lookups after expiry.
 ///
 /// The first pass may fail because signed content URLs expired before the
 /// worker reached them. Retrying the complete library after that is both slow
@@ -3855,10 +3988,15 @@ async fn build_retry_download_tasks(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
     failed_tasks: &[DownloadTask],
+    refresh: CleanupUrlRefresh,
     shutdown_token: CancellationToken,
-) -> Result<Vec<DownloadTask>> {
-    if failed_tasks.is_empty() {
-        return Ok(Vec::new());
+) -> Result<CleanupRetryPlan> {
+    if failed_tasks.is_empty() || shutdown_token.is_cancelled() {
+        return Ok(CleanupRetryPlan::default());
+    }
+
+    if matches!(refresh, CleanupUrlRefresh::Lookup) {
+        return Ok(refresh_failed_download_urls(passes, failed_tasks, &shutdown_token).await);
     }
 
     let mut pending_keys: FxHashSet<RetryTaskKey> =
@@ -3866,7 +4004,10 @@ async fn build_retry_download_tasks(
     let retry_state_ids = retry_state_ids_by_asset_record(failed_tasks);
     let requested_count = pending_keys.len();
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
-    let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested_count);
+    let mut retry = CleanupRetryPlan {
+        tasks: Vec::with_capacity(requested_count),
+        ..CleanupRetryPlan::default()
+    };
     let mut task_planner = planner::TaskPlanner::for_download(config.state_db.as_deref()).await?;
 
     for (pass_index, pass) in passes.iter().enumerate() {
@@ -3896,20 +4037,20 @@ async fn build_retry_download_tasks(
             if plan.filter_reason.is_some() {
                 continue;
             }
-            take_matching_retry_tasks(plan.tasks, &mut pending_keys, &mut tasks);
+            take_matching_retry_tasks(plan.tasks, &mut pending_keys, &mut retry.tasks);
         }
     }
 
     if !pending_keys.is_empty() {
         tracing::warn!(
             requested = requested_count,
-            refreshed = tasks.len(),
+            refreshed = retry.tasks.len(),
             missing = pending_keys.len(),
             "Cleanup pass could not refresh every failed task; unmatched failures remain pending"
         );
     }
 
-    Ok(tasks)
+    Ok(retry)
 }
 
 /// Hydrate current incremental asset records and rebuild only the task tuples
@@ -4391,7 +4532,10 @@ async fn has_metadata_backfill_work(config: &DownloadConfig) -> bool {
     let Some(db) = &config.state_db else {
         return false;
     };
-    match db.has_downloaded_without_metadata_hash().await {
+    match db
+        .has_downloaded_without_metadata_hash(&config.library)
+        .await
+    {
         Ok(needs_backfill) => needs_backfill,
         Err(e) => {
             tracing::warn!(
@@ -4416,12 +4560,20 @@ fn metadata_capture_candidate_matches(
     asset: &PhotoAsset,
     candidate: &crate::state::MetadataCaptureCandidate,
 ) -> bool {
-    candidate.versions.iter().any(|evidence| {
-        asset.versions().iter().any(|(version_size, version)| {
-            VersionSizeKey::from(*version_size) == evidence.version_size
-                && version.size == evidence.size_bytes
-                && version.checksum.as_ref() == evidence.checksum
-        })
+    candidate
+        .versions
+        .iter()
+        .any(|evidence| metadata_capture_version_matches(asset, evidence))
+}
+
+fn metadata_capture_version_matches(
+    asset: &PhotoAsset,
+    evidence: &crate::state::types::MetadataCaptureVersionEvidence,
+) -> bool {
+    asset.versions().iter().any(|(version_size, version)| {
+        VersionSizeKey::from(*version_size) == evidence.version_size
+            && version.size == evidence.size_bytes
+            && version.checksum.as_ref() == evidence.checksum
     })
 }
 
@@ -4704,7 +4856,26 @@ async fn run_metadata_capture_repair(
                         .await;
                         continue;
                     };
-                    if matches.next().is_some() {
+                    if let Some(other) = matches.next() {
+                        // Counts describe the ambiguity; even one full-rendition
+                        // match is not permission to choose among eligible children.
+                        let (matching_children, full_evidence_matching_children) =
+                            std::iter::once(asset)
+                                .chain(std::iter::once(other))
+                                .chain(matches)
+                                .fold((0usize, 0usize), |(matching, full), asset| {
+                                    let all_match = candidate.versions.iter().all(|evidence| {
+                                        metadata_capture_version_matches(&asset, evidence)
+                                    });
+                                    (matching + 1, full + usize::from(all_match))
+                                });
+                        tracing::warn!(
+                            diagnostic = "metadata_capture_ambiguity_counts_v1",
+                            stored_renditions = candidate.versions.len(),
+                            matching_children,
+                            full_evidence_matching_children,
+                            "Metadata capture remains ambiguous; retaining identity and checkpoint"
+                        );
                         record_metadata_capture_failure(
                             db.as_ref(),
                             &candidate.library,
@@ -5748,7 +5919,12 @@ pub async fn download_photos_with_sync(
             )
             .await
         }
-        SyncMode::Incremental { .. } if has_metadata_backfill_work(&config).await => {
+        // Revision repair already owns stale catalogue rows. Re-enumerating the
+        // library cannot resolve ambiguous identity and defeats its batch bound.
+        SyncMode::Incremental { .. }
+            if metadata_capture_repair.stats.metadata_capture_remaining == 0
+                && has_metadata_backfill_work(&config).await =>
+        {
             let reason = FullEnumerationReason::MetadataBackfill;
             tracing::info!(
                 full_enumeration_reason = reason.as_str(),
@@ -9293,6 +9469,300 @@ mod tests {
             created_local: chrono::Local::now().fixed_offset(),
             version_size,
             media_type: crate::state::MediaType::Photo,
+        }
+    }
+
+    #[tokio::test]
+    async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        #[derive(Clone, Debug)]
+        struct LookupOnlySession {
+            records: Arc<Vec<Value>>,
+            lookups: Arc<AtomicUsize>,
+            recovery: &'static str,
+            shutdown: CancellationToken,
+        }
+        #[async_trait::async_trait]
+        impl PhotosSession for LookupOnlySession {
+            async fn post(
+                &self,
+                url: &str,
+                _body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                assert!(
+                    url.contains("/records/lookup?"),
+                    "cleanup must not enumerate the library"
+                );
+                let call = self.lookups.fetch_add(1, Ordering::SeqCst);
+                if self.recovery == "shutdown_lookup" {
+                    self.shutdown.cancel();
+                }
+                let status = match self.recovery {
+                    "auth_asset" if call == 0 => Some(401),
+                    "auth_master" if call == 1 => Some(421),
+                    "rate_asset" if call == 0 => Some(429),
+                    "rate_master" if call == 1 => Some(503),
+                    "exhausted_asset" => Some(429),
+                    "exhausted_master" if call >= 1 => Some(503),
+                    _ => None,
+                };
+                if let Some(status) = status {
+                    return Err(crate::icloud::photos::session::HttpStatusError {
+                        status,
+                        url: url.into(),
+                        body: Some("private-provider-response".into()),
+                        retry_after: None,
+                    }
+                    .into());
+                }
+                Ok(json!({"records": self.records.as_ref()}))
+            }
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        for recovery in [
+            "fresh",
+            "album_fresh",
+            "album_unfiled",
+            "album_cancelled",
+            "album_changed_checksum",
+            "album_changed_size",
+            "expired",
+            "missing",
+            "auth_asset",
+            "auth_master",
+            "rate_asset",
+            "rate_master",
+            "exhausted_asset",
+            "exhausted_master",
+            "shutdown_lookup",
+        ] {
+            let (capture, _guard) = TracingCapture::install();
+            let downloads = matches!(
+                recovery,
+                "fresh" | "album_fresh" | "album_unfiled" | "rate_asset" | "rate_master"
+            );
+            let shutdown = CancellationToken::new();
+            let server = crate::start_wiremock_or_skip!();
+            let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+            Mock::given(method("GET"))
+                .and(path("/old.jpg"))
+                .respond_with(ResponseTemplate::new(410))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/new.jpg"))
+                .respond_with(if downloads {
+                    ResponseTemplate::new(200).set_body_bytes(body.clone())
+                } else {
+                    ResponseTemplate::new(410)
+                })
+                .expect(if downloads || recovery == "expired" {
+                    1
+                } else {
+                    0
+                })
+                .mount(&server)
+                .await;
+            let mut old = incremental_photo_records_with_url(
+                "FULL_EXPIRED",
+                "full-expired.jpg",
+                &format!("{}/old.jpg", server.uri()),
+                body.len() as u64,
+            );
+            old[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
+            let mut fresh = old.clone();
+            fresh[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+                json!(format!("{}/new.jpg", server.uri()));
+            if recovery == "album_changed_checksum" {
+                fresh[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("changed");
+            }
+            if recovery == "album_changed_size" {
+                fresh[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(body.len() + 1);
+            }
+            let old_asset = PhotoAsset::new(old[0].clone(), old[1].clone());
+            let fresh_asset = PhotoAsset::new(fresh[0].clone(), fresh[1].clone());
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let mut passes = vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session_and_retry_config(
+                    "PrimarySync",
+                    "",
+                    None,
+                    RetryConfig {
+                        max_retries: 1,
+                        base_delay_secs: 0,
+                        max_delay_secs: 0,
+                    },
+                    Box::new(LookupOnlySession {
+                        records: Arc::new(if recovery == "missing" {
+                            Vec::new()
+                        } else {
+                            fresh
+                        }),
+                        lookups: Arc::clone(&lookups),
+                        recovery,
+                        shutdown: shutdown.clone(),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }];
+            if recovery.starts_with("album_") {
+                let mut album = passes[0].clone();
+                album.kind = PassKind::Album;
+                album.album.name = "Album A".into();
+                passes.insert(0, album);
+            }
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("state.db");
+            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path().join("media"));
+            config.state_db = Some(db.clone());
+            if recovery.starts_with("album_") {
+                config.folder_structure = "{album}".into();
+            }
+            let source_pass = if recovery == "album_unfiled" {
+                passes.last().unwrap()
+            } else {
+                &passes[0]
+            };
+            let stream_config = Arc::new(config.with_pass(source_pass));
+            let config = Arc::new(config);
+            let client = Client::new();
+            let controls = DownloadControls::download_hidden();
+            let streaming = pipeline::stream_and_download_from_stream(
+                &client,
+                futures_util::stream::iter(vec![Ok(old_asset)]),
+                &stream_config,
+                controls,
+                1,
+                CancellationToken::new(),
+                pipeline::StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert!(streaming.url_expired_abort);
+            let original_path = streaming.failed[0].download_path.clone();
+            if recovery == "album_cancelled" {
+                shutdown.cancel();
+            }
+            let (outcome, stats) = pipeline::build_download_outcome(
+                &client,
+                &passes,
+                &config,
+                controls,
+                streaming,
+                Instant::now(),
+                shutdown.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                if recovery.starts_with("auth_") {
+                    matches!(outcome, DownloadOutcome::SessionExpired { .. })
+                } else {
+                    matches!(outcome, DownloadOutcome::PartialFailure { .. })
+                },
+                "URL batch cancellation remains a partial run even after cleanup"
+            );
+            assert_eq!(stats.downloaded, usize::from(downloads));
+            assert_eq!(stats.failed, usize::from(!downloads));
+            assert_eq!(
+                stats.interrupted,
+                recovery.starts_with("auth_")
+                    || matches!(recovery, "shutdown_lookup" | "album_cancelled")
+            );
+            assert_eq!(
+                stats.rate_limited,
+                match recovery {
+                    "rate_asset" | "rate_master" => 1,
+                    "exhausted_asset" | "exhausted_master" => 2,
+                    _ => 0,
+                }
+            );
+            assert_eq!(
+                lookups.load(Ordering::SeqCst),
+                match recovery {
+                    "album_cancelled" => 0,
+                    "missing" | "auth_asset" | "shutdown_lookup" => 1,
+                    "rate_asset" | "rate_master" | "exhausted_master" => 3,
+                    _ => 2,
+                }
+            );
+            if recovery.starts_with("auth_") {
+                assert!(!crate::sync_cycle::should_store_sync_token(&outcome, false));
+            }
+            let diagnostics: Vec<_> = capture
+                .events()
+                .into_iter()
+                .filter(|event| event.field("diagnostic") == Some("expired_url_refresh_failed"))
+                .collect();
+            assert_eq!(
+                diagnostics.len(),
+                usize::from(recovery.starts_with("auth_") || recovery.starts_with("exhausted_"))
+            );
+            for event in diagnostics {
+                assert_eq!(event.fields.len(), 5);
+                for key in [
+                    "message",
+                    "diagnostic",
+                    "failed_records",
+                    "authentication_failures",
+                    "rate_limit_observations",
+                ] {
+                    assert!(event.fields.contains_key(key));
+                }
+                assert!(!format!("{:?}", event.fields).contains("private-provider-response"));
+            }
+            let reopened = SqliteStateDb::open(&db_path).await.unwrap();
+            let summary = reopened.get_summary().await.unwrap();
+            assert_eq!(summary.downloaded, u64::from(downloads));
+            if downloads {
+                let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].local_path.as_ref(), Some(&original_path));
+                if recovery == "album_fresh" {
+                    assert!(original_path.starts_with(config.directory.join("Album A")));
+                    assert!(!config.directory.join("full-expired.jpg").exists());
+                }
+                if recovery == "album_unfiled" {
+                    assert!(!config.directory.join("Album A").exists());
+                }
+                assert_eq!(
+                    std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+                    body
+                );
+                let stable = pipeline::stream_and_download_from_stream(
+                    &client,
+                    futures_util::stream::iter(vec![Ok(fresh_asset)]),
+                    &stream_config,
+                    controls,
+                    1,
+                    CancellationToken::new(),
+                    pipeline::StreamRuntime::new(None, None),
+                )
+                .await
+                .unwrap();
+                assert_eq!(stable.downloaded, 0);
+                assert!(stable.failed.is_empty());
+            } else {
+                assert_eq!(
+                    summary.pending + summary.failed,
+                    1,
+                    "unrefreshed work must survive restart"
+                );
+            }
+            server.verify().await;
         }
     }
 
@@ -18627,7 +19097,11 @@ mod tests {
         .await
         .expect("mark downloaded");
         db.clear_metadata_hash_for_test("PrimarySync", "BACKFILL_BEFORE_SYNC", "original");
-        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
 
         let session = MockPhotosFlow::new()
             .album_count(0)
@@ -19161,6 +19635,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_backfill() {
+        #[derive(Clone, Debug)]
+        struct AmbiguousCaptureSession(Arc<Vec<Value>>);
+        #[async_trait::async_trait]
+        impl PhotosSession for AmbiguousCaptureSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                if url.contains("/records/lookup?") {
+                    return Ok(json!({"records": [self.0[0].clone()]}));
+                }
+                assert!(
+                    url.contains("/changes/zone?"),
+                    "ambiguous capture must not force album enumeration"
+                );
+                let request: Value = serde_json::from_str(&body).unwrap();
+                let records = if request["zones"][0]["syncToken"].is_string() {
+                    Vec::new()
+                } else {
+                    self.0.as_ref().clone()
+                };
+                Ok(changes_zone_response(records, "zone-token-next"))
+            }
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let mut records = incremental_photo_records_with_favorite("CAPTURE_AMBIGUOUS", false);
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let mut sibling = records[1].clone();
+        sibling["recordName"] = json!("asset-other-child");
+        sibling["fields"]["isFavorite"]["value"] = json!(1);
+        records.push(sibling);
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(AmbiguousCaptureSession(Arc::new(records))),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".into(),
+        };
+        let media_path = {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let path = seed_downloaded_metadata_asset(&db, &config, &pass, &asset).await;
+            db.set_metadata_capture_revision_for_test("PrimarySync", "CAPTURE_AMBIGUOUS", 0);
+            db.clear_metadata_hash_for_test("PrimarySync", "CAPTURE_AMBIGUOUS", "original");
+            path
+        };
+        let original_bytes = std::fs::read(&media_path).unwrap();
+        for cycle in 1..=2 {
+            let (capture, _guard) = TracingCapture::install();
+            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let mut config = config.clone();
+            config.state_db = Some(db.clone());
+            let result = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.full_enumeration_ran);
+            assert!(matches!(
+                result.outcome,
+                DownloadOutcome::PartialFailure { .. }
+            ));
+            assert_eq!(result.sync_token, None);
+            assert_eq!(result.stats.metadata_capture_remaining, 1);
+            assert_eq!(result.stats.metadata_capture_failures, 1);
+            assert_eq!(result.stats.metadata_capture_refreshed, 0);
+            assert_eq!(
+                result.stats.sync_token_blocked_reason,
+                Some(METADATA_CAPTURE_REPAIR_FAILED_REASON)
+            );
+            assert!(
+                db.get_legacy_master_state_owners()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let summary = db.get_summary().await.unwrap();
+            let status = summary
+                .metadata_capture
+                .iter()
+                .find(|status| status.library == "PrimarySync")
+                .unwrap();
+            assert_eq!(status.failed_assets, cycle);
+            assert_eq!(
+                status.pending_revision,
+                Some(crate::state::METADATA_CAPTURE_REVISION)
+            );
+            assert_eq!(
+                status.last_error.as_deref(),
+                Some("multiple provider children matched durable catalogue evidence")
+            );
+            assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
+            let diagnostics: Vec<_> = capture
+                .events()
+                .into_iter()
+                .filter(|event| {
+                    event.field("diagnostic") == Some("metadata_capture_ambiguity_counts_v1")
+                })
+                .collect();
+            assert_eq!(diagnostics.len(), 1);
+            let event = &diagnostics[0];
+            assert_eq!(event.field("stored_renditions"), Some("1"));
+            assert_eq!(event.field("matching_children"), Some("2"));
+            assert_eq!(event.field("full_evidence_matching_children"), Some("2"));
+            assert_eq!(event.fields.len(), 5);
+            for key in [
+                "message",
+                "diagnostic",
+                "stored_renditions",
+                "matching_children",
+                "full_evidence_matching_children",
+            ] {
+                assert!(event.fields.contains_key(key));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_backfill_in_another_library_does_not_force_full_enumeration() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let row = TestAssetRecord::new("OTHER_LIBRARY_BACKFILL")
+            .library("SharedSync-OTHER")
+            .build();
+        db.upsert_seen(&row).await.unwrap();
+        db.mark_downloaded(
+            "SharedSync-OTHER",
+            "OTHER_LIBRARY_BACKFILL",
+            "original",
+            Path::new("/other.jpg"),
+            "hash",
+            None,
+        )
+        .await
+        .unwrap();
+        db.clear_metadata_hash_for_test("SharedSync-OTHER", "OTHER_LIBRARY_BACKFILL", "original");
+        let result = run_bounded_incremental_sync(db.clone(), Vec::new()).await;
+        assert!(!result.full_enumeration_ran);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(
+            db.has_downloaded_without_metadata_hash("SharedSync-OTHER")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn failed_capture_lookup_preserves_incremental_checkpoint_and_retries() {
         #[derive(Clone, Debug)]
         struct FailingCaptureLookupSession;
@@ -19207,38 +19844,45 @@ mod tests {
             .await
             .unwrap();
         db.set_metadata_capture_revision_for_test("PrimarySync", "CAPTURE_RETRY", 0);
+        db.clear_metadata_hash_for_test("PrimarySync", "CAPTURE_RETRY", "original");
 
-        let result = download_photos_with_sync(
-            &Client::new(),
-            &[pass],
-            Arc::new(config),
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("lookup failure should remain a reported durable repair");
-
-        assert!(matches!(
-            result.outcome,
-            DownloadOutcome::PartialFailure { failed_count: 1 }
-        ));
-        assert_eq!(result.sync_token, None);
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some(METADATA_CAPTURE_REPAIR_FAILED_REASON)
-        );
-        assert_eq!(result.stats.metadata_capture_failures, 1);
-        assert_eq!(result.stats.metadata_capture_remaining, 1);
-        assert!(
-            db.has_metadata_capture_work(
-                &["PrimarySync"],
-                crate::state::METADATA_CAPTURE_REVISION,
+        for _ in 0..2 {
+            let result = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
             )
+            .await
+            .expect("lookup failure should remain a reported durable repair");
+
+            assert!(matches!(
+                result.outcome,
+                DownloadOutcome::PartialFailure { failed_count: 1 }
+            ));
+            assert!(
+                !result.full_enumeration_ran,
+                "stalled capture repair must not enumerate the library"
+            );
+            assert_eq!(result.sync_token, None);
+            assert!(result.stats.sync_token_blocked);
+            assert_eq!(
+                result.stats.sync_token_blocked_reason,
+                Some(METADATA_CAPTURE_REPAIR_FAILED_REASON)
+            );
+            assert_eq!(result.stats.metadata_capture_failures, 1);
+            assert_eq!(result.stats.metadata_capture_remaining, 1);
+            assert!(
+                db.has_metadata_capture_work(
+                    &["PrimarySync"],
+                    crate::state::METADATA_CAPTURE_REVISION,
+                )
                 .await
                 .unwrap(),
-            "failed lookup must leave durable retry work"
-        );
+                "failed lookup must leave durable retry work"
+            );
+        }
     }
 
     #[tokio::test]

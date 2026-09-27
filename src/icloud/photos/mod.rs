@@ -20,7 +20,9 @@ pub use album::PhotoAlbum;
 pub use album::PhotoAlbumConfig;
 #[cfg(test)]
 pub(crate) use album::ProviderLookupError;
-pub(crate) use album::{ProviderRecordId, RecordLookupRequest, RecordResolution};
+pub(crate) use album::{
+    ProviderRecordId, RecordLookupRequest, RecordResolution, RecordResolutionBatch,
+};
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
 pub(crate) use library::{PRIMARY_ZONE_NAME, is_shared_zone};

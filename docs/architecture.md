@@ -226,6 +226,20 @@ the catalog still records the previous source. Dry runs and filename listings
 do not commit choices. Recorded retry paths follow the same ownership checks. Explicit truncated-file repair can still use its own path
 when the existing fingerprint and repair authorization pass.
 
+Download planning also loads current-content publication receipts from
+`asset_metadata_paths`. An additional album copy can satisfy a download only
+in that pass's destination and filename family. The planner rejects foreign
+catalog ownership, opens the file without following links, and checks its
+local SHA-256. Old provider generations cannot satisfy current downloads.
+These checks do not move the catalog's current path or change retry receipts.
+Without reconciliation reservations, an unsafe historical path disables optional
+receipt reuse for that pass instead of blocking ordinary downloads. Reserved
+paths retain strict validation. Live Photo planning applies filters before file
+checks and does not hash the still when same-size current companions satisfy
+the existing skip rules. New companions use a verified still filename. Existing
+companions with older numbered still stems remain usable after hash verification;
+Kei does not rename or delete them.
+
 Local path reconciliation opens source and destination leaf entries without
 following symlinks. It hashes the opened file and rechecks its identity before
 accepting a destination, including entries that appear during publication.
@@ -305,6 +319,21 @@ HTTP error bodies retain the existing size bound and may contain non-JSON text.
 Successful responses are serialized from parsed JSON without pretty-printing.
 Writes are best-effort, with no run subfolder or cleanup.
 Release builds without debug assertions do not include this diagnostic code.
+
+A signed URL expiry stops the current full-download batch. The pipeline retains
+failed tasks, including queued tasks cancelled by that expiry, and makes one
+cleanup attempt through targeted asset and master lookups. User shutdown stops
+cleanup lookup and download dispatch. It does not enumerate albums again to
+refresh those URLs or rebuild unfiled exclusions. Cleanup updates only the URL
+on an already-selected task, preserving its destination and publication
+authorization. The library, child identity, rendition, checksum, and size must
+still match. Changed resources, missing lookups, a second expiry, and cancelled
+tasks retain durable retry work. Successful
+cleanup does not convert incomplete enumeration into checkpoint proof.
+Authentication failures during refresh stop cleanup and return a session-expired
+outcome. Refresh rate-limit observations contribute to the cycle count even
+when provider retries are exhausted. The `expired_url_refresh_failed` diagnostic
+reports failure, authentication, and rate-limit counts without provider details.
 
 Full enumeration streams records/query results and gathers a provider token
 from every active pass. Natural stream completion and usable, unanimous pass
@@ -561,7 +590,15 @@ and pending repair state. A normal sync hydrates stale downloaded rows in
 bounded provider-lookup batches, independent of album, media, and date filters.
 Only an identity that cannot be resolved from durable asset/master evidence
 uses the bounded legacy hydration path. Unselected libraries keep separate
-pending state and do not force work in selected libraries.
+pending state and do not force work in selected libraries. The legacy missing-hash
+fallback checks only the selected library. While revision repair has pending
+work, it owns that backlog instead of forcing a second full enumeration.
+Ambiguous provider children remain pending and block the affected checkpoint;
+a matching rendition alone does not prove which child owns the metadata.
+The `metadata_capture_ambiguity_counts_v1` diagnostic reports stored rendition,
+matching child, and full-evidence matching child counts. It contains no IDs,
+paths, checksums, or provider metadata. These counts do not authorize identity
+selection, even when only one child matches every stored rendition.
 
 Automatic repair processes at most 500 stale assets per library in one sync
 cycle. When a clean batch makes progress and work remains, watch and service

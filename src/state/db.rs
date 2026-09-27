@@ -254,6 +254,8 @@ pub struct ImportedRecord {
 /// Compact downloaded-state projection used to preload sync decisions.
 #[derive(Debug)]
 pub(crate) struct DownloadedFileRecord {
+    /// This receipt is also the catalog's current path, not an additional copy.
+    pub(crate) is_current_path: bool,
     pub(crate) library: String,
     pub(crate) id: String,
     pub(crate) version_size: VersionSizeKey,
@@ -390,10 +392,15 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
     ) -> Result<(), StateError>;
 }
 
-/// State operation used only to preload the download context.
+/// State projections used to preload download decisions and publication receipts.
 #[async_trait]
 pub(crate) trait DownloadContextStateStore: Send + Sync {
     async fn get_downloaded_file_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError>;
+
+    /// Current-content publication receipts, including additional album paths.
+    async fn get_downloaded_path_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
+        Ok(Vec::new())
+    }
 }
 
 /// State operations for the temporary-file ownership ledger.
@@ -1057,7 +1064,12 @@ pub trait MetadataRewriteStore: Send + Sync {
         pre_rewrite_checksum: Option<&str>,
         completion: MetadataRewriteCompletion,
     ) -> Result<bool, StateError>;
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
+    /// Check for live downloaded rows without a metadata hash in `library`.
+    ///
+    /// # Errors
+    /// Returns a state error if the catalogue query fails.
+    async fn has_downloaded_without_metadata_hash(&self, library: &str)
+    -> Result<bool, StateError>;
     async fn begin_metadata_capture_revision(
         &self,
         _library: &str,
@@ -3344,6 +3356,7 @@ impl SqliteStateDb {
                 let version_size: String = row.get(2)?;
                 let local_path: Option<String> = row.get(4)?;
                 Ok(DownloadedFileRecord {
+                    is_current_path: true,
                     library: row.get(0)?,
                     id: row.get(1)?,
                     version_size: VersionSizeKey::from_str(&version_size)
@@ -5447,13 +5460,17 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+    pub(crate) async fn has_downloaded_without_metadata_hash(
+        &self,
+        library: &str,
+    ) -> Result<bool, StateError> {
+        let library = library.to_owned();
         self.with_conn("has_downloaded_without_metadata_hash", move |conn| {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
-                     AND is_deleted = 0 AND metadata_hash IS NULL)",
-                    [],
+                     AND is_deleted = 0 AND metadata_hash IS NULL AND library = ?1)",
+                    [&library],
                     |row| row.get(0),
                 )
                 .map_err(|e| StateError::query("has_downloaded_without_metadata_hash", e))?;
@@ -6408,6 +6425,36 @@ impl DownloadContextStateStore for SqliteStateDb {
     async fn get_downloaded_file_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
         SqliteStateDb::get_downloaded_file_records(self).await
     }
+
+    async fn get_downloaded_path_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
+        self.with_conn("get_downloaded_path_records", |conn| {
+            let mut statement = conn.prepare_cached(
+                "SELECT p.library, p.id, p.version_size, p.provider_checksum, p.local_path, \
+                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path) \
+                 FROM asset_metadata_paths p JOIN assets a \
+                   ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
+                 WHERE a.status = 'downloaded' AND a.is_deleted = 0 \
+                   AND a.checksum = p.provider_checksum \
+                 ORDER BY (p.local_path IS a.local_path) DESC, p.local_path",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(DownloadedFileRecord {
+                    is_current_path: row.get(7)?,
+                    library: row.get(0)?,
+                    id: row.get(1)?,
+                    version_size: VersionSizeKey::from_str(&row.get::<_, String>(2)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    checksum: row.get(3)?,
+                    local_path: Some(PathBuf::from(row.get::<_, String>(4)?)),
+                    local_checksum: row.get(5)?,
+                    download_checksum: row.get(6)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StateError::from)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -6674,8 +6721,11 @@ impl MetadataRewriteStore for SqliteStateDb {
         .await
     }
 
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
-        SqliteStateDb::has_downloaded_without_metadata_hash(self).await
+    async fn has_downloaded_without_metadata_hash(
+        &self,
+        library: &str,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::has_downloaded_without_metadata_hash(self, library).await
     }
 
     async fn begin_metadata_capture_revision(
@@ -13099,7 +13149,11 @@ mod tests {
     #[tokio::test]
     async fn has_downloaded_without_metadata_hash_returns_false_on_empty() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            !db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -13107,7 +13161,11 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let rec = TestAssetRecord::new("P1").build();
         db.upsert_seen(&rec).await.unwrap();
-        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            !db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -13131,7 +13189,16 @@ mod tests {
             conn.execute("UPDATE assets SET metadata_hash = NULL WHERE id = 'D1'", [])
                 .unwrap();
         }
-        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.has_downloaded_without_metadata_hash("SharedSync-OTHER")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -13158,7 +13225,11 @@ mod tests {
             .await
             .unwrap();
         // A soft-deleted row is never re-enumerated, so its NULL hash must not drive full enumeration.
-        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            !db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

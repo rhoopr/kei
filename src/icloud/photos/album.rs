@@ -1060,20 +1060,18 @@ impl PhotoAlbum {
                 "zoneID": self.zone_id.as_ref(),
                 "desiredKeys": &*IDENTITY_LOOKUP_KEYS_VALUES,
             });
-            let response = match super::session::retry_post_allowing_record_errors(
+            let retried = super::session::retry_post_allowing_record_errors(
                 self.session.as_ref(),
                 &url,
                 &body.to_string(),
                 &[("Content-type", "text/plain")],
                 &self.retry_config,
             )
-            .await
-            {
-                Ok(retried) => {
-                    rate_limit_observations =
-                        rate_limit_observations.saturating_add(retried.rate_limit_observations);
-                    retried.response
-                }
+            .await;
+            rate_limit_observations =
+                rate_limit_observations.saturating_add(retried.rate_limit_observations);
+            let response = match retried.response {
+                Ok(response) => response,
                 Err(error) => {
                     let error = classify_provider_lookup_error(&error);
                     crate::metrics::record_targeted_lookup("transient_failure", batch.len());

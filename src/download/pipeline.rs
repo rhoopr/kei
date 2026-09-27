@@ -25,7 +25,7 @@ use super::error::DownloadError;
 use super::file::{LocalFileSizeExpectation, local_file_size_matches_state};
 use super::filter::{
     DerivedPath, DownloadTask, FilterReason, derive_expected_paths, determine_media_type,
-    extract_skip_candidates, is_asset_filtered,
+    extract_skip_candidates, is_asset_filtered, stored_path_matches_current_collision_family,
 };
 use super::finalize::{
     DownloadedFinalization, PendingStateWrite, StateWriteFlush, check_state_write_circuit_breaker,
@@ -866,90 +866,6 @@ async fn state_path_size_allows_skip(
     }
 }
 
-fn stored_path_matches_current_collision_family(
-    asset_id: &str,
-    derived: &DerivedPath,
-    derived_paths: &[DerivedPath],
-    config: &DownloadConfig,
-    stored_path: &Path,
-) -> bool {
-    if stored_path.parent() != derived.path.parent() {
-        return false;
-    }
-
-    let Some(stored_filename) = stored_path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-
-    collision_family_base_filenames(asset_id, derived, derived_paths, config)
-        .iter()
-        .any(|base| stored_filename_matches_base_family(stored_filename, base, asset_id))
-}
-
-fn collision_family_base_filenames(
-    asset_id: &str,
-    derived: &DerivedPath,
-    derived_paths: &[DerivedPath],
-    config: &DownloadConfig,
-) -> Vec<String> {
-    let mut bases = vec![
-        derived.filename.clone(),
-        super::paths::add_dedup_suffix(&derived.filename, derived.size),
-        super::paths::insert_asset_identity_suffix(&derived.filename, asset_id),
-    ];
-
-    if derived.version_size.is_live_photo_motion()
-        && let Some(primary) = primary_derived_path(derived_paths)
-    {
-        let primary_collision_filenames = [
-            super::paths::add_dedup_suffix(&primary.filename, primary.size),
-            super::paths::insert_asset_identity_suffix(&primary.filename, asset_id),
-        ];
-        for primary_filename in primary_collision_filenames {
-            bases.push(live_photo_motion_filename_for_primary(
-                &primary_filename,
-                config,
-            ));
-        }
-    }
-
-    bases.sort();
-    bases.dedup();
-    bases
-}
-
-fn primary_derived_path(derived_paths: &[DerivedPath]) -> Option<&DerivedPath> {
-    derived_paths
-        .iter()
-        .find(|derived| derived.version_size.is_primary_media())
-}
-
-fn live_photo_motion_filename_for_primary(
-    primary_filename: &str,
-    config: &DownloadConfig,
-) -> String {
-    match config.live_photo_mov_filename_policy {
-        crate::types::LivePhotoMovFilenamePolicy::Suffix => {
-            super::paths::live_photo_mov_path_suffix(primary_filename)
-        }
-        crate::types::LivePhotoMovFilenamePolicy::Original => {
-            super::paths::live_photo_mov_path_original(primary_filename)
-        }
-    }
-}
-
-fn stored_filename_matches_base_family(stored_filename: &str, base: &str, asset_id: &str) -> bool {
-    let base = super::paths::clean_filename(base);
-    let base = base.as_ref();
-    filenames_match_ampm_equivalent(stored_filename, base)
-        || super::paths::filename_matches_identity_collision(base, asset_id, stored_filename)
-        || super::paths::filename_matches_identity_collision(
-            &super::paths::normalize_ampm(base),
-            asset_id,
-            &super::paths::normalize_ampm(stored_filename),
-        )
-}
-
 fn filenames_match_ampm_equivalent(a: &str, b: &str) -> bool {
     a == b || super::paths::normalize_ampm(a) == super::paths::normalize_ampm(b)
 }
@@ -1029,15 +945,22 @@ pub(super) async fn state_confirmed_current_path_exists(
     task: &DownloadTask,
     task_planner: &mut TaskPlanner,
 ) -> Option<PathBuf> {
-    let recorded_file = ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)?;
-    recorded_current_path_exists(
-        config,
-        asset,
-        task.version_size,
-        task_planner,
-        recorded_file,
-    )
-    .await
+    if let Some(recorded_file) =
+        ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)
+        && let Some(path) = recorded_current_path_exists(
+            config,
+            asset,
+            task.version_size,
+            task_planner,
+            recorded_file,
+        )
+        .await
+    {
+        return Some(path);
+    }
+    task_planner
+        .verified_downloaded_path(asset, config, task.version_size)
+        .await
 }
 
 async fn record_seen_for_forwarded_task(
@@ -2421,6 +2344,13 @@ async fn consume_stream_download_tasks(
                 match classify_download_task_error(&e) {
                     DownloadTaskErrorClass::Interrupted => {
                         log_interrupted_download(pb, &task, &e);
+                        // URL expiry cancels the whole bounded queue, not just
+                        // the task that saw 410. Keep its unstarted work for
+                        // the same cleanup attempt. User shutdown still gates
+                        // cleanup lookup and dispatch through the parent token.
+                        if url_expired_abort {
+                            failed.push(task);
+                        }
                         continue;
                     }
                     DownloadTaskErrorClass::SessionExpired => {
@@ -2453,6 +2383,7 @@ async fn consume_stream_download_tasks(
                                 "Download URL expired; aborting current URL batch"
                             );
                         });
+                        failed.push(task);
                         pipeline_shutdown.cancel();
                         continue;
                     }
@@ -2823,7 +2754,7 @@ pub(super) async fn build_download_outcome(
         return Ok((DownloadOutcome::Success, stats));
     }
 
-    if streaming_result.url_expired_abort {
+    if streaming_result.url_expired_abort && failed_tasks.is_empty() {
         let retry_exhausted = skip_breakdown.retry_exhausted;
         let mut stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
@@ -2918,11 +2849,21 @@ pub(super) async fn build_download_outcome(
         "── Cleanup pass: re-fetching URLs and retrying failed downloads ──"
     );
 
-    let fresh_tasks =
-        super::build_retry_download_tasks(passes, config, &failed_tasks, shutdown_token.clone())
-            .await?;
+    let refresh = if streaming_result.url_expired_abort {
+        super::CleanupUrlRefresh::Lookup
+    } else {
+        super::CleanupUrlRefresh::Enumerate
+    };
+    let retry_plan = super::build_retry_download_tasks(
+        passes,
+        config,
+        &failed_tasks,
+        refresh,
+        shutdown_token.clone(),
+    )
+    .await?;
     tracing::debug!(
-        count = fresh_tasks.len(),
+        count = retry_plan.tasks.len(),
         "  Re-fetched failed tasks with fresh URLs"
     );
 
@@ -2944,16 +2885,27 @@ pub(super) async fn build_download_outcome(
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
     };
-    let pass_result = run_download_pass(pass_config, fresh_tasks).await;
+    let mut pass_result = run_download_pass(pass_config, retry_plan.tasks).await;
+    pass_result.rate_limit_observations += retry_plan.rate_limit_observations;
 
     let phase2_downloaded = pass_result.downloaded;
-    let remaining_failed = pass_result.failed;
+    // A lookup may be incomplete, or a second expired URL may cancel tasks that
+    // never started. Only a completed exact task retires the original failure.
+    let downloaded_keys: FxHashSet<_> = pass_result
+        .downloaded_tasks
+        .iter()
+        .map(super::RetryTaskKey::from)
+        .collect();
+    let remaining_failed: Vec<_> = failed_tasks
+        .into_iter()
+        .filter(|task| !downloaded_keys.contains(&super::RetryTaskKey::from(task)))
+        .collect();
     let phase2_auth_errors = pass_result.auth_errors;
     exif_failures += pass_result.exif_failures;
     state_write_failures += pass_result.state_write_failures;
-    let total_auth_errors = auth_errors + phase2_auth_errors;
+    let total_auth_errors = auth_errors + phase2_auth_errors + retry_plan.provider_auth_errors;
 
-    if total_auth_errors >= AUTH_ERROR_THRESHOLD {
+    if total_auth_errors >= AUTH_ERROR_THRESHOLD || retry_plan.provider_auth_errors > 0 {
         let mut merged_recap = streaming_result.recap.clone();
         merged_recap.merge(pass_result.recap.clone());
         let stats = super::SyncStats {
@@ -3001,7 +2953,8 @@ pub(super) async fn build_download_outcome(
         + exif_failures
         + enumeration_errors
         + retry_exhausted
-        + usize::from(enumeration_incomplete);
+        + usize::from(enumeration_incomplete)
+        + usize::from(streaming_result.url_expired_abort && failed == 0);
     if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
@@ -3369,6 +3322,19 @@ async fn download_single_task<C: super::file::DownloadClient>(
     metadata_flags: MetadataFlags,
     context: DownloadSingleContext<'_>,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
+    // A producer can commit retry state immediately before cancellation. Do not
+    // start another HTTP request for its queued task while draining that batch.
+    if context.shutdown_token.is_cancelled() {
+        return Err(DownloadError::Interrupted {
+            path: task
+                .download_path
+                .to_string_lossy()
+                .into_owned()
+                .into_boxed_str(),
+            bytes_written: 0,
+        }
+        .into());
+    }
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -5054,7 +5020,7 @@ mod tests {
             ))
         }
 
-        async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+        async fn has_downloaded_without_metadata_hash(&self, _: &str) -> Result<bool, StateError> {
             Ok(false)
         }
 
@@ -5611,6 +5577,144 @@ mod tests {
                 .is_some_and(|error| error.contains("verified bytes differ")),
             "collision must remain durable failed work"
         );
+    }
+
+    #[tokio::test]
+    async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for user_shutdown in [false, true] {
+            let server = crate::start_wiremock_or_skip!();
+            let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+            Mock::given(method("GET"))
+                .and(path("/expired.jpg"))
+                .respond_with(ResponseTemplate::new(410))
+                .expect(if user_shutdown { 0 } else { 1 })
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/fresh.jpg"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .expect(if user_shutdown { 0 } else { 2 })
+                .mount(&server)
+                .await;
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("state.db");
+            let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(dir.path().join("media"));
+            config.state_db = Some(db.clone());
+            let config = Arc::new(config);
+            let assets: Vec<_> = ["FIRST", "QUEUED"]
+                .into_iter()
+                .map(|id| {
+                    TestPhotoAsset::new(id)
+                        .filename(&format!("{id}.jpg"))
+                        .orig_size(body.len() as u64)
+                        .orig_url(&format!("{}/expired.jpg", server.uri()))
+                        .orig_checksum(&checksum)
+                        .build()
+                })
+                .collect();
+            let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+            let (tx, rx) = mpsc::channel(assets.len());
+            for asset in &assets {
+                let plan = planner.plan_download_asset(asset, &config).await.unwrap();
+                assert_eq!(plan.tasks.len(), 1);
+                for task in plan.tasks {
+                    planner::upsert_seen_for_task(db.as_ref(), &config, asset, &task)
+                        .await
+                        .unwrap();
+                    tx.send(task).await.unwrap();
+                }
+            }
+            drop(tx);
+            let shutdown = CancellationToken::new();
+            if user_shutdown {
+                shutdown.cancel();
+            }
+            let client = Client::new();
+            let result = consume_stream_download_tasks(
+                rx,
+                client.clone(),
+                StreamPipelineShared {
+                    config: config.clone(),
+                    state_db: config.state_db.clone(),
+                    pb: ProgressBar::hidden(),
+                    pipeline_shutdown: shutdown.child_token(),
+                },
+                StreamConsumerSettings {
+                    retry_config: config.retry,
+                    metadata_flags: MetadataFlags::default(),
+                    concurrency: 1,
+                    mode: crate::personality::Mode::Off,
+                    bytes_counter: Arc::new(AtomicU64::new(0)),
+                },
+            )
+            .await;
+            assert_eq!(result.url_expired_abort, !user_shutdown);
+            assert_eq!(result.failed.len(), if user_shutdown { 0 } else { 2 });
+            assert_eq!(db.get_summary().await.unwrap().pending, 2);
+            if user_shutdown {
+                server.verify().await;
+                continue;
+            }
+            assert!(
+                !shutdown.is_cancelled(),
+                "URL expiry must not cancel the user token"
+            );
+            let fresh = result
+                .failed
+                .into_iter()
+                .map(|task| DownloadTask {
+                    url: format!("{}/fresh.jpg", server.uri()).into(),
+                    ..task
+                })
+                .collect();
+            let recovered = run_download_pass(
+                PassConfig {
+                    client: &client,
+                    retry_config: &config.retry,
+                    metadata: MetadataFlags::default(),
+                    mark_capture_repair_after_download: false,
+                    concurrency: 1,
+                    reporting: DownloadReporting::hidden(),
+                    temp_suffix: config.temp_suffix.clone(),
+                    shutdown_token: shutdown.clone(),
+                    state_db: config.state_db.clone(),
+                    rate_limit_counter: Arc::new(AtomicUsize::new(0)),
+                    bandwidth_limiter: None,
+                    library: config.library.clone(),
+                },
+                fresh,
+            )
+            .await;
+            assert_eq!(recovered.downloaded, 2);
+            assert!(recovered.failed.is_empty());
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            assert_eq!(reopened.get_summary().await.unwrap().downloaded, 2);
+            for row in reopened.get_downloaded_page(0, 10).await.unwrap() {
+                assert_eq!(fs::read(row.local_path.as_ref().unwrap()).unwrap(), body);
+            }
+            let stable = stream_and_download_from_stream(
+                &client,
+                stream::iter(assets.into_iter().map(Ok)),
+                &config,
+                DownloadControls::download_hidden(),
+                2,
+                shutdown,
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stable.downloaded, 0);
+            assert!(stable.failed.is_empty());
+            server.verify().await;
+        }
     }
 
     #[tokio::test]
@@ -6922,7 +7026,11 @@ mod tests {
         .await
         .unwrap();
         db.clear_metadata_hash_for_test("PrimarySync", "BACKFILL", "original");
-        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+        assert!(
+            db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap()
+        );
 
         let client = reqwest::Client::new();
         let assets = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(existing_asset())]);
@@ -6943,7 +7051,9 @@ mod tests {
             "existing file should not be re-downloaded"
         );
         assert!(
-            !db.has_downloaded_without_metadata_hash().await.unwrap(),
+            !db.has_downloaded_without_metadata_hash("PrimarySync")
+                .await
+                .unwrap(),
             "on-disk skip must backfill metadata_hash for existing downloaded rows"
         );
     }
@@ -10256,5 +10366,490 @@ mod tests {
             child.is_cancelled(),
             "child must reflect parent cancellation"
         );
+    }
+    async fn record_verified_test_version(
+        db: &crate::state::SqliteStateDb,
+        asset: &PhotoAsset,
+        version: VersionSizeKey,
+        checksum: &str,
+        bytes: &[u8],
+        path: &Path,
+    ) {
+        use sha2::{Digest, Sha256};
+        record_downloaded_test_version(db, asset, version, checksum, bytes.len() as u64, path)
+            .await;
+        let local = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+        db.mark_downloaded(
+            "PrimarySync",
+            asset.id(),
+            version.as_str(),
+            path,
+            &local,
+            Some(&local),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_parent_receipt_does_not_block_current_download_pass() {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let asset = TestPhotoAsset::new("CURRENT").orig_size(2000).build();
+        let legacy = TestPhotoAsset::new("LEGACY").build();
+        record_downloaded_test_version(
+            &db,
+            &legacy,
+            VersionSizeKey::Original,
+            "legacy",
+            2000,
+            &dir.path().join("old/../OLD.JPG"),
+        )
+        .await;
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let derived = derive_expected_paths(&asset, &config);
+        let current = &derived[0];
+        fs::create_dir_all(current.path.parent().unwrap()).unwrap();
+        let bytes = vec![1u8; 2000];
+        fs::write(&current.path, &bytes).unwrap();
+        record_verified_test_version(
+            &db,
+            &asset,
+            current.version_size,
+            &current.checksum,
+            &bytes,
+            &current.path,
+        )
+        .await;
+        let planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+        assert!(
+            planner
+                .verified_downloaded_path(&asset, &config, current.version_size)
+                .await
+                .is_none(),
+            "an incomplete ownership index must disable all receipt reuse"
+        );
+        for _ in 0..2 {
+            let result = stream_and_download_from_stream(
+                &reqwest::Client::new(),
+                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+                &Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.state_write_failures, 0);
+            assert_eq!(result.skip_summary.on_disk, 1);
+            assert_eq!(result.downloaded, 0);
+            assert!(result.failed.is_empty());
+            assert_eq!(fs::read(&current.path).unwrap(), bytes);
+            assert_eq!(
+                fs::read_dir(current.path.parent().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn numbered_live_photo_paths_remain_stable_across_restart() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        for existing_motion in [true, false] {
+            let server = crate::start_wiremock_or_skip!();
+            let motion = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ";
+            let still_bytes = vec![1u8; 2000];
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(motion));
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(motion.as_slice())
+                        .insert_header("content-type", "video/quicktime"),
+                )
+                .expect(u64::from(!existing_motion))
+                .mount(&server)
+                .await;
+            let asset = TestPhotoAsset::new("NUMBERED")
+                .filename("IMG_0001.HEIC")
+                .item_type("public.heic")
+                .orig_file_type("public.heic")
+                .orig_size(2000)
+                .orig_checksum("heic_ck")
+                .orig_url(&format!("{}/still", server.uri()))
+                .live_photo(
+                    &format!("{}/motion", server.uri()),
+                    &checksum,
+                    motion.len() as u64,
+                )
+                .build();
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("state.db");
+            let db = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(dir.path().join("media"));
+            let bare = path_for_filename(&config, &asset, "IMG_0001.HEIC");
+            fs::create_dir_all(bare.parent().unwrap()).unwrap();
+            fs::write(&bare, &still_bytes).unwrap();
+            fs::write(
+                path_for_filename(&config, &asset, "IMG_0001-NUMBERED.HEIC"),
+                &still_bytes,
+            )
+            .unwrap();
+            for n in 2..=33 {
+                fs::write(
+                    path_for_filename(&config, &asset, &format!("IMG_0001-NUMBERED-{n}.HEIC")),
+                    &still_bytes,
+                )
+                .unwrap();
+            }
+            let still = path_for_filename(&config, &asset, "IMG_0001-NUMBERED-33.HEIC");
+            let stored_motion = path_for_filename(
+                &config,
+                &asset,
+                "IMG_0001-NUMBERED-34_HEVC-NUMBERED-685.MOV",
+            );
+            record_verified_test_version(
+                &db,
+                &asset,
+                VersionSizeKey::Original,
+                "heic_ck",
+                &still_bytes,
+                &path_for_filename(&config, &asset, "IMG_0001-NUMBERED-2.HEIC"),
+            )
+            .await;
+            record_verified_test_version(
+                &db,
+                &asset,
+                VersionSizeKey::Original,
+                "heic_ck",
+                &still_bytes,
+                &still,
+            )
+            .await;
+            if existing_motion {
+                fs::write(&stored_motion, motion).unwrap();
+                record_verified_test_version(
+                    &db,
+                    &asset,
+                    VersionSizeKey::LiveOriginal,
+                    &checksum,
+                    motion,
+                    &stored_motion,
+                )
+                .await;
+            }
+            drop(db);
+            let expected_motion = if existing_motion {
+                stored_motion
+            } else {
+                path_for_filename(&config, &asset, "IMG_0001-NUMBERED-33_HEVC.MOV")
+            };
+            for cycle in 0..3 {
+                let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+                config.state_db = Some(db.clone());
+                let result = stream_and_download_from_stream(
+                    &reqwest::Client::new(),
+                    stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+                    &Arc::new(config.clone()),
+                    DownloadControls::download_hidden(),
+                    1,
+                    CancellationToken::new(),
+                    StreamRuntime::new(None, None),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.downloaded,
+                    usize::from(!existing_motion && cycle == 0)
+                );
+                assert!(result.failed.is_empty());
+                assert_eq!(fs::read(&expected_motion).unwrap(), motion);
+                assert_eq!(fs::read(&still).unwrap(), still_bytes);
+                let rows = db.get_downloaded_file_records().await.unwrap();
+                assert!(
+                    rows.iter()
+                        .any(|row| row.local_path.as_ref() == Some(&still))
+                );
+                assert!(
+                    rows.iter()
+                        .any(|row| row.local_path.as_ref() == Some(&expected_motion))
+                );
+                assert_eq!(fs::read_dir(still.parent().unwrap()).unwrap().count(), 35);
+                config.state_db = None;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn album_publication_receipts_prevent_repeat_downloads_after_restart() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let server = crate::start_wiremock_or_skip!();
+        let bytes = b"\xff\xd8\xff\xe0\0\x10JFIF\0";
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.as_slice()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let asset = TestPhotoAsset::new("ALBUM_RECEIPTS")
+            .filename("IMG_3809.JPG")
+            .item_type("public.jpeg")
+            .orig_file_type("public.jpeg")
+            .orig_size(bytes.len() as u64)
+            .orig_checksum(&checksum)
+            .orig_url(&format!("{}/photo", server.uri()))
+            .build();
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path().join("media"));
+        for album in ["C", "B"] {
+            let path = config.directory.join(album).join("IMG_3809.JPG");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+            record_verified_test_version(
+                &db,
+                &asset,
+                VersionSizeKey::Original,
+                &checksum,
+                bytes,
+                &path,
+            )
+            .await;
+        }
+        drop(db);
+        for album in ["C", "B", "C", "B"] {
+            let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+            config.state_db = Some(db.clone());
+            config.folder_structure = album.to_string();
+            config.album_name = Some(Arc::from(album));
+            let result = stream_and_download_from_stream(
+                &reqwest::Client::new(),
+                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+                &Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.downloaded, 0);
+            assert_eq!(result.skip_summary.on_disk, 1);
+            assert!(result.failed.is_empty());
+            let rows = db.get_downloaded_file_records().await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].local_path.as_ref().unwrap(),
+                &config.directory.join("B/IMG_3809.JPG")
+            );
+            for folder in ["B", "C"] {
+                let path = config.directory.join(folder).join("IMG_3809.JPG");
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+            }
+            config.state_db = None;
+        }
+    }
+    #[tokio::test]
+    async fn additional_album_receipts_reject_missing_changed_and_foreign_files() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        #[derive(Debug)]
+        enum Mutation {
+            Missing,
+            Truncated,
+            SameSizeChange,
+            ForeignOwner,
+            ProviderChange,
+        }
+        for mutation in [
+            Mutation::Missing,
+            Mutation::Truncated,
+            Mutation::SameSizeChange,
+            Mutation::ForeignOwner,
+            Mutation::ProviderChange,
+        ] {
+            let server = crate::start_wiremock_or_skip!();
+            let original = b"\xff\xd8\xff\xe0\0\x10JFIF\0";
+            let replacement = b"\xff\xd8\xff\xe0\0\x10JFIF\0new";
+            let bytes = if matches!(mutation, Mutation::ProviderChange) {
+                replacement.as_slice()
+            } else {
+                original.as_slice()
+            };
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+            let old_checksum =
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(original));
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(bytes)
+                        .insert_header("content-type", "image/jpeg"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let asset = TestPhotoAsset::new("GUARDED_ALBUM")
+                .filename("PHOTO.JPG")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(bytes.len() as u64)
+                .orig_checksum(&checksum)
+                .orig_url(&format!("{}/photo", server.uri()))
+                .build();
+            let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+            let dir = TempDir::new().unwrap();
+            let a = dir.path().join("A/PHOTO.JPG");
+            let b = dir.path().join("B/PHOTO.JPG");
+            for path in [&a, &b] {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+            }
+            fs::write(&a, original).unwrap();
+            fs::write(&b, bytes).unwrap();
+            record_verified_test_version(
+                &db,
+                &asset,
+                VersionSizeKey::Original,
+                &old_checksum,
+                original,
+                &a,
+            )
+            .await;
+            record_verified_test_version(
+                &db,
+                &asset,
+                VersionSizeKey::Original,
+                &checksum,
+                bytes,
+                &b,
+            )
+            .await;
+            match mutation {
+                Mutation::Missing => fs::remove_file(&a).unwrap(),
+                Mutation::Truncated => fs::write(&a, [1u8]).unwrap(),
+                Mutation::SameSizeChange => fs::write(&a, vec![7u8; original.len()]).unwrap(),
+                Mutation::ForeignOwner => {
+                    let other = TestPhotoAsset::new("OTHER_OWNER").build();
+                    record_verified_test_version(
+                        &db,
+                        &other,
+                        VersionSizeKey::Original,
+                        &checksum,
+                        bytes,
+                        &a,
+                    )
+                    .await;
+                }
+                Mutation::ProviderChange => {}
+            }
+            let preserved = fs::read(&a).ok();
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(dir.path());
+            config.folder_structure = "A".to_string();
+            config.album_name = Some(Arc::from("A"));
+            config.state_db = Some(db.clone());
+            for cycle in 0..2 {
+                let result = stream_and_download_from_stream(
+                    &reqwest::Client::new(),
+                    stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+                    &Arc::new(config.clone()),
+                    DownloadControls::download_hidden(),
+                    1,
+                    CancellationToken::new(),
+                    StreamRuntime::new(None, None),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.downloaded, usize::from(cycle == 0), "{mutation:?}");
+                assert!(result.failed.is_empty(), "{mutation:?}");
+                assert_eq!(fs::read(&b).unwrap(), bytes);
+                if let Some(ref original_a) = preserved {
+                    assert_eq!(&fs::read(&a).unwrap(), original_a, "{mutation:?}");
+                }
+            }
+            let rows = db.get_downloaded_file_records().await.unwrap();
+            let row = rows.iter().find(|row| row.id == asset.id()).unwrap();
+            assert_eq!(fs::read(row.local_path.as_ref().unwrap()).unwrap(), bytes);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn additional_album_receipts_reject_leaf_and_ancestor_symlinks() {
+        use sha2::{Digest, Sha256};
+        let bytes = b"\xff\xd8\xff\xe0\0\x10JFIF\0";
+        let asset = TestPhotoAsset::new("LINK_RECEIPT")
+            .filename("PHOTO.JPG")
+            .orig_size(bytes.len() as u64)
+            .orig_checksum("provider")
+            .build();
+        for ancestor in [false, true] {
+            let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+            let dir = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let a = dir.path().join("A/PHOTO.JPG");
+            let b = dir.path().join("B/PHOTO.JPG");
+            for path in [&a, &b] {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, bytes).unwrap();
+            }
+            record_verified_test_version(
+                &db,
+                &asset,
+                VersionSizeKey::Original,
+                "provider",
+                bytes,
+                &a,
+            )
+            .await;
+            record_verified_test_version(
+                &db,
+                &asset,
+                VersionSizeKey::Original,
+                "provider",
+                bytes,
+                &b,
+            )
+            .await;
+            let target = outside.path().join("PHOTO.JPG");
+            fs::write(&target, bytes).unwrap();
+            fs::remove_file(&a).unwrap();
+            if ancestor {
+                fs::remove_dir(a.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(outside.path(), a.parent().unwrap()).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&target, &a).unwrap();
+            }
+            let mut config = DownloadConfig::test_default();
+            config.directory = Arc::from(dir.path());
+            config.folder_structure = "A".to_string();
+            config.state_db = Some(db.clone());
+            let planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+            assert!(
+                planner
+                    .verified_downloaded_path(&asset, &config, VersionSizeKey::Original)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(
+                Sha256::digest(fs::read(target).unwrap()),
+                Sha256::digest(bytes)
+            );
+        }
     }
 }

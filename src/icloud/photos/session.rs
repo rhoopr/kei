@@ -429,7 +429,7 @@ fn classify_rate_limit_error(e: &anyhow::Error) -> bool {
 
 #[derive(Debug)]
 pub(crate) struct RetriedPostResponse {
-    pub(crate) response: Value,
+    pub(crate) response: anyhow::Result<Value>,
     pub(crate) rate_limit_observations: usize,
 }
 
@@ -462,13 +462,14 @@ pub async fn retry_post(
 /// errors in the response for a batch-aware caller to classify. This is used
 /// by `/records/lookup`, where one explicit `UNKNOWN_ITEM` is a successful
 /// deletion result and must not fail unrelated records in the same batch.
+/// Retain rate-limit observations even when every retry fails.
 pub(crate) async fn retry_post_allowing_record_errors(
     session: &dyn PhotosSession,
     url: &str,
     body: &str,
     headers: &[(&str, &str)],
     retry_config: &RetryConfig,
-) -> anyhow::Result<RetriedPostResponse> {
+) -> RetriedPostResponse {
     let rate_limit_observations = AtomicUsize::new(0);
     let response = retry::retry_with_backoff(
         retry_config,
@@ -480,11 +481,11 @@ pub(crate) async fn retry_post_allowing_record_errors(
         },
         || async { session.post(url, body.to_owned(), headers).await },
     )
-    .await?;
-    Ok(RetriedPostResponse {
+    .await;
+    RetriedPostResponse {
         response,
         rate_limit_observations: rate_limit_observations.load(Ordering::Relaxed),
-    })
+    }
 }
 
 /// Errors from `changes/zone` when syncToken is invalid.
