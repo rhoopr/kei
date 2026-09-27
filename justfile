@@ -23,6 +23,7 @@ static-checks:
     scripts/check-contracts
     typos
     bash scripts/check-roundtrip-gate.sh
+    python3 scripts/fixtures/check_live_selection.py
 
 # Pre-push gate: static checks + offline behavior tests.
 gate:
@@ -284,6 +285,7 @@ test MODE="" *ARGS="":
         packaging|package)
             cargo build --release
             scripts/full-test/run_release_archive_smoke.sh
+            bash scripts/fixtures/check-package.sh
             ;;
         docker-full)
             run_docker_full

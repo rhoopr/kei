@@ -193,6 +193,10 @@ cargo test --all-features --test sync --test state_auth -- --ignored --test-thre
 
 ## Media fixtures
 
+The [fixture corpus guide](data/README.md) records the selected formats,
+provenance, sanitization, independent encoders, SHA-256 manifest, size budget,
+production-path tests, and extracted-source-package checks.
+
 `tests/data/` holds real camera and encoder outputs, not hand-built containers,
 so metadata writers are exercised against independently produced item maps.
 
@@ -237,18 +241,23 @@ opt-in (nightly + cargo-fuzz), excluded from `just gate`, and run via
    This prompts for a 2FA code and writes session tokens. Redo only when
    the session expires (typically months).
 
-3. Create a test album in iCloud Photos with at least:
+3. Keep at least one eligible asset in the primary library. General live
+   tests use `tests/data/live-selection.toml`: albums `none`, unfiled enabled,
+   primary library, and the 10 most recent assets. Change the bound only there.
+   No named album, filename, date, or media format is required. A read-only
+   preflight reports the eligible filename count and fails if it is zero.
+   When the bound truncates the inventory, live tests require checkpoint
+   suppression and a no-download repeat full pass. Positive incremental live
+   checks apply only when this bounded selection proves EOF. Deterministic
+   production-path tests cover both cases and config reconciliation.
 
-   | Asset | Used by |
-   |-------|---------|
-   | Regular JPEG | Basic download, size comparison, EXIF tests |
-   | Standalone video (MOV/MP4) | Skip-videos filter, Docker watch cycle |
-   | Live Photo (HEIC + MOV) | Skip-live-photos, MOV naming policy, HEIC XMP embed |
-   | Apple ProRAW (.DNG) | align-raw flag acceptance |
-   | Photo with non-ASCII filename | keep-unicode-in-filenames |
+Import runners also pass the shared count as `--recent`, because
+`import-existing` does not use the TOML recent count.
 
-   The default album name is `kei-test`. Override with `KEI_TEST_ALBUM`
-   if your album is named differently.
+Exact content checks use the [bundled corpus](data/README.md). The
+[migration map](data/live-migration.md) names each deterministic replacement
+and the live responsibilities that remain. The separate cross-zone scenario
+still needs its explicit opt-in fixture.
 
 ## Portability
 
@@ -260,21 +269,19 @@ details are baked into test code.
 | `ICLOUD_USERNAME` | required | Apple ID email |
 | `ICLOUD_PASSWORD` | required | Apple ID password |
 | `ICLOUD_TEST_COOKIE_DIR` | `./.test-cookies` | Pre-authenticated session dir |
-| `KEI_TEST_ALBUM` | `kei-test` | Test album name |
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image under test |
 | `CARGO_TARGET_DIR` | `./target` | Cargo build directory. Full-test packaging, shell, live, service, and metrics phases use release artifacts from this directory. |
 | `KEI_FULL_TEST_TMPDIR` | `/tmp/codex/kei/full-test/tmp` | Temporary directory for full-test child processes and shell-suite scratch data. |
 | `KEI_TEST_SCRATCH_DIR` | `/tmp/codex/kei/shell-tests-$USER` | Base dir for standalone shell-suite scratch; `just full-test` overrides this to `$KEI_FULL_TEST_TMPDIR/shell` or `/tmp/codex/kei/full-test/tmp/shell` |
-| `KEI_IMPORT_FIXTURE_DIR` | `/tmp/codex/kei/import-fixture` | Where `import_existing_live.rs` caches its `--recent 100` sync fixture across runs |
+| `KEI_IMPORT_FIXTURE_DIR` | `/tmp/codex/kei/import-fixture` | Parent directory for isolated import fixture runs retained for failure inspection |
 | `KEI_FULL_TEST_CROSS_ZONE_ALBUM` | unset | Optional full-test album fixture for cross-zone hydration. The album must include at least one asset from a non-primary source zone. |
 | `KEI_FULL_TEST_CROSS_ZONE_MIN_FILES` | `1` | Minimum non-primary downloaded asset rows required when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set. |
 | `KEI_FULL_TEST_REAL_SERVICE` | unset | Set to `1` to let `just full-test` install, start, status-check, and uninstall a real Linux user systemd service |
 | `KEI_FULL_TEST_EXPECT_VERSION` | unset | Optional exact Cargo package version expected by the release-archive smoke |
 
-`just test live` applies `KEI_TEST_ALBUM=kei-test` to match this
-repo's maintainer setup. Override in your environment to point at your
-own account. Cookie dir falls through to the harness default
-(`./.test-cookies`); set `ICLOUD_TEST_COOKIE_DIR` to override.
+`just test live` uses the shared bounded selection. Cookie dir falls through
+to the harness default (`./.test-cookies`); set `ICLOUD_TEST_COOKIE_DIR` to
+override it. Test state and download directories are isolated.
 
 ### Loopback-bound tests
 
@@ -320,7 +327,9 @@ happens:
   binary with a pre-seeded state DB. Covers everything that doesn't need
   the network (status flags, reconcile routing, config resolution).
 - **`sync.rs`** - live iCloud, `#[ignore]` gated. Covers the happy-path
-  download flow, filters, EXIF/XMP write-through, HEIC embed, sidecars.
+  bounded download flow, state, watch, reports, and filesystem recovery.
+  Content policies and metadata use bundled production-path tests under
+  `src/download/orchestration/fixture_tests/`.
 - **`state_auth.rs`** - live iCloud, `#[ignore]` gated. Covers status /
   reset state / verify / import-existing / sync --retry-failed.
 - **`import_existing_live.rs`** - live iCloud, `#[ignore]` gated.
@@ -409,7 +418,7 @@ Manual real-install coverage:
 - Windows SCM `CreateServiceW`, account password handoff, and service
   control dispatcher startup.
 - Boot/reboot persistence and a real long-running sync against the
-  `kei-test` album.
+  bounded primary-library selection.
 
 `just full-test` can run the Linux user-service lifecycle with
 `KEI_FULL_TEST_REAL_SERVICE=1`. It refuses to run if `kei.service` already

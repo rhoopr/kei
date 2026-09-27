@@ -11,7 +11,6 @@
 #   ICLOUD_USERNAME             (required) Apple ID email
 #   ICLOUD_PASSWORD             (required) Apple ID password
 #   ICLOUD_TEST_COOKIE_DIR      pre-authenticated session dir (default: $PROJECT_DIR/.test-cookies)
-#   KEI_TEST_ALBUM              test album name in iCloud (default: kei-test)
 #   KEI_DOCKER_IMAGE            docker image to test (default: kei:latest)
 #   KEI_TEST_SCRATCH_DIR        base dir for per-suite scratch (default: /tmp/codex/kei/shell-tests-$USER)
 
@@ -60,9 +59,34 @@ kei_db_path() {
     printf '%s/%s.db' "$(kei_cookie_dir)" "$(kei_user_slug)"
 }
 
-kei_album() {
-    printf '%s' "${KEI_TEST_ALBUM:-kei-test}"
+kei_live_filters() {
+    cat "$PROJECT_DIR/tests/data/live-selection.toml"
 }
+
+# import-existing reads its scan cap from --recent, not filters.recent.
+kei_live_recent() {
+    awk '$1 == "recent" && $2 == "=" { print $3 }' "$PROJECT_DIR/tests/data/live-selection.toml"
+}
+
+# No download or shared-state mutation. Fail before account-dependent suites.
+kei_preflight_selection() (
+    local work config output count
+    work=$(mktemp -d "${TMPDIR:-/tmp}/kei-live-selection-XXXXXX") || exit 1
+    trap 'rm -rf "$work"' EXIT
+    kei_copy_session_without_state "$work/data"
+    config=$(kei_write_sync_config "$work/data" "$work/media")
+    if ! output=$(KEI_DATA_DIR="$work/data" "$(kei_release_bin)" sync --config "$config" --only-print-filenames --no-progress-bar); then
+        echo "ABORT: bounded primary-library selection failed" >&2
+        exit 1
+    fi
+    count=$(printf '%s\n' "$output" | awk 'NF { count++ } END { print count+0 }')
+    echo "Live selection: primary library, albums=none, unfiled=true; eligible filenames=$count" >&2
+    if [ "$count" -eq 0 ]; then
+        echo "ABORT: empty bounded live selection. Add at least one eligible recent asset. Selection:" >&2
+        kei_live_filters >&2
+        exit 1
+    fi
+)
 
 kei_toml_string() {
     local s="$1"
@@ -95,9 +119,7 @@ kei_write_sync_config() {
         echo "[download]"
         printf 'directory = %s\n' "$(kei_toml_string "$download_dir")"
         kei_append_toml_fragment "$download_extra"
-        echo "[filters]"
-        printf 'albums = [%s]\n' "$(kei_toml_string "$(kei_album)")"
-        echo "unfiled = false"
+        kei_live_filters
         kei_append_toml_fragment "$filters_extra"
         if [ -n "$photos_extra" ]; then
             echo "[photos]"
@@ -170,6 +192,7 @@ kei_preflight_session() {
         --password "$ICLOUD_PASSWORD" 2>&1)
     if echo "$out" | grep -q "Authentication completed\|Session OK\|already authenticated"; then
         kei_check "session valid" 0
+        kei_preflight_selection || exit 1
         return 0
     fi
     echo "  ABORT: session invalid or rate-limited"
@@ -182,6 +205,12 @@ kei_preflight_session() {
 # of each row on stdout; `kei_db_exec` runs a mutating statement and
 # discards output. Both suppress the "unable to open" error that fires
 # before the first sync has created the DB.
+kei_sql_string() {
+    local value="$1"
+    value="${value//\'/\'\'}"
+    printf "'%s'" "$value"
+}
+
 kei_db_query() {
     sqlite3 "$(kei_db_path)" "$1" 2>/dev/null
 }

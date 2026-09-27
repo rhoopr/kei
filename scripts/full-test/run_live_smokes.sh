@@ -8,7 +8,6 @@
 #
 # Optional env:
 #   KEI_TEST_DATA_DIR  cookie / db dir (default .test-cookies under repo)
-#   KEI_TEST_ALBUM     album name for sync dry-run (default kei-test)
 #   KEI_TEST_DOWNLOAD_DIR  temp dir for sync/import dry-run (default under TMPDIR)
 #
 # Adding a new CLI subcommand: add a smoke line below. Don't add destructive

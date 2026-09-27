@@ -1,0 +1,16 @@
+{
+  "sources_sha256": {
+    "IMG_1853.HEIC": "8e6fac35b135ca6756ce8fb3368ec4dc3613ea5c0db34aa1eeefd3988e26c625",
+    "IMG_1853.mov": "5d24de6ae010d9bdaff559ea8f736923967cbc8e3e382cc0489a5673adec436d"
+  },
+  "pair_id": "76300000-0000-4000-8000-000000000001",
+  "all_packet_sizes_and_timing_preserved": true,
+  "video_and_timed_metadata_packets_identical": true,
+  "audio_decodes_to_silence": true,
+  "still_pixels_identical": true,
+  "still_rgb24_sha256": "3b55439e86ed73ad39a8b94130bb30b9c6f810627d1e88219e8e15d556181a47",
+  "gps_location_serial_tags_absent": true,
+  "still_image_time_retained": true,
+  "exiftool": "13.59",
+  "ffmpeg": "ffmpeg version n8.1.1 Copyright (c) 2000-2026 the FFmpeg developers"
+}

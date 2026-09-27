@@ -18,11 +18,12 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 kei_require_env
+kei_require_release_binary
+kei_preflight_selection || exit 1
 
 IMAGE="$(kei_docker_image)"
 COOKIES="$(kei_cookie_dir)"
 USER_SLUG="$(kei_user_slug)"
-ALBUM="$(kei_album)"
 kei_check_init
 
 kei_suite_banner "DOCKER LIVE INTEGRATION"
@@ -60,7 +61,7 @@ cp "$sync_config" "$DOCKER_CONFIG/config.toml"
     echo "interval = 60"
 } >"$DOCKER_CONFIG/watch-config.toml"
 
-echo "--- 1. Docker sync ($ALBUM album) ---"
+echo "--- 1. Docker sync (bounded primary library) ---"
 docker run --rm \
     -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
     -e KEI_DATA_DIR=/config \
@@ -176,8 +177,8 @@ docker run --rm \
     -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" list albums \
-    2>&1 | grep -qF "$ALBUM"
-kei_check "list-albums shows $ALBUM album"
+    2>&1 | grep -F "Library:" >/dev/null
+kei_check "list-albums shows library output"
 
 echo ""
 echo "--- 10. Watch mode cycles + graceful SIGTERM ---"

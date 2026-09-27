@@ -16,3 +16,6 @@ pub(super) mod url_refresh;
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod fixture_tests;

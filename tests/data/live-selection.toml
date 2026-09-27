@@ -1,0 +1,6 @@
+# One library-wide pass. Shared by Rust, shell, Docker, import and service tests.
+[filters]
+albums = ["none"]
+unfiled = true
+libraries = ["primary"]
+recent = 10

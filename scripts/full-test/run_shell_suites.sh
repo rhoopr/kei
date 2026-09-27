@@ -4,7 +4,6 @@
 # name is test_shell_<basename-with-dashes-as-underscores>.
 #
 # Required env (set by the orchestrator):
-#   KEI_TEST_ALBUM     default kei-test
 #   KEI_DOCKER_IMAGE   default kei:dev (must match Phase 2 build tag)
 #
 # Each shell suite hits Apple via the live binary, so they run as --live
@@ -22,7 +21,6 @@ if [[ ! -d "$shell_dir" ]]; then
     exit 1
 fi
 
-album="${KEI_TEST_ALBUM:-kei-test}"
 image="${KEI_DOCKER_IMAGE:-kei:dev}"
 shell_scratch="${KEI_TEST_SCRATCH_DIR:-/tmp/codex/kei/full-test/shell}"
 mkdir -p "$shell_scratch"
@@ -34,7 +32,6 @@ for sh in "$shell_dir"/*.sh; do
     phase="test_shell_${base//-/_}"
     "$time_phase" --live "$phase" -- \
         env \
-        KEI_TEST_ALBUM="$album" \
         KEI_DOCKER_IMAGE="$image" \
         KEI_TEST_SCRATCH_DIR="$shell_scratch" \
         "$sh"
