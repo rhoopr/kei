@@ -573,6 +573,26 @@ impl DownloadedFile {
         final_path: &Path,
         publication: FinalPublication,
     ) -> anyhow::Result<()> {
+        // ReplaceFileW opens its replacement without sharing data access.
+        // Keep an attribute-only identity handle before releasing the reader or
+        // writer, so Windows repair publication never has an unpinned interval.
+        #[cfg(windows)]
+        let expected_replacement = if matches!(publication, FinalPublication::ReplaceTruncated(_)) {
+            let expected = self.fingerprint().await?;
+            let retained = Arc::clone(&self.retained);
+            self.retained = tokio::task::spawn_blocking(move || {
+                let file = retained.path.pin_identity(file_identity(&retained.file)?)?;
+                let path = retained.path.sibling(retained.path.path())?;
+                Ok::<_, anyhow::Error>(Arc::new(RetainedDownload { path, file }))
+            })
+            .await??;
+            Some(expected)
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let expected_replacement: Option<ExistingFileFingerprint> = None;
+
         let retained = Arc::clone(&self.retained);
         let destination = final_path.to_path_buf();
         let final_confined = tokio::task::spawn_blocking(move || {
@@ -589,11 +609,14 @@ impl DownloadedFile {
             if file_identity(&file)? != file_identity(&retained.file)? {
                 // An existing identical destination is a valid deduplicated publication.
                 use std::io::Seek;
-                let mut original = retained.file.try_clone()?;
-                original.rewind()?;
-                let expected =
+                let expected = if let Some(expected) = expected_replacement {
+                    expected
+                } else {
+                    let mut original = retained.file.try_clone()?;
+                    original.rewind()?;
                     fingerprint_open_file_snapshot_blocking(&mut original, retained.path.path())?
-                        .fingerprint;
+                        .fingerprint
+                };
                 let actual =
                     fingerprint_open_file_snapshot_blocking(&mut file, final_confined.path())?
                         .fingerprint;

@@ -2045,3 +2045,56 @@ async fn resume_leaf_swap_during_body_never_redirects_writes_or_publishes() {
         }
     }
 }
+
+#[tokio::test]
+async fn retained_download_can_publish_approved_truncation_repair() {
+    for resume in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let destination = dir.path().join("repair.jpg");
+        std::fs::write(&destination, [0xFF, 0xD8]).unwrap();
+        let expected = super::super::fingerprint::fingerprint_regular_file(&destination)
+            .await
+            .unwrap();
+        let part = temp_download_path(&destination, "AAAA", ".part").unwrap();
+        let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        if resume {
+            std::fs::write(&part, &body[..2]).unwrap();
+        }
+        let remaining = if resume { &body[2..] } else { &body[..] };
+        let client = StubDownloadClient {
+            status: if resume { 206 } else { 200 },
+            content_length: Some(remaining.len() as u64),
+            content_range: resume.then(|| "bytes 2-7/8".to_string()),
+            content_type: Some("image/jpeg".to_string()),
+            body: remaining.to_vec(),
+        };
+        let downloaded = download_file_with_mode(
+            &client,
+            "http://stub/repair.jpg",
+            &destination,
+            "AAAA",
+            &RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            },
+            ".part",
+            DownloadOpts {
+                skip_rename: false,
+                expected_size: Some(body.len() as u64),
+                publication: FinalPublication::ReplaceTruncated(expected),
+            },
+            DownloadLimits::default(),
+            crate::personality::Mode::Off,
+        )
+        .await
+        .expect("retained identity must permit approved repair publication");
+        assert_eq!(downloaded.bytes_written, body.len() as u64);
+        assert_eq!(std::fs::read(&destination).unwrap(), body);
+        assert!(!part.exists());
+        assert_eq!(
+            downloaded.fingerprint().await.unwrap().size,
+            body.len() as u64
+        );
+    }
+}

@@ -291,6 +291,19 @@ impl ConfinedPath {
         Ok(file)
     }
 
+    /// Retain identity without data access, which would block ReplaceFileW's
+    /// exclusive open of a replacement file. The returned handle cannot read bytes.
+    #[cfg(windows)]
+    pub(crate) fn pin_identity(&self, expected: FileIdentity) -> std::io::Result<std::fs::File> {
+        self.validate_namespace()?;
+        let file = open_windows_entry_attributes(&self.path)?;
+        ensure_windows_regular(&file, &self.path)?;
+        if file_identity(&file)? != expected {
+            return Err(confined_identity_changed_error(&self.path));
+        }
+        Ok(file)
+    }
+
     pub(crate) fn validate_for_metadata(
         &self,
         expected: FileIdentity,
@@ -1176,6 +1189,27 @@ where
 mod tests {
     use super::*;
     use std::io;
+
+    #[cfg(windows)]
+    #[test]
+    fn confined_identity_pin_allows_exclusive_replacement_access() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("replacement.part");
+        std::fs::write(&path, b"replacement").unwrap();
+        let confined = ConfinedPath::open(root.path(), &path, ConfinedParents::Existing).unwrap();
+        let reader = confined.open_regular().unwrap();
+        let identity = file_identity(&reader).unwrap();
+        let mut exclusive = std::fs::OpenOptions::new();
+        exclusive.read(true).write(true).share_mode(0);
+        assert!(exclusive.open(&path).is_err());
+        let pinned = confined.pin_identity(identity).unwrap();
+        drop(reader);
+        let replacement = exclusive.open(&path).unwrap();
+        assert_eq!(file_identity(&replacement).unwrap(), identity);
+        assert_eq!(file_identity(&pinned).unwrap(), identity);
+    }
 
     #[test]
     fn confined_append_requires_regular_file_and_preserves_prefix() {
