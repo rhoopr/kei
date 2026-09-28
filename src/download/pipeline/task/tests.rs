@@ -724,3 +724,170 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_download_and_reope
         server.verify().await;
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resumed_task_rejects_symlink_and_preserves_regular_resume() {
+    use base64::Engine as _;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    #[derive(Clone, Copy)]
+    enum ResumeLeaf {
+        Symlink,
+        SwappedSymlink,
+        Regular,
+    }
+    for (leaf, embed) in [
+        ResumeLeaf::Symlink,
+        ResumeLeaf::SwappedSymlink,
+        ResumeLeaf::Regular,
+    ]
+    .into_iter()
+    .flat_map(|leaf| [false, true].map(|embed| (leaf, embed)))
+    {
+        let rejected = !matches!(leaf, ResumeLeaf::Regular);
+        let server = crate::start_wiremock_or_skip!();
+        let body = crate::download::pipeline::test_support::MINIMAL_JPEG.to_vec();
+        let prefix = &body[..2];
+        let dir = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let sentinel = external.path().join("sentinel.jpg");
+        fs::write(&sentinel, prefix).unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.state_db = Some(db.clone());
+        config.retry.max_retries = 0;
+        config.metadata.set_exif_datetime = embed;
+        let config = Arc::new(config);
+        let checksum = base64::engine::general_purpose::STANDARD.encode([0x73; 32]);
+        let asset = TestPhotoAsset::new("RESUME")
+            .filename("resume.jpg")
+            .orig_size(body.len() as u64)
+            .orig_url(&format!("{}/resume.jpg", server.uri()))
+            .orig_checksum(&checksum)
+            .build();
+        let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let task = &plan.tasks[0];
+        let final_path = task.download_path.clone();
+        let part = crate::download::file::temp_download_path(
+            &final_path,
+            &task.checksum,
+            &config.temp_suffix,
+        )
+        .unwrap();
+        fs::create_dir_all(part.parent().unwrap()).unwrap();
+        if matches!(leaf, ResumeLeaf::Symlink) {
+            std::os::unix::fs::symlink(&sentinel, &part).unwrap();
+        } else {
+            fs::write(&part, prefix).unwrap();
+        }
+        let swap_part = part.clone();
+        let swap_sentinel = sentinel.clone();
+        let response_body = body[2..].to_vec();
+        let content_range = format!("bytes 2-{}/{}", body.len() - 1, body.len());
+        Mock::given(method("GET"))
+            .and(path("/resume.jpg"))
+            .and(header("range", "bytes=2-"))
+            .respond_with(move |_: &wiremock::Request| {
+                // The Range request proves the production resume probe has run.
+                if matches!(leaf, ResumeLeaf::SwappedSymlink) {
+                    fs::rename(&swap_part, swap_part.with_extension("retained")).unwrap();
+                    std::os::unix::fs::symlink(&swap_sentinel, &swap_part).unwrap();
+                }
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", content_range.clone())
+                    .insert_header("content-type", "image/jpeg")
+                    .set_body_bytes(response_body.clone())
+            })
+            .expect(if matches!(leaf, ResumeLeaf::Symlink) {
+                0
+            } else {
+                1
+            })
+            .mount(&server)
+            .await;
+        planner::upsert_seen_for_task(db.as_ref(), &config, &asset, task)
+            .await
+            .unwrap();
+        let client = Client::new();
+        // Repeat the unchanged production cycle: unsafe input remains failed;
+        // successful resume becomes a state-backed skip with no second GET.
+        for cycle in 0..2 {
+            let result = stream_and_download_from_stream(
+                &client,
+                stream::iter(vec![Ok(asset.clone())]),
+                &config,
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(fs::read(&sentinel).unwrap(), prefix);
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            if rejected {
+                assert_eq!(result.downloaded, 0);
+                assert_eq!(result.failed.len(), 1);
+                assert!(!final_path.exists());
+                if matches!(leaf, ResumeLeaf::SwappedSymlink) {
+                    assert_eq!(fs::read(part.with_extension("retained")).unwrap(), prefix);
+                }
+                assert!(
+                    reopened
+                        .get_downloaded_page(0, 10)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                let failed = reopened.get_failed().await.unwrap();
+                assert_eq!(failed.len(), 1);
+                assert!(
+                    failed[0]
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("regular"))
+                );
+            } else {
+                assert_eq!(result.downloaded, usize::from(cycle == 0));
+                assert!(result.failed.is_empty());
+                assert_eq!(result.exif_failures, 0);
+                let bytes = fs::read(&final_path).unwrap();
+                if embed {
+                    assert_ne!(
+                        bytes, body,
+                        "opt-in metadata must exercise inode replacement"
+                    );
+                } else {
+                    assert_eq!(bytes, body);
+                }
+                use sha2::{Digest, Sha256};
+                let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(
+                    rows[0].download_checksum.as_deref(),
+                    Some(
+                        data_encoding::HEXLOWER
+                            .encode(&Sha256::digest(&body))
+                            .as_str()
+                    )
+                );
+                assert_eq!(
+                    rows[0].local_checksum.as_deref(),
+                    Some(
+                        data_encoding::HEXLOWER
+                            .encode(&Sha256::digest(&bytes))
+                            .as_str()
+                    )
+                );
+                assert!(!part.exists());
+                assert_eq!(reopened.get_downloaded_page(0, 10).await.unwrap().len(), 1);
+            }
+        }
+        server.verify().await;
+    }
+}

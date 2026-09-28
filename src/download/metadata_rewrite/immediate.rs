@@ -13,9 +13,10 @@ use std::sync::Arc;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataWriteOutcome {
     pub(super) embed_failed: bool,
-    pub(super) embed_input_changed: bool,
+    pub(in crate::download) embed_input_changed: bool,
     pub(super) embed_no_write: bool,
-    pub(super) embed_output_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,
+    pub(in crate::download) embed_output_fingerprint:
+        Option<crate::download::file::ExistingFileFingerprint>,
     pub(super) sidecar_failed: bool,
 }
 

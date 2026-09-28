@@ -619,6 +619,16 @@ write or resume .part
   -> finalize SQLite state
 ```
 
+The transfer owner opens an existing resume file through a retained parent
+handle with no-follow access and requires a regular file. It reads the Range
+offset from that file handle and uses the same handle for append writes.
+Resume probes reject symlinks. Identity checks reject a changed leaf before
+body writes, content validation, and publication. A final identity or byte check
+must pass before downloaded state can finalize. The task retains the file
+through metadata work and publication; an opt-in metadata replacement must
+match the writer's output fingerprint before it is accepted.
+The durable temporary-path claim alone does not authorize an append.
+
 Schema v19 records the exact temporary path before a state-backed download can
 write or resume it. Normal completion and graceful interruption retire that
 claim. A process crash leaves the claim as durable cleanup authority. Later
