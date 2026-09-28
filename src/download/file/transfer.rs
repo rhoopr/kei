@@ -2,24 +2,27 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::Context;
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
-use tokio::fs::{self, OpenOptions};
+use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::download::error::DownloadError;
 use crate::download::limiter::BandwidthLimiter;
+use crate::fs_util::{ConfinedParents, ConfinedPath, file_identity};
 use crate::retry::{self, RetryAction, RetryConfig};
 
+use super::fingerprint::{ExistingFileFingerprint, fingerprint_open_file_snapshot_blocking};
 use super::publication::publish_part_to_final;
 use super::replacement::FinalPublication;
 use super::validation::{
-    rejecting_content_type_reason, validate_download_lengths, validate_downloaded_content,
+    rejecting_content_type_reason, validate_download_lengths, validate_downloaded_file,
     validate_resume_content_range, validate_resume_size,
 };
 
@@ -155,7 +158,7 @@ pub(in crate::download) async fn download_file_with_mode<C: DownloadClient>(
     opts: DownloadOpts,
     limits: DownloadLimits<'_>,
     mode: crate::personality::Mode,
-) -> Result<u64, DownloadError> {
+) -> Result<DownloadedFile, DownloadError> {
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
 
@@ -229,6 +232,7 @@ async fn attempt_download<C: DownloadClient>(
         FinalPublication::NoReplace,
     )
     .await
+    .map(|download| download.bytes_written)
 }
 
 #[allow(
@@ -245,39 +249,43 @@ async fn attempt_download_with_publication<C: DownloadClient>(
     bandwidth_limiter: Option<&BandwidthLimiter>,
     shutdown_token: Option<&CancellationToken>,
     publication: FinalPublication,
-) -> Result<u64, DownloadError> {
+) -> Result<DownloadedFile, DownloadError> {
     let path_str = download_path.display().to_string();
 
-    let resume_offset = match fs::metadata(part_path).await {
-        Ok(meta) if meta.len() > 0 => {
-            // Discard stale .part files from crashed runs to avoid resuming
-            // from potentially corrupt bytes.
-            let stale = match meta.modified() {
-                Ok(mtime) => {
-                    mtime.elapsed().unwrap_or(std::time::Duration::ZERO)
-                        > std::time::Duration::from_secs(STALE_PART_FILE_SECS)
-                }
-                Err(e) => {
-                    tracing::warn!(target: "kei::download::file",
-                        path = %part_path.display(),
-                        error = %e,
-                        "Cannot read .part file mtime, treating as stale"
-                    );
-                    true
-                }
-            };
-            if stale {
-                tracing::warn!(target: "kei::download::file",
-                    path = %part_path.display(),
-                    size = meta.len(),
-                    "Stale .part file (>1h old), restarting download"
-                );
-                0
-            } else {
-                meta.len()
+    let part_owned = part_path.to_path_buf();
+    let (confined, resume_file) = tokio::task::spawn_blocking(move || {
+        let parent = part_owned.parent().unwrap_or_else(|| Path::new("."));
+        let confined = ConfinedPath::open(parent, &part_owned, ConfinedParents::Existing)?;
+        let file = confined.open_optional_append()?;
+        Ok::<_, std::io::Error>((confined, file))
+    })
+    .await
+    .map_err(|e| DownloadError::Other(e.into()))??;
+    let resume_file = resume_file.map(tokio::fs::File::from_std);
+    let resume_offset = if let Some(file) = &resume_file {
+        let meta = file.metadata().await?;
+        let stale = match meta.modified() {
+            Ok(mtime) => {
+                mtime.elapsed().unwrap_or(std::time::Duration::ZERO)
+                    > std::time::Duration::from_secs(STALE_PART_FILE_SECS)
             }
+            Err(e) => {
+                tracing::warn!(target: "kei::download::file",
+                    path = %part_path.display(), error = %e,
+                    "Cannot read .part file mtime, treating as stale");
+                true
+            }
+        };
+        if stale {
+            tracing::warn!(target: "kei::download::file",
+                path = %part_path.display(), size = meta.len(),
+                "Stale .part file (>1h old), restarting download");
+            0
+        } else {
+            meta.len()
         }
-        _ => 0,
+    } else {
+        0
     };
 
     let resume_from = if resume_offset > 0 {
@@ -359,39 +367,42 @@ async fn attempt_download_with_publication<C: DownloadClient>(
         return Err(error);
     }
 
-    // When starting fresh (no resume), unlink any existing .part and use
-    // create_new so a concurrent kei instance writing the same .part is
-    // detected as a hard error (AlreadyExists) rather than silently racing.
-    // When resuming, open append-only without create (the file must exist —
-    // we read its length at the top of this function).
-    let mut file = if truncate {
+    // The offset and writes use the same no-follow regular-file handle.
+    // Never reopen a resumed pathname after the request has been sent.
+    let file = if truncate {
+        drop(resume_file);
         crate::fs_util::log_remove_async(part_path).await;
-        OpenOptions::new()
+        // Preserve fresh-download permissions and exclusive creation. create_new
+        // rejects any existing leaf, including a symlink.
+        fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
-            .open(&part_path)
+            .open(part_path)
             .await
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::AlreadyExists => DownloadError::Other(anyhow::anyhow!(
                     "Another kei process is already writing {}. Only one kei instance may use the same download directory at a time.",
                     part_path.display()
                 )),
-                _ => {
-                    DownloadError::Other(anyhow::anyhow!("Could not open temporary download file: {e}"))
-                }
+                _ => DownloadError::Other(anyhow::anyhow!("Could not open temporary download file: {e}")),
             })?
     } else {
-        OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(&part_path)
-            .await
-            .map_err(|e| {
-                DownloadError::Other(anyhow::anyhow!(
-                    "Could not open temporary download file: {e}"
-                ))
-            })?
-    };
+        resume_file.ok_or_else(|| DownloadError::Other(anyhow::anyhow!(
+            "Resumed download lost its retained temporary file"
+        )))?
+    }.into_std().await;
+    let (confined, file) = tokio::task::spawn_blocking(move || {
+        confined.validate_identity(file_identity(&file)?)?;
+        Ok::<_, std::io::Error>((confined, file))
+    })
+    .await
+    .map_err(|e| DownloadError::Other(e.into()))??;
+    let retained = Arc::new(RetainedDownload {
+        path: confined,
+        file,
+    });
+    let mut file = fs::File::from_std(retained.file.try_clone()?);
 
     let mut stream = response.stream;
     let stream_result: Result<(), DownloadError> = async {
@@ -458,26 +469,171 @@ async fn attempt_download_with_publication<C: DownloadClient>(
         return Err(error);
     }
 
-    // Validate content looks like actual media, not an HTML error page.
-    // Apple's CDN occasionally returns HTTP 200 with HTML (rate limit, CAPTCHA,
-    // service unavailable) which would otherwise be saved as the final file.
-    let part_owned = part_path.to_path_buf();
+    // Inspect the retained inode, not a pathname that can change during HTTP IO.
+    let check = Arc::clone(&retained);
     let download_owned = download_path.to_path_buf();
     let validation = tokio::task::spawn_blocking(move || {
-        validate_downloaded_content(&part_owned, &download_owned)
+        let mut file = check.path.validate_identity(file_identity(&check.file)?)?;
+        validate_downloaded_file(&mut file, &download_owned)
     })
     .await
-    .map_err(|e| DownloadError::Disk(Box::new(std::io::Error::other(e))))?;
+    .map_err(|e| DownloadError::Other(e.into()))?;
     if let Err(e) = validation {
-        crate::fs_util::log_remove_async(part_path).await;
+        // A changed leaf is not ours to remove.
+        if matches!(e, DownloadError::InvalidContent { .. }) {
+            crate::fs_util::log_remove_async(part_path).await;
+        }
         return Err(e);
     }
 
+    let mut downloaded = DownloadedFile {
+        bytes_written,
+        retained,
+    };
     if !skip_rename {
-        publish_part_to_final(part_path, download_path, publication).await?;
+        downloaded
+            .publish(download_path, publication)
+            .await
+            .map_err(DownloadError::Other)?;
+    }
+    Ok(downloaded)
+}
+
+/// Retains the transferred inode across validation, metadata, and publication.
+#[derive(Debug)]
+struct RetainedDownload {
+    path: ConfinedPath,
+    file: std::fs::File,
+}
+
+#[derive(Debug)]
+#[must_use = "retain the downloaded file until metadata and publication complete"]
+pub(in crate::download) struct DownloadedFile {
+    pub(in crate::download) bytes_written: u64,
+    retained: Arc<RetainedDownload>,
+}
+
+impl DownloadedFile {
+    pub(in crate::download) async fn fingerprint(&self) -> anyhow::Result<ExistingFileFingerprint> {
+        let retained = Arc::clone(&self.retained);
+        tokio::task::spawn_blocking(move || {
+            let mut file = retained
+                .path
+                .validate_identity(file_identity(&retained.file)?)?;
+            let fingerprint =
+                fingerprint_open_file_snapshot_blocking(&mut file, retained.path.path())?
+                    .fingerprint;
+            retained
+                .path
+                .validate_identity(file_identity(&retained.file)?)?;
+            Ok(fingerprint)
+        })
+        .await?
     }
 
-    Ok(bytes_written)
+    pub(in crate::download) async fn set_times(
+        &self,
+        times: std::fs::FileTimes,
+    ) -> anyhow::Result<()> {
+        let retained = Arc::clone(&self.retained);
+        tokio::task::spawn_blocking(move || {
+            retained
+                .path
+                .validate_for_metadata(file_identity(&retained.file)?)?
+                .set_times(times)?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Accept only the exact output authorized by the metadata writer.
+    pub(in crate::download) async fn accept_metadata_output(
+        &mut self,
+        expected: ExistingFileFingerprint,
+    ) -> anyhow::Result<()> {
+        let retained = Arc::clone(&self.retained);
+        self.retained = tokio::task::spawn_blocking(move || {
+            let path = retained.path.sibling(retained.path.path())?;
+            let mut file = path.open_regular()?;
+            let actual =
+                fingerprint_open_file_snapshot_blocking(&mut file, path.path())?.fingerprint;
+            anyhow::ensure!(
+                actual == expected,
+                "Temporary download changed after metadata write"
+            );
+            path.validate_identity(file_identity(&file)?)?;
+            Ok::<_, anyhow::Error>(Arc::new(RetainedDownload { path, file }))
+        })
+        .await??;
+        Ok(())
+    }
+
+    pub(in crate::download) async fn publish(
+        &mut self,
+        final_path: &Path,
+        publication: FinalPublication,
+    ) -> anyhow::Result<()> {
+        // ReplaceFileW opens its replacement without sharing data access.
+        // Keep an attribute-only identity handle before releasing the reader or
+        // writer, so Windows repair publication never has an unpinned interval.
+        #[cfg(windows)]
+        let expected_replacement = if matches!(publication, FinalPublication::ReplaceTruncated(_)) {
+            let expected = self.fingerprint().await?;
+            let retained = Arc::clone(&self.retained);
+            self.retained = tokio::task::spawn_blocking(move || {
+                let file = retained.path.pin_identity(file_identity(&retained.file)?)?;
+                let path = retained.path.sibling(retained.path.path())?;
+                Ok::<_, anyhow::Error>(Arc::new(RetainedDownload { path, file }))
+            })
+            .await??;
+            Some(expected)
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let expected_replacement: Option<ExistingFileFingerprint> = None;
+
+        let retained = Arc::clone(&self.retained);
+        let destination = final_path.to_path_buf();
+        let final_confined = tokio::task::spawn_blocking(move || {
+            retained
+                .path
+                .validate_identity(file_identity(&retained.file)?)?;
+            retained.path.sibling(&destination)
+        })
+        .await??;
+        publish_part_to_final(self.retained.path.path(), final_path, publication).await?;
+        let retained = Arc::clone(&self.retained);
+        self.retained = tokio::task::spawn_blocking(move || {
+            let mut file = final_confined.open_regular()?;
+            if file_identity(&file)? != file_identity(&retained.file)? {
+                // An existing identical destination is a valid deduplicated publication.
+                use std::io::Seek;
+                let expected = if let Some(expected) = expected_replacement {
+                    expected
+                } else {
+                    let mut original = retained.file.try_clone()?;
+                    original.rewind()?;
+                    fingerprint_open_file_snapshot_blocking(&mut original, retained.path.path())?
+                        .fingerprint
+                };
+                let actual =
+                    fingerprint_open_file_snapshot_blocking(&mut file, final_confined.path())?
+                        .fingerprint;
+                anyhow::ensure!(
+                    actual == expected,
+                    "Published download changed identity and bytes"
+                );
+            }
+            final_confined.validate_identity(file_identity(&file)?)?;
+            Ok::<_, anyhow::Error>(Arc::new(RetainedDownload {
+                path: final_confined,
+                file,
+            }))
+        })
+        .await??;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -137,7 +137,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
     }
 
     let result: Result<(bool, String, Option<String>, u64, u64)> = async {
-        let bytes_downloaded = Box::pin(crate::download::file::download_file_with_mode(
+        let mut downloaded = Box::pin(crate::download::file::download_file_with_mode(
             client,
             &task.url,
             &task.download_path,
@@ -164,11 +164,12 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
 
         // Compute SHA-256 of the downloaded content before EXIF modification
         // so we store a hash that reflects the original download bytes.
-        let download_checksum = if let Some(path) = &part_path {
-            Some(crate::download::file::compute_sha256(path).await?)
+        let downloaded_fingerprint = if needs_embed {
+            Some(downloaded.fingerprint().await?)
         } else {
             None
         };
+        let download_checksum = downloaded_fingerprint.map(|fingerprint| data_encoding::HEXLOWER.encode(&fingerprint.sha256));
 
         let mut exif_ok = true;
         if let Some(part) = &part_path {
@@ -176,7 +177,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
                 metadata_rewrite::MetadataWriteRequest {
                     final_path: &task.download_path,
                     embed_path: Some(part),
-                    expected_embed_fingerprint: None,
+                    expected_embed_fingerprint: downloaded_fingerprint,
                     source_checksum: download_checksum.as_deref(),
                     sidecar_path: None,
                     payload: Arc::clone(&task.metadata),
@@ -187,25 +188,22 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
                 },
             )
             .await;
+            anyhow::ensure!(!outcome.embed_input_changed, "Temporary download changed before metadata write");
+            if let Some(expected) = outcome.embed_output_fingerprint {
+                downloaded.accept_metadata_output(expected).await?;
+            }
             exif_ok = !outcome.any_failed();
         }
 
         // Set mtime on .part (before rename) or final path directly.
         // rename() preserves mtime so this works in both cases.
-        let mtime_target = part_path.unwrap_or(&task.download_path).to_path_buf();
-        let ts = task.created_local.timestamp();
-        if let Err(e) = tokio::task::spawn_blocking(move || set_file_mtime(&mtime_target, ts)).await?
-        {
+        if let Err(e) = downloaded.set_times(download_file_times(&task.download_path, task.created_local.timestamp())).await {
             tracing::warn!(target: "kei::download::pipeline",
-                path = %task.download_path.display(),
-                error = %e,
-                "Could not set mtime"
-            );
+                path = %task.download_path.display(), error = %e, "Could not set mtime");
         }
 
-        // Atomic rename: .part → final (only when EXIF path was used)
-        if let Some(part) = &part_path {
-            crate::download::file::publish_part_to_final(part, &task.download_path, task.publication).await?;
+        if part_path.is_some() {
+            downloaded.publish(&task.download_path, task.publication).await?;
         }
 
         // Embed work already captured the original checksum. Otherwise take
@@ -213,7 +211,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
         let unmodified_checksum = if download_checksum.is_none()
             && metadata_flags.contains(metadata_rewrite::MetadataFlags::XMP_SIDECAR)
         {
-            Some(crate::download::file::compute_sha256(&task.download_path).await?)
+            Some(data_encoding::HEXLOWER.encode(&downloaded.fingerprint().await?.sha256))
         } else {
             None
         };
@@ -246,7 +244,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
 
         // Recheck after sidecar work before finalization, preserving the
         // existing final-file checksum boundary.
-        let local_checksum = crate::download::file::compute_sha256(&task.download_path).await?;
+        let local_checksum = data_encoding::HEXLOWER.encode(&downloaded.fingerprint().await?.sha256);
 
         // Note: Apple's `fileChecksum` is an MMCS (MobileMe Chunked Storage)
         // compound signature, not a SHA-1/SHA-256 content hash. It cannot be
@@ -262,7 +260,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
             exif_ok,
             local_checksum,
             download_checksum,
-            bytes_downloaded,
+            downloaded.bytes_written,
             disk_bytes,
         ))
     }
@@ -291,7 +289,13 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
 ///
 /// Handles negative timestamps (dates before 1970) gracefully by clamping
 /// to the Unix epoch.
+#[cfg(test)]
 fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
+    let file = std::fs::File::options().write(true).open(path)?;
+    file.set_times(download_file_times(path, timestamp))
+}
+
+fn download_file_times(path: &Path, timestamp: i64) -> FileTimes {
     let time = if timestamp >= 0 {
         UNIX_EPOCH + Duration::from_secs(timestamp.unsigned_abs())
     } else {
@@ -304,10 +308,7 @@ fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
             .checked_sub(Duration::from_secs(timestamp.unsigned_abs()))
             .unwrap_or(SystemTime::UNIX_EPOCH)
     };
-    let times = FileTimes::new().set_modified(time).set_accessed(time);
-    let file = std::fs::File::options().write(true).open(path)?;
-    file.set_times(times)?;
-    Ok(())
+    FileTimes::new().set_modified(time).set_accessed(time)
 }
 
 #[cfg(test)]

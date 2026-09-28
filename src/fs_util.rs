@@ -121,6 +121,7 @@ pub(crate) enum ConfinedParents {
 enum ConfinedAccess {
     Read,
     Metadata,
+    Append,
 }
 
 #[derive(Debug)]
@@ -234,6 +235,17 @@ impl ConfinedPath {
         }
     }
 
+    /// Open an existing regular file for append without following a leaf link.
+    /// The returned handle, not another pathname open, must supply the resume offset.
+    pub(crate) fn open_optional_append(&self) -> std::io::Result<Option<std::fs::File>> {
+        self.validate_namespace()?;
+        match self.open_regular_with_access(ConfinedAccess::Append) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn create_new_regular(&self) -> std::io::Result<std::fs::File> {
         self.validate_namespace()?;
         #[cfg(unix)]
@@ -273,6 +285,19 @@ impl ConfinedPath {
     ) -> std::io::Result<std::fs::File> {
         self.validate_namespace()?;
         let file = self.open_regular_with_access(ConfinedAccess::Read)?;
+        if file_identity(&file)? != expected {
+            return Err(confined_identity_changed_error(&self.path));
+        }
+        Ok(file)
+    }
+
+    /// Retain identity without data access, which would block ReplaceFileW's
+    /// exclusive open of a replacement file. The returned handle cannot read bytes.
+    #[cfg(windows)]
+    pub(crate) fn pin_identity(&self, expected: FileIdentity) -> std::io::Result<std::fs::File> {
+        self.validate_namespace()?;
+        let file = open_windows_entry_attributes(&self.path)?;
+        ensure_windows_regular(&file, &self.path)?;
         if file_identity(&file)? != expected {
             return Err(confined_identity_changed_error(&self.path));
         }
@@ -356,7 +381,11 @@ impl ConfinedPath {
         {
             use std::os::fd::AsRawFd;
 
-            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+            let access_flags = match access {
+                ConfinedAccess::Append => libc::O_RDWR | libc::O_APPEND,
+                ConfinedAccess::Read | ConfinedAccess::Metadata => libc::O_RDONLY,
+            };
+            let flags = access_flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
             let file = std::fs::File::from(
                 openat_owned(self.parent_dir.as_raw_fd(), &self.name, flags, 0).map_err(
                     |error| {
@@ -371,15 +400,15 @@ impl ConfinedPath {
             if !file.metadata()?.file_type().is_file() {
                 return Err(non_regular_error(&self.path));
             }
-            let _ = access;
             Ok(file)
         }
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES,
-                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+                FILE_APPEND_DATA, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+                FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_WRITE_ATTRIBUTES,
             };
 
             let probe = open_windows_entry_attributes(&self.path)?;
@@ -389,6 +418,7 @@ impl ConfinedPath {
                 .access_mode(match access {
                     ConfinedAccess::Read => FILE_GENERIC_READ | FILE_READ_ATTRIBUTES,
                     ConfinedAccess::Metadata => FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES,
+                    ConfinedAccess::Append => FILE_GENERIC_READ | FILE_APPEND_DATA,
                 })
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -1159,6 +1189,43 @@ where
 mod tests {
     use super::*;
     use std::io;
+
+    #[cfg(windows)]
+    #[test]
+    fn confined_identity_pin_allows_exclusive_replacement_access() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("replacement.part");
+        std::fs::write(&path, b"replacement").unwrap();
+        let confined = ConfinedPath::open(root.path(), &path, ConfinedParents::Existing).unwrap();
+        let reader = confined.open_regular().unwrap();
+        let identity = file_identity(&reader).unwrap();
+        let mut exclusive = std::fs::OpenOptions::new();
+        exclusive.read(true).write(true).share_mode(0);
+        assert!(exclusive.open(&path).is_err());
+        let pinned = confined.pin_identity(identity).unwrap();
+        drop(reader);
+        let replacement = exclusive.open(&path).unwrap();
+        assert_eq!(file_identity(&replacement).unwrap(), identity);
+        assert_eq!(file_identity(&pinned).unwrap(), identity);
+    }
+
+    #[test]
+    fn confined_append_requires_regular_file_and_preserves_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("resume.part");
+        let confined = ConfinedPath::open(root.path(), &path, ConfinedParents::Existing).unwrap();
+        assert!(confined.open_optional_append().unwrap().is_none());
+        std::fs::create_dir(&path).unwrap();
+        assert!(confined.open_optional_append().is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"prefix").unwrap();
+        let mut file = confined.open_optional_append().unwrap().unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 6);
+        std::io::Write::write_all(&mut file, b" suffix").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"prefix suffix");
+    }
 
     #[test]
     fn confined_path_rejects_parent_components() {

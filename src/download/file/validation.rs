@@ -371,13 +371,22 @@ fn is_mov_top_atom(atom: &[u8]) -> bool {
 /// planned; validation never rewrites extensions. Unknown extensions remain
 /// permissive so provider-side sidecars or new formats are not silently blocked
 /// before kei has a type-specific policy for them.
+#[cfg(test)]
 pub(super) fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
 ) -> Result<(), DownloadError> {
-    use std::io::Read;
-
     let mut file = std::fs::File::open(part_path).map_err(|e| DownloadError::Disk(Box::new(e)))?;
+    validate_downloaded_file(&mut file, download_path)
+}
+
+pub(super) fn validate_downloaded_file(
+    file: &mut std::fs::File,
+    download_path: &Path,
+) -> Result<(), DownloadError> {
+    use std::io::{Read, Seek};
+
+    file.rewind()?;
     let mut buf = [0u8; 16];
     let n = file
         .read(&mut buf)

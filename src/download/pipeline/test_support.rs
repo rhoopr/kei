@@ -560,7 +560,7 @@ impl MetadataRewriteStore for FailingDownloadStore {
 
 /// Minimal valid JPEG (SOI + APP0 JFIF + EOI). The XMP toolkit accepts it,
 /// so a metadata write against it exercises the real writer.
-#[cfg(feature = "xmp")]
+#[cfg(any(unix, feature = "xmp"))]
 pub(super) const MINIMAL_JPEG: [u8; 22] = [
     0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
     0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
