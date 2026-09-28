@@ -105,6 +105,14 @@ validation result and resets the HTTP connection pool. A recovered session
 replays the retained checkpoint. Ambiguous provider identities remain pending;
 authentication recovery does not authorize choosing a child or discarding work.
 
+Legacy-master hydration scans all current visible and hidden children before
+metadata-capture repair or pending-download recovery selects an owner. Hidden
+children remain identity candidates; soft- and hard-deleted children do not.
+Without a saved owner, multiple matching children remain unresolved, even
+across visibility states.
+This does not change download selection or permit checkpoint advancement
+without the existing completion proof.
+
 Unresolved asset-only delta hydration is incomplete work, even when no media
 transfer fails. The producer records `unresolved_asset_identity:<zone> = 1` in
 the existing metadata table before stream completion. The cycle owner clears
