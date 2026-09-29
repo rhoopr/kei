@@ -1391,6 +1391,16 @@ impl state::MetadataRewriteStore for FailingMetadataSetDb {
             .await
     }
 
+    async fn defer_metadata_capture_ambiguity(
+        &self,
+        candidate: &state::MetadataCaptureCandidate,
+        revision: i64,
+    ) -> Result<bool, state::error::StateError> {
+        self.inner
+            .defer_metadata_capture_ambiguity(candidate, revision)
+            .await
+    }
+
     async fn record_metadata_capture_failure(
         &self,
         library: &str,

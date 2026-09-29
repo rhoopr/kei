@@ -41,6 +41,7 @@ pub struct ImportedRecord {
 /// Compact downloaded-state projection used to preload sync decisions.
 #[derive(Debug)]
 pub(crate) struct DownloadedFileRecord {
+    pub(crate) added_at: Option<DateTime<Utc>>,
     /// This receipt is also the catalog's current path, not an additional copy.
     pub(crate) is_current_path: bool,
     pub(crate) library: String,
@@ -876,6 +877,18 @@ pub trait MetadataRewriteStore: Send + Sync {
         Err(StateError::Invariant {
             operation: "get_metadata_capture_candidates",
             detail: "metadata-capture candidate reads are not implemented by this store".into(),
+        })
+    }
+    /// Persist an ambiguity schedule without accepting identity or completing work.
+    /// Returns false when the candidate is stale; errors leave work pending.
+    async fn defer_metadata_capture_ambiguity(
+        &self,
+        _candidate: &MetadataCaptureCandidate,
+        _revision: i64,
+    ) -> Result<bool, StateError> {
+        Err(StateError::Invariant {
+            operation: "defer_metadata_capture_ambiguity",
+            detail: "metadata-capture retry state is not implemented by this store".into(),
         })
     }
     async fn record_metadata_capture_failure(

@@ -89,6 +89,8 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         metadata_capture_refreshed: 2,
         metadata_capture_failures: 1,
         metadata_capture_remaining: 5,
+        metadata_capture_unresolved: 2,
+        metadata_capture_deferred: 1,
         metadata_capture_progressed: false,
         state_write_failures: 2,
         enumeration_errors: 3,
@@ -156,6 +158,8 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         metadata_capture_refreshed: 3,
         metadata_capture_failures: 2,
         metadata_capture_remaining: 7,
+        metadata_capture_unresolved: 3,
+        metadata_capture_deferred: 2,
         metadata_capture_progressed: true,
         state_write_failures: 5,
         enumeration_errors: 6,
@@ -218,6 +222,8 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     assert_eq!(acc.metadata_capture_refreshed, 5);
     assert_eq!(acc.metadata_capture_failures, 3);
     assert_eq!(acc.metadata_capture_remaining, 12);
+    assert_eq!(acc.metadata_capture_unresolved, 5);
+    assert_eq!(acc.metadata_capture_deferred, 3);
     assert!(acc.metadata_capture_progressed);
     assert_eq!(acc.state_write_failures, 7, "state_write_failures must sum");
     assert_eq!(acc.enumeration_errors, 9, "enumeration_errors must sum");

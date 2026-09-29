@@ -468,6 +468,7 @@ async fn seed_downloaded_state_for_expected_path(
         .created_at(asset.created())
         .size(expected_path.size)
         .version_size(expected_path.version_size)
+        .added_at(asset.added_date())
         .build();
     db.upsert_seen(&record).await.expect("seed state row");
     db.mark_downloaded(
@@ -1898,13 +1899,9 @@ async fn full_sync_filtered_sibling_cannot_displace_legacy_master_owner_next_cyc
     let master_record = mock_master_record_with_filename("MASTER_OWNER", "owner.jpg");
     let excluded_ids = Arc::new(["asset-owner-b".to_string()].into_iter().collect());
     let first_session = MockPhotosFlow::new()
-        .album_count(2)
+        .album_count(1)
         .query_page(
-            vec![
-                asset_b_record.clone(),
-                master_record.clone(),
-                asset_a_record.clone(),
-            ],
+            vec![master_record.clone(), asset_a_record.clone()],
             Some("zone-token-first"),
         )
         .build();
@@ -1937,7 +1934,7 @@ async fn full_sync_filtered_sibling_cannot_displace_legacy_master_owner_next_cyc
     .expect("first owner-claim cycle should complete");
     assert!(matches!(first.outcome, DownloadOutcome::Success));
     assert_eq!(first.stats.downloaded, 0);
-    assert_eq!(first.stats.skipped.by_excluded_album, 1);
+    assert_eq!(first.stats.skipped.by_excluded_album, 0);
     assert_eq!(
         db.remaining_legacy_master_state_owner_claim_failures(),
         0,

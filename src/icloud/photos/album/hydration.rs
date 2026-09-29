@@ -6,6 +6,8 @@ use crate::icloud::photos::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
 use rustc_hash::FxHashSet;
 use serde_json::Value;
 use std::sync::Arc;
+
+use crate::types::ChangeReason;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -235,7 +237,8 @@ impl PhotoAlbum {
             seen_asset_record_names: &mut FxHashSet<String>,
             matched: &mut Vec<PhotoAsset>,
         ) {
-            if event.reason != crate::types::ChangeReason::Created {
+            // Hidden children still participate in legacy ownership matching.
+            if !matches!(event.reason, ChangeReason::Created | ChangeReason::Hidden) {
                 return;
             }
             let Some(asset) = event.asset else {

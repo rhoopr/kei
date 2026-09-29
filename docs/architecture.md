@@ -102,6 +102,7 @@ changing behavior.
 | State-store contracts | `src/state/db/contracts.rs` | Defines store roles and records exchanged with callers. |
 | Asset state transitions | `src/state/db/assets.rs` | Owns asset lifecycle, download finalization, retry eligibility, and provider source-state transitions. |
 | Shared SQLite writes and row decoding | `src/state/db/asset_writes.rs`, `src/state/db/rows.rs` | Shares asset writes within caller-owned transactions, column projections, date codecs, and row decoding. |
+| Metadata capture retries | `src/state/db/metadata_capture_retry.rs` | Stores generation-fenced ambiguity evidence and bounded retry deadlines. The cycle owner retains checkpoint authority. |
 | Durable provider identity | `src/state/db/identity.rs` | Stores library-scoped asset/master mappings and legacy state ownership. Provider record parsing stays in the iCloud adapter. |
 | Durable membership | `src/state/db/membership.rs` | Stores album snapshots, provider relations, and grouping projections. |
 | Durable metadata work | `src/state/db/metadata.rs` | Stores capture revisions, path-specific rewrite work, and repair receipts. It does not write media files. |
@@ -218,6 +219,54 @@ Before bounded mid-cycle reauthentication, the watch loop removes the cached
 validation result and resets the HTTP connection pool. A recovered session
 replays the retained checkpoint. Ambiguous provider identities remain pending;
 authentication recovery does not authorize choosing a child or discarding work.
+
+Legacy-master hydration scans all current visible and hidden children before
+metadata-capture repair or pending-download recovery selects an owner. Hidden
+children remain identity candidates; soft- and hard-deleted children do not.
+Without a saved owner, multiple matching children remain unresolved, even
+across visibility states.
+This does not change download selection or permit checkpoint advancement
+without the existing completion proof.
+
+A new legacy-owner claim requires consistent, present per-rendition `added_at`
+evidence matching the provider's `addedDate`, in addition to the existing
+rendition checks. Missing provider dates do not use the epoch fallback as
+identity evidence. Matching dates do not rank otherwise ambiguous children.
+Whole-second legacy dates match within that second because older writers
+discarded milliseconds. Fractional stored dates require an exact match.
+Different stored rendition dates, including mixed whole-second and fractional
+rows, remain unresolved at the atomic claim gate. Direct pending lookups also
+require matching rendition evidence before they can persist a new owner.
+Another historically mapped child blocks a new claim even when it is now
+missing or has its own catalogue row. The state owner checks family history
+and mixed rendition dates inside the claim transaction. Normal enumeration
+and pending recovery use the same restrictions; read-only retry planning does
+not persist a claim. Unresolved pending ownership holds the checkpoint.
+
+Metadata-capture retry evidence includes each rendition's added date, at
+millisecond precision. A changed date or an older fingerprint without dates
+makes retained work eligible again. Conflicting or missing date evidence uses
+the existing bounded retry queue. This does not delete or retire legacy rows,
+replace saved owners, or restore dates overwritten by an earlier repair.
+Recovery of those rows requires separately preserved historical evidence.
+
+Ambiguous metadata-capture repairs retain a schema-27 retry row keyed by
+library, catalogue asset ID, and target capture revision. An unchanged failure
+retries after one hour, doubling up to 24 hours. Changed catalogue identity or
+rendition evidence is eligible immediately. A durable generation rejects stale
+attempts; its counter survives retry retirement. The state reader excludes
+deferred candidates before applying the existing 500-identity batch limit.
+Unresolved and deferred counts are separate from failed repair attempts.
+Deferred work keeps the capture revision pending and its checkpoint blocked,
+even when a cycle makes no repair attempt. The cycle checks each library
+before committing inventory anchors or provider checkpoints, including
+`--refresh-metadata` runs that bypass automatic capture repair. Idle health
+and other-library success cannot turn retained ambiguity into a successful
+backup. Completion retires retry rows only after the existing repair or
+source-deletion rules remove the stale work. Retry scheduling does not select a child or authorize
+metadata rewrites, deletion, or checkpoint advancement.
+The download owners store these holds in `CheckpointEvidence`. Report counter
+changes and result composition cannot clear them.
 
 Unresolved asset-only delta hydration is incomplete work, even when no media
 transfer fails. The producer records `unresolved_asset_identity:<zone> = 1` in
