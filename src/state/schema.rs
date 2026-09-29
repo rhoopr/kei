@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 26;
+pub(crate) const SCHEMA_VERSION: i32 = 27;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -39,6 +39,21 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     assets_downloaded INTEGER DEFAULT 0,
     assets_failed INTEGER DEFAULT 0,
     interrupted INTEGER DEFAULT 0
+);
+";
+
+/// Retry schedules do not complete metadata capture or authorize checkpoint advancement.
+const SCHEMA_V27: &str = r"
+CREATE TABLE IF NOT EXISTS metadata_capture_retries (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    target_revision INTEGER NOT NULL,
+    evidence TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    attempts INTEGER NOT NULL CHECK(attempts > 0),
+    last_attempt_at INTEGER NOT NULL,
+    next_retry_at INTEGER NOT NULL,
+    PRIMARY KEY (library, asset_id, target_revision)
 );
 ";
 
@@ -800,6 +815,7 @@ fn migrate_to_version(
         24 => conn.execute_batch(SCHEMA_V24)?,
         25 => conn.execute_batch(SCHEMA_V25)?,
         26 => conn.execute_batch(SCHEMA_V26)?,
+        27 => conn.execute_batch(SCHEMA_V27)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -817,6 +833,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn v27_metadata_capture_retry_migration_preserves_pending_work() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=26 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute_batch("INSERT INTO metadata(key,value) VALUES ('sync_token:PrimarySync','retained');
+            INSERT INTO metadata_capture_state(library,pending_revision,failed_assets,updated_at) VALUES ('PrimarySync',1,19,0);").unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 27);
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "retained"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT pending_revision,failed_assets FROM metadata_capture_state",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            (1, 19)
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM metadata_capture_retries", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('metadata_capture_retries') WHERE pk>0 ORDER BY pk").unwrap();
+        let keys: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(keys, ["library", "asset_id", "target_revision"]);
+        conn.execute(
+            "INSERT INTO metadata_capture_retries VALUES \
+             ('PrimarySync','retained-asset',1,'[]',1,1,0,3600)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 26).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT asset_id,next_retry_at FROM metadata_capture_retries",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            ("retained-asset".to_owned(), 3600)
+        );
+    }
+
+    #[test]
     fn v26_sparse_retry_migration_preserves_catalog_and_checkpoints() {
         let conn = Connection::open_in_memory().unwrap();
         for version in 1..=25 {
@@ -826,7 +905,7 @@ mod tests {
             INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum) VALUES ('PrimarySync','child','original','provider','image.jpg',1,10,'photo','downloaded',1,'/photos/image.jpg','local');").unwrap();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 26);
+        assert_eq!(get_schema_version(&conn).unwrap(), 27);
         assert_eq!(
             conn.query_row(
                 "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",

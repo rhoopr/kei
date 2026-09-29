@@ -562,6 +562,7 @@ pub(crate) struct MetadataCaptureCandidate {
     pub(crate) master_record_name: String,
     pub(crate) asset_record_name: Option<String>,
     pub(crate) versions: Vec<MetadataCaptureVersionEvidence>,
+    pub(crate) retry_generation: Option<super::db::MetadataCaptureRetryGeneration>,
 }
 
 /// Durable metadata-capture state for one provider library.
@@ -574,6 +575,10 @@ pub struct MetadataCaptureStatus {
     pub processed_assets: u64,
     pub failed_assets: u64,
     pub remaining_assets: u64,
+    /// Ambiguous catalogue identities still awaiting repair.
+    pub unresolved_assets: u64,
+    /// Unchanged ambiguous identities whose retry time is in the future.
+    pub deferred_assets: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }

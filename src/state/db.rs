@@ -15,7 +15,9 @@ use super::types::{
     MetadataCaptureCandidate, MetadataCaptureStatus, MetadataCaptureVersionEvidence, SyncRunStats,
     SyncSummary, VersionSizeKey,
 };
+mod metadata_capture_retry;
 mod sparse_identity;
+pub(crate) use metadata_capture_retry::MetadataCaptureRetryGeneration;
 
 pub(crate) use sparse_identity::{
     SparseAttemptOutcome, SparseDeletionCheckpoint, SparseEvidence, SparseIdentity,
@@ -1089,6 +1091,18 @@ pub trait MetadataRewriteStore: Send + Sync {
         Err(StateError::Invariant {
             operation: "get_metadata_capture_candidates",
             detail: "metadata-capture candidate reads are not implemented by this store".into(),
+        })
+    }
+    /// Persist an ambiguity schedule without accepting identity or completing work.
+    /// Returns false when the candidate is stale; errors leave work pending.
+    async fn defer_metadata_capture_ambiguity(
+        &self,
+        _candidate: &MetadataCaptureCandidate,
+        _revision: i64,
+    ) -> Result<bool, StateError> {
+        Err(StateError::Invariant {
+            operation: "defer_metadata_capture_ambiguity",
+            detail: "metadata-capture retry state is not implemented by this store".into(),
         })
     }
     async fn record_metadata_capture_failure(
@@ -5489,6 +5503,7 @@ impl SqliteStateDb {
             let tx = conn.transaction().map_err(|e| {
                 StateError::query("begin_metadata_capture_revision::transaction", e)
             })?;
+            metadata_capture_retry::retire_completed(&tx, &library)?;
             let remaining = metadata_capture_remaining(&tx, &library, target_revision)?;
             let existing = tx
                 .query_row(
@@ -5536,17 +5551,10 @@ impl SqliteStateDb {
                 rusqlite::params![library, active, pending, processed, failed, last_error, now],
             )
             .map_err(|e| StateError::query("begin_metadata_capture_revision::write", e))?;
+            let status = metadata_capture_status(&tx, &library, target_revision, remaining)?;
             tx.commit()
                 .map_err(|e| StateError::query("begin_metadata_capture_revision::commit", e))?;
-            Ok(MetadataCaptureStatus {
-                library,
-                active_revision: active,
-                pending_revision: pending,
-                processed_assets: u64::try_from(processed).unwrap_or(0),
-                failed_assets: u64::try_from(failed).unwrap_or(0),
-                remaining_assets: remaining,
-                last_error,
-            })
+            Ok(status)
         })
         .await
     }
@@ -5558,90 +5566,14 @@ impl SqliteStateDb {
         limit: usize,
     ) -> Result<Vec<MetadataCaptureCandidate>, StateError> {
         let library = library.to_owned();
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.with_conn("get_metadata_capture_candidates", move |conn| {
-            let mut stmt = conn
-                .prepare_cached(
-                    r"
-                    WITH stale_assets AS (
-                        SELECT assets.library, assets.id
-                        FROM assets
-                        LEFT JOIN asset_metadata_capture_revisions AS revisions
-                          ON revisions.library = assets.library
-                         AND revisions.asset_id = assets.id
-                        WHERE assets.library = ?1
-                          AND assets.status = 'downloaded'
-                          AND assets.is_deleted = 0
-                          AND (revisions.revision IS NULL OR revisions.revision < ?2)
-                        GROUP BY assets.library, assets.id
-                        ORDER BY assets.id
-                        LIMIT ?3
-                    )
-                    SELECT stale_assets.library, stale_assets.id,
-                           COALESCE(mapping.master_record_name,
-                                    owner.master_record_name,
-                                    stale_assets.id),
-                           COALESCE(mapping.asset_record_name,
-                                    owner.asset_record_name),
-                           assets.version_size, assets.checksum, assets.size_bytes
-                    FROM stale_assets
-                    JOIN assets
-                      ON assets.library = stale_assets.library
-                     AND assets.id = stale_assets.id
-                     AND assets.status = 'downloaded'
-                     AND assets.is_deleted = 0
-                    LEFT JOIN asset_master_mappings AS mapping
-                      ON mapping.library = stale_assets.library
-                     AND mapping.asset_record_name = stale_assets.id
-                    LEFT JOIN legacy_master_state_owners AS owner
-                      ON owner.library = stale_assets.library
-                     AND owner.master_record_name = stale_assets.id
-                    ORDER BY stale_assets.id, assets.version_size
-                    ",
-                )
-                .map_err(|e| StateError::query("get_metadata_capture_candidates::prepare", e))?;
-            let rows = stmt
-                .query_map(rusqlite::params![library, target_revision, limit], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?,
-                    ))
-                })
-                .map_err(|e| StateError::query("get_metadata_capture_candidates::query", e))?;
-            let mut candidates = Vec::<MetadataCaptureCandidate>::new();
-            for row in rows {
-                let (library, asset_id, master, asset, version, checksum, size) =
-                    row.map_err(|e| StateError::query("get_metadata_capture_candidates::row", e))?;
-                let version_size =
-                    VersionSizeKey::from_str(&version).ok_or_else(|| StateError::Invariant {
-                        operation: "get_metadata_capture_candidates",
-                        detail: format!("unknown durable version_size {version:?}"),
-                    })?;
-                let evidence = MetadataCaptureVersionEvidence {
-                    version_size,
-                    checksum,
-                    size_bytes: u64::try_from(size).unwrap_or(0),
-                };
-                if let Some(candidate) = candidates.last_mut()
-                    && candidate.asset_id == asset_id
-                {
-                    candidate.versions.push(evidence);
-                } else {
-                    candidates.push(MetadataCaptureCandidate {
-                        library,
-                        asset_id,
-                        master_record_name: master,
-                        asset_record_name: asset,
-                        versions: vec![evidence],
-                    });
-                }
-            }
-            Ok(candidates)
+            metadata_capture_retry::candidates(
+                conn,
+                &library,
+                target_revision,
+                limit,
+                Utc::now().timestamp(),
+            )
         })
         .await
     }
@@ -5677,6 +5609,7 @@ impl SqliteStateDb {
             let tx = conn.transaction().map_err(|e| {
                 StateError::query("complete_metadata_capture_revision::transaction", e)
             })?;
+            metadata_capture_retry::retire_completed(&tx, &library)?;
             let remaining = metadata_capture_remaining(&tx, &library, target_revision)?;
             if remaining == 0 {
                 tx.execute(
@@ -5782,6 +5715,8 @@ fn metadata_capture_status(
             (target_revision, None, 0, 0, None)
         }
     });
+    let retries =
+        metadata_capture_retry::counts(conn, library, target_revision, Utc::now().timestamp())?;
     Ok(MetadataCaptureStatus {
         library: library.to_owned(),
         active_revision,
@@ -5789,6 +5724,8 @@ fn metadata_capture_status(
         processed_assets: u64::try_from(processed).unwrap_or(0),
         failed_assets: u64::try_from(failed).unwrap_or(0),
         remaining_assets,
+        unresolved_assets: retries.unresolved,
+        deferred_assets: retries.deferred,
         last_error,
     })
 }
@@ -6743,6 +6680,14 @@ impl MetadataRewriteStore for SqliteStateDb {
         limit: usize,
     ) -> Result<Vec<MetadataCaptureCandidate>, StateError> {
         SqliteStateDb::get_metadata_capture_candidates(self, library, target_revision, limit).await
+    }
+
+    async fn defer_metadata_capture_ambiguity(
+        &self,
+        candidate: &MetadataCaptureCandidate,
+        revision: i64,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::defer_metadata_capture_ambiguity(self, candidate, revision).await
     }
 
     async fn record_metadata_capture_failure(

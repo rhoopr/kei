@@ -179,10 +179,16 @@ shows how many retained sparse records are unresolved and deferred. A deferred
 lookup does not mean that the record was skipped safely or deleted. These
 limits reduce repeated lookups; they do not repair a missing provider identity.
 
-This state uses schema 26. Stop workers and back up the state database before
-trying this build. Older binaries that support only schema 25 cannot open the
-upgraded database. Keep a compatible backup if you need to return to an older
-build. Do not reset state or lower its schema version to bypass this check.
+Ambiguous metadata-capture identities also retain a retry schedule. Unchanged
+ambiguity retries after one hour, doubling up to 24 hours. Changed saved identity
+or rendition evidence becomes eligible immediately. Status reports unresolved
+identities and deferred retries separately from failed repair attempts.
+Deferral keeps the capture revision and checkpoint pending; it is not recovery.
+
+This state uses schema 27. Stop workers and back up the state database before
+trying this build. Binaries that support only schema 26 or earlier cannot
+open the upgraded database. Keep a compatible backup if you need to return
+to an older build. Do not reset state or lower its schema version to bypass this check.
 
 Kei marks unresolved asset identity cycles incomplete. Status
 remains unsafe across restarts and successful syncs in other libraries until

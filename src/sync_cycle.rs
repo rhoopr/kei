@@ -987,6 +987,25 @@ pub(crate) async fn run_cycle(
             sync_result.stats.full_enumeration_reason = sync_mode_decision.full_enumeration_reason;
         }
 
+        // --refresh-metadata bypasses automatic capture repair. Inspect the
+        // retained queue before inventory anchors or provider cursors commit,
+        // not just when reporting aggregate cycle health afterward.
+        if let Some(db) = state_db
+            && let Some(capture) = db
+                .get_summary()
+                .await?
+                .metadata_capture
+                .into_iter()
+                .find(|capture| capture.library == lib_state.zone_name)
+        {
+            sync_result.stats.metadata_capture_remaining = capture.remaining_assets;
+            sync_result.stats.metadata_capture_unresolved = capture.unresolved_assets;
+            sync_result.stats.metadata_capture_deferred = capture.deferred_assets;
+            if capture.unresolved_assets > 0 {
+                download::block_sync_token_for_metadata_capture(&mut sync_result.stats);
+            }
+        }
+
         let library_completed_without_errors =
             matches!(&sync_result.outcome, download::DownloadOutcome::Success)
                 && !sync_result.stats.identity_incomplete
@@ -1280,12 +1299,22 @@ pub(crate) async fn run_cycle(
         tracing::warn!(error = %e, "Failed to promote completed local path reconciliation");
     }
 
-    if let Some(db) = state_db
-        && db.get_summary().await?.unresolved_identity_zones > 0
-    {
-        download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
-        cycle_failed_count = cycle_failed_count.max(1);
-        db_sync_token_advance_safe = false;
+    if let Some(db) = state_db {
+        let summary = db.get_summary().await?;
+        if summary.unresolved_identity_zones > 0 {
+            download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
+            cycle_failed_count = cycle_failed_count.max(1);
+            db_sync_token_advance_safe = false;
+        }
+        if summary
+            .metadata_capture
+            .iter()
+            .any(|capture| capture.unresolved_assets > 0)
+        {
+            download::block_sync_token_for_metadata_capture(&mut cycle_stats);
+            cycle_failed_count = cycle_failed_count.max(1);
+            db_sync_token_advance_safe = false;
+        }
     }
 
     Ok(CycleResult {
