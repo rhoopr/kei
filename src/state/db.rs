@@ -256,6 +256,7 @@ pub struct ImportedRecord {
 /// Compact downloaded-state projection used to preload sync decisions.
 #[derive(Debug)]
 pub(crate) struct DownloadedFileRecord {
+    pub(crate) added_at: Option<DateTime<Utc>>,
     /// This receipt is also the catalog's current path, not an additional copy.
     pub(crate) is_current_path: bool,
     pub(crate) library: String,
@@ -3361,7 +3362,7 @@ impl SqliteStateDb {
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT library, id, version_size, checksum, local_path, \
-                            local_checksum, download_checksum \
+                            local_checksum, download_checksum, added_at \
                      FROM assets WHERE status = 'downloaded'",
                 )
                 .map_err(|e| StateError::query("get_downloaded_file_records", e))?;
@@ -3371,6 +3372,10 @@ impl SqliteStateDb {
                 let local_path: Option<String> = row.get(4)?;
                 Ok(DownloadedFileRecord {
                     is_current_path: true,
+                    added_at: row
+                        .get::<_, Option<f64>>(7)?
+                        .map(|date| decode_asset_date(date, 7))
+                        .transpose()?,
                     library: row.get(0)?,
                     id: row.get(1)?,
                     version_size: VersionSizeKey::from_str(&version_size)
@@ -4478,6 +4483,21 @@ impl SqliteStateDb {
             let tx = conn.transaction().map_err(|e| {
                 StateError::query("claim_legacy_master_state_owner::transaction", e)
             })?;
+            let existing: Option<String> = tx.query_row(
+                "SELECT asset_record_name FROM legacy_master_state_owners WHERE library=?1 AND master_record_name=?2",
+                rusqlite::params![library, master_record_name], |row| row.get(0),
+            ).optional()?;
+            if let Some(owner) = existing {
+                return Ok(owner == asset_record_name);
+            }
+            let conflicting_history: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset_master_mappings WHERE library=?1 AND master_record_name=?2 AND asset_record_name<>?3) \
+                 OR (SELECT COUNT(DISTINCT added_at)>1 OR (COUNT(*)>1 AND COUNT(added_at)<>COUNT(*)) FROM assets WHERE library=?1 AND id=?2 AND is_deleted=0)",
+                rusqlite::params![library, master_record_name, asset_record_name], |row| row.get(0),
+            )?;
+            if conflicting_history {
+                return Ok(false);
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO legacy_master_state_owners \
                     (library, master_record_name, asset_record_name, claimed_at) \
@@ -6367,7 +6387,7 @@ impl DownloadContextStateStore for SqliteStateDb {
         self.with_conn("get_downloaded_path_records", |conn| {
             let mut statement = conn.prepare_cached(
                 "SELECT p.library, p.id, p.version_size, p.provider_checksum, p.local_path, \
-                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path) \
+                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path), a.added_at \
                  FROM asset_metadata_paths p JOIN assets a \
                    ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
                  WHERE a.status = 'downloaded' AND a.is_deleted = 0 \
@@ -6377,6 +6397,7 @@ impl DownloadContextStateStore for SqliteStateDb {
             let rows = statement.query_map([], |row| {
                 Ok(DownloadedFileRecord {
                     is_current_path: row.get(7)?,
+                    added_at: row.get::<_, Option<f64>>(8)?.map(|date| decode_asset_date(date, 8)).transpose()?,
                     library: row.get(0)?,
                     id: row.get(1)?,
                     version_size: VersionSizeKey::from_str(&row.get::<_, String>(2)?)
@@ -7215,6 +7236,59 @@ mod tests {
             -9.223_372_036_854_776e18,
         ] {
             assert!(decode_asset_date(invalid, 4).is_err(), "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_owner_claim_rejects_mixed_or_missing_rendition_dates() {
+        let date = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let precise = date + chrono::Duration::milliseconds(123);
+        for (original_date, other_date, allowed) in [
+            (date, None, false),
+            (date, Some(DateTime::UNIX_EPOCH), false),
+            (date, Some(date), true),
+            (date, Some(precise), false),
+            (precise, Some(date), false),
+            (precise, Some(precise), true),
+            (
+                precise,
+                Some(date + chrono::Duration::milliseconds(456)),
+                false,
+            ),
+        ] {
+            let db = SqliteStateDb::open_in_memory().unwrap();
+            let original = crate::test_helpers::TestAssetRecord::new("master")
+                .added_at(original_date)
+                .build();
+            db.upsert_seen(&original).await.unwrap();
+            let mut adjusted = original.clone();
+            adjusted.version_size = VersionSizeKey::Adjusted;
+            adjusted.added_at = other_date;
+            db.upsert_seen(&adjusted).await.unwrap();
+            let claimed = db
+                .claim_legacy_master_state_owner("PrimarySync", "master", "child")
+                .await
+                .unwrap();
+            assert_eq!(claimed, allowed);
+            assert_eq!(
+                db.get_legacy_master_state_owners().await.unwrap().len(),
+                usize::from(claimed)
+            );
+            if claimed {
+                db.upsert_asset_master_mapping("PrimarySync", "later-sibling", "master")
+                    .await
+                    .unwrap();
+                assert!(
+                    db.claim_legacy_master_state_owner("PrimarySync", "master", "child")
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    !db.claim_legacy_master_state_owner("PrimarySync", "master", "later-sibling")
+                        .await
+                        .unwrap()
+                );
+            }
         }
     }
 

@@ -1862,7 +1862,7 @@ fn status_reports_metadata_capture_retry_without_private_evidence() {
     );
     conn.execute("INSERT INTO metadata_capture_state(library,pending_revision,failed_assets,updated_at) VALUES ('PrimarySync',1,19,0)", []).unwrap();
     let evidence =
-        serde_json::json!(["private-legacy", null, [["original", "abc", 1000]]]).to_string();
+        serde_json::json!(["private-legacy", null, [["original", "abc", 1000, null]]]).to_string();
     conn.execute("INSERT INTO metadata_capture_retries VALUES ('PrimarySync','private-legacy',1,?1,1,1,?2,?3)", rusqlite::params![evidence,chrono::Utc::now().timestamp(),chrono::Utc::now().timestamp()+3600]).unwrap();
     conn.execute("INSERT INTO sync_runs(started_at,completed_at,status) VALUES (1700000000,1700000010,'complete')", []).unwrap();
     drop(conn);

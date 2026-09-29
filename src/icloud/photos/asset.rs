@@ -745,9 +745,13 @@ impl PhotoAsset {
         self.metadata().capture_local(self.created())
     }
 
+    /// Provider date evidence without the display/path fallback to the epoch.
+    pub(crate) fn added_date_evidence(&self) -> Option<DateTime<Utc>> {
+        self.added_date_ms.and_then(f64_to_millis_datetime)
+    }
+
     pub fn added_date(&self) -> DateTime<Utc> {
-        self.added_date_ms
-            .and_then(f64_to_millis_datetime)
+        self.added_date_evidence()
             .unwrap_or_else(|| {
                 tracing::warn!(asset_id = %self.record_name, "Missing or invalid addedDate, falling back to epoch");
                 DateTime::UNIX_EPOCH
@@ -2979,6 +2983,7 @@ mod tests {
         // Missing assetDate falls back to epoch
         assert_eq!(asset.asset_date(), DateTime::UNIX_EPOCH);
         assert_eq!(asset.added_date(), DateTime::UNIX_EPOCH);
+        assert_eq!(asset.added_date_evidence(), None);
     }
 
     /// T-10: CPLMaster on page 1 with no matching CPLAsset; CPLAsset arrives
