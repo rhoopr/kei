@@ -1585,6 +1585,7 @@ struct DownloadContext {
     /// Persisted child owner for each adopted legacy master-keyed state row.
     /// `None` disables new legacy adoption after an owner query failure.
     legacy_master_state_owners: Option<LibraryMasterAssetMap>,
+    legacy_added_dates: LegacyAddedDates,
     /// Nested map: `library` -> set of asset IDs known to the state DB (any
     /// status). Used in retry-only mode to skip new assets that were never
     /// synced in the same CloudKit zone.
@@ -1595,6 +1596,28 @@ struct DownloadContext {
     /// True when at least one downloaded asset-version lacks a metadata hash.
     /// Cached because the producer checks this on hot on-disk skip paths.
     downloaded_without_metadata_hash: bool,
+}
+
+// None means a missing or conflicting rendition date, never an inferred epoch.
+type LegacyAddedDates =
+    FxHashMap<Arc<str>, FxHashMap<Arc<str>, Option<chrono::DateTime<chrono::Utc>>>>;
+
+fn retain_legacy_added_date(
+    dates: &mut LegacyAddedDates,
+    library: &Arc<str>,
+    id: &Arc<str>,
+    added_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    dates
+        .entry(Arc::clone(library))
+        .or_default()
+        .entry(Arc::clone(id))
+        .and_modify(|stored| {
+            if *stored != added_at {
+                *stored = None;
+            }
+        })
+        .or_insert(added_at);
 }
 
 impl DownloadContext {
@@ -1680,12 +1703,21 @@ impl DownloadContext {
         // the Arc without an extra copy.
         let mut interner: FxHashSet<Arc<str>> = FxHashSet::default();
 
+        let mapped_children: FxHashSet<_> = mapping_rows
+            .as_ref()
+            .ok()
+            .into_iter()
+            .flatten()
+            .map(|(library, child, _)| (library.as_str(), child.as_str()))
+            .collect();
+        let mut legacy_added_dates = LegacyAddedDates::default();
         let mut downloaded_ids: LibraryAssetVersionSet = FxHashMap::default();
         let mut downloaded_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
         let mut downloaded_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in downloaded_records {
             let crate::state::DownloadedFileRecord {
                 is_current_path: _,
+                added_at,
                 library,
                 id,
                 version_size,
@@ -1697,6 +1729,9 @@ impl DownloadContext {
             let lib = intern_id(&mut interner, library);
             let id = intern_id(&mut interner, id);
             let version_size: Box<str> = version_size.as_str().into();
+            if !mapped_children.contains(&(lib.as_ref(), id.as_ref())) {
+                retain_legacy_added_date(&mut legacy_added_dates, &lib, &id, added_at);
+            }
             downloaded_ids
                 .entry(Arc::clone(&lib))
                 .or_default()
@@ -1775,11 +1810,15 @@ impl DownloadContext {
                 local_checksum,
                 download_checksum,
                 downloaded_at,
+                added_at,
                 ..
             } = record;
             let lib = intern_id(&mut interner, library.to_string());
             let id = intern_id(&mut interner, id.to_string());
             let version_size: Box<str> = version_size.as_str().into();
+            if !mapped_children.contains(&(lib.as_ref(), id.as_ref())) {
+                retain_legacy_added_date(&mut legacy_added_dates, &lib, &id, added_at);
+            }
             pending_ids
                 .entry(Arc::clone(&lib))
                 .or_default()
@@ -1883,6 +1922,7 @@ impl DownloadContext {
             pending_files,
             asset_master_mappings,
             legacy_master_state_owners,
+            legacy_added_dates,
             known_ids,
             attempt_counts,
             downloaded_without_metadata_hash,
@@ -2070,8 +2110,8 @@ impl DownloadContext {
     ///
     /// New assets use their unique `CPLAsset.recordName`. A pre-v0.24 row can
     /// still be keyed by `CPLMaster.recordName`; retain that key only when its
-    /// provider checksum matches and durable family history identifies this
-    /// child as the sole sibling without its own state row.
+    /// provider checksum and all recorded added dates match. Another historical
+    /// child blocks a new claim even if it has its own state or is now missing.
     fn should_use_legacy_master_state(&self, library: &str, asset: &PhotoAsset) -> bool {
         let asset_record_name = asset.asset_record_name();
         let master_record_name = asset.id();
@@ -2094,6 +2134,17 @@ impl DownloadContext {
             return owner.as_ref() == asset_record_name;
         }
 
+        let Some(provider_added) = asset.added_date_evidence() else {
+            return false;
+        };
+        if self
+            .legacy_added_dates
+            .get(library)
+            .and_then(|dates| dates.get(master_record_name))
+            != Some(&Some(provider_added))
+        {
+            return false;
+        }
         let Some(mappings) = &self.asset_master_mappings else {
             return false;
         };
@@ -2105,6 +2156,12 @@ impl DownloadContext {
             // retain a checksum-compatible master row for their first child.
             return true;
         };
+        if mapped_children
+            .iter()
+            .any(|child| child.as_ref() != asset_record_name)
+        {
+            return false;
+        }
         let mut children_without_state = mapped_children
             .iter()
             .filter(|child| !self.has_state_version(library, child));
@@ -4901,6 +4958,24 @@ async fn run_metadata_capture_repair(
                         .await;
                         continue;
                     }
+                    if !candidate.versions.iter().all(|version| {
+                        version.added_at.is_some()
+                            && version.added_at == asset.added_date_evidence()
+                    }) {
+                        if let Err(error) = db
+                            .defer_metadata_capture_ambiguity(
+                                &candidate,
+                                crate::state::METADATA_CAPTURE_REVISION,
+                            )
+                            .await
+                        {
+                            repair.stats.state_write_failures += 1;
+                            tracing::warn!(error = %error, "Could not persist metadata-capture retry");
+                        }
+                        record_metadata_capture_failure(db.as_ref(), &candidate.library,
+                            "legacy rendition added dates do not establish a consistent provider child", &mut repair).await;
+                        continue;
+                    }
                     match db
                         .claim_legacy_master_state_owner(
                             &candidate.library,
@@ -4921,10 +4996,20 @@ async fn run_metadata_capture_repair(
                             .await;
                         }
                         Ok(false) => {
+                            if let Err(error) = db
+                                .defer_metadata_capture_ambiguity(
+                                    &candidate,
+                                    crate::state::METADATA_CAPTURE_REVISION,
+                                )
+                                .await
+                            {
+                                repair.stats.state_write_failures += 1;
+                                tracing::warn!(error = %error, "Could not persist metadata-capture retry");
+                            }
                             record_metadata_capture_failure(
                                 db.as_ref(),
                                 &candidate.library,
-                                "a different provider child owns the legacy catalogue row",
+                                "legacy catalogue ownership conflicts with durable family history",
                                 &mut repair,
                             )
                             .await;
@@ -5570,6 +5655,7 @@ async fn run_targeted_recovery_pass(
         pass_configs,
         unmatched_targets,
         requested,
+        identity_incomplete,
     } = plan;
     let unmatched = unmatched_targets.len();
 
@@ -5615,12 +5701,9 @@ async fn run_targeted_recovery_pass(
     }
 
     if tasks.is_empty() {
-        return Ok(pending_retry_no_download_result(
-            &started,
-            &shutdown_token,
-            unmatched,
-            0,
-        ));
+        let mut result = pending_retry_no_download_result(&started, &shutdown_token, unmatched, 0);
+        result.stats.identity_incomplete = identity_incomplete;
+        return Ok(result);
     }
 
     let pass_config = PassConfig {
@@ -5723,6 +5806,7 @@ async fn run_targeted_recovery_pass(
         .collect();
 
     let stats = SyncStats {
+        identity_incomplete,
         downloaded: pass_result.downloaded,
         failed: failed.saturating_add(remaining_unmatched),
         bytes_downloaded: pass_result.bytes_downloaded,
@@ -10261,6 +10345,7 @@ mod tests {
                 .checksum(&expected.checksum)
                 .filename(filename)
                 .created_at(asset.created())
+                .added_at(asset.added_date())
                 .size(expected.size)
                 .version_size(expected.version_size)
                 .metadata(
@@ -10378,6 +10463,7 @@ mod tests {
                 .filename("same.jpg")
                 .checksum(&checksum)
                 .size(1024)
+                .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
                 .build(),
         )
         .await
@@ -11396,6 +11482,7 @@ mod tests {
             .created_at(asset.created())
             .size(expected_path.size)
             .version_size(expected_path.version_size)
+            .added_at(asset.added_date())
             .build();
         db.upsert_seen(&record).await.expect("seed state row");
         db.mark_downloaded(
@@ -12605,13 +12692,9 @@ mod tests {
         let master_record = mock_master_record_with_filename("MASTER_OWNER", "owner.jpg");
         let excluded_ids = Arc::new(["asset-owner-b".to_string()].into_iter().collect());
         let first_session = MockPhotosFlow::new()
-            .album_count(2)
+            .album_count(1)
             .query_page(
-                vec![
-                    asset_b_record.clone(),
-                    master_record.clone(),
-                    asset_a_record.clone(),
-                ],
+                vec![master_record.clone(), asset_a_record.clone()],
                 Some("zone-token-first"),
             )
             .build();
@@ -12644,7 +12727,7 @@ mod tests {
         .expect("first owner-claim cycle should complete");
         assert!(matches!(first.outcome, DownloadOutcome::Success));
         assert_eq!(first.stats.downloaded, 0);
-        assert_eq!(first.stats.skipped.by_excluded_album, 1);
+        assert_eq!(first.stats.skipped.by_excluded_album, 0);
         assert_eq!(
             db.remaining_legacy_master_state_owner_claim_failures(),
             0,
@@ -14496,6 +14579,7 @@ mod tests {
             .filename("failed-before-sync.jpg")
             .checksum("ck_failed_before_sync")
             .size(1024)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
         db.mark_failed(
@@ -14575,6 +14659,7 @@ mod tests {
             .filename(filename)
             .checksum(checksum)
             .size(size)
+            .added_at(asset.added_date())
             .build();
         db.upsert_seen(&record).await.expect("seed state row");
         db.mark_downloaded(
@@ -14754,6 +14839,7 @@ mod tests {
             .filename("rewritten.jpg")
             .checksum("ck_metadata_rewritten_retry")
             .size(8)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed state row");
         db.mark_downloaded(
@@ -14859,6 +14945,7 @@ mod tests {
             .filename("photo.jpg")
             .checksum(&checksum)
             .size(body.len() as u64)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
         db.mark_downloaded(
@@ -14995,6 +15082,7 @@ mod tests {
             .filename("photo.jpg")
             .checksum("old-provider-checksum")
             .size(prior_body.len() as u64)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed state row");
         db.mark_downloaded(
@@ -16112,6 +16200,7 @@ mod tests {
                 .filename("reserved.jpg")
                 .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
                 .size(1024)
+                .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
                 .build(),
         )
         .await
@@ -16184,6 +16273,7 @@ mod tests {
                     .filename("reserved_edited.JPG")
                     .checksum(&checksum)
                     .size(1024)
+                    .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
                     .build(),
             )
             .await
@@ -16483,6 +16573,7 @@ mod tests {
                     .filename(filename)
                     .checksum(provider_checksum)
                     .size(1024)
+                    .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
                     .build(),
             )
             .await
@@ -16586,6 +16677,7 @@ mod tests {
                         .filename(&owned_filename)
                         .checksum(&checksum)
                         .size(1024)
+                        .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
                         .build(),
                 )
                 .await
@@ -17979,6 +18071,7 @@ mod tests {
             .filename("dry-run-pending.jpg")
             .checksum("ck_dry_run_pending")
             .size(1024)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
         db.upsert_asset_master_mapping("PrimarySync", "asset-DRY_RUN_PENDING", "DRY_RUN_PENDING")
@@ -18001,7 +18094,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(db);
+        config.state_db = Some(db.clone());
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".to_string(),
         };
@@ -18023,6 +18116,13 @@ mod tests {
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.stats.downloaded, 1);
         assert_eq!(result.sync_token, None);
+        assert!(
+            db.get_legacy_master_state_owners()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
         assert!(!result.stats.sync_token_blocked);
     }
 
@@ -18051,6 +18151,7 @@ mod tests {
             .filename("failed-before-sync.jpg")
             .checksum("ck_failed_before_sync")
             .size(1024)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
         db.mark_failed(
@@ -18160,6 +18261,7 @@ mod tests {
             .filename("pending-expired-url.jpg")
             .checksum("ck_pending_expired_url")
             .size(1024)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
         db.upsert_asset_master_mapping(
@@ -18473,7 +18575,14 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
-        for hidden in [false, true] {
+        for (hidden, added_seconds, other_child) in [
+            (false, Some(1_700_000_000), false),
+            (true, Some(1_700_000_000), false),
+            (true, Some(1_640_995_200), false),
+            (true, None, false),
+            (true, Some(1_700_000_000), true),
+        ] {
+            let guarded = added_seconds != Some(1_700_000_000) || other_child;
             let server = crate::start_wiremock_or_skip!();
             let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
             let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
@@ -18484,17 +18593,35 @@ mod tests {
                         .set_body_bytes(body.clone())
                         .insert_header("content-type", "image/jpeg"),
                 )
-                .expect(1)
+                .expect(u64::from(!guarded))
                 .mount(&server)
                 .await;
 
             let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-            let record = TestAssetRecord::new("LEGACY_PENDING_PRESENT")
+            let mut record = TestAssetRecord::new("LEGACY_PENDING_PRESENT")
                 .filename("legacy-pending.jpg")
                 .checksum(&checksum)
                 .size(8)
                 .build();
+            record.added_at =
+                added_seconds.and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0));
             db.upsert_seen(&record).await.expect("seed pending row");
+            if other_child {
+                db.upsert_asset_master_mapping(
+                    "PrimarySync",
+                    "missing-historical-child",
+                    "LEGACY_PENDING_PRESENT",
+                )
+                .await
+                .unwrap();
+                db.upsert_asset_master_mapping(
+                    "PrimarySync",
+                    "asset-LEGACY_PENDING_PRESENT",
+                    "LEGACY_PENDING_PRESENT",
+                )
+                .await
+                .unwrap();
+            }
 
             let download_url = format!("{}/legacy-pending.jpg", server.uri());
             let mut records = incremental_photo_records_with_url(
@@ -18533,6 +18660,22 @@ mod tests {
             .await
             .expect("live legacy pending master should hydrate and download");
 
+            if guarded {
+                assert!(result.stats.identity_incomplete);
+                // A candidate token may be returned, but the cycle owner's
+                // identity_incomplete gate must not commit it.
+                assert!(result.stats.failed > 0);
+                assert_eq!(db.get_pending().await.unwrap()[0].added_at, record.added_at);
+                assert!(
+                    db.get_legacy_master_state_owners()
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(db.get_summary().await.unwrap().source_deleted, 0);
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+                continue;
+            }
             assert!(result.full_enumeration_ran);
             assert!(matches!(result.outcome, DownloadOutcome::Success));
             let summary = db.get_summary().await.expect("summary");
@@ -18627,6 +18770,7 @@ mod tests {
             .filename(pending_filename)
             .checksum(&checksum)
             .size(8)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
         tokio::fs::create_dir_all(expected_path.parent().expect("expected path parent"))
@@ -18669,6 +18813,7 @@ mod tests {
             .filename("legacy-filtered-missing.jpg")
             .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
             .size(1024)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
         db.backdate_last_seen(
@@ -18858,7 +19003,10 @@ mod tests {
 
         let master = mock_master_record_with_filename("LEGACY_OWNED_RETRY", "owned-retry.jpg");
         let session = LegacyPendingHydrationSession {
-            lookup_records: Arc::new(vec![master.clone()]),
+            lookup_records: Arc::new(vec![
+                master.clone(),
+                mock_asset_record_for("asset-owned-b", "LEGACY_OWNED_RETRY"),
+            ]),
             hydration_records: Arc::new(vec![
                 master,
                 mock_asset_record_for("asset-owned-a", "LEGACY_OWNED_RETRY"),
@@ -18975,7 +19123,9 @@ mod tests {
         .await
         .expect("build pending retry plan");
 
-        assert_eq!(plan.unmatched_targets.len(), 0);
+        assert!(plan.tasks.is_empty());
+        assert_eq!(plan.unmatched_targets.len(), 1);
+        assert!(plan.identity_incomplete);
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.source_deleted, 0);
         assert_eq!(summary.pending, 1);
@@ -23567,11 +23717,30 @@ mod tests {
             .or_default()
             .insert("original".into(), checksum);
 
+        retain_legacy_added_date(
+            &mut ctx.legacy_added_dates,
+            &Arc::from("PrimarySync"),
+            &Arc::from("master-family"),
+            asset_a.added_date_evidence(),
+        );
+
         assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
 
         ctx.asset_master_mappings = Some(FxHashMap::default());
         ctx.legacy_master_state_owners = Some(FxHashMap::default());
         assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+        let dates = ctx.legacy_added_dates.get_mut("PrimarySync").unwrap();
+        dates.insert("master-family".into(), None);
+        assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+        ctx.legacy_added_dates
+            .get_mut("PrimarySync")
+            .unwrap()
+            .insert("master-family".into(), Some(chrono::DateTime::UNIX_EPOCH));
+        assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+        ctx.legacy_added_dates
+            .get_mut("PrimarySync")
+            .unwrap()
+            .insert("master-family".into(), asset_a.added_date_evidence());
 
         ctx.asset_master_mappings
             .as_mut()
@@ -23590,7 +23759,7 @@ mod tests {
             .entry("asset-b".into())
             .or_default()
             .insert("original".into());
-        assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+        assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
         assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_b));
 
         ctx.legacy_master_state_owners
@@ -23631,6 +23800,13 @@ mod tests {
             .entry("master-pending".into())
             .or_default()
             .insert("original".into(), checksum);
+
+        retain_legacy_added_date(
+            &mut ctx.legacy_added_dates,
+            &Arc::from("PrimarySync"),
+            &Arc::from("master-pending"),
+            asset.added_date_evidence(),
+        );
 
         assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset));
     }

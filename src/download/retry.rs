@@ -42,6 +42,7 @@ impl PendingRetryTarget {
 
 #[derive(Debug)]
 struct PendingRetryEvidence {
+    added_at: Option<chrono::DateTime<chrono::Utc>>,
     checksum: Arc<str>,
     filename: Arc<str>,
     local_file: Option<RecordedLocalFile>,
@@ -53,6 +54,7 @@ struct PendingRetryEvidence {
 impl PendingRetryEvidence {
     fn from_record(record: &crate::state::AssetRecord) -> Self {
         Self {
+            added_at: record.added_at,
             checksum: Arc::from(record.checksum.as_ref()),
             filename: Arc::from(record.filename.as_ref()),
             local_file: record.local_path.clone().map(|path| RecordedLocalFile {
@@ -189,6 +191,18 @@ fn select_legacy_candidate(
         };
     };
     if matching.next().is_none() {
+        if owner_asset_record_name.is_none()
+            && !targets.iter().all(|target| {
+                evidence.get(*target).is_some_and(|evidence| {
+                    evidence.added_at.is_some()
+                        && evidence.added_at == selected.added_date_evidence()
+                })
+            })
+        {
+            return LegacyCandidateSelection::EvidenceMismatch {
+                candidates: candidate_count,
+            };
+        }
         return LegacyCandidateSelection::Selected(selected);
     }
     LegacyCandidateSelection::Ambiguous {
@@ -212,6 +226,25 @@ pub(super) fn take_matching_pending_retry_tasks<I>(
             }
         }
     }
+}
+
+async fn claim_legacy_owner_for_retry(
+    db: &dyn DownloadStore,
+    library: &str,
+    asset: &PhotoAsset,
+    run_mode: super::DownloadRunMode,
+) -> Result<bool> {
+    if run_mode.downloads_files() {
+        return Ok(db
+            .claim_legacy_master_state_owner(library, asset.id(), asset.asset_record_name())
+            .await?);
+    }
+    // Read-only planning must not create an owner claim.
+    Ok(db
+        .get_asset_record_names_for_master(library, asset.id())
+        .await?
+        .iter()
+        .all(|child| child == asset.asset_record_name()))
 }
 
 struct PendingRetryPlanning<'a> {
@@ -481,6 +514,7 @@ pub(super) struct PendingRetryPlan {
     pub(super) pass_configs: Vec<Arc<DownloadConfig>>,
     pub(super) unmatched_targets: Vec<PendingRetryTarget>,
     pub(super) requested: usize,
+    pub(super) identity_incomplete: bool,
 }
 
 struct ProviderLookupPlan {
@@ -493,6 +527,13 @@ async fn build_provider_lookup_plan(
     library: &str,
     state_ids: &[&str],
 ) -> Result<ProviderLookupPlan> {
+    let owners: FxHashMap<_, _> = db
+        .get_legacy_master_state_owners()
+        .await?
+        .into_iter()
+        .filter(|(scope, _, _)| scope == library)
+        .map(|(_, master, child)| (master, child))
+        .collect();
     let mut requests = Vec::new();
     let mut seen_requests = FxHashSet::default();
     let mut master_by_state_id = FxHashMap::default();
@@ -503,12 +544,18 @@ async fn build_provider_lookup_plan(
         let master = mapped_master.as_deref().unwrap_or(state_id).to_string();
         let asset_record_names = if mapped_master.is_some() {
             vec![state_id.to_string()]
+        } else if let Some(owner) = owners.get(&master) {
+            vec![owner.clone()]
         } else {
             db.get_asset_record_names_for_master(library, &master)
                 .await?
         };
         master_by_state_id.insert(state_id.to_string(), master.clone());
-        if asset_record_names.is_empty() {
+        if asset_record_names.is_empty()
+            || (mapped_master.is_none()
+                && !owners.contains_key(&master)
+                && asset_record_names.len() > 1)
+        {
             let request_key = (state_id.to_string(), master.clone(), None);
             if seen_requests.insert(request_key.clone()) {
                 requests.push(RecordLookupRequest::master_only(
@@ -547,6 +594,13 @@ async fn apply_policy_excluded_resolutions(
     resolutions: Vec<(ProviderRecordId, RecordResolution)>,
     shutdown_token: &CancellationToken,
 ) -> Result<usize> {
+    let owners: FxHashSet<_> = db
+        .get_legacy_master_state_owners()
+        .await?
+        .into_iter()
+        .filter(|(scope, _, _)| scope == library)
+        .map(|(_, master, _)| master)
+        .collect();
     let mut source_deleted = 0usize;
     for (state_id, resolution) in resolutions {
         if shutdown_token.is_cancelled() {
@@ -559,6 +613,14 @@ async fn apply_policy_excluded_resolutions(
         } = resolution
         {
             let state_id = state_id.as_str();
+            if !master_family
+                && master_by_state_id
+                    .get(state_id)
+                    .is_some_and(|master| master == state_id)
+                && !owners.contains(state_id)
+            {
+                continue;
+            }
             let resolved = if master_family {
                 let master = master_by_state_id
                     .get(state_id)
@@ -724,6 +786,7 @@ pub(super) async fn build_pending_retry_download_tasks(
     } else {
         Vec::new()
     };
+    let mut identity_incomplete = false;
     let mut legacy_present_state_ids = FxHashSet::default();
     for (state_id, resolution) in resolutions {
         if pending_targets.is_empty() || shutdown_token.is_cancelled() {
@@ -731,6 +794,33 @@ pub(super) async fn build_pending_retry_download_tasks(
         }
         match resolution {
             RecordResolution::Present(asset) => {
+                if state_id.as_str() == asset.id()
+                    && !legacy_master_state_owners.contains_key(state_id.as_str())
+                {
+                    let dates_match = pending_targets
+                        .iter()
+                        .filter(|target| target.asset_id.as_ref() == state_id.as_str())
+                        .all(|target| {
+                            pending_evidence.get(target).is_some_and(|evidence| {
+                                evidence.added_at.is_some()
+                                    && evidence.added_at == asset.added_date_evidence()
+                            })
+                        });
+                    if !dates_match
+                        || !claim_legacy_owner_for_retry(
+                            db.as_ref(),
+                            &config.library,
+                            &asset,
+                            run_mode,
+                        )
+                        .await?
+                    {
+                        identity_incomplete = true;
+                        set_verification_for_state_id(db.as_ref(), &pending_targets, state_id.as_str(), AssetVerificationState::Unknown,
+                            "legacy ownership is not established by durable family and date evidence").await?;
+                        continue;
+                    }
+                }
                 PendingRetryPlanning {
                     run_mode,
                     db: db.as_ref(),
@@ -752,6 +842,23 @@ pub(super) async fn build_pending_retry_download_tasks(
                 master_family,
             } => {
                 let state_id = state_id.as_str();
+                if !master_family
+                    && master_by_state_id
+                        .get(state_id)
+                        .is_some_and(|master| master == state_id)
+                    && !legacy_master_state_owners.contains_key(state_id)
+                {
+                    set_verification_for_state_id(
+                        db.as_ref(),
+                        &pending_targets,
+                        state_id,
+                        AssetVerificationState::Unknown,
+                        "missing child does not establish legacy rendition ownership",
+                    )
+                    .await?;
+                    identity_incomplete = true;
+                    continue;
+                }
                 let resolved = if master_family {
                     let master = master_by_state_id
                         .get(state_id)
@@ -881,28 +988,29 @@ pub(super) async fn build_pending_retry_download_tasks(
             ) {
                 LegacyCandidateSelection::Selected(asset) => {
                     if persisted_owner.is_none()
-                        && !db
-                            .claim_legacy_master_state_owner(
-                                &config.library,
-                                asset.id(),
-                                asset.asset_record_name(),
-                            )
-                            .await?
+                        && !claim_legacy_owner_for_retry(
+                            db.as_ref(),
+                            &config.library,
+                            &asset,
+                            run_mode,
+                        )
+                        .await?
                     {
                         set_verification_for_state_id(
                             db.as_ref(),
                             &pending_targets,
                             &state_id,
                             AssetVerificationState::Unknown,
-                            "a different provider asset claimed the legacy master state",
+                            "legacy ownership conflicts with durable family history",
                         )
                         .await?;
                         tracing::warn!(
                             library = %config.library,
                             state_id,
                             asset_record_name = %asset.asset_record_name(),
-                            "Pending asset retained: legacy master owner changed concurrently"
+                            "Pending asset retained: legacy ownership remains unresolved"
                         );
+                        identity_incomplete = true;
                         continue;
                     }
                     db.upsert_asset_master_mapping(
@@ -979,6 +1087,9 @@ pub(super) async fn build_pending_retry_download_tasks(
                     );
                 }
             }
+            identity_incomplete |= pending_targets
+                .iter()
+                .any(|target| target.asset_id.as_ref() == state_id);
         }
     }
 
@@ -1010,6 +1121,7 @@ pub(super) async fn build_pending_retry_download_tasks(
         pass_configs,
         unmatched_targets: pending_targets.into_iter().collect(),
         requested,
+        identity_incomplete,
     })
 }
 
@@ -1042,6 +1154,7 @@ mod tests {
                 "fields": {
                     "masterRef": {"value": {"recordName": master}},
                     "assetDate": {"value": 1700000000000i64},
+                    "addedDate": {"value": 1700000000000i64},
                 },
             }),
         )
@@ -1132,6 +1245,7 @@ mod tests {
         let record = TestAssetRecord::new("legacy-master")
             .checksum("checksum-b")
             .size(200)
+            .added_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
             .build();
         let target = PendingRetryTarget::from_record(&record);
         let evidence =
@@ -1266,6 +1380,7 @@ mod tests {
             .unwrap();
         let actual_checksum = file::compute_sha256(&path).await.unwrap();
         let mut evidence = PendingRetryEvidence {
+            added_at: None,
             checksum: Arc::from("provider-checksum"),
             filename: Arc::from("photo.jpg"),
             local_file: Some(RecordedLocalFile {

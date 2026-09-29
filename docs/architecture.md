@@ -113,6 +113,23 @@ across visibility states.
 This does not change download selection or permit checkpoint advancement
 without the existing completion proof.
 
+A new legacy-owner claim requires consistent, present per-rendition `added_at`
+evidence matching the provider's `addedDate`, in addition to the existing
+rendition checks. Missing provider dates do not use the epoch fallback as
+identity evidence. Matching dates do not rank otherwise ambiguous children.
+Another historically mapped child blocks a new claim even when it is now
+missing or has its own catalogue row. The state owner checks family history
+and mixed rendition dates inside the claim transaction. Normal enumeration
+and pending recovery use the same restrictions; read-only retry planning does
+not persist a claim. Unresolved pending ownership holds the checkpoint.
+
+Metadata-capture retry evidence includes each rendition's added date, at
+millisecond precision. A changed date or an older fingerprint without dates
+makes retained work eligible again. Conflicting or missing date evidence uses
+the existing bounded retry queue. This does not delete or retire legacy rows,
+replace saved owners, or restore dates overwritten by an earlier repair.
+Recovery of those rows requires separately preserved historical evidence.
+
 Ambiguous metadata-capture repairs retain a schema-27 retry row keyed by
 library, catalogue asset ID, and target capture revision. An unchanged failure
 retries after one hour, doubling up to 24 hours. Changed catalogue identity or

@@ -36,7 +36,14 @@ fn evidence(candidate: &MetadataCaptureCandidate) -> String {
     let versions: Vec<_> = candidate
         .versions
         .iter()
-        .map(|v| (v.version_size.as_str(), v.checksum.as_str(), v.size_bytes))
+        .map(|v| {
+            (
+                v.version_size.as_str(),
+                v.checksum.as_str(),
+                v.size_bytes,
+                v.added_at.map(|date| date.timestamp_millis()),
+            )
+        })
         .collect();
     json!([
         candidate.master_record_name,
@@ -65,7 +72,7 @@ fn candidate_query(asset_id: Option<&str>) -> String {
         SELECT a.id, COALESCE(m.master_record_name,o.master_record_name,a.id),
                COALESCE(m.asset_record_name,o.asset_record_name),
                a.version_size,a.checksum,a.size_bytes,
-               r.evidence,r.generation,r.attempts,r.next_retry_at,r.target_revision
+               r.evidence,r.generation,r.attempts,r.next_retry_at,r.target_revision,a.added_at
         FROM assets a
         LEFT JOIN asset_metadata_capture_revisions v ON v.library=a.library AND v.asset_id=a.id
         LEFT JOIN asset_master_mappings m ON m.library=a.library AND m.asset_record_name=a.id
@@ -152,6 +159,10 @@ fn visit(
             })?;
         if let Some((candidate, _)) = &mut pending {
             candidate.versions.push(MetadataCaptureVersionEvidence {
+                added_at: row
+                    .get::<_, Option<f64>>(11)?
+                    .map(|date| super::decode_asset_date(date, 11))
+                    .transpose()?,
                 version_size,
                 checksum: row.get(4)?,
                 size_bytes: u64::try_from(row.get::<_, i64>(5)?).map_err(|_negative_size| {
@@ -530,6 +541,8 @@ mod tests {
         for mutation in [
             "UPDATE assets SET checksum='changed' WHERE id='A'",
             "UPDATE assets SET size_bytes=2048 WHERE id='A'",
+            "UPDATE assets SET added_at=1514764800.125 WHERE id='A'",
+            "UPDATE metadata_capture_retries SET evidence=json_remove(evidence,'$[2][0][3]') WHERE asset_id='A'",
             "INSERT INTO legacy_master_state_owners VALUES ('PrimarySync','A','authoritative-child',0)",
         ] {
             let db = SqliteStateDb::open_in_memory().unwrap();

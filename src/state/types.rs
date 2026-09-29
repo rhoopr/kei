@@ -549,6 +549,7 @@ pub struct SyncRunStats {
 /// master-keyed catalogue row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataCaptureVersionEvidence {
+    pub(crate) added_at: Option<DateTime<Utc>>,
     pub(crate) version_size: VersionSizeKey,
     pub(crate) checksum: String,
     pub(crate) size_bytes: u64,
