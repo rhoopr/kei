@@ -7242,10 +7242,23 @@ mod tests {
     #[tokio::test]
     async fn legacy_owner_claim_rejects_mixed_or_missing_rendition_dates() {
         let date = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        for other_date in [None, Some(DateTime::UNIX_EPOCH), Some(date)] {
+        let precise = date + chrono::Duration::milliseconds(123);
+        for (original_date, other_date, allowed) in [
+            (date, None, false),
+            (date, Some(DateTime::UNIX_EPOCH), false),
+            (date, Some(date), true),
+            (date, Some(precise), false),
+            (precise, Some(date), false),
+            (precise, Some(precise), true),
+            (
+                precise,
+                Some(date + chrono::Duration::milliseconds(456)),
+                false,
+            ),
+        ] {
             let db = SqliteStateDb::open_in_memory().unwrap();
             let original = crate::test_helpers::TestAssetRecord::new("master")
-                .added_at(date)
+                .added_at(original_date)
                 .build();
             db.upsert_seen(&original).await.unwrap();
             let mut adjusted = original.clone();
@@ -7256,7 +7269,7 @@ mod tests {
                 .claim_legacy_master_state_owner("PrimarySync", "master", "child")
                 .await
                 .unwrap();
-            assert_eq!(claimed, other_date == Some(date));
+            assert_eq!(claimed, allowed);
             assert_eq!(
                 db.get_legacy_master_state_owners().await.unwrap().len(),
                 usize::from(claimed)

@@ -13,6 +13,7 @@ use super::{
     pipeline, planner,
 };
 use crate::icloud::photos::{PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution};
+use crate::state::types::legacy_added_date_matches;
 use crate::state::{AssetVerificationState, VersionSizeKey};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -194,8 +195,7 @@ fn select_legacy_candidate(
         if owner_asset_record_name.is_none()
             && !targets.iter().all(|target| {
                 evidence.get(*target).is_some_and(|evidence| {
-                    evidence.added_at.is_some()
-                        && evidence.added_at == selected.added_date_evidence()
+                    legacy_added_date_matches(evidence.added_at, selected.added_date_evidence())
                 })
             })
         {
@@ -802,11 +802,22 @@ pub(super) async fn build_pending_retry_download_tasks(
                         .filter(|target| target.asset_id.as_ref() == state_id.as_str())
                         .all(|target| {
                             pending_evidence.get(target).is_some_and(|evidence| {
-                                evidence.added_at.is_some()
-                                    && evidence.added_at == asset.added_date_evidence()
+                                legacy_added_date_matches(
+                                    evidence.added_at,
+                                    asset.added_date_evidence(),
+                                )
+                            })
+                        });
+                    let rendition_matches = pending_targets
+                        .iter()
+                        .filter(|target| target.asset_id.as_ref() == state_id.as_str())
+                        .any(|target| {
+                            pending_evidence.get(target).is_some_and(|evidence| {
+                                candidate_matches_durable_evidence(&asset, target, evidence)
                             })
                         });
                     if !dates_match
+                        || !rendition_matches
                         || !claim_legacy_owner_for_retry(
                             db.as_ref(),
                             &config.library,

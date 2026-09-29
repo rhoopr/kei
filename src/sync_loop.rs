@@ -9037,6 +9037,8 @@ mod tests {
             1024,
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         );
+        page["records"][1]["fields"]["addedDate"] =
+            json!({"value": RUN_CYCLE_ASSET_DATE_MS + 123, "type": "TIMESTAMP"});
         page["records"][1]["fields"]["isHidden"] = json!({"value": 1, "type": "INT64"});
         page["records"][1]["fields"]["isFavorite"] = json!({"value": 1, "type": "INT64"});
         let repair_requests = Arc::new(AtomicUsize::new(0));

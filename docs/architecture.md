@@ -117,6 +117,11 @@ A new legacy-owner claim requires consistent, present per-rendition `added_at`
 evidence matching the provider's `addedDate`, in addition to the existing
 rendition checks. Missing provider dates do not use the epoch fallback as
 identity evidence. Matching dates do not rank otherwise ambiguous children.
+Whole-second legacy dates match within that second because older writers
+discarded milliseconds. Fractional stored dates require an exact match.
+Different stored rendition dates, including mixed whole-second and fractional
+rows, remain unresolved at the atomic claim gate. Direct pending lookups also
+require matching rendition evidence before they can persist a new owner.
 Another historically mapped child blocks a new claim even when it is now
 missing or has its own catalogue row. The state owner checks family history
 and mixed rendition dates inside the claim transaction. Normal enumeration

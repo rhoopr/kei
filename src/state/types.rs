@@ -545,6 +545,20 @@ pub struct SyncRunStats {
     pub inventory_drop_library: Option<String>,
 }
 
+/// Match a provider date at the precision retained by a legacy row.
+/// Older writers discarded milliseconds. Missing dates and differences in
+/// retained fractional precision remain unresolved.
+pub(crate) fn legacy_added_date_matches(
+    stored: Option<DateTime<Utc>>,
+    provider: Option<DateTime<Utc>>,
+) -> bool {
+    let (Some(stored), Some(provider)) = (stored, provider) else {
+        return false;
+    };
+    stored.timestamp() == provider.timestamp()
+        && (stored.timestamp_subsec_millis() == 0 || stored == provider)
+}
+
 /// One provider version used to identify the correct child of a legacy
 /// master-keyed catalogue row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -654,6 +668,23 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::mem::size_of;
+
+    #[test]
+    fn legacy_added_dates_preserve_available_precision() {
+        let second = DateTime::from_timestamp(-1, 0).unwrap();
+        let precise = second + chrono::Duration::milliseconds(123);
+        let different = second + chrono::Duration::milliseconds(456);
+        assert!(legacy_added_date_matches(Some(second), Some(precise)));
+        assert!(legacy_added_date_matches(Some(precise), Some(precise)));
+        assert!(!legacy_added_date_matches(Some(precise), Some(second)));
+        assert!(!legacy_added_date_matches(Some(precise), Some(different)));
+        assert!(!legacy_added_date_matches(None, Some(precise)));
+        assert!(!legacy_added_date_matches(Some(second), None));
+        assert!(!legacy_added_date_matches(
+            Some(second),
+            Some(DateTime::UNIX_EPOCH)
+        ));
+    }
 
     #[test]
     fn test_version_size_key_round_trip() {

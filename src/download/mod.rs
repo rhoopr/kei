@@ -63,6 +63,7 @@ use crate::icloud::photos::{
     SyncTokenError,
 };
 use crate::retry::RetryConfig;
+use crate::state::types::legacy_added_date_matches;
 use crate::state::{
     DownloadContextStateStore, DownloadStateStore, MembershipStore, MetadataRewriteStore,
     ReconciliationStateStore, ReportStateStore, SyncTokenStore, TempFileOwnershipStore,
@@ -2137,12 +2138,14 @@ impl DownloadContext {
         let Some(provider_added) = asset.added_date_evidence() else {
             return false;
         };
-        if self
-            .legacy_added_dates
-            .get(library)
-            .and_then(|dates| dates.get(master_record_name))
-            != Some(&Some(provider_added))
-        {
+        if !legacy_added_date_matches(
+            self.legacy_added_dates
+                .get(library)
+                .and_then(|dates| dates.get(master_record_name))
+                .copied()
+                .flatten(),
+            Some(provider_added),
+        ) {
             return false;
         }
         let Some(mappings) = &self.asset_master_mappings else {
@@ -4959,8 +4962,7 @@ async fn run_metadata_capture_repair(
                         continue;
                     }
                     if !candidate.versions.iter().all(|version| {
-                        version.added_at.is_some()
-                            && version.added_at == asset.added_date_evidence()
+                        legacy_added_date_matches(version.added_at, asset.added_date_evidence())
                     }) {
                         if let Err(error) = db
                             .defer_metadata_capture_ambiguity(
@@ -14577,7 +14579,7 @@ mod tests {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = crate::test_helpers::TestAssetRecord::new("FAILED_BEFORE_SYNC")
             .filename("failed-before-sync.jpg")
-            .checksum("ck_failed_before_sync")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
             .size(1024)
             .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
@@ -15095,6 +15097,16 @@ mod tests {
         )
         .await
         .expect("seed recorded local path");
+        // The provider bytes change only after this child's ownership is known.
+        assert!(
+            db.claim_legacy_master_state_owner(
+                "PrimarySync",
+                "CHANGED_TRUNCATED_PATH",
+                "asset-CHANGED_TRUNCATED_PATH"
+            )
+            .await
+            .unwrap()
+        );
         tokio::fs::write(&recorded_path, b"bad")
             .await
             .expect("truncate recorded download");
@@ -18069,7 +18081,7 @@ mod tests {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = crate::test_helpers::TestAssetRecord::new("DRY_RUN_PENDING")
             .filename("dry-run-pending.jpg")
-            .checksum("ck_dry_run_pending")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
             .size(1024)
             .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
@@ -18149,8 +18161,8 @@ mod tests {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = crate::test_helpers::TestAssetRecord::new("FAILED_BEFORE_SYNC")
             .filename("failed-before-sync.jpg")
-            .checksum("ck_failed_before_sync")
-            .size(1024)
+            .checksum(&checksum)
+            .size(8)
             .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
@@ -18259,8 +18271,8 @@ mod tests {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = crate::test_helpers::TestAssetRecord::new("PENDING_EXPIRED_URL")
             .filename("pending-expired-url.jpg")
-            .checksum("ck_pending_expired_url")
-            .size(1024)
+            .checksum(&checksum)
+            .size(8)
             .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
@@ -18631,6 +18643,8 @@ mod tests {
                 8,
             );
             records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+            records[1]["fields"]["addedDate"] =
+                json!({"value": 1_700_000_000_123i64, "type": "TIMESTAMP"});
             records[1]["fields"]["isHidden"] = json!({"value": i64::from(hidden), "type": "INT64"});
             let session = LegacyPendingHydrationSession {
                 lookup_records: Arc::new(vec![records[0].clone()]),
@@ -18980,6 +18994,72 @@ mod tests {
                 .expect("mapping lookup"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn pending_direct_lookup_requires_rendition_evidence_before_claiming_owner() {
+        let matching_checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        for (checksum, size, rejected) in [
+            ("different-checksum", 1024, true),
+            (matching_checksum, 999, true),
+            ("different-checksum", 999, true),
+            (matching_checksum, 1024, false),
+        ] {
+            let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+            let record = TestAssetRecord::new("LEGACY_DIRECT")
+                .checksum(checksum)
+                .size(size)
+                .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", "asset-direct", "LEGACY_DIRECT")
+                .await
+                .unwrap();
+            let mut child = mock_asset_record_for("asset-direct", "LEGACY_DIRECT");
+            child["fields"]["addedDate"] =
+                json!({"value": 1_700_000_000_123i64, "type": "TIMESTAMP"});
+            let passes = vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(vec![
+                            mock_master_record_with_filename("LEGACY_DIRECT", "direct.jpg"),
+                            child,
+                        ]),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }];
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path());
+            config.state_db = Some(db.clone());
+            for _cycle in 0..2 {
+                let plan = build_pending_retry_download_tasks(
+                    &passes,
+                    &config,
+                    DownloadRunMode::Download,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(plan.tasks.len(), usize::from(!rejected));
+                assert_eq!(plan.identity_incomplete, rejected);
+                let owners = db.get_legacy_master_state_owners().await.unwrap();
+                assert_eq!(owners.len(), usize::from(!rejected));
+                if rejected {
+                    assert_eq!(plan.unmatched_targets.len(), 1);
+                    let pending = db.get_pending().await.unwrap();
+                    assert_eq!(pending[0].checksum.as_ref(), checksum);
+                    assert_eq!(pending[0].size_bytes, size);
+                    assert_eq!(pending[0].added_at, record.added_at);
+                    assert_eq!(db.get_summary().await.unwrap().source_deleted, 0);
+                }
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+            }
+        }
     }
 
     #[tokio::test]
