@@ -81,6 +81,12 @@ pub(crate) async fn run_status(
                     capture.failed_assets,
                     capture.remaining_assets
                 );
+                if capture.unresolved_assets > 0 {
+                    println!(
+                        "    {} unresolved identities, {} deferred retries",
+                        capture.unresolved_assets, capture.deferred_assets
+                    );
+                }
                 if let Some(error) = &capture.last_error {
                     println!("    Last error: {error}");
                 }

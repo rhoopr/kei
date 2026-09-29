@@ -311,6 +311,8 @@ pub struct SyncStats {
     pub metadata_capture_refreshed: usize,
     pub metadata_capture_failures: usize,
     pub metadata_capture_remaining: u64,
+    pub metadata_capture_unresolved: u64,
+    pub metadata_capture_deferred: u64,
     /// True when this cycle durably reduced metadata-capture work.
     #[serde(skip)]
     pub(crate) metadata_capture_progressed: bool,
@@ -493,6 +495,8 @@ impl SyncStats {
         self.metadata_capture_refreshed += other.metadata_capture_refreshed;
         self.metadata_capture_failures += other.metadata_capture_failures;
         self.metadata_capture_remaining += other.metadata_capture_remaining;
+        self.metadata_capture_unresolved += other.metadata_capture_unresolved;
+        self.metadata_capture_deferred += other.metadata_capture_deferred;
         self.metadata_capture_progressed |= other.metadata_capture_progressed;
         self.state_write_failures += other.state_write_failures;
         self.enumeration_errors += other.enumeration_errors;
@@ -4677,6 +4681,8 @@ async fn run_metadata_capture_repair(
         }
     };
     repair.stats.metadata_capture_remaining = initial.remaining_assets;
+    repair.stats.metadata_capture_unresolved = initial.unresolved_assets;
+    repair.stats.metadata_capture_deferred = initial.deferred_assets;
     if initial.remaining_assets == 0 {
         return repair;
     }
@@ -4876,6 +4882,16 @@ async fn run_metadata_capture_repair(
                             full_evidence_matching_children,
                             "Metadata capture remains ambiguous; retaining identity and checkpoint"
                         );
+                        if let Err(error) = db
+                            .defer_metadata_capture_ambiguity(
+                                &candidate,
+                                crate::state::METADATA_CAPTURE_REVISION,
+                            )
+                            .await
+                        {
+                            repair.stats.state_write_failures += 1;
+                            tracing::warn!(error = %error, "Could not persist metadata-capture retry");
+                        }
                         record_metadata_capture_failure(
                             db.as_ref(),
                             &candidate.library,
@@ -4970,6 +4986,8 @@ async fn run_metadata_capture_repair(
             repair.stats.metadata_capture_progressed =
                 status.remaining_assets < initial.remaining_assets;
             repair.stats.metadata_capture_remaining = status.remaining_assets;
+            repair.stats.metadata_capture_unresolved = status.unresolved_assets;
+            repair.stats.metadata_capture_deferred = status.deferred_assets;
         }
         Err(error) => {
             repair.stats.state_write_failures = repair.stats.state_write_failures.saturating_add(1);
@@ -4978,6 +4996,9 @@ async fn run_metadata_capture_repair(
                 repair.stats.metadata_capture_failures.saturating_add(1);
             tracing::warn!(error = %error, library, "Could not finalize metadata-capture repair state");
         }
+    }
+    if repair.stats.metadata_capture_unresolved > 0 {
+        block_sync_token_for_metadata_capture(&mut repair.stats);
     }
     if repair.failures > 0 || repair.stats.interrupted {
         block_sync_token_for_incremental_delta(
@@ -4992,6 +5013,11 @@ fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullEnumerationR
     if result.full_enumeration_ran && result.stats.full_enumeration_reason.is_none() {
         result.stats.full_enumeration_reason = Some(reason);
     }
+}
+
+pub(crate) fn block_sync_token_for_metadata_capture(stats: &mut SyncStats) {
+    stats.identity_incomplete = true;
+    block_sync_token_for_incremental_delta(stats, METADATA_CAPTURE_REPAIR_FAILED_REASON);
 }
 
 pub(crate) fn block_sync_token_for_unresolved_identity(stats: &mut SyncStats) {
@@ -6062,11 +6088,13 @@ pub async fn download_photos_with_sync(
     .await?;
 
     result.stats.accumulate(&metadata_capture_repair.stats);
-    if metadata_capture_repair.failures > 0 {
+    if metadata_capture_repair.failures > 0
+        || metadata_capture_repair.stats.metadata_capture_unresolved > 0
+    {
         result.outcome = merge_download_outcomes(
             &result.outcome,
             &DownloadOutcome::PartialFailure {
-                failed_count: metadata_capture_repair.failures,
+                failed_count: metadata_capture_repair.failures.max(1),
             },
         );
     }
@@ -19652,7 +19680,7 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_backfill() {
         #[derive(Clone, Debug)]
-        struct AmbiguousCaptureSession(Arc<Vec<Value>>);
+        struct AmbiguousCaptureSession(Arc<Vec<Value>>, Arc<std::sync::Mutex<Vec<&'static str>>>);
         #[async_trait::async_trait]
         impl PhotosSession for AmbiguousCaptureSession {
             async fn post(
@@ -19662,13 +19690,31 @@ mod tests {
                 _headers: &[(&str, &str)],
             ) -> anyhow::Result<Value> {
                 if url.contains("/records/lookup?") {
-                    return Ok(json!({"records": [self.0[0].clone()]}));
+                    self.1.lock().unwrap().push("lookup");
+                    let request: Value = serde_json::from_str(&body).unwrap();
+                    let names: Vec<_> = request["records"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r["recordName"].as_str().unwrap())
+                        .collect();
+                    return Ok(
+                        json!({"records": self.0.iter().filter(|r| names.contains(&r["recordName"].as_str().unwrap())).collect::<Vec<_>>() }),
+                    );
                 }
                 assert!(
                     url.contains("/changes/zone?"),
                     "ambiguous capture must not force album enumeration"
                 );
                 let request: Value = serde_json::from_str(&body).unwrap();
+                self.1
+                    .lock()
+                    .unwrap()
+                    .push(if request["zones"][0]["syncToken"].is_string() {
+                        "delta"
+                    } else {
+                        "inventory"
+                    });
                 let records = if request["zones"][0]["syncToken"].is_string() {
                     Vec::new()
                 } else {
@@ -19680,7 +19726,7 @@ mod tests {
                 Box::new(self.clone())
             }
         }
-        for hidden_count in 0..=2 {
+        for (children, hidden_count) in [(2, 0), (2, 1), (2, 2), (3, 0), (3, 1), (3, 3)] {
             let dir = TempDir::new().unwrap();
             let db_path = dir.path().join("state.db");
             let mut records = incremental_photo_records_with_favorite("CAPTURE_AMBIGUOUS", false);
@@ -19688,7 +19734,12 @@ mod tests {
             let mut sibling = records[1].clone();
             sibling["recordName"] = json!("asset-other-child");
             sibling["fields"]["isFavorite"]["value"] = json!(1);
-            records.push(sibling);
+            records.push(sibling.clone());
+            if children == 3 {
+                sibling["recordName"] = json!("asset-third-child");
+                records.push(sibling);
+            }
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             for record in records.iter_mut().skip(1).take(hidden_count) {
                 record["fields"]["isHidden"] = json!({"value": 1, "type": "INT64"});
             }
@@ -19697,7 +19748,10 @@ mod tests {
                 album: album_with_session(
                     "PrimarySync",
                     "",
-                    Box::new(AmbiguousCaptureSession(Arc::new(records))),
+                    Box::new(AmbiguousCaptureSession(
+                        Arc::new(records),
+                        Arc::clone(&calls),
+                    )),
                 ),
                 exclude_ids: Arc::new(FxHashSet::default()),
             };
@@ -19714,9 +19768,16 @@ mod tests {
                 path
             };
             let original_bytes = std::fs::read(&media_path).unwrap();
-            for cycle in 1..=2 {
+            for cycle in 1..=3 {
                 let (capture, _guard) = TracingCapture::install();
                 let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+                if cycle == 3 {
+                    db.acquire_lock("test_retry_due")
+                        .unwrap()
+                        .execute("UPDATE metadata_capture_retries SET next_retry_at=0", [])
+                        .unwrap();
+                }
+                calls.lock().unwrap().clear();
                 let mut config = config.clone();
                 config.state_db = Some(db.clone());
                 let result = download_photos_with_sync(
@@ -19735,7 +19796,31 @@ mod tests {
                 ));
                 assert_eq!(result.sync_token, None);
                 assert_eq!(result.stats.metadata_capture_remaining, 1);
-                assert_eq!(result.stats.metadata_capture_failures, 1);
+                assert_eq!(
+                    result.stats.metadata_capture_failures,
+                    usize::from(cycle != 2)
+                );
+                assert_eq!(result.stats.metadata_capture_unresolved, 1);
+                assert_eq!(result.stats.metadata_capture_deferred, 1);
+                assert!(result.stats.identity_incomplete);
+                assert_eq!(
+                    calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|&&call| call == "lookup")
+                        .count(),
+                    usize::from(cycle != 2)
+                );
+                assert_eq!(
+                    calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|&&call| call == "inventory")
+                        .count(),
+                    usize::from(cycle != 2)
+                );
                 assert_eq!(result.stats.metadata_capture_refreshed, 0);
                 assert_eq!(
                     result.stats.sync_token_blocked_reason,
@@ -19753,7 +19838,8 @@ mod tests {
                     .iter()
                     .find(|status| status.library == "PrimarySync")
                     .unwrap();
-                assert_eq!(status.failed_assets, cycle);
+                assert_eq!(status.failed_assets, if cycle == 3 { 2 } else { 1 });
+                assert_eq!((status.unresolved_assets, status.deferred_assets), (1, 1));
                 assert_eq!(
                     status.pending_revision,
                     Some(crate::state::METADATA_CAPTURE_REVISION)
@@ -19770,11 +19856,20 @@ mod tests {
                         event.field("diagnostic") == Some("metadata_capture_ambiguity_counts_v1")
                     })
                     .collect();
-                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(diagnostics.len(), usize::from(cycle != 2));
+                if cycle == 2 {
+                    continue;
+                }
                 let event = &diagnostics[0];
                 assert_eq!(event.field("stored_renditions"), Some("1"));
-                assert_eq!(event.field("matching_children"), Some("2"));
-                assert_eq!(event.field("full_evidence_matching_children"), Some("2"));
+                assert_eq!(
+                    event.field("matching_children"),
+                    Some(if children == 2 { "2" } else { "3" })
+                );
+                assert_eq!(
+                    event.field("full_evidence_matching_children"),
+                    Some(if children == 2 { "2" } else { "3" })
+                );
                 assert_eq!(event.fields.len(), 5);
                 for key in [
                     "message",
@@ -19785,6 +19880,54 @@ mod tests {
                 ] {
                     assert!(event.fields.contains_key(key));
                 }
+            }
+            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            assert!(
+                db.claim_legacy_master_state_owner(
+                    "PrimarySync",
+                    "CAPTURE_AMBIGUOUS",
+                    asset.asset_record_name()
+                )
+                .await
+                .unwrap()
+            );
+            drop(db);
+            for recovered_cycle in 0..2 {
+                let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+                calls.lock().unwrap().clear();
+                let mut recovered_config = config.clone();
+                recovered_config.state_db = Some(db.clone());
+                let result = download_photos_with_sync(
+                    &Client::new(),
+                    std::slice::from_ref(&pass),
+                    Arc::new(recovered_config),
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(result.outcome, DownloadOutcome::Success));
+                assert!(!result.stats.identity_incomplete);
+                assert_eq!(result.stats.metadata_capture_unresolved, 0);
+                assert_eq!(
+                    result.stats.metadata_capture_refreshed,
+                    usize::from(recovered_cycle == 0)
+                );
+                assert_eq!(
+                    calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|&&c| c == "lookup")
+                        .count(),
+                    usize::from(recovered_cycle == 0)
+                );
+                assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+                assert_eq!(
+                    db.get_summary().await.unwrap().metadata_capture[0].pending_revision,
+                    None
+                );
+                assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
             }
         }
     }
@@ -24685,6 +24828,8 @@ mod tests {
             metadata_capture_refreshed: 2,
             metadata_capture_failures: 1,
             metadata_capture_remaining: 5,
+            metadata_capture_unresolved: 2,
+            metadata_capture_deferred: 1,
             metadata_capture_progressed: false,
             state_write_failures: 2,
             enumeration_errors: 3,
@@ -24759,6 +24904,8 @@ mod tests {
             metadata_capture_refreshed: 3,
             metadata_capture_failures: 2,
             metadata_capture_remaining: 7,
+            metadata_capture_unresolved: 3,
+            metadata_capture_deferred: 2,
             metadata_capture_progressed: true,
             state_write_failures: 5,
             enumeration_errors: 6,
@@ -24827,6 +24974,8 @@ mod tests {
         assert_eq!(acc.metadata_capture_refreshed, 5);
         assert_eq!(acc.metadata_capture_failures, 3);
         assert_eq!(acc.metadata_capture_remaining, 12);
+        assert_eq!(acc.metadata_capture_unresolved, 5);
+        assert_eq!(acc.metadata_capture_deferred, 3);
         assert!(acc.metadata_capture_progressed);
         assert_eq!(acc.state_write_failures, 7, "state_write_failures must sum");
         assert_eq!(acc.enumeration_errors, 9, "enumeration_errors must sum");

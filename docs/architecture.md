@@ -113,6 +113,22 @@ across visibility states.
 This does not change download selection or permit checkpoint advancement
 without the existing completion proof.
 
+Ambiguous metadata-capture repairs retain a schema-27 retry row keyed by
+library, catalogue asset ID, and target capture revision. An unchanged failure
+retries after one hour, doubling up to 24 hours. Changed catalogue identity or
+rendition evidence is eligible immediately. A durable generation rejects stale
+attempts; its counter survives retry retirement. The state reader excludes
+deferred candidates before applying the existing 500-identity batch limit.
+Unresolved and deferred counts are separate from failed repair attempts.
+Deferred work keeps the capture revision pending and its checkpoint blocked,
+even when a cycle makes no repair attempt. The cycle checks each library
+before committing inventory anchors or provider checkpoints, including
+`--refresh-metadata` runs that bypass automatic capture repair. Idle health
+and other-library success cannot turn retained ambiguity into a successful backup. Completion
+retires retry rows only after the existing repair or source-deletion rules
+remove the stale work. Retry scheduling does not select a child or authorize
+metadata rewrites, deletion, or checkpoint advancement.
+
 Unresolved asset-only delta hydration is incomplete work, even when no media
 transfer fails. The producer records `unresolved_asset_identity:<zone> = 1` in
 the existing metadata table before stream completion. The cycle owner clears

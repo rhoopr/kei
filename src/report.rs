@@ -229,6 +229,8 @@ mod tests {
                 metadata_capture_refreshed: 25,
                 metadata_capture_failures: 2,
                 metadata_capture_remaining: 75,
+                metadata_capture_unresolved: 19,
+                metadata_capture_deferred: 18,
                 inventory_drop_warnings: 1,
                 inventory_drop_assets: 5,
                 inventory_drop_percent: Some(1.2),
@@ -253,6 +255,8 @@ mod tests {
         assert_eq!(parsed["stats"]["metadata_capture_refreshed"], 25);
         assert_eq!(parsed["stats"]["metadata_capture_failures"], 2);
         assert_eq!(parsed["stats"]["metadata_capture_remaining"], 75);
+        assert_eq!(parsed["stats"]["metadata_capture_unresolved"], 19);
+        assert_eq!(parsed["stats"]["metadata_capture_deferred"], 18);
         assert_eq!(parsed["stats"]["inventory_drop_warnings"], 1);
         assert_eq!(parsed["stats"]["inventory_drop_previous_total"], 410);
         assert_eq!(parsed["stats"]["inventory_drop_current_total"], 405);

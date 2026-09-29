@@ -82,7 +82,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 26;
+const HELPER_SCHEMA_VERSION: i32 = 27;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -361,6 +361,19 @@ CREATE TABLE IF NOT EXISTS unresolved_sparse_identities (
     PRIMARY KEY (library, source_record_name)
 );
 CREATE INDEX IF NOT EXISTS idx_sparse_identity_retry ON unresolved_sparse_identities(library, next_retry_at);
+
+CREATE TABLE IF NOT EXISTS metadata_capture_retries (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    target_revision INTEGER NOT NULL,
+    evidence TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    attempts INTEGER NOT NULL CHECK(attempts > 0),
+    last_attempt_at INTEGER NOT NULL,
+    next_retry_at INTEGER NOT NULL,
+    PRIMARY KEY (library, asset_id, target_revision)
+);
+
 ").unwrap();
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();
@@ -392,7 +405,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 26). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 27). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -410,7 +423,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 26;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 27;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -1831,6 +1844,44 @@ fn status_shows_safe_backup_summary_after_clean_sync() {
         ),
         "stdout: {stdout}"
     );
+}
+
+#[test]
+fn status_reports_metadata_capture_retry_without_private_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "private-legacy",
+        "downloaded",
+        "photo.jpg",
+        Some("/p/photo.jpg"),
+        None,
+        None,
+    );
+    conn.execute("INSERT INTO metadata_capture_state(library,pending_revision,failed_assets,updated_at) VALUES ('PrimarySync',1,19,0)", []).unwrap();
+    let evidence =
+        serde_json::json!(["private-legacy", null, [["original", "abc", 1000]]]).to_string();
+    conn.execute("INSERT INTO metadata_capture_retries VALUES ('PrimarySync','private-legacy',1,?1,1,1,?2,?3)", rusqlite::params![evidence,chrono::Utc::now().timestamp(),chrono::Utc::now().timestamp()+3600]).unwrap();
+    conn.execute("INSERT INTO sync_runs(started_at,completed_at,status) VALUES (1700000000,1700000010,'complete')", []).unwrap();
+    drop(conn);
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 unresolved identities, 1 deferred retries"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("19 failed"), "{stdout}");
+    assert!(stdout.contains("Backup status: unsafe"), "{stdout}");
+    assert!(!stdout.contains("private-legacy"));
 }
 
 #[test]
