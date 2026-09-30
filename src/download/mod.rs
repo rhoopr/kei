@@ -3518,6 +3518,16 @@ pub(crate) async fn reconcile_catalog_paths(
     let Some(provider_pass) = passes.first() else {
         return Ok(PathReconciliationResult::default());
     };
+    if let Err(error) = file::recover_conditional_replacements(&config.directory).await {
+        tracing::warn!(error = %format!("{error:#}"), "Could not recover replacements before path reconciliation; keeping catalogue paths and checkpoints unchanged");
+        return Ok(PathReconciliationResult {
+            complete: false,
+            stats: SyncStats {
+                failed: 1,
+                ..SyncStats::default()
+            },
+        });
+    }
 
     let mut records = Vec::new();
     let mut offset = 0u64;
@@ -5957,6 +5967,9 @@ pub async fn download_photos_with_sync(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
+    if matches!(controls.run_mode, DownloadRunMode::Download) {
+        file::recover_conditional_replacements(&config.directory).await?;
+    }
     cleanup_orphan_part_files(&config).await;
     if matches!(config.sync_mode, SyncMode::Incremental { .. })
         && let Some(db) = &config.state_db

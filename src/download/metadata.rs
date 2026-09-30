@@ -1242,6 +1242,8 @@ pub(super) fn prepare_metadata_with_expected_fingerprint(
     temp_suffix: &str,
     expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
 ) -> Result<PreparedMetadataFile> {
+    #[cfg(target_os = "linux")]
+    super::file::recover_file_replacement(path)?;
     #[cfg(not(feature = "xmp"))]
     {
         prepare_metadata_native(path, write, temp_suffix, expected_fingerprint)
@@ -1731,7 +1733,9 @@ pub(super) fn write_reconciled_sidecar(
     Ok(receipt)
 }
 
-/// Write `write` as a `.xmp` sidecar next to the media file, atomically.
+/// Write `write` as a `.xmp` sidecar next to the media file with guarded publication.
+/// Unsupported Linux filesystems use a journaled replacement; readers can
+/// briefly observe an absent sidecar.
 ///
 /// If a sidecar already exists (e.g., from Darktable / Lightroom / digiKam),
 /// its existing XMP properties are read and kei's fields are layered on top
@@ -1757,19 +1761,40 @@ pub(crate) async fn write_sidecar(
     };
 
     // CONTRACT: XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT
-    super::file::publish_file_if_unchanged(
+    let publication = super::file::publish_file_if_unchanged(
         &prepared.tmp_path,
         &prepared.sidecar_path,
         prepared.expected,
     )
-    .await
-    .with_context(|| {
-        format!(
-            "Could not install XMP sidecar {} -> {}",
-            prepared.tmp_path.display(),
-            prepared.sidecar_path.display()
-        )
-    })?;
+    .await;
+    if let Err(error) = publication {
+        #[cfg(target_os = "linux")]
+        if super::file::classify_conditional_publish_error(&error).filesystem_unsupported
+            && super::file::classify_conditional_publish_error(&error)
+                .retained_paths
+                .is_empty()
+        {
+            // Remove only the writer's unchanged output after an unsupported
+            // filesystem operation. Explicit recovery claims always retain it.
+            let temp = prepared.tmp_path.clone();
+            let output = prepared.output;
+            let identity = prepared.identity;
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = super::file::cleanup_prepared_sidecar(&temp, output, identity) {
+                    tracing::warn!(path = %temp.display(), error = %format!("{error:#}"), "Could not safely remove prepared sidecar; retaining file");
+                }
+            })
+            .await
+            .context("Sidecar cleanup task panicked")?;
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "Could not install XMP sidecar {} -> {}",
+                prepared.tmp_path.display(),
+                prepared.sidecar_path.display()
+            )
+        });
+    }
     tracing::debug!(path = %prepared.sidecar_path.display(), "Wrote XMP sidecar");
     Ok(())
 }
@@ -1779,6 +1804,10 @@ struct PreparedSidecar {
     tmp_path: PathBuf,
     sidecar_path: PathBuf,
     expected: Option<super::file::ExistingFileFingerprint>,
+    #[cfg(target_os = "linux")]
+    output: super::file::ExistingFileFingerprint,
+    #[cfg(target_os = "linux")]
+    identity: crate::fs_util::FileIdentity,
 }
 
 #[cfg(feature = "xmp")]
@@ -1801,6 +1830,8 @@ fn prepare_sidecar_write(
     let mut sidecar_name = name.to_os_string();
     sidecar_name.push(".xmp");
     let sidecar_path = media_path.with_file_name(&sidecar_name);
+    #[cfg(target_os = "linux")]
+    super::file::recover_file_replacement(&sidecar_path)?;
     // Seed the packet with any existing sidecar content so user-authored
     // ratings / keywords / develop settings from another tool survive.
     let (mut meta, expected) = match std::fs::read(&sidecar_path) {
@@ -1857,6 +1888,10 @@ fn prepare_sidecar_write(
         tmp_path,
         sidecar_path,
         expected,
+        #[cfg(target_os = "linux")]
+        output: fingerprint_bytes(&bytes)?,
+        #[cfg(target_os = "linux")]
+        identity: crate::fs_util::file_identity(&temp)?,
     }))
 }
 
@@ -2499,7 +2534,7 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
 
 /// Read the first 12 bytes of `file` and verify it starts with an
 /// ISO-BMFF `ftyp` box whose major brand is in the HEIF family. Used as
-/// a sanity check between `rewrite_xmp` and the atomic rename so a
+/// a sanity check between `rewrite_xmp` and guarded publication so a
 /// malformed rewrite never lands on disk. Reads from the still-open
 /// rewrite handle (seeks back to 0) to avoid reopening `tmp_path`
 /// immediately after `sync_all`; the path is only used for diagnostics.

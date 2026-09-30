@@ -85,7 +85,9 @@ or truncated downloads for retry. It reads media but writes state unless
 
 Only explicit repair may replace an existing recorded truncated file. It
 requires the durable truncation marker, verifies the new download and configured
-metadata writes, and checks the old fingerprint before atomic replacement.
+metadata writes, and checks the old fingerprint before guarded replacement.
+Linux filesystems that reject atomic exchange use the journaled fallback
+shown in [Guarded publication](metadata.md#guarded-publication).
 A changed target remains a failure rather than permission to overwrite it.
 Normal downloads and missing-file retries keep no-overwrite publication.
 
