@@ -134,6 +134,11 @@ fn rust_files_under(path: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn production_source(source: &str) -> &str {
+    // A leading inner attribute gates the entire external module in Rust.
+    // Do not treat nested attributes or textual mentions as file-level gates.
+    if source.starts_with("#![cfg(test)]\n") {
+        return "";
+    }
     let source = source
         .split_once("\n#[cfg(test)]\nmod tests")
         .map_or(source, |(prod, _)| prod);
@@ -1896,6 +1901,24 @@ fn funding_file_contains_only_configured_sponsor_platforms() {
         "ko_fi: rhoopr",
         "FUNDING.yml should not keep unconfigured GitHub template placeholders"
     );
+}
+
+#[test]
+fn production_source_only_excludes_leading_file_level_test_gate() {
+    let production = "fn owner() { payload.downcast_ref::<String>(); }\n";
+    assert_eq!(
+        production_source(&format!("#![cfg(test)]\n{production}")),
+        ""
+    );
+    for source in [
+        production.to_string(),
+        format!("mod nested {{\n#![cfg(test)]\n}}\n{production}"),
+        format!("fn first() {{}}\n#![cfg(test)]\n{production}"),
+        format!("const TEXT: &str = \"#![cfg(test)]\";\n{production}"),
+        format!("// #![cfg(test)]\n{production}"),
+    ] {
+        assert_eq!(production_source(&source), source);
+    }
 }
 
 #[test]

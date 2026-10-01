@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Bounded, replayable event orderings across metadata-capture recovery.
 
 use std::collections::HashSet;
