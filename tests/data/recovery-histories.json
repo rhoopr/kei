@@ -1,0 +1,23 @@
+[
+  {
+    "name": "hidden-date-regresses-after-owner-claim",
+    "provenance": "reconstructed-public-issue",
+    "public_issues": [861, 862],
+    "relationships": "A legacy master row and child mapping share provider checksum and size. Invalid hidden child dates coexist with a valid visible sibling, retaining ambiguity. The retry survives reopen and provider-only improvement, then a valid owner claim survives a failed SQLite metadata refresh. Subsequent missing/null/extreme dates cannot overwrite the known catalogue date or checkpoint. Existing local media and unrelated XMP remain unchanged; photo downloads and metadata writes are disabled.",
+    "faults": ["MissingDate", "NullDate", "OutOfRangeDate", "FailRefresh", "MissingDate"]
+  },
+  {
+    "name": "historical-family-evidence-disappears-and-returns",
+    "provenance": "reconstructed-public-issue",
+    "public_issues": [765, 853, 862],
+    "relationships": "A synthetic historical master retains its downloaded path, checksum, date, and child mapping across ambiguous matching siblings. After the shared prefix establishes a durable owner without completing refresh, that child disappears from lookup and returns with malformed date evidence. Unknown evidence must preserve owned media, retry work and the old checkpoint. Only the final valid child date permits completion; two stable cycles must remain quiet.",
+    "faults": ["MissingChild", "Ambiguous", "MissingChild", "InterruptLookup", "FailRefresh"]
+  },
+  {
+    "name": "visibility-and-selection-drift-during-recovery",
+    "provenance": "reconstructed-public-issue",
+    "public_issues": [861, 862],
+    "relationships": "The same retained master/child family alternates visible and hidden malformed dates, with a recent-item filter temporarily enabled. Selection drift cannot bless malformed required metadata, retire recovery debt or change media/XMP. Interrupted lookup and refresh failure survive SQLite reopen. Recovery restores baseline selection with a different valid final date, followed by two quiet cycles. This composition is constructed for testing, not a reported exact sequence.",
+    "faults": ["VisibleInvalid", "FilteredInvalid", "InterruptLookup", "FilteredInvalid", "NullDate"]
+  }
+]

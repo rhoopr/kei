@@ -4,8 +4,10 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rand::SeedableRng;
+use futures_util::FutureExt;
 use rand::seq::SliceRandom;
+use rand::{RngExt, SeedableRng};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -18,42 +20,29 @@ use crate::sync_loop::test_support::{
 };
 use crate::{download, state};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum Event {
     Ambiguous,
     Deferred,
     MissingDate,
     NullDate,
     OutOfRangeDate,
+    MissingChild,
+    VisibleInvalid,
+    FilteredInvalid,
     InterruptLookup,
     FailRefresh,
     Recover,
     Steady,
 }
 
-async fn run_capture_recovery_sequence(seed: u64) {
+async fn run_capture_history(seed: u64, trace: &[Event]) {
     const ZONE: &str = "SharedSync-SEQUENCE";
     const MASTER: &str = "master-sequence";
     const CHILD: &str = "asset-master-sequence";
     const TOKEN_KEY: &str = "sync_token:SharedSync-SEQUENCE";
     const CHECKSUM: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const RECOVERED_DATE: i64 = RUN_CYCLE_ASSET_DATE_MS + 42 * 86_400_000;
-
-    // The prefix reaches a durable owner with an uncommitted metadata refresh.
-    // Every shuffle then regresses provider evidence or interrupts recovery.
-    // Recovery is deliberately separate from fault selection, so liveness has
-    // a fixed bound and cannot be excused by an unlucky generated schedule.
-    let mut faults = [
-        Event::MissingDate,
-        Event::NullDate,
-        Event::OutOfRangeDate,
-        Event::InterruptLookup,
-        Event::FailRefresh,
-    ];
-    faults.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
-    let mut trace = vec![Event::Ambiguous, Event::Deferred, Event::FailRefresh];
-    trace.extend(faults);
-    trace.extend([Event::Recover, Event::Steady, Event::Steady]);
 
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("state.db");
@@ -118,12 +107,21 @@ async fn run_capture_recovery_sequence(seed: u64) {
             "type": "TIMESTAMP"
         });
         match event {
-            Event::Ambiguous | Event::MissingDate => {
+            Event::Ambiguous
+            | Event::MissingDate
+            | Event::VisibleInvalid
+            | Event::FilteredInvalid => {
                 fields.as_object_mut().unwrap().remove("assetDate");
             }
             Event::NullDate => fields["assetDate"]["value"] = json!(null),
             Event::OutOfRangeDate => fields["assetDate"]["value"] = json!(1e100),
             _ => {}
+        }
+        if matches!(event, Event::VisibleInvalid) {
+            fields["isHidden"]["value"] = json!(0);
+        }
+        if matches!(event, Event::MissingChild) {
+            page["records"].as_array_mut().unwrap().truncate(1);
         }
         if matches!(event, Event::Ambiguous) {
             let mut sibling = page["records"][1].clone();
@@ -171,6 +169,7 @@ async fn run_capture_recovery_sequence(seed: u64) {
             db.clone(),
             RunCycleDownloadConfigOptions {
                 media: media_without_photo_downloads(),
+                recent: matches!(event, Event::FilteredInvalid).then_some(1),
                 ..RunCycleDownloadConfigOptions::default()
             },
         );
@@ -194,31 +193,48 @@ async fn run_capture_recovery_sequence(seed: u64) {
         // counters. The final cycle is reopened too, not only intermediate ones.
         let db = state::SqliteStateDb::open(&database).await.unwrap();
         let rows = db.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id.as_ref(), MASTER);
+        assert_eq!(rows.len(), 1, "downloaded row count");
+        assert_eq!(rows[0].id.as_ref(), MASTER, "legacy row identity");
         assert_eq!(
             rows[0].created_at,
             if repaired {
                 chrono::DateTime::from_timestamp_millis(RECOVERED_DATE).unwrap()
             } else {
                 original_date
-            }
+            },
+            "capture date requires valid committed evidence"
         );
         assert_eq!(
             rows[0].added_at.unwrap().timestamp_millis(),
-            RUN_CYCLE_ASSET_DATE_MS
+            RUN_CYCLE_ASSET_DATE_MS,
+            "addition date preserved"
         );
-        assert_eq!(rows[0].checksum.as_ref(), CHECKSUM);
-        assert_eq!(rows[0].local_path.as_deref(), Some(media_path.as_path()));
-        assert_eq!(rows[0].metadata.is_hidden, repaired);
-        assert_eq!(rows[0].metadata.is_favorite, repaired);
+        assert_eq!(
+            rows[0].checksum.as_ref(),
+            CHECKSUM,
+            "provider checksum preserved"
+        );
+        assert_eq!(
+            rows[0].local_path.as_deref(),
+            Some(media_path.as_path()),
+            "tracked path preserved"
+        );
+        assert_eq!(
+            rows[0].metadata.is_hidden, repaired,
+            "hidden metadata changes only on recovery"
+        );
+        assert_eq!(
+            rows[0].metadata.is_favorite, repaired,
+            "favorite metadata changes only on recovery"
+        );
         assert_eq!(
             db.get_legacy_master_state_owners().await.unwrap(),
             if step >= 2 {
                 HashSet::from([(ZONE.to_string(), MASTER.to_string(), CHILD.to_string())])
             } else {
                 HashSet::new()
-            }
+            },
+            "exact legacy ownership"
         );
         assert_eq!(
             db.get_metadata(TOKEN_KEY).await.unwrap().as_deref(),
@@ -226,7 +242,8 @@ async fn run_capture_recovery_sequence(seed: u64) {
                 "zone-tok-new"
             } else {
                 "zone-tok-prev"
-            })
+            }),
+            "checkpoint requires completed capture"
         );
         let summary = db.get_summary().await.unwrap();
         assert_eq!(
@@ -236,7 +253,8 @@ async fn run_capture_recovery_sequence(seed: u64) {
                 summary.policy_excluded,
                 summary.source_deleted
             ),
-            (1, 0, 0, 0)
+            (1, 0, 0, 0),
+            "durable status counts"
         );
         let capture = summary
             .metadata_capture
@@ -249,7 +267,8 @@ async fn run_capture_recovery_sequence(seed: u64) {
                 None
             } else {
                 Some(state::METADATA_CAPTURE_REVISION)
-            }
+            },
+            "pending capture revision"
         );
         assert!(
             db.get_pending_metadata_rewrites(10)
@@ -268,7 +287,8 @@ async fn run_capture_recovery_sequence(seed: u64) {
                 state::METADATA_CAPTURE_REVISION
             } else {
                 0
-            }
+            },
+            "asset capture receipt"
         );
         let retries: i64 = conn
             .query_row(
@@ -277,17 +297,37 @@ async fn run_capture_recovery_sequence(seed: u64) {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(retries, i64::from(!repaired));
-        assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
-        assert_eq!(std::fs::read(&sidecar).unwrap(), b"private sidecar bytes");
-        assert_eq!(std::fs::read_dir(&media).unwrap().count(), 2);
-        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(
+            retries,
+            i64::from(!repaired),
+            "retry evidence retained until recovery"
+        );
+        assert_eq!(
+            std::fs::read(&media_path).unwrap(),
+            original_bytes,
+            "original media bytes"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            b"private sidecar bytes",
+            "unrelated sidecar bytes"
+        );
+        assert_eq!(
+            std::fs::read_dir(&media).unwrap().count(),
+            2,
+            "no extra media files"
+        );
+        assert_eq!(result.stats.downloaded, 0, "no media downloads");
         assert_eq!(
             result.stats.metadata_capture_refreshed,
-            usize::from(matches!(event, Event::Recover))
+            usize::from(matches!(event, Event::Recover)),
+            "one successful capture refresh"
         );
         if matches!(event, Event::FailRefresh) {
-            assert_eq!(result.stats.metadata_capture_failures, 1);
+            assert_eq!(
+                result.stats.metadata_capture_failures, 1,
+                "refresh failure reported"
+            );
             assert!(
                 capture
                     .last_error
@@ -303,13 +343,23 @@ async fn run_capture_recovery_sequence(seed: u64) {
         if matches!(event, Event::Deferred) {
             // The provider now has one valid child, but the client has not
             // observed that change. Backoff must survive restart until due.
-            assert_eq!(result.stats.metadata_capture_deferred, 1);
-            assert_eq!(lookups.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                result.stats.metadata_capture_deferred, 1,
+                "retry remains deferred"
+            );
+            assert_eq!(
+                lookups.load(Ordering::SeqCst),
+                2,
+                "no lookup during deferral"
+            );
         }
         if repaired {
-            assert_eq!(result.failed_count, 0);
+            assert_eq!(result.failed_count, 0, "recovery failure count");
             assert!(!result.stats.identity_incomplete);
-            assert_eq!(result.stats.metadata_capture_remaining, 0);
+            assert_eq!(
+                result.stats.metadata_capture_remaining, 0,
+                "finite capture recovery"
+            );
             let requests = lookups.load(Ordering::SeqCst);
             if let Some(previous) = completed_lookups {
                 assert_eq!(requests, previous, "quiet stable tail");
@@ -317,6 +367,26 @@ async fn run_capture_recovery_sequence(seed: u64) {
             completed_lookups = Some(requests);
         }
     }
+}
+
+async fn run_capture_recovery_sequence(seed: u64) {
+    // The prefix reaches a durable owner with an uncommitted metadata refresh.
+    // Every shuffle then regresses provider evidence or interrupts recovery.
+    // Recovery is deliberately separate from fault selection, so liveness has
+    // a fixed bound and cannot be excused by an unlucky generated schedule.
+    let mut faults = [
+        Event::MissingDate,
+        Event::NullDate,
+        Event::OutOfRangeDate,
+        Event::InterruptLookup,
+        Event::FailRefresh,
+    ];
+    faults.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
+    let mut trace = vec![Event::Ambiguous, Event::Deferred, Event::FailRefresh];
+    trace.extend(faults);
+    trace.extend([Event::Recover, Event::Steady, Event::Steady]);
+
+    Box::pin(run_capture_history(seed, &trace)).await;
 }
 
 #[tokio::test]
@@ -334,4 +404,142 @@ async fn capture_recovery_sequence_seed_869() {
 #[tokio::test]
 async fn capture_recovery_sequence_seed_870() {
     Box::pin(run_capture_recovery_sequence(870)).await;
+}
+
+// Public incident descriptions are reconstructed into synthetic fixture facts.
+// None of these cases contains captured provider traffic, account DBs or photos.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconstructedHistory {
+    name: String,
+    provenance: String,
+    public_issues: Vec<u64>,
+    relationships: String,
+    faults: Vec<Event>,
+}
+
+fn with_recovery_tail(faults: &[Event]) -> Vec<Event> {
+    let mut trace = vec![Event::Ambiguous, Event::Deferred, Event::FailRefresh];
+    trace.extend_from_slice(faults);
+    trace.extend([Event::Recover, Event::Steady, Event::Steady]);
+    trace
+}
+
+fn generated_faults(seed: u64) -> Vec<Event> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let vocabulary = [
+        Event::MissingDate,
+        Event::NullDate,
+        Event::OutOfRangeDate,
+        Event::InterruptLookup,
+        Event::FailRefresh,
+        Event::MissingChild,
+        Event::VisibleInvalid,
+        Event::FilteredInvalid,
+        Event::Ambiguous,
+    ];
+    // Draw with replacement and vary length, rather than shuffling a fixed bag.
+    // Repeated errors and oscillating evidence survive every SQLite reopen.
+    (0..rng.random_range(1..=18))
+        .map(|_| vocabulary[rng.random_range(0..vocabulary.len())])
+        .collect()
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else {
+        "non-string panic".to_string()
+    }
+}
+
+async fn check_capture_history(seed: u64, faults: &[Event]) {
+    assert!(
+        faults.len() <= 18,
+        "replay retains the generated length bound"
+    );
+    assert!(
+        faults
+            .iter()
+            .all(|event| !matches!(event, Event::Deferred | Event::Recover | Event::Steady)),
+        "replay faults cannot replace prerequisite or liveness events"
+    );
+    let trace = with_recovery_tail(faults);
+    let result = std::panic::AssertUnwindSafe(run_capture_history(seed, &trace))
+        .catch_unwind()
+        .await;
+    let Err(original) = result else { return };
+    let signature = panic_message(original.as_ref());
+    let mut reduced = faults.to_vec();
+    let mut attempts = 0;
+    let mut index = 0;
+    // Bounded deletion reduction preserves the prerequisite state and mandatory
+    // valid/quiet tail. Stable oracle labels distinguish assertion failures.
+    while index < reduced.len() && attempts < 24 {
+        let mut candidate = reduced.clone();
+        candidate.remove(index);
+        let candidate_trace = with_recovery_tail(&candidate);
+        attempts += 1;
+        let result = std::panic::AssertUnwindSafe(run_capture_history(seed, &candidate_trace))
+            .catch_unwind()
+            .await;
+        if result
+            .as_ref()
+            .is_err_and(|payload| panic_message(payload.as_ref()) == signature)
+        {
+            reduced = candidate;
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
+    eprintln!(
+        "Replay reduced faults with KEI_RECOVERY_FAULTS='{}' cargo test --lib capture_generated_histories -- --nocapture",
+        serde_json::to_string(&reduced).unwrap()
+    );
+    eprintln!(
+        "RECOVERY FAILURE seed={seed} original={trace:?} reduced={:?} deletion_attempts={attempts} assertion={signature}",
+        with_recovery_tail(&reduced)
+    );
+    std::panic::resume_unwind(original);
+}
+
+#[tokio::test]
+async fn capture_reconstructed_incident_histories() {
+    let cases: Vec<ReconstructedHistory> = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/recovery-histories.json"
+    )))
+    .unwrap();
+    assert_eq!(cases.len(), 3);
+    for case in cases {
+        assert_eq!(case.provenance, "reconstructed-public-issue");
+        assert!(!case.public_issues.is_empty());
+        assert!(!case.relationships.is_empty());
+        eprintln!(
+            "reconstructed case={} issues={:?} relationships={}",
+            case.name, case.public_issues, case.relationships
+        );
+        Box::pin(check_capture_history(862, &case.faults)).await;
+    }
+}
+
+#[tokio::test]
+async fn capture_generated_histories() {
+    // Keep the default gate bounded. The full printed trace is the replay
+    // contract, since RNG algorithms can change across dependency upgrades.
+    if let Ok(faults) = std::env::var("KEI_RECOVERY_FAULTS") {
+        let faults: Vec<Event> = serde_json::from_str(&faults).expect("JSON event array");
+        Box::pin(check_capture_history(0, &faults)).await;
+    } else {
+        let seeds = std::env::var("KEI_RECOVERY_SEED").map_or_else(
+            |_| vec![0, 1, 42, 765, 853, 861, 862, 20261001],
+            |seed| vec![seed.parse::<u64>().expect("unsigned recovery seed")],
+        );
+        for seed in seeds {
+            Box::pin(check_capture_history(seed, &generated_faults(seed))).await;
+        }
+    }
 }

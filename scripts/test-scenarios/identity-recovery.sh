@@ -22,3 +22,7 @@ run_scenario_test lib run_cycle_single_survivor_preserved
 
 # Fixed seeded orderings: deferred work, regressing evidence, interruption and a quiet tail.
 run_scenario_test lib capture_recovery_sequence_seed_
+
+# Public-incident reconstructions and bounded generated histories with reduction.
+run_scenario_test lib capture_reconstructed_incident_histories
+run_scenario_test lib capture_generated_histories

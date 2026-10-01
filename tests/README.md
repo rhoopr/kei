@@ -127,8 +127,8 @@ The initial slice in #873 ran 11 tests in 25.7 seconds on Linux with a warm defa
 build cache. That is below the proposed additional 2-5 minute PR budget. Cold
 compilation is excluded; complete-suite timings remain separate gate evidence.
 
-Broader generated exploration, shrinking, semantic fuzzing, process termination, composed
-filesystem recovery, and physical NFS/NAS qualification remain later phases.
+Broad exploration, semantic fuzzing, process termination, composed filesystem
+recovery, and physical NFS/NAS qualification remain later phases.
 SQLite reopen and injected transaction failure do not model abrupt process death
 or power-loss durability.
 
@@ -160,7 +160,59 @@ retain the expanded trace when comparing different dependency revisions.
 
 The deadline mutation is confined to the fixture, and cancellation is cooperative.
 This does not qualify abrupt process termination, filesystem recovery or NAS
-durability. Broader generated exploration and shrinking remain later work.
+durability. The bounded generated histories below extend these fixed schedules.
+
+### Reconstructed and generated histories
+
+`tests/data/recovery-histories.json` contains three **reconstructed** histories
+based on public descriptions in [#861](https://github.com/rhoopr/kei/issues/861),
+[#765](https://github.com/rhoopr/kei/issues/765),
+[#853](https://github.com/rhoopr/kei/issues/853), and
+[#862](https://github.com/rhoopr/kei/issues/862). These are synthetic compositions,
+not captured reporter databases, photos, provider traffic, or exact incident
+replays. Each entry records its provenance and relationships among the provider
+family, SQLite evidence, files, and configuration. The runner instantiates those
+relationships using the existing synthetic recovery fixture.
+
+Eight default seeds draw 1-18 faults with replacement from nine events. They vary
+length, repetition, missing child evidence, invalid dates, visibility, temporary
+recent-item filtering, interrupted lookup, and failed refresh. Every history has
+the same required ambiguity/deferred/failed-refresh prefix and valid/two-quiet
+cycle tail. The prefix establishes a known durable owner; generated faults test
+that retained owner's recovery, not arbitrary attribution of unknown families.
+The original four fixed schedules remain separately runnable. Together, the six
+tests execute 192 production cycles. The initial all-feature run took 7.02 seconds
+with a warm build cache; compilation is excluded.
+
+All histories enter the production cycle and reopen SQLite after every operation.
+The oracle uses fixture facts to check exact ownership, status, dates, checksums,
+retry/revision state, checkpoints, original bytes, unrelated sidecar bytes, and
+bounded work. Recovery must complete on the first valid tail cycle. Two further
+cycles must not repeat metadata hydration, repair, or download. Configuration
+changes here cover recent-item selection only; metadata writers remain disabled.
+
+Run the focused slice with `just test scenario identity-recovery`. Replay a seed:
+
+```sh
+KEI_RECOVERY_SEED=765 cargo test --lib capture_generated_histories -- --nocapture
+```
+
+On failure, at most 24 fresh fixture replays try deleting fault events while
+preserving the prefix, mandatory tail, and original panic message. The original
+failure is always rethrown. The reported reduced trace is a bounded reduction,
+not a claim of global minimality. A temporary byte-loss mutation was detected and
+reduced from four faults to `MissingChild` in six replays; that mutation is not
+part of the committed tests. Replay a fault array directly (no dependence
+on the RNG version):
+
+```sh
+KEI_RECOVERY_FAULTS='["MissingChild","FailRefresh"]' cargo test --lib capture_generated_histories -- --nocapture
+```
+
+Save the printed seed, full original trace, reduced trace, and assertion before
+changing code. Promote any demonstrated product defect to its own deterministic
+regression. These tests do not exercise arbitrary library shapes, real-account
+state, abrupt process death, or power-loss durability.
 
 ## State-transition proof
 
