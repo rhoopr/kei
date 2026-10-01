@@ -2695,6 +2695,148 @@ async fn drain_records_the_rewritten_checksum_even_when_the_sidecar_fails() {
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
+async fn tactical_sidecar_restart_retires_debt_and_becomes_quiet() {
+    use xmp_toolkit::{OpenFileOptions, XmpFile};
+
+    let dir = tempfile::tempdir().unwrap();
+    let original = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let path = dir.path().join("SIDEFAIL_LIFECYCLE.jpg");
+    std::fs::write(&path, original).unwrap();
+    let original_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let scan_start = original
+        .windows(2)
+        .position(|bytes| bytes == [0xff, 0xda])
+        .unwrap();
+    let original_scan = original.get(scan_start..).unwrap();
+    let unrelated_sidecar = dir.path().join("unrelated.xmp");
+    std::fs::write(&unrelated_sidecar, b"user-owned metadata").unwrap();
+    let db = crate::state::SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    seed_downloaded_marker(
+        &db,
+        "SIDEFAIL_LIFECYCLE",
+        "SIDEFAIL_LIFECYCLE.jpg",
+        &path,
+        &original_checksum,
+        crate::state::types::AssetMetadata {
+            rating: Some(3),
+            metadata_hash: Some("fresh-hash".into()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let sidecar = path.with_file_name("SIDEFAIL_LIFECYCLE.jpg.xmp");
+    std::fs::create_dir(&sidecar).unwrap();
+    let flags = embedded_rating_flags() | MetadataFlags::XMP_SIDECAR;
+    let first = run_pending(
+        &db,
+        flags,
+        Arc::from(".meta-tmp"),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!((first.fetched, first.applied, first.failed), (1, 0, 1));
+    let first_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    assert_ne!(first_checksum, original_checksum);
+    assert_eq!(
+        stored_checksums(&db).await,
+        (
+            Some(first_checksum.clone()),
+            Some(original_checksum.clone())
+        )
+    );
+    assert!(std::fs::read(&path).unwrap().ends_with(original_scan));
+    drop(db);
+    let reopened = crate::state::SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        stored_checksums(&reopened).await,
+        (Some(first_checksum), Some(original_checksum.clone()))
+    );
+    std::fs::remove_dir(&sidecar).unwrap();
+    let recovered = run_pending(
+        &reopened,
+        flags,
+        Arc::from(".meta-tmp"),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        (recovered.fetched, recovered.applied, recovered.failed),
+        (1, 1, 0)
+    );
+    assert_eq!(recovered.retired_from_selected_queue, 1);
+    assert!(
+        reopened
+            .get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let media_bytes = std::fs::read(&path).unwrap();
+    assert!(
+        media_bytes.ends_with(original_scan),
+        "compressed image scan and EOI must survive retry"
+    );
+    let current_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let expected_checksums = (Some(current_checksum), Some(original_checksum));
+    assert_eq!(stored_checksums(&reopened).await, expected_checksums);
+    let mut embedded = XmpFile::new().unwrap();
+    embedded
+        .open_file(&path, OpenFileOptions::default().for_read())
+        .unwrap();
+    assert_eq!(
+        embedded
+            .xmp()
+            .unwrap()
+            .property_i32(xmp_ns::XMP, "Rating")
+            .unwrap()
+            .value,
+        3
+    );
+    drop(embedded);
+    let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+    let sidecar_xmp: XmpMeta = std::str::from_utf8(&sidecar_bytes)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        sidecar_xmp
+            .property_i32(xmp_ns::XMP, "Rating")
+            .unwrap()
+            .value,
+        3
+    );
+    let quiet = run_pending(
+        &reopened,
+        flags,
+        Arc::from(".meta-tmp"),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!((quiet.fetched, quiet.applied, quiet.failed), (0, 0, 0));
+    assert_eq!(std::fs::read(&path).unwrap(), media_bytes);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+    assert_eq!(stored_checksums(&reopened).await, expected_checksums);
+    assert_eq!(
+        std::fs::read(&unrelated_sidecar).unwrap(),
+        b"user-owned metadata"
+    );
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
 async fn capture_queue_pagination_counts_retired_capture_debt() {
     use crate::config::MetadataConfig;
     use crate::download::DownloadStore;
