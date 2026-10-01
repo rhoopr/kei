@@ -15,8 +15,10 @@ for seed in replacement-fits replacement-grows multi-xmp conflicting-tmap-xmp; d
     cmp "fuzz/seeds/heif_rewrite/$seed" "tests/data/heif-rewrite/$seed"
 done
 
-cargo package --allow-dirty --no-verify --offline
-tar -xzf "$target_dir/package/kei-$version.crate" -C "$work"
+# Repackaging can retain trailing bytes from an older, larger archive.
+# Generate the source archive in fresh scratch space, retaining build caches.
+cargo package --target-dir "$work/package-target" --allow-dirty --no-verify --offline
+tar -xzf "$work/package-target/package/kei-$version.crate" -C "$work"
 cd "$work/kei-$version"
 export CARGO_TARGET_DIR="$target_dir/fixture-package"
 # Retain dependency builds, but rebuild kei with this extraction's absolute
