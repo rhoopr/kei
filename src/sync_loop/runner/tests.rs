@@ -5,3 +5,5 @@ mod configuration;
 mod enumeration;
 mod metadata;
 mod recovery_sequences;
+
+mod released_upgrade;

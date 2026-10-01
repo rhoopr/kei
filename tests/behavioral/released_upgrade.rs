@@ -1,6 +1,7 @@
 //! Reconstructed history, not captured reporter data or a simulated provider sync.
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -120,8 +121,10 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
         let path = media.join(filename);
         std::fs::write(&path, bytes).unwrap();
         let checksum = format!("{:x}", Sha256::digest(bytes));
-        conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,local_path,last_seen_at,local_checksum,download_checksum) VALUES (?1,?2,?3,?4,?5,1000,?6,'image','downloaded',?7,1000,?4,?4)",
-            rusqlite::params![library,id,version,checksum,filename,bytes.len() as i64,path.to_str().unwrap()]).unwrap();
+        let provider_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+        conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,local_path,last_seen_at,local_checksum,download_checksum) VALUES (?1,?2,?3,?8,?5,1000,?6,'photo','downloaded',?7,1000,?4,?4)",
+            rusqlite::params![library,id,version,checksum,filename,bytes.len() as i64,path.to_str().unwrap(),provider_checksum]).unwrap();
     }
     // Deliberate fixture SQL models already-persisted provider facts and an
     // interrupted previous cycle. It is not attributed to the released CLI.
@@ -129,10 +132,10 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
         INSERT INTO asset_master_mappings VALUES ('PrimarySync','same','master-primary',1000),('SharedSync-synthetic','same','master-shared',1000);
         INSERT INTO legacy_master_state_owners VALUES ('PrimarySync','master-primary','same',1000);
         INSERT INTO asset_albums VALUES ('PrimarySync','same','Original album','icloud'),('SharedSync-synthetic','same','Shared album','icloud');
-        INSERT INTO metadata VALUES ('sync_token:PrimarySync','committed-before-interruption'),('pending_sync_token:PrimarySync','uncommitted-tail'),('config_hash:PrimarySync','old-config');
+        INSERT INTO metadata VALUES ('sync_token:PrimarySync','committed-before-interruption'),('pending_sync_token:old-enum:PrimarySync','uncommitted-tail'),('config_hash','old-config'),('enum_config_hash','old-enum');
         INSERT INTO metadata_capture_state(library,pending_revision,failed_assets,updated_at) VALUES ('PrimarySync',1,1,1000);
         INSERT INTO sync_runs(started_at,status) VALUES (1000,'running');
-        INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,last_error) VALUES ('PrimarySync','pending','original','pending-checksum','pending.jpg',1000,100,'image','pending',1000,'interrupted transfer');
+        INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,last_error) VALUES ('PrimarySync','pending','original','pending-checksum','pending.jpg',1000,100,'photo','pending',1000,'interrupted transfer');
         UPDATE assets SET title='edited title',metadata_write_failed_at=1001 WHERE library='PrimarySync' AND id='same' AND version_size='adjusted';
     ").unwrap();
     drop(conn);

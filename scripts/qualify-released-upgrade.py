@@ -55,13 +55,16 @@ def main():
     if target == Path("/tmp") or Path("/tmp") in target.parents:
         parser.error("CARGO_TARGET_DIR must be outside /tmp")
     env["CARGO_TARGET_DIR"] = str(target)
-    command = ["unshare", "-Urn", "cargo", "test", "--offline", "--test", "behavioral",
-               "released_v0240_history_preserves_durable_evidence_through_upgrade",
-               "--", "--nocapture"]
     print(f"Verified {ARCHIVE}: sha256:{actual}; {output}", flush=True)
     print("Released tag commit: aec13c42ce476edd8f8e0019bf58da1fd5d1b879", flush=True)
-    print("Network-disabled command:", " ".join(command), flush=True)
-    subprocess.run(command, cwd=Path(__file__).resolve().parents[1], env=env, check=True)
+    for target_args in (["--test", "behavioral"], ["--lib"]):
+        command = ["unshare", "-Urn", "sh", "-ec",
+                   'ip link set lo up; exec "$@"', "kei-upgrade",
+                   "cargo", "test", "--offline", *target_args,
+                   "released_v0240_", "--", "--nocapture"]
+        print("Network-disabled command:", " ".join(command), flush=True)
+        subprocess.run(command, cwd=Path(__file__).resolve().parents[1], env=env, check=True)
+
 
 
 if __name__ == "__main__":
