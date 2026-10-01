@@ -117,9 +117,68 @@ pub(crate) const DESIRED_KEYS: &[&str] = &[
     "isKeyAsset",
 ];
 
+/// `CloudKit` field names that exist on assets, but not referenced in Python.
+pub(crate) const DESIRED_KEYS_ADDITIONAL: &[&str] = &[
+    "adjustedMediaMetaDataStrType",
+    "adjustmentCompoundVersion",
+    "adjustmentCreatorCode",
+    "adjustmentSourceType",
+    "adjustmentTimestampEnc",
+    "codec",
+    "computeStateAdjustmentFingerprintEnc",
+    "computeStateLastUpdatedDateEnc",
+    "computeStateVersion",
+    "facesVersion",
+    "fullSizeJPEGSource",
+    "importDate",
+    "importedBy",
+    "importedByBundleIdentifierEnc",
+    "importedByDisplayNameEnc",
+    "lastViewedDateEnc",
+    "mediaGroupId",
+    "mediaMetaDataEnc",
+    "mediaMetaDataType",
+    "mostRecentAddedDate",
+    "originalChoice",
+    "originalCreationDate",
+    "otherAdjustmentsFingerprint",
+    "people",
+    "playCount",
+    "recordModificationDate",
+    "resComputeStateData",
+    "resOriginalFileSize",
+    "resOriginalVidComplFileSize",
+    "resVideoMediaMetaDataFileSize",
+    "resVideoMediaMetaDataFileType",
+    "resVideoMediaMetaDataFingerprint",
+    "resVideoMediaMetaDataHeight",
+    "resVideoMediaMetaDataRes",
+    "resVideoMediaMetaDataWidth",
+    "resVidHDRMedFileSize",
+    "resVidHDRMedFileType",
+    "resVidHDRMedFingerprint",
+    "resVidHDRMedHeight",
+    "resVidHDRMedRes",
+    "resVidHDRMedWidth",
+    "resVidLargeFileSize",
+    "resVidLargeFileType",
+    "resVidLargeFingerprint",
+    "resVidLargeHeight",
+    "resVidLargeRes",
+    "resVidLargeWidth",
+    "shareCount",
+    "sharedSyncSharingStateEnc",
+    "timeZoneNameEnc",
+    "trashReason",
+    "videoFrameRate",
+    "viewCount",
+    "viewPresentationTypeEnc",
+];
+
 pub(crate) static DESIRED_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::new(|| {
     DESIRED_KEYS
         .iter()
+        .chain(DESIRED_KEYS_ADDITIONAL.iter())
         .map(|k| Value::String((*k).to_string()))
         .collect()
 });
@@ -376,8 +435,15 @@ mod tests {
     fn test_desired_keys_values_matches_keys() {
         let values = &*DESIRED_KEYS_VALUES;
         assert!(!values.is_empty(), "DESIRED_KEYS_VALUES must not be empty");
-        assert_eq!(values.len(), DESIRED_KEYS.len());
-        for (key, val) in DESIRED_KEYS.iter().zip(values.iter()) {
+        assert_eq!(
+            values.len(),
+            DESIRED_KEYS.len() + DESIRED_KEYS_ADDITIONAL.len()
+        );
+        for (key, val) in DESIRED_KEYS
+            .iter()
+            .chain(DESIRED_KEYS_ADDITIONAL.iter())
+            .zip(values.iter())
+        {
             assert_eq!(val.as_str().unwrap(), *key);
         }
     }
@@ -489,6 +555,19 @@ mod tests {
                 "Missing critical field: {field}"
             );
         }
+    }
+
+    #[test]
+    fn test_desired_keys_values_contains_both_compatible_and_new_keys() {
+        let values = &*DESIRED_KEYS_VALUES;
+        assert!(
+            values.contains(&Value::String("filenameEnc".to_string())),
+            "Missing compatible key: filenameEnc"
+        );
+        assert!(
+            values.contains(&Value::String("importedByDisplayNameEnc".to_string())),
+            "Missing new key: importedByDisplayNameEnc"
+        );
     }
 
     #[test]
