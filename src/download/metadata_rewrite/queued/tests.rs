@@ -2707,7 +2707,7 @@ async fn tactical_sidecar_restart_retires_debt_and_becomes_quiet() {
         .windows(2)
         .position(|bytes| bytes == [0xff, 0xda])
         .unwrap();
-    let original_scan = original.get(scan_start..).unwrap();
+    let (_, original_scan) = original.split_at(scan_start);
     let unrelated_sidecar = dir.path().join("unrelated.xmp");
     std::fs::write(&unrelated_sidecar, b"user-owned metadata").unwrap();
     let db = crate::state::SqliteStateDb::open(&dir.path().join("state.db"))
