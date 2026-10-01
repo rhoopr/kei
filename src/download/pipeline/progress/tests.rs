@@ -172,11 +172,23 @@ fn log_sync_summary_no_error_line_when_all_counters_zero() {
     crate::download::pipeline::progress::log_sync_summary("── Test Summary ──", &stats);
 
     assert!(
-        !logs_contain("EXIF write failure"),
+        !logs_contain("metadata write failure"),
         "line 2 must not fire when exif/state/enum counters are all zero"
     );
     assert!(
         !logs_contain("enumeration error"),
         "line 2 must not fire when exif/state/enum counters are all zero"
     );
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn log_sync_summary_labels_sidecar_failures_as_metadata() {
+    let stats = crate::download::SyncStats {
+        exif_failures: 2,
+        ..Default::default()
+    };
+    super::log_sync_summary("Test Summary", &stats);
+    assert!(logs_contain("2 metadata write failure(s)"));
+    assert!(!logs_contain("EXIF write failure"));
 }

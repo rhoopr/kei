@@ -264,6 +264,9 @@ pub async fn download_photos_with_sync(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
+    if matches!(controls.run_mode, super::models::DownloadRunMode::Download) {
+        crate::download::file::recover_conditional_replacements(&config.directory).await?;
+    }
     cleanup_orphan_part_files(&config).await;
     if matches!(config.sync_mode, SyncMode::Incremental { .. })
         && let Some(db) = &config.state_db

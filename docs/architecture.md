@@ -76,6 +76,7 @@ changing behavior.
 | File publication and replacement | `src/download/file/publication.rs`, `src/download/file/replacement.rs` | Handles no-overwrite collisions and conditional replacement with displaced-file verification and restoration. |
 | Confined local copies | `src/download/file/reconciliation.rs` | Retains verified files and parent-directory capabilities through local copy and state finalization. |
 | File platform primitives | `src/download/file/platform.rs` | Owns platform rename, exchange, hard-link, and directory durability operations. |
+| Linux replacement recovery | `src/download/file/replacement_recovery.rs` | Journals conditional replacement when atomic exchange is unsupported, and recovers interrupted publication without overwriting concurrent edits. |
 | State finalization | `src/download/finalize.rs` | Persists downloaded or failed outcomes and retries deferred state writes. |
 | Sparse identity retries | `src/download/orchestration/delta/sparse_identity.rs`, `src/state/db/sparse_identity.rs` | Selects bounded source retries and persists generation-fenced evidence; the cycle owner retains checkpoint authority. |
 | Durable retry resolution | `src/download/retry.rs` | Revalidates pending provider identity and builds exact retry tasks. |
@@ -697,8 +698,9 @@ never authorize deletion.
 `kei sync --repair-truncated` is the only media-replacement path. Pending
 retry planning requires the durable reconcile truncation marker, confirms the
 recorded file is still truncated, and fingerprints its bytes. After the new
-download and configured metadata writes pass, the file owner atomically
-exchanges the verified `.part` file with that exact fingerprint. A changed
+download and configured metadata writes pass, the file owner replaces only
+that exact fingerprint. It uses atomic exchange where supported and the
+journaled Linux fallback described below otherwise. A changed
 target is restored or retained and the state row stays failed. All other
 downloads keep no-overwrite publication.
 
@@ -788,15 +790,43 @@ other than the resolved XMP packet, and every opaque `meta` sub-box, remains
 byte-identical, and that re-reading the rewritten file resolves the packet just
 written, allowing for the space padding an in-place replacement leaves in the
 reused extent. Every embedded writer exclusively creates a unique sibling and
-replaces the source only while an atomic exchange proves the displaced bytes
-and prepared replacement still match their approved fingerprints. Metadata-only
-retries also pass the checksum-gate fingerprint into the writer, closing the
+replaces the source only while the displaced bytes and prepared replacement
+still match their approved fingerprints. Atomic exchange is preferred.
+Metadata-only retries also pass the checksum-gate fingerprint into the writer, closing the
 interval between catalogue validation and the writer's read. Existing regular
 files and links at candidate temporary paths remain untouched. Safe pre-exchange
 failures remove only the uniquely owned prepared file. Concurrent edits preserve
 the source and its catalogue checksum evidence, keep the durable rewrite marker,
 and leave any ambiguously displaced entry at its reported sibling path. The
 replacement file retains the source permissions.
+
+On Linux, filesystems that reject `RENAME_EXCHANGE` use a journaled fallback.
+An exclusively created, owner-only sibling directory holds a version-1 JSON
+manifest with lossless filename bytes and both SHA-256 fingerprints. Its name
+is `.kei-replace-` plus the SHA-256 hash of the destination filename. The
+prepared file is hard-linked into that directory and synced before the
+original is displaced. Installation and restoration use hard links that refuse
+an existing destination. The final path can be absent between displacement and
+installation. Directory syncs precede the durable commit marker. Normal
+completion removes only byte-verified recovery entries.
+
+Before download discovery or catalog path reconciliation, Linux walks the
+download tree through retained directory handles and recovers these journals.
+The configured root may be a symlink alias; recovery resolves that trusted
+anchor while refusing links beneath it. Reconciliation also recovers each
+recorded source media and sidecar before planning, including old roots after
+a directory change. Missing parent namespaces fail verification rather than
+being treated as missing journal entries.
+Directory reads require `/proc/self/fd`. Journal links are rejected. Dry-run and
+filename-only download modes do not recover journals. Queued metadata work also checks its media
+and sidecar journals before testing existence or checksums. Recovery restores
+uncommitted originals or completes cleanup of committed replacements. Unknown
+versions, malformed manifests, changed bytes, and conflicting destinations
+retain the journal and fail the operation. Journal file locks prevent local
+writers from recovering an active transaction. NFS mounts with `nolock` do not
+provide cross-host locking; do not run kei on the same destination from
+multiple NFS clients. Recovery does not authorize provider checkpoint progress
+or downloaded-state finalization by itself.
 
 `METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the
 current binary. Schema v18 stores per-asset revisions and per-library active

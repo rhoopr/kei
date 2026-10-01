@@ -144,7 +144,9 @@ pub(in crate::download) fn write_reconciled_sidecar(
     Ok(receipt)
 }
 
-/// Write `write` as a `.xmp` sidecar next to the media file, atomically.
+/// Write `write` as a `.xmp` sidecar next to the media file with guarded publication.
+/// Unsupported Linux filesystems use a journaled replacement; readers can
+/// briefly observe an absent sidecar.
 ///
 /// If a sidecar already exists (e.g., from Darktable / Lightroom / digiKam),
 /// its existing XMP properties are read and kei's fields are layered on top
@@ -169,19 +171,40 @@ pub(crate) async fn write_sidecar(
     };
 
     // CONTRACT: XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT
-    crate::download::file::publish_file_if_unchanged(
+    let publication = crate::download::file::publish_file_if_unchanged(
         &prepared.tmp_path,
         &prepared.sidecar_path,
         prepared.expected,
     )
-    .await
-    .with_context(|| {
-        format!(
-            "Could not install XMP sidecar {} -> {}",
-            prepared.tmp_path.display(),
-            prepared.sidecar_path.display()
-        )
-    })?;
+    .await;
+    if let Err(error) = publication {
+        #[cfg(target_os = "linux")]
+        if crate::download::file::classify_conditional_publish_error(&error).filesystem_unsupported
+            && crate::download::file::classify_conditional_publish_error(&error)
+                .retained_paths
+                .is_empty()
+        {
+            // Remove only the writer's unchanged output after an unsupported
+            // filesystem operation. Explicit recovery claims always retain it.
+            let temp = prepared.tmp_path.clone();
+            let output = prepared.output;
+            let identity = prepared.identity;
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = crate::download::file::cleanup_prepared_sidecar(&temp, output, identity) {
+                    tracing::warn!(path = %temp.display(), error = %format!("{error:#}"), "Could not safely remove prepared sidecar; retaining file");
+                }
+            })
+            .await
+            .context("Sidecar cleanup task panicked")?;
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "Could not install XMP sidecar {} -> {}",
+                prepared.tmp_path.display(),
+                prepared.sidecar_path.display()
+            )
+        });
+    }
     tracing::debug!(target: "kei::download::metadata", path = %prepared.sidecar_path.display(), "Wrote XMP sidecar");
     Ok(())
 }
@@ -190,6 +213,10 @@ struct PreparedSidecar {
     tmp_path: PathBuf,
     sidecar_path: PathBuf,
     expected: Option<crate::download::file::ExistingFileFingerprint>,
+    #[cfg(target_os = "linux")]
+    output: crate::download::file::ExistingFileFingerprint,
+    #[cfg(target_os = "linux")]
+    identity: crate::fs_util::FileIdentity,
 }
 
 fn prepare_sidecar_write(
@@ -211,6 +238,8 @@ fn prepare_sidecar_write(
     let mut sidecar_name = name.to_os_string();
     sidecar_name.push(".xmp");
     let sidecar_path = media_path.with_file_name(&sidecar_name);
+    #[cfg(target_os = "linux")]
+    crate::download::file::recover_file_replacement(&sidecar_path)?;
     // Seed the packet with any existing sidecar content so user-authored
     // ratings / keywords / develop settings from another tool survive.
     let (mut meta, expected) = match std::fs::read(&sidecar_path) {
@@ -267,6 +296,10 @@ fn prepare_sidecar_write(
         tmp_path,
         sidecar_path,
         expected,
+        #[cfg(target_os = "linux")]
+        output: fingerprint_bytes(&bytes)?,
+        #[cfg(target_os = "linux")]
+        identity: crate::fs_util::file_identity(&temp)?,
     }))
 }
 

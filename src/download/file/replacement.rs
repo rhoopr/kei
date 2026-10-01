@@ -31,13 +31,15 @@ pub(in crate::download) enum ConditionalPublishTargetChanged {
 
 #[derive(Debug, thiserror::Error)]
 #[error("Conditional publication must retain paths: {paths:?}")]
-struct ConditionalPublishMustRetainPaths {
-    paths: Vec<PathBuf>,
+pub(super) struct ConditionalPublishMustRetainPaths {
+    pub(super) paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::download) struct ConditionalPublishErrorDisposition {
     pub(in crate::download) target_changed: bool,
+    #[cfg(target_os = "linux")]
+    pub(in crate::download) filesystem_unsupported: bool,
     pub(in crate::download) retained_paths: Vec<PathBuf>,
 }
 
@@ -50,12 +52,18 @@ pub(in crate::download) fn classify_conditional_publish_error(
         || error
             .downcast_ref::<std::io::Error>()
             .is_some_and(|source| source.kind() == std::io::ErrorKind::NotFound);
+    #[cfg(target_os = "linux")]
+    let filesystem_unsupported = error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(super::platform::is_renameat2_unsupported);
     let retained_paths = error
         .downcast_ref::<ConditionalPublishMustRetainPaths>()
         .map(|marker| marker.paths.clone())
         .unwrap_or_default();
     ConditionalPublishErrorDisposition {
         target_changed,
+        #[cfg(target_os = "linux")]
+        filesystem_unsupported,
         retained_paths,
     }
 }
@@ -169,6 +177,15 @@ fn replace_file_if_unchanged_blocking(
     }
     let displaced_path = match exchange_repair_files_blocking(part_path, final_path, expected) {
         Ok(displaced_path) => displaced_path,
+        #[cfg(target_os = "linux")]
+        Err(error) if classify_conditional_publish_error(&error).filesystem_unsupported => {
+            return super::replacement_recovery::publish(
+                part_path,
+                final_path,
+                expected,
+                replacement,
+            );
+        }
         Err(error) if classify_conditional_publish_error(&error).target_changed => {
             return Err(error).context(ConditionalPublishTargetChanged::Unverifiable {
                 path: final_path.to_path_buf(),

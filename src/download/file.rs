@@ -15,6 +15,10 @@ mod platform;
 mod publication;
 mod reconciliation;
 mod replacement;
+#[cfg(target_os = "linux")]
+mod replacement_recovery;
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 mod transfer;
 mod validation;
 
@@ -62,3 +66,51 @@ pub(super) use self::{
     publication::publish_part_to_final, replacement::ConditionalPublishErrorDisposition,
     transfer::DownloadResponse,
 };
+
+/// Recover interrupted fallback publications before normal download work.
+#[cfg(target_os = "linux")]
+pub(super) async fn recover_conditional_replacements(root: &std::path::Path) -> anyhow::Result<()> {
+    replacement_recovery::recover_tree(root).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) async fn recover_conditional_replacements(
+    _root: &std::path::Path,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+pub(super) fn cleanup_prepared_sidecar(
+    path: &std::path::Path,
+    expected: ExistingFileFingerprint,
+    identity: crate::fs_util::FileIdentity,
+) -> anyhow::Result<()> {
+    replacement_recovery::cleanup_prepared(path, expected, identity)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn recover_file_replacement(path: &std::path::Path) -> anyhow::Result<()> {
+    replacement_recovery::recover_target(path)
+}
+
+/// Recover the media and sidecar journals before inspecting either input.
+pub(super) async fn recover_metadata_replacements(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            replacement_recovery::recover_target(&path)?;
+            let mut name = path
+                .file_name()
+                .context("Metadata path has no filename")?
+                .to_os_string();
+            name.push(".xmp");
+            replacement_recovery::recover_target(&path.with_file_name(name))
+        })
+        .await??;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
+    Ok(())
+}

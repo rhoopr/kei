@@ -55,6 +55,17 @@ pub(crate) async fn reconcile_catalog_paths(
         return Ok(PathReconciliationResult::default());
     };
 
+    if let Err(error) = file::recover_conditional_replacements(&config.directory).await {
+        tracing::warn!(error = %format!("{error:#}"), "Could not recover replacements before path reconciliation; keeping catalogue paths and checkpoints unchanged");
+        return Ok(PathReconciliationResult {
+            complete: false,
+            stats: SyncStats {
+                failed: 1,
+                ..SyncStats::default()
+            },
+        });
+    }
+
     let mut records = Vec::new();
     let mut offset = 0u64;
     const PAGE_SIZE: u32 = 1_000;
@@ -74,6 +85,23 @@ pub(crate) async fn reconcile_catalog_paths(
             complete: true,
             stats: SyncStats::default(),
         });
+    }
+
+    // Root drift can leave interrupted media or sidecar transactions outside
+    // the newly configured tree. Restore them before planning reads the source.
+    for record in &records {
+        if let Some(path) = &record.local_path
+            && let Err(error) = file::recover_metadata_replacements(path).await
+        {
+            tracing::warn!(error = %format!("{error:#}"), "Could not recover recorded source; keeping catalogue paths and checkpoints unchanged");
+            return Ok(PathReconciliationResult {
+                complete: false,
+                stats: SyncStats {
+                    failed: 1,
+                    ..SyncStats::default()
+                },
+            });
+        }
     }
 
     let mut targets: FxHashSet<PendingRetryTarget> = records
