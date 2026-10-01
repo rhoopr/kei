@@ -538,8 +538,9 @@ pub(super) fn recover_target(target: &Path) -> Result<()> {
 }
 
 /// Recover journals before discovery or checksum checks can misclassify an
-/// interrupted displacement as a missing or changed media file. No links are
-/// traversed, and all mutations use retained, no-follow directory capabilities.
+/// interrupted displacement as a missing or changed media file. The configured
+/// root is resolved first; descendant links are not traversed, and mutations
+/// use retained, no-follow directory capabilities.
 pub(super) async fn recover_tree(root: &Path) -> Result<()> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || recover_tree_blocking(&root)).await??;
@@ -550,7 +551,15 @@ fn recover_tree_blocking(root: &Path) -> Result<()> {
     if !root.try_exists()? {
         return Ok(());
     }
-    let mut directories = vec![root.to_path_buf()];
+    anyhow::ensure!(
+        !root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "Replacement recovery root contains a parent component"
+    );
+    // The configured root is a trusted anchor and may be an alias. Descendants
+    // and journals still undergo no-follow traversal from its resolved path.
+    let mut directories = vec![std::fs::canonicalize(root)?];
     while let Some(directory) = directories.pop() {
         let capability = confined(&directory.join(".kei-recovery-probe"))?;
         for entry in std::fs::read_dir(format!("/proc/self/fd/{}", capability.parent_fd()))? {

@@ -222,7 +222,8 @@ fn recovery_refuses_symlinked_journal_and_parent() {
     assert_eq!(fs::read_dir(external.path()).unwrap().count(), 0);
     let parent = dir.path().join("linked-parent");
     std::os::unix::fs::symlink(external.path(), &parent).unwrap();
-    assert!(recover_tree_blocking(&parent).is_err());
+    recover_tree_blocking(&parent).unwrap();
+    assert_eq!(fs::read_dir(external.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -684,4 +685,65 @@ fn unsupported_filesystem_classification_preserves_the_error_chain() {
                 .filesystem_unsupported
         );
     }
+}
+
+#[test]
+fn renamed_parent_retains_edited_original_and_all_journal_entries() {
+    use std::io::Write;
+    let dir = TempDir::new().unwrap();
+    let parent = dir.path().join("photos");
+    fs::create_dir(&parent).unwrap();
+    let (target, _, journal) = prepare(&parent);
+    let mut original = fs::OpenOptions::new().write(true).open(&target).unwrap();
+    publish_journal(&journal, |_| Ok(())).unwrap();
+    let moved = dir.path().join("moved");
+    fs::rename(&parent, &moved).unwrap();
+    original.write_all(b"user edit").unwrap();
+    original.sync_all().unwrap();
+    assert!(journal.finish().is_err());
+    let moved_journal = moved.join(journal.directory.path().file_name().unwrap());
+    assert_eq!(
+        fs::read(moved_journal.join("original")).unwrap(),
+        b"user edit"
+    );
+    assert_eq!(
+        fs::read(moved_journal.join("replacement")).unwrap(),
+        b"replacement"
+    );
+    assert!(moved_journal.join("manifest.json").exists());
+    assert!(moved_journal.join("committed").exists());
+    drop(journal);
+    assert!(recover_tree_blocking(&moved).is_err());
+    assert_eq!(
+        fs::read(moved_journal.join("original")).unwrap(),
+        b"user edit"
+    );
+}
+
+#[test]
+fn configured_root_alias_recovers_journals_without_following_descendant_links() {
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let (target, _, journal) = prepare(&real);
+    assert!(
+        publish_journal(&journal, |stage| {
+            anyhow::ensure!(stage != Stage::Displaced, "interrupted");
+            Ok(())
+        })
+        .is_err()
+    );
+    drop(journal);
+    let external = TempDir::new().unwrap();
+    let (external_target, _, external_journal) = prepare(external.path());
+    std::os::unix::fs::symlink(external.path(), real.join("descendant")).unwrap();
+    recover_tree_blocking(&alias).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"original");
+    assert!(!directory_path(&target).unwrap().exists());
+    assert!(directory_path(&external_target).unwrap().exists());
+    recover_tree_blocking(&alias).unwrap();
+    assert!(directory_path(&external_target).unwrap().exists());
+    drop(external_journal);
 }

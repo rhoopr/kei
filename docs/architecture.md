@@ -644,6 +644,11 @@ completion removes only byte-verified recovery entries.
 
 Before download discovery or catalog path reconciliation, Linux walks the
 download tree through retained directory handles and recovers these journals.
+The configured root may be a symlink alias; recovery resolves that trusted
+anchor while refusing links beneath it. Reconciliation also recovers each
+recorded source media and sidecar before planning, including old roots after
+a directory change. Missing parent namespaces fail verification rather than
+being treated as missing journal entries.
 Directory reads require `/proc/self/fd`. Journal links are rejected. Dry-run and
 filename-only download modes do not recover journals. Queued metadata work also checks its media
 and sidecar journals before testing existence or checksums. Recovery restores
