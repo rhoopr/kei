@@ -32,6 +32,8 @@ mod authentication;
 mod configuration;
 #[path = "behavioral/output.rs"]
 mod output;
+#[path = "behavioral/released_upgrade.rs"]
+mod released_upgrade;
 #[path = "behavioral/state.rs"]
 mod state;
 #[path = "behavioral/support.rs"]

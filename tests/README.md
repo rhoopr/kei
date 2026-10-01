@@ -618,3 +618,67 @@ Failed or cancelled validation is followed by recovery and an unchanged cycle
 with no repeated source lookups.
 Snapshot-token, changed-link, stale-generation, redaction, and versioned
 completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.
+
+## Released schema upgrade history
+
+`behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
+starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
+binary (schema 25), then executes the current production CLI through schema 28.
+The fixture contains no captured user data. SQL explicitly reconstructs a
+synthetic history with original and edited renditions, repeated IDs in two
+libraries, a local removal, metadata debt, an unfinished sync ledger row,
+partial bytes, master mappings, and committed versus pending checkpoints.
+
+The test reopens SQLite after commands, checks preserved bytes and identity
+evidence, changes the destination config, requires missing-file reconciliation
+to leave durable failed work, and repeats reconciliation and verification twice.
+Restoring a file alone must not falsely finalize its failed row. The companion library test
+`released_v0240_failed_history_recovers_after_upgrade_and_restart` starts from
+the same schema fixture (or actual released-binary-created schema), retains an
+explicit authoritative source/master mapping and failed media row, and runs
+three production cycles. The first injects a state-write failure and must retain
+the checkpoint and a pending retry row (retry routing resets failed to
+pending before the injected write). After reopening SQLite, authoritative synthetic
+provider evidence and a local HTTP JPEG must finish recovery on the second
+cycle. The third must retain the recovered path and bytes without another
+lookup or download. Unrelated original and sidecar bytes remain unchanged.
+This companion test uses real JPEG framing and provider checksum encoding. Text byte fixtures
+test preservation and SHA-256 checks; they do not qualify image decoders.
+
+The normal gate runs this test without downloads or a historical executable.
+To additionally qualify the actual released binary on Linux, obtain these
+official assets outside the test gate:
+
+- [v0.24.0 archive](https://github.com/rhoopr/kei/releases/download/v0.24.0/kei-linux-x86_64.tar.gz)
+- [v0.24.0 checksums](https://github.com/rhoopr/kei/releases/download/v0.24.0/SHA256SUMS.txt)
+
+Then run:
+
+```sh
+CARGO_TARGET_DIR=/home/example/kei-cache python3 scripts/qualify-released-upgrade.py \
+  --assets /home/example/kei-releases/v0.24.0 \
+  --scratch /home/example/kei-upgrade-qualification
+```
+
+The qualifier checks the archive against both the pinned GitHub asset digest
+`0402df3eff13904ca1417d5b52758ccbe98a2d7f5360b84cb04cde5972a5c4f3`
+and the release checksum file. It extracts only the regular binary, checks
+`kei 0.24.0`, and requires `unshare -Urn` to run both replays with only loopback networking enabled. No external
+network interfaces or routes are available; local HTTP serves synthetic bytes. The release tag resolves to
+`aec13c42ce476edd8f8e0019bf58da1fd5d1b879`; archive verification establishes
+artifact identity, not a reproducible-build attestation.
+
+In qualification mode, the old binary creates schema 25 and its emitted schema
+must exactly match the checked-in SQL. The SQL fixture was generated with
+Python sqlite3 Connection.iterdump() after the released binary ran verify
+against an empty database file; PRAGMA user_version = 25 was appended because
+iterdump does not emit that pragma. It contains the complete released schema
+and no asset rows. The equality check compares all non-internal sqlite_master
+objects, so regeneration cannot silently substitute the current schema. It verifies four synthetic files, detects
+an external edit, and preserves durable state before the current binary runs.
+Fixtures are still seeded by explicit SQL, not by historical iCloud sync.
+All child CLIs clear inherited environment and use explicit fixture config and
+data paths. Cargo uses `--offline`, so dependencies must already be cached.
+The qualifier fails if user/network namespaces are unavailable; it does not
+silently fall back to a externally network-enabled run. The cycle test uses a strict wiremock bind
+so unavailable loopback fails qualification instead of skipping the proof.
