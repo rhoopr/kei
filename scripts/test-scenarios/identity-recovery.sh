@@ -19,3 +19,6 @@ run_scenario_test lib sparse_retry_omitted_source_preserves_failed_work_then_rec
 # Schema-28 preservation keeps unattributed history separate from current children.
 run_scenario_test lib run_cycle_ambiguous_children_preserved_independently
 run_scenario_test lib run_cycle_single_survivor_preserved
+
+# Fixed seeded orderings: deferred work, regressing evidence, interruption and a quiet tail.
+run_scenario_test lib capture_recovery_sequence_seed_

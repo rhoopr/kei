@@ -1,12 +1,85 @@
 //! Shared fixtures for sync-loop production-path tests.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde_json::{Value, json};
 
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::PassScope;
+use crate::icloud::photos::PhotosSession;
 use crate::sync_cycle::{CycleResult, LibraryState, run_cycle};
 use crate::{auth, cli, config, download, retry, state};
+
+#[derive(Clone, Debug)]
+pub(super) struct MutableCaptureSession {
+    pub(super) zone: &'static str,
+    pub(super) cancel_after_lookup: Option<CancellationToken>,
+    pub(super) records: Arc<std::sync::Mutex<Vec<Value>>>,
+    pub(super) repair_requests: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for MutableCaptureSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if url.contains("/records/lookup?") {
+            self.repair_requests.fetch_add(1, Ordering::SeqCst);
+            let records = self.records.lock().unwrap();
+            let requested = request["records"].as_array().unwrap();
+            let selected: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    requested
+                        .iter()
+                        .any(|item| item["recordName"] == record["recordName"])
+                })
+                .collect();
+            if let Some(cancel) = &self.cancel_after_lookup {
+                cancel.cancel();
+            }
+            return Ok(json!({"records": selected}));
+        }
+        if url.contains("/changes/zone?") {
+            let records = if request["zones"][0]["syncToken"].is_string() {
+                Vec::new()
+            } else {
+                self.repair_requests.fetch_add(1, Ordering::SeqCst);
+                self.records.lock().unwrap().clone()
+            };
+            return Ok(json!({"zones": [{
+                "zoneID": {"zoneName": self.zone, "ownerRecordName": "_defaultOwner"},
+                "syncToken": "zone-tok-new", "moreComing": false, "records": records
+            }]}));
+        }
+        if url.contains("/internal/records/query/batch") {
+            return Ok(album_count_response(1));
+        }
+        assert!(url.contains("/records/query?"));
+        let offset = request["query"]["filterBy"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|filter| filter["fieldName"] == "startRank")
+            .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+            .unwrap_or(0);
+        let records = if offset == 0 {
+            self.records.lock().unwrap().clone()
+        } else {
+            Vec::new()
+        };
+        Ok(json!({"records": records, "syncToken": "zone-tok-new"}))
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
 
 pub(super) fn make_incremental_album(zone_sync_token: &str) -> crate::icloud::photos::PhotoAlbum {
     use serde_json::json;

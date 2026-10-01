@@ -3214,7 +3214,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
 
 #[tokio::test]
 async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
-    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
+    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig};
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3234,69 +3234,6 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
             const MASTER: &str = "master-hidden";
             const CHILD: &str = "asset-master-hidden";
             const TOKEN_KEY: &str = "sync_token:SharedSync-HIDDEN";
-            #[derive(Clone, Debug)]
-            struct HiddenCaptureSession {
-                records: Arc<std::sync::Mutex<Vec<Value>>>,
-                repair_requests: Arc<AtomicUsize>,
-            }
-            #[async_trait::async_trait]
-            impl PhotosSession for HiddenCaptureSession {
-                async fn post(
-                    &self,
-                    url: &str,
-                    body: String,
-                    _headers: &[(&str, &str)],
-                ) -> anyhow::Result<Value> {
-                    let request: Value = serde_json::from_str(&body)?;
-                    if url.contains("/records/lookup?") {
-                        self.repair_requests.fetch_add(1, Ordering::SeqCst);
-                        let records = self.records.lock().unwrap();
-                        let requested = request["records"].as_array().unwrap();
-                        let selected: Vec<_> = records
-                            .iter()
-                            .filter(|record| {
-                                requested
-                                    .iter()
-                                    .any(|item| item["recordName"] == record["recordName"])
-                            })
-                            .collect();
-                        return Ok(json!({"records": selected}));
-                    }
-                    if url.contains("/changes/zone?") {
-                        let records = if request["zones"][0]["syncToken"].is_string() {
-                            Vec::new()
-                        } else {
-                            self.repair_requests.fetch_add(1, Ordering::SeqCst);
-                            self.records.lock().unwrap().clone()
-                        };
-                        return Ok(json!({"zones": [{
-                            "zoneID": {"zoneName": ZONE, "ownerRecordName": "_defaultOwner"},
-                            "syncToken": "zone-tok-new", "moreComing": false, "records": records
-                        }]}));
-                    }
-                    if url.contains("/internal/records/query/batch") {
-                        return Ok(album_count_response(1));
-                    }
-                    assert!(url.contains("/records/query?"));
-                    let offset = request["query"]["filterBy"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .find(|filter| filter["fieldName"] == "startRank")
-                        .and_then(|filter| filter["fieldValue"]["value"].as_u64())
-                        .unwrap_or(0);
-                    let records = if offset == 0 {
-                        self.records.lock().unwrap().clone()
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(json!({"records": records, "syncToken": "zone-tok-new"}))
-                }
-                fn clone_box(&self) -> Box<dyn PhotosSession> {
-                    Box::new(self.clone())
-                }
-            }
-
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("state.db");
             let media_dir = dir.path().join("media");
@@ -3391,7 +3328,9 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                     container_id: None,
                     cross_zone_sources: Vec::new(),
                 },
-                Box::new(HiddenCaptureSession {
+                Box::new(crate::sync_loop::test_support::MutableCaptureSession {
+                    zone: ZONE,
+                    cancel_after_lookup: None,
                     records: Arc::clone(&provider_records),
                     repair_requests: Arc::clone(&repair_requests),
                 }),

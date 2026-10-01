@@ -4,3 +4,4 @@ mod checkpoints;
 mod configuration;
 mod enumeration;
 mod metadata;
+mod recovery_sequences;

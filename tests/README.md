@@ -85,7 +85,7 @@ full set with `just test scenarios`.
 
 ## Bounded identity recovery
 
-Run `just test scenario identity-recovery` for the first phase of
+Run `just test scenario identity-recovery` for the bounded recovery phases of
 [#862](https://github.com/rhoopr/kei/issues/862). It composes existing production
 owner tests instead of adding a simulation framework. The complete offline
 suites execute these same tests; the gate also validates the scenario filters.
@@ -123,14 +123,44 @@ Historical pre-fix revisions have not been rerun for this slice. The #861
 counterexamples are retained and strengthened on current main; this is not a
 claim that historical/refactor parity proves the independent oracle.
 
-The focused slice ran 11 tests in 25.7 seconds on Linux with a warm default-feature
+The initial slice in #873 ran 11 tests in 25.7 seconds on Linux with a warm default-feature
 build cache. That is below the proposed additional 2-5 minute PR budget. Cold
 compilation is excluded; complete-suite timings remain separate gate evidence.
 
-Generated sequences, shrinking, semantic fuzzing, process termination, composed
+Broader generated exploration, shrinking, semantic fuzzing, process termination, composed
 filesystem recovery, and physical NFS/NAS qualification remain later phases.
 SQLite reopen and injected transaction failure do not model abrupt process death
 or power-loss durability.
+
+### Seeded recovery sequences
+
+The bounded next phase adds four fixed seeds: 862, 873, 869, and 870.
+The expanded 15-test slice took 27.4 seconds with a warm default-feature cache;
+the four sequence tests took 0.94 seconds.
+Each runs eleven production cycles against its own file-backed SQLite database
+and nonempty media directory. This targets evidence that regresses after a valid
+owner survives a failed refresh, beyond the initial invalid-to-valid matrices.
+
+Every trace begins with ambiguous evidence, a provider-only improvement during
+backoff, then an explicitly due retry whose valid owner claim survives an injected refresh
+failure. Five seeded events reorder missing, null, and out-of-range provider
+dates, cancellation during lookup, and another refresh failure. The tail always
+supplies a new valid date, then runs two unchanged cycles. Recovery must complete
+on that first fault-free cycle; seeded ordering cannot postpone the liveness
+deadline. Each cycle releases production DB handles and reopens SQLite before
+checking dates, owner, capture receipt, retry row, checkpoint, statuses, media
+and an unrelated sidecar. The quiet tail permits normal delta polling but no
+repeat metadata hydration, inventory scan, repair, or download.
+
+Replay one schedule with
+`cargo test --lib capture_recovery_sequence_seed_862 -- --nocapture`
+(substitute any listed seed). Each step prints the seed, event index, event and
+complete expanded trace. The fixed seeds use the existing locked rand dependency;
+retain the expanded trace when comparing different dependency revisions.
+
+The deadline mutation is confined to the fixture, and cancellation is cooperative.
+This does not qualify abrupt process termination, filesystem recovery or NAS
+durability. Broader generated exploration and shrinking remain later work.
 
 ## State-transition proof
 
