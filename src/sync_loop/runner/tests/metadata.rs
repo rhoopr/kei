@@ -3218,8 +3218,18 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    for invalid in [None, Some(Value::Null), Some(json!(1e100))] {
-        for with_sibling in [false, true] {
+    // Epoch is a valid timestamp control, not a missing-date sentinel.
+    for invalid in [None, Some(Value::Null), Some(json!(1e100)), Some(json!(0))] {
+        let valid_epoch = invalid == Some(json!(0));
+        // Fully valid ambiguous families use schema-28 preservation, covered
+        // separately. Here the epoch control isolates valid-date acceptance.
+        let sibling_cases: &[Option<bool>] = if valid_epoch {
+            &[None]
+        } else {
+            &[None, Some(false), Some(true)]
+        };
+        for &sibling_hidden in sibling_cases {
+            let with_sibling = sibling_hidden.is_some();
             const ZONE: &str = "SharedSync-HIDDEN";
             const MASTER: &str = "master-hidden";
             const CHILD: &str = "asset-master-hidden";
@@ -3240,7 +3250,17 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                     let request: Value = serde_json::from_str(&body)?;
                     if url.contains("/records/lookup?") {
                         self.repair_requests.fetch_add(1, Ordering::SeqCst);
-                        return Ok(json!({"records": [self.records.lock().unwrap()[0]]}));
+                        let records = self.records.lock().unwrap();
+                        let requested = request["records"].as_array().unwrap();
+                        let selected: Vec<_> = records
+                            .iter()
+                            .filter(|record| {
+                                requested
+                                    .iter()
+                                    .any(|item| item["recordName"] == record["recordName"])
+                            })
+                            .collect();
+                        return Ok(json!({"records": selected}));
                     }
                     if url.contains("/changes/zone?") {
                         let records = if request["zones"][0]["syncToken"].is_string() {
@@ -3348,6 +3368,7 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
             if with_sibling {
                 let mut sibling = page["records"][1].clone();
                 sibling["recordName"] = json!("valid-sibling");
+                sibling["fields"]["isHidden"]["value"] = json!(i64::from(sibling_hidden.unwrap()));
                 sibling["fields"]["assetDate"] =
                     json!({"value": RUN_CYCLE_ASSET_DATE_MS, "type": "TIMESTAMP"});
                 page["records"].as_array_mut().unwrap().push(sibling);
@@ -3386,12 +3407,28 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
             );
             let config = make_run_cycle_config();
             let mut completed_requests = None;
-            for cycle in 0..4 {
-                if cycle == 2 {
+            for cycle in 0..5 {
+                eprintln!(
+                    "capture date={invalid:?} sibling_hidden={sibling_hidden:?} cycle={cycle}: seed -> malformed/control -> reopen -> valid+write-failure -> retry -> steady"
+                );
+                // A real SQLite failure after valid evidence arrives must not
+                // commit the catalogue refresh or its capture receipt.
+                if cycle == 2 && !with_sibling && !valid_epoch {
+                    rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+                        "CREATE TRIGGER fail_capture_refresh BEFORE UPDATE OF created_at ON assets BEGIN SELECT RAISE(ABORT, 'injected capture refresh failure'); END;"
+                    ).unwrap();
+                }
+                if cycle == 3 && !with_sibling && !valid_epoch {
+                    rusqlite::Connection::open(&db_path)
+                        .unwrap()
+                        .execute_batch("DROP TRIGGER fail_capture_refresh")
+                        .unwrap();
+                }
+                if cycle == 2 && !valid_epoch {
                     provider_records.lock().unwrap()[1]["fields"]["assetDate"] =
                         json!({"value": RUN_CYCLE_ASSET_DATE_MS, "type": "TIMESTAMP"});
                 }
-                let recovered = cycle >= 2 && !with_sibling;
+                let recovered = !with_sibling && (valid_epoch || cycle >= 3);
                 let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
                 let db = Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
                 let build_config = make_run_cycle_download_config_builder_with_options(
@@ -3423,12 +3460,16 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                 assert_eq!(result.stats.downloaded, 0);
                 assert_eq!(
                     result.stats.metadata_capture_refreshed,
-                    usize::from(cycle == 2 && !with_sibling)
+                    usize::from(!with_sibling && if valid_epoch { cycle == 0 } else { cycle == 3 })
                 );
                 assert_eq!(
                     result.stats.metadata_capture_remaining,
                     u64::from(!recovered)
                 );
+                drop(build_config);
+                drop(db);
+                drop(inner);
+                let inner = state::SqliteStateDb::open(&db_path).await.unwrap();
                 assert_eq!(
                     inner.get_metadata(TOKEN_KEY).await.unwrap().as_deref(),
                     Some(if recovered {
@@ -3443,7 +3484,11 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                     rows[0].created_at,
                     chrono::DateTime::from_timestamp(
                         if recovered {
-                            RUN_CYCLE_ASSET_DATE_MS / 1000
+                            if valid_epoch {
+                                0
+                            } else {
+                                RUN_CYCLE_ASSET_DATE_MS / 1000
+                            }
                         } else {
                             1_600_000_000
                         },
@@ -3452,10 +3497,43 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                     .unwrap()
                 );
                 assert_eq!(rows[0].metadata.is_hidden, recovered);
+                assert_eq!(rows[0].metadata.is_favorite, recovered);
+                assert_eq!(
+                    rows[0].checksum.as_ref(),
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                );
+                assert_eq!(
+                    rows[0].added_at.unwrap().timestamp(),
+                    RUN_CYCLE_ASSET_DATE_MS / 1000
+                );
+                let summary = inner.get_summary().await.unwrap();
+                assert_eq!(
+                    (
+                        summary.downloaded,
+                        summary.policy_excluded,
+                        summary.source_deleted
+                    ),
+                    (1, 0, 0)
+                );
+                assert!(
+                    inner
+                        .get_pending_metadata_rewrites(10)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
                 assert_eq!(rows[0].local_path.as_deref(), Some(media_path.as_path()));
                 assert_eq!(
-                    inner.get_legacy_master_state_owners().await.unwrap().len(),
-                    usize::from(recovered)
+                    inner.get_legacy_master_state_owners().await.unwrap(),
+                    if !with_sibling && (valid_epoch || cycle >= 2) {
+                        std::collections::HashSet::from([(
+                            ZONE.to_string(),
+                            MASTER.to_string(),
+                            CHILD.to_string(),
+                        )])
+                    } else {
+                        std::collections::HashSet::new()
+                    }
                 );
                 let status = inner
                     .get_summary()
@@ -3471,6 +3549,25 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                         None
                     } else {
                         Some(state::METADATA_CAPTURE_REVISION)
+                    }
+                );
+                // Inspect persisted retry evidence independently of cycle counters.
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                let retries: i64 = conn.query_row(
+                    "SELECT count(*) FROM metadata_capture_retries WHERE library=?1 AND asset_id=?2 AND attempts=1 AND next_retry_at>last_attempt_at",
+                    [ZONE, MASTER], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(retries, i64::from(with_sibling));
+                let revision: i64 = conn.query_row(
+                    "SELECT revision FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2",
+                    [ZONE, MASTER], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(
+                    revision,
+                    if recovered {
+                        state::METADATA_CAPTURE_REVISION
+                    } else {
+                        0
                     }
                 );
                 assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
