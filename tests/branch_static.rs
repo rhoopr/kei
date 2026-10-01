@@ -368,6 +368,113 @@ fn full_test_release_artifacts_follow_cargo_target_dir() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_source_package_uses_fresh_archive_and_preserves_shared_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    let bin = root.join("bin");
+    let target = root.join("target dir");
+    let source = root.join("package-source");
+    for dir in [
+        bin.clone(),
+        target.join("package"),
+        source.join("kei-0.0.0"),
+        root.join("scripts/fixtures"),
+        root.join("scripts/full-test"),
+        root.join("fuzz/seeds/heif_rewrite"),
+        root.join("tests/data/heif-rewrite"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for script in [
+        "scripts/fixtures/check-package.sh",
+        "scripts/full-test/cargo_target_dir.sh",
+    ] {
+        write_executable(&root.join(script), &repo_file(script));
+    }
+    for seed in [
+        "replacement-fits",
+        "replacement-grows",
+        "multi-xmp",
+        "conflicting-tmap-xmp",
+    ] {
+        for dir in ["fuzz/seeds/heif_rewrite", "tests/data/heif-rewrite"] {
+            std::fs::write(root.join(dir).join(seed), "fixture").unwrap();
+        }
+    }
+    std::fs::write(root.join("Cargo.toml"), "version = \"0.0.0\"\n").unwrap();
+    std::fs::write(source.join("kei-0.0.0/fresh-package"), "fresh bytes").unwrap();
+    let archive = target.join("package/kei-0.0.0.crate");
+    let sibling = target.join("package/kei-other.crate");
+    let cache = target.join("cached-dependency");
+    std::fs::write(&archive, "stale archive with trailing bytes").unwrap();
+    std::fs::write(&sibling, "retain sibling").unwrap();
+    std::fs::write(&cache, "retain cache").unwrap();
+    run_git(&root, &["init", "-b", "fixture"]);
+    write_executable(
+        &bin.join("cargo"),
+        r#"#!/bin/bash
+set -euo pipefail
+if [[ "$1" == package ]]; then
+    [[ "$2" == --target-dir ]]
+    [[ "$3" == "$TMPDIR"/kei-fixture-package-*/package-target ]]
+    [[ ! -e "$3" ]]
+    printf 'package --target-dir <fresh> %s\n' "${*:4}" >> "$CALL_LOG"
+    mkdir -p "$3/package"
+    tar -czf "$3/package/kei-0.0.0.crate" -C "$PACKAGE_SOURCE" kei-0.0.0
+else
+    printf '%s\n' "$*" >> "$CALL_LOG"
+    [[ "$(cat fresh-package)" == 'fresh bytes' ]]
+    [[ "$CARGO_TARGET_DIR" == "$EXPECTED_TARGET/fixture-package" ]]
+fi
+"#,
+    );
+    let log = root.join("calls");
+    for _ in 0..2 {
+        std::fs::write(&log, "").unwrap();
+        let output = Command::new("bash")
+            .arg(root.join("scripts/fixtures/check-package.sh"))
+            .current_dir(&root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CARGO_TARGET_DIR", &target)
+            .env("EXPECTED_TARGET", &target)
+            .env("PACKAGE_SOURCE", &source)
+            .env("CALL_LOG", &log)
+            .env("TMPDIR", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "package --target-dir <fresh> --allow-dirty --no-verify --offline",
+                "clean --offline --release --package kei",
+                "test --offline --release --all-features --test media_fixtures",
+                "test --offline --release --all-features --lib bundled_ -- --test-threads=1",
+                "test --offline --release --no-default-features --test media_fixtures",
+                "test --offline --release --no-default-features --lib bundled_ -- --test-threads=1",
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(&sibling).unwrap(), "retain sibling");
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), "retain cache");
+        assert_eq!(
+            std::fs::read_to_string(&archive).unwrap(),
+            "stale archive with trailing bytes"
+        );
+    }
+}
+
 #[test]
 fn full_test_run_start_metadata_is_stable_until_finalize() {
     let begin = repo_file("scripts/full-test/begin_run.sh");
