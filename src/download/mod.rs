@@ -3518,6 +3518,16 @@ pub(crate) async fn reconcile_catalog_paths(
     let Some(provider_pass) = passes.first() else {
         return Ok(PathReconciliationResult::default());
     };
+    if let Err(error) = file::recover_conditional_replacements(&config.directory).await {
+        tracing::warn!(error = %format!("{error:#}"), "Could not recover replacements before path reconciliation; keeping catalogue paths and checkpoints unchanged");
+        return Ok(PathReconciliationResult {
+            complete: false,
+            stats: SyncStats {
+                failed: 1,
+                ..SyncStats::default()
+            },
+        });
+    }
 
     let mut records = Vec::new();
     let mut offset = 0u64;
@@ -3538,6 +3548,23 @@ pub(crate) async fn reconcile_catalog_paths(
             complete: true,
             stats: SyncStats::default(),
         });
+    }
+
+    // Root drift can leave interrupted media or sidecar transactions outside
+    // the newly configured tree. Restore them before planning reads the source.
+    for record in &records {
+        if let Some(path) = &record.local_path
+            && let Err(error) = file::recover_metadata_replacements(path).await
+        {
+            tracing::warn!(error = %format!("{error:#}"), "Could not recover recorded source; keeping catalogue paths and checkpoints unchanged");
+            return Ok(PathReconciliationResult {
+                complete: false,
+                stats: SyncStats {
+                    failed: 1,
+                    ..SyncStats::default()
+                },
+            });
+        }
     }
 
     let mut targets: FxHashSet<PendingRetryTarget> = records
@@ -5979,6 +6006,9 @@ pub async fn download_photos_with_sync(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
+    if matches!(controls.run_mode, DownloadRunMode::Download) {
+        file::recover_conditional_replacements(&config.directory).await?;
+    }
     cleanup_orphan_part_files(&config).await;
     if matches!(config.sync_mode, SyncMode::Incremental { .. })
         && let Some(db) = &config.state_db
@@ -17501,6 +17531,8 @@ mod tests {
             ReconciliationMetadataCase::Conflict,
             ReconciliationMetadataCase::StateFailure,
             ReconciliationMetadataCase::Missing,
+            #[cfg(target_os = "linux")]
+            ReconciliationMetadataCase::Interrupted,
         ] {
             #[cfg(not(feature = "xmp"))]
             if !matches!(
@@ -17526,6 +17558,8 @@ mod tests {
         Conflict,
         StateFailure,
         Missing,
+        #[cfg(target_os = "linux")]
+        Interrupted,
     }
 
     async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
@@ -17624,6 +17658,44 @@ mod tests {
             .unwrap();
         if !matches!(mode, ReconciliationMetadataCase::Missing) {
             std::fs::write(&source_sidecar, packet).unwrap();
+        }
+        #[cfg(target_os = "linux")]
+        if matches!(mode, ReconciliationMetadataCase::Interrupted) {
+            use sha2::{Digest, Sha256};
+            use std::os::unix::ffi::OsStrExt;
+
+            // Seed the durable on-disk state left at the displaced boundary
+            // for both sources, outside the newly configured root.
+            for source in [&old_path, &source_sidecar] {
+                let name = source.file_name().unwrap().as_bytes();
+                let journal = source.with_file_name(format!(
+                    ".kei-replace-{}",
+                    data_encoding::HEXLOWER.encode(&Sha256::digest(name))
+                ));
+                std::fs::create_dir(&journal).unwrap();
+                let original = std::fs::read(source).unwrap();
+                let replacement = b"prepared replacement";
+                let manifest = json!({
+                    "version": 1,
+                    "target": name,
+                    "original": {
+                        "size": original.len(),
+                        "sha256": Sha256::digest(&original).to_vec(),
+                    },
+                    "replacement": {
+                        "size": replacement.len(),
+                        "sha256": Sha256::digest(replacement).to_vec(),
+                    }
+                });
+                std::fs::write(
+                    journal.join("manifest.json"),
+                    serde_json::to_vec(&manifest).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(journal.join("replacement"), replacement).unwrap();
+                std::fs::rename(source, journal.join("original")).unwrap();
+                assert!(!source.exists());
+            }
         }
         #[cfg(feature = "xmp")]
         {

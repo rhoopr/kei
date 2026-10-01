@@ -16,6 +16,9 @@ use super::limiter::BandwidthLimiter;
 use crate::fs_util::{ConfinedParents, ConfinedPath, FileIdentity, file_identity};
 use crate::retry::{self, RetryAction, RetryConfig};
 
+#[cfg(target_os = "linux")]
+mod replacement_recovery;
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// HTTP response from a download request.
@@ -162,6 +165,8 @@ struct ConditionalPublishMustRetainPaths {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ConditionalPublishErrorDisposition {
     pub(super) target_changed: bool,
+    #[cfg(target_os = "linux")]
+    pub(super) filesystem_unsupported: bool,
     pub(super) retained_paths: Vec<PathBuf>,
 }
 
@@ -174,12 +179,18 @@ pub(super) fn classify_conditional_publish_error(
         || error
             .downcast_ref::<std::io::Error>()
             .is_some_and(|source| source.kind() == std::io::ErrorKind::NotFound);
+    #[cfg(target_os = "linux")]
+    let filesystem_unsupported = error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(is_renameat2_unsupported);
     let retained_paths = error
         .downcast_ref::<ConditionalPublishMustRetainPaths>()
         .map(|marker| marker.paths.clone())
         .unwrap_or_default();
     ConditionalPublishErrorDisposition {
         target_changed,
+        #[cfg(target_os = "linux")]
+        filesystem_unsupported,
         retained_paths,
     }
 }
@@ -665,6 +676,52 @@ pub(super) async fn publish_part_to_final(
     }
 }
 
+/// Recover interrupted fallback publications before normal download work.
+#[cfg(target_os = "linux")]
+pub(super) async fn recover_conditional_replacements(root: &Path) -> anyhow::Result<()> {
+    replacement_recovery::recover_tree(root).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) async fn recover_conditional_replacements(_root: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+pub(super) fn cleanup_prepared_sidecar(
+    path: &Path,
+    expected: ExistingFileFingerprint,
+    identity: FileIdentity,
+) -> anyhow::Result<()> {
+    replacement_recovery::cleanup_prepared(path, expected, identity)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn recover_file_replacement(path: &Path) -> anyhow::Result<()> {
+    replacement_recovery::recover_target(path)
+}
+
+/// Recover the media and sidecar journals before inspecting either input.
+pub(super) async fn recover_metadata_replacements(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            replacement_recovery::recover_target(&path)?;
+            let mut name = path
+                .file_name()
+                .context("Metadata path has no filename")?
+                .to_os_string();
+            name.push(".xmp");
+            replacement_recovery::recover_target(&path.with_file_name(name))
+        })
+        .await??;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
+    Ok(())
+}
+
 /// Publish a prepared file only while the destination still matches the
 /// caller's initial observation. `None` means the destination did not exist;
 /// `Some` authorizes replacement of exactly those bytes and no others.
@@ -764,6 +821,10 @@ fn replace_file_if_unchanged_blocking(
     }
     let displaced_path = match exchange_repair_files_blocking(part_path, final_path, expected) {
         Ok(displaced_path) => displaced_path,
+        #[cfg(target_os = "linux")]
+        Err(error) if classify_conditional_publish_error(&error).filesystem_unsupported => {
+            return replacement_recovery::publish(part_path, final_path, expected, replacement);
+        }
         Err(error) if classify_conditional_publish_error(&error).target_changed => {
             return Err(error).context(ConditionalPublishTargetChanged::Unverifiable {
                 path: final_path.to_path_buf(),

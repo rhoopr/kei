@@ -3569,7 +3569,7 @@ pub(super) fn log_sync_summary(title: &str, stats: &super::SyncStats) {
     // code 2 with no other failure counts needs to see it here.
     if stats.exif_failures > 0 || stats.state_write_failures > 0 || stats.enumeration_errors > 0 {
         tracing::info!(
-            "  {} EXIF write failure(s), {} state write failure(s), {} enumeration error(s)",
+            "  {} metadata write failure(s), {} state write failure(s), {} enumeration error(s)",
             stats.exif_failures,
             stats.state_write_failures,
             stats.enumeration_errors
@@ -5153,6 +5153,18 @@ mod tests {
         );
     }
 
+    #[tracing_test::traced_test]
+    #[test]
+    fn log_sync_summary_labels_sidecar_failures_as_metadata() {
+        let stats = super::super::SyncStats {
+            exif_failures: 2,
+            ..Default::default()
+        };
+        super::log_sync_summary("Test Summary", &stats);
+        assert!(logs_contain("2 metadata write failure(s)"));
+        assert!(!logs_contain("EXIF write failure"));
+    }
+
     /// Inverse of the above: when every error counter is zero, the
     /// line-2 conditional must not fire.
     #[tracing_test::traced_test]
@@ -5166,7 +5178,7 @@ mod tests {
         super::log_sync_summary("── Test Summary ──", &stats);
 
         assert!(
-            !logs_contain("EXIF write failure"),
+            !logs_contain("metadata write failure"),
             "line 2 must not fire when exif/state/enum counters are all zero"
         );
         assert!(

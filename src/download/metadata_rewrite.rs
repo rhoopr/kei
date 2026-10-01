@@ -420,7 +420,7 @@ async fn write_sidecar_metadata(
             false
         }
         Err(e) => {
-            tracing::warn!(path = %log_path.display(), error = %e, "Failed to write XMP sidecar");
+            tracing::warn!(path = %log_path.display(), error = %format!("{e:#}"), "Failed to write XMP sidecar");
             false
         }
     }
@@ -939,6 +939,12 @@ where
             continue;
         };
         let path = PathBuf::from(local_path);
+        if let Err(error) = super::file::recover_metadata_replacements(&path).await {
+            tracing::warn!(path = %path.display(), error = %format!("{error:#}"),
+                "Could not recover metadata replacement; leaving marker for retry");
+            errored += 1;
+            continue;
+        }
         // tokio::fs defers the stat to the blocking pool; raw
         // std::Path::exists() would block the async runtime thread.
         // Keep the marker on missing so a future sync that re-downloads the

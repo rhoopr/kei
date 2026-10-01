@@ -81,3 +81,20 @@ The easiest local removals are:
    its local `unsafe` block.
 3. Add a direct `rustix` dependency for process, fs, and termios wrappers. That
    would remove most Unix syscall wrappers while preserving their semantics.
+
+## Journaled Linux replacement
+
+- `src/download/file/replacement_recovery.rs::unlink`: `unlinkat` uses a
+  retained parent descriptor and a NUL-terminated leaf. It never follows the
+  leaf. Byte checks authorize removal; unknown entries retain the journal.
+- `move_to_owned_slot`: `renameat` moves into a never-used slot inside an
+  exclusively created owner-only journal directory. Both directory descriptors
+  and names outlive the call. Public-target restoration never uses rename.
+- `Journal::create`: `mkdirat` uses a retained parent and refuses an existing
+  leaf. Mode `0700` keeps recovery entries private.
+- `Journal::open`: `openat` uses a retained parent, `O_NOFOLLOW`, and
+  `O_NONBLOCK`. The resulting descriptor becomes one owned `File`; its identity
+  must match the no-follow regular-file check before locking or reading.
+- The replacement recovery test launcher installs a seccomp filter in its
+  child process before exec. The filter lives through `prctl`, rejects only
+  flagged `renameat2` calls, and leaves the parent process unchanged.
