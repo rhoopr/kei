@@ -143,6 +143,16 @@ async fn refresh_metadata_capture_candidate(
     asset: PhotoAsset,
     repair: &mut MetadataCaptureRepair,
 ) {
+    let Some(created) = asset.asset_date_evidence() else {
+        record_metadata_capture_failure(
+            db,
+            &candidate.library,
+            "provider capture date is missing or invalid",
+            repair,
+        )
+        .await;
+        return;
+    };
     if let Err(error) = db
         .upsert_asset_master_mapping(&candidate.library, asset.asset_record_name(), asset.id())
         .await
@@ -157,7 +167,7 @@ async fn refresh_metadata_capture_candidate(
         .refresh_downloaded_asset_metadata(
             &candidate.library,
             &candidate.asset_id,
-            (&capture, asset.created(), Some(asset.added_date())),
+            (&capture, created, Some(asset.added_date())),
             mark_for_rewrite,
             false,
             crate::state::METADATA_CAPTURE_REVISION,
@@ -448,6 +458,18 @@ async fn collect_metadata_capture_repair(
                             db.as_ref(),
                             &candidate.library,
                             "multiple provider children matched durable catalogue evidence",
+                            &mut repair,
+                        )
+                        .await;
+                        continue;
+                    }
+                    // Count every matching child before validating the selected date.
+                    // Dropping malformed siblings earlier would manufacture uniqueness.
+                    if asset.asset_date_evidence().is_none() {
+                        record_metadata_capture_failure(
+                            db.as_ref(),
+                            &candidate.library,
+                            "provider capture date is missing or invalid",
                             &mut repair,
                         )
                         .await;
