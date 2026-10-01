@@ -189,7 +189,7 @@ pub(super) fn prepare_metadata_heif(
 
 /// Read the first 12 bytes of `file` and verify it starts with an
 /// ISO-BMFF `ftyp` box whose major brand is in the HEIF family. Used as
-/// a sanity check between `rewrite_xmp` and the atomic rename so a
+/// a sanity check between `rewrite_xmp` and guarded publication so a
 /// malformed rewrite never lands on disk. Reads from the still-open
 /// rewrite handle (seeks back to 0) to avoid reopening `tmp_path`
 /// immediately after `sync_all`; the path is only used for diagnostics.

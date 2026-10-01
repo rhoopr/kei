@@ -52,7 +52,10 @@ pub(in crate::download) fn publish_reconciliation_part_blocking(
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn hard_link_confined(part: &ConfinedPath, destination: &ConfinedPath) -> std::io::Result<()> {
+pub(super) fn hard_link_confined(
+    part: &ConfinedPath,
+    destination: &ConfinedPath,
+) -> std::io::Result<()> {
     // SAFETY: both retained directory descriptors and NUL-terminated names
     // remain live. linkat refuses an existing destination; no path cleanup follows.
     if unsafe {
@@ -192,7 +195,7 @@ fn renameat2_blocking(
 }
 
 #[cfg(target_os = "linux")]
-fn is_renameat2_unsupported(e: &std::io::Error) -> bool {
+pub(super) fn is_renameat2_unsupported(e: &std::io::Error) -> bool {
     matches!(
         e.raw_os_error(),
         Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)

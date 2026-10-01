@@ -116,6 +116,13 @@ This rule does not expand GPS speed/time or movie-field policy.
 Metadata writers create unique temporary files exclusively, validate stable
 inputs and approved replacement fingerprints, preserve permissions, and fsync
 before guarded publication. Media replacement uses atomic exchange where
-applicable. Sidecars have their own existing-packet ownership and byte checks;
+supported. On Linux, filesystems such as NFS that reject exchange use a journaled
+fallback. This also applies to existing sidecars. It requires hard-link support
+and briefly leaves the final path absent. Interrupted replacements are recovered
+on the next sync. Keep `.kei-replace-*` recovery directories until kei finishes
+recovery; they can contain original user bytes. Conflicting or changed bytes
+stay available and block completion instead of being overwritten.
+
+Sidecars have their own existing-packet ownership and byte checks;
 reports do not share all of these rules. A changed input cannot authorize a
 blind rename over user data. Ambiguous entries stay available for inspection.

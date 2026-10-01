@@ -66,6 +66,8 @@ pub(in crate::download) fn prepare_metadata_with_expected_fingerprint(
     temp_suffix: &str,
     expected_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,
 ) -> Result<PreparedMetadataFile> {
+    #[cfg(target_os = "linux")]
+    crate::download::file::recover_file_replacement(path)?;
     #[cfg(not(feature = "xmp"))]
     {
         prepare_metadata_native(path, write, temp_suffix, expected_fingerprint)

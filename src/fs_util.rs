@@ -228,7 +228,9 @@ impl ConfinedPath {
     }
 
     pub(crate) fn open_optional_regular(&self) -> std::io::Result<Option<std::fs::File>> {
-        match self.open_regular() {
+        // A missing namespace is not a missing leaf in the retained parent.
+        self.validate_namespace()?;
+        match self.open_regular_with_access(ConfinedAccess::Read) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),

@@ -2278,6 +2278,8 @@ async fn path_reconciliation_preserves_mtime_and_metadata_across_retry() {
         ReconciliationMetadataCase::Conflict,
         ReconciliationMetadataCase::StateFailure,
         ReconciliationMetadataCase::Missing,
+        #[cfg(target_os = "linux")]
+        ReconciliationMetadataCase::Interrupted,
     ] {
         #[cfg(not(feature = "xmp"))]
         if !matches!(
@@ -2303,6 +2305,8 @@ enum ReconciliationMetadataCase {
     Conflict,
     StateFailure,
     Missing,
+    #[cfg(target_os = "linux")]
+    Interrupted,
 }
 
 async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
@@ -2401,6 +2405,44 @@ async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
         .unwrap();
     if !matches!(mode, ReconciliationMetadataCase::Missing) {
         std::fs::write(&source_sidecar, packet).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    if matches!(mode, ReconciliationMetadataCase::Interrupted) {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::OsStrExt;
+
+        // Seed the durable on-disk state left at the displaced boundary
+        // for both sources, outside the newly configured root.
+        for source in [&old_path, &source_sidecar] {
+            let name = source.file_name().unwrap().as_bytes();
+            let journal = source.with_file_name(format!(
+                ".kei-replace-{}",
+                data_encoding::HEXLOWER.encode(&Sha256::digest(name))
+            ));
+            std::fs::create_dir(&journal).unwrap();
+            let original = std::fs::read(source).unwrap();
+            let replacement = b"prepared replacement";
+            let manifest = json!({
+                "version": 1,
+                "target": name,
+                "original": {
+                    "size": original.len(),
+                    "sha256": Sha256::digest(&original).to_vec(),
+                },
+                "replacement": {
+                    "size": replacement.len(),
+                    "sha256": Sha256::digest(replacement).to_vec(),
+                }
+            });
+            std::fs::write(
+                journal.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(journal.join("replacement"), replacement).unwrap();
+            std::fs::rename(source, journal.join("original")).unwrap();
+            assert!(!source.exists());
+        }
     }
     #[cfg(feature = "xmp")]
     {

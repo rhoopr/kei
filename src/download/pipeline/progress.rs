@@ -90,7 +90,7 @@ pub(in crate::download) fn log_sync_summary(title: &str, stats: &crate::download
     // code 2 with no other failure counts needs to see it here.
     if stats.exif_failures > 0 || stats.state_write_failures > 0 || stats.enumeration_errors > 0 {
         tracing::info!(target: "kei::download::pipeline",
-            "  {} EXIF write failure(s), {} state write failure(s), {} enumeration error(s)",
+            "  {} metadata write failure(s), {} state write failure(s), {} enumeration error(s)",
             stats.exif_failures,
             stats.state_write_failures,
             stats.enumeration_errors

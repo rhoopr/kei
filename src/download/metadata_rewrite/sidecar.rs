@@ -61,7 +61,7 @@ pub(super) async fn write_sidecar_metadata(
         Err(e) => {
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
-                path = %log_path.display(), error = %e, "Failed to write XMP sidecar");
+                path = %log_path.display(), error = %format!("{e:#}"), "Failed to write XMP sidecar");
             false
         }
     }
