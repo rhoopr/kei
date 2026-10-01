@@ -3509,7 +3509,7 @@ enum AmbiguousChildFault {
 }
 
 async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
-    exercise_legacy_child_cycles(fault, &[2, 3]).await;
+    Box::pin(exercise_legacy_child_cycles(fault, &[2, 3])).await;
 }
 
 async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: &[usize]) {
