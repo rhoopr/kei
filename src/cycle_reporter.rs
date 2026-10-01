@@ -1014,6 +1014,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tactical_failed_sample_production_cap_and_deleted_exclusion() {
+        for count in [199_u32, 200, 201] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("state.db");
+            let db = state::SqliteStateDb::open(&db_path).await.unwrap();
+            for index in 0..=count {
+                let id = format!("FAIL_{index:03}");
+                let record = crate::test_helpers::TestAssetRecord::new(&id).build();
+                db.upsert_seen(&record).await.unwrap();
+                db.mark_failed("PrimarySync", &id, "original", "fixture failure")
+                    .await
+                    .unwrap();
+                db.backdate_last_seen(&id, 1_000 + i64::from(index));
+            }
+            // The newest row would appear first unless deletion is filtered before the cap.
+            db.mark_soft_deleted("PrimarySync", &format!("FAIL_{count:03}"), None)
+                .await
+                .unwrap();
+            drop(db);
+            let db = state::SqliteStateDb::open(&db_path).await.unwrap();
+            let report_path = dir.path().join("report.json");
+            let notifier = Notifier::new(None);
+            let reporter = reporter_with_db(dir.path(), Some(&report_path), &notifier, &db);
+            let stats = SyncStats {
+                downloaded: 7,
+                failed: 3,
+                ..SyncStats::default()
+            };
+            let expected_stats = serde_json::to_value(&stats).unwrap();
+            let mut health = HealthStatus::new();
+            for _ in 0..2 {
+                report_cycle(&reporter, &mut health, &stats, 3, false).await;
+                let report = parse_json(&report_path);
+                let sample = report["failed_assets"].as_array().unwrap();
+                let expected: Vec<_> = (0..count).rev().take(200).map(|index| {
+                    serde_json::json!({"id": format!("FAIL_{index:03}"), "version_size": "original", "error_message": "fixture failure"})
+                }).collect();
+                assert_eq!(sample, &expected, "count={count}");
+                if count == 201 {
+                    assert_eq!(report["failed_assets_truncated"], 1);
+                } else {
+                    assert!(report.get("failed_assets_truncated").is_none());
+                }
+                assert_eq!(
+                    report["stats"], expected_stats,
+                    "sampling must not change aggregate facts"
+                );
+                assert_eq!(report["status"], "partial_failure");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn partial_failure_updates_health_and_writes_partial_report() {
         let dir = tempfile::tempdir().unwrap();
         let report_path = dir.path().join("sync_report.json");
