@@ -168,9 +168,13 @@ where
     /// duration, reports, and completion notifications must not change.
     pub(crate) async fn report_skipped_watch_cycle(&self, health: &mut HealthStatus) {
         let unresolved = if let Some(db) = self.state_db {
-            db.get_summary()
-                .await
-                .map(|summary| summary.unresolved_identity_zones > 0)
+            db.get_summary().await.map(|summary| {
+                summary.unresolved_identity_zones > 0
+                    || summary
+                        .metadata_capture
+                        .iter()
+                        .any(|capture| capture.unresolved_assets > 0)
+            })
         } else {
             Ok(false)
         };
@@ -1079,6 +1083,54 @@ mod tests {
                 .unwrap()
                 .contains("unresolved asset identity")
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_capture_retry_keeps_idle_health_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = state::SqliteStateDb::open_in_memory().unwrap();
+        let row = crate::test_helpers::TestAssetRecord::new("private-legacy")
+            .library("unselected-zone")
+            .build();
+        db.upsert_seen(&row).await.unwrap();
+        db.mark_downloaded(
+            "unselected-zone",
+            "private-legacy",
+            "original",
+            std::path::Path::new("/retained/photo.jpg"),
+            "local",
+            None,
+        )
+        .await
+        .unwrap();
+        db.set_metadata_capture_revision_for_test("unselected-zone", "private-legacy", 0);
+        db.begin_metadata_capture_revision("unselected-zone", 1)
+            .await
+            .unwrap();
+        let candidate = db
+            .get_metadata_capture_candidates("unselected-zone", 1, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(
+            db.defer_metadata_capture_ambiguity(&candidate, 1)
+                .await
+                .unwrap()
+        );
+        let notifier = Notifier::new(None);
+        let reporter = reporter_with_surfaces(dir.path(), None, &notifier, Some(&db), None);
+        let mut health = HealthStatus::new();
+        health.record_success();
+        let previous = health.last_success_at;
+        reporter.report_skipped_watch_cycle(&mut health).await;
+        assert_eq!(health.last_success_at, previous);
+        assert_eq!(health.consecutive_failures, 1);
+        db.set_metadata_capture_revision_for_test("unselected-zone", "private-legacy", 1);
+        db.complete_metadata_capture_revision("unselected-zone", 1)
+            .await
+            .unwrap();
+        reporter.report_skipped_watch_cycle(&mut health).await;
+        assert_eq!(health.consecutive_failures, 0);
     }
 
     #[tokio::test]

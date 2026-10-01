@@ -14,6 +14,7 @@ use super::asset_writes::{
     update_status_to_downloaded, upsert_asset_row,
 };
 use super::membership::refresh_asset_album_groupings_tx;
+use super::rows::decode_asset_date;
 #[cfg(test)]
 use super::rows::{ASSET_COLUMNS, row_to_asset_record};
 use super::{
@@ -572,7 +573,7 @@ impl SqliteStateDb {
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT library, id, version_size, checksum, local_path, \
-                            local_checksum, download_checksum \
+                            local_checksum, download_checksum, added_at \
                      FROM assets WHERE status = 'downloaded'",
                 )
                 .map_err(|e| StateError::query("get_downloaded_file_records", e))?;
@@ -582,6 +583,10 @@ impl SqliteStateDb {
                 let local_path: Option<String> = row.get(4)?;
                 Ok(DownloadedFileRecord {
                     is_current_path: true,
+                    added_at: row
+                        .get::<_, Option<f64>>(7)?
+                        .map(|date| decode_asset_date(date, 7))
+                        .transpose()?,
                     library: row.get(0)?,
                     id: row.get(1)?,
                     version_size: VersionSizeKey::from_str(&version_size)
@@ -1443,7 +1448,7 @@ impl DownloadContextStateStore for SqliteStateDb {
         self.with_conn("get_downloaded_path_records", |conn| {
             let mut statement = conn.prepare_cached(
                 "SELECT p.library, p.id, p.version_size, p.provider_checksum, p.local_path, \
-                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path) \
+                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path), a.added_at \
                  FROM asset_metadata_paths p JOIN assets a \
                    ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
                  WHERE a.status = 'downloaded' AND a.is_deleted = 0 \
@@ -1453,6 +1458,7 @@ impl DownloadContextStateStore for SqliteStateDb {
             let rows = statement.query_map([], |row| {
                 Ok(DownloadedFileRecord {
                     is_current_path: row.get(7)?,
+                    added_at: row.get::<_, Option<f64>>(8)?.map(|date| decode_asset_date(date, 8)).transpose()?,
                     library: row.get(0)?,
                     id: row.get(1)?,
                     version_size: VersionSizeKey::from_str(&row.get::<_, String>(2)?)

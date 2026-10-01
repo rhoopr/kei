@@ -374,6 +374,47 @@ async fn hydrate_matching_master_assets_collects_every_live_sibling() {
 }
 
 #[tokio::test]
+async fn hydrate_matching_master_assets_retains_hidden_siblings_but_not_deleted_children() {
+    let mut hidden = changes_asset("asset-hidden", "master-target");
+    hidden["fields"]["isHidden"] = json!({"value": 1, "type": "INT64"});
+    let mut soft_deleted = hidden.clone();
+    soft_deleted["recordName"] = json!("asset-soft-deleted");
+    soft_deleted["fields"]["isDeleted"] = json!({"value": 1, "type": "INT64"});
+    let mut hard_deleted = hidden.clone();
+    hard_deleted["recordName"] = json!("asset-hard-deleted");
+    hard_deleted["deleted"] = json!(true);
+    let page1 = vec![
+        changes_master("master-target"),
+        changes_asset("asset-visible", "master-target"),
+        soft_deleted,
+        hard_deleted,
+    ];
+    let mock = MockPhotosSession::new()
+        .ok(canned_changes_page(&page1, "token-page1", true))
+        .ok(canned_changes_page(&[hidden], "token-final", false));
+    let album = make_album_with_session(100, Box::new(mock));
+    let masters = FxHashSet::from_iter(["master-target".to_string()]);
+
+    let matched = album
+        .hydrate_matching_master_assets_from_changes(&masters, &CancellationToken::new())
+        .await
+        .expect("master hydration must include the later hidden sibling");
+
+    assert_eq!(matched.len(), 2);
+    let names: FxHashSet<_> = matched.iter().map(PhotoAsset::asset_record_name).collect();
+    assert_eq!(
+        names,
+        FxHashSet::from_iter(["asset-visible", "asset-hidden"])
+    );
+    assert!(matched.iter().any(|asset| asset.metadata().is_hidden));
+    assert!(
+        matched
+            .iter()
+            .all(|asset| asset.source_zone() == Some("PrimarySync"))
+    );
+}
+
+#[tokio::test]
 async fn hydrate_matching_master_assets_scans_later_sibling_pages() {
     let page1 = vec![
         changes_master("master-target"),

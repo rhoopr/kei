@@ -483,9 +483,11 @@ pub async fn download_photos_with_sync(
     )
     .await?;
 
-    let repair_outcome = if metadata_capture_repair.failures > 0 {
+    let repair_outcome = if metadata_capture_repair.failures > 0
+        || metadata_capture_repair.stats.metadata_capture_unresolved > 0
+    {
         DownloadOutcome::PartialFailure {
-            failed_count: metadata_capture_repair.failures,
+            failed_count: metadata_capture_repair.failures.max(1),
         }
     } else {
         DownloadOutcome::Success
@@ -497,7 +499,7 @@ pub async fn download_photos_with_sync(
         checkpoint: metadata_capture_repair.checkpoint,
         full_enumeration_ran: false,
     };
-    if metadata_capture_repair.failures > 0 {
+    if matches!(repair.outcome, DownloadOutcome::PartialFailure { .. }) {
         result.outcome = merge_download_outcomes(&result.outcome, &repair.outcome);
     }
     result.accumulate(&repair);

@@ -55,7 +55,7 @@ pub(super) fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 26;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 27;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -334,6 +334,19 @@ CREATE TABLE IF NOT EXISTS unresolved_sparse_identities (
     PRIMARY KEY (library, source_record_name)
 );
 CREATE INDEX IF NOT EXISTS idx_sparse_identity_retry ON unresolved_sparse_identities(library, next_retry_at);
+
+CREATE TABLE IF NOT EXISTS metadata_capture_retries (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    target_revision INTEGER NOT NULL,
+    evidence TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    attempts INTEGER NOT NULL CHECK(attempts > 0),
+    last_attempt_at INTEGER NOT NULL,
+    next_retry_at INTEGER NOT NULL,
+    PRIMARY KEY (library, asset_id, target_revision)
+);
+
 ").unwrap();
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();

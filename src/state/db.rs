@@ -19,9 +19,11 @@ mod identity;
 mod import;
 mod membership;
 mod metadata;
+mod metadata_capture_retry;
 mod reconciliation;
 mod reports;
 mod sparse_identity;
+pub(crate) use metadata_capture_retry::MetadataCaptureRetryGeneration;
 pub(crate) use sparse_identity::{
     SparseAttemptOutcome, SparseDeletionCheckpoint, SparseEvidence, SparseIdentity,
     SparseIdentityProof, SparseIdentityStore, SparseSourceId,

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
@@ -270,8 +271,9 @@ async fn pending_retry_expired_url_hydrates_current_records() {
     let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
     let record = crate::test_helpers::TestAssetRecord::new("PENDING_EXPIRED_URL")
         .filename("pending-expired-url.jpg")
-        .checksum("ck_pending_expired_url")
-        .size(1024)
+        .checksum(&checksum)
+        .size(8)
+        .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
         .build();
     db.upsert_seen(&record).await.expect("seed pending row");
     db.upsert_asset_master_mapping(

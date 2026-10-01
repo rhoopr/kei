@@ -8,6 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::download::filter::{FilterReason, is_asset_filtered};
 use crate::icloud::photos::PhotoAsset;
+use crate::state::types::legacy_added_date_matches;
 use crate::state::{
     DownloadContextStateStore, DownloadStateStore, MetadataRewriteStore, VersionSizeKey,
 };
@@ -169,6 +170,7 @@ pub(in crate::download) struct DownloadContext {
     /// Persisted child owner for each adopted legacy master-keyed state row.
     /// `None` disables new legacy adoption after an owner query failure.
     pub(in crate::download) legacy_master_state_owners: Option<LibraryMasterAssetMap>,
+    legacy_added_dates: LegacyAddedDates,
     /// Nested map: `library` -> set of asset IDs known to the state DB (any
     /// status). Used in retry-only mode to skip new assets that were never
     /// synced in the same CloudKit zone.
@@ -179,6 +181,28 @@ pub(in crate::download) struct DownloadContext {
     /// True when at least one downloaded asset-version lacks a metadata hash.
     /// Cached because the producer checks this on hot on-disk skip paths.
     pub(in crate::download) downloaded_without_metadata_hash: bool,
+}
+
+// None means a missing or conflicting rendition date, never an inferred epoch.
+type LegacyAddedDates =
+    FxHashMap<Arc<str>, FxHashMap<Arc<str>, Option<chrono::DateTime<chrono::Utc>>>>;
+
+fn retain_legacy_added_date(
+    dates: &mut LegacyAddedDates,
+    library: &Arc<str>,
+    id: &Arc<str>,
+    added_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    dates
+        .entry(Arc::clone(library))
+        .or_default()
+        .entry(Arc::clone(id))
+        .and_modify(|stored| {
+            if *stored != added_at {
+                *stored = None;
+            }
+        })
+        .or_insert(added_at);
 }
 
 impl DownloadContext {
@@ -264,12 +288,21 @@ impl DownloadContext {
         // the Arc without an extra copy.
         let mut interner: FxHashSet<Arc<str>> = FxHashSet::default();
 
+        let mapped_children: FxHashSet<_> = mapping_rows
+            .as_ref()
+            .ok()
+            .into_iter()
+            .flatten()
+            .map(|(library, child, _)| (library.as_str(), child.as_str()))
+            .collect();
+        let mut legacy_added_dates = LegacyAddedDates::default();
         let mut downloaded_ids: LibraryAssetVersionSet = FxHashMap::default();
         let mut downloaded_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
         let mut downloaded_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in downloaded_records {
             let crate::state::DownloadedFileRecord {
                 is_current_path: _,
+                added_at,
                 library,
                 id,
                 version_size,
@@ -281,6 +314,9 @@ impl DownloadContext {
             let lib = intern_id(&mut interner, library);
             let id = intern_id(&mut interner, id);
             let version_size: Box<str> = version_size.as_str().into();
+            if !mapped_children.contains(&(lib.as_ref(), id.as_ref())) {
+                retain_legacy_added_date(&mut legacy_added_dates, &lib, &id, added_at);
+            }
             downloaded_ids
                 .entry(Arc::clone(&lib))
                 .or_default()
@@ -359,11 +395,15 @@ impl DownloadContext {
                 local_checksum,
                 download_checksum,
                 downloaded_at,
+                added_at,
                 ..
             } = record;
             let lib = intern_id(&mut interner, library.to_string());
             let id = intern_id(&mut interner, id.to_string());
             let version_size: Box<str> = version_size.as_str().into();
+            if !mapped_children.contains(&(lib.as_ref(), id.as_ref())) {
+                retain_legacy_added_date(&mut legacy_added_dates, &lib, &id, added_at);
+            }
             pending_ids
                 .entry(Arc::clone(&lib))
                 .or_default()
@@ -467,6 +507,7 @@ impl DownloadContext {
             pending_files,
             asset_master_mappings,
             legacy_master_state_owners,
+            legacy_added_dates,
             known_ids,
             attempt_counts,
             downloaded_without_metadata_hash,
@@ -658,8 +699,8 @@ impl DownloadContext {
     ///
     /// New assets use their unique `CPLAsset.recordName`. A pre-v0.24 row can
     /// still be keyed by `CPLMaster.recordName`; retain that key only when its
-    /// provider checksum matches and durable family history identifies this
-    /// child as the sole sibling without its own state row.
+    /// provider checksum and all recorded added dates match. Another historical
+    /// child blocks a new claim even if it has its own state or is now missing.
     pub(in crate::download) fn should_use_legacy_master_state(
         &self,
         library: &str,
@@ -686,6 +727,19 @@ impl DownloadContext {
             return owner.as_ref() == asset_record_name;
         }
 
+        let Some(provider_added) = asset.added_date_evidence() else {
+            return false;
+        };
+        if !legacy_added_date_matches(
+            self.legacy_added_dates
+                .get(library)
+                .and_then(|dates| dates.get(master_record_name))
+                .copied()
+                .flatten(),
+            Some(provider_added),
+        ) {
+            return false;
+        }
         let Some(mappings) = &self.asset_master_mappings else {
             return false;
         };
@@ -697,6 +751,12 @@ impl DownloadContext {
             // retain a checksum-compatible master row for their first child.
             return true;
         };
+        if mapped_children
+            .iter()
+            .any(|child| child.as_ref() != asset_record_name)
+        {
+            return false;
+        }
         let mut children_without_state = mapped_children
             .iter()
             .filter(|child| !self.has_state_version(library, child));
