@@ -7,9 +7,9 @@ offline Rust gate uses the checked-in SQL schema instead of this binary.
 import argparse
 import hashlib
 import os
-from pathlib import Path
 import subprocess
 import tarfile
+from pathlib import Path
 
 DIGEST = "0402df3eff13904ca1417d5b52758ccbe98a2d7f5360b84cb04cde5972a5c4f3"
 ARCHIVE = "kei-linux-x86_64.tar.gz"
