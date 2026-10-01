@@ -81,6 +81,7 @@ pub(super) fn metadata_capture_remaining(
                ON revisions.library = assets.library AND revisions.asset_id = assets.id \
              WHERE assets.library = ?1 AND assets.status = 'downloaded' \
                AND assets.is_deleted = 0 \
+               AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id) \
                AND (revisions.revision IS NULL OR revisions.revision < ?2) \
              GROUP BY assets.id \
          )",
@@ -115,8 +116,10 @@ pub(super) fn metadata_capture_status(
         )
         .optional()
         .map_err(|e| StateError::query("metadata_capture_status", e))?;
+    let (unattributed_legacy_assets, unattributed_legacy_pending) =
+        super::legacy_preservation::counts(conn, library)?;
     let (active_revision, pending_revision, processed, failed, last_error) = row.unwrap_or({
-        if remaining_assets > 0 {
+        if remaining_assets > 0 || unattributed_legacy_assets > 0 {
             (0, Some(target_revision), 0, 0, None)
         } else {
             (target_revision, None, 0, 0, None)
@@ -125,6 +128,8 @@ pub(super) fn metadata_capture_status(
     let retries =
         metadata_capture_retry::counts(conn, library, target_revision, Utc::now().timestamp())?;
     Ok(MetadataCaptureStatus {
+        unattributed_legacy_assets,
+        unattributed_legacy_pending,
         library: library.to_owned(),
         active_revision,
         pending_revision,
@@ -163,7 +168,7 @@ fn query_pending_metadata_rewrites(
     let sql = format!(
         "SELECT {ASSET_COLUMNS}, capture_repair_metadata_hash, \
             capture_repair_output_checksum, capture_repair_output_size, source_checksum \
-         FROM ({source}) WHERE {queue_predicate} \
+         FROM ({source}) AS rewrite_source WHERE {queue_predicate} AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=rewrite_source.library AND p.asset_id=rewrite_source.id) \
            AND status = 'downloaded' AND is_deleted = 0 AND local_path IS NOT NULL \
            {scope} ORDER BY {order}, local_path LIMIT ? OFFSET ?"
     );
@@ -904,7 +909,7 @@ impl SqliteStateDb {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
-                     AND is_deleted = 0 AND metadata_hash IS NULL AND library = ?1)",
+                     AND is_deleted = 0 AND metadata_hash IS NULL AND library = ?1 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id))",
                     [&library],
                     |row| row.get(0),
                 )
@@ -1032,7 +1037,12 @@ impl SqliteStateDb {
             })?;
             metadata_capture_retry::retire_completed(&tx, &library)?;
             let remaining = metadata_capture_remaining(&tx, &library, target_revision)?;
-            if remaining == 0 {
+            let protected: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1)",
+                [&library],
+                |row| row.get(0),
+            )?;
+            if remaining == 0 && !protected {
                 tx.execute(
                     "UPDATE metadata_capture_state SET active_revision = MAX(active_revision, ?1), \
                         pending_revision = NULL, failed_assets = 0, last_error = NULL, \
@@ -1061,7 +1071,9 @@ impl SqliteStateDb {
         let libraries = unique_sorted_strings(libraries);
         self.with_conn("has_metadata_capture_work", move |conn| {
             for library in libraries {
-                if metadata_capture_remaining(conn, &library, target_revision)? > 0 {
+                if metadata_capture_remaining(conn, &library, target_revision)? > 0
+                    || super::legacy_preservation::counts(conn, &library)?.1 > 0
+                {
                     return Ok(true);
                 }
                 let pending: bool = conn
@@ -1180,6 +1192,49 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl MetadataRewriteStore for SqliteStateDb {
+    async fn legacy_child_receipts(
+        &self,
+        library: &str,
+        id: &str,
+    ) -> Result<Vec<crate::state::AssetRecord>, crate::state::error::StateError> {
+        SqliteStateDb::legacy_child_receipts(self, library, id).await
+    }
+    async fn legacy_preparation_snapshots(
+        &self,
+        library: &str,
+        limit: usize,
+    ) -> Result<Vec<super::LegacyPreparationSnapshot>, StateError> {
+        SqliteStateDb::legacy_preparation_snapshots(self, library, limit).await
+    }
+    async fn prepare_legacy_preservation(
+        &self,
+        snapshot: &super::LegacyPreparationSnapshot,
+        files: &[super::LegacyFileEvidence],
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::prepare_legacy_preservation(self, snapshot, files).await
+    }
+    async fn legacy_preservations(
+        &self,
+        library: &str,
+    ) -> Result<Vec<super::LegacyPreservation>, StateError> {
+        SqliteStateDb::legacy_preservations(self, library).await
+    }
+    async fn legacy_dependency_evidence(
+        &self,
+        library: &str,
+        id: &str,
+    ) -> Result<String, StateError> {
+        SqliteStateDb::legacy_dependency_evidence(self, library, id).await
+    }
+    async fn reactivate_legacy_preservation(
+        &self,
+        library: &str,
+        id: &str,
+        expected_generation: Option<i64>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::reactivate_legacy_preservation(self, library, id, expected_generation).await
+    }
+
     async fn record_metadata_write_failure(
         &self,
         library: &str,

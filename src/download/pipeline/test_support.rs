@@ -516,6 +516,8 @@ impl MetadataRewriteStore for FailingDownloadStore {
         target_revision: i64,
     ) -> Result<crate::state::MetadataCaptureStatus, StateError> {
         Ok(crate::state::MetadataCaptureStatus {
+            unattributed_legacy_assets: 0,
+            unattributed_legacy_pending: 0,
             library: library.to_owned(),
             active_revision: target_revision,
             pending_revision: None,

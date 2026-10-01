@@ -17,9 +17,13 @@ mod checkpoints;
 mod contracts;
 mod identity;
 mod import;
+mod legacy_preservation;
 mod membership;
 mod metadata;
 mod metadata_capture_retry;
+pub(crate) use legacy_preservation::{
+    LegacyActivationProof, LegacyFileEvidence, LegacyPreparationSnapshot, LegacyPreservation,
+};
 mod reconciliation;
 mod reports;
 mod sparse_identity;

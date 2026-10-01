@@ -19,6 +19,13 @@ pub(super) fn refresh_asset_album_groupings_tx(
     asset_id: &str,
     previous_name: Option<&str>,
 ) -> Result<(), StateError> {
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1 AND asset_id=?2)",
+        rusqlite::params![library, asset_id],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
     let operation = "refresh_asset_album_groupings";
     let mut stmt = tx
         .prepare_cached(
@@ -614,7 +621,8 @@ impl SqliteStateDb {
                 "UPDATE asset_album_memberships \
                  SET is_deleted = 1, updated_at = ?1 \
                  WHERE library = ?2 AND container_id = ?3 \
-                   AND generation <> ?4 AND is_deleted = 0",
+                   AND generation <> ?4 AND is_deleted = 0 \
+                   AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=asset_album_memberships.library AND p.asset_id=asset_album_memberships.asset_record_name)",
                 rusqlite::params![now, &library, &container_id, generation],
             )
             .map_err(|e| StateError::query("complete_album_membership_snapshot::prune", e))?;

@@ -9,6 +9,8 @@ pub(crate) struct HealthStatus {
     pub(crate) last_success_at: Option<DateTime<Utc>>,
     pub(crate) consecutive_failures: u32,
     pub(crate) last_error: Option<String>,
+    pub(crate) unattributed_legacy_assets: u64,
+    pub(crate) unattributed_legacy_pending: u64,
 }
 
 impl HealthStatus {
@@ -18,6 +20,8 @@ impl HealthStatus {
             last_success_at: None,
             consecutive_failures: 0,
             last_error: None,
+            unattributed_legacy_assets: 0,
+            unattributed_legacy_pending: 0,
         }
     }
 

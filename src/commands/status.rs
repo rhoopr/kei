@@ -71,6 +71,14 @@ pub(crate) async fn run_status(
     if !summary.metadata_capture.is_empty() {
         println!("Metadata capture:");
         for capture in &summary.metadata_capture {
+            if capture.unattributed_legacy_assets > 0 {
+                println!(
+                    "  {}: {} legacy records need attribution; {} awaiting current-work preservation proof",
+                    capture.library,
+                    capture.unattributed_legacy_assets,
+                    capture.unattributed_legacy_pending
+                );
+            }
             if let Some(pending) = capture.pending_revision {
                 println!(
                     "  {}: revision {} -> {}; {} processed, {} failed, {} remaining",
@@ -240,6 +248,16 @@ pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String 
         reasons.push(format!(
             "{} awaiting provider verification",
             count_phrase(summary.awaiting_provider_verification, "asset")
+        ));
+    }
+    let unattributed: u64 = summary
+        .metadata_capture
+        .iter()
+        .map(|capture| capture.unattributed_legacy_assets)
+        .sum();
+    if unattributed > 0 {
+        reasons.push(format!(
+            "{unattributed} preserved legacy records need attribution"
         ));
     }
     let metadata_capture_remaining: u64 = summary

@@ -581,6 +581,8 @@ impl MetricsHandle {
             last_success_at: health.last_success_at,
             consecutive_failures: health.consecutive_failures,
             last_error: health.last_error.clone(),
+            unattributed_legacy_assets: health.unattributed_legacy_assets,
+            unattributed_legacy_pending: health.unattributed_legacy_pending,
         });
     }
 

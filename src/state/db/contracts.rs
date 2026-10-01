@@ -243,6 +243,8 @@ pub(crate) struct ScopedDbSyncToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointTransition {
+    pub(crate) legacy_preservation_proofs: Vec<super::LegacyActivationProof>,
+    pub(crate) legacy_config_hash: Option<String>,
     pub(crate) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(crate) metadata_updates: Vec<(String, String)>,
     pub(crate) metadata_deletes: Vec<String>,
@@ -449,6 +451,9 @@ pub trait DownloadStateStore: Send + Sync {
     async fn get_asset_master_mappings(
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError> {
+        Ok(HashSet::new())
+    }
+    async fn get_protected_legacy_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
         Ok(HashSet::new())
     }
     async fn get_legacy_master_state_owners(
@@ -804,6 +809,67 @@ pub trait MembershipStore: Send + Sync {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
+    async fn legacy_child_receipts(
+        &self,
+        _library: &str,
+        _id: &str,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        Err(StateError::Invariant {
+            operation: "legacy_child_receipts",
+            detail: "legacy preservation is unsupported by this store".into(),
+        })
+    }
+    async fn legacy_preparation_snapshots(
+        &self,
+        _library: &str,
+        _limit: usize,
+    ) -> Result<Vec<super::LegacyPreparationSnapshot>, StateError> {
+        Err(StateError::Invariant {
+            operation: "legacy_preparation_snapshots",
+            detail: "legacy preservation is unsupported by this store".into(),
+        })
+    }
+    async fn prepare_legacy_preservation(
+        &self,
+        _snapshot: &super::LegacyPreparationSnapshot,
+        _files: &[super::LegacyFileEvidence],
+    ) -> Result<bool, StateError> {
+        Err(StateError::Invariant {
+            operation: "prepare_legacy_preservation",
+            detail: "legacy preservation is unsupported by this store".into(),
+        })
+    }
+    async fn legacy_preservations(
+        &self,
+        _library: &str,
+    ) -> Result<Vec<super::LegacyPreservation>, StateError> {
+        Err(StateError::Invariant {
+            operation: "legacy_preservations",
+            detail: "legacy preservation is unsupported by this store".into(),
+        })
+    }
+    async fn legacy_dependency_evidence(
+        &self,
+        _library: &str,
+        _id: &str,
+    ) -> Result<String, StateError> {
+        Err(StateError::Invariant {
+            operation: "legacy_dependency_evidence",
+            detail: "legacy preservation is unsupported by this store".into(),
+        })
+    }
+    async fn reactivate_legacy_preservation(
+        &self,
+        _library: &str,
+        _id: &str,
+        _expected_generation: Option<i64>,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "reactivate_legacy_preservation",
+            detail: "legacy preservation is unsupported by this store".into(),
+        })
+    }
+
     async fn record_metadata_write_failure(
         &self,
         library: &str,

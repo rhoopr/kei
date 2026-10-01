@@ -800,6 +800,11 @@ impl state::DownloadStateStore for FailingMetadataSetDb {
         self.inner.get_asset_master_mappings().await
     }
 
+    async fn get_protected_legacy_ids(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError> {
+        self.inner.get_protected_legacy_ids().await
+    }
     async fn get_legacy_master_state_owners(
         &self,
     ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError> {
@@ -1243,6 +1248,55 @@ impl state::MembershipStore for FailingMetadataSetDb {
 
 #[async_trait::async_trait]
 impl state::MetadataRewriteStore for FailingMetadataSetDb {
+    async fn legacy_child_receipts(
+        &self,
+        library: &str,
+        id: &str,
+    ) -> Result<Vec<crate::state::AssetRecord>, crate::state::error::StateError> {
+        self.inner.legacy_child_receipts(library, id).await
+    }
+    async fn legacy_preparation_snapshots(
+        &self,
+        library: &str,
+        limit: usize,
+    ) -> Result<Vec<state::LegacyPreparationSnapshot>, state::error::StateError> {
+        self.inner
+            .legacy_preparation_snapshots(library, limit)
+            .await
+    }
+    async fn prepare_legacy_preservation(
+        &self,
+        snapshot: &state::LegacyPreparationSnapshot,
+        files: &[state::LegacyFileEvidence],
+    ) -> Result<bool, state::error::StateError> {
+        self.inner
+            .prepare_legacy_preservation(snapshot, files)
+            .await
+    }
+    async fn legacy_preservations(
+        &self,
+        library: &str,
+    ) -> Result<Vec<state::LegacyPreservation>, state::error::StateError> {
+        self.inner.legacy_preservations(library).await
+    }
+    async fn legacy_dependency_evidence(
+        &self,
+        library: &str,
+        id: &str,
+    ) -> Result<String, state::error::StateError> {
+        self.inner.legacy_dependency_evidence(library, id).await
+    }
+    async fn reactivate_legacy_preservation(
+        &self,
+        library: &str,
+        id: &str,
+        expected_generation: Option<i64>,
+    ) -> Result<(), state::error::StateError> {
+        self.inner
+            .reactivate_legacy_preservation(library, id, expected_generation)
+            .await
+    }
+
     async fn record_metadata_write_failure(
         &self,
         library: &str,

@@ -13,6 +13,7 @@ pub mod session;
 pub(crate) mod smart_folders;
 pub mod types;
 
+pub(crate) use album::CompleteLegacyInventory;
 #[cfg(test)]
 pub(crate) use album::MAX_EMPTY_PAGE_PROBES;
 pub use album::PhotoAlbum;

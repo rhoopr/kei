@@ -171,6 +171,7 @@ pub(in crate::download) struct DownloadContext {
     /// `None` disables new legacy adoption after an owner query failure.
     pub(in crate::download) legacy_master_state_owners: Option<LibraryMasterAssetMap>,
     legacy_added_dates: LegacyAddedDates,
+    protected_legacy_ids: LibraryAssetSet,
     /// Nested map: `library` -> set of asset IDs known to the state DB (any
     /// status). Used in retry-only mode to skip new assets that were never
     /// synced in the same CloudKit zone.
@@ -233,6 +234,7 @@ impl DownloadContext {
             known_id_rows,
             mapping_rows,
             legacy_owner_rows,
+            protected_legacy_rows,
         ) = tokio::join!(
             async {
                 db.get_downloaded_file_records().await.unwrap_or_else(|e| {
@@ -275,6 +277,7 @@ impl DownloadContext {
             known_ids_fut,
             db.get_asset_master_mappings(),
             db.get_legacy_master_state_owners(),
+            db.get_protected_legacy_ids(),
         );
 
         // Shared interner so the same asset_id allocates exactly one
@@ -462,7 +465,7 @@ impl DownloadContext {
             })
             .ok();
 
-        let legacy_master_state_owners = legacy_owner_rows
+        let mut legacy_master_state_owners = legacy_owner_rows
             .map(|owner_rows| {
                 let mut owners: LibraryMasterAssetMap = FxHashMap::default();
                 for (library, master_record_name, asset_record_name) in owner_rows {
@@ -478,6 +481,20 @@ impl DownloadContext {
             })
             .ok();
 
+        let mut protected_legacy_ids: LibraryAssetSet = FxHashMap::default();
+        match protected_legacy_rows {
+            Ok(rows) => {
+                for (library, id) in rows {
+                    let library = intern_id(&mut interner, library);
+                    let id = intern_id(&mut interner, id);
+                    protected_legacy_ids.entry(library).or_default().insert(id);
+                }
+            }
+            Err(error) => {
+                legacy_master_state_owners = None;
+                tracing::warn!(%error, "Legacy preservation could not be loaded; legacy adoption disabled");
+            }
+        }
         let mut known_ids: LibraryAssetSet = FxHashMap::default();
         for (library, asset_id) in known_id_rows {
             let lib = intern_id(&mut interner, library);
@@ -491,8 +508,25 @@ impl DownloadContext {
             let id = intern_id(&mut interner, asset_id);
             attempt_counts.entry(lib).or_default().insert(id, count);
         }
-        let downloaded_without_metadata_hash = count_version_set_entries(&downloaded_ids)
-            > count_value_map_entries(&downloaded_metadata_hashes);
+        let downloaded_without_metadata_hash = if protected_legacy_ids.is_empty() {
+            count_version_set_entries(&downloaded_ids)
+                > count_value_map_entries(&downloaded_metadata_hashes)
+        } else {
+            downloaded_ids.iter().any(|(library, ids)| {
+                ids.iter().any(|(id, versions)| {
+                    !protected_legacy_ids
+                        .get(library)
+                        .is_some_and(|protected| protected.contains(id))
+                        && versions.iter().any(|version| {
+                            downloaded_metadata_hashes
+                                .get(library)
+                                .and_then(|ids| ids.get(id))
+                                .and_then(|versions| versions.get(version))
+                                .is_none()
+                        })
+                })
+            })
+        };
 
         Self {
             downloaded_ids,
@@ -508,6 +542,7 @@ impl DownloadContext {
             asset_master_mappings,
             legacy_master_state_owners,
             legacy_added_dates,
+            protected_legacy_ids,
             known_ids,
             attempt_counts,
             downloaded_without_metadata_hash,
@@ -708,6 +743,13 @@ impl DownloadContext {
     ) -> bool {
         let asset_record_name = asset.asset_record_name();
         let master_record_name = asset.id();
+        if self
+            .protected_legacy_ids
+            .get(library)
+            .is_some_and(|ids| ids.contains(master_record_name))
+        {
+            return false;
+        }
         if asset_record_name == master_record_name
             || self.has_state_version(library, asset_record_name)
         {
@@ -805,6 +847,16 @@ impl DownloadContext {
         asset: &PhotoAsset,
         claimed_legacy_master_states: &mut ClaimedLegacyMasterStates,
     ) -> std::result::Result<Arc<str>, crate::state::error::StateError> {
+        if self
+            .protected_legacy_ids
+            .get(library)
+            .is_some_and(|ids| ids.contains(asset.asset_record_name()))
+        {
+            return Err(crate::state::error::StateError::Invariant {
+                operation: "select_asset_state_record_name_for_download",
+                detail: "provider identity collides with a protected legacy record".into(),
+            });
+        }
         let state_record_name =
             self.select_asset_state_record_name(library, asset, claimed_legacy_master_states);
         if state_record_name.as_ref() != asset.id()

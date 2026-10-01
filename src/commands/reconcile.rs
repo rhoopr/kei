@@ -28,7 +28,7 @@ use crate::cli;
 use crate::config;
 use crate::download::file::{LocalFileSizeExpectation, local_file_size_matches_state};
 use crate::state;
-use crate::state::{ReportStateStore, VersionSizeKey};
+use crate::state::{DownloadStateStore, ReportStateStore, VersionSizeKey};
 
 use super::{LISTING_CAP, print_truncation_tail};
 
@@ -276,10 +276,16 @@ pub(crate) async fn run_reconcile(
         print_truncation_tail(total_issues, printed.get());
     }
 
+    let protected = db.get_protected_legacy_ids().await?;
+    let mut protected_drift = 0u64;
     let mut marked_failed = 0u64;
     let mut mark_errors = 0u64;
     if !args.dry_run {
         for m in &drifted {
+            if protected.contains(&(m.library.to_string(), m.id.to_string())) {
+                protected_drift += 1;
+                continue;
+            }
             match db
                 .mark_failed(&m.library, &m.id, m.version_size.as_str(), m.kind.reason())
                 .await
@@ -326,6 +332,11 @@ pub(crate) async fn run_reconcile(
         );
     } else {
         println!("  Marked failed: {marked_failed}");
+        if protected_drift > 0 {
+            println!(
+                "  Protected legacy records needing inspection: {protected_drift}; original receipts retained"
+            );
+        }
         if mark_errors > 0 {
             println!("  Mark errors:   {mark_errors}");
         }

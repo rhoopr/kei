@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 27;
+pub(crate) const SCHEMA_VERSION: i32 = 28;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -41,6 +41,94 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     interrupted INTEGER DEFAULT 0
 );
 ";
+
+/// Preservation starts empty. Classification and cursor permission require the
+/// state owner's fenced prepare/activate transactions, never schema migration.
+fn migrate_legacy_preservation(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(r"
+CREATE TABLE IF NOT EXISTS unattributed_legacy (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    evidence_version INTEGER NOT NULL CHECK(evidence_version = 1),
+    original_evidence TEXT NOT NULL,
+    files TEXT NOT NULL,
+    prepared_at INTEGER NOT NULL,
+    active_generation INTEGER,
+    PRIMARY KEY(library, asset_id)
+);
+CREATE TABLE IF NOT EXISTS unattributed_legacy_paths (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    path_key TEXT NOT NULL,
+    local_path TEXT NOT NULL,
+    PRIMARY KEY(library, asset_id, path_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS unattributed_legacy_path_owner ON unattributed_legacy_paths(path_key);
+CREATE TABLE IF NOT EXISTS unattributed_legacy_proofs (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    evidence_version INTEGER NOT NULL CHECK(evidence_version = 1),
+    dependency_evidence TEXT NOT NULL,
+    provider_evidence TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    prior_cursor TEXT NOT NULL,
+    next_cursor TEXT NOT NULL,
+    committed_at INTEGER NOT NULL,
+    PRIMARY KEY(library, asset_id, generation)
+);
+CREATE TRIGGER IF NOT EXISTS unattributed_original_immutable BEFORE UPDATE ON unattributed_legacy
+WHEN NEW.library IS NOT OLD.library OR NEW.asset_id IS NOT OLD.asset_id
+ OR NEW.evidence_version IS NOT OLD.evidence_version OR NEW.original_evidence IS NOT OLD.original_evidence
+ OR NEW.files IS NOT OLD.files OR NEW.prepared_at IS NOT OLD.prepared_at
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_original_retained BEFORE DELETE ON unattributed_legacy
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy evidence must be retained'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_proof_immutable BEFORE UPDATE ON unattributed_legacy_proofs
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy proof is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_proof_retained BEFORE DELETE ON unattributed_legacy_proofs
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy proof must be retained'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_path_immutable BEFORE UPDATE ON unattributed_legacy_paths
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy path is protected'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_path_retained BEFORE DELETE ON unattributed_legacy_paths
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy path must be retained'); END;
+")?;
+    // Defense in depth. Callers must exclude protected identities before byte
+    // writes; refusing a late state write alone cannot protect file contents.
+    for (table, id) in [
+        ("assets", "id"),
+        ("asset_metadata_paths", "id"),
+        ("asset_metadata_capture_revisions", "asset_id"),
+        ("metadata_capture_retries", "asset_id"),
+        ("asset_albums", "asset_id"),
+        ("asset_people", "asset_id"),
+        ("asset_album_memberships", "asset_record_name"),
+        ("legacy_master_state_owners", "master_record_name"),
+    ] {
+        for (action, row) in [("INSERT", "NEW"), ("UPDATE", "OLD"), ("DELETE", "OLD")] {
+            let moved_into = if action == "UPDATE" {
+                format!(
+                    " OR EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=NEW.library AND p.asset_id=NEW.{id})"
+                )
+            } else {
+                String::new()
+            };
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS unattributed_protect_{table}_{action} BEFORE {action} ON {table} \
+                 WHEN EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library={row}.library AND p.asset_id={row}.{id}){moved_into} \
+                 BEGIN SELECT RAISE(ABORT, 'unattributed legacy identity is protected'); END;"
+            ))?;
+        }
+    }
+    // Re-entry is supported, but an unrelated table with this name must not
+    // silently masquerade as the preservation schema.
+    conn.prepare("SELECT library,asset_id,evidence_version,original_evidence,files,prepared_at,active_generation FROM unattributed_legacy LIMIT 0")?;
+    conn.prepare(
+        "SELECT library,asset_id,path_key,local_path FROM unattributed_legacy_paths LIMIT 0",
+    )?;
+    conn.prepare("SELECT library,asset_id,generation,evidence_version,dependency_evidence,provider_evidence,config_hash,prior_cursor,next_cursor,committed_at FROM unattributed_legacy_proofs LIMIT 0")?;
+    Ok(())
+}
 
 /// Retry schedules do not complete metadata capture or authorize checkpoint advancement.
 const SCHEMA_V27: &str = r"
@@ -816,6 +904,7 @@ fn migrate_to_version(
         25 => conn.execute_batch(SCHEMA_V25)?,
         26 => conn.execute_batch(SCHEMA_V26)?,
         27 => conn.execute_batch(SCHEMA_V27)?,
+        28 => migrate_legacy_preservation(conn)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -833,6 +922,134 @@ mod tests {
     use super::*;
 
     #[test]
+    fn v28_preservation_migration_is_empty_and_retains_schema27_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=27 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute_batch("INSERT INTO metadata(key,value) VALUES ('sync_token:PrimarySync','before');
+            INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum) VALUES ('PrimarySync','legacy','original','provider','image.jpg',1.25,2.5,10,'photo','downloaded',1,'/photos/image.jpg','local');
+            INSERT INTO metadata_capture_retries VALUES ('PrimarySync','legacy',1,'[1,2,3]',8,4,10,20);
+            INSERT INTO asset_master_mappings VALUES ('PrimarySync','child-a','legacy',1),('PrimarySync','child-b','legacy',2);").unwrap();
+        fn rows(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+                .unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+        let tables = [
+            "assets",
+            "metadata",
+            "metadata_capture_retries",
+            "asset_master_mappings",
+            "asset_metadata_paths",
+            "asset_metadata_capture_revisions",
+        ];
+        let before: Vec<_> = tables.iter().map(|table| rows(&conn, table)).collect();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 28);
+        for (table, original) in tables.iter().zip(before) {
+            assert_eq!(rows(&conn, table), original, "{table}");
+        }
+        for table in [
+            "unattributed_legacy",
+            "unattributed_legacy_paths",
+            "unattributed_legacy_proofs",
+        ] {
+            assert!(rows(&conn, table).is_empty());
+        }
+    }
+
+    #[test]
+    fn v28_preservation_guards_originals_and_history_by_library() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for library in ["PrimarySync", "OtherSync"] {
+            conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at) VALUES (?1,'legacy','original','checksum','original.jpg',1,10,'photo','downloaded',1)",[library]).unwrap();
+        }
+        conn.execute_batch("INSERT INTO metadata_capture_retries VALUES ('PrimarySync','legacy',1,'original retry',8,4,10,20);
+            INSERT INTO unattributed_legacy VALUES ('PrimarySync','legacy',1,'original evidence','[]',1,NULL);
+            INSERT INTO unattributed_legacy_proofs VALUES ('PrimarySync','legacy',1,1,'child evidence','provider evidence','config','before','after',1);
+            INSERT INTO unattributed_legacy_paths VALUES ('PrimarySync','legacy','path-key','/photos/original.jpg');").unwrap();
+        for sql in [
+            "UPDATE assets SET created_at=99 WHERE library='PrimarySync'",
+            "DELETE FROM assets WHERE library='PrimarySync'",
+            "UPDATE metadata_capture_retries SET generation=9",
+            "DELETE FROM metadata_capture_retries",
+            "INSERT INTO asset_metadata_capture_revisions VALUES ('PrimarySync','legacy',1,99)",
+            "INSERT INTO legacy_master_state_owners VALUES ('PrimarySync','legacy','guessed-child',99)",
+            "UPDATE unattributed_legacy SET original_evidence='changed'",
+            "DELETE FROM unattributed_legacy",
+            "UPDATE unattributed_legacy_proofs SET dependency_evidence='changed'",
+            "DELETE FROM unattributed_legacy_proofs",
+            "DELETE FROM unattributed_legacy_paths",
+        ] {
+            assert!(conn.execute_batch(sql).is_err(), "guard missed {sql}");
+        }
+        assert_eq!(
+            conn.execute(
+                "UPDATE assets SET created_at=99 WHERE library='OtherSync'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute("UPDATE unattributed_legacy SET active_generation=1", [])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute("UPDATE unattributed_legacy SET active_generation=NULL", [])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT original_evidence FROM unattributed_legacy",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "original evidence"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM unattributed_legacy_proofs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn v28_failed_migration_rolls_back_and_retains_prior_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=27 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute_batch("CREATE TABLE unattributed_legacy_paths(blocked INTEGER);")
+            .unwrap();
+        assert!(migrate(&conn).is_err());
+        // The failed step is rolled back, even when this fixture's caller has
+        // not closed the connection yet. No partially activated row can exist.
+        assert_eq!(get_schema_version(&conn).unwrap(), 27);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='unattributed_legacy'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn v27_metadata_capture_retry_migration_preserves_pending_work() {
         let conn = Connection::open_in_memory().unwrap();
         for version in 1..=26 {
@@ -842,7 +1059,7 @@ mod tests {
             INSERT INTO metadata_capture_state(library,pending_revision,failed_assets,updated_at) VALUES ('PrimarySync',1,19,0);").unwrap();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 27);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(
             conn.query_row(
                 "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
@@ -905,7 +1122,7 @@ mod tests {
             INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum) VALUES ('PrimarySync','child','original','provider','image.jpg',1,10,'photo','downloaded',1,'/photos/image.jpg','local');").unwrap();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 27);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(
             conn.query_row(
                 "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",

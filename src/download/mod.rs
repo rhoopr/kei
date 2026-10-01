@@ -58,3 +58,5 @@ use orchestration::url_refresh::{
     reason = "retain the existing crate-level type paths in the facade"
 )]
 pub(crate) use orchestration::{models::PassKey, reconciliation::PathReconciliationResult};
+
+pub(crate) mod legacy_preservation;

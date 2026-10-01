@@ -844,6 +844,64 @@ matching child, and full-evidence matching child counts. It contains no IDs,
 paths, checksums, or provider metadata. These counts do not authorize identity
 selection, even when only one child matches every stored rendition.
 
+Schema v28 can preserve an unclaimed, ambiguous legacy master receipt without
+assigning it to a child. `download/legacy_preservation.rs` owns eligibility and
+file validation; `state/db/legacy_preservation.rs` owns immutable evidence and
+generation-fenced receipts. Migration creates empty tables and protection
+triggers only. It does not classify or rewrite existing records. Schema-27
+binaries reject a migrated database; read-only reports require the current
+schema and never migrate it.
+
+Preparation protects the original catalogue rows, capture revisions, retry
+receipts, relationship history, media paths and sidecar presence. It preserves
+the old checkpoint. A complete unfiltered zone inventory must cover hidden
+children, all pages, an explicit completion marker and a nonblank final cursor.
+Each scan is limited to 10,000 pages, 1,000,000 records and 256 MiB of serialized
+response data; a cycle considers at most 64 new candidates. Exhausting a limit
+retains the hold. Sparse, malformed, cross-library or incomplete evidence cannot
+activate preservation. No diagnostic count is ownership proof.
+
+Activation requires a normal completed current inventory and, when a retained
+cursor exists, a successful delta bridge. Independently identified current
+children need separate, finalized receipts and verified files for every selected
+rendition. A file published before a state-write crash may qualify by exact
+SHA-256 equality with the current provider checksum; filename and size are not
+sufficient. Modified media needs its verified pre-metadata checksum. Pending
+rewrite, capture-repair or path-reconciliation debt keeps this conservative
+qualification blocked. Retained reconciliation destination choices are naming
+evidence, not pending work, and remain part of the dependency comparison. No metadata writer is enabled automatically. A replay
+that creates debt holds the cursor; a later cycle may qualify after configured
+current-child work completes.
+
+Original media and sidecars are fingerprinted through confined paths; links,
+pending temporary writes, replacement journals, shared paths and changed bytes
+reject qualification. Shared-root replacement recovery checks protected paths from
+all libraries before opening a journal, including unselected libraries. Current child files and sidecar presence are also bound
+into the receipt. Original files are never moved, rewritten, adopted or deleted.
+Normal downloads, metadata repair, local path reconciliation, imports and source
+tombstones respect the protection before byte writes; SQL guards provide defense
+in depth. `reconcile` reports drift in protected originals without converting
+them into download retries. Verification and manifest export retain the original
+identities, dates, paths and history; download status does not establish ownership.
+
+The final SQLite transaction compares the original snapshot, current child and
+family evidence, receipt generation, configuration metadata and prior cursor.
+It appends the proof and commits the cursor together. Staged config-reconciliation
+cursors use the same transaction. Invalid or stale proof, incomplete current work,
+interruption and write failure retain the prior cursor. Existing current-provider
+identity and checkpoint guards remain independent and are never cleared to permit
+preservation. An unchanged activated receipt can support ordinary incremental
+cycles without another full inventory. Changed family, configuration, file or
+receipt evidence reactivates the hold while retaining every original snapshot and
+prior proof. Reactivation does not authorize historical attribution or rewriting.
+
+`status`, cycle reports and health JSON expose `unattributed_legacy_assets` and
+`unattributed_legacy_pending` separately from download failures. The first counts
+legacy records still needing attribution; the second counts records awaiting
+valid current-work preservation proof. Original capture revision and retry history
+remain stored. Advancing current sync does not claim a complete historical backup;
+backup safety remains false while attribution is unresolved.
+
 Automatic repair processes at most 500 stale assets per library in one sync
 cycle. When a clean batch makes progress and work remains, watch and service
 mode wait at most 60 seconds before the next cycle. A stalled or failed batch

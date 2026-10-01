@@ -69,13 +69,17 @@ pub(super) use self::{
 
 /// Recover interrupted fallback publications before normal download work.
 #[cfg(target_os = "linux")]
-pub(super) async fn recover_conditional_replacements(root: &std::path::Path) -> anyhow::Result<()> {
-    replacement_recovery::recover_tree(root).await
+pub(super) async fn recover_conditional_replacements(
+    root: &std::path::Path,
+    protected_paths: &[std::path::PathBuf],
+) -> anyhow::Result<()> {
+    replacement_recovery::recover_tree(root, protected_paths).await
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(super) async fn recover_conditional_replacements(
     _root: &std::path::Path,
+    _protected_paths: &[std::path::PathBuf],
 ) -> anyhow::Result<()> {
     Ok(())
 }
@@ -113,4 +117,31 @@ pub(super) async fn recover_metadata_replacements(path: &std::path::Path) -> any
     #[cfg(not(target_os = "linux"))]
     let _ = path;
     Ok(())
+}
+
+/// Read-only prerequisite for preserving a target that recovery could otherwise change.
+pub(super) async fn has_replacement_journal(
+    root: &std::path::Path,
+    target: &std::path::Path,
+) -> anyhow::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let root = root.to_path_buf();
+        let target = target.to_path_buf();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let path = replacement_recovery::directory_path(&target)?;
+            Ok(crate::fs_util::ConfinedPath::open(
+                &root,
+                &path,
+                crate::fs_util::ConfinedParents::Existing,
+            )?
+            .entry_exists()?)
+        })
+        .await?
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, target);
+        Ok(false)
+    }
 }

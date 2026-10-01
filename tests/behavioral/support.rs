@@ -55,7 +55,7 @@ pub(super) fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 27;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 28;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -348,6 +348,82 @@ CREATE TABLE IF NOT EXISTS metadata_capture_retries (
 );
 
 ").unwrap();
+    conn.execute_batch(r"
+CREATE TABLE IF NOT EXISTS unattributed_legacy (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    evidence_version INTEGER NOT NULL CHECK(evidence_version = 1),
+    original_evidence TEXT NOT NULL,
+    files TEXT NOT NULL,
+    prepared_at INTEGER NOT NULL,
+    active_generation INTEGER,
+    PRIMARY KEY(library, asset_id)
+);
+CREATE TABLE IF NOT EXISTS unattributed_legacy_paths (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    path_key TEXT NOT NULL,
+    local_path TEXT NOT NULL,
+    PRIMARY KEY(library, asset_id, path_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS unattributed_legacy_path_owner ON unattributed_legacy_paths(path_key);
+CREATE TABLE IF NOT EXISTS unattributed_legacy_proofs (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    evidence_version INTEGER NOT NULL CHECK(evidence_version = 1),
+    dependency_evidence TEXT NOT NULL,
+    provider_evidence TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    prior_cursor TEXT NOT NULL,
+    next_cursor TEXT NOT NULL,
+    committed_at INTEGER NOT NULL,
+    PRIMARY KEY(library, asset_id, generation)
+);
+CREATE TRIGGER IF NOT EXISTS unattributed_original_immutable BEFORE UPDATE ON unattributed_legacy
+WHEN NEW.library IS NOT OLD.library OR NEW.asset_id IS NOT OLD.asset_id
+ OR NEW.evidence_version IS NOT OLD.evidence_version OR NEW.original_evidence IS NOT OLD.original_evidence
+ OR NEW.files IS NOT OLD.files OR NEW.prepared_at IS NOT OLD.prepared_at
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_original_retained BEFORE DELETE ON unattributed_legacy
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy evidence must be retained'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_proof_immutable BEFORE UPDATE ON unattributed_legacy_proofs
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy proof is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_proof_retained BEFORE DELETE ON unattributed_legacy_proofs
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy proof must be retained'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_path_immutable BEFORE UPDATE ON unattributed_legacy_paths
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy path is protected'); END;
+CREATE TRIGGER IF NOT EXISTS unattributed_path_retained BEFORE DELETE ON unattributed_legacy_paths
+BEGIN SELECT RAISE(ABORT, 'unattributed legacy path must be retained'); END;
+").unwrap();
+    // Defense in depth. Callers must exclude protected identities before byte
+    // writes; refusing a late state write alone cannot protect file contents.
+    for (table, id) in [
+        ("assets", "id"),
+        ("asset_metadata_paths", "id"),
+        ("asset_metadata_capture_revisions", "asset_id"),
+        ("metadata_capture_retries", "asset_id"),
+        ("asset_albums", "asset_id"),
+        ("asset_people", "asset_id"),
+        ("asset_album_memberships", "asset_record_name"),
+        ("legacy_master_state_owners", "master_record_name"),
+    ] {
+        for (action, row) in [("INSERT", "NEW"), ("UPDATE", "OLD"), ("DELETE", "OLD")] {
+            let moved_into = if action == "UPDATE" {
+                format!(
+                    " OR EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=NEW.library AND p.asset_id=NEW.{id})"
+                )
+            } else {
+                String::new()
+            };
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS unattributed_protect_{table}_{action} BEFORE {action} ON {table} \
+                 WHEN EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library={row}.library AND p.asset_id={row}.{id}){moved_into} \
+                 BEGIN SELECT RAISE(ABORT, 'unattributed legacy identity is protected'); END;"
+            )).unwrap();
+        }
+    }
+
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();
     conn

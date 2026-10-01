@@ -66,8 +66,11 @@ lint settings, and dependency lockfile entries are not counted. There are no
 - `src/download/file/platform.rs::renameat2_confined_blocking`,
   `rename_confined_macos`, and `hard_link_confined` retain both parent
   descriptors and NUL-terminated names for no-overwrite publication.
-- Windows attribute probes use live handles and correctly sized output
-  storage. Initialization is assumed only after the syscall succeeds.
+- `src/fs_util.rs::windows_file_information` and Windows attribute probes use
+  live handles and correctly sized output storage. Initialization is assumed
+  only after the syscall succeeds. The same initialized structure supplies
+  the link count used to reject shared file objects during legacy preservation;
+  stable `std` does not expose that Windows handle field.
 - `std` has no equivalent descriptor-relative traversal/publication API.
   Replacing these calls with ordinary path operations would restore the race.
 
