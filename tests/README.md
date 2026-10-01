@@ -35,6 +35,7 @@ tests/
 | `cargo test --test cli` | no | `just test fast` |
 | `cargo test --test behavioral` | no | `just test fast` |
 | `cargo test --test branch_static` | no | `just test offline`, selected scenario slices |
+| `cargo test --all-features --lib icloud::photos::album::lookup::tests::live_targeted_record_lookup_distinguishes_present_and_missing -- --exact --ignored --test-threads=1` | yes | `just test live` |
 | `cargo test --all-features --test sync -- --ignored --test-threads=1` | yes | `just test live` |
 | `cargo test --all-features --test state_auth -- --ignored --test-threads=1` | yes | `just test live` |
 | `cargo test --all-features --test import_existing_live -- --ignored --test-threads=1` | yes | `just test live` |
@@ -53,7 +54,11 @@ tests/
 rather than `just test fast`. Run it directly or through a relevant scenario
 slice when changing packaging, migration guidance, or validation tooling.
 
-The three live Rust targets also contain offline tests. Without `--ignored`,
+The library lookup probe runs by exact name so the live route does not run
+other ignored library tests, including the parent-controlled process-death
+child. Full-test reaches this probe through `just test live`.
+
+The three live Rust integration targets also contain offline tests. Without `--ignored`,
 they run shared helper tests; `import_existing_live` also checks fixture
 isolation, command construction, and rejection of a removed CLI flag. These
 offline tests run in `just test offline` and `just gate` without credentials.
@@ -178,7 +183,7 @@ just test                       # all-feature offline tests
 just test offline               # all-feature/no-default suites + scenario catalog checks
 just test scenario NAME         # focused behavior slice from scripts/test-scenarios/
 just test scenarios             # every focused offline scenario slice
-just test live                  # live sync + state_auth + import-existing against iCloud
+just test live                  # live lookup + sync + state_auth + import-existing against iCloud
 just test live-shell            # discovered live shell suites
 just test live-smoke            # release-binary live CLI/import smokes
 just test concurrency           # shell: concurrent/resume/partial-fail
