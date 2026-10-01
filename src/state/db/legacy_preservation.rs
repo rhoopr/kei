@@ -526,6 +526,214 @@ mod tests {
         ];
         (db, snapshot, files)
     }
+    #[tokio::test]
+    async fn legacy_preservation_retains_mixed_rendition_dates_without_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (db, _, mut files) = seed(&path).await;
+        let original_date = chrono::DateTime::from_timestamp(1_514_764_800, 0).unwrap();
+        let adjusted_date = chrono::DateTime::from_timestamp(1_420_070_400, 0).unwrap();
+        {
+            let conn = db.acquire_lock("seed_historical_dates").unwrap();
+            conn.execute(
+                "UPDATE assets SET added_at=?1 WHERE library='PrimarySync' AND id='master'",
+                [original_date.timestamp()],
+            )
+            .unwrap();
+        }
+        let adjusted = dir.path().join("adjusted.jpg");
+        std::fs::write(&adjusted, b"adjusted historical bytes").unwrap();
+        let checksum = crate::download::file::compute_sha256(&adjusted)
+            .await
+            .unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("master")
+            .version_size(crate::state::VersionSizeKey::Adjusted)
+            .added_at(adjusted_date)
+            .size(25)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "master",
+            "adjusted",
+            &adjusted,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.set_metadata_capture_revision_for_test("PrimarySync", "master", 0);
+        files.push(LegacyFileEvidence {
+            root: dir.path().into(),
+            path: adjusted.clone(),
+            sha256: Some(checksum),
+            size: Some(25),
+        });
+        let snapshot = db
+            .legacy_preparation_snapshots("PrimarySync", 64)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(
+            db.prepare_legacy_preservation(&snapshot, &files)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.legacy_preservations("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        files.push(LegacyFileEvidence {
+            root: dir.path().into(),
+            path: dir.path().join("adjusted.jpg.xmp"),
+            sha256: None,
+            size: None,
+        });
+        assert!(
+            db.prepare_legacy_preservation(&snapshot, &files)
+                .await
+                .unwrap()
+        );
+        drop(db);
+        for _ in 0..2 {
+            let db = SqliteStateDb::open(&path).await.unwrap();
+            let preserved = db.legacy_preservations("PrimarySync").await.unwrap();
+            assert_eq!(preserved.len(), 1);
+            assert_eq!(preserved[0].original_evidence, snapshot.evidence);
+            assert_eq!(preserved[0].active_generation, None);
+            assert!(
+                db.get_legacy_master_state_owners()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                let expected = match row.version_size {
+                    crate::state::VersionSizeKey::Original => original_date,
+                    crate::state::VersionSizeKey::Adjusted => adjusted_date,
+                    _ => panic!("unexpected synthetic rendition"),
+                };
+                assert_eq!(row.added_at, Some(expected));
+            }
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("before")
+            );
+            assert_eq!(
+                std::fs::read(&adjusted).unwrap(),
+                b"adjusted historical bytes"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("original.jpg")).unwrap(),
+                b"legacy bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_preservation_saved_owner_excludes_retained_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (db, snapshot, files) = seed(&path).await;
+        // Model a saved claim from an older writer without asking today's
+        // conservative claim gate to infer an owner for this family.
+        db.acquire_lock("seed_saved_legacy_claim").unwrap().execute(
+            "INSERT INTO legacy_master_state_owners VALUES ('PrimarySync','master','child-a',1)", [],
+        ).unwrap();
+        assert!(
+            db.legacy_preparation_snapshots("PrimarySync", 64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !db.prepare_legacy_preservation(&snapshot, &files)
+                .await
+                .unwrap()
+        );
+        drop(db);
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        assert!(
+            db.legacy_preservations("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.get_legacy_master_state_owners().await.unwrap().len(), 1);
+        assert_eq!(db.get_asset_master_mappings().await.unwrap().len(), 2);
+        assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 1);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("original.jpg")).unwrap(),
+            b"legacy bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_preservation_single_child_stale_receipt_keeps_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (db, snapshot, files) = seed(&path).await;
+        assert!(
+            db.prepare_legacy_preservation(&snapshot, &files)
+                .await
+                .unwrap()
+        );
+        let child = crate::test_helpers::TestAssetRecord::new("child-a").build();
+        db.upsert_seen(&child).await.unwrap();
+        // Only the SQLite compare-and-commit boundary is under test here;
+        // the synthetic proof is not a claim of validated provider coverage.
+        let stale = proof(&db, &snapshot).await;
+        let mut changed = child.clone();
+        changed.added_at = chrono::DateTime::from_timestamp(1_600_000_000, 0);
+        db.upsert_seen(&changed).await.unwrap();
+        assert!(
+            db.commit_checkpoint_transition(transition(vec![stale]))
+                .await
+                .is_err()
+        );
+        drop(db);
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before")
+        );
+        let preserved = db.legacy_preservations("PrimarySync").await.unwrap();
+        assert_eq!(preserved[0].active_generation, None);
+        assert_eq!(preserved[0].original_evidence, snapshot.evidence);
+        assert!(
+            db.get_legacy_master_state_owners()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let conn = db.acquire_lock("assert_no_stale_proof").unwrap();
+        let proofs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM unattributed_legacy_proofs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(proofs, 0);
+    }
+
     async fn proof(
         db: &SqliteStateDb,
         snapshot: &LegacyPreparationSnapshot,

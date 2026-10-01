@@ -3494,6 +3494,8 @@ enum AmbiguousChildFault {
     None,
     Preserve,
     PreserveConfigChange,
+    PreserveIncompleteInventory,
+    PreserveCheckpointFailure,
     PreserveCompanion,
     PreservePaginatedHidden,
     PreserveHiddenUnselected,
@@ -3507,6 +3509,10 @@ enum AmbiguousChildFault {
 }
 
 async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
+    Box::pin(exercise_legacy_child_cycles(fault, &[2, 3])).await;
+}
+
+async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: &[usize]) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -3519,6 +3525,7 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
         bridge_debt: bool,
         paginated: bool,
         omit_hidden: bool,
+        incomplete_inventory: bool,
     }
     #[async_trait::async_trait]
     impl crate::icloud::photos::PhotosSession for ChildSession {
@@ -3553,9 +3560,14 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
                 );
             }
             if url.contains("/changes/zone?") {
-                return Ok(
-                    serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":self.records}]}),
-                );
+                let mut response = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":self.records}]});
+                if self.incomplete_inventory {
+                    response["zones"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("moreComing");
+                }
+                return Ok(response);
             }
             if url.contains("/records/query/batch?") {
                 return Ok(album_count_response(if self.complete {
@@ -3619,6 +3631,8 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
         fault,
         AmbiguousChildFault::Preserve
             | AmbiguousChildFault::PreserveConfigChange
+            | AmbiguousChildFault::PreserveIncompleteInventory
+            | AmbiguousChildFault::PreserveCheckpointFailure
             | AmbiguousChildFault::PreserveCompanion
             | AmbiguousChildFault::PreservePaginatedHidden
             | AmbiguousChildFault::PreserveHiddenUnselected
@@ -3627,7 +3641,7 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
             | AmbiguousChildFault::PreserveStateWrite
             | AmbiguousChildFault::PreservePathConflict
     );
-    for children in [2, 3] {
+    for &children in child_counts {
         for sidecars in [false, true] {
             let server = crate::start_wiremock_or_skip!();
             let bytes =
@@ -3758,6 +3772,18 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
                         .await
                         .unwrap();
                 }
+                // Historical membership survives even when a complete current
+                // inventory has only one (or no) live child. It is not ownership.
+                for missing in children..2 {
+                    inner
+                        .upsert_asset_master_mapping(
+                            "PrimarySync",
+                            &format!("historical-absent-{missing}"),
+                            "legacy-master",
+                        )
+                        .await
+                        .unwrap();
+                }
                 inner
                     .set_metadata("sync_token:PrimarySync", "before")
                     .await
@@ -3780,6 +3806,11 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
                         .await
                         .unwrap()
                 );
+            }
+            if matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure) {
+                rusqlite::Connection::open(&database).unwrap().execute_batch(
+                    "CREATE TRIGGER fail_single_survivor_proof BEFORE INSERT ON unattributed_legacy_proofs BEGIN SELECT RAISE(ABORT,'injected checkpoint receipt failure'); END;"
+                ).unwrap();
             }
             let receipt_sql = "SELECT * FROM assets WHERE id='legacy-master'";
             let retry_sql = "SELECT * FROM metadata_capture_retries WHERE asset_id='legacy-master'";
@@ -3832,6 +3863,10 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
                     bridge_debt: matches!(fault, AmbiguousChildFault::PreserveBridgeDebt),
                     paginated: matches!(fault, AmbiguousChildFault::PreservePaginatedHidden),
                     omit_hidden: matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected),
+                    incomplete_inventory: matches!(
+                        fault,
+                        AmbiguousChildFault::PreserveIncompleteInventory
+                    ),
                 };
                 let mut primary = make_run_cycle_library_state_with_album(
                     "PrimarySync",
@@ -3928,6 +3963,10 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
                     "no guessed owner {label}"
                 );
                 let activated = preserving
+                    && children > 0
+                    && !matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory)
+                    && !(cycle == 0
+                        && matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure))
                     && !matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected)
                     && (!matches!(fault, AmbiguousChildFault::PreserveBridgeDebt)
                         || (cfg!(feature = "xmp") && sidecars && cycle > 0))
@@ -3983,6 +4022,18 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
                         result.stats.unattributed_legacy_pending, 0,
                         "current proof count {label}"
                     );
+                } else if preserving
+                    && (children == 0
+                        || matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory))
+                {
+                    assert!(
+                        inner
+                            .legacy_preservations("PrimarySync")
+                            .await
+                            .unwrap()
+                            .is_empty(),
+                        "no incomplete preparation {label}"
+                    );
                 } else if preserving {
                     assert_eq!(
                         inner.legacy_preservations("PrimarySync").await.unwrap()[0]
@@ -4006,6 +4057,10 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
                         result.stats.interrupted || result.stats.state_write_failures > 0,
                         "fault exercised {label}"
                     );
+                } else if matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory) {
+                    assert_eq!(result.stats.downloaded, 0, "incomplete inventory {label}");
+                    assert_eq!(inner.get_downloaded_page(0, 20).await.unwrap().len(), 1);
+                    assert!(result.stats.sync_token_blocked, "incomplete hold {label}");
                 } else {
                     let downloaded = inner.get_downloaded_page(0, 20).await.unwrap();
                     let mut paths = std::collections::HashSet::new();
@@ -4088,8 +4143,19 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
                         }
                     }
                 }
+                if cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure) {
+                    assert!(
+                        rows(&database, "SELECT * FROM unattributed_legacy_proofs").is_empty(),
+                        "failed receipt transaction rolled back {label}"
+                    );
+                    rusqlite::Connection::open(&database)
+                        .unwrap()
+                        .execute_batch("DROP TRIGGER fail_single_survivor_proof;")
+                        .unwrap();
+                }
                 let requests = server.received_requests().await.unwrap().len();
-                if cycle == 1 {
+                if cycle == 1 && !matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory)
+                {
                     assert!(
                         requests
                             >= names.len()
@@ -4203,6 +4269,87 @@ async fn run_cycle_ambiguous_children_unselected_hidden() {
 async fn run_cycle_ambiguous_children_config_reactivation() {
     Box::pin(exercise_ambiguous_child_cycles(
         AmbiguousChildFault::PreserveConfigChange,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_preserved() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::Preserve,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_hidden_paginated() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreservePaginatedHidden,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_incomplete_inventory_holds() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveIncompleteInventory,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_interruption_recovers() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveCancel,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_current_write_failure_recovers() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveStateWrite,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_checkpoint_failure_is_atomic() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveCheckpointFailure,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_bridge_debt_holds() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveBridgeDebt,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_config_change_revalidates() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveConfigChange,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_zero_children_hold() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::Preserve,
+        &[0],
     ))
     .await;
 }

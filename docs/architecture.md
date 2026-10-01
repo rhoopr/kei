@@ -844,8 +844,13 @@ matching child, and full-evidence matching child counts. It contains no IDs,
 paths, checksums, or provider metadata. These counts do not authorize identity
 selection, even when only one child matches every stored rendition.
 
-Schema v28 can preserve an unclaimed, ambiguous legacy master receipt without
-assigning it to a child. `download/legacy_preservation.rs` owns eligibility and
+Schema v28 can preserve an unclaimed legacy master receipt with at least two
+historical child mappings without assigning it to a child. A complete current
+inventory must contain at least one live child. A sole survivor must satisfy the
+same independent current-child receipt and file checks as a multi-child family;
+historical siblings missing from that inventory do not establish ownership or
+authorize source deletion. Zero-current-child families and saved legacy owners
+remain excluded. `download/legacy_preservation.rs` owns eligibility and
 file validation; `state/db/legacy_preservation.rs` owns immutable evidence and
 generation-fenced receipts. Migration creates empty tables and protection
 triggers only. It does not classify or rewrite existing records. Schema-27

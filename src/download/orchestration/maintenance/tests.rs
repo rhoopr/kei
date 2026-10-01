@@ -94,6 +94,101 @@ async fn incremental_with_metadata_backfill_records_full_enumeration_reason() {
 }
 
 #[tokio::test]
+async fn completed_legacy_capture_does_not_infer_historical_recovery_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+    let media_path = dir.path().join("historical.jpg");
+    let overwritten_date = chrono::DateTime::from_timestamp(1_500_000_000, 0).unwrap();
+    tokio::fs::write(&media_path, b"preserved historical bytes")
+        .await
+        .unwrap();
+    {
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("historical-master")
+            .added_at(overwritten_date)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "historical-master",
+            "original",
+            &media_path,
+            "local-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+        // Seed the durable result of an earlier bad claim. This deliberately
+        // supplies an owner; it does not assert that ownership was proven.
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", "historical-master", "wrong-child")
+                .await
+                .unwrap()
+        );
+        for child in ["wrong-child", "historical-child"] {
+            db.upsert_asset_master_mapping("PrimarySync", child, "historical-master")
+                .await
+                .unwrap();
+        }
+        db.set_metadata_capture_revision_for_test("PrimarySync", "historical-master", 1);
+        db.set_metadata("sync_token:PrimarySync", "retained-token")
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        let repair = run_metadata_capture_repair(
+            &[],
+            &config,
+            DownloadControls::download_hidden(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(repair.failures, 0);
+        assert!(
+            db.legacy_preparation_snapshots("PrimarySync", 64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.legacy_preservations("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(repair.stats.metadata_capture_refreshed, 0);
+        assert_eq!(repair.stats.metadata_capture_remaining, 0);
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].added_at, Some(overwritten_date));
+        assert_eq!(rows[0].local_path.as_deref(), Some(media_path.as_path()));
+        let owners = db.get_legacy_master_state_owners().await.unwrap();
+        assert_eq!(owners.len(), 1);
+        assert!(owners.contains(&(
+            "PrimarySync".to_string(),
+            "historical-master".to_string(),
+            "wrong-child".to_string(),
+        )));
+        assert_eq!(db.get_asset_master_mappings().await.unwrap().len(), 2);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("retained-token")
+        );
+        assert_eq!(
+            tokio::fs::read(&media_path).await.unwrap(),
+            b"preserved historical bytes"
+        );
+    }
+}
+
+#[tokio::test]
 async fn contract_metadata_capture_revision_repair_is_durable() {
     let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
     let dir = TempDir::new().expect("temp dir");
