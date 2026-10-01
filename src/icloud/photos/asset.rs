@@ -725,9 +725,13 @@ impl PhotoAsset {
         self.filename.as_deref()
     }
 
+    /// Provider capture-date evidence without the display/path epoch fallback.
+    pub(crate) fn asset_date_evidence(&self) -> Option<DateTime<Utc>> {
+        self.asset_date_ms.and_then(f64_to_millis_datetime)
+    }
+
     pub fn asset_date(&self) -> DateTime<Utc> {
-        self.asset_date_ms
-            .and_then(f64_to_millis_datetime)
+        self.asset_date_evidence()
             .unwrap_or_else(|| {
                 tracing::warn!(asset_id = %self.record_name, "Missing or invalid assetDate, falling back to epoch");
                 DateTime::UNIX_EPOCH
