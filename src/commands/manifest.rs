@@ -240,6 +240,89 @@ mod tests {
         assert_eq!(row.albums, ["Family", "Vacation"]);
     }
 
+    #[tokio::test]
+    async fn tactical_manifest_keeps_library_id_version_and_album_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let mut expected = Vec::new();
+        for library in ["LibraryA", "LibraryB"] {
+            for id in ["SAME_ID", "SECOND_ID"] {
+                let albums = if library == "LibraryA" {
+                    vec!["A-only", "Shared-name"]
+                } else {
+                    vec!["B-only", "Shared-name"]
+                };
+                for version in [
+                    crate::state::VersionSizeKey::Original,
+                    crate::state::VersionSizeKey::Medium,
+                ] {
+                    let key = format!("{library}-{id}-{}", version.as_str());
+                    let provider = format!("provider-{key}");
+                    let local = format!("local-{key}");
+                    let download = format!("download-{key}");
+                    let path = dir.path().join(&key).join("same.jpg");
+                    let record = TestAssetRecord::new(id)
+                        .library(library)
+                        .version_size(version)
+                        .filename("same.jpg")
+                        .checksum(&provider)
+                        .build();
+                    db.upsert_seen(&record).await.unwrap();
+                    db.mark_downloaded(
+                        library,
+                        id,
+                        version.as_str(),
+                        &path,
+                        &local,
+                        Some(&download),
+                    )
+                    .await
+                    .unwrap();
+                    expected.push((
+                        library.to_string(),
+                        id.to_string(),
+                        version.as_str().to_string(),
+                        "same.jpg".to_string(),
+                        Some(path.display().to_string()),
+                        provider,
+                        Some(local),
+                        Some(download),
+                        albums.iter().map(|v| (*v).to_string()).collect::<Vec<_>>(),
+                    ));
+                }
+                for album in albums {
+                    db.add_asset_album(library, id, album, "icloud")
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        drop(db);
+        expected.sort();
+        for _ in 0..2 {
+            let rows = load_manifest_rows(&db_path).await.unwrap();
+            assert_eq!(rows.len(), 8);
+            let actual: Vec<_> = rows
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.library,
+                        r.asset_id,
+                        r.version,
+                        r.filename,
+                        r.local_path,
+                        r.checksum,
+                        r.local_checksum,
+                        r.download_checksum,
+                        r.albums,
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
     #[test]
     fn csv_escapes_special_fields_and_keeps_albums_as_json() {
         let rows = vec![ManifestRow {
