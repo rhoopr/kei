@@ -97,12 +97,10 @@ impl LegacyCycle {
             match album.complete_legacy_inventory(&masters, cancel).await {
                 Ok(inventory) => {
                     for candidate in candidates {
-                        if inventory
+                        if !inventory
                             .children
                             .iter()
-                            .filter(|child| child.id() == candidate.asset_id)
-                            .count()
-                            < 2
+                            .any(|child| child.id() == candidate.asset_id)
                         {
                             continue;
                         }
@@ -366,7 +364,10 @@ async fn qualify_family(
         .iter()
         .filter(|child| child.id() == record.asset_id)
         .collect();
-    anyhow::ensure!(children.len() >= 2, "Legacy family is no longer ambiguous");
+    anyhow::ensure!(
+        !children.is_empty(),
+        "Legacy family has no current children"
+    );
     let mut paths: FxHashSet<_> = record
         .files
         .iter()
