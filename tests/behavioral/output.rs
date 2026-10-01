@@ -221,6 +221,44 @@ fn status_shows_safe_backup_summary_after_clean_sync() {
 }
 
 #[test]
+fn status_reports_metadata_capture_retry_without_private_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "private-legacy",
+        "downloaded",
+        "photo.jpg",
+        Some("/p/photo.jpg"),
+        None,
+        None,
+    );
+    conn.execute("INSERT INTO metadata_capture_state(library,pending_revision,failed_assets,updated_at) VALUES ('PrimarySync',1,19,0)", []).unwrap();
+    let evidence =
+        serde_json::json!(["private-legacy", null, [["original", "abc", 1000, null]]]).to_string();
+    conn.execute("INSERT INTO metadata_capture_retries VALUES ('PrimarySync','private-legacy',1,?1,1,1,?2,?3)", rusqlite::params![evidence,chrono::Utc::now().timestamp(),chrono::Utc::now().timestamp()+3600]).unwrap();
+    conn.execute("INSERT INTO sync_runs(started_at,completed_at,status) VALUES (1700000000,1700000010,'complete')", []).unwrap();
+    drop(conn);
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 unresolved identities, 1 deferred retries"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("19 failed"), "{stdout}");
+    assert!(stdout.contains("Backup status: unsafe"), "{stdout}");
+    assert!(!stdout.contains("private-legacy"));
+}
+
+#[test]
 fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";

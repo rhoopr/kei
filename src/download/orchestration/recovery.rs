@@ -46,6 +46,7 @@ async fn run_targeted_recovery_pass(
         pass_configs,
         unmatched_targets,
         requested,
+        identity_incomplete,
     } = plan;
     let unmatched = unmatched_targets.len();
 
@@ -91,12 +92,10 @@ async fn run_targeted_recovery_pass(
     }
 
     if tasks.is_empty() {
-        return Ok(pending_retry_no_download_result(
-            &started,
-            &shutdown_token,
-            unmatched,
-            0,
-        ));
+        let mut result = pending_retry_no_download_result(&started, &shutdown_token, unmatched, 0);
+        result.checkpoint.identity_incomplete = identity_incomplete;
+        result.checkpoint.project(&mut result.stats);
+        return Ok(result);
     }
 
     let pass_config = PassConfig {
@@ -199,6 +198,7 @@ async fn run_targeted_recovery_pass(
         .collect();
 
     let checkpoint = CheckpointEvidence {
+        identity_incomplete,
         state_write_failures: pass_result.state_write_failures,
         interrupted: shutdown_token.is_cancelled()
             || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,

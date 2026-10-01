@@ -8,6 +8,7 @@ use crate::state::VersionSizeKey;
 use super::super::test_support::{
     mock_asset_record_for, mock_master_record_with_filename, mock_photo_records_with_filename,
 };
+use super::retain_legacy_added_date;
 use super::{DownloadContext, count_value_map_entries, count_version_set_entries};
 
 #[test]
@@ -251,11 +252,30 @@ fn legacy_master_state_requires_compatible_unambiguous_history() {
         .or_default()
         .insert("original".into(), checksum);
 
+    retain_legacy_added_date(
+        &mut ctx.legacy_added_dates,
+        &Arc::from("PrimarySync"),
+        &Arc::from("master-family"),
+        asset_a.added_date_evidence(),
+    );
+
     assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
 
     ctx.asset_master_mappings = Some(FxHashMap::default());
     ctx.legacy_master_state_owners = Some(FxHashMap::default());
     assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+    let dates = ctx.legacy_added_dates.get_mut("PrimarySync").unwrap();
+    dates.insert("master-family".into(), None);
+    assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+    ctx.legacy_added_dates
+        .get_mut("PrimarySync")
+        .unwrap()
+        .insert("master-family".into(), Some(chrono::DateTime::UNIX_EPOCH));
+    assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+    ctx.legacy_added_dates
+        .get_mut("PrimarySync")
+        .unwrap()
+        .insert("master-family".into(), asset_a.added_date_evidence());
 
     ctx.asset_master_mappings
         .as_mut()
@@ -274,7 +294,7 @@ fn legacy_master_state_requires_compatible_unambiguous_history() {
         .entry("asset-b".into())
         .or_default()
         .insert("original".into());
-    assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+    assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
     assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_b));
 
     ctx.legacy_master_state_owners
@@ -315,6 +335,13 @@ fn legacy_master_state_accepts_matching_pending_retry() {
         .entry("master-pending".into())
         .or_default()
         .insert("original".into(), checksum);
+
+    retain_legacy_added_date(
+        &mut ctx.legacy_added_dates,
+        &Arc::from("PrimarySync"),
+        &Arc::from("master-pending"),
+        asset.added_date_evidence(),
+    );
 
     assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset));
 }

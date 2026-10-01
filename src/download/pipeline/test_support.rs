@@ -522,6 +522,8 @@ impl MetadataRewriteStore for FailingDownloadStore {
             processed_assets: 0,
             failed_assets: 0,
             remaining_assets: 0,
+            unresolved_assets: 0,
+            deferred_assets: 0,
             last_error: None,
         })
     }

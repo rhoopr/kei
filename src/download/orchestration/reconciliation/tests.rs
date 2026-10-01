@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
@@ -65,6 +66,7 @@ async fn import_refusal_preserves_reserved_retry_across_restart() {
             .filename("same.jpg")
             .checksum(&checksum)
             .size(1024)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build(),
     )
     .await
@@ -666,6 +668,7 @@ async fn assert_reserved_content_update(
             .filename("reserved.jpg")
             .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
             .size(1024)
+            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
             .build(),
     )
     .await
@@ -1102,6 +1105,7 @@ async fn assert_reserved_download_transition(
                 .filename("reserved_edited.JPG")
                 .checksum(&checksum)
                 .size(1024)
+                .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
                 .build(),
         )
         .await
@@ -1397,6 +1401,7 @@ async fn assert_pending_retry_reservations(entry: PendingReservationEntry) {
                 .filename(filename)
                 .checksum(provider_checksum)
                 .size(1024)
+                .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
                 .build(),
         )
         .await
@@ -1500,6 +1505,7 @@ async fn assert_pending_retry_reservations(entry: PendingReservationEntry) {
                     .filename(&owned_filename)
                     .checksum(&checksum)
                     .size(1024)
+                    .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
                     .build(),
             )
             .await

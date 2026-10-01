@@ -253,6 +253,7 @@ pub(super) async fn seed_downloaded_metadata_asset(
             .checksum(&expected.checksum)
             .filename(filename)
             .created_at(asset.created())
+            .added_at(asset.added_date())
             .size(expected.size)
             .version_size(expected.version_size)
             .metadata(

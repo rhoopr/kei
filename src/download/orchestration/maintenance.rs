@@ -11,11 +11,12 @@ use crate::download::{filter, metadata_rewrite};
 use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 use crate::icloud::photos::{PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution};
 use crate::state::VersionSizeKey;
+use crate::state::types::legacy_added_date_matches;
 
 use super::config::DownloadConfig;
 use super::models::{
     CheckpointEvidence, DownloadControls, DownloadStore, METADATA_CAPTURE_REPAIR_FAILED_REASON,
-    SyncStats, block_sync_token_for_incremental_delta,
+    SyncStats, block_sync_token_for_incremental_delta, block_sync_token_for_metadata_capture,
 };
 
 /// Drain pending metadata-rewrite markers in bounded batches so a
@@ -230,6 +231,8 @@ async fn collect_metadata_capture_repair(
         }
     };
     repair.stats.metadata_capture_remaining = initial.remaining_assets;
+    repair.stats.metadata_capture_unresolved = initial.unresolved_assets;
+    repair.stats.metadata_capture_deferred = initial.deferred_assets;
     if initial.remaining_assets == 0 {
         return repair;
     }
@@ -431,6 +434,16 @@ async fn collect_metadata_capture_repair(
                             full_evidence_matching_children,
                             "Metadata capture remains ambiguous; retaining identity and checkpoint"
                         );
+                        if let Err(error) = db
+                            .defer_metadata_capture_ambiguity(
+                                &candidate,
+                                crate::state::METADATA_CAPTURE_REVISION,
+                            )
+                            .await
+                        {
+                            repair.checkpoint.state_write_failures += 1;
+                            tracing::warn!(error = %error, "Could not persist metadata-capture retry");
+                        }
                         record_metadata_capture_failure(
                             db.as_ref(),
                             &candidate.library,
@@ -438,6 +451,23 @@ async fn collect_metadata_capture_repair(
                             &mut repair,
                         )
                         .await;
+                        continue;
+                    }
+                    if !candidate.versions.iter().all(|version| {
+                        legacy_added_date_matches(version.added_at, asset.added_date_evidence())
+                    }) {
+                        if let Err(error) = db
+                            .defer_metadata_capture_ambiguity(
+                                &candidate,
+                                crate::state::METADATA_CAPTURE_REVISION,
+                            )
+                            .await
+                        {
+                            repair.checkpoint.state_write_failures += 1;
+                            tracing::warn!(error = %error, "Could not persist metadata-capture retry");
+                        }
+                        record_metadata_capture_failure(db.as_ref(), &candidate.library,
+                            "legacy rendition added dates do not establish a consistent provider child", &mut repair).await;
                         continue;
                     }
                     match db
@@ -460,10 +490,20 @@ async fn collect_metadata_capture_repair(
                             .await;
                         }
                         Ok(false) => {
+                            if let Err(error) = db
+                                .defer_metadata_capture_ambiguity(
+                                    &candidate,
+                                    crate::state::METADATA_CAPTURE_REVISION,
+                                )
+                                .await
+                            {
+                                repair.checkpoint.state_write_failures += 1;
+                                tracing::warn!(error = %error, "Could not persist metadata-capture retry");
+                            }
                             record_metadata_capture_failure(
                                 db.as_ref(),
                                 &candidate.library,
-                                "a different provider child owns the legacy catalogue row",
+                                "legacy catalogue ownership conflicts with durable family history",
                                 &mut repair,
                             )
                             .await;
@@ -525,6 +565,8 @@ async fn collect_metadata_capture_repair(
             repair.stats.metadata_capture_progressed =
                 status.remaining_assets < initial.remaining_assets;
             repair.stats.metadata_capture_remaining = status.remaining_assets;
+            repair.stats.metadata_capture_unresolved = status.unresolved_assets;
+            repair.stats.metadata_capture_deferred = status.deferred_assets;
         }
         Err(error) => {
             repair.checkpoint.state_write_failures =
@@ -534,6 +576,11 @@ async fn collect_metadata_capture_repair(
                 repair.stats.metadata_capture_failures.saturating_add(1);
             tracing::warn!(error = %error, library, "Could not finalize metadata-capture repair state");
         }
+    }
+    if repair.stats.metadata_capture_unresolved > 0 {
+        repair.checkpoint.identity_incomplete = true;
+        repair.checkpoint.sync_token_blocked = true;
+        block_sync_token_for_metadata_capture(&mut repair.stats);
     }
     if repair.failures > 0 || repair.checkpoint.interrupted {
         repair.checkpoint.sync_token_blocked = true;

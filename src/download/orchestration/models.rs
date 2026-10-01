@@ -284,6 +284,12 @@ impl SyncResult {
         self.full_enumeration_ran |= other.full_enumeration_ran;
     }
 
+    pub(crate) fn block_for_metadata_capture(&mut self) {
+        self.checkpoint.identity_incomplete = true;
+        self.checkpoint.sync_token_blocked = true;
+        block_sync_token_for_metadata_capture(&mut self.stats);
+    }
+
     pub(crate) fn block_for_unresolved_identity(&mut self) {
         self.checkpoint.identity_incomplete = true;
         self.checkpoint.sync_token_blocked = true;
@@ -320,6 +326,8 @@ pub struct SyncStats {
     pub metadata_capture_refreshed: usize,
     pub metadata_capture_failures: usize,
     pub metadata_capture_remaining: u64,
+    pub metadata_capture_unresolved: u64,
+    pub metadata_capture_deferred: u64,
     /// True when this cycle durably reduced metadata-capture work.
     #[serde(skip)]
     pub(crate) metadata_capture_progressed: bool,
@@ -509,6 +517,8 @@ impl SyncStats {
         self.metadata_capture_refreshed += other.metadata_capture_refreshed;
         self.metadata_capture_failures += other.metadata_capture_failures;
         self.metadata_capture_remaining += other.metadata_capture_remaining;
+        self.metadata_capture_unresolved += other.metadata_capture_unresolved;
+        self.metadata_capture_deferred += other.metadata_capture_deferred;
         self.metadata_capture_progressed |= other.metadata_capture_progressed;
         self.count_probe_failures += other.count_probe_failures;
         self.stale_pending_pruned += other.stale_pending_pruned;
@@ -901,6 +911,11 @@ pub(super) fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullE
     if result.full_enumeration_ran && result.stats.full_enumeration_reason.is_none() {
         result.stats.full_enumeration_reason = Some(reason);
     }
+}
+
+pub(crate) fn block_sync_token_for_metadata_capture(stats: &mut SyncStats) {
+    stats.identity_incomplete = true;
+    block_sync_token_for_incremental_delta(stats, METADATA_CAPTURE_REPAIR_FAILED_REASON);
 }
 
 pub(crate) fn block_sync_token_for_unresolved_identity(stats: &mut SyncStats) {
