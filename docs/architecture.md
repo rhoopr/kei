@@ -24,26 +24,132 @@ changing behavior.
 |------|-------|----------|
 | Process startup and dispatch | `src/lib.rs` | Starts the runtime, resolves bootstrap paths, configures logging, dispatches commands, and maps exit codes. |
 | CLI shape | `src/cli.rs` | Defines clap arguments and parsing. It does not execute command behavior. |
-| Runtime configuration | `src/config.rs` | Resolves TOML, environment, and command inputs into runtime policy. |
+| Runtime configuration facade | `src/config.rs` | Preserves configuration types, entry points, and visibility. |
+| Configuration input | `src/config/input.rs` | Owns the TOML schema and file loading. |
+| Runtime policy types | `src/config/runtime.rs` | Owns resolved configuration types, media selection, and date-bound semantics. |
+| Configuration resolution | `src/config/resolve.rs` | Resolves TOML, environment, and command inputs into runtime policy, including shared sync/import path fields. |
+| Configuration paths | `src/config/paths.rs` | Resolves bootstrap, data, and credential paths and validates download directories. |
+| Folder-template validation | `src/config/templates.rs` | Owns default category templates and validates token placement. |
+| Configuration persistence | `src/config/persistence.rs` | Projects runtime policy to TOML and writes first-run configuration. |
 | Selection grammar | `src/selection.rs` | Parses album, smart-folder, library, exclusion, and unfiled selectors. |
-| Sync/watch loop | `src/sync_loop.rs` | Owns authentication recovery, watch cadence, library/pass refresh, database pre-checks, and cycle-level reporting. |
+| Sync/watch facade and runner | `src/sync_loop.rs`, `src/sync_loop/runner.rs` | Preserves command-facing entry points; the runner composes startup, sync cycles, and watch control. |
+| Sync session recovery | `src/sync_loop/session.rs` | Coordinates authentication, 2FA recovery, library initialization, and idle session-lock handoffs through the shared auth and command owners. |
+| Database change pre-check | `src/sync_loop/precheck.rs` | Owns scoped database tokens, selected-zone checks, and inclusion of pending local work. It does not replace the per-zone checkpoint gate. |
+| Sync plan refresh | `src/sync_loop/planning.rs` | Resolves and refreshes library pass plans through the command owner; reports shared-library notices and path warnings. |
+| Local drift checks | `src/sync_loop/reconcile.rs` | Runs bounded local drift recovery and periodic read-only catalog diagnostics. |
+| Watch policy | `src/sync_loop/watch.rs` | Owns watch cadence, metadata follow-up timing, and one-shot recovery rules. |
+| Cycle ledger reporting | `src/sync_loop/reporting.rs` | Records cycle-run summaries and combines refresh-tail outcomes for reporting. |
 | One sync cycle | `src/sync_cycle.rs` | Chooses source enumeration, reconciles config drift, dispatches each library, and advances or preserves provider checkpoints. |
 | Library and pass planning | `src/commands/service.rs` | Resolves libraries, collection scope, album plans, smart folders, unfiled passes, and cross-zone hydration. |
 | iCloud Photos adapter | `src/icloud/photos/` | Owns CloudKit records, queries, change streams, provider identity, albums, smart folders, and metadata decoding. |
-| Download orchestration | `src/download/mod.rs` | Routes full, incremental, targeted-backfill, and durable-retry work and produces checkpoint evidence. |
+| Album facade and counts | `src/icloud/photos/album.rs`, `src/icloud/photos/album/counts.rs` | Preserves album configuration and entry points; counts owns count queries and same-library batching. |
+| Targeted provider lookup | `src/icloud/photos/album/lookup.rs` | Resolves requested records and merges identity evidence conservatively. |
+| Provider enumeration | `src/icloud/photos/album/planning.rs`, `src/icloud/photos/album/enumeration.rs` | Planning selects rank ranges and page sizes; enumeration starts fetchers and delivers completion tokens. |
+| Provider page fetching | `src/icloud/photos/album/fetch.rs` | Owns query construction, empty-page probes, record pairing, deduplication, and asset emission. |
+| Enumeration completion | `src/icloud/photos/album/completion.rs` | Collects fetcher completion evidence and requires unanimous tokens before returning a checkpoint candidate. |
+| Album hydration | `src/icloud/photos/album/hydration.rs` | Matches named-album members across source zones and hydrates durable asset or master identities. |
+| Provider change streams | `src/icloud/photos/album/changes.rs` | Owns sequential change scans, delta buffering, and last-good-token delivery. |
+| Download facade and dispatch | `src/download/mod.rs`, `src/download/orchestration/dispatch.rs` | Preserves download entry points and composes full, incremental, targeted-backfill, and durable-retry work. |
+| Download models and configuration | `src/download/orchestration/models.rs`, `src/download/orchestration/config.rs` | Owns controls, results, per-zone checkpoint evidence, reporting projections, checkpoint reasons, coverage fingerprints, and configuration hashes. |
+| Download context and selection | `src/download/orchestration/context.rs`, `src/download/orchestration/selection.rs` | Loads library-scoped state and identity evidence, derives pass configurations, and checks incremental routing eligibility. |
+| Full enumeration | `src/download/orchestration/full.rs` | Owns bounded enumeration, album snapshots, pass counts, and token evidence. |
+| Incremental enumeration | `src/download/orchestration/incremental.rs`, `src/download/orchestration/delta.rs` | Runs separate streaming and collecting strategies with one shared delta-state owner for provider-event bookkeeping and routing facts. |
+| Download recovery | `src/download/orchestration/recovery.rs`, `src/download/orchestration/url_refresh.rs` | Runs durable pending recovery and refreshes exact download tasks with current provider URLs. |
+| Local catalog maintenance | `src/download/orchestration/reconciliation.rs`, `src/download/orchestration/cleanup.rs`, `src/download/orchestration/maintenance.rs` | Reconciles catalog paths, removes durably owned stale temporary files, and repairs metadata-capture revisions. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
-| Streaming workers | `src/download/pipeline.rs` | Runs bounded producers and consumers, coordinates file transfer, metadata writes, adoption, and outcome aggregation. |
-| File transfer | `src/download/file.rs` | Downloads, resumes, validates, and publishes one media file. |
+| Filter facade and configuration | `src/download/filter.rs`, `src/download/filter/config.rs` | Preserves filter entry points and shares path and filter settings between sync and import. |
+| Asset eligibility | `src/download/filter/eligibility.rs` | Owns content, date, and filename filters and media classification, without path or filesystem decisions. |
+| Rendition selection | `src/download/filter/versions.rs` | Owns RAW alignment, primary and companion selection, and selected-rendition metadata keys. |
+| Task metadata | `src/download/filter/metadata.rs` | Builds metadata payloads with preloaded album and people groupings. |
+| Expected asset paths | `src/download/filter/expected_paths.rs` | Derives paths shared by sync and import before collision resolution; uses the rendition-selection owner. |
+| Collision planning | `src/download/filter/collisions.rs` | Owns normalized path claims and existing-file collision resolution. |
+| Download task derivation | `src/download/filter/tasks.rs` | Composes eligibility, expected paths, collision results, and metadata into download tasks. Path rendering stays in `src/download/paths.rs`. |
+| Download pipeline facade | `src/download/pipeline.rs`, `src/download/pipeline/streaming.rs` | Preserves entry points and composes run modes, producer execution, consumer execution, and pass finalization. |
+| Local-file adoption | `src/download/pipeline/adoption.rs` | Validates current and pending local-file evidence before adoption or an on-disk skip. |
+| Streaming producer | `src/download/pipeline/producer.rs` | Plans assets, forecasts disk space, records skip counts, and dispatches pending tasks. |
+| Streaming consumer | `src/download/pipeline/consumer.rs` | Runs bounded workers and accumulates transfer results and deferred state writes. |
+| Single-task execution | `src/download/pipeline/task.rs` | Coordinates one transfer, metadata completion, temporary-file ownership, and worker error classification. |
+| Download pass and outcome | `src/download/pipeline/pass.rs`, `src/download/pipeline/outcome.rs` | Executes explicit task passes, finalizes streaming state, retries failed tasks, and aggregates sync outcomes. |
+| Download progress and summary | `src/download/pipeline/progress.rs` | Formats durations and sync summaries and reports rate-limit pressure. |
+| File facade and transfer | `src/download/file.rs`, `src/download/file/transfer.rs` | Preserves entry points and owns HTTP retry, resume, stream writes, and temporary-file cleanup. |
+| File validation and fingerprints | `src/download/file/validation.rs`, `src/download/file/fingerprint.rs` | Validates response lengths and media, checks local size evidence, and captures same-read hashes and snapshots. |
+| File publication and replacement | `src/download/file/publication.rs`, `src/download/file/replacement.rs` | Handles no-overwrite collisions and conditional replacement with displaced-file verification and restoration. |
+| Confined local copies | `src/download/file/reconciliation.rs` | Retains verified files and parent-directory capabilities through local copy and state finalization. |
+| File platform primitives | `src/download/file/platform.rs` | Owns platform rename, exchange, hard-link, and directory durability operations. |
 | Linux replacement recovery | `src/download/file/replacement_recovery.rs` | Journals conditional replacement when atomic exchange is unsupported, and recovers interrupted publication without overwriting concurrent edits. |
 | State finalization | `src/download/finalize.rs` | Persists downloaded or failed outcomes and retries deferred state writes. |
+| Sparse identity retries | `src/download/orchestration/delta/sparse_identity.rs`, `src/state/db/sparse_identity.rs` | Selects bounded source retries and persists generation-fenced evidence; the cycle owner retains checkpoint authority. |
 | Durable retry resolution | `src/download/retry.rs` | Revalidates pending provider identity and builds exact retry tasks. |
 | Path rendering | `src/download/paths.rs` | Expands folder templates, normalizes names, and handles collision suffixes. |
-| Metadata writing | `src/download/metadata.rs`, `src/download/heif.rs`, `src/download/metadata_rewrite.rs` | Probes and writes opt-in EXIF/XMP data and drains metadata-only retry markers. |
-| SQLite state | `src/state/` | Owns schema migrations, role traits, asset state, membership snapshots, provider checkpoints, verification state, and sync runs. |
+| Metadata facade and values | `src/download/metadata.rs`, `src/download/metadata/values.rs`, `src/download/metadata/xmp_fields.rs` | Preserves writer entry points and shared values, with one owner for managed XMP properties, namespace initialization, and field encoding. |
+| Metadata evidence | `src/download/metadata/probe.rs`, `src/download/metadata/source_gps.rs` | Probes existing EXIF/XMP fields and performs bounded source EXIF GPS decoding for write planning. |
+| Embedded writer dispatch | `src/download/metadata/embedded.rs`, `src/download/metadata/formats.rs` | Validates approved input and selects a format writer using content and extension detection. |
+| Format-specific metadata preparation | `src/download/metadata/heif_writer.rs`, `src/download/metadata/xmp_writer.rs`, `src/download/metadata/native_writer.rs` | Prepares HEIF-family, XMP Toolkit, or native-only EXIF output. Publication stays in the prepared-file owner. |
+| Embedded replacement publication | `src/download/metadata/prepared.rs` | Owns exclusive temporary files, fingerprints, and stable-input publication through the file replacement primitives. |
+| Sidecar ownership and publication | `src/download/metadata/sidecar.rs` | Prepares sidecars, validates ownership, and conditionally publishes writes, including reconciled sidecars. |
+| HEIF facade and file-backed reads | `src/download/heif.rs`, `src/download/heif/file.rs` | Preserves HEIF entry points and typed errors; locates native Exif with bounded file reads without loading media payloads. |
+| HEIF layout | `src/download/heif/boxes.rs`, `src/download/heif/items.rs` | Owns box boundaries, item tables, extent resolution, and item-location encoding. |
+| HEIF metadata relationships | `src/download/heif/relationships.rs` | Resolves primary-image metadata ownership and encodes item references. Ambiguous ownership fails closed. |
+| HEIF native Exif | `src/download/heif/exif.rs` | Extracts native Exif and repairs capture timestamps within the TIFF payload. |
+| HEIF XMP | `src/download/heif/xmp_read.rs`, `src/download/heif/xmp_write.rs` | Reads, inserts, and replaces the selected XMP packet without re-encoding image payloads. |
+| HEIF preservation checks | `src/download/heif/preservation.rs` | Validates non-XMP item payloads and opaque metadata after a rewrite. |
+| Metadata rewrite facade and immediate execution | `src/download/metadata_rewrite.rs`, `src/download/metadata_rewrite/immediate.rs` | Preserves rewrite entry points and coordinates download-time metadata writes. The pipeline retains media publication and state finalization. |
+| Metadata write planning | `src/download/metadata_rewrite/planning.rs` | Owns opt-in flags and embedded field decisions shared by immediate and queued execution. |
+| Metadata write execution | `src/download/metadata_rewrite/embedded.rs`, `src/download/metadata_rewrite/sidecar.rs` | Coordinates fingerprint-guarded embedded writes and source-aware sidecar writes through the metadata owners. |
+| Queued metadata retries | `src/download/metadata_rewrite/queued.rs` | Tags durable rewrite work, executes bounded retry pages, and retires completed markers. |
+| Rewrite evidence and groupings | `src/download/metadata_rewrite/capture.rs`, `src/download/metadata_rewrite/grouping.rs` | Verifies capture-repair fingerprints and timestamps; loads current library-scoped groupings for queued work. |
+| SQLite facade and connection lifecycle | `src/state/mod.rs`, `src/state/db.rs` | Preserves state entry points, opens connections, and dispatches blocking SQLite work. Child owners retain their transaction boundaries. |
+| SQLite schema | `src/state/schema.rs` | Owns schema versions and migrations. |
+| State-store contracts | `src/state/db/contracts.rs` | Defines store roles and records exchanged with callers. |
+| Asset state transitions | `src/state/db/assets.rs` | Owns asset lifecycle, download finalization, retry eligibility, and provider source-state transitions. |
+| Shared SQLite writes and row decoding | `src/state/db/asset_writes.rs`, `src/state/db/rows.rs` | Shares asset writes within caller-owned transactions, column projections, date codecs, and row decoding. |
+| Metadata capture retries | `src/state/db/metadata_capture_retry.rs` | Stores generation-fenced ambiguity evidence and bounded retry deadlines. The cycle owner retains checkpoint authority. |
+| Durable provider identity | `src/state/db/identity.rs` | Stores library-scoped asset/master mappings and legacy state ownership. Provider record parsing stays in the iCloud adapter. |
+| Durable membership | `src/state/db/membership.rs` | Stores album snapshots, provider relations, and grouping projections. |
+| Durable metadata work | `src/state/db/metadata.rs` | Stores capture revisions, path-specific rewrite work, and repair receipts. It does not write media files. |
+| Durable checkpoints | `src/state/db/checkpoints.rs` | Stores provider checkpoints, scoped database tokens, and enumeration progress. Sync policy decides when checkpoint proof permits a commit. |
+| Temporary-file ownership | `src/state/db/temp_files.rs` | Stores losslessly encoded paths and durable temporary-file ownership. Filesystem cleanup stays in download orchestration. |
+| Durable reconciliation | `src/state/db/reconciliation.rs` | Stores destination reservations and reads catalog evidence for reconciliation. |
+| Durable import adoption | `src/state/db/import.rs` | Atomically adopts imported files into state and reads imported records. Matching policy stays in the import command. |
+| State reports | `src/state/db/reports.rs` | Reads status, verification and manifest data, and records sync-run history. |
 | Import-existing | `src/commands/import.rs` | Matches existing files to expected iCloud paths and adopts verified files into state. |
 | Service integration | `src/service/` | Owns install, uninstall, status, service execution, and platform renderers. |
 | Operator surfaces | `src/commands/status.rs`, `src/commands/doctor.rs`, `src/commands/manifest.rs` | Read local state for status, redacted diagnostics, and catalog export. |
 | Reports and monitoring | `src/cycle_reporter.rs`, `src/report.rs`, `src/health.rs`, `src/metrics.rs`, `src/notifications.rs` | Converts cycle facts into reports, health, metrics, and notifications. |
+
+Album tests use `icloud::photos::album::<owner>::tests::<test_name>` instead
+of `icloud::photos::album::tests::<test_name>`. The owners are `lookup`,
+`counts`, `planning`, `enumeration`, `fetch`, `completion`, `hydration`, and
+`changes`. All 88 original tests retain their names, attributes, and assertions,
+including the ignored live lookup test. Shared fixtures stay in
+`src/icloud/photos/album/test_support.rs`. Album tracing keeps the
+`kei::icloud::photos::album` target.
+
+Album-owner dependencies are one-way: hydration uses enumeration and change
+scans; enumeration uses planning, fetching, and completion; fetching uses
+planning types and completion evidence. Lookup, counts, planning, completion,
+and changes do not call sibling owners. The facade retains stream routing and
+public entry points. No album child owns durable checkpoint policy.
+
+File tests use `download::file::<owner>::tests::<test_name>` instead of
+`download::file::tests::<test_name>`. The owners are `transfer`, `validation`,
+`fingerprint`, `publication`, `replacement`, and `reconciliation`. HTTP tests
+retain their nested `wiremock_tests` module under `transfer::tests`. Test names
+and assertions are unchanged; the Windows partial-replacement test remains
+Windows-only. File tracing keeps the `kei::download::file` target.
+
+File-owner dependencies are one-way: transfer calls validation and publication;
+publication calls replacement, platform primitives, and fingerprinting;
+replacement calls platform primitives and fingerprinting; reconciliation calls
+platform primitives and fingerprinting; validation uses fingerprinting for
+local-size evidence. Platform primitives do not decide replacement or retry
+policy. In particular, Windows partial-exchange recovery stays in replacement.
+
+Pipeline tests use `download::pipeline::<owner>::tests::<test_name>` instead
+of `download::pipeline::tests::<test_name>`. The owners are `adoption`,
+`consumer`, `outcome`, `pass`, `producer`, `progress`, `streaming`, and `task`.
+Test names and assertions are unchanged. Shared test fixtures stay in
+`src/download/pipeline/test_support.rs`.
 
 ## Main flows
 
@@ -56,6 +162,15 @@ src/main.rs
   -> src/cli.rs
   -> command owner, service owner, or src/sync_loop.rs
 ```
+
+`run` composes private phases in `src/lib.rs`: `load_startup_config`,
+`resolve_startup_output`, `initialize_logging`, and `dispatch_command`.
+Config loading retains the Docker fallback and passes parse errors to
+`doctor` without blocking its diagnostic report. Output resolution keeps the
+friendly-mode request separate from the mode allowed by the environment.
+The log-writer guard stays in `run` until dispatch returns. Startup injects
+the captured environment password before dispatch. Command dispatch retains
+the setup wizard's one-shot sync path and the service owner's entry point.
 
 The CLI requires a subcommand. `kei sync` enters the sync path. Commands such
 as `status`, `doctor`, and `manifest` read local state without entering the
@@ -154,10 +269,12 @@ Deferred work keeps the capture revision pending and its checkpoint blocked,
 even when a cycle makes no repair attempt. The cycle checks each library
 before committing inventory anchors or provider checkpoints, including
 `--refresh-metadata` runs that bypass automatic capture repair. Idle health
-and other-library success cannot turn retained ambiguity into a successful backup. Completion
-retires retry rows only after the existing repair or source-deletion rules
-remove the stale work. Retry scheduling does not select a child or authorize
+and other-library success cannot turn retained ambiguity into a successful
+backup. Completion retires retry rows only after the existing repair or
+source-deletion rules remove the stale work. Retry scheduling does not select a child or authorize
 metadata rewrites, deletion, or checkpoint advancement.
+The download owners store these holds in `CheckpointEvidence`. Report counter
+changes and result composition cannot clear them.
 
 Unresolved asset-only delta hydration is incomplete work, even when no media
 transfer fails. The producer records `unresolved_asset_identity:<zone> = 1` in
@@ -193,7 +310,7 @@ Observation and the existing unresolved marker commit in one transaction.
 The `sparse_identity_generation` metadata counter assigns monotonically
 increasing generations, including when a cleared source reappears.
 
-`src/download/sparse_identity.rs` owns retry selection for both incremental
+`src/download/orchestration/delta/sparse_identity.rs` owns retry selection for both incremental
 paths. A matching valid sparse lookup starts a one-hour delay. Repeated
 matching results double the delay to a 24-hour maximum. Each library execution
 selects at most 100 due, identified sparse source-only lookups, ordered by
@@ -225,8 +342,10 @@ guards. Existing schema-26 outcome labels remain readable.
 
 Hydration, explicitly soft-deleted source `CPLAsset` deltas, and exact-source
 hard-deletion tombstones supply generation-fenced receipts, not permission to
-advance a checkpoint. The cycle owner still requires normal processing and checkpoint
-proof. The checkpoint transaction validates every retained source receipt
+advance a checkpoint. Incremental results carry these receipts in
+`CheckpointEvidence`, not `SyncStats`. Inventory and delta-bridge composition
+retain the receipts in zone-local evidence. The cycle owner still requires
+normal processing and checkpoint proof. The checkpoint transaction validates every retained source receipt
 before clearing its row and zone marker. Missing, changed, or stale receipts
 roll back the transition. Inventory alone, interruption, failed state writes,
 and another library's success cannot clear the obligation. Configuration
@@ -412,6 +531,14 @@ before routing; an inconclusive lookup preserves the prior zone checkpoint.
 Album snapshots and smart folders may require targeted refresh work before or
 alongside the incremental stream.
 
+Both strategies use `IncrementalDeltaState` in `orchestration/delta.rs` for
+identity mappings, source-state transitions, album and relation bookkeeping,
+event counts, and completion tokens. The streaming strategy emits created
+assets through a bounded channel and defers album, relation, and unpaired-asset
+work. The collecting strategy observes all events before state writes, hydrates
+missing identities, and applies relations before routing created assets.
+These orders preserve each strategy's token-safety and selected-album behavior.
+
 Downloadable photo records require non-blank `CPLMaster` and `CPLAsset` record names
 and a usable `assetDate` before they enter filtering or path planning. Full
 enumeration reports a malformed record as incomplete. Incremental enumeration
@@ -437,6 +564,11 @@ PhotoAsset
 Only producer-dispatched work becomes pending through `upsert_seen`. Filtered
 or skipped assets must not be left as retryable work unless a dedicated state
 transition owns that result.
+
+Full enumeration divides the configured download-worker limit across concurrent
+album passes. Each pass gets the same allocation, rounded down. The remainder
+stays unused so replacement passes cannot exceed the total limit. Passes keep
+their existing cancellation, publication, and state-finalization paths.
 
 Asset dates used for filtering, path rendering, file metadata, and sidecars are
 resolved from Apple's UTC instant plus the asset's `timeZoneOffset` when that
@@ -544,6 +676,16 @@ write or resume .part
   -> finalize SQLite state
 ```
 
+The transfer owner opens an existing resume file through a retained parent
+handle with no-follow access and requires a regular file. It reads the Range
+offset from that file handle and uses the same handle for append writes.
+Resume probes reject symlinks. Identity checks reject a changed leaf before
+body writes, content validation, and publication. A final identity or byte check
+must pass before downloaded state can finalize. The task retains the file
+through metadata work and publication; an opt-in metadata replacement must
+match the writer's output fingerprint before it is accepted.
+The durable temporary-path claim alone does not authorize an append.
+
 Schema v19 records the exact temporary path before a state-backed download can
 write or resume it. Normal completion and graceful interruption retire that
 claim. A process crash leaves the claim as durable cleanup authority. Later
@@ -573,6 +715,25 @@ not weaken deferred state-write handling or infer that a visible final file
 means the database transition succeeded.
 
 ### Checkpoint advancement
+
+`SyncResult.checkpoint` carries the per-zone completion, interruption, state
+durability, identity, and token-block evidence. The source-checkpoint classifier
+reads this evidence and the result's source token and outcome. It does not read
+the reporting snapshot in `SyncResult.stats`.
+
+Full enumeration obtains evidence directly from pipeline finalization. Attached
+pending recovery and metadata-capture repair also supply execution evidence.
+Same-zone composition combines this evidence once, then projects its counters
+into the report. Recovery pass and record lists stay in the per-zone evidence;
+cycle reports do not accumulate them. Report fields and reason values keep
+their existing JSON representation.
+
+Incremental result assemblers still use `SyncResult::from_execution` to capture
+their execution statistics at the result boundary. This is the boundary of the
+pilot, not a second authority after result assembly. Later composition must use
+the captured evidence, never reconstruct it from a reporting snapshot. Query
+token holds, inventory/delta bridges, and unresolved identities update the
+evidence in their existing policy owners.
 
 Preserve the zone checkpoint on:
 
@@ -870,10 +1031,10 @@ Stable IDs connect safety rules to production owners and focused tests.
 | Contract | Owner | Required behavior |
 |----------|-------|-------------------|
 | `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
-| `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/mod.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
+| `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/orchestration/cleanup.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
-| `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/mod.rs` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
-| `MALFORMED_REQUIRED_ASSET_FIELDS_BLOCK_CHECKPOINT` | `src/icloud/photos/asset.rs`, `src/icloud/photos/album.rs`, `src/download/mod.rs`, `src/sync_cycle.rs` | A live asset with a missing or invalid required identity or capture date blocks its zone checkpoint before filtering or path planning. |
+| `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/orchestration/` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
+| `MALFORMED_REQUIRED_ASSET_FIELDS_BLOCK_CHECKPOINT` | `src/icloud/photos/asset.rs`, `src/icloud/photos/album/fetch.rs`, `src/icloud/photos/album/lookup.rs`, `src/download/orchestration/incremental.rs`, `src/sync_cycle.rs` | A live asset with a missing or invalid required identity or capture date blocks its zone checkpoint before filtering or path planning. |
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
 | `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
@@ -881,7 +1042,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/heif.rs`, `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | A HEIF-family embedded rewrite accepts tone-map insertion only when `dimg` and primary Exif `cdsc` relationships prove the exact target and no existing XMP owns that tone map, prepares a uniquely owned sibling, and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
 | `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
 | `XMP_GPS_ACCURACY_REQUIRES_MATCHING_LOCATION` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs`, `src/state/db.rs` | Native horizontal accuracy requires valid native latitude and longitude equal to the exported provider coordinates, plus a matching verified-download source checksum. Recovered local or download checksums cannot establish native provenance. Readable missing, invalid, or mismatched evidence omits accuracy and clears only obsolete kei-owned values. Source I/O failure preserves unknown fields and durable retry evidence. |
-| `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
+| `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/orchestration/maintenance.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 
 ## Change-impact checklist
 
@@ -904,6 +1065,15 @@ Stable IDs connect safety rules to production owners and focused tests.
 - Unit tests live near their owner module.
 - Cross-module and binary behavior lives under `tests/`.
 - Live iCloud tests are ignored by default and run single-threaded.
+- `tests/data/media-manifest.json` owns the bundled media inventory and size
+  budget. `download::orchestration::fixture_tests` exercises these bytes
+  through enumeration, planning, download, publication, and reopened SQLite.
+  Its selection, naming, metadata, and recovery modules replace content-dependent
+  live assertions. `tests/data/live-migration.md` records the mapping. General
+  live entry points share `tests/data/live-selection.toml` and reject an empty
+  eligible selection before the suite.
+  `scripts/fixtures/` owns maintainer-only generation and sanitization and
+  the optimized extracted-source-package check. Tests do not fetch media.
 - Shell suites cover crash, concurrency, state-machine, and container behavior.
 - Fuzz targets cover parser and metadata trust boundaries.
 - `justfile` owns local script and workflow lint commands. Protected CI runs

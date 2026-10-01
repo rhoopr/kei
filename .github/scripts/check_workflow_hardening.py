@@ -119,6 +119,7 @@ def check_service_smoke_paths(errors: list[str]) -> None:
         "src/commands/service.rs",
         "src/cli.rs",
         "src/config.rs",
+        "src/config/**",
         "src/lib.rs",
         "src/commands/status.rs",
     ):

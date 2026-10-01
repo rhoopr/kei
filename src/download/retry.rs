@@ -998,6 +998,7 @@ pub(super) async fn build_pending_retry_download_tasks(
                 break;
             }
             if hydration_failed {
+                identity_incomplete = true;
                 continue;
             }
             let matching_targets: Vec<&PendingRetryTarget> = pending_targets

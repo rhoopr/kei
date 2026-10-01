@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConditionalPublishMustRetainPaths, ConditionalPublishTargetChanged, ExistingFileFingerprint,
+    ExistingFileFingerprint,
+    replacement::{ConditionalPublishMustRetainPaths, ConditionalPublishTargetChanged},
 };
 use crate::fs_util::{ConfinedParents, ConfinedPath, FileIdentity, file_identity};
 
@@ -244,7 +245,7 @@ impl Journal {
         manifest.sync_parent()?;
         directory.sync_parent()?;
         let journal = Self::paths(target, directory, lock, evidence)?;
-        super::hard_link_confined(part, &journal.replacement)?;
+        super::platform::hard_link_confined(part, &journal.replacement)?;
         journal.replacement.open_regular()?.sync_all()?;
         journal.replacement.sync_parent()?;
         anyhow::ensure!(
@@ -425,7 +426,7 @@ impl Journal {
             move_to_owned_slot(&self.target, &self.rollback)?;
             self.sync()?;
             if read_fingerprint(&self.rollback)?.as_ref() != Some(&self.evidence.replacement) {
-                super::hard_link_confined(&self.rollback, &self.target)?;
+                super::platform::hard_link_confined(&self.rollback, &self.target)?;
                 self.sync()?;
                 anyhow::bail!(
                     "Concurrent edit restored during rollback; retaining all recovery bytes"
@@ -434,7 +435,7 @@ impl Journal {
         }
         if !self.target.entry_exists()? {
             // Unlike rename, hard_link cannot overwrite a concurrent edit.
-            super::hard_link_confined(&self.original, &self.target)?;
+            super::platform::hard_link_confined(&self.original, &self.target)?;
             self.sync()?;
         }
         anyhow::ensure!(
@@ -508,7 +509,7 @@ fn publish_journal(journal: &Journal, mut hook: impl FnMut(Stage) -> Result<()>)
         read_fingerprint(&journal.replacement)?.as_ref() == Some(&journal.evidence.replacement),
         "Prepared replacement changed after displacement"
     );
-    super::hard_link_confined(&journal.replacement, &journal.target)?;
+    super::platform::hard_link_confined(&journal.replacement, &journal.target)?;
     journal.sync()?;
     hook(Stage::Installed)?;
     anyhow::ensure!(

@@ -19,9 +19,10 @@ source "$repo_root/tests/shell/lib.sh"
 
 kei_require_env
 kei_require_release_binary
+kei_preflight_selection
 
 binary=$(kei_release_bin)
-album=$(kei_album)
+recent=$(kei_live_recent)
 work=$(mktemp -d "${TMPDIR:-/tmp/codex/kei/full-test/tmp}/kei-live-import-rehearsal-XXXXX")
 trap 'rm -rf "$work"' EXIT
 
@@ -45,10 +46,7 @@ write_config() {
         echo "[download]"
         printf 'directory = %s\n' "$(kei_toml_string "$photos")"
         echo
-        echo "[filters]"
-        printf 'albums = [%s]\n' "$(kei_toml_string "$album")"
-        echo "unfiled = false"
-        echo 'libraries = ["primary"]'
+        kei_live_filters
     } >"$path"
 }
 
@@ -73,9 +71,9 @@ run_and_show() {
     return "$rc"
 }
 
-echo "--- seed sync ($album, recent 10 per filter) ---"
+echo "--- seed sync (bounded primary-library selection) ---"
 run_and_show seed-sync \
-    "$binary" sync --recent 10 --recent-scope per-filter --no-progress-bar --config "$sync_config"
+    "$binary" sync --no-progress-bar --config "$sync_config"
 
 file_count=$(find "$photos" -type f | wc -l | tr -d ' ')
 echo "seed_files=$file_count"
@@ -86,15 +84,15 @@ fi
 
 echo "--- import dry-run into fresh DB ---"
 run_and_show import-dry-run \
-    "$binary" import-existing --dry-run --recent 10 --force-empty --no-progress-bar --config "$import_config"
+    "$binary" import-existing --dry-run --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
 
 echo "--- import real into fresh DB ---"
 run_and_show import-real \
-    "$binary" import-existing --recent 10 --force-empty --no-progress-bar --config "$import_config"
+    "$binary" import-existing --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
 
 echo "--- import repeat dry-run ---"
 run_and_show import-repeat-dry-run \
-    "$binary" import-existing --dry-run --recent 10 --force-empty --no-progress-bar --config "$import_config"
+    "$binary" import-existing --dry-run --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
 
 matched=$(awk -F: '/Files matched/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$work/import-real.out" | tail -1)
 unmatched=$(awk -F: '/Unmatched versions/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$work/import-real.out" | tail -1)

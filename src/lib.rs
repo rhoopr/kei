@@ -702,9 +702,48 @@ pub fn main_inner() -> ExitCode {
 
 async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Result<()> {
     let cli = cli::parse_cli_with_sources(std::env::args_os()).map_err(|e| anyhow::anyhow!(e))?;
+    let config = load_startup_config(&cli)?;
+    let output = resolve_startup_output(&cli, config.toml.as_ref());
 
+    // Keep the guard until dispatch returns so fast commands drain their logs.
+    // BarSuspendingStderr pauses progress rendering around each log write.
+    let (make_writer, _writer_guard, redact_password) = build_redacting_writer(BarSuspendingStderr);
+    initialize_logging(&output, make_writer);
+    if config.used_docker_fallback {
+        tracing::debug!(
+            path = %config.path.display(),
+            "Using Docker fallback config (default path not found)"
+        );
+    }
+
+    let globals = config::GlobalArgs::from_bootstrap_env();
+    let mut command = cli.command;
+    // Restore the password scrubbed before runtime creation for every command.
+    command.inject_env_password(env_password);
+    dispatch_command(
+        command,
+        &globals,
+        config,
+        output,
+        redact_password,
+        input_mode,
+    )
+    .await
+}
+
+/// Config discovery facts and the load result, including recoverable doctor errors.
+struct StartupConfig {
+    path: PathBuf,
+    explicitly_set: bool,
+    used_docker_fallback: bool,
+    toml: Option<TomlConfig>,
+    load_error: Option<String>,
+}
+
+const DOCKER_FALLBACK_CONFIG: &str = "/config/config.toml";
+
+fn load_startup_config(cli: &cli::Cli) -> anyhow::Result<StartupConfig> {
     // Load TOML config early so it can influence log level.
-    // If the user explicitly set --config, the file must exist.
     //
     // Docker fallback: when no --config is passed, the default
     // ~/.config/kei/config.toml may not exist inside a container (it
@@ -712,7 +751,6 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     // convention /config/config.toml as a fallback so that `docker exec`
     // subcommands (get-code, submit-code, credential, etc.) automatically
     // find the same config the Docker CMD uses.
-    const DOCKER_FALLBACK_CONFIG: &str = "/config/config.toml";
     let config_explicitly_set =
         cli.config != "~/.config/kei/config.toml" && cli.config != DOCKER_FALLBACK_CONFIG;
     let (config_path, used_docker_fallback) = {
@@ -735,13 +773,31 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
     let is_doctor_command = matches!(cli.command, cli::Command::Doctor(_));
-    let (mut toml_config, toml_config_error) =
+    let (toml_config, toml_config_error) =
         match config::load_toml_config(&config_path, config_required) {
             Ok(config) => (config, None),
             Err(e) if is_doctor_command => (None, Some(e.to_string())),
             Err(e) => return Err(e),
         };
 
+    Ok(StartupConfig {
+        path: config_path,
+        explicitly_set: config_explicitly_set,
+        used_docker_fallback,
+        toml: toml_config,
+        load_error: toml_config_error,
+    })
+}
+
+/// Output policy resolved before logging and command dispatch.
+struct StartupOutput {
+    personality_mode: personality::Mode,
+    friendly_request: Option<bool>,
+    default_filter: String,
+}
+
+#[must_use]
+fn resolve_log_filter(cli: &cli::Cli, toml_config: Option<&TomlConfig>) -> (&'static str, bool) {
     // Resolve log level: --log-level > --verbose > TOML > default (info).
     // `--verbose` is a friendlier alias for `--log-level info` and is
     // overridden if `--log-level` is also explicitly set.
@@ -752,7 +808,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     });
     let log_level_explicit = cli_log_level.is_some();
     let effective_log_level = cli_log_level
-        .or_else(|| toml_config.as_ref().and_then(|t| t.log_level))
+        .or_else(|| toml_config.and_then(|t| t.log_level))
         .unwrap_or(types::LogLevel::Info);
 
     // Scope debug/info to the app crate so dependency crates stay quieter.
@@ -764,6 +820,12 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         types::LogLevel::Error => "error",
     };
 
+    (off_filter, log_level_explicit)
+}
+
+#[must_use]
+fn resolve_startup_output(cli: &cli::Cli, toml_config: Option<&TomlConfig>) -> StartupOutput {
+    let (off_filter, log_level_explicit) = resolve_log_filter(cli, toml_config);
     // Resolve friendly mode. The gate has multiple short-circuits (service
     // context, non-TTY, RUST_LOG, machine-output mode, ...) so the user-stated
     // preference is a request, not a guarantee.
@@ -774,14 +836,12 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     // setup wizard's question and the TOML key are opt-out levers; first
     // contact with kei on a plain terminal already gets the friendly UX.
     //
-    let mut command = cli.command.clone();
     let toml_report_json = toml_config
-        .as_ref()
         .and_then(|t| t.report.as_ref())
         .and_then(|r| r.json.as_ref())
         .is_some();
     let (cmd_no_progress_bar, cmd_only_print_filenames, cmd_report_json, cmd_service_run) =
-        match &command {
+        match &cli.command {
             cli::Command::Sync { sync, .. } => (
                 sync.no_progress_bar,
                 sync.only_print_filenames,
@@ -799,7 +859,6 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         cmd_service_run,
     );
     let toml_friendly = toml_config
-        .as_ref()
         .and_then(|t| t.ui.as_ref())
         .and_then(|u| u.friendly);
     let cli_friendly = cli.friendly_request();
@@ -808,19 +867,19 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         personality::resolve_with_request(cli_friendly, toml_friendly, &personality_ctx);
     let default_filter = personality::tracing::default_filter_for(personality_mode, off_filter);
 
-    // `_writer_guard` MUST live until `run` returns. A `static`-stored
-    // guard never drops (Rust skips static destructors), so subprocess
-    // tests reading stderr after kei exits race against unflushed events
-    // on fast teardown (observed on macOS CI).
-    // `BarSuspendingStderr` interposes between tracing and stderr so that
-    // every WARN/ERROR write happens with the in-flight progress bar paused
-    // (via `MultiProgress::suspend`). Without this, a tracing event landing
-    // mid-redraw causes the bar's ANSI cursor moves to desync, leaving
-    // partial duplicate cards on screen (issue surfaced during real syncs).
-    let (make_writer, _writer_guard, redact_password) = build_redacting_writer(BarSuspendingStderr);
+    StartupOutput {
+        personality_mode,
+        friendly_request,
+        default_filter,
+    }
+}
 
-    let env_filter = personality::tracing::env_filter(&default_filter);
-    if personality_mode.is_friendly() {
+fn initialize_logging(
+    output: &StartupOutput,
+    make_writer: impl for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+) {
+    let env_filter = personality::tracing::env_filter(&output.default_filter);
+    if output.personality_mode.is_friendly() {
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_writer(make_writer)
@@ -835,31 +894,36 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
             .with_writer(make_writer)
             .init();
     }
+}
 
-    if used_docker_fallback {
-        tracing::debug!(
-            path = %config_path.display(),
-            "Using Docker fallback config (default path not found)"
-        );
-    }
-
-    // Build non-TOML globals early. In v0.20 these come from the narrow
-    // bootstrap env allow-list, not public global CLI flags.
-    let globals = config::GlobalArgs::from_bootstrap_env();
-
-    // Inject the password captured from env before the runtime started,
-    // since we cleared ICLOUD_PASSWORD before Cli::parse() could see it.
-    // Must happen before command dispatch so all subcommands (login,
-    // list, etc.) receive the password, not just sync.
-    command.inject_env_password(env_password);
+async fn dispatch_command(
+    command: Command,
+    globals: &config::GlobalArgs,
+    config: StartupConfig,
+    output: StartupOutput,
+    redact_password: Arc<std::sync::Mutex<Option<SecretString>>>,
+    input_mode: InputMode,
+) -> anyhow::Result<()> {
+    let StartupConfig {
+        path: config_path,
+        explicitly_set: config_explicitly_set,
+        toml: mut toml_config,
+        load_error: toml_config_error,
+        ..
+    } = config;
+    let StartupOutput {
+        personality_mode,
+        friendly_request,
+        ..
+    } = output;
     let (is_one_shot, pw, sync) = match command {
         Command::Status(args) => {
-            return run_status(args, &globals, toml_config.as_ref()).await;
+            return run_status(args, globals, toml_config.as_ref()).await;
         }
         Command::Doctor(args) => {
             return run_doctor(
                 args,
-                &globals,
+                globals,
                 toml_config.as_ref(),
                 &config_path,
                 toml_config_error,
@@ -867,27 +931,27 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
             .await;
         }
         Command::Manifest(args) => {
-            return run_manifest(args, &globals, toml_config.as_ref()).await;
+            return run_manifest(args, globals, toml_config.as_ref()).await;
         }
         Command::Reset { what } => match what {
             cli::ResetCommand::State { yes } => {
-                return run_reset_state(yes, &globals, toml_config.as_ref()).await;
+                return run_reset_state(yes, globals, toml_config.as_ref()).await;
             }
             cli::ResetCommand::SyncToken { yes } => {
-                return run_reset_sync_token(yes, &globals, toml_config.as_ref(), input_mode).await;
+                return run_reset_sync_token(yes, globals, toml_config.as_ref(), input_mode).await;
             }
             cli::ResetCommand::Session { yes } => {
-                return run_reset_session(yes, &globals, toml_config.as_ref()).await;
+                return run_reset_session(yes, globals, toml_config.as_ref()).await;
             }
         },
         Command::Verify(args) => {
-            return run_verify(args, &globals, toml_config.as_ref()).await;
+            return run_verify(args, globals, toml_config.as_ref()).await;
         }
         Command::Reconcile(args) => {
-            return run_reconcile(args, &globals, toml_config.as_ref()).await;
+            return run_reconcile(args, globals, toml_config.as_ref()).await;
         }
         Command::ImportExisting(args) => {
-            return run_import_existing(args, &globals, toml_config.as_ref(), input_mode).await;
+            return run_import_existing(args, globals, toml_config.as_ref(), input_mode).await;
         }
         Command::Login {
             password,
@@ -896,20 +960,14 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
             return run_login(
                 subcommand,
                 &password,
-                &globals,
+                globals,
                 toml_config.as_ref(),
                 input_mode,
             )
             .await;
         }
         Command::Password { password, action } => {
-            return run_password(
-                action,
-                &globals,
-                &password,
-                toml_config.as_ref(),
-                input_mode,
-            );
+            return run_password(action, globals, &password, toml_config.as_ref(), input_mode);
         }
         Command::List {
             password,
@@ -920,7 +978,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
                 what,
                 &password,
                 libraries,
-                &globals,
+                globals,
                 toml_config.as_ref(),
                 input_mode,
             )
@@ -928,7 +986,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         }
         Command::Config { action } => match action {
             cli::ConfigAction::Show => {
-                return run_config_show(&globals, toml_config.as_ref());
+                return run_config_show(globals, toml_config.as_ref());
             }
             cli::ConfigAction::Setup { output } => {
                 let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
@@ -961,7 +1019,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
             cli::ServiceAction::Run(args) => {
                 let cli::ServiceRunArgs { password, sync } = *args;
                 return Box::pin(service::run::run(
-                    &globals,
+                    globals,
                     sync_loop::SyncArgs {
                         is_one_shot: false,
                         service_mode: true,
@@ -969,8 +1027,8 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
                         sync,
                         toml_config,
                         config_explicitly_set,
-                        config_path: config_path.clone(),
-                        redact_password: Arc::clone(&redact_password),
+                        config_path,
+                        redact_password,
                         // service run is hard-off per gate; resolved mode is
                         // already Off here, but pass through for symmetry.
                         personality_mode,
@@ -984,7 +1042,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         Command::Sync { password, sync, .. } => (sync.retry_failed, password, sync),
     };
     Box::pin(sync_loop::run_sync(
-        &globals,
+        globals,
         sync_loop::SyncArgs {
             is_one_shot,
             service_mode: false,
@@ -992,8 +1050,8 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
             sync,
             toml_config,
             config_explicitly_set,
-            config_path: config_path.clone(),
-            redact_password: Arc::clone(&redact_password),
+            config_path,
+            redact_password,
             personality_mode,
             friendly_request,
             input_mode,
@@ -1006,6 +1064,140 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
 mod tests {
     use super::*;
     use tracing_subscriber::EnvFilter;
+
+    fn startup_cli() -> cli::Cli {
+        cli::Cli {
+            config: String::new(),
+            log_level: None,
+            verbose: false,
+            command: Command::Config {
+                action: cli::ConfigAction::Show,
+            },
+        }
+    }
+
+    #[test]
+    fn startup_config_loads_explicit_file_before_output_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "log_level = 'warn'\n[ui]\nfriendly = false\n").unwrap();
+        let cli = cli::Cli {
+            config: path.to_string_lossy().into_owned(),
+            ..startup_cli()
+        };
+        let config = load_startup_config(&cli).unwrap();
+        assert_eq!(config.path, path);
+        assert!(config.explicitly_set);
+        assert!(!config.used_docker_fallback);
+        assert!(config.load_error.is_none());
+        let output = resolve_startup_output(&cli, config.toml.as_ref());
+        assert_eq!(output.default_filter, "warn");
+        assert_eq!(output.personality_mode, personality::Mode::Off);
+        assert_eq!(output.friendly_request, Some(false));
+    }
+
+    #[test]
+    fn startup_config_allows_missing_file_only_when_parent_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cli = startup_cli();
+        cli.config = dir
+            .path()
+            .join("config.toml")
+            .to_string_lossy()
+            .into_owned();
+        let config = load_startup_config(&cli).unwrap();
+        assert!(config.explicitly_set);
+        assert!(config.toml.is_none());
+        assert!(config.load_error.is_none());
+        assert!(!config.path.exists(), "discovery must not create config");
+        cli.config = dir
+            .path()
+            .join("missing/config.toml")
+            .to_string_lossy()
+            .into_owned();
+        let err = load_startup_config(&cli).err().unwrap();
+        assert!(err.to_string().contains("Could not read config file"));
+    }
+
+    #[test]
+    fn startup_config_retains_parse_error_only_for_doctor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "broken = [").unwrap();
+        let mut cli = cli::Cli {
+            config: path.to_string_lossy().into_owned(),
+            ..startup_cli()
+        };
+        let err = load_startup_config(&cli).err().unwrap().to_string();
+        assert!(err.contains("Failed to parse config file"));
+        cli.command = Command::Doctor(cli::DoctorArgs {
+            json: true,
+            live: false,
+        });
+        let config = load_startup_config(&cli).unwrap();
+        assert_eq!(config.path, path);
+        assert!(config.toml.is_none());
+        assert_eq!(config.load_error.as_deref(), Some(err.as_str()));
+    }
+
+    #[test]
+    fn startup_log_filter_preserves_precedence_and_explicitness() {
+        use types::LogLevel::{Debug, Error, Info, Warn};
+
+        for (cli_level, verbose, toml_level, expected, explicit) in [
+            (None, false, None, "kei=info", false),
+            (None, false, Some(Debug), "kei=debug,info", false),
+            (None, false, Some(Warn), "warn", false),
+            (None, false, Some(Error), "error", false),
+            (None, true, Some(Error), "kei=info", true),
+            (Some(Info), false, Some(Error), "kei=info", true),
+            (Some(Debug), true, Some(Error), "kei=debug,info", true),
+        ] {
+            let cli = cli::Cli {
+                log_level: cli_level,
+                verbose,
+                ..startup_cli()
+            };
+            let mut toml: TomlConfig = toml::from_str("").unwrap();
+            toml.log_level = toml_level;
+            assert_eq!(resolve_log_filter(&cli, Some(&toml)), (expected, explicit));
+        }
+        assert_eq!(
+            resolve_log_filter(&startup_cli(), None),
+            ("kei=info", false)
+        );
+    }
+
+    #[test]
+    fn startup_output_keeps_request_separate_from_hard_off_mode() {
+        let toml: TomlConfig = toml::from_str("[ui]\nfriendly = false\n").unwrap();
+        let mut cli = cli::Cli {
+            log_level: Some(types::LogLevel::Debug),
+            command: Command::Sync {
+                friendly: cli::FriendlyArgs {
+                    friendly: true,
+                    no_friendly: false,
+                },
+                password: cli::PasswordArgs::default(),
+                sync: cli::SyncArgs::default(),
+            },
+            ..startup_cli()
+        };
+        let output = resolve_startup_output(&cli, Some(&toml));
+        assert_eq!(output.friendly_request, Some(true));
+        assert_eq!(output.personality_mode, personality::Mode::Off);
+        assert_eq!(output.default_filter, "kei=debug,info");
+
+        cli.log_level = None;
+        cli.command = Command::Service {
+            action: cli::ServiceAction::Status,
+        };
+        let toml: TomlConfig = toml::from_str("[ui]\nfriendly = true\n").unwrap();
+        let output = resolve_startup_output(&cli, Some(&toml));
+        assert_eq!(output.friendly_request, Some(true));
+        assert_eq!(output.personality_mode, personality::Mode::Off);
+        assert_eq!(output.default_filter, "kei=info");
+    }
 
     #[test]
     fn input_mode_only_allows_interactive_prompts() {

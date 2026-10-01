@@ -1,18 +1,24 @@
 //! Offline branch-coherence checks for packaging and migration docs.
 //!
-//! These intentionally inspect repository files instead of spawning Docker or
-//! contacting iCloud. The live shell suites still own runtime behavior; this
-//! file pins the risky static contracts that made this branch easy to regress.
+//! Static contracts and real tooling dispatch with controlled child executables.
+//! These checks do not contact iCloud or run Docker. Live and platform suites
+//! still own their runtime behavior.
 
-#![allow(clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "tooling fixtures and assertions fail the test on setup or dispatch errors"
+)]
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::process::Command;
 #[cfg(target_os = "linux")]
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn repo_file(path: &str) -> String {
     let mut full = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -37,8 +43,21 @@ fn missing_required_fragments(contents: &str, required: &[&str]) -> Vec<String> 
         .collect()
 }
 
-fn normalize_whitespace(contents: &str) -> String {
-    contents.split_whitespace().collect::<Vec<_>>().join(" ")
+// Check navigation, not prose: labels and rule wording are free to change.
+fn policy_link_resolves(source: &str, href: &str, target: &str) -> bool {
+    source.contains(&format!("]({href})"))
+        && href.split_once('#').is_none_or(|(_, anchor)| {
+            target.lines().any(|line| {
+                line.strip_prefix("## ").is_some_and(|heading| {
+                    heading
+                        .to_ascii_lowercase()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join("-")
+                        == anchor
+                })
+            })
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -296,50 +315,6 @@ fn notification_script_docs_pin_legacy_env_plus_report_json() {
     );
 }
 
-#[test]
-fn full_test_routes_child_tempdirs_to_tmp_codex() {
-    let run_all = repo_file("scripts/full-test/run_all.sh");
-    let tmp_assignment = "full_tmp_dir=\"${KEI_FULL_TEST_TMPDIR:-/tmp/codex/kei/full-test/tmp}\"";
-    let tmp_export = "export TMPDIR=\"$full_tmp_dir\"";
-    let temp_export = "export TEMP=\"$full_tmp_dir\"";
-    let tmp_windows_export = "export TMP=\"$full_tmp_dir\"";
-    let shell_scratch_export =
-        "export KEI_TEST_SCRATCH_DIR=\"${KEI_TEST_SCRATCH_DIR:-$full_tmp_dir/shell}\"";
-
-    for expected in [
-        tmp_assignment,
-        "mkdir -p \"$full_tmp_dir\"",
-        tmp_export,
-        temp_export,
-        tmp_windows_export,
-        shell_scratch_export,
-        "mkdir -p \"$KEI_TEST_SCRATCH_DIR\"",
-    ] {
-        assert!(
-            run_all.contains(expected),
-            "full-test orchestrator missing /tmp/codex tempdir setup: {expected}"
-        );
-    }
-
-    let export_pos = run_all
-        .find(tmp_export)
-        .expect("full-test must export TMPDIR before live tests");
-    let shell_export_pos = run_all
-        .find(shell_scratch_export)
-        .expect("full-test must export KEI_TEST_SCRATCH_DIR before shell tests");
-    let live_pos = run_all
-        .find("run_live_phase live_provider")
-        .expect("full-test live provider phase must still exist");
-    let shell_pos = run_all
-        .find("run_shell_suites.sh")
-        .expect("full-test shell phase must still exist");
-
-    assert!(
-        export_pos < live_pos && export_pos < shell_pos && shell_export_pos < shell_pos,
-        "TMPDIR and KEI_TEST_SCRATCH_DIR must be set before live cargo and shell phases allocate tempdirs"
-    );
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn full_test_release_artifacts_follow_cargo_target_dir() {
@@ -495,7 +470,7 @@ fn focused_scenario_catalog_lists_every_runner_slice() {
                 return None;
             }
             let name = path.file_stem()?.to_str()?;
-            (!matches!(name, "lib" | "list")).then(|| name.to_owned())
+            (!matches!(name, "lib" | "list" | "check")).then(|| name.to_owned())
         })
         .collect();
 
@@ -535,68 +510,93 @@ fn config_reconciliation_scenario_pins_transition_seed_tests() {
 }
 
 #[test]
-fn state_transition_proof_is_pinned_across_process_surfaces() {
-    let applicability = "Changes to durable configuration, filesystem paths, media publication, metadata, SQLite state, retry work, or provider checkpoints require a state-transition proof through the production call graph.";
-    let stages = [
-        "Initial durable state",
-        "Controlled mutation",
-        "Production cycle",
-        "Durable outcome",
-        "Steady-state cycle",
-    ];
-    for path in [
-        "CONTRIBUTING.md",
-        "tests/README.md",
-        ".github/pull_request_template.md",
-        ".agents/skills/kei-pr-ready/SKILL.md",
+fn state_transition_policy_links_resolve() {
+    for (source, href) in [
+        ("CONTRIBUTING.md", "tests/README.md#state-transition-proof"),
+        ("tests/README.md", "../CONTRIBUTING.md#tests"),
+        (
+            ".github/pull_request_template.md",
+            "https://github.com/rhoopr/kei/blob/HEAD/tests/README.md#state-transition-proof",
+        ),
+        (
+            ".github/pull_request_template.md",
+            "https://github.com/rhoopr/kei/blob/HEAD/CONTRIBUTING.md#pull-requests-and-review",
+        ),
+        (
+            ".agents/skills/kei-pr-ready/SKILL.md",
+            "../../../tests/README.md#state-transition-proof",
+        ),
+        (
+            ".agents/skills/kei-pr-ready/SKILL.md",
+            "../../../CONTRIBUTING.md#tests",
+        ),
     ] {
-        let contents = repo_file(path);
-        let normalized = normalize_whitespace(&contents);
+        let path = repo_path(source);
+        // Template links also work after GitHub copies them into a PR body.
+        let file = href.split('#').next().unwrap();
+        let target_path = match file.strip_prefix("https://github.com/rhoopr/kei/blob/HEAD/") {
+            Some(file) => repo_path(file),
+            None => path.parent().unwrap().join(file),
+        };
+        let target = std::fs::read_to_string(&target_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", target_path.display()));
+        let contents = repo_file(source);
         assert!(
-            normalized.contains(applicability),
-            "{path} state-transition applicability categories drifted"
+            policy_link_resolves(&contents, href, &target),
+            "{source}: {href}"
         );
-        let missing = missing_required_fragments(&contents, &stages);
         assert!(
-            missing.is_empty(),
-            "{path} missing state-transition proof stages: {missing:?}"
+            policy_link_resolves(
+                &contents.replace(
+                    "state-transition proof requirements",
+                    "durable-state test guidance"
+                ),
+                href,
+                &target.replace("Initial durable state", "Seeded durable state"),
+            ),
+            "equivalent wording must not require a Rust assertion edit"
         );
+        assert!(!policy_link_resolves(
+            &contents.replace(href, "missing.md"),
+            href,
+            &target
+        ));
+        assert!(!policy_link_resolves(
+            &contents,
+            href,
+            "# Missing section\n"
+        ));
     }
+}
 
-    let deliberately_drifted = repo_file("CONTRIBUTING.md").replacen("retry work, ", "", 1);
-    assert!(
-        !normalize_whitespace(&deliberately_drifted).contains(applicability),
-        "the process contract check must detect a deliberately removed applicability category"
-    );
-
-    let readiness = repo_file(".agents/skills/kei-pr-ready/SKILL.md");
-    let readiness_requirements = [
-        "alternate byte-landing and",
-        "downloaded-state finalization route",
-        "correctness, safety, liveness, performance, and user-visible metadata",
-        "A normal-download test does not",
-        "Do not label a complete owner or module \"fully inspected\"",
-    ];
-    let missing = missing_required_fragments(&readiness, &readiness_requirements);
-    assert!(
-        missing.is_empty(),
-        "kei-pr-ready missing cross-route review requirements: {missing:?}"
-    );
-
-    let template = repo_file(".github/pull_request_template.md");
-    let template_requirements = ["Deliberate defect mutation", "Not applicable"];
-    let missing = missing_required_fragments(&template, &template_requirements);
-    assert!(
-        missing.is_empty(),
-        "pull request template missing transition evidence fields: {missing:?}"
-    );
-
-    let deliberately_broken = template.replacen(stages[4], "Repeat run", 1);
-    assert_eq!(
-        missing_required_fragments(&deliberately_broken, &stages),
-        vec![stages[4].to_owned()],
-        "the process contract check must detect a deliberately removed transition stage"
-    );
+#[cfg(target_os = "linux")]
+#[test]
+fn safety_contract_checker_rejects_missing_links() {
+    let temp = tempfile::tempdir().expect("contract checker fixture");
+    for directory in ["scripts", "docs", "src", "tests"] {
+        std::fs::create_dir(temp.path().join(directory)).unwrap();
+    }
+    let checker = temp.path().join("scripts/check-contracts");
+    std::fs::copy(repo_path("scripts/check-contracts"), &checker).unwrap();
+    let catalog = "| `FILE_PUBLISH_NO_OVERWRITE` | owner | rule |\n";
+    let owner = "// CONTRACT: FILE_PUBLISH_NO_OVERWRITE\n";
+    let test = "fn contract_file_publish_no_overwrite() {}\n";
+    let run = |catalog: &str, owner: &str, test: &str| {
+        std::fs::write(temp.path().join("docs/architecture.md"), catalog).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), owner).unwrap();
+        std::fs::write(temp.path().join("tests/contract.rs"), test).unwrap();
+        Command::new("python3").arg(&checker).output().unwrap()
+    };
+    assert!(run(catalog, owner, test).status.success());
+    for (catalog, owner, test, diagnostic) in [
+        ("", owner, test, "production marker is not documented"),
+        (catalog, "", test, "no production owner marker"),
+        (catalog, owner, "", "missing contract_ test name"),
+    ] {
+        let output = run(catalog, owner, test);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(diagnostic));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -608,8 +608,13 @@ fn scenario_runner_rejects_filters_that_match_no_tests() {
         &cargo_stub,
         r#"#!/usr/bin/env bash
 set -euo pipefail
-if [[ " $* " == *" --list "* && " $* " == *" known_filter "* ]]; then
-  echo "module::known_filter: test"
+if [[ " $* " == *" list_failure "* ]]; then exit 23; fi
+if [[ " $* " == *" --list "* ]]; then
+  if [[ " $* " == *" known_filter "* || " $* " == *" run_failure "* ]]; then
+    echo "module::known_filter: test"
+  fi
+elif [[ " $* " == *" run_failure "* ]]; then
+  exit 23
 fi
 "#,
     );
@@ -635,6 +640,10 @@ fi
         "known scenario filter should execute: {}",
         String::from_utf8_lossy(&known.stderr)
     );
+
+    assert_eq!(run_filter("").status.code(), Some(2));
+    assert_eq!(run_filter("list_failure").status.code(), Some(1));
+    assert_eq!(run_filter("run_failure").status.code(), Some(23));
 
     let missing = run_filter("missing_filter");
     assert_eq!(missing.status.code(), Some(2));
@@ -768,11 +777,8 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
     run_git(&repo, &["add", "tracked.txt", "Cargo.lock"]);
     run_git(&repo, &["commit", "-m", "fixture"]);
 
-    std::fs::write(
-        runs.join(".current.jsonl"),
-        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.25,\"tests\":3}\n",
-    )
-    .expect("write phase fixture");
+    std::fs::write(runs.join(".current.jsonl"), full_test_phase_fixture())
+        .expect("write phase fixture");
     std::fs::write(runs.join(".run-started-at"), "2026-07-17T12:34:56\n")
         .expect("write start fixture");
     let head = run_git(&repo, &["rev-parse", "HEAD"]);
@@ -789,6 +795,48 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
         bin.display(),
         std::env::var("PATH").expect("PATH must be set")
     );
+
+    let valid = full_test_phase_fixture();
+    for phase in [
+        "static_checks",
+        "offline_core",
+        "nightly_tools",
+        "package",
+        "docker_full",
+    ] {
+        for status in ["missing", "skipped", "fail"] {
+            let invalid: String = valid
+                .lines()
+                .filter_map(|line| {
+                    if line.contains(&format!("\"phase\":\"{phase}\"")) {
+                        (status != "missing")
+                            .then(|| line.replace("\"pass\"", &format!("\"{status}\"")))
+                    } else {
+                        Some(line.to_owned())
+                    }
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            std::fs::write(runs.join(".current.jsonl"), invalid).unwrap();
+            let output = Command::new("bash")
+                .arg(repo_path("scripts/full-test/finalize_run.sh"))
+                .current_dir(&repo)
+                .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "must reject {phase}={status}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains(phase));
+            assert!(runs.join(".current.jsonl").exists());
+            assert!(runs.join(".run-marker").exists());
+        }
+    }
+    // Explicit live skips are recorded, never converted to passing coverage.
+    let valid = valid.replace(
+        "\"phase\":\"live_provider\",\"status\":\"pass\"",
+        "\"phase\":\"live_provider\",\"status\":\"skipped\"",
+    );
+    std::fs::write(runs.join(".current.jsonl"), valid).unwrap();
 
     let output = Command::new("bash")
         .arg(repo_path("scripts/full-test/finalize_run.sh"))
@@ -816,6 +864,7 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
     assert_eq!(record["end_worktree_clean"], true);
     assert_eq!(record["phases"]["static_checks"]["status"], "pass");
     assert_eq!(record["phases"]["static_checks"]["tests"], 3);
+    assert_eq!(record["phases"]["live_provider"]["status"], "skipped");
     assert!(record["metrics"].is_object());
     assert!(record["metrics"]["deps_count"].is_number());
     for staging in [
@@ -861,11 +910,8 @@ fn full_test_head_change_is_not_current_validation() {
         "begin fixture failed: {}",
         String::from_utf8_lossy(&begin.stderr)
     );
-    std::fs::write(
-        runs.join(".current.jsonl"),
-        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.0}\n",
-    )
-    .expect("write phase fixture");
+    std::fs::write(runs.join(".current.jsonl"), full_test_phase_fixture())
+        .expect("write phase fixture");
 
     std::fs::write(repo.join("tracked.txt"), "end\n").expect("write ending file");
     run_git(&repo, &["add", "tracked.txt"]);
@@ -949,11 +995,8 @@ fn full_test_dirty_start_is_not_current_validation() {
         "begin fixture failed: {}",
         String::from_utf8_lossy(&begin.stderr)
     );
-    std::fs::write(
-        runs.join(".current.jsonl"),
-        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.0}\n",
-    )
-    .expect("write phase fixture");
+    std::fs::write(runs.join(".current.jsonl"), full_test_phase_fixture())
+        .expect("write phase fixture");
     std::fs::write(repo.join("tracked.txt"), "committed\n").expect("restore committed file");
 
     write_executable(&bin.join("cargo"), "#!/usr/bin/env bash\nexit 0\n");
@@ -1128,20 +1171,10 @@ fn full_test_checks_gnu_linux_userland_before_begin_run() {
 
 #[test]
 fn full_test_docker_smokes_quote_configured_image() {
-    let run_all = repo_file("scripts/full-test/run_all.sh");
     let justfile = repo_file("justfile");
     let shell_suites = repo_file("scripts/full-test/run_shell_suites.sh");
     let docker_puid = repo_file("scripts/full-test/run_docker_puid_smoke.sh");
     let shell_lib = repo_file("tests/shell/lib.sh");
-
-    assert!(
-        run_all.contains(r#"export KEI_DOCKER_IMAGE="${KEI_DOCKER_IMAGE:-kei:dev}""#),
-        "full-test must export the configured docker image default"
-    );
-    assert!(
-        run_all.contains("run_phase docker_full -- just test docker-full"),
-        "full-test docker group must route through the named docker-full recipe"
-    );
 
     for expected in [
         r#"docker run --rm "${KEI_DOCKER_IMAGE:-kei:dev}" --version"#,
@@ -1175,92 +1208,203 @@ fn full_test_docker_smokes_quote_configured_image() {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn shell_block(contents: &str, marker: &str, indentation: &str) -> String {
+    contents
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("missing shell block: {marker}"))
+        .1
+        .lines()
+        .take_while(|line| line.is_empty() || line.starts_with(indentation))
+        .filter_map(|line| line.strip_prefix(indentation))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// Execute the checked-in shell bodies without requiring just on every CI host.
+// Stubs record argv; they do not claim to run lint or Rust behavior coverage.
+#[cfg(target_os = "linux")]
+fn run_tooling_shell(body: &str, fail_call: &str) -> (Output, Vec<String>) {
+    let temp = tempfile::tempdir().unwrap_or_else(|e| panic!("tooling shell fixture: {e}"));
+    let pycache = tempfile::tempdir().unwrap_or_else(|e| panic!("tooling pycache: {e}"));
+    for directory in [
+        "bin",
+        "scripts",
+        "tests/shell",
+        "docker",
+        ".github/scripts",
+        ".github/workflows",
+    ] {
+        std::fs::create_dir_all(temp.path().join(directory)).unwrap();
+    }
+    let recorder = r#"#!/bin/bash
+set -euo pipefail
+call=$(printf '%s' "${0##*/}"; printf '\t%s' "$@")
+printf '%s\n' "$call" >> "$CALL_LOG"
+if [[ "$call" == "${FAIL_CALL:-}" ]]; then exit 23; fi
+if [[ "${0##*/}" == python3 && "${1:-}" == -m ]]; then
+    [[ "${PYTHONPYCACHEPREFIX:-}" == /* && "$PYTHONPYCACHEPREFIX" != "$PWD/"* ]] || exit 24
+fi
+if [[ "${0##*/}" == cargo && "${1:-}" == doc ]]; then
+    [[ "${RUSTDOCFLAGS:-}" == -Dwarnings ]] || exit 24
+fi
+"#;
+    for name in [
+        "cargo",
+        "just",
+        "bash",
+        "python3",
+        "shellcheck",
+        "shfmt",
+        "ruff",
+        "actionlint",
+        "typos",
+    ] {
+        write_executable(&temp.path().join("bin").join(name), recorder);
+    }
+    write_executable(&temp.path().join("scripts/check-contracts"), recorder);
+    for file in [
+        "scripts/space name.sh",
+        "scripts/check-roundtrip-gate.sh",
+        "scripts/helper.py",
+        "tests/shell/example.sh",
+        "docker/entrypoint.sh",
+        ".github/scripts/check_workflow_hardening.py",
+        ".github/workflows/check.yml",
+    ] {
+        std::fs::write(temp.path().join(file), "").unwrap();
+    }
+    let log = temp.path().join("calls");
+    std::fs::write(&log, "").unwrap();
+    let output = Command::new("/bin/bash")
+        .args(["-euo", "pipefail", "-c", body])
+        .current_dir(temp.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                temp.path().join("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("PYTHONPYCACHEPREFIX", pycache.path())
+        .env_remove("RUSTDOCFLAGS")
+        .env("CALL_LOG", &log)
+        .env("FAIL_CALL", fail_call)
+        .output()
+        .unwrap_or_else(|e| panic!("execute tooling shell body: {e}"));
+    let calls = std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (output, calls)
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn local_gate_includes_script_and_workflow_lint_recipes() {
     let justfile = repo_file("justfile");
     let ci = repo_file(".github/workflows/ci.yml");
-
-    for expected in [
-        "static-checks:",
-        "lint-workflows:",
-        "python3 .github/scripts/check_workflow_hardening.py",
-        "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile .github/scripts/*.py",
-        "actionlint .github/workflows/*.yml",
-        "lint-scripts:",
-        "python_files+=(scripts/check-contracts)",
-        "for shell_file in \"${shell_files[@]}\"; do",
-        "bash -n \"$shell_file\"",
-        "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile \"${python_files[@]}\"",
-        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
-        "shfmt -d \"${shell_files[@]}\"",
-        "ruff check \"${python_files[@]}\"",
+    let gate = shell_block(&justfile, "\ngate:\n", "    ");
+    let static_checks = shell_block(&justfile, "\nstatic-checks:\n", "    ");
+    let scripts = shell_block(&justfile, "\nlint-scripts:\n", "    ");
+    let workflows = shell_block(&justfile, "\nlint-workflows:\n", "    ");
+    let ci_lint = ci
+        .split_once("  script-lint:\n")
+        .unwrap()
+        .1
+        .split_once("\n  typos:")
+        .unwrap()
+        .0;
+    let ci_shell = shell_block(ci_lint, "        run: |\n", "          ");
+    let shell_files = "docker/entrypoint.sh\tscripts/check-roundtrip-gate.sh\tscripts/space name.sh\ttests/shell/example.sh";
+    let python_files =
+        ".github/scripts/check_workflow_hardening.py\tscripts/helper.py\tscripts/check-contracts";
+    let script_calls = vec![
+        "bash\t-n\tdocker/entrypoint.sh".to_owned(),
+        "bash\t-n\tscripts/check-roundtrip-gate.sh".to_owned(),
+        "bash\t-n\tscripts/space name.sh".to_owned(),
+        "bash\t-n\ttests/shell/example.sh".to_owned(),
+        format!("python3\t-m\tpy_compile\t{python_files}"),
+        format!("shellcheck\t-x\t-P\ttests/shell:scripts:scripts/full-test\t{shell_files}"),
+        format!("shfmt\t-d\t{shell_files}"),
+        format!("ruff\tcheck\t{python_files}"),
+    ];
+    let gate_calls = ["just\tstatic-checks", "just\ttest\toffline"].map(str::to_owned);
+    let static_calls = [
+        "cargo\tfmt\t--all\t--check",
+        "cargo\tclippy\t--all-targets\t--all-features\t--\t-D\twarnings",
+        "cargo\tclippy\t--all-targets\t--no-default-features\t--\t-D\twarnings",
+        "cargo\tdoc\t--no-deps\t--all-features",
+        "cargo\tfetch\t--locked",
+        "cargo\taudit\t--deny\twarnings",
+        "just\tlint-workflows",
+        "just\tlint-scripts",
+        "check-contracts\t",
+        "typos\t",
+        "bash\tscripts/check-roundtrip-gate.sh",
+        "python3\tscripts/fixtures/check_live_selection.py",
+    ]
+    .map(str::to_owned);
+    let workflow_calls = [
+        "python3\t.github/scripts/check_workflow_hardening.py",
+        "python3\t-m\tpy_compile\t.github/scripts/check_workflow_hardening.py",
+        "actionlint\t.github/workflows/check.yml",
+    ]
+    .map(str::to_owned);
+    let mut ci_calls = script_calls.clone();
+    ci_calls.push("actionlint\t.github/workflows/check.yml".to_owned());
+    for (body, required) in [
+        (&gate, gate_calls.as_slice()),
+        (&static_checks, static_calls.as_slice()),
+        (&scripts, script_calls.as_slice()),
+        (&workflows, workflow_calls.as_slice()),
+        (&ci_shell, ci_calls.as_slice()),
     ] {
+        let (output, calls) = run_tooling_shell(body, "");
         assert!(
-            justfile.contains(expected),
-            "justfile must keep script/workflow lint coverage: {expected}"
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        assert_eq!(calls, required, "required tool dispatch changed");
+        for call in required {
+            let (output, calls) = run_tooling_shell(body, call);
+            assert_eq!(output.status.code(), Some(23), "must propagate {call}");
+            assert_eq!(calls.last(), Some(call), "must stop after {call}");
+        }
+        // A semicolon/newline change in a Bash loop must preserve its argv contract.
+        let formatted = body.replace("; do\n", "\ndo\n");
+        let (output, calls) = run_tooling_shell(&formatted, "");
+        assert!(output.status.success());
+        assert_eq!(calls, required);
     }
-
-    let static_checks = justfile
-        .split_once("static-checks:\n")
-        .map(|(_, tail)| tail)
-        .and_then(|tail| tail.split_once("\n\n").map(|(recipe, _)| recipe))
-        .expect("justfile must keep static-checks recipe");
-    for expected in ["just lint-workflows", "just lint-scripts"] {
-        assert!(
-            static_checks.contains(expected),
-            "just static-checks must run {expected}"
-        );
-    }
-
-    let gate = justfile
-        .split_once("gate:\n")
-        .map(|(_, tail)| tail)
-        .and_then(|tail| tail.split_once("\n\n").map(|(gate, _)| gate))
-        .expect("justfile must keep gate recipe");
-    for expected in [
-        "just static-checks",
-        "cargo test --all-features",
-        "cargo test --no-default-features",
-    ] {
-        assert!(gate.contains(expected), "just gate must run {expected}");
-    }
-
-    assert!(
-        ci.contains("  script-lint:\n"),
-        "CI workflow must keep the script-lint job"
+    let omitted_dispatch = static_checks.replace("just lint-scripts", "true");
+    assert_ne!(omitted_dispatch, static_checks);
+    let (output, calls) = run_tooling_shell(&omitted_dispatch, "");
+    assert!(output.status.success());
+    assert!(!calls.iter().any(|call| call == "just\tlint-scripts"));
+    assert_ne!(
+        calls, static_calls,
+        "omitted dispatch must fail the same argv check"
     );
-    assert!(
-        ci.contains("PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile"),
-        "CI script lint must route generated Python bytecode outside the repo tree"
-    );
+
+    // Retain CI tool pinning and aggregate-job reachability checks.
     for expected in [
         "jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db",
         "actionlint = \"1.7.12\"",
         "ruff = \"0.16.3\"",
         "shellcheck = \"0.11.0\"",
         "shfmt = \"3.13.1\"",
-        "python_files+=(scripts/check-contracts)",
-        "for shell_file in \"${shell_files[@]}\"; do",
-        "bash -n \"$shell_file\"",
-        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
-        "shfmt -d \"${shell_files[@]}\"",
-        "ruff check \"${python_files[@]}\"",
-        "actionlint .github/workflows/*.yml",
     ] {
         assert!(
-            ci.contains(expected),
-            "CI script lint must check each script with the matching interpreter: {expected}"
+            ci_lint.contains(expected),
+            "missing pinned CI tool: {expected}"
         );
     }
-    let aggregate = ci
-        .split_once("  ci:\n")
-        .map(|(_, tail)| tail)
-        .expect("CI aggregate job must exist");
-    assert!(
-        aggregate.contains("      - script-lint\n"),
-        "aggregate CI job must require script-lint"
-    );
+    let aggregate = ci.split_once("  ci:\n").unwrap().1;
+    assert!(aggregate.contains("      - script-lint\n"));
 }
 
 #[test]
@@ -1354,6 +1498,7 @@ fn service_smoke_path_filters_cover_shared_dispatch() {
         "src/commands/service.rs",
         "src/cli.rs",
         "src/config.rs",
+        "src/config/**",
         "src/lib.rs",
         "src/commands/status.rs",
     ] {
@@ -1372,51 +1517,22 @@ fn service_smoke_path_filters_cover_shared_dispatch() {
 #[test]
 fn contributor_docs_match_current_gate() {
     let contributing = repo_file("CONTRIBUTING.md");
-    let pr_template = repo_file(".github/pull_request_template.md");
-
-    for expected in [
-        "cargo fmt --all --check",
-        "cargo clippy --all-targets --all-features -- -D warnings",
-        "cargo clippy --all-targets --no-default-features -- -D warnings",
-        "cargo test --all-features",
-        "cargo test --no-default-features",
-        "RUSTDOCFLAGS=\"-Dwarnings\" cargo doc --no-deps --all-features",
-        "cargo audit --deny warnings",
-        "python3 .github/scripts/check_workflow_hardening.py",
-        "python_files+=(scripts/check-contracts)",
-        "for shell_file in \"${shell_files[@]}\"; do bash -n \"$shell_file\"; done",
-        "PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile",
-        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
-        "shfmt -d \"${shell_files[@]}\"",
-        "ruff check \"${python_files[@]}\"",
-        "actionlint .github/workflows/*.yml",
-        "scripts/check-contracts",
-        "bash scripts/check-roundtrip-gate.sh",
-    ] {
-        assert!(
-            contributing.contains(expected),
-            "CONTRIBUTING.md must document current gate command: {expected}"
-        );
-    }
-
-    assert!(
-        pr_template.contains("`just gate` passes"),
-        "PR template should ask reviewers for the current local gate"
-    );
-    for expected in [
-        "## Contract and risk",
-        "## Regression proof",
-        "independent/adversarial review results",
-    ] {
-        assert!(
-            pr_template.contains(expected),
-            "PR template must capture verification evidence: {expected}"
-        );
-    }
-    assert!(
-        !pr_template.contains("cargo test --bin kei --test cli --test behavioral"),
-        "PR template must not keep stale partial test command"
-    );
+    assert!(contributing.contains("just gate"));
+    assert!(policy_link_resolves(
+        &contributing,
+        "justfile",
+        &repo_file("justfile")
+    ));
+    assert!(policy_link_resolves(
+        &contributing,
+        "tests/README.md#running",
+        &repo_file("tests/README.md"),
+    ));
+    assert!(policy_link_resolves(
+        &repo_file(".github/pull_request_template.md"),
+        "https://github.com/rhoopr/kei/blob/HEAD/CONTRIBUTING.md#workflow",
+        &contributing,
+    ));
 }
 
 #[test]
@@ -1430,18 +1546,14 @@ fn repo_pr_ready_skill_uses_current_validation_workflow() {
     let skill = repo_file(".agents/skills/kei-pr-ready/SKILL.md");
     for expected in [
         "name: kei-pr-ready",
-        "without publishing or changing it",
         "just agent-status",
         "just review-scope BASE=<resolved-base>",
-        "coverage ledger",
-        "validation provenance",
         "STALE",
         "OTHER BRANCH",
         "docs/architecture.md",
         "tests/README.md",
         "just test scenario NAME",
         "just gate",
-        "final verdict: ready or not ready",
     ] {
         assert!(
             skill.contains(expected),
@@ -1793,23 +1905,47 @@ fn live_import_smoke_uses_toml_directory() {
 }
 
 #[test]
-fn live_import_rehearsal_seeds_album_with_per_filter_recent_scope() {
+fn live_import_rehearsal_uses_shared_bounded_selection() {
     let rehearsal = repo_file("scripts/full-test/run_live_import_rehearsal.sh");
+    assert!(rehearsal.contains("recent=$(kei_live_recent)"));
+    #[cfg(unix)]
+    {
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_live_recent"#,
+            ])
+            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let selection: toml::Table = repo_file("tests/data/live-selection.toml").parse().unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            selection["filters"]["recent"]
+                .as_integer()
+                .unwrap()
+                .to_string()
+        );
+    }
 
     assert!(
-        rehearsal.contains("sync --recent 10 --recent-scope per-filter --no-progress-bar"),
-        "live import rehearsal must seed from the selected album's recent window, not the global library frontier"
+        rehearsal.contains("sync --no-progress-bar --config")
+            && rehearsal.contains("kei_live_filters"),
+        "live import rehearsal must seed from the shared single-pass selection"
     );
     assert!(
         rehearsal.contains("set +e\n    \"$@\" >\"$out\" 2>\"$err\"\n    local rc=$?\n    set -e"),
         "live import rehearsal must print command tails before propagating a failed command"
     );
     assert!(
-        rehearsal.contains("import-existing --dry-run --recent 10 --force-empty --no-progress-bar"),
+        rehearsal.contains(
+            "import-existing --dry-run --force-empty --recent \"$recent\" --no-progress-bar"
+        ),
         "live import rehearsal dry-run should keep import-existing bounded to the same recent count"
     );
     assert!(
-        rehearsal.contains("import-existing --recent 10 --force-empty --no-progress-bar"),
+        rehearsal.contains("import-existing --force-empty --recent \"$recent\" --no-progress-bar"),
         "live import rehearsal real import should keep import-existing bounded to the same recent count"
     );
 }
@@ -1846,4 +1982,489 @@ fn full_test_cross_zone_album_phase_is_opt_in_and_checks_source_zone() {
         readme.contains("KEI_FULL_TEST_CROSS_ZONE_ALBUM"),
         "tests README must document the opt-in cross-zone fixture"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_offline_dispatch_preserves_features_and_checks_scenario_filters() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let scripts = root.join("scripts/test-scenarios");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(root.join("justfile"), repo_file("justfile")).unwrap();
+    let mut catalog = String::new();
+    for entry in std::fs::read_dir(repo_path("scripts/test-scenarios")).unwrap() {
+        let entry = entry.unwrap();
+        let contents = std::fs::read_to_string(entry.path()).unwrap();
+        write_executable(&scripts.join(entry.file_name()), &contents);
+        for line in contents.lines() {
+            if let Some(call) = line.strip_prefix("run_scenario_test ") {
+                let (_, filter) = call.split_once(' ').unwrap();
+                catalog.push_str(&format!("fixture::{filter}: test\n"));
+            }
+        }
+    }
+    std::fs::write(root.join("catalog"), catalog).unwrap();
+    write_executable(
+        &bin.join("cargo"),
+        r#"#!/bin/bash
+set -euo pipefail
+call=$(printf '%s' "$1"; shift; printf '\t%s' "$@")
+printf '%s\n' "$call" >> "$CALL_LOG"
+[[ "$call" != "${FAIL_CALL:-}" ]] || exit 23
+if [[ "$call" == *--list ]]; then
+    [[ "${EMPTY_CATALOG:-0}" != 1 ]] || exit 0
+    cat "$CATALOG"
+fi
+"#,
+    );
+    let log = root.join("calls");
+    let run = |args: &[&str], fail: &str, empty: bool| {
+        std::fs::write(&log, "").unwrap();
+        let output = Command::new("just")
+            .args(args)
+            .current_dir(root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CARGO", bin.join("cargo"))
+            .env("CALL_LOG", &log)
+            .env("CATALOG", root.join("catalog"))
+            .env("FAIL_CALL", fail)
+            .env("EMPTY_CATALOG", if empty { "1" } else { "0" })
+            .output()
+            .unwrap();
+        let calls: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        (output, calls)
+    };
+    let expected = [
+        "test\t--all-features",
+        "test\t--no-default-features",
+        "test\t--lib\t--\t--list",
+        "test\t--test\tbranch_static\t--\t--list",
+    ];
+    let (output, calls) = run(&["test", "offline"], "", false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(calls, expected);
+    for call in expected {
+        let (output, calls) = run(&["test", "offline"], call, false);
+        assert!(!output.status.success(), "must propagate {call}");
+        assert_eq!(calls.last().unwrap(), call);
+    }
+    let (output, _) = run(&["test", "offline"], "", true);
+    assert!(!output.status.success(), "empty catalogs must fail closed");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no tests matched"));
+    for args in [
+        vec!["test", "scenario"],
+        vec!["test", "scenario", "missing"],
+    ] {
+        let (output, calls) = run(&args, "", false);
+        assert!(!output.status.success());
+        assert!(calls.is_empty());
+    }
+    let (output, calls) = run(&["test", "scenarios"], "", false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!calls.is_empty());
+    assert_eq!(calls.len() % 2, 0);
+    for pair in calls.chunks_exact(2) {
+        assert_eq!(pair[0], format!("{}\t--\t--list", pair[1]));
+        assert!(!pair[1].contains("--features"));
+    }
+    let first_run = &calls[1];
+    let (output, failed_calls) = run(&["test", "scenarios"], first_run, false);
+    assert!(!output.status.success());
+    assert_eq!(failed_calls.last(), Some(first_run));
+    // A stale filter in a real scenario script must fail through the full route.
+    let scenario = scripts.join("auth-session.sh");
+    let original = std::fs::read_to_string(&scenario).unwrap();
+    std::fs::write(
+        &scenario,
+        format!("{original}\nrun_scenario_test lib removed_test\n"),
+    )
+    .unwrap();
+    let (output, _) = run(&["test", "offline"], "", false);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("filter=removed_test"));
+    std::fs::write(&scenario, original).unwrap();
+    for body in ["#!/bin/bash\nexit 23\n", "#!/bin/bash\nexit 0\n"] {
+        write_executable(&scripts.join("list.sh"), body);
+        for route in ["offline", "scenarios"] {
+            let (output, _) = run(&["test", route], "", false);
+            assert!(
+                !output.status.success(),
+                "failed or empty discovery must reject {route}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_live_dispatch_reaches_lookup_only_and_propagates_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let scripts = root.join("scripts/just");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(root.join("justfile"), repo_file("justfile")).unwrap();
+    std::fs::write(
+        scripts.join("live-env.sh"),
+        repo_file("scripts/just/live-env.sh"),
+    )
+    .unwrap();
+    write_executable(
+        &bin.join("cargo"),
+        r#"#!/bin/bash
+set -euo pipefail
+call=$(printf '%s' "$1"; shift; printf '\t%s' "$@")
+printf '%s\n' "$call" >> "$CALL_LOG"
+[[ "$call" != "${FAIL_CALL:-}" ]] || exit 23
+"#,
+    );
+    let log = root.join("calls");
+    let expected = [
+        "test\t--all-features\t--lib\ticloud::photos::album::lookup::tests::live_targeted_record_lookup_distinguishes_present_and_missing\t--\t--exact\t--ignored\t--test-threads=1",
+        "test\t--all-features\t--test\tsync\t--\t--ignored\t--test-threads=1",
+        "test\t--all-features\t--test\tstate_auth\t--\t--ignored\t--test-threads=1",
+        "test\t--all-features\t--test\timport_existing_live\t--\t--ignored\t--test-threads=1",
+    ];
+    for fail in std::iter::once("").chain(expected) {
+        std::fs::write(&log, "").unwrap();
+        let output = Command::new("just")
+            .args(["test", "live"])
+            .current_dir(root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("ICLOUD_USERNAME", "fixture@example.invalid")
+            .env_remove("ICLOUD_PASSWORD")
+            .env("CALL_LOG", &log)
+            .env("FAIL_CALL", fail)
+            .output()
+            .unwrap();
+        let calls: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        if fail.is_empty() {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(calls, expected);
+        } else {
+            assert!(!output.status.success(), "must propagate {fail}");
+            assert_eq!(calls.last().unwrap(), fail, "must stop after child failure");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn full_test_phase_fixture() -> String {
+    [
+        "static_checks",
+        "offline_core",
+        "nightly_tools",
+        "package",
+        "docker_full",
+        "live_provider",
+        "live_import_rehearsal",
+        "service",
+    ]
+    .iter()
+    .map(|phase| {
+        format!(
+            "{{\"phase\":\"{phase}\",\"status\":\"pass\",\"exit\":0,\"wall_s\":1.25,\"tests\":3}}\n"
+        )
+    })
+    .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_dispatch_reaches_required_phases_and_stops_on_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    let scripts = root.join("scripts/full-test");
+    let bin = root.join("bin");
+    let runs = temp.path().join("runs");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&runs).unwrap();
+    for name in [
+        "run_all.sh",
+        "begin_run.sh",
+        "time_phase.sh",
+        "finalize_run.sh",
+        "record_skip.sh",
+        "render_summary.py",
+    ] {
+        write_executable(
+            &scripts.join(name),
+            &repo_file(&format!("scripts/full-test/{name}")),
+        );
+    }
+    let recorder = r#"#!/bin/bash
+set -euo pipefail
+call=$(printf '%s' "${0##*/}"; if [[ $# -gt 0 ]]; then printf '\t%s' "$@"; fi)
+printf '%s\n' "$call" >> "$CALL_LOG"
+if [[ "$call" == "${FAIL_CALL:-}" ]]; then
+    if [[ "${CANCEL_CHILD:-0}" == 1 ]]; then kill -TERM $$; fi
+    exit 23
+fi
+if [[ "${0##*/}" == just || "${0##*/}" == run_* ]]; then
+    [[ "$TMPDIR" == "$KEI_FULL_TEST_TMPDIR" && "$TMP" == "$TMPDIR" && "$TEMP" == "$TMPDIR" ]]
+    [[ "$KEI_TEST_SCRATCH_DIR" == "$TMPDIR/shell" ]]
+    [[ "$KEI_DOCKER_IMAGE" == 'fixture image:dev' ]]
+fi
+"#;
+    for name in ["just", "systemd-analyze"] {
+        write_executable(&bin.join(name), recorder);
+    }
+    for name in [
+        "check_userland.sh",
+        "check_prereqs.sh",
+        "run_shell_suites.sh",
+        "run_live_smokes.sh",
+        "run_live_import_rehearsal.sh",
+        "run_cross_zone_album_hydration.sh",
+        "diff_runs.sh",
+    ] {
+        write_executable(&scripts.join(name), recorder);
+    }
+    write_executable(
+        &scripts.join("collect_metrics.py"),
+        "#!/bin/bash\necho '{}'\n",
+    );
+    run_git(&root, &["init", "-b", "fixture"]);
+    run_git(&root, &["config", "user.name", "Kei Test"]);
+    run_git(&root, &["config", "user.email", "kei-test@example.invalid"]);
+    std::fs::write(root.join("tracked"), "fixture").unwrap();
+    run_git(&root, &["add", "tracked"]);
+    run_git(&root, &["commit", "-m", "fixture"]);
+    let log = temp.path().join("calls");
+    let run = |fail: &str, cancel: bool| {
+        std::fs::write(&log, "").unwrap();
+        let output = Command::new("bash")
+            .arg(scripts.join("run_all.sh"))
+            .current_dir(&root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CALL_LOG", &log)
+            .env("FAIL_CALL", fail)
+            .env("CANCEL_CHILD", if cancel { "1" } else { "0" })
+            .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+            .env("KEI_FULLTEST_LOG_DIR", temp.path().join("logs"))
+            .env("KEI_FULL_TEST_TMPDIR", temp.path().join("tmp"))
+            .env_remove("KEI_TEST_SCRATCH_DIR")
+            .env("KEI_DOCKER_IMAGE", "fixture image:dev")
+            .env("KEI_FULL_TEST_CROSS_ZONE_ALBUM", "fixture")
+            .env("KEI_FULL_TEST_REAL_SERVICE", "1")
+            .env("KEI_FULLTEST_VERBOSE", if cancel { "0" } else { "1" })
+            .output()
+            .unwrap();
+        let calls: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        (output, calls)
+    };
+    let expected = [
+        "check_userland.sh",
+        "check_prereqs.sh",
+        "just\tstatic-checks",
+        "just\ttest\toffline",
+        "just\ttest\tnightly-tools",
+        "just\ttest\tpackaging",
+        "just\ttest\tdocker-full",
+        "just\ttest\tlive",
+        "run_shell_suites.sh",
+        "run_live_smokes.sh",
+        "run_live_import_rehearsal.sh",
+        "run_cross_zone_album_hydration.sh",
+        "just\ttest\tservice",
+        "just\ttest\thost-service",
+        "diff_runs.sh",
+    ];
+    let (output, calls) = run("", false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(calls, expected);
+    for call in expected {
+        let (output, calls) = run(call, false);
+        assert!(!output.status.success(), "must propagate {call}");
+        assert_eq!(calls.last().unwrap(), call, "must stop after child failure");
+        assert!(!command_text(&output).contains("Result: PASS"));
+        assert!(!runs.join(".run-marker").exists());
+    }
+    let (output, calls) = run("just\ttest\toffline", true);
+    assert!(
+        !output.status.success(),
+        "cancelled child must fail the run"
+    );
+    assert_eq!(calls.last().unwrap(), "just\ttest\toffline");
+    assert!(!command_text(&output).contains("Result: PASS"));
+    // Removing a required phase must not finalize an incomplete run as passing.
+    let original = repo_file("scripts/full-test/run_all.sh");
+    let omitted = original.replace("run_phase offline_core -- just test offline", ":");
+    assert_ne!(omitted, original);
+    std::fs::write(scripts.join("run_all.sh"), omitted).unwrap();
+    let (output, _) = run("", false);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("offline_core"));
+    assert!(!command_text(&output).contains("Result: PASS"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_selection_guard_rejects_retired_album_consumers() {
+    let guard = repo_path("scripts/fixtures/check_live_selection.py");
+    let output = Command::new("python3")
+        .arg(&guard)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("tests")).unwrap();
+    std::fs::create_dir(dir.path().join("scripts")).unwrap();
+    std::fs::write(dir.path().join("justfile"), "").unwrap();
+    let key = ["KEI_TEST_", "ALBUM"].concat();
+    for (path, body) in [
+        (
+            "tests/consumer.rs",
+            format!("fn consumer() {{ std::env::var(\"{key}\"); }}"),
+        ),
+        ("scripts/consumer.sh", format!("export {key}=retired")),
+        (
+            "justfile",
+            format!("test:\n    env {key}=retired cargo test"),
+        ),
+    ] {
+        let path = dir.path().join(path);
+        std::fs::write(&path, body).unwrap();
+        let output = Command::new("python3")
+            .arg(&guard)
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "guard accepted {}",
+            path.display()
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("retired named-album consumer"));
+        std::fs::write(path, "").unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_shell_preflight_rejects_empty_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("kei");
+    for (output, success) in [("", false), ("controlled.JPG", true)] {
+        write_executable(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n"));
+        let result = Command::new("bash")
+            .args(["-c", r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_release_bin() { printf '%s' "$BINARY"; }; kei_copy_session_without_state() { mkdir -p "$1"; }; kei_preflight_selection"#])
+            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .env("BINARY", &binary)
+            .output().unwrap();
+        assert_eq!(
+            result.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if !success {
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("empty bounded live selection")
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_shell_sql_quotes_arbitrary_media_paths() {
+    for path in [
+        "/photos/Photo.JPG",
+        "/photos/Café's image.MOV",
+        "/photos/a\nb.JPG",
+    ] {
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_sql_string "$MEDIA_PATH""#,
+            ])
+            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .env("MEDIA_PATH", path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = format!("SELECT {}", String::from_utf8(output.stdout).unwrap());
+        assert_eq!(
+            db.query_row(&sql, [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            path
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn docker_album_listing_drains_output_under_pipefail() {
+    let script = repo_file("tests/shell/docker.sh");
+    let section = script
+        .split_once("echo \"--- 9. List albums in container ---\"")
+        .unwrap()
+        .1;
+    let pipeline = section.split_once("kei_check").unwrap().0;
+    assert!(pipeline.contains("grep -F \"Library:\" >/dev/null"));
+    let early_close = pipeline.replace("grep -F \"Library:\" >/dev/null", "grep -qF \"Library:\"");
+    for (pipeline, success) in [(pipeline, true), (early_close.as_str(), false)] {
+        let command = format!(
+            "set -o pipefail\ndocker() {{ printf 'Library: controlled\\n'; printf 'album %s\\n' {{1..10000}}; }}\n{pipeline}"
+        );
+        let output = Command::new("bash")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

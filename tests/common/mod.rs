@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub mod live_selection;
+
 /// Set when any test detects an Apple 503 rate-limit response.
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
 
@@ -399,6 +401,7 @@ pub fn require_preauth() -> (String, String, PathBuf) {
     let dir = cookie_dir();
     AUTH_CREDS.get_or_init(|| (username.clone(), password.clone(), dir.clone()));
     ensure_session(&username, &password, &dir);
+    live_selection::ensure_selection(&username, &password, &dir);
     let isolated_dir = isolated_data_dir(&username, &dir);
     (username, password, isolated_dir)
 }

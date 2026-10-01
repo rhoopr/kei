@@ -190,7 +190,8 @@ Deferral keeps the capture revision and checkpoint pending; it is not recovery.
 This state uses schema 27. Stop workers and back up the state database before
 trying this build. Binaries that support only schema 26 or earlier cannot
 open the upgraded database. Keep a compatible backup if you need to return
-to an older build. Do not reset state or lower its schema version to bypass this check.
+to an older build. Do not reset state or lower its schema version to bypass
+this check.
 
 Kei marks unresolved asset identity cycles incomplete. Status
 remains unsafe across restarts and successful syncs in other libraries until

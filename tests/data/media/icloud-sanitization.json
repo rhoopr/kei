@@ -1,0 +1,14 @@
+{
+  "source_sha256": "57b8560b2abd3e49ecfbf73d9eb1a8ca453ab161966ec06124cf46698b6d86c9",
+  "source": "Downloaded from the maintainer's shared iCloud Photos library with kei on 2026-09-27",
+  "permission": "Maintainer confirmed ownership and authorized sanitized samples under MIT on 2026-09-27",
+  "privacy_review": "User-selected sunset, trees and yard; no people, documents or visible addresses; GPS removed and capture times replaced",
+  "decoded_pixels_identical": true,
+  "compressed_image_packets_identical": true,
+  "rgb24_sha256": "6cec82e3a9518bd46646a335c48073a6ca5683758608ca208d2c430226e213d0",
+  "gps_location_identifiers_serial_absent": true,
+  "personal_xmp_removed": true,
+  "auxiliary_xmp_identical": true,
+  "exiftool": "13.59",
+  "ffmpeg": "ffmpeg version n8.1.1 Copyright (c) 2000-2026 the FFmpeg developers"
+}

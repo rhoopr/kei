@@ -4,7 +4,8 @@ use chrono::{DateTime, Utc};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio_util::sync::CancellationToken;
 
-use super::{DownloadConfig, DownloadRunMode, IncrementalDeltaSummary};
+use super::IncrementalDeltaSummary;
+use crate::download::{DownloadConfig, DownloadRunMode};
 use crate::icloud::photos::ProviderRecordId;
 use crate::icloud::photos::asset::{ChangeEvent, SparseShareEvidence};
 use crate::state::{
@@ -316,8 +317,9 @@ impl SparseRetryContext {
 
 #[cfg(test)]
 mod tests {
+    use super::super::IncrementalDeltaSummary;
     use super::{SPARSE_LOOKUPS_PER_LIBRARY, SparseRetryContext};
-    use crate::download::{DownloadConfig, DownloadRunMode, IncrementalDeltaSummary};
+    use crate::download::{DownloadConfig, DownloadRunMode};
     use crate::icloud::photos::asset::SparseShareEvidence;
     use crate::state::{
         SparseAttemptOutcome, SparseEvidence, SparseIdentityStore, SparseSourceId, SqliteStateDb,

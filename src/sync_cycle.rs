@@ -117,6 +117,19 @@ pub(crate) struct CycleResult {
     pub(crate) db_sync_token_advance_safe: bool,
 }
 
+impl CycleResult {
+    /// The database pre-check needs a clean aggregate cycle as well as safe
+    /// selected-zone checkpoints. A durable transfer failure can satisfy the
+    /// zone gate without satisfying this broader gate.
+    #[must_use]
+    pub(crate) fn can_advance_database_checkpoint(&self) -> bool {
+        !self.session_expired
+            && self.failed_count == 0
+            && !self.stats.interrupted
+            && self.db_sync_token_advance_safe
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CheckpointBasis {
     IncrementalDelta,
@@ -199,19 +212,19 @@ fn source_checkpoint_decision(
             RecoveryAction::Reauthenticate,
         );
     }
-    if result.stats.interrupted {
+    if result.checkpoint.interrupted {
         return preserve(
             CheckpointHoldReason::Interrupted,
             RecoveryAction::ReplayFromPriorToken,
         );
     }
-    if result.stats.enumeration_errors > 0 || result.stats.enumeration_incomplete {
+    if result.checkpoint.enumeration_errors > 0 || result.checkpoint.enumeration_incomplete {
         return preserve(
             CheckpointHoldReason::EnumerationIncomplete,
             RecoveryAction::ContinueTail,
         );
     }
-    if result.stats.state_write_failures > 0 {
+    if result.checkpoint.state_write_failures > 0 {
         return preserve(
             CheckpointHoldReason::StateNotDurable,
             RecoveryAction::ReplayFromPriorToken,
@@ -222,20 +235,20 @@ fn source_checkpoint_decision(
         .as_ref()
         .filter(|token| !token.trim().is_empty())
     else {
-        let recovery = if !result.stats.checkpoint_retry_passes.is_empty() {
-            RecoveryAction::RetryPasses(result.stats.checkpoint_retry_passes.clone())
-        } else if !result.stats.checkpoint_revalidate_records.is_empty() {
-            RecoveryAction::RevalidateRecords(result.stats.checkpoint_revalidate_records.clone())
+        let recovery = if !result.checkpoint.retry_passes.is_empty() {
+            RecoveryAction::RetryPasses(result.checkpoint.retry_passes.clone())
+        } else if !result.checkpoint.revalidate_records.is_empty() {
+            RecoveryAction::RevalidateRecords(result.checkpoint.revalidate_records.clone())
         } else {
             RecoveryAction::ReplayFromPriorToken
         };
         return preserve(CheckpointHoldReason::TokenProofIncomplete, recovery);
     };
-    if result.stats.sync_token_blocked || result.stats.identity_incomplete {
-        let recovery = if result.stats.checkpoint_retry_passes.is_empty() {
+    if result.checkpoint.sync_token_blocked || result.checkpoint.identity_incomplete {
+        let recovery = if result.checkpoint.retry_passes.is_empty() {
             RecoveryAction::ReplayFromPriorToken
         } else {
-            RecoveryAction::RetryPasses(result.stats.checkpoint_retry_passes.clone())
+            RecoveryAction::RetryPasses(result.checkpoint.retry_passes.clone())
         };
         return preserve(CheckpointHoldReason::TokenProofIncomplete, recovery);
     }
@@ -648,6 +661,7 @@ pub(crate) async fn run_cycle(
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
+    let mut sparse_identity_proofs = Vec::new();
 
     let cycle_has_stale_plan = library_states.iter().any(|s| s.plan_is_stale);
     if cycle_has_stale_plan {
@@ -945,17 +959,17 @@ pub(crate) async fn run_cycle(
                         lib_state.plan_is_stale,
                         CheckpointBasis::IncrementalDelta,
                     );
-                    let bridge_outcome =
+                    sync_result.outcome =
                         merge_download_outcomes(&sync_result.outcome, &bridge_result.outcome);
-                    sync_result.stats.accumulate(&bridge_result.stats);
-                    sync_result.outcome = bridge_outcome;
+                    sync_result.accumulate(&bridge_result);
                     if !bridge_result.full_enumeration_ran {
                         if let SourceCheckpointDecision::Advance { token, .. } = bridge_decision {
                             sync_result.sync_token = Some(token);
                             checkpoint_basis = CheckpointBasis::InventoryWithDeltaBridge;
                         } else {
                             sync_result.sync_token = None;
-                            sync_result.stats.sync_token_blocked = true;
+                            sync_result.checkpoint.sync_token_blocked = true;
+                            sync_result.checkpoint.project(&mut sync_result.stats);
                             sync_result.stats.sync_token_blocked_reason =
                                 Some("inventory_delta_bridge_failed");
                             sync_result.stats.sync_token_blocked_source = Some("kei");
@@ -965,7 +979,8 @@ pub(crate) async fn run_cycle(
                         }
                     } else {
                         sync_result.sync_token = None;
-                        sync_result.stats.sync_token_blocked = true;
+                        sync_result.checkpoint.sync_token_blocked = true;
+                        sync_result.checkpoint.project(&mut sync_result.stats);
                         sync_result.stats.sync_token_blocked_reason =
                             Some("inventory_delta_bridge_failed");
                         sync_result.stats.sync_token_blocked_source = Some("kei");
@@ -980,7 +995,7 @@ pub(crate) async fn run_cycle(
         if unresolved_identity && matches!(checkpoint_basis, CheckpointBasis::CompleteInventory) {
             // An inventory cannot prove that the previously ambiguous deltas
             // were resolved. Require replay from the retained cursor.
-            download::block_sync_token_for_unresolved_identity(&mut sync_result.stats);
+            sync_result.block_for_unresolved_identity();
         }
 
         if sync_result.full_enumeration_ran && sync_result.stats.full_enumeration_reason.is_none() {
@@ -1002,15 +1017,15 @@ pub(crate) async fn run_cycle(
             sync_result.stats.metadata_capture_unresolved = capture.unresolved_assets;
             sync_result.stats.metadata_capture_deferred = capture.deferred_assets;
             if capture.unresolved_assets > 0 {
-                download::block_sync_token_for_metadata_capture(&mut sync_result.stats);
+                sync_result.block_for_metadata_capture();
             }
         }
 
         let library_completed_without_errors =
             matches!(&sync_result.outcome, download::DownloadOutcome::Success)
-                && !sync_result.stats.identity_incomplete
-                && !sync_result.stats.interrupted
-                && sync_result.stats.enumeration_errors == 0
+                && !sync_result.checkpoint.identity_incomplete
+                && !sync_result.checkpoint.interrupted
+                && sync_result.checkpoint.enumeration_errors == 0
                 && !shutdown_token.is_cancelled();
         if should_warn_zero_assets(
             &sync_result,
@@ -1077,6 +1092,13 @@ pub(crate) async fn run_cycle(
                 if let Some(db) = state_db {
                     let reconciliation_active = force_full_for_config_hash;
                     if reconciliation_active {
+                        sparse_identity_proofs.extend(
+                            sync_result
+                                .checkpoint
+                                .sparse_identity_proofs
+                                .iter()
+                                .cloned(),
+                        );
                         let candidate_key =
                             pending_zone_token_key(&enum_config_hash, &lib_state.zone_name);
                         if let Err(e) = db.set_metadata(&candidate_key, &token).await {
@@ -1111,7 +1133,7 @@ pub(crate) async fn run_cycle(
                         if let Err(e) = db
                             .commit_checkpoint_transition(state::CheckpointTransition {
                                 sparse_identity_proofs: sync_result
-                                    .stats
+                                    .checkpoint
                                     .sparse_identity_proofs
                                     .clone(),
                                 metadata_updates,
@@ -1203,7 +1225,7 @@ pub(crate) async fn run_cycle(
             sync_result.stats.sync_token_blocked_zone = Some(lib_state.zone_name.clone());
         }
 
-        if sync_result.stats.identity_incomplete {
+        if sync_result.checkpoint.identity_incomplete {
             cycle_failed_count += 1;
         }
 
@@ -1269,7 +1291,7 @@ pub(crate) async fn run_cycle(
             metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
             if let Err(e) = db
                 .commit_checkpoint_transition(state::CheckpointTransition {
-                    sparse_identity_proofs: cycle_stats.sparse_identity_proofs.clone(),
+                    sparse_identity_proofs,
                     metadata_updates,
                     metadata_deletes,
                 })
@@ -1480,13 +1502,15 @@ mod tests {
     #[test]
     fn should_warn_zero_assets_requires_active_passes() {
         let sync_result = download::SyncResult {
-            outcome: download::DownloadOutcome::Success,
-            sync_token: Some("zone-token".to_string()),
-            stats: download::SyncStats {
-                assets_seen: 0,
-                ..download::SyncStats::default()
-            },
             full_enumeration_ran: true,
+            ..download::SyncResult::from_execution(
+                download::DownloadOutcome::Success,
+                Some("zone-token".to_string()),
+                download::SyncStats {
+                    assets_seen: 0,
+                    ..download::SyncStats::default()
+                },
+            )
         };
         assert!(!should_warn_zero_assets(
             &sync_result,
@@ -1500,13 +1524,15 @@ mod tests {
     #[test]
     fn should_warn_zero_assets_when_all_gates_are_true() {
         let sync_result = download::SyncResult {
-            outcome: download::DownloadOutcome::Success,
-            sync_token: Some("zone-token".to_string()),
-            stats: download::SyncStats {
-                assets_seen: 0,
-                ..download::SyncStats::default()
-            },
             full_enumeration_ran: true,
+            ..download::SyncResult::from_execution(
+                download::DownloadOutcome::Success,
+                Some("zone-token".to_string()),
+                download::SyncStats {
+                    assets_seen: 0,
+                    ..download::SyncStats::default()
+                },
+            )
         };
         assert!(should_warn_zero_assets(
             &sync_result,
@@ -1519,15 +1545,14 @@ mod tests {
 
     #[test]
     fn durable_transfer_failure_can_advance_source_checkpoint() {
-        let result = download::SyncResult {
-            outcome: download::DownloadOutcome::PartialFailure { failed_count: 1 },
-            sync_token: Some("zone-token-next".to_string()),
-            stats: download::SyncStats {
+        let result = download::SyncResult::from_execution(
+            download::DownloadOutcome::PartialFailure { failed_count: 1 },
+            Some("zone-token-next".to_string()),
+            download::SyncStats {
                 failed: 1,
                 ..download::SyncStats::default()
             },
-            full_enumeration_ran: false,
-        };
+        );
 
         assert_eq!(
             source_checkpoint_decision(&result, false, false, CheckpointBasis::IncrementalDelta,),
@@ -1539,17 +1564,41 @@ mod tests {
     }
 
     #[test]
+    fn metadata_capture_hold_survives_report_changes_and_result_composition() {
+        let mut result = download::SyncResult::from_execution(
+            download::DownloadOutcome::Success,
+            Some("zone-token-next".to_string()),
+            download::SyncStats::default(),
+        );
+        result.block_for_metadata_capture();
+        result.stats = download::SyncStats::default();
+        result.accumulate(&download::SyncResult::from_execution(
+            download::DownloadOutcome::Success,
+            None,
+            download::SyncStats::default(),
+        ));
+        assert!(result.checkpoint.identity_incomplete);
+        assert!(result.stats.identity_incomplete);
+        assert_eq!(
+            source_checkpoint_decision(&result, false, false, CheckpointBasis::IncrementalDelta),
+            SourceCheckpointDecision::Preserve {
+                reason: CheckpointHoldReason::TokenProofIncomplete,
+                recovery: RecoveryAction::ReplayFromPriorToken,
+            }
+        );
+    }
+
+    #[test]
     fn failed_retry_state_write_preserves_source_checkpoint() {
-        let result = download::SyncResult {
-            outcome: download::DownloadOutcome::PartialFailure { failed_count: 1 },
-            sync_token: Some("zone-token-next".to_string()),
-            stats: download::SyncStats {
+        let result = download::SyncResult::from_execution(
+            download::DownloadOutcome::PartialFailure { failed_count: 1 },
+            Some("zone-token-next".to_string()),
+            download::SyncStats {
                 failed: 1,
                 state_write_failures: 1,
                 ..download::SyncStats::default()
             },
-            full_enumeration_ran: false,
-        };
+        );
 
         assert_eq!(
             source_checkpoint_decision(&result, false, false, CheckpointBasis::IncrementalDelta,),
@@ -1567,17 +1616,19 @@ mod tests {
             kind: PassKind::Unfiled,
             label: "unfiled".to_string(),
         };
-        let result = download::SyncResult {
-            outcome: download::DownloadOutcome::Success,
-            sync_token: None,
-            stats: download::SyncStats {
-                sync_token_blocked: true,
-                checkpoint_retry_passes: vec![pass.clone()],
-                ..download::SyncStats::default()
-            },
+        let mut result = download::SyncResult {
             full_enumeration_ran: true,
+            ..download::SyncResult::from_execution(
+                download::DownloadOutcome::Success,
+                None,
+                download::SyncStats {
+                    sync_token_blocked: true,
+                    ..download::SyncStats::default()
+                },
+            )
         };
 
+        result.checkpoint.retry_passes = vec![pass.clone()];
         assert_eq!(
             source_checkpoint_decision(&result, false, false, CheckpointBasis::CompleteInventory),
             SourceCheckpointDecision::Preserve {
@@ -1603,8 +1654,8 @@ mod tests {
             let identity_incomplete = mask & 512 != 0;
             let has_safety_blocker = mask & 255 != 0 || identity_incomplete;
             for token in tokens {
-                let result = download::SyncResult {
-                    outcome: if session_expired {
+                let mut result = download::SyncResult::from_execution(
+                    if session_expired {
                         download::DownloadOutcome::SessionExpired {
                             auth_error_count: 1,
                         }
@@ -1613,8 +1664,8 @@ mod tests {
                     } else {
                         download::DownloadOutcome::Success
                     },
-                    sync_token: token.map(str::to_string),
-                    stats: download::SyncStats {
+                    token.map(str::to_string),
+                    download::SyncStats {
                         interrupted,
                         enumeration_errors: usize::from(enumeration_error),
                         enumeration_incomplete,
@@ -1623,8 +1674,7 @@ mod tests {
                         identity_incomplete,
                         ..download::SyncStats::default()
                     },
-                    full_enumeration_ran: false,
-                };
+                );
                 let should_advance = !has_safety_blocker && token == Some("zone-token");
                 let decision = source_checkpoint_decision(
                     &result,
@@ -1636,6 +1686,26 @@ mod tests {
                     matches!(decision, SourceCheckpointDecision::Advance { .. }),
                     should_advance,
                     "unexpected checkpoint decision for mask {mask:#010b} and token {token:?}"
+                );
+                // Reporting snapshots cannot remove or introduce safety evidence.
+                result.stats = download::SyncStats {
+                    state_write_failures: usize::from(!state_not_durable),
+                    enumeration_errors: usize::from(!enumeration_error),
+                    enumeration_incomplete: !enumeration_incomplete,
+                    interrupted: !interrupted,
+                    sync_token_blocked: !token_proof_blocked,
+                    identity_incomplete: !identity_incomplete,
+                    ..download::SyncStats::default()
+                };
+                let reported_decision = source_checkpoint_decision(
+                    &result,
+                    dry_run,
+                    stale_pass_plan,
+                    CheckpointBasis::IncrementalDelta,
+                );
+                assert_eq!(
+                    reported_decision, decision,
+                    "report mutation changed mask {mask:#010b}"
                 );
             }
         }

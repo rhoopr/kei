@@ -2,7 +2,7 @@ use super::{
     Fingerprint, Journal, Manifest, Stage, confined, directory_path, publish, publish_journal,
     recover_target, recover_tree_blocking,
 };
-use crate::download::file::fingerprint_regular_file_blocking;
+use crate::download::file::fingerprint::fingerprint_regular_file_blocking;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use tempfile::TempDir;
@@ -377,15 +377,15 @@ fn unsupported_rename_flags_exercise_the_production_publication_routes() {
         + FLAGS_ARGUMENT * std::mem::size_of::<u64>()
         + if cfg!(target_endian = "big") { 4 } else { 0 };
     let routes = [
-        "download::file::tests::approved_truncated_publish_replaces_only_expected_bytes",
+        "download::file::replacement::tests::approved_truncated_publish_replaces_only_expected_bytes",
         #[cfg(feature = "xmp")]
-        "download::metadata::tests::write_sidecar_creates_xmp_file_next_to_media",
+        "download::metadata::sidecar::tests::write_sidecar_creates_xmp_file_next_to_media",
         #[cfg(feature = "xmp")]
-        "download::metadata::tests::write_sidecar_is_atomic_rewrite",
+        "download::metadata::sidecar::tests::write_sidecar_is_atomic_rewrite",
         #[cfg(feature = "xmp")]
-        "download::metadata_rewrite::tests::drain_clears_previously_owned_sidecar_fields",
+        "download::metadata_rewrite::queued::tests::drain_clears_previously_owned_sidecar_fields",
         #[cfg(feature = "xmp")]
-        "download::metadata_rewrite::tests::drain_establishes_a_checksum_baseline_when_none_was_recorded",
+        "download::metadata_rewrite::queued::tests::drain_establishes_a_checksum_baseline_when_none_was_recorded",
     ];
     for error in [libc::EOPNOTSUPP, libc::EINVAL, libc::ENOSYS] {
         for route in &routes {

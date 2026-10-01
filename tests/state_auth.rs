@@ -1,7 +1,8 @@
 //! State-management tests that require network credentials (live iCloud API).
 //!
 //! Exercises status, reset state, verify, import-existing, and retry-failed
-//! against real iCloud data. All tests are `#[ignore]` — run with:
+//! against real iCloud data. Live tests are `#[ignore]`; shared helper tests
+//! run offline without `--ignored`. Run the live tests with:
 //!
 //! ```sh
 //! cargo test --all-features --test state_auth -- --ignored --test-threads=1
@@ -16,7 +17,8 @@
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    reason = "live assertions and shared helpers use panics, diagnostics, and bounded fixture casts and indexing"
 )]
 
 mod common;
@@ -38,10 +40,10 @@ fn sync_config(
     filters_extra: &str,
 ) -> std::path::PathBuf {
     let body = format!(
-        "[download]\ndirectory = {}\n{download_extra}[filters]\nalbums = [\"none\"]\n{filters_extra}",
+        "[download]\ndirectory = {}\n{download_extra}[filters]\n{filters_extra}",
         common::toml_string(&dir.to_string_lossy())
     );
-    common::write_toml_config(data_dir, "state-auth-sync", &body)
+    common::live_selection::write_live_config(data_dir, "state-auth-sync", &body)
 }
 
 fn import_config(data_dir: &Path, dir: &Path, download_extra: &str) -> std::path::PathBuf {
@@ -49,7 +51,7 @@ fn import_config(data_dir: &Path, dir: &Path, download_extra: &str) -> std::path
         "[download]\ndirectory = {}\n{download_extra}",
         common::toml_string(&dir.to_string_lossy())
     );
-    common::write_toml_config(data_dir, "state-auth-import", &body)
+    common::live_selection::write_live_config(data_dir, "state-auth-import", &body)
 }
 
 fn sync_cmd(
@@ -59,12 +61,9 @@ fn sync_cmd(
     dir: &Path,
     recent: u32,
 ) -> assert_cmd::Command {
-    // `--album none` pins single-pass semantics (the unfiled pass alone
-    // enumerates the library). v0.13's no-flag default is `--album all`,
-    // which would multiply API calls per sync by `num_albums + 1` even
-    // under `--recent N` and overrun Apple's rate limits across the
-    // suite. The state-DB invariants tested here are pass-shape
-    // independent.
+    // data/live-selection.toml selects one bounded primary-library pass
+    // with albums = ["none"] and unfiled = true. These state tests do not
+    // need album passes or shared-library fixtures.
     let config_path = sync_config(cookie_dir, dir, "", "");
     let mut cmd = common::cmd();
     cmd.env("ICLOUD_USERNAME", username)
@@ -126,9 +125,8 @@ fn import_cmd(
     cmd
 }
 
-/// Like [`sync_cmd`] but for `--retry-failed` runs. Same `--album none`
-/// rationale: the test fixture is built to exercise retry-failed state
-/// transitions, not multi-pass enumeration.
+/// Like [`sync_cmd`] but for `--retry-failed` runs. Uses the same bounded
+/// primary-library selection to exercise retry state transitions.
 fn retry_failed_cmd(
     username: &str,
     password: &str,

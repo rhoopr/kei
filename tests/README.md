@@ -3,7 +3,10 @@
 Everything under `tests/` is either a Rust integration target or a shell
 script that exercises scenarios easier to set up from shell than from
 Rust. The repo-root `justfile` is the entry point; the layout below
-explains what runs where.
+explains what runs where. Follow the
+[contribution and review rules](../CONTRIBUTING.md#tests) for test placement,
+behavior changes, and failure investigation. This guide owns the
+[state-transition proof](#state-transition-proof) and suite-specific setup.
 
 ## Layout
 
@@ -13,6 +16,7 @@ tests/
   data/               media fixtures (see "Media fixtures" below)
   cli.rs                       argument parsing and help output
   behavioral.rs                offline end-to-end behavior (pre-seeded DB, real binary)
+  branch_static.rs             offline packaging, migration, and tooling checks
   sync.rs                      live sync flow against iCloud (#[ignore] live tests)
   state_auth.rs                live status / reset / verify / import commands
   import_existing_live.rs      live import-existing scenarios (#[ignore] live tests)
@@ -25,26 +29,39 @@ tests/
 
 ## Test catalog
 
-| Target | Count | Network | Runs via |
-|--------|------:|:-------:|----------|
-| `cargo test --bin kei` | 1550 | no | `just test fast` |
-| `cargo test --test cli` | 95 | no | `just test fast` |
-| `cargo test --test behavioral` | 112 | no | `just test fast` |
-| `cargo test --all-features --test sync` | 43 `#[ignore]` | yes | `just test live` |
-| `cargo test --all-features --test state_auth` | 17 `#[ignore]` | yes | `just test live` |
-| `cargo test --all-features --test import_existing_live` | 9 `#[ignore]` | yes | `just test live` |
-| `tests/shell/concurrency.sh` | 8 | yes | `just test concurrency` |
-| `tests/shell/state-machine.sh` | 20 | yes | `just test state` |
-| `tests/shell/docker.sh` | 16 | yes | `just test docker` |
-| `scripts/full-test/run_live_import_rehearsal.sh` | 1 | yes | `just full-test` |
-| `scripts/full-test/run_cross_zone_album_hydration.sh` | 1 | yes | `just full-test` when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set |
-| `scripts/full-test/run_docker_puid_smoke.sh` | 1 | no | `just full-test` |
-| `scripts/full-test/run_release_archive_smoke.sh` | 1 | no | `just full-test` |
-| `scripts/test-scenarios/*.sh` | focused slices | no | `just test scenario NAME` or `just test scenarios` |
-| `scripts/full-test/run_release_regression_smoke.sh` | 8 | no | `just release-smoke` |
-| `.github/workflows/service-smoke.yml` | 3 (linux/macos/windows) | no | `just service-smoke` (linux/macOS) |
+| Target | Network | Runs via |
+|--------|:-------:|----------|
+| `cargo test --lib` | no | `just test fast` |
+| `cargo test --test cli` | no | `just test fast` |
+| `cargo test --test behavioral` | no | `just test fast` |
+| `cargo test --test branch_static` | no | `just test offline`, selected scenario slices |
+| `cargo test --all-features --lib icloud::photos::album::lookup::tests::live_targeted_record_lookup_distinguishes_present_and_missing -- --exact --ignored --test-threads=1` | yes | `just test live` |
+| `cargo test --all-features --test sync -- --ignored --test-threads=1` | yes | `just test live` |
+| `cargo test --all-features --test state_auth -- --ignored --test-threads=1` | yes | `just test live` |
+| `cargo test --all-features --test import_existing_live -- --ignored --test-threads=1` | yes | `just test live` |
+| `tests/shell/concurrency.sh` | yes | `just test concurrency` |
+| `tests/shell/state-machine.sh` | yes | `just test state` |
+| `tests/shell/docker.sh` | yes | `just test docker` |
+| `scripts/full-test/run_live_import_rehearsal.sh` | yes | `just full-test` |
+| `scripts/full-test/run_cross_zone_album_hydration.sh` | yes | `just full-test` when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set |
+| `scripts/full-test/run_docker_puid_smoke.sh` | no | `just full-test` |
+| `scripts/full-test/run_release_archive_smoke.sh` | no | `just full-test` |
+| `scripts/test-scenarios/*.sh` | no | `just test scenario NAME` or `just test scenarios` |
+| `scripts/full-test/run_release_regression_smoke.sh` | no | `just release-smoke` |
+| `.github/workflows/service-smoke.yml` | no | `just service-smoke` (linux/macOS) |
 
-Counts are approximate and drift as tests are added.
+`branch_static` belongs to the complete offline routes, including `just gate`,
+rather than `just test fast`. Run it directly or through a relevant scenario
+slice when changing packaging, migration guidance, or validation tooling.
+
+The library lookup probe runs by exact name so the live route does not run
+other ignored library tests, including the parent-controlled process-death
+child. Full-test reaches this probe through `just test live`.
+
+The three live Rust integration targets also contain offline tests. Without `--ignored`,
+they run shared helper tests; `import_existing_live` also checks fixture
+isolation, command construction, and rejection of a removed CLI flag. These
+offline tests run in `just test offline` and `just gate` without credentials.
 
 ## Focused scenario slices
 
@@ -99,13 +116,74 @@ was checked.
 
 ## Running
 
+Choose the route by purpose:
+
+| Purpose | Command | Proof |
+|---------|---------|-------|
+| Focused iteration | `just test scenario NAME`, `just test fast`, or `just test PATTERN` | Relevant tests with default features; not a complete gate |
+| Complete offline gate | `just gate` | Static checks, all-feature and no-default suites, and focused-filter catalog checks |
+| Release and live validation | `just full-test` | The offline gate's checks plus nightly tools, package, Docker, live provider, release-binary, and service phases |
+
+`just test offline` runs the behavior and catalog portion of `just gate`.
+`just test` runs only the all-feature suite. Existing focused, packaging,
+Docker, service, and live commands remain available individually.
+
+### Route coverage
+
+The change from the `8f3467c` route removes replay, not distinct test setups:
+
+| Route | Before | Now |
+|-------|--------|-----|
+| `just gate` | Static checks; all-feature suite; no-default suite | Static checks; `just test offline` |
+| `just test offline` | All-feature suite; default-feature drift targets; no-default suite; default-feature scope-matrix filter | All-feature suite; no-default suite; default-feature scenario catalogs |
+| `just full-test` offline phases | Static checks; offline route; every scenario list and test invocation | Static checks; offline route, with no scenario execution replay |
+| Focused scenarios | Default-feature library and `branch_static` filters, listed before execution | Unchanged; empty filters now also fail |
+| Nightly tools | Optional fuzz build; required nightly unused-dependency check | Unchanged |
+| Package and Docker | Release archive; extracted binary; container build, PUID, multiarch, CLI, default command | Unchanged |
+| Live and service | Provider tests; shell suites; release-binary CLI and import rehearsal; service smoke | Unchanged, including opt-in cross-zone and real host-service checks |
+
+Both complete Rust suites include every integration target and the library
+scope matrix. At this baseline, the drift-target loop adds no targets.
+The no-default suite remains separate: it exercises disabled-XMP behavior
+and native EXIF paths.
+
+Default features enable `xmp`. All features also enable `__fuzz_internals`.
+The latter adds parser wrappers, re-exports, and extra HEIF preservation
+assertions. Its conditional sites do not replace default-feature production
+paths or remove default tests. This source-level comparison, together with
+the target and environment inventory, supports using the all-feature suite
+for the scenario and scope-matrix proof. Matching test names alone is not
+that argument. Revisit this equivalence if feature gates change.
+
+Scenarios add no fixtures, environment, or isolation beyond their underlying
+tests. `scripts/test-scenarios/check.sh` sources the same runners and checks
+each filter against cached default-feature catalogs, once per target. It
+fails on empty filters, stale filters, failed listings, or an empty catalog
+of scenarios. These catalog checks do not execute tests and are not counted
+as passing tests. Focused commands still list and execute each filter.
+
+Offline suites retain Cargo's test scheduling. `just test fast` retains its
+single-threaded library run. No repository-wide `RUST_TEST_THREADS` setting
+was found; caller overrides still apply. Live provider tests remain
+single-threaded. Full-test retains its temporary-directory setup, live skip
+and rate-limit records, child-failure handling, and start/end Git provenance.
+Finalization rejects missing or skipped required offline phases and failed
+phase records. Live and platform skips remain explicit, not test coverage.
+
+Linux tooling tests in `branch_static` require `just` on `PATH`; CI installs
+its pinned version before both complete Rust suites and coverage runs. Other
+platforms retain their existing Rust test coverage; executable dispatcher
+fixtures are Linux-only.
+
+### Commands
+
 ```sh
 just test fast                  # fast offline unit + key integration targets
 just test                       # all-feature offline tests
-just test offline               # offline all-feature/no-default/drift/scope checks
+just test offline               # all-feature/no-default suites + scenario catalog checks
 just test scenario NAME         # focused behavior slice from scripts/test-scenarios/
 just test scenarios             # every focused offline scenario slice
-just test live                  # live sync + state_auth + import-existing against iCloud
+just test live                  # live lookup + sync + state_auth + import-existing against iCloud
 just test live-shell            # discovered live shell suites
 just test live-smoke            # release-binary live CLI/import smokes
 just test concurrency           # shell: concurrent/resume/partial-fail
@@ -124,12 +202,16 @@ just full-test                  # grouped full battery with logs, live skips, me
 Without `just`, run the raw commands directly:
 
 ```sh
-cargo test --bin kei --test cli --test behavioral
+cargo test --lib --test cli --test behavioral
 cargo test --all-features --test sync --test state_auth -- --ignored --test-threads=1
 ./tests/shell/concurrency.sh
 ```
 
 ## Media fixtures
+
+The [fixture corpus guide](data/README.md) records the selected formats,
+provenance, sanitization, independent encoders, SHA-256 manifest, size budget,
+production-path tests, and extracted-source-package checks.
 
 `tests/data/` holds real camera and encoder outputs, not hand-built containers,
 so metadata writers are exercised against independently produced item maps.
@@ -175,18 +257,23 @@ opt-in (nightly + cargo-fuzz), excluded from `just gate`, and run via
    This prompts for a 2FA code and writes session tokens. Redo only when
    the session expires (typically months).
 
-3. Create a test album in iCloud Photos with at least:
+3. Keep at least one eligible asset in the primary library. General live
+   tests use `tests/data/live-selection.toml`: albums `none`, unfiled enabled,
+   primary library, and the 10 most recent assets. Change the bound only there.
+   No named album, filename, date, or media format is required. A read-only
+   preflight reports the eligible filename count and fails if it is zero.
+   When the bound truncates the inventory, live tests require checkpoint
+   suppression and a no-download repeat full pass. Positive incremental live
+   checks apply only when this bounded selection proves EOF. Deterministic
+   production-path tests cover both cases and config reconciliation.
 
-   | Asset | Used by |
-   |-------|---------|
-   | Regular JPEG | Basic download, size comparison, EXIF tests |
-   | Standalone video (MOV/MP4) | Skip-videos filter, Docker watch cycle |
-   | Live Photo (HEIC + MOV) | Skip-live-photos, MOV naming policy, HEIC XMP embed |
-   | Apple ProRAW (.DNG) | align-raw flag acceptance |
-   | Photo with non-ASCII filename | keep-unicode-in-filenames |
+Import runners also pass the shared count as `--recent`, because
+`import-existing` does not use the TOML recent count.
 
-   The default album name is `kei-test`. Override with `KEI_TEST_ALBUM`
-   if your album is named differently.
+Exact content checks use the [bundled corpus](data/README.md). The
+[migration map](data/live-migration.md) names each deterministic replacement
+and the live responsibilities that remain. The separate cross-zone scenario
+still needs its explicit opt-in fixture.
 
 ## Portability
 
@@ -198,21 +285,19 @@ details are baked into test code.
 | `ICLOUD_USERNAME` | required | Apple ID email |
 | `ICLOUD_PASSWORD` | required | Apple ID password |
 | `ICLOUD_TEST_COOKIE_DIR` | `./.test-cookies` | Pre-authenticated session dir |
-| `KEI_TEST_ALBUM` | `kei-test` | Test album name |
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image under test |
 | `CARGO_TARGET_DIR` | `./target` | Cargo build directory. Full-test packaging, shell, live, service, and metrics phases use release artifacts from this directory. |
 | `KEI_FULL_TEST_TMPDIR` | `/tmp/codex/kei/full-test/tmp` | Temporary directory for full-test child processes and shell-suite scratch data. |
 | `KEI_TEST_SCRATCH_DIR` | `/tmp/codex/kei/shell-tests-$USER` | Base dir for standalone shell-suite scratch; `just full-test` overrides this to `$KEI_FULL_TEST_TMPDIR/shell` or `/tmp/codex/kei/full-test/tmp/shell` |
-| `KEI_IMPORT_FIXTURE_DIR` | `/tmp/codex/kei/import-fixture` | Where `import_existing_live.rs` caches its `--recent 100` sync fixture across runs |
+| `KEI_IMPORT_FIXTURE_DIR` | `/tmp/codex/kei/import-fixture` | Parent directory for isolated import fixture runs retained for failure inspection |
 | `KEI_FULL_TEST_CROSS_ZONE_ALBUM` | unset | Optional full-test album fixture for cross-zone hydration. The album must include at least one asset from a non-primary source zone. |
 | `KEI_FULL_TEST_CROSS_ZONE_MIN_FILES` | `1` | Minimum non-primary downloaded asset rows required when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set. |
 | `KEI_FULL_TEST_REAL_SERVICE` | unset | Set to `1` to let `just full-test` install, start, status-check, and uninstall a real Linux user systemd service |
 | `KEI_FULL_TEST_EXPECT_VERSION` | unset | Optional exact Cargo package version expected by the release-archive smoke |
 
-`just test live` applies `KEI_TEST_ALBUM=kei-test` to match this
-repo's maintainer setup. Override in your environment to point at your
-own account. Cookie dir falls through to the harness default
-(`./.test-cookies`); set `ICLOUD_TEST_COOKIE_DIR` to override.
+`just test live` uses the shared bounded selection. Cookie dir falls through
+to the harness default (`./.test-cookies`); set `ICLOUD_TEST_COOKIE_DIR` to
+override it. Test state and download directories are isolated.
 
 ### Loopback-bound tests
 
@@ -258,7 +343,9 @@ happens:
   binary with a pre-seeded state DB. Covers everything that doesn't need
   the network (status flags, reconcile routing, config resolution).
 - **`sync.rs`** - live iCloud, `#[ignore]` gated. Covers the happy-path
-  download flow, filters, EXIF/XMP write-through, HEIC embed, sidecars.
+  bounded download flow, state, watch, reports, and filesystem recovery.
+  Content policies and metadata use bundled production-path tests under
+  `src/download/orchestration/fixture_tests/`.
 - **`state_auth.rs`** - live iCloud, `#[ignore]` gated. Covers status /
   reset state / verify / import-existing / sync --retry-failed.
 - **`import_existing_live.rs`** - live iCloud, `#[ignore]` gated.
@@ -347,7 +434,7 @@ Manual real-install coverage:
 - Windows SCM `CreateServiceW`, account password handoff, and service
   control dispatcher startup.
 - Boot/reboot persistence and a real long-running sync against the
-  `kei-test` album.
+  bounded primary-library selection.
 
 `just full-test` can run the Linux user-service lifecycle with
 `KEI_FULL_TEST_REAL_SERVICE=1`. It refuses to run if `kei.service` already

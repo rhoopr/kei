@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "max_total_bytes": 8388608,
+  "files": [
+    {
+      "path": "media/apple-live.heic",
+      "bytes": 1258357,
+      "sha256": "a4c1cc407327856f18e3b81f9d34dc7b66fac6ed54d1cdde16f9e5164cf04ec5",
+      "origin": "Apple camera / Photos; sanitized",
+      "license": "CC-BY-2.0",
+      "coverage": "Live Photo pairing and real Apple container preservation",
+      "source_url": "https://github.com/RhetTbull/osxphotos/blob/cbe5a1d1df3719caaf07d1940ce0b32a6b85c191/tests/test-images/IMG_1853.HEIC",
+      "source_sha256": "8e6fac35b135ca6756ce8fb3368ec4dc3613ea5c0db34aa1eeefd3988e26c625",
+      "license_file": "LICENSE-osxphotos-media",
+      "attribution": "Rhet Turnbull and OSXPhotos contributors; modified as documented in README.md"
+    },
+    {
+      "path": "media/apple-live.mov",
+      "bytes": 4227876,
+      "sha256": "9e7cd1cb90f6d4ec7b82f96bb5fc5cee42c2273965994d56ed855f6006848e84",
+      "origin": "Apple camera / Photos; sanitized",
+      "license": "CC-BY-2.0",
+      "coverage": "Live Photo pairing and real Apple container preservation",
+      "source_url": "https://github.com/RhetTbull/osxphotos/blob/cbe5a1d1df3719caaf07d1940ce0b32a6b85c191/tests/test-images/IMG_1853.mov",
+      "source_sha256": "5d24de6ae010d9bdaff559ea8f736923967cbc8e3e382cc0489a5673adec436d",
+      "license_file": "LICENSE-osxphotos-media",
+      "attribution": "Rhet Turnbull and OSXPhotos contributors; modified as documented in README.md"
+    },
+    {
+      "path": "media/metadata.jpg",
+      "bytes": 4381,
+      "sha256": "37fc601b7ed94c703635d331cac5705d610ccbb01321935f20577458a141f6b1",
+      "origin": "independently encoded synthetic media",
+      "license": "MIT",
+      "coverage": "format transfer, metadata and deterministic content cases",
+      "recipe": "scripts/fixtures/generate.py",
+      "license_file": "../../LICENSE"
+    },
+    {
+      "path": "media/pattern.avif",
+      "bytes": 381,
+      "sha256": "9cbda219d2e3b8307124d0b6d9dee9399a94615a662c6266ae0dc06c5871cfa1",
+      "origin": "independently encoded synthetic media",
+      "license": "MIT",
+      "coverage": "format transfer, metadata and deterministic content cases",
+      "recipe": "scripts/fixtures/generate.py",
+      "license_file": "../../LICENSE"
+    },
+    {
+      "path": "media/pattern.dng",
+      "bytes": 2544,
+      "sha256": "754fc3b84f123615b3e0c1bb521180b61c83e15ea340842b67e11de4f040bc3c",
+      "origin": "independently encoded synthetic media",
+      "license": "MIT",
+      "coverage": "format transfer, metadata and deterministic content cases",
+      "recipe": "scripts/fixtures/generate.py",
+      "license_file": "../../LICENSE"
+    },
+    {
+      "path": "media/pattern.heic",
+      "bytes": 621,
+      "sha256": "9b90b83a08ccabd89efdf5c6b7b0f7487e9b5281cc262a459aab1a7dc940d74e",
+      "origin": "independently encoded synthetic media",
+      "license": "MIT",
+      "coverage": "format transfer, metadata and deterministic content cases",
+      "recipe": "scripts/fixtures/generate.py",
+      "license_file": "../../LICENSE"
+    },
+    {
+      "path": "media/pattern.jpg",
+      "bytes": 1000,
+      "sha256": "1f7b7dd82b9a019b98add756d74e4cfdfb952bb8a1a010869c80de0fd8e5c215",
+      "origin": "independently encoded synthetic media",
+      "license": "MIT",
+      "coverage": "format transfer, metadata and deterministic content cases",
+      "recipe": "scripts/fixtures/generate.py",
+      "license_file": "../../LICENSE"
+    },
+    {
+      "path": "media/pattern.mov",
+      "bytes": 3341,
+      "sha256": "6006962a838a00bc1646d5f5a28a6f567ce643a343a202061423fd03f170e976",
+      "origin": "independently encoded synthetic media",
+      "license": "MIT",
+      "coverage": "format transfer, metadata and deterministic content cases",
+      "recipe": "scripts/fixtures/generate.py",
+      "license_file": "../../LICENSE"
+    },
+    {
+      "path": "media/pattern.mp4",
+      "bytes": 3286,
+      "sha256": "543b1cd78334d693273f78959147aec11ca2424b4303061a481fbc25af6fb112",
+      "origin": "independently encoded synthetic media",
+      "license": "MIT",
+      "coverage": "format transfer, metadata and deterministic content cases",
+      "recipe": "scripts/fixtures/generate.py",
+      "license_file": "../../LICENSE"
+    },
+    {
+      "path": "media/pattern.png",
+      "bytes": 131,
+      "sha256": "9042e9a0c261a55d084b53be15463f2b68cbe01162f89ca865e2ba20370fffe9",
+      "origin": "independently encoded synthetic media",
+      "license": "MIT",
+      "coverage": "format transfer, metadata and deterministic content cases",
+      "recipe": "scripts/fixtures/generate.py",
+      "license_file": "../../LICENSE"
+    },
+    {
+      "path": "apple-hdr-gainmap.heic",
+      "bytes": 238982,
+      "sha256": "c690fa4ecc6ae71ee9a926de869a95835a5d41e764ccbc200647e2fb9d0800cc",
+      "origin": "existing documented upstream fixture",
+      "license": "MIT",
+      "coverage": "tiled HDR gain map and AVIF XMP item preservation",
+      "source_url": "https://github.com/johncf/apple-hdr-heic/blob/286d5b094f0bd901a35aa0b8582746aedcb32bb4/tests/data/hdr-sample.heic",
+      "license_file": "LICENSE-apple-hdr-gainmap"
+    },
+    {
+      "path": "white_1x1.avif",
+      "bytes": 305,
+      "sha256": "ea4e43d1f07e4c00de16c13afa32376111bb306e51f08212cf4c1b6064df3667",
+      "origin": "existing documented upstream fixture",
+      "license": "BSD-2-Clause",
+      "coverage": "tiled HDR gain map and AVIF XMP item preservation",
+      "source_url": "https://github.com/AOMediaCodec/libavif/blob/cbb391c194ee15cf9607e517c269ed99e6bf0197/tests/data/white_1x1.avif",
+      "license_file": "LICENSE-libavif-white-1x1"
+    },
+    {
+      "path": "heif-rewrite/replacement-fits",
+      "bytes": 541,
+      "sha256": "32201580267f029595d687d8cd0bfb2f118f6c022622d51492a6aeccc37efbd8",
+      "origin": "existing kei structural fuzz seed; package copy, not independently encoded media",
+      "license": "MIT",
+      "license_file": "../../LICENSE",
+      "coverage": "existing HEIF XMP replacement and ownership regression tests",
+      "source_url": "https://github.com/rhoopr/kei/blob/a4e89dfd73d04028ad357a9c9a487aa39df6824c/fuzz/seeds/heif_rewrite/replacement-fits"
+    },
+    {
+      "path": "heif-rewrite/replacement-grows",
+      "bytes": 289,
+      "sha256": "6734de7f8741265b2c2ca60b6ec6f3bd16033e6d3da9c7b5bad6579e54e18c61",
+      "origin": "existing kei structural fuzz seed; package copy, not independently encoded media",
+      "license": "MIT",
+      "license_file": "../../LICENSE",
+      "coverage": "existing HEIF XMP replacement and ownership regression tests",
+      "source_url": "https://github.com/rhoopr/kei/blob/a4e89dfd73d04028ad357a9c9a487aa39df6824c/fuzz/seeds/heif_rewrite/replacement-grows"
+    },
+    {
+      "path": "heif-rewrite/multi-xmp",
+      "bytes": 925,
+      "sha256": "6ad796850425379b10847034130e75e475405763213fdca28ac5d6b234a82a28",
+      "origin": "existing kei structural fuzz seed; package copy, not independently encoded media",
+      "license": "MIT",
+      "license_file": "../../LICENSE",
+      "coverage": "existing HEIF XMP replacement and ownership regression tests",
+      "source_url": "https://github.com/rhoopr/kei/blob/a4e89dfd73d04028ad357a9c9a487aa39df6824c/fuzz/seeds/heif_rewrite/multi-xmp"
+    },
+    {
+      "path": "heif-rewrite/conflicting-tmap-xmp",
+      "bytes": 992,
+      "sha256": "d34f8040d509f3393e0e2d2deff2e4dcd3f27a844d998b24164a0cc946d7034b",
+      "origin": "existing kei structural fuzz seed; package copy, not independently encoded media",
+      "license": "MIT",
+      "license_file": "../../LICENSE",
+      "coverage": "existing HEIF XMP replacement and ownership regression tests",
+      "source_url": "https://github.com/rhoopr/kei/blob/a4e89dfd73d04028ad357a9c9a487aa39df6824c/fuzz/seeds/heif_rewrite/conflicting-tmap-xmp"
+    },
+    {
+      "path": "media/icloud-still.heic",
+      "bytes": 2218151,
+      "sha256": "7aaa1d5f87a58ea68827b9e5e0798a92b7ad128d26d05e6163304fdd6fef8ca0",
+      "origin": "Shared iCloud Photos download; maintainer-selected sunset; sanitized",
+      "license": "MIT",
+      "license_file": "LICENSE-icloud-media",
+      "recipe": "scripts/fixtures/sanitize_icloud_still.py",
+      "source_sha256": "57b8560b2abd3e49ecfbf73d9eb1a8ca453ab161966ec06124cf46698b6d86c9",
+      "permission": "Maintainer confirmed ownership and authorized MIT redistribution on 2026-09-27",
+      "coverage": "iCloud-delivered Apple HEIC with auxiliary images and HDR metadata; transfer, XMP rewrite and non-XMP item preservation"
+    }
+  ]
+}

@@ -4,9 +4,11 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 
-use super::{
-    MetadataCaptureCandidate, MetadataCaptureVersionEvidence, SqliteStateDb, StateError,
-    VersionSizeKey,
+use super::SqliteStateDb;
+use super::rows::decode_asset_date;
+use crate::state::error::StateError;
+use crate::state::types::{
+    MetadataCaptureCandidate, MetadataCaptureVersionEvidence, VersionSizeKey,
 };
 
 const INITIAL_RETRY_SECONDS: i64 = 60 * 60;
@@ -161,7 +163,7 @@ fn visit(
             candidate.versions.push(MetadataCaptureVersionEvidence {
                 added_at: row
                     .get::<_, Option<f64>>(11)?
-                    .map(|date| super::decode_asset_date(date, 11))
+                    .map(|date| decode_asset_date(date, 11))
                     .transpose()?,
                 version_size,
                 checksum: row.get(4)?,

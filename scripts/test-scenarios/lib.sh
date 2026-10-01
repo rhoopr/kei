@@ -5,6 +5,10 @@ run_scenario_test() {
     local filter="$2"
     local cargo_bin="${CARGO:-cargo}"
     local -a target_args
+    if [[ -z "$filter" ]]; then
+        echo "scenario runner: empty filter for target=$target" >&2
+        return 2
+    fi
 
     case "$target" in
         lib)
@@ -20,7 +24,17 @@ run_scenario_test() {
     esac
 
     local listed
-    if ! listed=$("$cargo_bin" test "${target_args[@]}" "$filter" -- --list); then
+    if [[ -n "${scenario_catalog_dir:-}" ]]; then
+        # check.sh owns this private cache for one catalog-only validation run.
+        local catalog="$scenario_catalog_dir/${target//:/_}"
+        if [[ ! -f "$catalog" ]]; then
+            if ! "$cargo_bin" test "${target_args[@]}" -- --list >"$catalog"; then
+                echo "scenario runner: could not list target=$target" >&2
+                return 1
+            fi
+        fi
+        listed=$(awk -v filter="$filter" '/: test$/ { name=substr($0, 1, length($0)-6); if (index(name, filter)) print }' "$catalog")
+    elif ! listed=$("$cargo_bin" test "${target_args[@]}" "$filter" -- --list); then
         echo "scenario runner: could not list target=$target filter=$filter" >&2
         return 1
     fi
@@ -29,5 +43,6 @@ run_scenario_test() {
         return 2
     fi
 
+    [[ -z "${scenario_catalog_dir:-}" ]] || return 0
     "$cargo_bin" test "${target_args[@]}" "$filter"
 }
