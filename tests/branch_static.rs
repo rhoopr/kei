@@ -2114,6 +2114,71 @@ fi
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn full_test_live_dispatch_reaches_lookup_only_and_propagates_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let scripts = root.join("scripts/just");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(root.join("justfile"), repo_file("justfile")).unwrap();
+    std::fs::write(
+        scripts.join("live-env.sh"),
+        repo_file("scripts/just/live-env.sh"),
+    )
+    .unwrap();
+    write_executable(
+        &bin.join("cargo"),
+        r#"#!/bin/bash
+set -euo pipefail
+call=$(printf '%s' "$1"; shift; printf '\t%s' "$@")
+printf '%s\n' "$call" >> "$CALL_LOG"
+[[ "$call" != "${FAIL_CALL:-}" ]] || exit 23
+"#,
+    );
+    let log = root.join("calls");
+    let expected = [
+        "test\t--all-features\t--lib\ticloud::photos::album::lookup::tests::live_targeted_record_lookup_distinguishes_present_and_missing\t--\t--exact\t--ignored\t--test-threads=1",
+        "test\t--all-features\t--test\tsync\t--\t--ignored\t--test-threads=1",
+        "test\t--all-features\t--test\tstate_auth\t--\t--ignored\t--test-threads=1",
+        "test\t--all-features\t--test\timport_existing_live\t--\t--ignored\t--test-threads=1",
+    ];
+    for fail in std::iter::once("").chain(expected) {
+        std::fs::write(&log, "").unwrap();
+        let output = Command::new("just")
+            .args(["test", "live"])
+            .current_dir(root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("ICLOUD_USERNAME", "fixture@example.invalid")
+            .env_remove("ICLOUD_PASSWORD")
+            .env("CALL_LOG", &log)
+            .env("FAIL_CALL", fail)
+            .output()
+            .unwrap();
+        let calls: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        if fail.is_empty() {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(calls, expected);
+        } else {
+            assert!(!output.status.success(), "must propagate {fail}");
+            assert_eq!(calls.last().unwrap(), fail, "must stop after child failure");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn full_test_phase_fixture() -> String {
     [
         "static_checks",

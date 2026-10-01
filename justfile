@@ -258,6 +258,7 @@ test MODE="" *ARGS="":
             ;;
         live)
             _live_env
+            cargo test --all-features --lib icloud::photos::album::lookup::tests::live_targeted_record_lookup_distinguishes_present_and_missing -- --exact --ignored --test-threads=1
             cargo test --all-features --test sync -- --ignored --test-threads=1
             cargo test --all-features --test state_auth -- --ignored --test-threads=1
             cargo test --all-features --test import_existing_live -- --ignored --test-threads=1
