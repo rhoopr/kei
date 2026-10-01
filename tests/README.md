@@ -76,11 +76,61 @@ full set with `just test scenarios`.
 | `config-docs` | Supported configuration stays aligned with examples, migration guidance, and contributor commands | Config keys, defaults, examples, migration docs, or gate commands |
 | `config-reconciliation` | Config-hash staging, local catalog path reconciliation, and repeat-cycle stability | Download config hashes, path reconciliation, config drift, or local reconciliation copies |
 | `fulltest-harness` | Full-test phase reachability and rejection of stale or empty scenario filters | `just` dispatch, full-test orchestration, or scenario-runner helpers |
+| `identity-recovery` | Malformed capture dates, ambiguous historical owners, deferred retries, restart, and eventual recovery | Metadata capture, pending recovery, identity evidence, or their checkpoint gates |
 | `identity-deltas` | Incremental identity mapping, hard and soft deletion, selected relations, and master-family transitions | CloudKit change parsing, identity mapping, membership, or tombstone policy |
 | `path-family` | Collision suffixes and primary, Live Photo, import, and pending-file family matching | Path rendering, collision handling, import matching, or on-disk adoption |
 | `pending-recovery` | Durable pending hydration, policy-excluded deletion proof, ambiguous identity retention, and sibling recovery | Retry resolution, pending or policy-excluded state, provider identity, or targeted hydration |
 | `service-health` | Health and metrics facts exposed by unattended operation | Health checks, metrics, cycle reporting, or service monitoring |
 | `url-refresh` | Refresh of expired or aged download URLs without replaying stale deltas | Incremental downloads, URL freshness, album hydration, or retry downloads |
+
+## Bounded identity recovery
+
+Run `just test scenario identity-recovery` for the first phase of
+[#862](https://github.com/rhoopr/kei/issues/862). It composes existing production
+owner tests instead of adding a simulation framework. The complete offline
+suites execute these same tests; the gate also validates the scenario filters.
+
+| Evidence | Tests selected by the slice |
+|----------|-----------------------------|
+| Missing, null, out-of-range, and valid epoch capture dates; one child or a matching visible/hidden sibling | `hidden_invalid_capture_date` selects both metadata capture and pending recovery |
+| Conflicting or missing historical dates/owners and failed retry persistence | `run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint`, `bounded_full_sync_hydrates_live_legacy_pending_master` |
+| Deferred work, changed authoritative evidence, bounded recovery, and no repeated completed work | `run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_repaired`, `ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_backfill` |
+| Schema-28 preservation with one or multiple current children | `run_cycle_single_survivor_preserved`, `run_cycle_ambiguous_children_preserved_independently` |
+| Changed rendition evidence and stale retry attempts | `metadata_capture_retry_changed_evidence_is_due_and_old_attempt_cannot_delay_it` |
+| Other-library success cannot clear unresolved work; streaming and collecting paths retain failed work | `unresolved_identity_survives_restart_and_other_zone_success_then_recovers`, `sparse_retry_omitted_source_preserves_failed_work_then_recovers_media` |
+
+The two capture-date matrices seed file-backed SQLite and nonempty media
+directories. Each logs its provider date, sibling visibility, cycle, and operation
+sequence on failure. They release production DB handles and reopen SQLite before
+asserting durable dates, ownership, statuses, retry evidence, capture revisions,
+checkpoints, and unchanged media as applicable. Assertions use fixture facts,
+not the production candidate-selection algorithm. A valid Unix epoch must make
+progress; an invalid date must never become an epoch through a fallback.
+Matching malformed siblings remain ambiguity evidence.
+
+The capture matrix changes invalid provider evidence to a valid date, injects a
+SQLite refresh failure, removes the trigger, and requires recovery on the next
+cycle plus an unchanged follow-up. A valid owner claim may survive a failed
+metadata refresh, but the catalogue date, capture receipt, and checkpoint must
+remain unchanged until refresh commits. Malformed mixed-child cases remain unresolved;
+separate existing tests supply authoritative ownership and prove finite recovery.
+Fully valid ambiguous families exercise schema-28 preservation in their existing
+regressions. The capture epoch control isolates a single child's valid date.
+No media rewrite is enabled. Pending recovery verifies the exact downloaded
+bytes, preserves unrelated media, and permits only one HTTP download.
+
+Historical pre-fix revisions have not been rerun for this slice. The #861
+counterexamples are retained and strengthened on current main; this is not a
+claim that historical/refactor parity proves the independent oracle.
+
+The focused slice ran 11 tests in 25.7 seconds on Linux with a warm default-feature
+build cache. That is below the proposed additional 2-5 minute PR budget. Cold
+compilation is excluded; complete-suite timings remain separate gate evidence.
+
+Generated sequences, shrinking, semantic fuzzing, process termination, composed
+filesystem recovery, and physical NFS/NAS qualification remain later phases.
+SQLite reopen and injected transaction failure do not model abrupt process death
+or power-loss durability.
 
 ## State-transition proof
 

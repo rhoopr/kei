@@ -2107,8 +2107,10 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
-    for invalid in [None, Some(Value::Null), Some(json!(1e100))] {
-        for with_sibling in [false, true] {
+    for invalid in [None, Some(Value::Null), Some(json!(1e100)), Some(json!(0))] {
+        let valid_epoch = invalid == Some(json!(0));
+        for sibling_hidden in [None, Some(false), Some(true)] {
+            let with_sibling = sibling_hidden.is_some();
             let server = crate::start_wiremock_or_skip!();
             let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
             let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
@@ -2140,7 +2142,10 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                 db.upsert_seen(&record).await.unwrap();
             }
             for cycle in 0..4 {
-                let recovered = cycle >= 2 && !with_sibling;
+                eprintln!(
+                    "pending date={invalid:?} sibling_hidden={sibling_hidden:?} cycle={cycle}: seed -> malformed/control -> reopen -> valid -> steady"
+                );
+                let recovered = !with_sibling && (valid_epoch || cycle >= 2);
                 let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
                 let mut records = incremental_photo_records_with_url(
                     "LEGACY_INVALID_CAPTURE",
@@ -2150,7 +2155,7 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                 );
                 records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
                 records[1]["fields"]["isHidden"] = json!({"value": 1, "type": "INT64"});
-                if cycle < 2 {
+                if cycle < 2 || valid_epoch {
                     match &invalid {
                         None => {
                             records[1]["fields"]
@@ -2167,6 +2172,8 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                 if with_sibling {
                     let mut sibling = records[1].clone();
                     sibling["recordName"] = json!("valid-sibling");
+                    sibling["fields"]["isHidden"]["value"] =
+                        json!(i64::from(sibling_hidden.unwrap()));
                     sibling["fields"]["assetDate"] =
                         json!({"value": 1_700_000_000_000i64, "type": "TIMESTAMP"});
                     records.push(sibling);
@@ -2190,7 +2197,8 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                 config.sync_mode = SyncMode::Full;
                 config.recent = Some(300);
                 config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
-                    Utc.timestamp_opt(946_684_800, 0).unwrap(),
+                    Utc.timestamp_opt(if valid_epoch { 0 } else { 946_684_800 }, 0)
+                        .unwrap(),
                 ));
                 let result = download_photos_with_sync(
                     &Client::new(),
@@ -2201,6 +2209,8 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                 )
                 .await
                 .unwrap();
+                drop(db);
+                let db = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
                 let summary = db.get_summary().await.unwrap();
                 assert_eq!(
                     summary.pending,
@@ -2213,11 +2223,19 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                 assert_eq!(result.checkpoint.identity_incomplete, !recovered);
                 assert_eq!(
                     result.stats.downloaded,
-                    usize::from(cycle == 2 && recovered)
+                    usize::from(!with_sibling && if valid_epoch { cycle == 0 } else { cycle == 2 })
                 );
                 assert_eq!(
-                    db.get_legacy_master_state_owners().await.unwrap().len(),
-                    usize::from(recovered)
+                    db.get_legacy_master_state_owners().await.unwrap(),
+                    if recovered {
+                        std::collections::HashSet::from([(
+                            "PrimarySync".to_string(),
+                            "LEGACY_INVALID_CAPTURE".to_string(),
+                            "asset-LEGACY_INVALID_CAPTURE".to_string(),
+                        )])
+                    } else {
+                        std::collections::HashSet::new()
+                    }
                 );
                 if recovered {
                     let rows = db.get_downloaded_page(0, 10).await.unwrap();
@@ -2226,6 +2244,7 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                         body
                     );
                     assert_eq!(rows[0].created_at, record.created_at);
+                    assert_eq!(rows[0].checksum.as_ref(), checksum);
                 } else {
                     let rows = db.get_pending().await.unwrap();
                     assert_eq!(rows[0].created_at, record.created_at);
@@ -2237,6 +2256,7 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                     b"retained unrelated media"
                 );
             }
+            server.verify().await;
         }
     }
 }
