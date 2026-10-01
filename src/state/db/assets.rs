@@ -789,7 +789,7 @@ impl SqliteStateDb {
             {
                 let mut stmt = tx
                     .prepare_cached(
-                        "UPDATE assets SET last_seen_at = ?1 WHERE library = ?2 AND id = ?3",
+                        "UPDATE assets SET last_seen_at = ?1 WHERE library = ?2 AND id = ?3 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id)",
                     )
                     .map_err(|e| StateError::query("touch_last_seen_many::prepare", e))?;
                 for id in &ids {
@@ -914,7 +914,7 @@ impl SqliteStateDb {
             let updated = conn
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
-                 WHERE library = ?2 AND id = ?3",
+                 WHERE library = ?2 AND id = ?3 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id)",
                     rusqlite::params![deleted_at.map(|dt| dt.timestamp()), &library, &asset_id],
                 )
                 .map_err(|e| StateError::query("mark_soft_deleted", e))?;
@@ -944,7 +944,7 @@ impl SqliteStateDb {
             let marked = tx
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
-                     WHERE library = ?2 AND id = ?3",
+                     WHERE library = ?2 AND id = ?3 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id)",
                     rusqlite::params![deleted_at.map(|dt| dt.timestamp()), library, asset_id],
                 )
                 .map_err(|e| StateError::query("resolve_source_deleted::mark", e))?;
@@ -978,7 +978,7 @@ impl SqliteStateDb {
             let updated = conn
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
-                     WHERE library = ?2 AND (id = ?3 OR id IN ( \
+                     WHERE library = ?2 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id) AND (id = ?3 OR id IN ( \
                         SELECT asset_record_name FROM asset_master_mappings \
                         WHERE library = ?2 AND master_record_name = ?3 \
                      ))",
@@ -1015,7 +1015,7 @@ impl SqliteStateDb {
             let marked = tx
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
-                     WHERE library = ?2 AND (id = ?3 OR id IN ( \
+                     WHERE library = ?2 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id) AND (id = ?3 OR id IN ( \
                         SELECT asset_record_name FROM asset_master_mappings \
                         WHERE library = ?2 AND master_record_name = ?3 \
                      ))",
@@ -1058,7 +1058,7 @@ impl SqliteStateDb {
         self.with_conn("mark_hidden_at_source", move |conn| {
             let updated = conn
                 .execute(
-                    "UPDATE assets SET is_hidden = 1 WHERE library = ?1 AND id = ?2",
+                    "UPDATE assets SET is_hidden = 1 WHERE library = ?1 AND id = ?2 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id)",
                     rusqlite::params![library, asset_id],
                 )
                 .map_err(|e| StateError::query("mark_hidden_at_source", e))?;
@@ -1308,6 +1308,15 @@ impl DownloadStateStore for SqliteStateDb {
         SqliteStateDb::get_asset_master_mappings(self).await
     }
 
+    async fn get_protected_legacy_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
+        self.with_conn("get_protected_legacy_ids", |conn| {
+            let mut stmt = conn.prepare("SELECT library,asset_id FROM unattributed_legacy")?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(StateError::from)
+        })
+        .await
+    }
     async fn get_legacy_master_state_owners(
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError> {

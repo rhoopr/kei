@@ -9,7 +9,7 @@ use rusqlite::OptionalExtension;
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 27). The shared helper
+/// `state::schema::SCHEMA_VERSION` (currently 28). The shared helper
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -27,7 +27,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 27;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 28;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -1140,4 +1140,102 @@ fn behavioral_helper_carries_every_migrated_column() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(path_key, ["library", "id", "version_size", "local_path"]);
+}
+
+#[test]
+fn behavioral_preservation_tables_and_guards_are_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = create_state_db(dir.path(), "fixture@example.com");
+    for table in [
+        "unattributed_legacy",
+        "unattributed_legacy_paths",
+        "unattributed_legacy_proofs",
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "{table}");
+    }
+    let guards:i64=conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'unattributed_%'",[],|row|row.get(0)).unwrap();
+    assert_eq!(guards, 30);
+}
+
+#[test]
+fn preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let username = "synthetic@example.com";
+    let conn = create_state_db(data_dir.path(), username);
+    let missing = data_dir.path().join("retained-original.jpg");
+    insert_asset(
+        &conn,
+        "LEGACY",
+        "downloaded",
+        "retained-original.jpg",
+        Some(missing.to_str().unwrap()),
+        None,
+        Some("original-checksum"),
+    );
+    conn.execute("INSERT INTO sync_runs(started_at,completed_at,status) VALUES (1700000000,1700000001,'complete')", []).unwrap();
+    // This tests the command/report boundary with an explicitly prepared
+    // synthetic record; it does not manufacture an activation proof.
+    conn.execute("INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) VALUES ('PrimarySync','LEGACY',1,'synthetic-original','[]',1)", []).unwrap();
+    drop(conn);
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", data_dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(out).unwrap();
+    assert!(
+        output.contains(
+            "1 legacy records need attribution; 1 awaiting current-work preservation proof"
+        ),
+        "{output}"
+    );
+    assert!(output.contains("Backup status: unsafe"), "{output}");
+    assert!(
+        output.contains("Backup status: unsafe - 1 preserved legacy records need attribution"),
+        "{output}"
+    );
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", data_dir.path())
+        .args(["reconcile"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(out).unwrap();
+    assert!(
+        output
+            .contains("Protected legacy records needing inspection: 1; original receipts retained"),
+        "{output}"
+    );
+    let conn = rusqlite::Connection::open(
+        data_dir
+            .path()
+            .join(format!("{}.db", sanitize_username(username))),
+    )
+    .unwrap();
+    let retained: (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT status,last_error,local_checksum FROM assets WHERE id='LEGACY'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        retained,
+        ("downloaded".into(), None, "original-checksum".into())
+    );
+    assert!(!missing.exists());
 }

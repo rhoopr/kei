@@ -328,6 +328,8 @@ pub struct SyncStats {
     pub metadata_capture_remaining: u64,
     pub metadata_capture_unresolved: u64,
     pub metadata_capture_deferred: u64,
+    pub unattributed_legacy_assets: u64,
+    pub unattributed_legacy_pending: u64,
     /// True when this cycle durably reduced metadata-capture work.
     #[serde(skip)]
     pub(crate) metadata_capture_progressed: bool,
@@ -519,6 +521,8 @@ impl SyncStats {
         self.metadata_capture_remaining += other.metadata_capture_remaining;
         self.metadata_capture_unresolved += other.metadata_capture_unresolved;
         self.metadata_capture_deferred += other.metadata_capture_deferred;
+        self.unattributed_legacy_assets += other.unattributed_legacy_assets;
+        self.unattributed_legacy_pending += other.unattributed_legacy_pending;
         self.metadata_capture_progressed |= other.metadata_capture_progressed;
         self.count_probe_failures += other.count_probe_failures;
         self.stale_pending_pruned += other.stale_pending_pruned;

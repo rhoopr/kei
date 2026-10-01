@@ -583,6 +583,10 @@ pub(crate) struct MetadataCaptureCandidate {
 /// Durable metadata-capture state for one provider library.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MetadataCaptureStatus {
+    /// Preserved original identities whose historical owner remains unknown.
+    pub unattributed_legacy_assets: u64,
+    /// Originals without a currently valid preservation coverage receipt.
+    pub unattributed_legacy_pending: u64,
     pub library: String,
     pub active_revision: i64,
     #[serde(skip_serializing_if = "Option::is_none")]

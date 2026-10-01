@@ -747,3 +747,42 @@ fn configured_root_alias_recovers_journals_without_following_descendant_links() 
     assert!(directory_path(&external_target).unwrap().exists());
     drop(external_journal);
 }
+
+#[test]
+fn protected_legacy_journal_is_untouched_even_through_root_alias() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("shared");
+    fs::create_dir(&root).unwrap();
+    let (target, part, _journal) = prepare(&root);
+    let journal_path = directory_path(&target).unwrap();
+    let snapshot = || {
+        let mut entries: Vec<_> = fs::read_dir(&journal_path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(&path).unwrap(),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    };
+    let before = snapshot();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    assert!(
+        super::recover_tree_blocking_with_protection(&alias, std::slice::from_ref(&target),)
+            .is_err()
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"original");
+    assert_eq!(fs::read(&part).unwrap(), b"replacement");
+    assert_eq!(snapshot(), before);
+    // Even an empty journal must not be removed by Journal::open.
+    drop(_journal);
+    fs::remove_dir_all(&journal_path).unwrap();
+    fs::create_dir(&journal_path).unwrap();
+    assert!(super::recover_tree_blocking_with_protection(&root, &[target]).is_err());
+    assert!(journal_path.is_dir());
+}

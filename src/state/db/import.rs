@@ -31,6 +31,9 @@ impl SqliteStateDb {
                 .transaction()
                 .map_err(|e| StateError::query("import_adopt::begin", e))?;
 
+            let protected_path = crate::fs_util::confined_path_key(&local_path).map_err(|_private_error|StateError::Invariant {operation:"import_adopt",detail:"invalid import destination".into()})?;
+            let protected: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM unattributed_legacy_paths WHERE path_key=?1)",[protected_path],|row|row.get(0))?;
+            if protected { return Err(StateError::Invariant {operation:"import_adopt",detail:"import destination is protected unattributed legacy evidence".into()}); }
             let has_reservations: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM reconciliation_paths)",
                 [],

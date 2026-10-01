@@ -88,6 +88,7 @@ fn candidate_query(asset_id: Option<&str>) -> String {
                AND (v.revision IS NULL OR v.revision<rr.target_revision)
          )
         WHERE a.library=?1 AND a.status='downloaded' AND a.is_deleted=0
+          AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=a.library AND p.asset_id=a.id)
           AND (v.revision IS NULL OR v.revision < ?2){identity_filter}
         ORDER BY a.id,a.version_size
     "
@@ -230,7 +231,7 @@ pub(super) fn counts(
 }
 
 pub(super) fn retire_completed(conn: &Connection, library: &str) -> Result<(), StateError> {
-    conn.execute(r"DELETE FROM metadata_capture_retries AS r WHERE r.library=?1 AND NOT EXISTS (
+    conn.execute(r"DELETE FROM metadata_capture_retries AS r WHERE r.library=?1 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=r.library AND p.asset_id=r.asset_id) AND NOT EXISTS (
         SELECT 1 FROM assets a LEFT JOIN asset_metadata_capture_revisions v ON v.library=a.library AND v.asset_id=a.id
         WHERE a.library=r.library AND a.id=r.asset_id AND a.status='downloaded' AND a.is_deleted=0
           AND (v.revision IS NULL OR v.revision < r.target_revision)

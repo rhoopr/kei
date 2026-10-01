@@ -55,7 +55,12 @@ pub(crate) async fn reconcile_catalog_paths(
         return Ok(PathReconciliationResult::default());
     };
 
-    if let Err(error) = file::recover_conditional_replacements(&config.directory).await {
+    let protected_paths =
+        crate::download::legacy_preservation::protected_replacement_paths(Some(db.as_ref()))
+            .await?;
+    if let Err(error) =
+        file::recover_conditional_replacements(&config.directory, &protected_paths).await
+    {
         tracing::warn!(error = %format!("{error:#}"), "Could not recover replacements before path reconciliation; keeping catalogue paths and checkpoints unchanged");
         return Ok(PathReconciliationResult {
             complete: false,
@@ -66,6 +71,13 @@ pub(crate) async fn reconcile_catalog_paths(
         });
     }
 
+    let protected: std::collections::HashSet<String> = db
+        .get_protected_legacy_ids()
+        .await?
+        .into_iter()
+        .filter(|(library, _)| library == config.library.as_ref())
+        .map(|(_, id)| id)
+        .collect();
     let mut records = Vec::new();
     let mut offset = 0u64;
     const PAGE_SIZE: u32 = 1_000;
@@ -73,7 +85,9 @@ pub(crate) async fn reconcile_catalog_paths(
         let page = db.get_downloaded_page(offset, PAGE_SIZE).await?;
         let page_len = page.len();
         records.extend(page.into_iter().filter(|record| {
-            record.library.as_ref() == config.library.as_ref() && !record.metadata.is_deleted
+            record.library.as_ref() == config.library.as_ref()
+                && !record.metadata.is_deleted
+                && !protected.contains(record.id.as_ref())
         }));
         if page_len < PAGE_SIZE as usize {
             break;

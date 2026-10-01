@@ -17,6 +17,8 @@ mod hydration;
 mod lookup;
 mod planning;
 
+mod preservation_proof;
+pub(crate) use preservation_proof::CompleteLegacyInventory;
 #[cfg(test)]
 mod test_support;
 

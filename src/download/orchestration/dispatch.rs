@@ -265,7 +265,12 @@ pub async fn download_photos_with_sync(
 ) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
     if matches!(controls.run_mode, super::models::DownloadRunMode::Download) {
-        crate::download::file::recover_conditional_replacements(&config.directory).await?;
+        let protected = crate::download::legacy_preservation::protected_replacement_paths(
+            config.state_db.as_deref(),
+        )
+        .await?;
+        crate::download::file::recover_conditional_replacements(&config.directory, &protected)
+            .await?;
     }
     cleanup_orphan_part_files(&config).await;
     if matches!(config.sync_mode, SyncMode::Incremental { .. })

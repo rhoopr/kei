@@ -3486,3 +3486,723 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
         }
     }
 }
+
+// #765: known provider child identities must not imply an owner for an old
+// master-keyed receipt. Exercise production cycles, with only synthetic data.
+#[derive(Clone, Copy, Debug)]
+enum AmbiguousChildFault {
+    None,
+    Preserve,
+    PreserveConfigChange,
+    PreserveCompanion,
+    PreservePaginatedHidden,
+    PreserveHiddenUnselected,
+    PreserveBridgeDebt,
+    PreserveCancel,
+    PreserveStateWrite,
+    PreservePathConflict,
+    PathConflict,
+    Cancel,
+    StateWrite,
+}
+
+async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    #[derive(Clone, Debug)]
+    struct ChildSession {
+        records: Vec<serde_json::Value>,
+        complete: bool,
+        bridge_debt: bool,
+        paginated: bool,
+        omit_hidden: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for ChildSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            if self.paginated && url.contains("/changes/zone?") {
+                let cursor = request["zones"][0]["syncToken"].as_str();
+                if cursor.is_none() || cursor == Some("family-page") {
+                    let (records, token, more) = if cursor.is_none() {
+                        (&self.records[..2], "family-page", true)
+                    } else {
+                        (&self.records[2..], "after", false)
+                    };
+                    return Ok(
+                        serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":token,"moreComing":more,"records":records}]}),
+                    );
+                }
+            }
+
+            if self.complete
+                && url.contains("/changes/zone?")
+                && request["zones"][0]["syncToken"].is_string()
+                && !self.bridge_debt
+            {
+                return Ok(
+                    serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":[]}]}),
+                );
+            }
+            if url.contains("/changes/zone?") {
+                return Ok(
+                    serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":self.records}]}),
+                );
+            }
+            if url.contains("/records/query/batch?") {
+                return Ok(album_count_response(if self.complete {
+                    (self.records.len() - 1 - usize::from(self.omit_hidden)) as u64
+                } else {
+                    0
+                }));
+            }
+            if url.contains("/records/query?") {
+                let offset = request["query"]["filterBy"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|filter| filter["fieldName"] == "startRank")
+                    .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                    .unwrap_or(0);
+                let records = if self.complete && offset == 0 {
+                    self.records
+                        .iter()
+                        .filter(|record| {
+                            !self.omit_hidden
+                                || record["fields"]["isHidden"]["value"] != serde_json::json!(1)
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                return Ok(serde_json::json!({"records":records,"syncToken":"after"}));
+            }
+            assert!(url.contains("/records/lookup?"));
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            let names = request["records"].as_array().unwrap();
+            let records: Vec<_> = self
+                .records
+                .iter()
+                .filter(|record| {
+                    names
+                        .iter()
+                        .any(|name| name["recordName"] == record["recordName"])
+                })
+                .collect();
+            Ok(serde_json::json!({"records":records}))
+        }
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn rows(database: &std::path::Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let conn = rusqlite::Connection::open(database).unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let count = stmt.column_count();
+        stmt.query_map([], |row| (0..count).map(|index| row.get(index)).collect())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    let preserving = matches!(
+        fault,
+        AmbiguousChildFault::Preserve
+            | AmbiguousChildFault::PreserveConfigChange
+            | AmbiguousChildFault::PreserveCompanion
+            | AmbiguousChildFault::PreservePaginatedHidden
+            | AmbiguousChildFault::PreserveHiddenUnselected
+            | AmbiguousChildFault::PreserveBridgeDebt
+            | AmbiguousChildFault::PreserveCancel
+            | AmbiguousChildFault::PreserveStateWrite
+            | AmbiguousChildFault::PreservePathConflict
+    );
+    for children in [2, 3] {
+        for sidecars in [false, true] {
+            let server = crate::start_wiremock_or_skip!();
+            let bytes =
+                b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9";
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+            let motion = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ";
+            let motion_checksum =
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(motion));
+            if matches!(fault, AmbiguousChildFault::PreserveCompanion) {
+                Mock::given(method("GET"))
+                    .and(path("/child.mov"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(motion))
+                    .mount(&server)
+                    .await;
+            }
+
+            Mock::given(method("GET"))
+                .and(path("/child.jpg"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(&server)
+                .await;
+            let page = full_album_page_with_download(
+                "PrimarySync",
+                "legacy-master",
+                "after",
+                &format!("{}/child.jpg", server.uri()),
+                bytes.len() as u64,
+                &checksum,
+            );
+            let mut records = vec![page["records"][0].clone()];
+            records[0]["fields"]["filenameEnc"] = serde_json::json!({"value":"photo.jpg"});
+            if matches!(fault, AmbiguousChildFault::PreserveCompanion) {
+                records[0]["fields"]["resOriginalVidComplRes"] = serde_json::json!({"value":{"downloadURL":format!("{}/child.mov",server.uri()),"size":motion.len(),"fileChecksum":motion_checksum}});
+                records[0]["fields"]["resOriginalVidComplFileType"] =
+                    serde_json::json!({"value":"com.apple.quicktime-movie"});
+            }
+
+            let names: Vec<_> = (0..children).map(|i| format!("child-{i}-unique")).collect();
+            for (index, name) in names.iter().enumerate() {
+                let mut child = page["records"][1].clone();
+                child["recordName"] = serde_json::json!(name);
+                child["fields"]["isFavorite"] = serde_json::json!({"value":index % 2});
+                if index == children - 1
+                    && matches!(
+                        fault,
+                        AmbiguousChildFault::PreservePaginatedHidden
+                            | AmbiguousChildFault::PreserveHiddenUnselected
+                    )
+                {
+                    child["fields"]["isHidden"] = serde_json::json!({"value":1});
+                }
+                records.push(child);
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("state.db");
+            let media = dir.path().join("media");
+            let destination = media.join(run_cycle_expected_date_dir());
+            std::fs::create_dir_all(&destination).unwrap();
+            let legacy_path = destination.join("photo.jpg");
+            let legacy_xmp = destination.join("photo.jpg.xmp");
+            std::fs::write(&legacy_path, bytes).unwrap();
+            std::fs::write(&legacy_xmp, b"legacy sidecar: never adopt or replace").unwrap();
+            let legacy_motion = destination.join("photo.MOV");
+            let legacy_motion_xmp = destination.join("photo.MOV.xmp");
+            if matches!(fault, AmbiguousChildFault::PreserveCompanion) {
+                std::fs::write(&legacy_motion, motion).unwrap();
+                std::fs::write(&legacy_motion_xmp, b"retained motion sidecar").unwrap();
+            }
+            let collision = destination.join(format!("photo-{}.jpg", bytes.len()));
+            if matches!(
+                fault,
+                AmbiguousChildFault::PathConflict | AmbiguousChildFault::PreservePathConflict
+            ) {
+                std::fs::write(&collision, b"unrelated existing file").unwrap();
+            }
+            {
+                let inner = state::SqliteStateDb::open(&database).await.unwrap();
+                let date =
+                    chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap();
+                let mut metadata = state::AssetMetadata::default();
+                metadata.refresh_hash();
+                let record = crate::test_helpers::TestAssetRecord::new("legacy-master")
+                    .filename("photo.jpg")
+                    .created_at(date)
+                    .added_at(date)
+                    .checksum(&checksum)
+                    .size(bytes.len() as u64)
+                    .metadata(metadata)
+                    .build();
+                inner.upsert_seen(&record).await.unwrap();
+                inner
+                    .mark_downloaded(
+                        "PrimarySync",
+                        "legacy-master",
+                        "original",
+                        &legacy_path,
+                        "legacy-local-checksum",
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                if matches!(fault, AmbiguousChildFault::PreserveCompanion) {
+                    let record = crate::test_helpers::TestAssetRecord::new("legacy-master")
+                        .version_size(state::VersionSizeKey::LiveOriginal)
+                        .filename("photo.MOV")
+                        .created_at(date)
+                        .added_at(date)
+                        .checksum(&motion_checksum)
+                        .size(motion.len() as u64)
+                        .build();
+                    inner.upsert_seen(&record).await.unwrap();
+                    inner
+                        .mark_downloaded(
+                            "PrimarySync",
+                            "legacy-master",
+                            "live_original",
+                            &legacy_motion,
+                            "retained-local-motion",
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                inner.set_metadata_capture_revision_for_test("PrimarySync", "legacy-master", 0);
+                for name in &names {
+                    inner
+                        .upsert_asset_master_mapping("PrimarySync", name, "legacy-master")
+                        .await
+                        .unwrap();
+                }
+                inner
+                    .set_metadata("sync_token:PrimarySync", "before")
+                    .await
+                    .unwrap();
+                inner
+                    .begin_metadata_capture_revision(
+                        "PrimarySync",
+                        state::METADATA_CAPTURE_REVISION,
+                    )
+                    .await
+                    .unwrap();
+                let candidate = inner
+                    .get_metadata_capture_candidates("PrimarySync", 1, 1)
+                    .await
+                    .unwrap()
+                    .remove(0);
+                assert!(
+                    inner
+                        .defer_metadata_capture_ambiguity(&candidate, 1)
+                        .await
+                        .unwrap()
+                );
+            }
+            let receipt_sql = "SELECT * FROM assets WHERE id='legacy-master'";
+            let retry_sql = "SELECT * FROM metadata_capture_retries WHERE asset_id='legacy-master'";
+            let revision_sql =
+                "SELECT * FROM asset_metadata_capture_revisions WHERE asset_id='legacy-master'";
+            let mapping_sql = "SELECT library,asset_record_name,master_record_name FROM asset_master_mappings ORDER BY asset_record_name";
+            let receipt = rows(&database, receipt_sql);
+            let retry = rows(&database, retry_sql);
+            let revision = rows(&database, revision_sql);
+            let mappings = rows(&database, mapping_sql);
+            let config = make_run_cycle_config();
+            let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+            let mut completed_requests = 0;
+            let mut completed_outputs = std::collections::HashMap::new();
+            for cycle in 0..if matches!(fault, AmbiguousChildFault::PreserveConfigChange) {
+                4
+            } else {
+                3
+            } {
+                let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                let cancel = CancellationToken::new();
+                let db: Arc<dyn download::DownloadStore> = if cycle == 0
+                    && matches!(
+                        fault,
+                        AmbiguousChildFault::Cancel
+                            | AmbiguousChildFault::StateWrite
+                            | AmbiguousChildFault::PreserveCancel
+                            | AmbiguousChildFault::PreserveStateWrite
+                    ) {
+                    let failing = FailingMetadataSetDb::without_set_failure(
+                        inner.clone(),
+                        "injected #765 state failure",
+                    );
+                    Arc::new(
+                        if matches!(
+                            fault,
+                            AmbiguousChildFault::Cancel | AmbiguousChildFault::PreserveCancel
+                        ) {
+                            failing.with_cancel_on_upsert(cancel.clone())
+                        } else {
+                            failing.with_mark_downloaded_failure()
+                        },
+                    )
+                } else {
+                    inner.clone()
+                };
+                let provider = ChildSession {
+                    records: records.clone(),
+                    complete: preserving,
+                    bridge_debt: matches!(fault, AmbiguousChildFault::PreserveBridgeDebt),
+                    paginated: matches!(fault, AmbiguousChildFault::PreservePaginatedHidden),
+                    omit_hidden: matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected),
+                };
+                let mut primary = make_run_cycle_library_state_with_album(
+                    "PrimarySync",
+                    "sync_token:PrimarySync",
+                    make_full_album_with_boxed_session("PrimarySync", Box::new(provider.clone())),
+                );
+                if preserving {
+                    primary.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+                        Box::new(provider.clone()),
+                        "PrimarySync",
+                    );
+                }
+                let base_builder = make_run_cycle_download_config_builder_with_options(
+                    &media,
+                    db.clone(),
+                    RunCycleDownloadConfigOptions {
+                        #[cfg(feature = "xmp")]
+                        xmp_sidecar: sidecars,
+                        concurrent_downloads: Some(1),
+                        ..RunCycleDownloadConfigOptions::default()
+                    },
+                );
+                let builder = |mode, excluded, groups, library| {
+                    let mut built = base_builder(mode, excluded, groups, library);
+                    if matches!(fault, AmbiguousChildFault::PreserveConfigChange) && cycle >= 2 {
+                        let current = Arc::make_mut(&mut built);
+                        current.folder_structure = "relocated".into();
+                        current.folder_structure_albums = Arc::from("relocated");
+                        current.folder_structure_smart_folders = Arc::from("relocated");
+                    }
+                    built
+                };
+                let result = run_cycle(
+                    &[&primary],
+                    &config,
+                    Some(db.as_ref()),
+                    false,
+                    &builder,
+                    download::DownloadControls::download_hidden(),
+                    &shared_session,
+                    &cancel,
+                )
+                .await
+                .unwrap();
+                let label = format!(
+                    "fault={fault:?} children={children} sidecars={sidecars} cycle={cycle}"
+                );
+                assert_eq!(
+                    std::fs::read(&legacy_path).unwrap(),
+                    bytes,
+                    "legacy bytes {label}"
+                );
+                assert_eq!(
+                    std::fs::read(&legacy_xmp).unwrap(),
+                    b"legacy sidecar: never adopt or replace",
+                    "legacy XMP {label}"
+                );
+                if matches!(
+                    fault,
+                    AmbiguousChildFault::PathConflict | AmbiguousChildFault::PreservePathConflict
+                ) {
+                    assert_eq!(
+                        std::fs::read(&collision).unwrap(),
+                        b"unrelated existing file",
+                        "conflict {label}"
+                    );
+                }
+                if matches!(fault, AmbiguousChildFault::PreserveCompanion) {
+                    assert_eq!(
+                        std::fs::read(&legacy_motion).unwrap(),
+                        motion,
+                        "original motion {label}"
+                    );
+                    assert_eq!(
+                        std::fs::read(&legacy_motion_xmp).unwrap(),
+                        b"retained motion sidecar",
+                        "original motion metadata {label}"
+                    );
+                }
+                assert_eq!(rows(&database, receipt_sql), receipt, "receipt {label}");
+                assert_eq!(rows(&database, retry_sql), retry, "retry {label}");
+                assert_eq!(rows(&database, revision_sql), revision, "revision {label}");
+                assert_eq!(
+                    rows(&database, mapping_sql),
+                    mappings,
+                    "mapping history {label}"
+                );
+                assert!(
+                    inner
+                        .get_legacy_master_state_owners()
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "no guessed owner {label}"
+                );
+                let activated = preserving
+                    && !matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected)
+                    && (!matches!(fault, AmbiguousChildFault::PreserveBridgeDebt)
+                        || (cfg!(feature = "xmp") && sidecars && cycle > 0))
+                    && !(cycle == 0
+                        && matches!(
+                            fault,
+                            AmbiguousChildFault::PreserveCancel
+                                | AmbiguousChildFault::PreserveStateWrite
+                        ));
+                assert_eq!(
+                    inner
+                        .get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(if activated { "after" } else { "before" }),
+                    "checkpoint {label}: {:?}",
+                    result.stats
+                );
+                if activated {
+                    assert!(
+                        !result.stats.identity_incomplete,
+                        "preservation is separate from provider identity {label}"
+                    );
+                    assert_eq!(
+                        inner.legacy_preservations("PrimarySync").await.unwrap()[0]
+                            .active_generation,
+                        Some(
+                            if matches!(fault, AmbiguousChildFault::PreserveConfigChange)
+                                && cycle >= 2
+                            {
+                                2
+                            } else {
+                                1
+                            }
+                        ),
+                        "active generation {label}"
+                    );
+                    if cycle >= 2
+                        && !(matches!(fault, AmbiguousChildFault::PreserveConfigChange)
+                            && cycle == 2)
+                    {
+                        assert!(
+                            result.stats.full_enumeration_reason.is_none(),
+                            "unchanged cycle should remain incremental {label}"
+                        );
+                    }
+                    assert_eq!(
+                        result.stats.unattributed_legacy_assets, 1,
+                        "attribution count {label}"
+                    );
+                    assert_eq!(
+                        result.stats.unattributed_legacy_pending, 0,
+                        "current proof count {label}"
+                    );
+                } else if preserving {
+                    assert_eq!(
+                        inner.legacy_preservations("PrimarySync").await.unwrap()[0]
+                            .active_generation,
+                        None,
+                        "prepared hold {label}"
+                    );
+                } else {
+                    assert!(result.stats.identity_incomplete, "hold {label}");
+                }
+                if cycle == 0
+                    && matches!(
+                        fault,
+                        AmbiguousChildFault::Cancel
+                            | AmbiguousChildFault::StateWrite
+                            | AmbiguousChildFault::PreserveCancel
+                            | AmbiguousChildFault::PreserveStateWrite
+                    )
+                {
+                    assert!(
+                        result.stats.interrupted || result.stats.state_write_failures > 0,
+                        "fault exercised {label}"
+                    );
+                } else {
+                    let downloaded = inner.get_downloaded_page(0, 20).await.unwrap();
+                    let mut paths = std::collections::HashSet::new();
+                    let mut outputs = std::collections::HashMap::new();
+                    paths.insert(legacy_path.clone());
+                    for (index, name) in names.iter().enumerate() {
+                        if matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected)
+                            && index == names.len() - 1
+                        {
+                            assert!(!downloaded.iter().any(|row| row.id.as_ref() == name));
+                            continue;
+                        }
+                        let row = downloaded
+                            .iter()
+                            .find(|row| {
+                                row.id.as_ref() == name
+                                    && row.version_size == state::VersionSizeKey::Original
+                            })
+                            .unwrap_or_else(|| panic!("child missing {name} {label}"));
+                        let path = row.local_path.as_ref().unwrap();
+                        assert!(
+                            paths.insert(path.clone()),
+                            "child aliases another receipt {name} {label}: {path:?}"
+                        );
+                        assert_eq!(std::fs::read(path).unwrap(), bytes, "child bytes {label}");
+                        outputs.insert(path.clone(), std::fs::read(path).unwrap());
+                        if matches!(fault, AmbiguousChildFault::PreserveCompanion) {
+                            let companion = downloaded
+                                .iter()
+                                .find(|row| {
+                                    row.id.as_ref() == name
+                                        && row.version_size == state::VersionSizeKey::LiveOriginal
+                                })
+                                .expect("independent motion receipt");
+                            let target = companion.local_path.as_ref().unwrap();
+                            assert_ne!(target, &legacy_motion);
+                            assert!(paths.insert(target.clone()));
+                            assert_eq!(std::fs::read(target).unwrap(), motion);
+                            outputs.insert(target.clone(), std::fs::read(target).unwrap());
+                            #[cfg(feature = "xmp")]
+                            if sidecars {
+                                let target =
+                                    std::path::PathBuf::from(format!("{}.xmp", target.display()));
+                                assert!(target.is_file());
+                                outputs.insert(target.clone(), std::fs::read(target).unwrap());
+                            }
+                        }
+                        #[cfg(feature = "xmp")]
+                        if sidecars {
+                            let sidecar = path.with_file_name(format!(
+                                "{}.xmp",
+                                path.file_name().unwrap().to_str().unwrap()
+                            ));
+                            assert!(sidecar.is_file(), "child sidecar missing {name} {label}");
+                            assert_ne!(sidecar, legacy_xmp, "child sidecar aliases legacy {label}");
+                            outputs.insert(sidecar.clone(), std::fs::read(&sidecar).unwrap());
+                        }
+                    }
+                    if cycle == 1 {
+                        completed_outputs = outputs;
+                    } else if cycle >= 2 {
+                        if cycle == 2 && matches!(fault, AmbiguousChildFault::PreserveConfigChange)
+                        {
+                            for (path, bytes) in &completed_outputs {
+                                assert_eq!(
+                                    &std::fs::read(path).unwrap(),
+                                    bytes,
+                                    "prior child copy retained {label}"
+                                );
+                            }
+                            assert!(
+                                outputs
+                                    .keys()
+                                    .all(|path| path.starts_with(media.join("relocated"))),
+                                "new current paths {label}"
+                            );
+                            completed_outputs = outputs;
+                        } else {
+                            assert_eq!(outputs, completed_outputs, "steady files {label}");
+                        }
+                    }
+                }
+                let requests = server.received_requests().await.unwrap().len();
+                if cycle == 1 {
+                    assert!(
+                        requests
+                            >= names.len()
+                                - usize::from(matches!(
+                                    fault,
+                                    AmbiguousChildFault::PreserveHiddenUnselected
+                                )),
+                        "fresh child downloads {label}"
+                    );
+                    completed_requests = requests;
+                }
+                if cycle >= 2 {
+                    assert_eq!(requests, completed_requests, "steady network {label}");
+                    if !(matches!(fault, AmbiguousChildFault::PreserveConfigChange) && cycle == 2) {
+                        assert_eq!(result.stats.downloaded, 0, "steady download {label}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_independent() {
+    Box::pin(exercise_ambiguous_child_cycles(AmbiguousChildFault::None)).await;
+}
+#[tokio::test]
+async fn run_cycle_ambiguous_children_path_conflict() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::PathConflict,
+    ))
+    .await;
+}
+#[tokio::test]
+async fn run_cycle_ambiguous_children_interrupted() {
+    Box::pin(exercise_ambiguous_child_cycles(AmbiguousChildFault::Cancel)).await;
+}
+#[tokio::test]
+async fn run_cycle_ambiguous_children_state_failure() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::StateWrite,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_preserved_independently() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::Preserve,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_bridge_debt() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::PreserveBridgeDebt,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_preserved_interrupted() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::PreserveCancel,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_preserved_state_failure() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::PreserveStateWrite,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_preserved_path_conflict() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::PreservePathConflict,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_companions() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::PreserveCompanion,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_paginated_hidden() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::PreservePaginatedHidden,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_unselected_hidden() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::PreserveHiddenUnselected,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_ambiguous_children_config_reactivation() {
+    Box::pin(exercise_ambiguous_child_cycles(
+        AmbiguousChildFault::PreserveConfigChange,
+    ))
+    .await;
+}

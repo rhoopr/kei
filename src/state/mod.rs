@@ -20,7 +20,8 @@ pub(crate) use db::{
 pub use db::ImportedRecord;
 pub(crate) use db::{
     AssetVerificationState, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
-    OwnedTempFile, ReconciliationCatalogPath, ReconciliationContent, ReconciliationPathKey,
+    LegacyActivationProof, LegacyFileEvidence, LegacyPreservation, OwnedTempFile,
+    ReconciliationCatalogPath, ReconciliationContent, ReconciliationPathKey,
     ReconciliationReservation, ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken,
     TempFileOwnershipStore,
 };
@@ -43,3 +44,6 @@ pub(crate) const UNRESOLVED_IDENTITY_PREFIX: &str = "unresolved_asset_identity:"
 pub(crate) fn unresolved_identity_key(zone: &str) -> String {
     format!("{UNRESOLVED_IDENTITY_PREFIX}{zone}")
 }
+
+#[cfg(test)]
+pub(crate) use db::LegacyPreparationSnapshot;

@@ -63,6 +63,8 @@ fn test_sync_result_session_expired() {
 #[test]
 fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     let lib_a = SyncStats {
+        unattributed_legacy_assets: 2,
+        unattributed_legacy_pending: 1,
         identity_incomplete: true,
         assets_seen: 10,
         api_total_at_start: Some(12),
@@ -132,6 +134,8 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     };
 
     let lib_b = SyncStats {
+        unattributed_legacy_assets: 3,
+        unattributed_legacy_pending: 2,
         identity_incomplete: false,
         assets_seen: 20,
         api_total_at_start: Some(22),
@@ -203,6 +207,8 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     acc.accumulate(&lib_b);
     assert!(acc.identity_incomplete);
 
+    assert_eq!(acc.unattributed_legacy_assets, 5);
+    assert_eq!(acc.unattributed_legacy_pending, 3);
     assert_eq!(acc.assets_seen, 30, "assets_seen must sum");
     assert_eq!(
         acc.api_total_at_start,
@@ -549,6 +555,8 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
             .is_none()
     );
     db.commit_checkpoint_transition(CheckpointTransition {
+        legacy_preservation_proofs: Vec::new(),
+        legacy_config_hash: None,
         sparse_identity_proofs: inventory.checkpoint.sparse_identity_proofs,
         metadata_updates: vec![("sync_token:PrimarySync".into(), "after".into())],
         metadata_deletes: vec![unresolved_identity_key("PrimarySync")],

@@ -169,6 +169,16 @@ where
     pub(crate) async fn report_skipped_watch_cycle(&self, health: &mut HealthStatus) {
         let unresolved = if let Some(db) = self.state_db {
             db.get_summary().await.map(|summary| {
+                health.unattributed_legacy_assets = summary
+                    .metadata_capture
+                    .iter()
+                    .map(|capture| capture.unattributed_legacy_assets)
+                    .sum();
+                health.unattributed_legacy_pending = summary
+                    .metadata_capture
+                    .iter()
+                    .map(|capture| capture.unattributed_legacy_pending)
+                    .sum();
                 summary.unresolved_identity_zones > 0
                     || summary
                         .metadata_capture
@@ -252,6 +262,8 @@ where
     }
 
     fn update_health(&self, health: &mut HealthStatus, input: &CycleFacts<'_>) {
+        health.unattributed_legacy_assets = input.stats.unattributed_legacy_assets;
+        health.unattributed_legacy_pending = input.stats.unattributed_legacy_pending;
         match input.status {
             CycleStatus::Success => health.record_success(),
             CycleStatus::Failed if input.stats.identity_incomplete => {

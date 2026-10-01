@@ -16,6 +16,19 @@ pub(crate) enum FileIdentity {
     Legacy { volume: u32, index: u64 },
 }
 
+/// Count directory entries referring to this opened file, without path lookup.
+pub(crate) fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(file.metadata()?.nlink())
+    }
+    #[cfg(windows)]
+    {
+        Ok(u64::from(windows_file_information(file)?.nNumberOfLinks))
+    }
+}
+
 pub(crate) fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
     #[cfg(unix)]
     {
@@ -629,7 +642,9 @@ fn open_windows_entry_attributes(path: &Path) -> std::io::Result<std::fs::File> 
 }
 
 #[cfg(windows)]
-fn windows_file_attributes(file: &std::fs::File) -> std::io::Result<u32> {
+fn windows_file_information(
+    file: &std::fs::File,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
 
@@ -642,7 +657,12 @@ fn windows_file_attributes(file: &std::fs::File) -> std::io::Result<u32> {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: the successful call initialized the complete structure.
-    Ok(unsafe { info.assume_init() }.dwFileAttributes)
+    Ok(unsafe { info.assume_init() })
+}
+
+#[cfg(windows)]
+fn windows_file_attributes(file: &std::fs::File) -> std::io::Result<u32> {
+    Ok(windows_file_information(file)?.dwFileAttributes)
 }
 
 #[cfg(windows)]

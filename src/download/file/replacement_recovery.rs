@@ -85,7 +85,7 @@ fn confined(path: &Path) -> Result<ConfinedPath> {
     )?)
 }
 
-fn directory_path(target: &Path) -> Result<PathBuf> {
+pub(super) fn directory_path(target: &Path) -> Result<PathBuf> {
     let name = target
         .file_name()
         .context("Replacement target has no filename")?;
@@ -542,13 +542,28 @@ pub(super) fn recover_target(target: &Path) -> Result<()> {
 /// interrupted displacement as a missing or changed media file. The configured
 /// root is resolved first; descendant links are not traversed, and mutations
 /// use retained, no-follow directory capabilities.
-pub(super) async fn recover_tree(root: &Path) -> Result<()> {
+pub(super) async fn recover_tree(
+    root: &Path,
+    protected_paths: &[std::path::PathBuf],
+) -> Result<()> {
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || recover_tree_blocking(&root)).await??;
+    let protected_paths = protected_paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        recover_tree_blocking_with_protection(&root, &protected_paths)
+    })
+    .await??;
     Ok(())
 }
 
+#[cfg(test)]
 fn recover_tree_blocking(root: &Path) -> Result<()> {
+    recover_tree_blocking_with_protection(root, &[])
+}
+
+fn recover_tree_blocking_with_protection(
+    root: &Path,
+    protected_paths: &[std::path::PathBuf],
+) -> Result<()> {
     if !root.try_exists()? {
         return Ok(());
     }
@@ -560,12 +575,34 @@ fn recover_tree_blocking(root: &Path) -> Result<()> {
     );
     // The configured root is a trusted anchor and may be an alias. Descendants
     // and journals still undergo no-follow traversal from its resolved path.
+    let mut protected_journals = std::collections::HashSet::new();
+    for path in protected_paths {
+        let journal = directory_path(path)?;
+        let parent = journal
+            .parent()
+            .context("Protected replacement has no parent")?;
+        // Fail closed on missing/changed parents. This also resolves aliases of
+        // the trusted root before comparing with recovery's canonical paths.
+        protected_journals.insert(
+            std::fs::canonicalize(parent)?.join(
+                journal
+                    .file_name()
+                    .context("Protected replacement has no name")?,
+            ),
+        );
+    }
     let mut directories = vec![std::fs::canonicalize(root)?];
     while let Some(directory) = directories.pop() {
         let capability = confined(&directory.join(".kei-recovery-probe"))?;
         for entry in std::fs::read_dir(format!("/proc/self/fd/{}", capability.parent_fd()))? {
             let entry = entry?;
             if journal_name(&entry.file_name()) {
+                // Opening an incomplete journal can clean it up; reject before
+                // open, including originals belonging to unselected libraries.
+                anyhow::ensure!(
+                    !protected_journals.contains(&directory.join(entry.file_name())),
+                    "Replacement recovery intersects protected legacy evidence; all bytes retained"
+                );
                 if let Some(journal) = Journal::open(&directory.join(entry.file_name()))
                     .with_context(|| {
                         format!(
