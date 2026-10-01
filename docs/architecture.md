@@ -113,6 +113,13 @@ across visibility states.
 This does not change download selection or permit checkpoint advancement
 without the existing completion proof.
 
+Hidden children can supply identity evidence without a valid `assetDate`.
+Recovery counts all matching children before validating a selected child's
+capture date. Missing, null, or out-of-range dates cannot authorize an owner
+claim, metadata refresh, pending-file adoption, or download-policy exclusion.
+Invalid selected dates retain repair or retry work and hold the checkpoint.
+The display/path epoch fallback is not recovery evidence.
+
 A new legacy-owner claim requires consistent, present per-rendition `added_at`
 evidence matching the provider's `addedDate`, in addition to the existing
 rendition checks. Missing provider dates do not use the epoch fallback as

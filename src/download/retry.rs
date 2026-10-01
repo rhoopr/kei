@@ -148,6 +148,7 @@ impl PendingRetryEvidence {
 #[derive(Debug)]
 enum LegacyCandidateSelection {
     Selected(PhotoAsset),
+    InvalidCaptureDate,
     Missing,
     EvidenceMismatch { candidates: usize },
     Ambiguous { matches: usize },
@@ -192,6 +193,10 @@ fn select_legacy_candidate(
         };
     };
     if matching.next().is_none() {
+        // Malformed-date children still count toward sibling ambiguity.
+        if selected.asset_date_evidence().is_none() {
+            return LegacyCandidateSelection::InvalidCaptureDate;
+        }
         if owner_asset_record_name.is_none()
             && !targets.iter().all(|target| {
                 evidence.get(*target).is_some_and(|evidence| {
@@ -794,6 +799,18 @@ pub(super) async fn build_pending_retry_download_tasks(
         }
         match resolution {
             RecordResolution::Present(asset) => {
+                if asset.asset_date_evidence().is_none() {
+                    identity_incomplete = true;
+                    set_verification_for_state_id(
+                        db.as_ref(),
+                        &pending_targets,
+                        state_id.as_str(),
+                        AssetVerificationState::Unknown,
+                        "provider capture date is missing or invalid",
+                    )
+                    .await?;
+                    continue;
+                }
                 if state_id.as_str() == asset.id()
                     && !legacy_master_state_owners.contains_key(state_id.as_str())
                 {
@@ -1048,6 +1065,16 @@ pub(super) async fn build_pending_retry_download_tasks(
                         retry_sources: &mut retry_sources,
                     }
                     .plan_resolved_asset(&asset, &state_id)
+                    .await?;
+                }
+                LegacyCandidateSelection::InvalidCaptureDate => {
+                    set_verification_for_state_id(
+                        db.as_ref(),
+                        &pending_targets,
+                        &state_id,
+                        AssetVerificationState::Unknown,
+                        "provider capture date is missing or invalid",
+                    )
                     .await?;
                 }
                 LegacyCandidateSelection::Missing => {

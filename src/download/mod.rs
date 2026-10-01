@@ -4666,6 +4666,16 @@ async fn refresh_metadata_capture_candidate(
     asset: PhotoAsset,
     repair: &mut MetadataCaptureRepair,
 ) {
+    let Some(created) = asset.asset_date_evidence() else {
+        record_metadata_capture_failure(
+            db,
+            &candidate.library,
+            "provider capture date is missing or invalid",
+            repair,
+        )
+        .await;
+        return;
+    };
     if let Err(error) = db
         .upsert_asset_master_mapping(&candidate.library, asset.asset_record_name(), asset.id())
         .await
@@ -4680,7 +4690,7 @@ async fn refresh_metadata_capture_candidate(
         .refresh_downloaded_asset_metadata(
             &candidate.library,
             &candidate.asset_id,
-            (&capture, asset.created(), Some(asset.added_date())),
+            (&capture, created, Some(asset.added_date())),
             mark_for_rewrite,
             false,
             crate::state::METADATA_CAPTURE_REVISION,
@@ -4956,6 +4966,18 @@ async fn run_metadata_capture_repair(
                             db.as_ref(),
                             &candidate.library,
                             "multiple provider children matched durable catalogue evidence",
+                            &mut repair,
+                        )
+                        .await;
+                        continue;
+                    }
+                    // Count every matching child before validating the selected date.
+                    // Dropping malformed siblings earlier would manufacture uniqueness.
+                    if asset.asset_date_evidence().is_none() {
+                        record_metadata_capture_failure(
+                            db.as_ref(),
+                            &candidate.library,
+                            "provider capture date is missing or invalid",
                             &mut repair,
                         )
                         .await;
@@ -26722,5 +26744,150 @@ mod tests {
         assert_eq!(dst.skipped.duplicates, 7);
         assert_eq!(dst.rate_limited, 4);
         assert!(dst.interrupted);
+    }
+
+    #[tokio::test]
+    async fn hidden_invalid_capture_date_preserves_pending_recovery() {
+        use crate::test_helpers::TestAssetRecord;
+        use base64::Engine as _;
+        use chrono::{TimeZone, Utc};
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for invalid in [None, Some(Value::Null), Some(json!(1e100))] {
+            for with_sibling in [false, true] {
+                let server = crate::start_wiremock_or_skip!();
+                let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+                let checksum =
+                    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+                Mock::given(method("GET"))
+                    .and(path("/retained.jpg"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(body.clone())
+                            .insert_header("content-type", "image/jpeg"),
+                    )
+                    .expect(u64::from(!with_sibling))
+                    .mount(&server)
+                    .await;
+                let dir = TempDir::new().unwrap();
+                let db_path = dir.path().join("state.db");
+                let media = dir.path().join("media");
+                std::fs::create_dir(&media).unwrap();
+                let sentinel = media.join("unrelated.jpg");
+                std::fs::write(&sentinel, b"retained unrelated media").unwrap();
+                let record = TestAssetRecord::new("LEGACY_INVALID_CAPTURE")
+                    .filename("retained.jpg")
+                    .checksum(&checksum)
+                    .size(8)
+                    .created_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
+                    .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
+                    .build();
+                {
+                    let db = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+                    db.upsert_seen(&record).await.unwrap();
+                }
+                for cycle in 0..4 {
+                    let recovered = cycle >= 2 && !with_sibling;
+                    let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+                    let mut records = incremental_photo_records_with_url(
+                        "LEGACY_INVALID_CAPTURE",
+                        "retained.jpg",
+                        &format!("{}/retained.jpg", server.uri()),
+                        8,
+                    );
+                    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                        json!(checksum);
+                    records[1]["fields"]["isHidden"] = json!({"value": 1, "type": "INT64"});
+                    if cycle < 2 {
+                        match &invalid {
+                            None => {
+                                records[1]["fields"]
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .remove("assetDate");
+                            }
+                            Some(value) => {
+                                records[1]["fields"]["assetDate"] =
+                                    json!({"value": value, "type": "TIMESTAMP"});
+                            }
+                        }
+                    }
+                    if with_sibling {
+                        let mut sibling = records[1].clone();
+                        sibling["recordName"] = json!("valid-sibling");
+                        sibling["fields"]["assetDate"] =
+                            json!({"value": 1_700_000_000_000i64, "type": "TIMESTAMP"});
+                        records.push(sibling);
+                    }
+                    let passes = vec![AlbumPass {
+                        kind: PassKind::Unfiled,
+                        album: album_with_session(
+                            "PrimarySync",
+                            "",
+                            Box::new(LegacyPendingHydrationSession {
+                                lookup_records: Arc::new(vec![records[0].clone()]),
+                                hydration_records: Arc::new(records),
+                                hydration_error: None,
+                            }),
+                        ),
+                        exclude_ids: Arc::new(FxHashSet::default()),
+                    }];
+                    let mut config = test_config();
+                    config.directory = Arc::from(media.as_path());
+                    config.state_db = Some(db.clone());
+                    config.sync_mode = SyncMode::Full;
+                    config.recent = Some(300);
+                    config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+                        Utc.timestamp_opt(946_684_800, 0).unwrap(),
+                    ));
+                    let result = download_photos_with_sync(
+                        &Client::new(),
+                        &passes,
+                        Arc::new(config),
+                        DownloadControls::download_hidden(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                    let summary = db.get_summary().await.unwrap();
+                    assert_eq!(
+                        summary.pending,
+                        u64::from(!recovered),
+                        "invalid={invalid:?}, sibling={with_sibling}, cycle={cycle}"
+                    );
+                    assert_eq!(summary.policy_excluded, 0);
+                    assert_eq!(summary.source_deleted, 0);
+                    assert_eq!(summary.downloaded, u64::from(recovered));
+                    assert_eq!(result.stats.identity_incomplete, !recovered);
+                    assert_eq!(
+                        result.stats.downloaded,
+                        usize::from(cycle == 2 && recovered)
+                    );
+                    assert_eq!(
+                        db.get_legacy_master_state_owners().await.unwrap().len(),
+                        usize::from(recovered)
+                    );
+                    if recovered {
+                        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+                        assert_eq!(
+                            std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+                            body
+                        );
+                        assert_eq!(rows[0].created_at, record.created_at);
+                    } else {
+                        let rows = db.get_pending().await.unwrap();
+                        assert_eq!(rows[0].created_at, record.created_at);
+                        assert_eq!(rows[0].added_at, record.added_at);
+                        assert_eq!(summary.awaiting_provider_verification, 1);
+                    }
+                    assert_eq!(
+                        std::fs::read(&sentinel).unwrap(),
+                        b"retained unrelated media"
+                    );
+                }
+            }
+        }
     }
 }
