@@ -36,6 +36,24 @@ impl BandwidthLimiter {
         self.inner.consume(n).await;
     }
 
+    /// Refund a reservation cancelled before its chunk can be written.
+    /// Upstream consumption reserves immediately and does not refund on drop.
+    pub(crate) async fn consume_or_cancel(
+        &self,
+        n: usize,
+        token: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        let consumed = self.inner.consume(n);
+        tokio::select! {
+            biased;
+            () = token.cancelled() => {
+                self.inner.unconsume(n);
+                false
+            }
+            () = consumed => true,
+        }
+    }
+
     pub(crate) fn bytes_per_sec(&self) -> u64 {
         #[allow(
             clippy::cast_possible_truncation,
@@ -96,5 +114,53 @@ mod tests {
     fn bytes_per_sec_reports_configured_limit() {
         let limiter = BandwidthLimiter::new(500_000);
         assert_eq!(limiter.bytes_per_sec(), 500_000);
+    }
+    #[tokio::test]
+    async fn cancellation_refunds_only_its_reservation_and_preserves_other_waiters() {
+        let limiter = BandwidthLimiter::new(1000);
+        let keep_token = tokio_util::sync::CancellationToken::new();
+        let cancelled_token = tokio_util::sync::CancellationToken::new();
+        let kept = limiter.consume_or_cancel(1000, &keep_token);
+        tokio::pin!(kept);
+        assert!(futures_util::poll!(&mut kept).is_pending());
+        let cancelled = limiter.consume_or_cancel(100_000, &cancelled_token);
+        tokio::pin!(cancelled);
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        assert_eq!(limiter.inner.total_bytes_consumed(), 101_000);
+        cancelled_token.cancel();
+        assert!(!cancelled.await);
+        assert_eq!(limiter.inner.total_bytes_consumed(), 1000);
+        // Refunding the cancelled reservation must not release another waiter early.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut kept)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), kept)
+                .await
+                .unwrap()
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                limiter.consume_or_cancel(1, &keep_token)
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(limiter.inner.total_bytes_consumed(), 1001);
+        keep_token.cancel();
+        assert_eq!(
+            limiter.inner.total_bytes_consumed(),
+            1001,
+            "cancellation after acquisition must not refund committed budget"
+        );
+        assert!(!limiter.consume_or_cancel(10, &keep_token).await);
+        assert_eq!(
+            limiter.inner.total_bytes_consumed(),
+            1001,
+            "already cancelled reservations refund exactly once"
+        );
     }
 }
