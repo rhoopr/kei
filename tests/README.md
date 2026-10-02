@@ -214,6 +214,48 @@ changing code. Promote any demonstrated product defect to its own deterministic
 regression. These tests do not exercise arbitrary library shapes, real-account
 state, abrupt process death, or power-loss durability.
 
+### Mixed library provider response equivalence
+
+`mixed_library_provider_shapes` composes long-lived synthetic families in two
+zones with reused raw IDs, distinct dates and checksums, independent current
+children, unattributed legacy files, and numbered Live Photo publications in
+two zone-local albums. Two fixed histories each run six production cycles through
+`run_cycle`, reopening real SQLite after every cycle. One withholds the final
+inventory while another zone progresses; the other changes still-only selection
+to both renditions and changes album selection and order during identity debt.
+Both retain complete-evidence recovery and two quiet cycles.
+
+Each history runs through baseline responses, independent-family reordering and
+alternate page cuts, then those same cuts with exact duplicate observations and
+an empty continuation page. These are equivalent snapshots, not reordered causal
+updates or tombstones. Normalized state comparisons include identity, ownership,
+publication receipts, membership, retry and deletion state, and active and staged
+zone checkpoints. Independent oracles check legacy bytes, existing numbered paths,
+new-child ownership and subsequent stability, request bounds, and quiet hydration,
+download, metadata-repair and file counts. New collision suffix spelling is not
+part of response equivalence. Mock-server bind failures fail the test.
+
+The cap is 36 production cycles per feature configuration. Replay JSON selects
+one complete six-cycle history and encoding; a non-baseline encoding also runs its
+baseline, for at most 12 cycles. It preserves prerequisites and recovery/quiet
+tails; no fault-deleting reducer is applied to these fixed histories:
+
+```sh
+KEI_MIXED_REPLAY='{"history":"SelectionChange","encoding":"DuplicateEmpty"}' \
+  cargo test --all-features --lib mixed_library_provider_shapes -- --nocapture
+```
+
+`mixed_numbered_album_mode_transition_repro` reduces the discovered receipt-reuse
+bug to two production cycles, one zone, two album publications, and no legacy or
+identity debt. `mixed_legacy_reservation_blocks_preparation_repro` reduces the
+second bug to one zone and one reconciliation call: missing sibling evidence
+must not create a master reservation, claim an owner, or disqualify later
+preservation. The full history proves subsequent recovery and quiet cycles.
+The existing pagination, tombstone, hidden-sibling, configuration
+reactivation, single-survivor, multi-album and restarted Live Photo proofs remain
+separate lower-level coverage. This small composition matrix does not qualify
+whole-library inventory memory or request cost at production library scale.
+
 ## State-transition proof
 
 Changes to durable configuration, filesystem paths, media publication,
