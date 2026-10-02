@@ -223,7 +223,10 @@ two zone-local albums. Two fixed histories each run six production cycles throug
 `run_cycle`, reopening real SQLite after every cycle. One withholds the final
 inventory while another zone progresses; the other changes still-only selection
 to both renditions and changes album selection and order during identity debt.
-Both retain complete-evidence recovery and two quiet cycles.
+Both retain complete-evidence recovery and two quiet cycles. The recovery
+cycle makes any synthetic discovery retry eligible by changing only its due
+timestamp; it retains the retry signature, identity debt and all receipts.
+This models elapsed scheduling time without sleeping or bypassing proof gates.
 
 Each history runs through baseline responses, independent-family reordering and
 alternate page cuts, then those same cuts with exact duplicate observations and

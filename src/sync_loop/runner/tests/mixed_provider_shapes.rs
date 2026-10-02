@@ -456,6 +456,25 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
     let mut child_paths = BTreeMap::new();
     for cycle in 0..CYCLES {
         eprintln!("{replay:?} cycle={cycle}/{CYCLES}");
+        if cycle == 2 {
+            // Model the scheduled recovery becoming eligible without waiting
+            // an hour. Only the synthetic discovery retry timestamp changes;
+            // the evidence signature, identity debt and receipts stay intact.
+            // This key is absent before the inventory-budget fix (#881).
+            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            let key = format!("legacy_preservation_inventory_retry:{}", ZONES[0]);
+            if let Some(encoded) = db.get_metadata(&key).await.unwrap()
+                && !encoded.is_empty()
+            {
+                let mut retry: Value = serde_json::from_str(&encoded).unwrap();
+                assert_eq!(retry["version"], 1, "known discovery retry fixture");
+                assert!(retry["next_attempt_at"].as_i64().unwrap() > 0);
+                retry["next_attempt_at"] = json!(0);
+                db.set_metadata(&key, &serde_json::to_string(&retry).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
         let result = {
             let db: Arc<dyn download::DownloadStore> =
                 Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
