@@ -98,7 +98,9 @@ pub struct Location {
 /// Decode `locationEnc` or `locationV2Enc` fields.
 ///
 /// Both contain a binary plist dict with `lat: f64`, `lon: f64`, `alt: f64`
-/// keys. Returns `None` if decoding fails or lat/lon are absent.
+/// keys. Returns `None` if decoding fails or the coordinate pair is absent,
+/// nonfinite, or outside latitude [-90, 90] and longitude [-180, 180].
+/// Nonfinite optional altitude is omitted without rejecting valid coordinates.
 pub fn decode_location(fields: &Value, key: &str) -> Option<Location> {
     let entry = fields.get(key)?;
     if entry.is_null() {
@@ -110,10 +112,21 @@ pub fn decode_location(fields: &Value, key: &str) -> Option<Location> {
     let latitude = dict.get("lat").and_then(plist_to_f64)?;
     let longitude = dict.get("lon").and_then(plist_to_f64)?;
     let altitude = dict.get("alt").and_then(plist_to_f64);
+    validated_location(latitude, longitude, altitude)
+}
+
+fn validated_location(latitude: f64, longitude: f64, altitude: Option<f64>) -> Option<Location> {
+    if !latitude.is_finite()
+        || !longitude.is_finite()
+        || !(-90.0..=90.0).contains(&latitude)
+        || !(-180.0..=180.0).contains(&longitude)
+    {
+        return None;
+    }
     Some(Location {
         latitude,
         longitude,
-        altitude,
+        altitude: altitude.filter(|value| value.is_finite()),
     })
 }
 
@@ -131,6 +144,7 @@ fn plist_to_f64(value: &PlistValue) -> Option<f64> {
 
 /// Decode a location with automatic fallback: prefer `locationV2Enc`, then
 /// `locationEnc`, then the plain `locationLatitude`/`locationLongitude` pair.
+/// Selects the first valid coordinate pair, skipping malformed or invalid candidates.
 /// Altitude is only available from the plist-encoded variants.
 pub fn decode_location_with_fallback(fields: &Value) -> Option<Location> {
     if let Some(loc) = decode_location(fields, "locationV2Enc") {
@@ -141,11 +155,7 @@ pub fn decode_location_with_fallback(fields: &Value) -> Option<Location> {
     }
     let lat = fields.get("locationLatitude")?.get("value")?.as_f64()?;
     let lng = fields.get("locationLongitude")?.get("value")?.as_f64()?;
-    Some(Location {
-        latitude: lat,
-        longitude: lng,
-        altitude: None,
-    })
+    validated_location(lat, lng, None)
 }
 
 #[cfg(test)]
@@ -315,5 +325,163 @@ mod tests {
     #[test]
     fn decode_location_fallback_returns_none_when_all_missing() {
         assert_eq!(decode_location_with_fallback(&json!({})), None);
+    }
+
+    fn tactical_location_entry(latitude: f64, longitude: f64, altitude: f64) -> Value {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("lat".into(), PlistValue::Real(latitude));
+        dict.insert("lon".into(), PlistValue::Real(longitude));
+        dict.insert("alt".into(), PlistValue::Real(altitude));
+        json!({"value": b64(&bplist_from(PlistValue::Dictionary(dict))), "type": "ENCRYPTED_BYTES"})
+    }
+
+    #[test]
+    fn tactical_gps_invalid_coordinates_do_not_enter_extracted_metadata() {
+        let mut accepted = Vec::new();
+        for (latitude, longitude) in [
+            (91.0, 2.0),
+            (-91.0, 2.0),
+            (1.0, 181.0),
+            (1.0, -181.0),
+            (f64::NAN, 2.0),
+            (f64::INFINITY, 2.0),
+            (f64::NEG_INFINITY, 2.0),
+            (1.0, f64::NAN),
+            (1.0, f64::INFINITY),
+            (1.0, f64::NEG_INFINITY),
+        ] {
+            for key in ["locationV2Enc", "locationEnc"] {
+                let fields = json!({key: tactical_location_entry(latitude, longitude, 3.0)});
+                let metadata = super::super::metadata::extract(&json!({}), &fields);
+                if metadata.latitude.is_some() || metadata.longitude.is_some() {
+                    accepted.push(format!("{key}: {latitude:?}, {longitude:?}"));
+                }
+            }
+            // JSON cannot represent nonfinite numbers; test only representable plain fields.
+            if latitude.is_finite() && longitude.is_finite() {
+                let fields = json!({"locationLatitude": {"value": latitude}, "locationLongitude": {"value": longitude}});
+                let metadata = super::super::metadata::extract(&json!({}), &fields);
+                if metadata.latitude.is_some() || metadata.longitude.is_some() {
+                    accepted.push(format!("plain: {latitude:?}, {longitude:?}"));
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "invalid coordinates reached canonical metadata: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn tactical_gps_valid_boundaries_remain_valid() {
+        for (latitude, longitude) in [(0.0, 0.0), (90.0, 180.0), (-90.0, -180.0)] {
+            for fields in [
+                json!({"locationV2Enc": tactical_location_entry(latitude, longitude, 0.0)}),
+                json!({"locationEnc": tactical_location_entry(latitude, longitude, 0.0)}),
+                json!({"locationLatitude": {"value": latitude}, "locationLongitude": {"value": longitude}}),
+            ] {
+                let metadata = super::super::metadata::extract(&json!({}), &fields);
+                assert_eq!(metadata.latitude, Some(latitude));
+                assert_eq!(metadata.longitude, Some(longitude));
+            }
+        }
+    }
+
+    #[test]
+    fn tactical_gps_invalid_v2_does_not_override_valid_fallback() {
+        let fields = json!({
+            "locationV2Enc": tactical_location_entry(91.0, 2.0, 3.0),
+            "locationEnc": tactical_location_entry(10.0, 20.0, 30.0),
+            "locationLatitude": {"value": 40.0},
+            "locationLongitude": {"value": 50.0},
+        });
+        let metadata = super::super::metadata::extract(&json!({}), &fields);
+        // Invalid V2 must fall through to the first valid candidate.
+        assert_eq!(
+            (metadata.latitude, metadata.longitude, metadata.altitude),
+            (Some(10.0), Some(20.0), Some(30.0))
+        );
+    }
+
+    #[test]
+    fn tactical_gps_nonfinite_altitude_does_not_enter_extracted_metadata() {
+        for altitude in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for key in ["locationV2Enc", "locationEnc"] {
+                let fields = json!({
+                    key: tactical_location_entry(1.0, 2.0, altitude),
+                    "locationLatitude": {"value": 40.0},
+                    "locationLongitude": {"value": 50.0},
+                });
+                let metadata = super::super::metadata::extract(&json!({}), &fields);
+                assert_eq!(metadata.latitude, Some(1.0));
+                assert_eq!(metadata.longitude, Some(2.0));
+                assert_eq!(metadata.altitude, None);
+            }
+        }
+    }
+
+    #[test]
+    fn gps_extraction_selects_first_valid_coordinate_pair() {
+        let malformed = json!({"value": "!!not-base64!!", "type": "ENCRYPTED_BYTES"});
+        for (v2, v1, expected) in [
+            (
+                tactical_location_entry(1.0, 2.0, -3.0),
+                tactical_location_entry(10.0, 20.0, 30.0),
+                (Some(1.0), Some(2.0), Some(-3.0)),
+            ),
+            (
+                tactical_location_entry(1.0, 2.0, f64::NAN),
+                tactical_location_entry(10.0, 20.0, 30.0),
+                (Some(1.0), Some(2.0), None),
+            ),
+            (
+                tactical_location_entry(1.0, 181.0, 3.0),
+                tactical_location_entry(-91.0, 20.0, 30.0),
+                (Some(40.0), Some(50.0), None),
+            ),
+            (
+                malformed.clone(),
+                tactical_location_entry(10.0, 20.0, 30.0),
+                (Some(10.0), Some(20.0), Some(30.0)),
+            ),
+            (malformed.clone(), malformed, (Some(40.0), Some(50.0), None)),
+            (
+                Value::Null,
+                tactical_location_entry(10.0, f64::NAN, 30.0),
+                (Some(40.0), Some(50.0), None),
+            ),
+        ] {
+            let fields = json!({
+                "locationV2Enc": v2,
+                "locationEnc": v1,
+                "locationLatitude": {"value": 40.0},
+                "locationLongitude": {"value": 50.0},
+            });
+            let metadata = super::super::metadata::extract(&json!({}), &fields);
+            assert_eq!(
+                (metadata.latitude, metadata.longitude, metadata.altitude),
+                expected,
+                "fields: {fields}"
+            );
+        }
+    }
+
+    #[test]
+    fn gps_extraction_omits_location_when_no_valid_pair_exists() {
+        for plain in [
+            json!({"locationLatitude": {"value": 91.0}, "locationLongitude": {"value": 50.0}}),
+            json!({"locationLatitude": {"value": 40.0}}),
+            json!({"locationLongitude": {"value": 50.0}}),
+            json!({"locationLatitude": {"value": "40"}, "locationLongitude": {"value": 50.0}}),
+        ] {
+            let mut fields = plain;
+            fields["locationV2Enc"] = tactical_location_entry(f64::INFINITY, 2.0, 3.0);
+            fields["locationEnc"] = tactical_location_entry(10.0, -181.0, 30.0);
+            let metadata = super::super::metadata::extract(&json!({}), &fields);
+            assert_eq!(
+                (metadata.latitude, metadata.longitude, metadata.altitude),
+                (None, None, None)
+            );
+        }
     }
 }

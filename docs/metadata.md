@@ -93,6 +93,16 @@ Untouched stale sidecars have no automatic output-revision sweep; that remains
 [#799](https://github.com/rhoopr/kei/issues/799). Path reconciliation copies an
 existing valid packet rather than regenerating it.
 
+### GPS coordinates
+
+Provider GPS capture uses the first valid coordinate pair from `locationV2Enc`,
+`locationEnc`, then plain latitude/longitude fields. Latitude must be finite and
+within [-90, 90]; longitude must be finite and within [-180, 180]. Zero and both
+endpoints remain valid. Invalid candidates fall through to the next source.
+Nonfinite optional altitude is omitted while valid coordinates are retained.
+This validation applies when provider records are decoded; it does not scan or
+rewrite historical catalogue values or local media.
+
 ### GPS accuracy provenance
 
 Exporting native horizontal accuracy alongside provider coordinates requires
