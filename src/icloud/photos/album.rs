@@ -18,7 +18,7 @@ mod lookup;
 mod planning;
 
 mod preservation_proof;
-pub(crate) use preservation_proof::CompleteLegacyInventory;
+pub(crate) use preservation_proof::{CompleteLegacyInventory, legacy_inventory_diagnostic};
 #[cfg(test)]
 mod test_support;
 
