@@ -76,12 +76,18 @@ impl InventoryFailureKind {
     }
 }
 
-pub(crate) fn legacy_inventory_diagnostic(
+pub(crate) fn classify_legacy_inventory_error(
     error: &anyhow::Error,
 ) -> Option<LegacyInventoryDiagnostic> {
+    if let Some(failure) = error.downcast_ref::<LegacyInventoryFailure>() {
+        return Some(failure.diagnostic);
+    }
     error
-        .downcast_ref::<LegacyInventoryFailure>()
-        .map(|failure| failure.diagnostic)
+        .downcast_ref::<InventoryFailureKind>()
+        .map(|kind| LegacyInventoryDiagnostic {
+            reason: kind.as_str(),
+            ..LegacyInventoryDiagnostic::default()
+        })
 }
 
 // Counting serialization avoids allocating another copy of a potentially large
@@ -179,9 +185,8 @@ impl PhotoAlbum {
         self.scan_legacy_preservation_inventory(masters, cancel, budget, &mut progress)
             .await
             .map_err(|source: anyhow::Error| {
-                progress.reason = source
-                    .downcast_ref::<InventoryFailureKind>()
-                    .map_or("invalid_inventory_evidence", InventoryFailureKind::as_str);
+                progress.reason = classify_legacy_inventory_error(&source)
+                    .map_or("invalid_inventory_evidence", |diagnostic| diagnostic.reason);
                 LegacyInventoryFailure {
                     diagnostic: progress,
                     source,
@@ -676,7 +681,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let diagnostic = super::legacy_inventory_diagnostic(&error).unwrap();
+        let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
         assert_eq!(diagnostic.reason, "retained_byte_budget");
         assert_eq!(diagnostic.retained_bytes, exact.retained_bytes);
         assert_eq!(diagnostic.pages, 1);
@@ -709,7 +714,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let diagnostic = super::legacy_inventory_diagnostic(&error).unwrap();
+        let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
         assert_eq!(diagnostic.reason, "response_page_byte_budget");
         assert_eq!(diagnostic.transferred_bytes, bytes);
         assert_eq!(diagnostic.retained_bytes, 0);
@@ -783,7 +788,7 @@ mod tests {
             .legacy_preservation_inventory(&masters(), &CancellationToken::new(), BUDGET)
             .await
             .unwrap_err();
-        let diagnostic = super::legacy_inventory_diagnostic(&error).unwrap();
+        let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
         assert_eq!(diagnostic.reason, "provider_request_failed");
         let rendered = format!("{diagnostic:?} {error}");
         for private in ["private-record", "secret.invalid", "private-token"] {

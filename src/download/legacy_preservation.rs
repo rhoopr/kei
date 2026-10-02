@@ -108,7 +108,7 @@ fn inventory_retry_signature(
 }
 
 pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) {
-    if let Some(diagnostic) = crate::icloud::photos::legacy_inventory_diagnostic(error) {
+    if let Some(diagnostic) = crate::icloud::photos::classify_legacy_inventory_error(error) {
         tracing::warn!(
             stage,
             reason = diagnostic.reason,
