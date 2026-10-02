@@ -7,3 +7,5 @@ mod metadata;
 mod recovery_sequences;
 
 mod released_upgrade;
+
+mod mixed_provider_shapes;

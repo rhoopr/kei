@@ -125,6 +125,13 @@ pub(crate) async fn reconcile_catalog_paths(
     let mut requests = Vec::new();
     let mut seen_requests = FxHashSet::default();
     let mut master_by_state_id = FxHashMap::default();
+    let legacy_owners: FxHashSet<String> = db
+        .get_legacy_master_state_owners()
+        .await?
+        .into_iter()
+        .filter_map(|(library, master, _)| (library == config.library.as_ref()).then_some(master))
+        .collect();
+    let mut unattributed_masters = FxHashSet::default();
     for record in &records {
         let mapped_master = db
             .get_master_record_name_for_asset(&config.library, &record.id)
@@ -139,6 +146,12 @@ pub(crate) async fn reconcile_catalog_paths(
             db.get_asset_record_names_for_master(&config.library, &master)
                 .await?
         };
+        if mapped_master.is_none()
+            && asset_record_names.len() > 1
+            && !legacy_owners.contains(&master)
+        {
+            unattributed_masters.insert(record.id.to_string());
+        }
         master_by_state_id.insert(record.id.to_string(), master.clone());
         for asset_record_name in asset_record_names {
             let key = (
@@ -210,6 +223,7 @@ pub(crate) async fn reconcile_catalog_paths(
                 });
             }
         };
+    task_planner.add_downloaded_paths(db.get_downloaded_path_records().await?);
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
     let mut stats = SyncStats::default();
@@ -219,6 +233,13 @@ pub(crate) async fn reconcile_catalog_paths(
         }
         match resolution {
             RecordResolution::Present(asset) => {
+                // Targeted lookup can return one usable child while another
+                // sibling remains unresolved. It cannot attribute a legacy
+                // master or reserve its path; preservation needs that evidence
+                // untouched when a later complete inventory becomes available.
+                if unattributed_masters.contains(state_id.as_str()) {
+                    continue;
+                }
                 targets.retain(|target| target.asset_id.as_ref() != state_id.as_str());
                 let known_albums = albums_by_asset.get(state_id.as_str());
                 for (pass, pass_config) in passes.iter().zip(&pass_configs) {
@@ -280,6 +301,24 @@ pub(crate) async fn reconcile_catalog_paths(
                     }
                     for task in plan.tasks {
                         let target = PendingRetryTarget::from_task(&task);
+                        if let Some(path) = task_planner
+                            .verified_downloaded_path(&asset, pass_config, task.version_size)
+                            .await
+                        {
+                            // Receipts use absolute paths. Equivalent-root drift
+                            // still needs to finalize the catalogue's spelling.
+                            let spelling_changed = records_by_target
+                                .get(&target)
+                                .and_then(|record| record.local_path.as_deref())
+                                .is_some_and(|current| {
+                                    current != path
+                                        && crate::fs_util::confined_path_key(current).ok()
+                                            == crate::fs_util::confined_path_key(&path).ok()
+                                });
+                            if path.parent() == task.download_path.parent() && !spelling_changed {
+                                continue;
+                            }
+                        }
                         if let Some(record) = records_by_target.get(&target)
                             && record.checksum.as_ref() == task.checksum.as_ref()
                             && record.size_bytes == task.size
