@@ -413,6 +413,18 @@ the existing skip rules. New companions use a verified still filename. Existing
 companions with older numbered still stems remain usable after hash verification;
 Kei does not rename or delete them.
 
+Local path reconciliation retains an unowned legacy master with multiple
+historical children as unresolved work, even when targeted lookup returns one
+usable sibling. It does not reserve that master's path or relax preservation
+eligibility. Independently owned current children can still reconcile, and later
+complete inventory can prepare preservation and release the checkpoint hold.
+
+Local path reconciliation also loads these publication receipts. A verified
+copy in the selected pass satisfies that rendition even when the catalogue's
+current path belongs to another album. Reconciliation preserves a verified
+numbered still filename when planning its companion, so changing Live Photo
+selection or album order does not create another copy of an owned pair.
+
 Local path reconciliation opens source and destination leaf entries without
 following symlinks. It hashes the opened file and rechecks its identity before
 accepting a destination, including entries that appear during publication.
