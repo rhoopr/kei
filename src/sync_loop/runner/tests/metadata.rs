@@ -3533,6 +3533,7 @@ enum AmbiguousChildFault {
     PreserveIncompleteInventory,
     PreserveInventoryRecovery,
     PreserveFreshRetry,
+    PreserveSharedOriginal,
     PreserveCheckpointFailure,
     PreserveCompanion,
     PreservePaginatedHidden,
@@ -3677,6 +3678,7 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
             | AmbiguousChildFault::PreserveIncompleteInventory
             | AmbiguousChildFault::PreserveInventoryRecovery
             | AmbiguousChildFault::PreserveFreshRetry
+            | AmbiguousChildFault::PreserveSharedOriginal
             | AmbiguousChildFault::PreserveCheckpointFailure
             | AmbiguousChildFault::PreserveCompanion
             | AmbiguousChildFault::PreservePaginatedHidden
@@ -3749,6 +3751,10 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
             let legacy_xmp = destination.join("photo.jpg.xmp");
             std::fs::write(&legacy_path, bytes).unwrap();
             std::fs::write(&legacy_xmp, b"legacy sidecar: never adopt or replace").unwrap();
+            let external_alias = dir.path().join("importer-alias.jpg");
+            if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
+                std::fs::hard_link(&legacy_path, &external_alias).unwrap();
+            }
             let legacy_motion = destination.join("photo.MOV");
             let legacy_motion_xmp = destination.join("photo.MOV.xmp");
             if matches!(fault, AmbiguousChildFault::PreserveCompanion) {
@@ -3950,6 +3956,16 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     }
                     built
                 };
+                let warning_path = dir.path().join(format!("cycle-{cycle}.log"));
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_writer(std::sync::Mutex::new(
+                        std::fs::File::create(&warning_path).unwrap(),
+                    ))
+                    .finish();
+                use tracing::instrument::WithSubscriber as _;
                 let result = run_cycle(
                     &[&primary],
                     &config,
@@ -3960,8 +3976,26 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     &shared_session,
                     &cancel,
                 )
+                .with_subscriber(subscriber)
                 .await
                 .unwrap();
+                if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
+                    let log = std::fs::read_to_string(&warning_path).unwrap();
+                    let warning = log
+                        .lines()
+                        .find(|line| {
+                            line.contains("Legacy preservation candidates remain unresolved")
+                        })
+                        .expect("shared-link candidate warning");
+                    assert!(warning.contains("stage="));
+                    assert!(warning.contains("preparation"));
+                    assert!(warning.contains("invalid_original_files=1"));
+                    assert!(warning.contains("shared_file_links=1"));
+                    assert!(warning.contains("no_current_child=0"));
+                    assert!(warning.contains("stale_candidates=0"));
+                    assert!(!warning.contains("legacy-master"));
+                    assert!(!warning.contains("photo.jpg"));
+                }
                 let label = format!(
                     "fault={fault:?} children={children} sidecars={sidecars} cycle={cycle}"
                 );
@@ -3970,6 +4004,21 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     bytes,
                     "legacy bytes {label}"
                 );
+                if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
+                    assert_eq!(
+                        std::fs::read(&external_alias).unwrap(),
+                        bytes,
+                        "alias {label}"
+                    );
+                    assert!(
+                        result.stats.sync_token_blocked,
+                        "shared original hold {label}"
+                    );
+                    assert_eq!(
+                        result.stats.unattributed_legacy_assets, 0,
+                        "no preparation {label}"
+                    );
+                }
                 assert_eq!(
                     std::fs::read(&legacy_xmp).unwrap(),
                     b"legacy sidecar: never adopt or replace",
@@ -4026,7 +4075,11 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     && !(cycle < 2
                         && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
                     && children > 0
-                    && !matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory)
+                    && !matches!(
+                        fault,
+                        AmbiguousChildFault::PreserveIncompleteInventory
+                            | AmbiguousChildFault::PreserveSharedOriginal
+                    )
                     && !(cycle == 0
                         && matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure))
                     && !matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected)
@@ -4083,7 +4136,11 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     );
                 } else if preserving
                     && (children == 0
-                        || matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory)
+                        || matches!(
+                            fault,
+                            AmbiguousChildFault::PreserveIncompleteInventory
+                                | AmbiguousChildFault::PreserveSharedOriginal
+                        )
                         || (cycle < 2
                             && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
                         || (cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry)))
@@ -4119,9 +4176,12 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                         result.stats.interrupted || result.stats.state_write_failures > 0,
                         "fault exercised {label}"
                     );
-                } else if matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory)
-                    || (cycle < 2
-                        && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
+                } else if matches!(
+                    fault,
+                    AmbiguousChildFault::PreserveIncompleteInventory
+                        | AmbiguousChildFault::PreserveSharedOriginal
+                ) || (cycle < 2
+                    && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
                     || (cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry))
                 {
                     assert_eq!(result.stats.downloaded, 0, "incomplete inventory {label}");
@@ -4254,6 +4314,7 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                         fault,
                         AmbiguousChildFault::PreserveIncompleteInventory
                             | AmbiguousChildFault::PreserveInventoryRecovery
+                            | AmbiguousChildFault::PreserveSharedOriginal
                     )
                 {
                     assert!(
@@ -4477,6 +4538,15 @@ async fn run_cycle_single_survivor_first_failure_creates_retry_then_preserves_af
 async fn run_cycle_single_survivor_inventory_backoff_keeps_hold_then_config_change_recovers() {
     Box::pin(exercise_legacy_child_cycles(
         AmbiguousChildFault::PreserveInventoryRecovery,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_shared_original_keeps_hold() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveSharedOriginal,
         &[1],
     ))
     .await;
