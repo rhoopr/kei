@@ -2,6 +2,7 @@
 //! production recovery, and two quiet cycles. This proves process death only;
 //! it does not model storage caches or power loss.
 use std::collections::BTreeMap;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -89,6 +90,19 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     visit(root, root, &mut out);
     out
 }
+fn file_stamps(
+    root: &Path,
+    files: &BTreeMap<PathBuf, Vec<u8>>,
+) -> BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
+    files
+        .keys()
+        .map(|path| {
+            let metadata = std::fs::metadata(root.join(path)).unwrap();
+            (path.clone(), (metadata.ino(), metadata.modified().unwrap()))
+        })
+        .collect()
+}
+
 fn durable(root: &Path) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
     ["SELECT library,id,version_size,status,local_path,local_checksum,last_error,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum FROM assets ORDER BY 1,2,3",
      "SELECT library,id,version_size,local_path,provider_checksum,local_checksum,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum FROM asset_metadata_paths ORDER BY 1,2,3,4",
@@ -623,6 +637,7 @@ async fn process_death_recovery_matrix() {
             ),
             i64::from(interrupted)
         );
+        let stable_stamps = file_stamps(&root.path().join("media"), &stable_files);
         let stable_state = durable(root.path());
         let stable_requests = server.received_requests().await.unwrap().len();
         assert!(
@@ -635,6 +650,11 @@ async fn process_death_recovery_matrix() {
                 (0, 0)
             );
             assert_eq!(durable(root.path()), stable_state, "quiet durable state");
+            assert_eq!(
+                file_stamps(&root.path().join("media"), &stable_files),
+                stable_stamps,
+                "quiet file identity and modification time; no identical metadata rewrite"
+            );
             assert_eq!(
                 files(&root.path().join("media")),
                 stable_files,

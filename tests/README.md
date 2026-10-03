@@ -284,7 +284,9 @@ state, and the source checkpoint. A committed replacement can retain a recent
 prepared-file claim under the existing cleanup grace period. The fixture verifies
 those bytes, then ages only that exact claim and file; the next production cycle
 must retire them through normal cleanup. Two further cycles must perform no
-hydration, download or metadata repair and leave durable state and files stable.
+hydration, download or metadata repair and leave durable state, file bytes,
+identities and modification times stable. Identity/time checks also detect
+metadata rewrites that reproduce identical bytes.
 The matrix has at most 28 production cycles including prerequisites, six killed
 cycles, recovery, eligible cleanup and quiet tails. Warm execution initially took 4.7 seconds with all features and 4.5 seconds
 without default features; compilation is excluded.
