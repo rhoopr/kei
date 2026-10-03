@@ -95,7 +95,7 @@ fn durable(root: &Path) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
      "SELECT library,asset_record_name,master_record_name FROM asset_master_mappings ORDER BY 1,2",
      "SELECT library,asset_id FROM metadata_capture_retries ORDER BY 1,2",
      "SELECT path FROM owned_temp_files ORDER BY path",
-     "SELECT id,status,interrupted FROM sync_runs WHERE status!='completed' ORDER BY id",
+     "SELECT id,status,interrupted FROM sync_runs WHERE status!='complete' ORDER BY id",
      "SELECT key,value FROM metadata WHERE key LIKE 'sync_token:%' OR key LIKE 'pending_sync_token:%' OR key LIKE 'unresolved_asset_identity:%' ORDER BY key"]
         .iter().map(|sql| rows(root, sql)).collect()
 }
@@ -445,13 +445,16 @@ async fn process_death_recovery_matrix() {
             i64::from(repair || persisted == 1),
             "publication receipt boundary"
         );
-        let orphaned = u64::from(point != "checkpoint-persisted");
+        // The repair runs in the retry pass after enumeration has completed
+        // its tracked run. Initial-download finalization remains inside it.
+        let interrupted = matches!(point, "published" | "state-persisted");
+        let orphaned = u64::from(interrupted);
         assert_eq!(
             count(
                 root.path(),
                 "SELECT count(*) FROM sync_runs WHERE status='running'"
             ),
-            orphaned as i64,
+            i64::from(interrupted),
             "durable interrupted run"
         );
         {
@@ -611,7 +614,7 @@ async fn process_death_recovery_matrix() {
                 root.path(),
                 "SELECT count(*) FROM sync_runs WHERE status='interrupted' AND interrupted=1"
             ),
-            orphaned as i64
+            i64::from(interrupted)
         );
         let stable_state = durable(root.path());
         let stable_requests = server.received_requests().await.unwrap().len();
