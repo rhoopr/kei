@@ -1841,82 +1841,208 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn collecting_rewrite_failure_retains_marker_and_advances_durable_checkpoint() {
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use xmp_toolkit::{XmpMeta, xmp_ns};
+
     let dir = TempDir::new().expect("temp dir");
-    let media_path = dir.path().join("rewrite-retry.jpg");
-    tokio::fs::write(&media_path, b"existing media")
-        .await
-        .expect("seed media");
+    let database = dir.path().join("state.db");
+    let media = dir.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    let media_path = media.join("rewrite-retry.jpg");
+    let sidecar = media.join("rewrite-retry.jpg.xmp");
+    let original = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    std::fs::write(&media_path, original).unwrap();
+    let modified = std::fs::metadata(&media_path).unwrap().modified().unwrap();
+    let checksum = file::compute_sha256(&media_path).await.unwrap();
+    let provider_checksum =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(original));
+    let unrelated = media.join("unrelated.xmp");
+    std::fs::write(&unrelated, b"independent user metadata").unwrap();
     let mut metadata = crate::state::AssetMetadata {
         title: Some("fresh catalogue title".to_string()),
         ..crate::state::AssetMetadata::default()
     };
     metadata.refresh_hash();
     let record = TestAssetRecord::new("REWRITE_RETRY")
+        .created_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
         .filename("rewrite-retry.jpg")
-        .checksum("provider-checksum")
-        .size(14)
+        .checksum(&provider_checksum)
+        .size(original.len() as u64)
         .metadata(metadata)
         .build();
-    db.upsert_seen(&record).await.expect("seed state row");
-    db.mark_downloaded(
-        "PrimarySync",
-        "REWRITE_RETRY",
-        "original",
-        &media_path,
-        "local-checksum",
-        None,
-    )
-    .await
-    .expect("mark downloaded");
-    db.record_metadata_write_failure("PrimarySync", "REWRITE_RETRY", "original")
+    {
+        let db = SqliteStateDb::open(&database).await.unwrap();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "REWRITE_RETRY",
+            "original",
+            &media_path,
+            &checksum,
+            Some(&checksum),
+        )
         .await
-        .expect("queue rewrite");
-    db.fail_metadata_marker_clear_for_test();
-
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: changes_album(
-            "",
-            changes_zone_session(Arc::new(AtomicUsize::new(0)), Vec::new()),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.recent = Some(10);
-    config.metadata.xmp_sidecar = true;
-    config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-
-    let result = download_photos_incremental(
-        &Client::new(),
-        std::slice::from_ref(&pass),
-        &Arc::new(config),
-        "zone-token-prev",
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("rewrite failure should remain a durable partial result");
-
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
-    assert_eq!(result.stats.downloaded, 0);
-    assert_eq!(result.stats.exif_failures, 1);
-    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-    assert!(media_path.with_file_name("rewrite-retry.jpg.xmp").exists());
-    let pending = db
-        .get_pending_metadata_rewrites(10)
-        .await
-        .expect("read rewrite queue");
-    assert_eq!(pending.len(), 1);
-    assert_eq!(
-        pending[0].metadata.title.as_deref(),
-        Some("fresh catalogue title"),
-        "the retained marker must reference the durable fresh catalogue state"
-    );
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "REWRITE_RETRY", "original")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "zone-token-prev")
+            .await
+            .unwrap();
+    }
+    let mut recovered_sidecar = None;
+    for cycle in 0..3 {
+        {
+            let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+            if cycle == 0 {
+                db.fail_metadata_marker_clear_for_test();
+            }
+            let pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: changes_album(
+                    "",
+                    changes_zone_session(Arc::new(AtomicUsize::new(0)), Vec::new()),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let mut config = test_config();
+            config.directory = Arc::from(media.clone());
+            config.recent = Some(10);
+            config.metadata.xmp_sidecar = true;
+            config.state_db = Some(db.clone());
+            let result = download_photos_incremental(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                &Arc::new(config),
+                "zone-token-prev",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            if cycle == 0 {
+                assert!(matches!(
+                    result.outcome,
+                    DownloadOutcome::PartialFailure { failed_count: 1 }
+                ));
+            } else {
+                assert!(matches!(result.outcome, DownloadOutcome::Success));
+            }
+            assert_eq!(result.stats.downloaded, 0, "cycle {cycle}");
+            assert_eq!(result.stats.exif_failures, usize::from(cycle == 0));
+            assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        }
+        // Release production handles, including the temporary failure trigger,
+        // before checking durable catalogue and publication evidence.
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        let owned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM assets \
+             WHERE library='PrimarySync' AND id='REWRITE_RETRY' AND version_size='original' \
+               AND status='downloaded' AND local_path=?1 AND checksum=?2 AND download_checksum=?3 \
+               AND title='fresh catalogue title' AND created_at=?4 AND metadata_hash=?5 \
+               AND capture_repair_metadata_hash IS NULL AND capture_repair_output_checksum IS NULL \
+               AND capture_repair_output_size IS NULL",
+                rusqlite::params![
+                    media_path.to_str().unwrap(),
+                    provider_checksum,
+                    checksum,
+                    record.created_at.timestamp(),
+                    record.metadata.metadata_hash
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owned, 1, "cycle {cycle}");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM assets", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let debt: Option<i64> = conn
+            .query_row("SELECT metadata_write_failed_at FROM assets", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(debt.is_some(), cycle == 0, "cycle {cycle}");
+        // Ordinary finalization failure clears an unconfirmed local checksum.
+        // Sidecar-only recovery must not falsely vouch for the media bytes.
+        assert_eq!(
+            conn.query_row("SELECT local_checksum FROM assets", [], |row| row
+                .get::<_, Option<String>>(0))
+                .unwrap(),
+            None
+        );
+        let publication: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_metadata_paths \
+             WHERE library='PrimarySync' AND id='REWRITE_RETRY' AND version_size='original' \
+               AND local_path=?1 AND provider_checksum=?2 AND download_checksum=?3 \
+               AND local_checksum IS NULL AND (metadata_write_failed_at IS NOT NULL)=?4 \
+               AND capture_repair_metadata_hash IS NULL AND capture_repair_output_checksum IS NULL \
+               AND capture_repair_output_size IS NULL",
+                rusqlite::params![
+                    media_path.to_str().unwrap(),
+                    provider_checksum,
+                    checksum,
+                    i64::from(cycle == 0)
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(publication, 1, "cycle {cycle}");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM asset_metadata_paths", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            1
+        );
+        // This owner returns a checkpoint candidate; the cycle owner commits it.
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "zone-token-prev"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&media_path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&media_path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(file::compute_sha256(&media_path).await.unwrap(), checksum);
+        assert_eq!(
+            std::fs::read(&unrelated).unwrap(),
+            b"independent user metadata"
+        );
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        let parsed: XmpMeta = std::str::from_utf8(&sidecar_bytes)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            parsed
+                .localized_text(xmp_ns::DC, "title", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "fresh catalogue title"
+        );
+        let sidecar_modified = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+        if cycle == 1 {
+            recovered_sidecar = Some((sidecar_bytes, sidecar_modified));
+        } else if cycle == 2 {
+            assert_eq!(Some((sidecar_bytes, sidecar_modified)), recovered_sidecar);
+        }
+        assert_eq!(std::fs::read_dir(&media).unwrap().count(), 3);
+    }
 }
 
 #[tokio::test]
