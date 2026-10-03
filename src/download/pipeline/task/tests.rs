@@ -572,6 +572,125 @@ async fn temporary_ownership_retires_after_publish_and_interruption() {
     );
 }
 
+#[tokio::test]
+async fn truncated_task_retires_ownership_after_settled_prefix_and_resumes() {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let exercise = async {
+        let body = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serve = tokio::spawn(async move {
+            for resumed in [false, true] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(
+                        request.len() < 4096,
+                        "fixture request headers exceeded bound"
+                    );
+                    let mut byte = [0];
+                    assert_eq!(socket.read(&mut byte).await.unwrap(), 1);
+                    request.extend_from_slice(&byte);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("get /settled.jpg http/1.1\r\n"));
+                assert_eq!(request.contains("\r\nrange: bytes=4-\r\n"), resumed);
+                let headers = if resumed {
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 4-7/8\r\nContent-Type: image/jpeg\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nContent-Type: image/jpeg\r\nConnection: close\r\n\r\n"
+                };
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket
+                    .write_all(if resumed { &body[4..] } else { &body[..4] })
+                    .await
+                    .unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.state_db = Some(db.clone());
+        config.retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let config = Arc::new(config);
+        let checksum = base64::engine::general_purpose::STANDARD.encode([0x74; 32]);
+        let asset = TestPhotoAsset::new("SETTLED")
+            .filename("settled.jpg")
+            .orig_size(body.len() as u64)
+            .orig_url(&format!("http://{address}/settled.jpg"))
+            .orig_checksum(&checksum)
+            .build();
+        let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let task = &plan.tasks[0];
+        let final_path = task.download_path.clone();
+        let part = crate::download::file::temp_download_path(
+            &final_path,
+            &task.checksum,
+            &config.temp_suffix,
+        )
+        .unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        for cycle in 0..3 {
+            let result = stream_and_download_from_stream(
+                &client,
+                stream::iter(vec![Ok(asset.clone())]),
+                &config,
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            assert!(
+                reopened
+                    .get_owned_temp_files_before(i64::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a stopped or completed transfer must retire its temporary claim"
+            );
+            if cycle == 0 {
+                assert_eq!(result.downloaded, 0);
+                assert_eq!(result.failed.len(), 1);
+                assert!(!final_path.exists());
+                assert_eq!(fs::read(&part).unwrap(), body[..4]);
+                assert!(
+                    reopened
+                        .get_downloaded_page(0, 10)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(reopened.get_failed().await.unwrap().len(), 1);
+            } else {
+                assert_eq!(result.downloaded, usize::from(cycle == 1));
+                assert!(result.failed.is_empty());
+                assert_eq!(fs::read(&final_path).unwrap(), body);
+                assert!(!part.exists());
+                assert_eq!(reopened.get_downloaded_page(0, 10).await.unwrap().len(), 1);
+                assert!(reopened.get_failed().await.unwrap().is_empty());
+            }
+        }
+        serve.await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(10), exercise)
+        .await
+        .expect("offline truncation, resume and unchanged cycles must be bounded");
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn contract_xmp_gps_accuracy_requires_matching_location_download_and_reopen() {

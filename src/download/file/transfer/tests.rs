@@ -201,6 +201,165 @@ impl DownloadClient for StubDownloadClient {
     }
 }
 
+/// Hold the sole blocking worker after file setup, so Tokio's buffered
+/// write cannot reach the filesystem before the stream fails or is cancelled.
+struct BlockedWriteClient {
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    stream_exit: Arc<tokio::sync::Notify>,
+    cancel: Option<CancellationToken>,
+}
+
+#[async_trait::async_trait]
+impl DownloadClient for BlockedWriteClient {
+    async fn fetch(
+        &self,
+        _url: &str,
+        resume_from: Option<u64>,
+    ) -> Result<DownloadResponse, BoxError> {
+        use futures_util::StreamExt;
+        assert_eq!(resume_from, None);
+        let release = self.release.lock().unwrap().take().unwrap();
+        let first = futures_util::stream::once(async move {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = release.recv();
+            });
+            ready.await.unwrap();
+            Ok(Bytes::from_static(&[0xff, 0xd8, 0xff, 0xe0]))
+        });
+        let stream_exit = Arc::clone(&self.stream_exit);
+        let cancel = self.cancel.clone();
+        let last = futures_util::stream::once(async move {
+            stream_exit.notify_one();
+            if let Some(token) = cancel {
+                token.cancel();
+                futures_util::future::pending::<Result<Bytes, BoxError>>().await
+            } else {
+                Err(std::io::Error::other("synthetic transport EOF").into())
+            }
+        });
+        Ok(DownloadResponse {
+            status: 200,
+            content_length: Some(8),
+            content_range: None,
+            content_type: Some("image/jpeg".to_string()),
+            stream: Box::pin(first.chain(last)),
+        })
+    }
+}
+
+fn assert_failed_transfer_waits_for_pending_write(cancel: bool) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (release, receiver) = std::sync::mpsc::channel();
+        let token = CancellationToken::new();
+        let client = BlockedWriteClient {
+            release: std::sync::Mutex::new(Some(receiver)),
+            stream_exit: Arc::new(tokio::sync::Notify::new()),
+            cancel: cancel.then(|| token.clone()),
+        };
+        let (final_path, part, _dir) = setup_download_dir("pending-write", "jpg");
+        let download = attempt_download(
+            &client,
+            "http://stub/pending-write.jpg",
+            &final_path,
+            &part,
+            false,
+            Some(8),
+            None,
+            cancel.then_some(&token),
+        );
+        tokio::pin!(download);
+        let observation = async {
+            let controller = async {
+                tokio::select! {
+                    result = &mut download => Some(result),
+                    () = client.stream_exit.notified() => {
+                        tokio::time::timeout(std::time::Duration::from_millis(100), &mut download)
+                            .await
+                            .ok()
+                    }
+                }
+            };
+            // No assertion or panic may strand the blocked worker.
+            let observed =
+                tokio::time::timeout(std::time::Duration::from_secs(5), controller).await;
+            drop(release);
+            let (returned_before_write, result) = match observed {
+                Ok(Some(result)) => (true, result),
+                Ok(None) => (false, download.await),
+                Err(error) => panic!("fixture never reached stream exit: {error}"),
+            };
+            // Join queued filesystem work even for the unfixed negative control.
+            tokio::task::spawn_blocking(|| {}).await.unwrap();
+            assert!(
+                !returned_before_write,
+                "transfer returned before its pending filesystem write completed"
+            );
+            if cancel {
+                assert!(matches!(
+                    result,
+                    Err(DownloadError::Interrupted {
+                        bytes_written: 4,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(DownloadError::Http {
+                        bytes_written: 4,
+                        ..
+                    })
+                ));
+            }
+            assert!(!final_path.exists());
+            assert_eq!(std::fs::read(&part).unwrap(), [0xff, 0xd8, 0xff, 0xe0]);
+            // A subsequent request must resume the settled prefix, including
+            // after the cancelled token is replaced by a fresh invocation.
+            let resumed = StubDownloadClient::ok(&[0x00, 0x10, 0x4a, 0x46]).with_status(206);
+            assert_eq!(
+                attempt_download(
+                    &resumed,
+                    "http://stub/pending-write.jpg",
+                    &final_path,
+                    &part,
+                    false,
+                    Some(8),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+                8
+            );
+            assert_eq!(
+                std::fs::read(&final_path).unwrap(),
+                [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]
+            );
+            assert!(!part.exists());
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), observation)
+            .await
+            .expect("released write must settle within the fixture deadline");
+    });
+}
+
+#[test]
+fn transport_error_waits_for_pending_filesystem_write() {
+    assert_failed_transfer_waits_for_pending_write(false);
+}
+
+#[test]
+fn cancellation_waits_for_pending_filesystem_write() {
+    assert_failed_transfer_waits_for_pending_write(true);
+}
+
 /// Helper: set up a temp directory with download and part paths.
 fn setup_download_dir(name: &str, ext: &str) -> (PathBuf, PathBuf, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -1375,32 +1534,51 @@ mod wiremock_tests {
         assert_eq!(std::fs::read(&download_path).unwrap(), full_body);
     }
 
-    /// A Content-Length mismatch (server declares 1000 bytes
-    /// but transmits 800) MUST surface as a `ContentLengthMismatch`
-    /// error, the `.part` file must be removed, and NO file must
-    /// appear at the final path. This is the feared-most data-loss
-    /// case (silent corruption masquerading as success). The exact
-    /// negative — `final_path` does NOT exist — is what catches a
-    /// future refactor that fell through to the rename step.
+    /// A complete HTTP body shorter than the expected media must fail the
+    /// size check, remove its partial file, and never publish the final path.
     #[tokio::test]
     async fn truncated_response_does_not_promote_to_final_path() {
-        let server = crate::start_wiremock_or_skip!();
+        assert_short_http_response(false).await;
+    }
 
-        // Body is 4 bytes of valid JPEG SOI/JFIF signature; we tell
-        // the client Content-Length=8 so the post-stream check fires.
-        let truncated_body = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    /// An incomplete HTTP body is a retryable transport failure. Keep only
+    /// resumable partial bytes, never a final file, without waiting for timeout.
+    #[tokio::test]
+    async fn truncated_transport_preserves_partial_without_publication() {
+        assert_short_http_response(true).await;
+    }
 
-        Mock::given(method("GET"))
-            .and(path("/truncated.jpg"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(truncated_body.clone())
-                    // Override the auto-set content-length to claim 8.
-                    .insert_header("content-length", "8")
-                    .insert_header("content-type", "image/jpeg"),
+    async fn assert_short_http_response(declare_full_length: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Hyper/wiremock may keep a mismatched Content-Length response alive.
+        // Serve raw HTTP so EOF is deterministic in both debug and release.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = [0xFF, 0xD8, 0xFF, 0xE0];
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+                assert!(request.len() < 4096, "unexpectedly large fixture request");
+            }
+            assert!(request.starts_with(b"GET /truncated.jpg HTTP/1.1\r\n"));
+            let length = if declare_full_length {
+                "Content-Length: 8\r\n"
+            } else {
+                ""
+            };
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n{length}Connection: close\r\n\r\n"
             )
-            .mount(&server)
-            .await;
+            .into_bytes();
+            response.extend_from_slice(&body);
+            socket.write_all(&response).await.unwrap();
+            socket.shutdown().await.unwrap();
+            // Dropping the socket closes it, rather than relying on a client
+            // timeout or on a mock server's connection lifetime.
+        };
 
         let dir = TempDir::new().unwrap();
         let download_path = dir.path().join("truncated.jpg");
@@ -1409,14 +1587,14 @@ mod wiremock_tests {
             base_delay_secs: 0,
             max_delay_secs: 0,
         };
-        // Realistic SHA256 of the *full* 8-byte payload — irrelevant
-        // here because the size check fires first, but we use a
-        // realistic-looking value not "checksum123".
-        let result = download_file_with_mode(
-            &reqwest::Client::new(),
-            &format!("{}/truncated.jpg", server.uri()),
+        let checksum = "0000000000000000000000000000000000000000000000000000000000000000";
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://{address}/truncated.jpg");
+        let download = download_file_with_mode(
+            &client,
+            &url,
             &download_path,
-            "0000000000000000000000000000000000000000000000000000000000000000",
+            checksum,
             &config,
             ".kei-tmp",
             DownloadOpts {
@@ -1426,38 +1604,49 @@ mod wiremock_tests {
             },
             DownloadLimits::default(),
             crate::personality::Mode::Off,
-        )
-        .await;
-
-        // Expected error: server underdelivered relative to its
-        // declared Content-Length, OR relative to expected_size if
-        // wiremock chose to honor only one.
-        let err = result.expect_err("truncated response must fail");
-        assert!(
-            matches!(
-                err,
-                DownloadError::ContentLengthMismatch { .. } | DownloadError::Http { .. }
-            ),
-            "expected size-mismatch class error, got: {err:?}"
         );
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(download, serve)
+        })
+        .await
+        .expect("closed short response must finish within the fixture deadline");
 
-        // Critical invariants: no .part lingers, and no final file
-        // landed (the would-be silent-corruption signature).
+        let err = result.expect_err("short response must fail");
         assert!(
             !download_path.exists(),
             "final path must NOT exist on truncation; got file with size {:?}",
             std::fs::metadata(&download_path).ok().map(|m| m.len())
         );
-        // Walk the temp dir to confirm there's no orphan .part either.
-        let stragglers: Vec<_> = std::fs::read_dir(dir.path())
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .map(|entry| entry.unwrap().path())
             .collect();
-        assert!(
-            stragglers.is_empty(),
-            "no .part or other files must remain after truncated download; got {stragglers:?}"
-        );
+        if declare_full_length {
+            assert!(
+                matches!(
+                    err,
+                    DownloadError::Http {
+                        content_length: Some(8),
+                        bytes_written: 4,
+                        ..
+                    }
+                ),
+                "expected truncated transport after four bytes, got: {err:?}"
+            );
+            assert!(err.is_retryable(), "transport EOF must remain resumable");
+            let partial = temp_download_path(&download_path, checksum, ".kei-tmp").unwrap();
+            assert_eq!(entries, vec![partial.clone()]);
+            assert_eq!(std::fs::read(partial).unwrap(), body);
+        } else {
+            assert!(
+                matches!(err, DownloadError::ContentLengthMismatch { .. }),
+                "expected completed-body size mismatch, got: {err:?}"
+            );
+            assert!(
+                entries.is_empty(),
+                "no partial or other files may remain after size mismatch; got {entries:?}"
+            );
+        }
     }
 
     /// When the destination parent directory is removed

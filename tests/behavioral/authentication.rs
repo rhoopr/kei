@@ -3,6 +3,7 @@
 use super::{clean_cmd, sanitize_username, write_fake_two_factor_config};
 use crate::common;
 use predicates::prelude::{PredicateBooleanExt, predicate};
+#[cfg(debug_assertions)]
 use std::time::Duration;
 
 #[test]
@@ -57,6 +58,7 @@ fn password_set_headless_without_source_fails_before_prompt() {
         ));
 }
 
+#[cfg(debug_assertions)]
 fn assert_foreground_two_factor_failure(command: &str) {
     let dir = tempfile::tempdir().unwrap();
     let config_path = write_fake_two_factor_config(dir.path(), "test@example.com");
@@ -71,16 +73,19 @@ fn assert_foreground_two_factor_failure(command: &str) {
         .stderr(predicate::str::contains("kei login submit-code <CODE>"));
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn login_two_factor_required_exits_with_auth_code() {
     assert_foreground_two_factor_failure("login");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn one_shot_sync_two_factor_required_exits_with_auth_code() {
     assert_foreground_two_factor_failure("sync");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn service_two_factor_required_keeps_waiting_for_submitted_code() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,6 +129,39 @@ fn service_two_factor_required_keeps_waiting_for_submitted_code() {
         "service did not enter durable 2FA wait:\n{}",
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+/// Release must ignore the synthetic hook and follow real missing-credential
+/// handling, including service mode. Fresh state has no token or password, so
+/// these commands fail before any Apple authentication request.
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_two_factor_required_hook_is_ignored() {
+    for args in [&["login"][..], &["sync"][..], &["service", "run"][..]] {
+        let dir = tempfile::tempdir().unwrap();
+        let username = "test@example.com";
+        let config_path = write_fake_two_factor_config(dir.path(), username);
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join(format!("{}.session", sanitize_username(username))),
+            "{}\n",
+        )
+        .unwrap();
+
+        clean_cmd()
+            .env("KEI_DATA_DIR", &data_dir)
+            .env("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS", "1")
+            .args(args)
+            .args(["--config", config_path.to_str().unwrap()])
+            .assert()
+            .code(3)
+            .stderr(predicate::str::contains("No password was available"))
+            .stderr(predicate::str::contains("Offline 2FA-required test seam").not())
+            .stderr(predicate::str::contains("kei login get-code").not())
+            .stderr(predicate::str::contains("kei login submit-code <CODE>").not())
+            .stderr(predicate::str::contains("Waiting for 2FA code submission").not());
+    }
 }
 
 /// `password backend` against a fresh cookie dir prints the credential

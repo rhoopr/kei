@@ -788,7 +788,13 @@ fn startup_logging_precedence_reaches_sync_dispatch() {
             shows_start,
             "{flags:?}: {stderr}"
         );
-        assert!(stderr.contains("kei login get-code"), "{stderr}");
+        // The fake 2FA hook is deliberately absent from release builds.
+        let auth_error = if cfg!(debug_assertions) {
+            "kei login get-code"
+        } else {
+            "No password was available"
+        };
+        assert!(stderr.contains(auth_error), "{stderr}");
     }
 }
 
