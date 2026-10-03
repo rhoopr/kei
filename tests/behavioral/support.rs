@@ -458,12 +458,17 @@ pub(super) fn write_fake_two_factor_config(
 ) -> std::path::PathBuf {
     let download_dir = dir.join("photos");
     std::fs::create_dir_all(&download_dir).unwrap();
+    // An explicit empty file bypasses the global OS credential store.
+    // Release ignores the fake hook and must fail before Apple authentication.
+    let password_file = dir.join("empty-password");
+    std::fs::write(&password_file, "").unwrap();
     let config_path = dir.join("config.toml");
     std::fs::write(
         &config_path,
         format!(
-            "[auth]\nusername = {}\n\n[download]\ndirectory = {}\n",
+            "[auth]\nusername = {}\npassword_file = {}\n\n[download]\ndirectory = {}\n",
             common::toml_string(username),
+            common::toml_string(&password_file.to_string_lossy()),
             common::toml_string(&download_dir.to_string_lossy()),
         ),
     )
