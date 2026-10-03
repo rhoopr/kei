@@ -884,6 +884,10 @@ pub(super) fn merge_streaming_result(combined: &mut StreamingResult, result: Str
     combined.enumeration_errors += result.enumeration_errors;
     combined.assets_seen += result.assets_seen;
     combined.skip_summary += result.skip_summary;
+    combined.bytes_downloaded += result.bytes_downloaded;
+    combined.disk_bytes_written += result.disk_bytes_written;
+    combined.photos_downloaded += result.photos_downloaded;
+    combined.videos_downloaded += result.videos_downloaded;
     // AND-fold across passes so a single pass aborting (e.g.
     // producer-channel close, panic) leaves the marker set.
     combined.enumeration_complete = combined.enumeration_complete && result.enumeration_complete;
