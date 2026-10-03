@@ -107,6 +107,19 @@ fn inventory_retry_signature(
     Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(encoded)))
 }
 
+#[derive(Debug, thiserror::Error)]
+enum LegacyFileError {
+    #[error("Legacy preservation requires independent file objects")]
+    SharedFileLinks,
+}
+
+fn classify_legacy_file_error(error: &anyhow::Error) -> Option<&'static str> {
+    match error.downcast_ref::<LegacyFileError>() {
+        Some(LegacyFileError::SharedFileLinks) => Some("shared_file_links"),
+        None => None,
+    }
+}
+
 pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) {
     if let Some(diagnostic) = crate::icloud::photos::classify_legacy_inventory_error(error) {
         tracing::warn!(
@@ -117,6 +130,12 @@ pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) 
             transferred_bytes = diagnostic.transferred_bytes,
             retained_bytes = diagnostic.retained_bytes,
             "Legacy preservation inventory unavailable; retaining attribution checkpoint hold"
+        );
+    } else if let Some(reason) = classify_legacy_file_error(error) {
+        tracing::warn!(
+            stage,
+            reason,
+            "Legacy preservation files unavailable; retaining attribution checkpoint hold"
         );
     } else {
         // Provider errors and file/state errors can contain private identifiers,
@@ -214,6 +233,7 @@ impl LegacyCycle {
                     db.set_metadata(&retry_key, "").await?;
                     let mut no_current_child = 0usize;
                     let mut invalid_original_files = 0usize;
+                    let mut shared_file_links = 0usize;
                     let mut stale_candidates = 0usize;
                     for candidate in candidates {
                         if !inventory
@@ -238,7 +258,10 @@ impl LegacyCycle {
                                 .await
                                 {
                                     Ok(file) => files.push(file),
-                                    Err(_) => {
+                                    Err(error) => {
+                                        if classify_legacy_file_error(&error).is_some() {
+                                            shared_file_links += 1;
+                                        }
                                         valid = false;
                                         break;
                                     }
@@ -258,8 +281,10 @@ impl LegacyCycle {
                     }
                     if no_current_child + invalid_original_files + stale_candidates > 0 {
                         tracing::warn!(
+                            stage = "preparation",
                             no_current_child,
                             invalid_original_files,
+                            shared_file_links,
                             stale_candidates,
                             "Legacy preservation candidates remain unresolved; retaining attribution checkpoint hold"
                         );
@@ -450,8 +475,10 @@ async fn fingerprint(
         }
         let file = confined.open_optional_regular()?;
         if let Some(file) = &file {
+            let links = crate::fs_util::file_link_count(file)?;
+            anyhow::ensure!(links <= 1, LegacyFileError::SharedFileLinks);
             anyhow::ensure!(
-                crate::fs_util::file_link_count(file)? == 1,
+                links == 1,
                 "Legacy preservation requires independent file objects"
             );
         }
@@ -720,6 +747,58 @@ mod tests {
         );
         assert_eq!(std::fs::read(&temporary).unwrap(), b"pending");
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn preservation_shared_file_links_are_typed_and_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cancel = CancellationToken::new();
+        // The same helper guards originals and independently owned current outputs.
+        for name in [
+            "private-original.jpg",
+            "private-current-child.jpg",
+            "private-sidecar.xmp",
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, b"verified synthetic bytes").unwrap();
+            let evidence = fingerprint(root, &path, true, ".kei-tmp", &cancel)
+                .await
+                .unwrap();
+            let alias = root.join(format!("{name}.alias"));
+            std::fs::hard_link(&path, &alias).unwrap();
+            let error = verify_files(&[evidence], ".kei-tmp", &cancel)
+                .await
+                .unwrap_err()
+                .context("private-provider-id/private-path");
+            assert_eq!(
+                super::classify_legacy_file_error(&error),
+                Some("shared_file_links")
+            );
+            let log = root.join("warning.log");
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                super::log_preservation_hold("certification", &error);
+                super::log_preservation_hold("checkpoint", &error);
+            });
+            let output = std::fs::read_to_string(log).unwrap();
+            assert!(output.contains("stage=\"certification\""));
+            assert!(output.contains("stage=\"checkpoint\""));
+            assert_eq!(output.matches("reason=\"shared_file_links\"").count(), 2);
+            assert!(!output.contains("private"));
+            assert!(!output.contains(&root.display().to_string()));
+            assert_eq!(std::fs::read(&path).unwrap(), b"verified synthetic bytes");
+            assert_eq!(std::fs::read(&alias).unwrap(), b"verified synthetic bytes");
+        }
+        assert_eq!(
+            super::classify_legacy_file_error(&anyhow::anyhow!("shared_file_links")),
+            None
+        );
     }
 
     #[test]

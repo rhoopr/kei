@@ -919,7 +919,13 @@ current-child work completes.
 
 Original media and sidecars are fingerprinted through confined paths; links,
 pending temporary writes, replacement journals, shared paths and changed bytes
-reject qualification. Shared-root replacement recovery checks protected paths from
+reject qualification. Preparation warnings retain the aggregate
+`invalid_original_files` candidate count and expose `shared_file_links` as a subset,
+counting each candidate once at its first rejected media or sidecar. Typed shared-link
+errors also expose only the fixed reason `shared_file_links` at certification and
+checkpoint stages. Original and current-child files retain the same independent-object
+requirement; a hash recheck does not authorize shared inode writes.
+Shared-root replacement recovery checks protected paths from
 all libraries before opening a journal, including unselected libraries. Current child files and sidecar presence are also bound
 into the receipt. Original files are never moved, rewritten, adopted or deleted.
 Normal downloads, metadata repair, local path reconciliation, imports and source
