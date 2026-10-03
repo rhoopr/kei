@@ -100,6 +100,39 @@ fn durable(root: &Path) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
         .iter().map(|sql| rows(root, sql)).collect()
 }
 
+fn assert_owned_receipts(root: &Path) {
+    use rusqlite::types::Value as Sql;
+    let expected_receipt = vec![vec![
+        Sql::Text(target(root).to_str().unwrap().to_string()),
+        Sql::Text(hash(MEDIA)),
+        Sql::Text(checksum(MEDIA)),
+    ]];
+    assert_eq!(
+        rows(
+            root,
+            "SELECT local_path,local_checksum,checksum FROM assets WHERE library='PrimarySync'"
+        ),
+        expected_receipt,
+        "exact catalogue ownership and checksums"
+    );
+    assert_eq!(
+        rows(
+            root,
+            "SELECT local_path,local_checksum,provider_checksum FROM asset_metadata_paths WHERE library='PrimarySync'"
+        ),
+        expected_receipt,
+        "exact publication ownership and checksums"
+    );
+    assert_eq!(
+        count(
+            root,
+            "SELECT count(*) FROM assets WHERE library='PrimarySync' AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL)"
+        ),
+        0,
+        "repair markers drained"
+    );
+}
+
 #[derive(Clone, Debug)]
 struct Provider {
     records: Vec<Value>,
@@ -391,6 +424,9 @@ async fn process_death_recovery_matrix() {
             i64::from(matches!(point, "state-persisted" | "checkpoint-persisted")),
             "finalization boundary"
         );
+        if persisted == 1 {
+            assert_owned_receipts(root.path());
+        }
         let journal_files = files(&root.path().join("media"));
         let journals = journal_files
             .keys()
@@ -536,36 +572,7 @@ async fn process_death_recovery_matrix() {
             0,
             "eligible production cleanup retires claims"
         );
-        use rusqlite::types::Value as Sql;
-        let expected_receipt = vec![vec![
-            Sql::Text(target(root.path()).to_str().unwrap().to_string()),
-            Sql::Text(hash(MEDIA)),
-            Sql::Text(checksum(MEDIA)),
-        ]];
-        assert_eq!(
-            rows(
-                root.path(),
-                "SELECT local_path,local_checksum,checksum FROM assets WHERE library='PrimarySync'"
-            ),
-            expected_receipt,
-            "exact catalogue ownership and checksums"
-        );
-        assert_eq!(
-            rows(
-                root.path(),
-                "SELECT local_path,local_checksum,provider_checksum FROM asset_metadata_paths WHERE library='PrimarySync'"
-            ),
-            expected_receipt,
-            "exact publication ownership and checksums"
-        );
-        assert_eq!(
-            count(
-                root.path(),
-                "SELECT count(*) FROM assets WHERE library='PrimarySync' AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL)"
-            ),
-            0,
-            "repair markers drained"
-        );
+        assert_owned_receipts(root.path());
         let stable_files = files(&root.path().join("media"));
         assert_eq!(
             stable_files.len(),
