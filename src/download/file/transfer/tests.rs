@@ -201,6 +201,165 @@ impl DownloadClient for StubDownloadClient {
     }
 }
 
+/// Hold the sole blocking worker after file setup, so Tokio's buffered
+/// write cannot reach the filesystem before the stream fails or is cancelled.
+struct BlockedWriteClient {
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    stream_exit: Arc<tokio::sync::Notify>,
+    cancel: Option<CancellationToken>,
+}
+
+#[async_trait::async_trait]
+impl DownloadClient for BlockedWriteClient {
+    async fn fetch(
+        &self,
+        _url: &str,
+        resume_from: Option<u64>,
+    ) -> Result<DownloadResponse, BoxError> {
+        use futures_util::StreamExt;
+        assert_eq!(resume_from, None);
+        let release = self.release.lock().unwrap().take().unwrap();
+        let first = futures_util::stream::once(async move {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = release.recv();
+            });
+            ready.await.unwrap();
+            Ok(Bytes::from_static(&[0xff, 0xd8, 0xff, 0xe0]))
+        });
+        let stream_exit = Arc::clone(&self.stream_exit);
+        let cancel = self.cancel.clone();
+        let last = futures_util::stream::once(async move {
+            stream_exit.notify_one();
+            if let Some(token) = cancel {
+                token.cancel();
+                futures_util::future::pending::<Result<Bytes, BoxError>>().await
+            } else {
+                Err(std::io::Error::other("synthetic transport EOF").into())
+            }
+        });
+        Ok(DownloadResponse {
+            status: 200,
+            content_length: Some(8),
+            content_range: None,
+            content_type: Some("image/jpeg".to_string()),
+            stream: Box::pin(first.chain(last)),
+        })
+    }
+}
+
+fn assert_failed_transfer_waits_for_pending_write(cancel: bool) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (release, receiver) = std::sync::mpsc::channel();
+        let token = CancellationToken::new();
+        let client = BlockedWriteClient {
+            release: std::sync::Mutex::new(Some(receiver)),
+            stream_exit: Arc::new(tokio::sync::Notify::new()),
+            cancel: cancel.then(|| token.clone()),
+        };
+        let (final_path, part, _dir) = setup_download_dir("pending-write", "jpg");
+        let download = attempt_download(
+            &client,
+            "http://stub/pending-write.jpg",
+            &final_path,
+            &part,
+            false,
+            Some(8),
+            None,
+            cancel.then_some(&token),
+        );
+        tokio::pin!(download);
+        let observation = async {
+            let controller = async {
+                tokio::select! {
+                    result = &mut download => Some(result),
+                    () = client.stream_exit.notified() => {
+                        tokio::time::timeout(std::time::Duration::from_millis(100), &mut download)
+                            .await
+                            .ok()
+                    }
+                }
+            };
+            // No assertion or panic may strand the blocked worker.
+            let observed =
+                tokio::time::timeout(std::time::Duration::from_secs(5), controller).await;
+            drop(release);
+            let (returned_before_write, result) = match observed {
+                Ok(Some(result)) => (true, result),
+                Ok(None) => (false, download.await),
+                Err(error) => panic!("fixture never reached stream exit: {error}"),
+            };
+            // Join queued filesystem work even for the unfixed negative control.
+            tokio::task::spawn_blocking(|| {}).await.unwrap();
+            assert!(
+                !returned_before_write,
+                "transfer returned before its pending filesystem write completed"
+            );
+            if cancel {
+                assert!(matches!(
+                    result,
+                    Err(DownloadError::Interrupted {
+                        bytes_written: 4,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(DownloadError::Http {
+                        bytes_written: 4,
+                        ..
+                    })
+                ));
+            }
+            assert!(!final_path.exists());
+            assert_eq!(std::fs::read(&part).unwrap(), [0xff, 0xd8, 0xff, 0xe0]);
+            // A subsequent request must resume the settled prefix, including
+            // after the cancelled token is replaced by a fresh invocation.
+            let resumed = StubDownloadClient::ok(&[0x00, 0x10, 0x4a, 0x46]).with_status(206);
+            assert_eq!(
+                attempt_download(
+                    &resumed,
+                    "http://stub/pending-write.jpg",
+                    &final_path,
+                    &part,
+                    false,
+                    Some(8),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+                8
+            );
+            assert_eq!(
+                std::fs::read(&final_path).unwrap(),
+                [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]
+            );
+            assert!(!part.exists());
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), observation)
+            .await
+            .expect("released write must settle within the fixture deadline");
+    });
+}
+
+#[test]
+fn transport_error_waits_for_pending_filesystem_write() {
+    assert_failed_transfer_waits_for_pending_write(false);
+}
+
+#[test]
+fn cancellation_waits_for_pending_filesystem_write() {
+    assert_failed_transfer_waits_for_pending_write(true);
+}
+
 /// Helper: set up a temp directory with download and part paths.
 fn setup_download_dir(name: &str, ext: &str) -> (PathBuf, PathBuf, TempDir) {
     let dir = TempDir::new().unwrap();

@@ -703,6 +703,11 @@ restart the transfer; a second 416 terminates that attempt. Transfer retry
 pauses and bandwidth waits observe shutdown before another request or chunk
 write. A cancelled bandwidth reservation is refunded, and interruption reports
 the retained byte count without publishing or finalizing the file.
+Before returning a body-stream error or interruption, the transfer owner flushes
+pending filesystem writes. Retry offset reads and temporary-claim retirement
+therefore follow write completion. A flush failure is a disk error rather than
+a resumable transport error. Successful transfers also sync the data before
+validation and publication.
 
 Schema v19 records the exact temporary path before a state-backed download can
 write or resume it. Normal completion and graceful interruption retire that

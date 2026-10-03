@@ -518,11 +518,20 @@ async fn attempt_download_with_publication<C: DownloadClient>(
             file.write_all(&chunk).await?;
             bytes_written += chunk.len() as u64;
         }
-        file.flush().await?;
-        file.sync_data().await?;
         Ok(())
     }
     .await;
+    // Tokio buffers writes before its blocking filesystem work completes.
+    // Settle that work on errors and interruption too, before retry can read
+    // the retained length or the caller can retire temporary-file ownership.
+    // A disk failure takes precedence over a retryable transport error.
+    let stream_result = match file.flush().await {
+        Ok(()) => match stream_result {
+            Ok(()) => file.sync_data().await.map_err(DownloadError::from),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error.into()),
+    };
     drop(file);
     if let Err(e) = stream_result {
         if !e.is_retryable() && !e.is_interrupted() {
