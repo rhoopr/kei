@@ -43,6 +43,60 @@ const PROVIDER_DATA_FIELDS: &[&str] = &[
     "isKeyAsset",
     "assetSubtype",
     "assetSubtypeV2",
+    "adjustedMediaMetaDataStrType",
+    "adjustmentCompoundVersion",
+    "adjustmentCreatorCode",
+    "adjustmentSourceType",
+    "adjustmentTimestampEnc",
+    "codec",
+    "computeStateAdjustmentFingerprintEnc",
+    "computeStateLastUpdatedDateEnc",
+    "computeStateVersion",
+    "facesVersion",
+    "fullSizeJPEGSource",
+    "importDate",
+    "importedBy",
+    "importedByBundleIdentifierEnc",
+    "importedByDisplayNameEnc",
+    "lastViewedDateEnc",
+    "mediaGroupId",
+    "mediaMetaDataEnc",
+    "mediaMetaDataType",
+    "mostRecentAddedDate",
+    "originalChoice",
+    "originalCreationDate",
+    "otherAdjustmentsFingerprint",
+    "people",
+    "playCount",
+    "recordModificationDate",
+    "resComputeStateData",
+    "resOriginalFileSize",
+    "resOriginalVidComplFileSize",
+    "resVideoMediaMetaDataFileSize",
+    "resVideoMediaMetaDataFileType",
+    "resVideoMediaMetaDataFingerprint",
+    "resVideoMediaMetaDataHeight",
+    "resVideoMediaMetaDataRes",
+    "resVideoMediaMetaDataWidth",
+    "resVidHDRMedFileSize",
+    "resVidHDRMedFileType",
+    "resVidHDRMedFingerprint",
+    "resVidHDRMedHeight",
+    "resVidHDRMedRes",
+    "resVidHDRMedWidth",
+    "resVidLargeFileSize",
+    "resVidLargeFileType",
+    "resVidLargeFingerprint",
+    "resVidLargeHeight",
+    "resVidLargeRes",
+    "resVidLargeWidth",
+    "shareCount",
+    "sharedSyncSharingStateEnc",
+    "timeZoneNameEnc",
+    "trashReason",
+    "videoFrameRate",
+    "viewCount",
+    "viewPresentationTypeEnc",
 ];
 
 /// Extract `AssetMetadata` from an iCloud CPLMaster + CPLAsset record pair.
@@ -468,6 +522,7 @@ mod tests {
                 "recordChangeTag": {"value": "tag42"},
                 "containerId": {"value": "c1"},
                 "isKeyAsset": {"value": 1},
+                "playCount": {"value": 5},
             }),
         );
         let pd = m.provider_data.expect("provider_data should be populated");
@@ -475,6 +530,7 @@ mod tests {
         assert_eq!(parsed["recordChangeTag"], json!("tag42"));
         assert_eq!(parsed["containerId"], json!("c1"));
         assert_eq!(parsed["isKeyAsset"], json!(1));
+        assert_eq!(parsed["playCount"], json!(5));
     }
 
     #[test]
