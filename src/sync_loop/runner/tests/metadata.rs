@@ -3531,6 +3531,9 @@ enum AmbiguousChildFault {
     Preserve,
     PreserveConfigChange,
     PreserveIncompleteInventory,
+    PreserveInventoryRecovery,
+    PreserveFreshRetry,
+    PreserveSharedOriginal,
     PreserveCheckpointFailure,
     PreserveCompanion,
     PreservePaginatedHidden,
@@ -3562,6 +3565,7 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
         paginated: bool,
         omit_hidden: bool,
         incomplete_inventory: bool,
+        inventory_requests: Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait::async_trait]
     impl crate::icloud::photos::PhotosSession for ChildSession {
@@ -3572,6 +3576,10 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
             _: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
             let request: serde_json::Value = serde_json::from_str(&body)?;
+            if url.contains("/changes/zone?") && request["zones"][0]["syncToken"].is_null() {
+                self.inventory_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             if self.paginated && url.contains("/changes/zone?") {
                 let cursor = request["zones"][0]["syncToken"].as_str();
                 if cursor.is_none() || cursor == Some("family-page") {
@@ -3668,6 +3676,9 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
         AmbiguousChildFault::Preserve
             | AmbiguousChildFault::PreserveConfigChange
             | AmbiguousChildFault::PreserveIncompleteInventory
+            | AmbiguousChildFault::PreserveInventoryRecovery
+            | AmbiguousChildFault::PreserveFreshRetry
+            | AmbiguousChildFault::PreserveSharedOriginal
             | AmbiguousChildFault::PreserveCheckpointFailure
             | AmbiguousChildFault::PreserveCompanion
             | AmbiguousChildFault::PreservePaginatedHidden
@@ -3740,6 +3751,10 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
             let legacy_xmp = destination.join("photo.jpg.xmp");
             std::fs::write(&legacy_path, bytes).unwrap();
             std::fs::write(&legacy_xmp, b"legacy sidecar: never adopt or replace").unwrap();
+            let external_alias = dir.path().join("importer-alias.jpg");
+            if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
+                std::fs::hard_link(&legacy_path, &external_alias).unwrap();
+            }
             let legacy_motion = destination.join("photo.MOV");
             let legacy_motion_xmp = destination.join("photo.MOV.xmp");
             if matches!(fault, AmbiguousChildFault::PreserveCompanion) {
@@ -3836,12 +3851,14 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     .await
                     .unwrap()
                     .remove(0);
-                assert!(
-                    inner
-                        .defer_metadata_capture_ambiguity(&candidate, 1)
-                        .await
-                        .unwrap()
-                );
+                if !matches!(fault, AmbiguousChildFault::PreserveFreshRetry) {
+                    assert!(
+                        inner
+                            .defer_metadata_capture_ambiguity(&candidate, 1)
+                            .await
+                            .unwrap()
+                    );
+                }
             }
             if matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure) {
                 rusqlite::Connection::open(&database).unwrap().execute_batch(
@@ -3854,18 +3871,20 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                 "SELECT * FROM asset_metadata_capture_revisions WHERE asset_id='legacy-master'";
             let mapping_sql = "SELECT library,asset_record_name,master_record_name FROM asset_master_mappings ORDER BY asset_record_name";
             let receipt = rows(&database, receipt_sql);
-            let retry = rows(&database, retry_sql);
+            let mut retry = rows(&database, retry_sql);
             let revision = rows(&database, revision_sql);
             let mappings = rows(&database, mapping_sql);
             let config = make_run_cycle_config();
             let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
             let mut completed_requests = 0;
             let mut completed_outputs = std::collections::HashMap::new();
-            for cycle in 0..if matches!(fault, AmbiguousChildFault::PreserveConfigChange) {
-                4
-            } else {
-                3
-            } {
+            let inventory_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let relocating = matches!(
+                fault,
+                AmbiguousChildFault::PreserveConfigChange
+                    | AmbiguousChildFault::PreserveInventoryRecovery
+            );
+            for cycle in 0..if relocating { 4 } else { 3 } {
                 let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
                 let cancel = CancellationToken::new();
                 let db: Arc<dyn download::DownloadStore> = if cycle == 0
@@ -3902,7 +3921,9 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     incomplete_inventory: matches!(
                         fault,
                         AmbiguousChildFault::PreserveIncompleteInventory
-                    ),
+                    ) || (cycle == 0
+                        && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery)),
+                    inventory_requests: Arc::clone(&inventory_requests),
                 };
                 let mut primary = make_run_cycle_library_state_with_album(
                     "PrimarySync",
@@ -3927,7 +3948,7 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                 );
                 let builder = |mode, excluded, groups, library| {
                     let mut built = base_builder(mode, excluded, groups, library);
-                    if matches!(fault, AmbiguousChildFault::PreserveConfigChange) && cycle >= 2 {
+                    if relocating && cycle >= 2 {
                         let current = Arc::make_mut(&mut built);
                         current.folder_structure = "relocated".into();
                         current.folder_structure_albums = Arc::from("relocated");
@@ -3935,6 +3956,16 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     }
                     built
                 };
+                let warning_path = dir.path().join(format!("cycle-{cycle}.log"));
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_writer(std::sync::Mutex::new(
+                        std::fs::File::create(&warning_path).unwrap(),
+                    ))
+                    .finish();
+                use tracing::instrument::WithSubscriber as _;
                 let result = run_cycle(
                     &[&primary],
                     &config,
@@ -3945,8 +3976,26 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     &shared_session,
                     &cancel,
                 )
+                .with_subscriber(subscriber)
                 .await
                 .unwrap();
+                if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
+                    let log = std::fs::read_to_string(&warning_path).unwrap();
+                    let warning = log
+                        .lines()
+                        .find(|line| {
+                            line.contains("Legacy preservation candidates remain unresolved")
+                        })
+                        .expect("shared-link candidate warning");
+                    assert!(warning.contains("stage="));
+                    assert!(warning.contains("preparation"));
+                    assert!(warning.contains("invalid_original_files=1"));
+                    assert!(warning.contains("shared_file_links=1"));
+                    assert!(warning.contains("no_current_child=0"));
+                    assert!(warning.contains("stale_candidates=0"));
+                    assert!(!warning.contains("legacy-master"));
+                    assert!(!warning.contains("photo.jpg"));
+                }
                 let label = format!(
                     "fault={fault:?} children={children} sidecars={sidecars} cycle={cycle}"
                 );
@@ -3955,6 +4004,21 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     bytes,
                     "legacy bytes {label}"
                 );
+                if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
+                    assert_eq!(
+                        std::fs::read(&external_alias).unwrap(),
+                        bytes,
+                        "alias {label}"
+                    );
+                    assert!(
+                        result.stats.sync_token_blocked,
+                        "shared original hold {label}"
+                    );
+                    assert_eq!(
+                        result.stats.unattributed_legacy_assets, 0,
+                        "no preparation {label}"
+                    );
+                }
                 assert_eq!(
                     std::fs::read(&legacy_xmp).unwrap(),
                     b"legacy sidecar: never adopt or replace",
@@ -3983,6 +4047,14 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     );
                 }
                 assert_eq!(rows(&database, receipt_sql), receipt, "receipt {label}");
+                if cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry) {
+                    retry = rows(&database, retry_sql);
+                    assert_eq!(
+                        retry.len(),
+                        1,
+                        "first capture failure creates durable retry {label}"
+                    );
+                }
                 assert_eq!(rows(&database, retry_sql), retry, "retry {label}");
                 assert_eq!(rows(&database, revision_sql), revision, "revision {label}");
                 assert_eq!(
@@ -3999,8 +4071,15 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     "no guessed owner {label}"
                 );
                 let activated = preserving
+                    && !(cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry))
+                    && !(cycle < 2
+                        && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
                     && children > 0
-                    && !matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory)
+                    && !matches!(
+                        fault,
+                        AmbiguousChildFault::PreserveIncompleteInventory
+                            | AmbiguousChildFault::PreserveSharedOriginal
+                    )
                     && !(cycle == 0
                         && matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure))
                     && !matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected)
@@ -4041,10 +4120,7 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                         ),
                         "active generation {label}"
                     );
-                    if cycle >= 2
-                        && !(matches!(fault, AmbiguousChildFault::PreserveConfigChange)
-                            && cycle == 2)
-                    {
+                    if cycle >= 2 && !(relocating && cycle == 2) {
                         assert!(
                             result.stats.full_enumeration_reason.is_none(),
                             "unchanged cycle should remain incremental {label}"
@@ -4060,7 +4136,14 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     );
                 } else if preserving
                     && (children == 0
-                        || matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory))
+                        || matches!(
+                            fault,
+                            AmbiguousChildFault::PreserveIncompleteInventory
+                                | AmbiguousChildFault::PreserveSharedOriginal
+                        )
+                        || (cycle < 2
+                            && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
+                        || (cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry)))
                 {
                     assert!(
                         inner
@@ -4093,7 +4176,14 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                         result.stats.interrupted || result.stats.state_write_failures > 0,
                         "fault exercised {label}"
                     );
-                } else if matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory) {
+                } else if matches!(
+                    fault,
+                    AmbiguousChildFault::PreserveIncompleteInventory
+                        | AmbiguousChildFault::PreserveSharedOriginal
+                ) || (cycle < 2
+                    && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
+                    || (cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry))
+                {
                     assert_eq!(result.stats.downloaded, 0, "incomplete inventory {label}");
                     assert_eq!(inner.get_downloaded_page(0, 20).await.unwrap().len(), 1);
                     assert!(result.stats.sync_token_blocked, "incomplete hold {label}");
@@ -4158,8 +4248,7 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     if cycle == 1 {
                         completed_outputs = outputs;
                     } else if cycle >= 2 {
-                        if cycle == 2 && matches!(fault, AmbiguousChildFault::PreserveConfigChange)
-                        {
+                        if cycle == 2 && relocating {
                             for (path, bytes) in &completed_outputs {
                                 assert_eq!(
                                     &std::fs::read(path).unwrap(),
@@ -4189,8 +4278,44 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                         .execute_batch("DROP TRIGGER fail_single_survivor_proof;")
                         .unwrap();
                 }
+                if matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory) {
+                    assert_eq!(
+                        inventory_requests.load(std::sync::atomic::Ordering::SeqCst),
+                        1,
+                        "reopened failed discovery is deferred with the hold intact {label}"
+                    );
+                } else if matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery) {
+                    assert_eq!(
+                        inventory_requests.load(std::sync::atomic::Ordering::SeqCst),
+                        if cycle < 2 { 1 } else { 3 },
+                        "changed configuration permits fresh preparation and certification {label}"
+                    );
+                }
+                if cycle == 0
+                    && matches!(
+                        fault,
+                        AmbiguousChildFault::PreserveIncompleteInventory
+                            | AmbiguousChildFault::PreserveInventoryRecovery
+                    )
+                {
+                    // Normal replay can refresh relation timestamps without a
+                    // changed identity; restart must retain the discovery delay.
+                    rusqlite::Connection::open(&database)
+                        .unwrap()
+                        .execute(
+                            "UPDATE asset_master_mappings SET updated_at=updated_at+3600",
+                            [],
+                        )
+                        .unwrap();
+                }
                 let requests = server.received_requests().await.unwrap().len();
-                if cycle == 1 && !matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory)
+                if cycle == 1
+                    && !matches!(
+                        fault,
+                        AmbiguousChildFault::PreserveIncompleteInventory
+                            | AmbiguousChildFault::PreserveInventoryRecovery
+                            | AmbiguousChildFault::PreserveSharedOriginal
+                    )
                 {
                     assert!(
                         requests
@@ -4203,9 +4328,19 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     );
                     completed_requests = requests;
                 }
-                if cycle >= 2 {
+                if cycle == 2 && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery) {
+                    assert!(
+                        requests >= names.len(),
+                        "first current-child download after config retry {label}"
+                    );
+                    completed_requests = requests;
+                }
+                if cycle >= 2
+                    && !(cycle == 2
+                        && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
+                {
                     assert_eq!(requests, completed_requests, "steady network {label}");
-                    if !(matches!(fault, AmbiguousChildFault::PreserveConfigChange) && cycle == 2) {
+                    if !(relocating && cycle == 2) {
                         assert_eq!(result.stats.downloaded, 0, "steady download {label}");
                     }
                 }
@@ -4386,6 +4521,33 @@ async fn run_cycle_single_survivor_zero_children_hold() {
     Box::pin(exercise_legacy_child_cycles(
         AmbiguousChildFault::Preserve,
         &[0],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_first_failure_creates_retry_then_preserves_after_restart() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveFreshRetry,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_inventory_backoff_keeps_hold_then_config_change_recovers() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveInventoryRecovery,
+        &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_single_survivor_shared_original_keeps_hold() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveSharedOriginal,
+        &[1],
     ))
     .await;
 }

@@ -879,10 +879,37 @@ Preparation protects the original catalogue rows, capture revisions, retry
 receipts, relationship history, media paths and sidecar presence. It preserves
 the old checkpoint. A complete unfiltered zone inventory must cover hidden
 children, all pages, an explicit completion marker and a nonblank final cursor.
-Each scan is limited to 10,000 pages, 1,000,000 records and 256 MiB of serialized
-response data; a cycle considers at most 64 new candidates. Exhausting a limit
-retains the hold. Sparse, malformed, cross-library or incomplete evidence cannot
-activate preservation. No diagnostic count is ownership proof.
+Each scan is limited to 10,000 pages and 1,000,000 observed records. It retains
+compact latest identity/reference/deletion evidence for unrelated records and
+full latest records for candidate masters and children, then hydrates those
+families after the final page. Historical child mappings cannot replace complete
+family discovery. Later updates and tombstones replace earlier evidence, including
+references that enter or leave a candidate family.
+
+The byte guards allow at most 64 MiB for one serialized response page and 256 MiB
+for retained record representations, identity storage and pagination cursors.
+Cumulative transferred bytes are counted separately and do not consume the
+retained-evidence budget. These counts are representation bounds, not process RSS;
+one response is decoded before its page-size guard. A cycle considers at most 64
+new candidates. Exhausting a limit retains the hold. Sparse, malformed,
+cross-library or incomplete evidence cannot activate preservation. No diagnostic
+count is ownership proof.
+
+Failed preparation discovery records a versioned, library-scoped
+`legacy_preservation_inventory_retry:` receipt in the metadata table. An unchanged
+configuration and durable original-family evidence defer another preparation scan
+for at most one hour across restart. Retry scheduling, capture cycle counters and
+unchanged relation refresh timestamps do not reset that delay. Changed
+configuration or original-family evidence permits
+a new attempt; malformed, unsupported or out-of-range retry receipts never defer
+work. Deferral supplies no provider evidence or checkpoint permission. Prepared
+records still require fresh certification, and metadata-capture retry scheduling
+remains independent. Successful discovery clears its failure delay.
+
+Preparation and certification use separate complete scans; a preparation result
+cannot certify work performed later. Failure warnings expose only a fixed stage
+and category plus aggregate page, record, transferred-byte and retained-byte
+counts. Provider error text, record identities, paths and URLs remain private.
 
 Activation requires a normal completed current inventory and, when a retained
 cursor exists, a successful delta bridge. Independently identified current
@@ -898,7 +925,13 @@ current-child work completes.
 
 Original media and sidecars are fingerprinted through confined paths; links,
 pending temporary writes, replacement journals, shared paths and changed bytes
-reject qualification. Shared-root replacement recovery checks protected paths from
+reject qualification. Preparation warnings retain the aggregate
+`invalid_original_files` candidate count and expose `shared_file_links` as a subset,
+counting each candidate once at its first rejected media or sidecar. Typed shared-link
+errors also expose only the fixed reason `shared_file_links` at certification and
+checkpoint stages. Original and current-child files retain the same independent-object
+requirement; a hash recheck does not authorize shared inode writes.
+Shared-root replacement recovery checks protected paths from
 all libraries before opening a journal, including unselected libraries. Current child files and sidecar presence are also bound
 into the receipt. Original files are never moved, rewritten, adopted or deleted.
 Normal downloads, metadata repair, local path reconciliation, imports and source

@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use base64::Engine as _;
 use rustc_hash::FxHashSet;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{DownloadConfig, DownloadStore};
@@ -33,6 +35,117 @@ pub(crate) async fn protected_replacement_paths(
         }
     }
     Ok(paths)
+}
+
+const INVENTORY_RETRY_SECONDS: i64 = 60 * 60;
+const INVENTORY_RETRY_PREFIX: &str = "legacy_preservation_inventory_retry:";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InventoryRetry {
+    version: u8,
+    signature: String,
+    next_attempt_at: i64,
+}
+
+impl InventoryRetry {
+    fn deferred(&self, signature: &str, now: i64) -> bool {
+        self.version == 1
+            && self.signature == signature
+            && self.next_attempt_at > now
+            && self.next_attempt_at <= now.saturating_add(INVENTORY_RETRY_SECONDS)
+    }
+}
+
+fn inventory_retry_signature(
+    config_hash: &str,
+    candidates: &[crate::state::db::LegacyPreparationSnapshot],
+) -> anyhow::Result<String> {
+    let mut evidence = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let mut original: serde_json::Value = serde_json::from_str(&candidate.evidence)?;
+        let tables = original
+            .get_mut("evidence")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("Missing legacy preparation evidence")?;
+        // Retry timestamps and cycle counters do not change the historical
+        // family. All original receipt, owner, path and relationship facts stay
+        // in the signature; preparation still compares the entire snapshot.
+        tables.remove("metadata_capture_retries");
+        tables.remove("capture_state_at_preparation");
+        if let Some(history) = tables.get_mut("family_history")
+            && let Some(index) = history
+                .get("columns")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|columns| {
+                    columns
+                        .iter()
+                        .position(|column| column.as_str() == Some("updated_at"))
+                })
+        {
+            // Replaying an unchanged child refreshes this bookkeeping timestamp.
+            // Preserve relation identities in the signature, and retain the full
+            // unmodified table in the eventual preparation snapshot.
+            let rows = history
+                .get_mut("rows")
+                .and_then(serde_json::Value::as_array_mut)
+                .context("Missing legacy family history rows")?;
+            for row in rows {
+                *row.as_array_mut()
+                    .and_then(|values| values.get_mut(index))
+                    .context("Invalid legacy family history row")? = serde_json::Value::Null;
+            }
+        }
+        evidence.push(original);
+    }
+    let encoded = serde_json::to_vec(&(
+        1,
+        config_hash,
+        crate::state::METADATA_CAPTURE_REVISION,
+        evidence,
+    ))?;
+    Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(encoded)))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum LegacyFileError {
+    #[error("Legacy preservation requires independent file objects")]
+    SharedFileLinks,
+}
+
+fn classify_legacy_file_error(error: &anyhow::Error) -> Option<&'static str> {
+    match error.downcast_ref::<LegacyFileError>() {
+        Some(LegacyFileError::SharedFileLinks) => Some("shared_file_links"),
+        None => None,
+    }
+}
+
+pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) {
+    if let Some(diagnostic) = crate::icloud::photos::classify_legacy_inventory_error(error) {
+        tracing::warn!(
+            stage,
+            reason = diagnostic.reason,
+            pages = diagnostic.pages,
+            records = diagnostic.records,
+            transferred_bytes = diagnostic.transferred_bytes,
+            retained_bytes = diagnostic.retained_bytes,
+            "Legacy preservation inventory unavailable; retaining attribution checkpoint hold"
+        );
+    } else if let Some(reason) = classify_legacy_file_error(error) {
+        tracing::warn!(
+            stage,
+            reason,
+            "Legacy preservation files unavailable; retaining attribution checkpoint hold"
+        );
+    } else {
+        // Provider errors and file/state errors can contain private identifiers,
+        // URLs or paths. Only a fixed category reaches ordinary logs.
+        tracing::warn!(
+            stage,
+            reason = "current_evidence_incomplete",
+            "Legacy preservation evidence incomplete; retaining attribution checkpoint hold"
+        );
+    }
 }
 
 #[derive(Default)]
@@ -89,6 +202,26 @@ impl LegacyCycle {
         }
         let candidates = db.legacy_preparation_snapshots(&config.library, 64).await?;
         if !candidates.is_empty() {
+            let retry_key = format!("{INVENTORY_RETRY_PREFIX}{}", config.library);
+            let signature = inventory_retry_signature(config_hash, &candidates)?;
+            let now = chrono::Utc::now().timestamp();
+            let deferred = db
+                .get_metadata(&retry_key)
+                .await?
+                .and_then(|encoded| serde_json::from_str::<InventoryRetry>(&encoded).ok())
+                .is_some_and(|retry| retry.deferred(&signature, now));
+            if deferred {
+                tracing::info!(
+                    stage = "preparation",
+                    reason = "inventory_retry_deferred",
+                    candidates = candidates.len(),
+                    "Legacy preservation discovery deferred; retaining attribution checkpoint hold"
+                );
+                return Ok(Self {
+                    preserved,
+                    prepared_proofs: Vec::new(),
+                });
+            }
             let masters = candidates
                 .iter()
                 .map(|candidate| candidate.asset_id.clone())
@@ -96,12 +229,19 @@ impl LegacyCycle {
             // Provider failures cannot relax existing capture/checkpoint guards.
             match album.complete_legacy_inventory(&masters, cancel).await {
                 Ok(inventory) => {
+                    // A successful scan cannot borrow an earlier failure delay.
+                    db.set_metadata(&retry_key, "").await?;
+                    let mut no_current_child = 0usize;
+                    let mut invalid_original_files = 0usize;
+                    let mut shared_file_links = 0usize;
+                    let mut stale_candidates = 0usize;
                     for candidate in candidates {
                         if !inventory
                             .children
                             .iter()
                             .any(|child| child.id() == candidate.asset_id)
                         {
+                            no_current_child += 1;
                             continue;
                         }
                         let mut files = Vec::new();
@@ -118,7 +258,10 @@ impl LegacyCycle {
                                 .await
                                 {
                                     Ok(file) => files.push(file),
-                                    Err(_) => {
+                                    Err(error) => {
+                                        if classify_legacy_file_error(&error).is_some() {
+                                            shared_file_links += 1;
+                                        }
                                         valid = false;
                                         break;
                                     }
@@ -129,14 +272,39 @@ impl LegacyCycle {
                             }
                         }
                         if valid {
-                            db.prepare_legacy_preservation(&candidate, &files).await?;
+                            if !db.prepare_legacy_preservation(&candidate, &files).await? {
+                                stale_candidates += 1;
+                            }
+                        } else {
+                            invalid_original_files += 1;
                         }
+                    }
+                    if no_current_child + invalid_original_files + stale_candidates > 0 {
+                        tracing::warn!(
+                            stage = "preparation",
+                            no_current_child,
+                            invalid_original_files,
+                            shared_file_links,
+                            stale_candidates,
+                            "Legacy preservation candidates remain unresolved; retaining attribution checkpoint hold"
+                        );
                     }
                     preserved = db.legacy_preservations(&config.library).await?;
                 }
-                Err(_) => tracing::debug!(
-                    "Legacy preservation inventory unavailable; retaining attribution checkpoint hold"
-                ),
+                Err(error) => {
+                    log_preservation_hold("preparation", &error);
+                    if !cancel.is_cancelled() {
+                        let retry = InventoryRetry {
+                            version: 1,
+                            signature,
+                            next_attempt_at: chrono::Utc::now()
+                                .timestamp()
+                                .saturating_add(INVENTORY_RETRY_SECONDS),
+                        };
+                        db.set_metadata(&retry_key, &serde_json::to_string(&retry)?)
+                            .await?;
+                    }
+                }
             }
         }
         Ok(Self {
@@ -307,8 +475,10 @@ async fn fingerprint(
         }
         let file = confined.open_optional_regular()?;
         if let Some(file) = &file {
+            let links = crate::fs_util::file_link_count(file)?;
+            anyhow::ensure!(links <= 1, LegacyFileError::SharedFileLinks);
             anyhow::ensure!(
-                crate::fs_util::file_link_count(file)? == 1,
+                links == 1,
                 "Legacy preservation requires independent file objects"
             );
         }
@@ -579,6 +749,58 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
     }
 
+    #[tokio::test]
+    async fn preservation_shared_file_links_are_typed_and_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cancel = CancellationToken::new();
+        // The same helper guards originals and independently owned current outputs.
+        for name in [
+            "private-original.jpg",
+            "private-current-child.jpg",
+            "private-sidecar.xmp",
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, b"verified synthetic bytes").unwrap();
+            let evidence = fingerprint(root, &path, true, ".kei-tmp", &cancel)
+                .await
+                .unwrap();
+            let alias = root.join(format!("{name}.alias"));
+            std::fs::hard_link(&path, &alias).unwrap();
+            let error = verify_files(&[evidence], ".kei-tmp", &cancel)
+                .await
+                .unwrap_err()
+                .context("private-provider-id/private-path");
+            assert_eq!(
+                super::classify_legacy_file_error(&error),
+                Some("shared_file_links")
+            );
+            let log = root.join("warning.log");
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                super::log_preservation_hold("certification", &error);
+                super::log_preservation_hold("checkpoint", &error);
+            });
+            let output = std::fs::read_to_string(log).unwrap();
+            assert!(output.contains("stage=\"certification\""));
+            assert!(output.contains("stage=\"checkpoint\""));
+            assert_eq!(output.matches("reason=\"shared_file_links\"").count(), 2);
+            assert!(!output.contains("private"));
+            assert!(!output.contains(&root.display().to_string()));
+            assert_eq!(std::fs::read(&path).unwrap(), b"verified synthetic bytes");
+            assert_eq!(std::fs::read(&alias).unwrap(), b"verified synthetic bytes");
+        }
+        assert_eq!(
+            super::classify_legacy_file_error(&anyhow::anyhow!("shared_file_links")),
+            None
+        );
+    }
+
     #[test]
     fn preservation_current_content_requires_exact_source_bytes_or_verified_prewrite_receipt() {
         use sha2::{Digest, Sha256};
@@ -633,6 +855,91 @@ mod tests {
             "{\"version\":1,\"children\":[{}]}",
         ] {
             assert!(provider_files(evidence).is_err(), "{evidence}");
+        }
+    }
+    #[tokio::test]
+    async fn preservation_inventory_retry_roundtrip_is_bounded_and_evidence_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let key = format!("{}PrimarySync", super::INVENTORY_RETRY_PREFIX);
+        let retry = super::InventoryRetry {
+            version: 1,
+            signature: "original-evidence".into(),
+            next_attempt_at: 4600,
+        };
+        {
+            let db = crate::state::SqliteStateDb::open(&path).await.unwrap();
+            db.set_metadata(&key, &serde_json::to_string(&retry).unwrap())
+                .await
+                .unwrap();
+            db.set_metadata("sync_token:PrimarySync", "held")
+                .await
+                .unwrap();
+        }
+        let db = crate::state::SqliteStateDb::open(&path).await.unwrap();
+        let decoded: super::InventoryRetry =
+            serde_json::from_str(&db.get_metadata(&key).await.unwrap().unwrap()).unwrap();
+        assert!(decoded.deferred("original-evidence", 1000));
+        assert!(!decoded.deferred("changed-evidence", 1000));
+        assert!(!decoded.deferred("original-evidence", 4600));
+        assert!(!decoded.deferred("original-evidence", 999));
+        let unsupported = super::InventoryRetry {
+            version: 2,
+            ..decoded
+        };
+        assert!(!unsupported.deferred("original-evidence", 1000));
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("held")
+        );
+        assert!(
+            serde_json::from_str::<super::InventoryRetry>(
+                r#"{"version":1,"signature":"x","next_attempt_at":1,"unexpected":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preservation_inventory_retry_signature_keeps_original_facts_and_config() {
+        let original = serde_json::json!({"version":1,"library":"PrimarySync","asset_id":"master","evidence":{
+            "assets":{"added_at":123,"checksum":"original"},
+            "family_history":{"columns":["library","child","master","updated_at"],"rows":[["PrimarySync","child-a","master",1000],["PrimarySync","child-b","master",1000]]},
+            "owners":[],
+            "metadata_capture_retries":{"next_retry_at":1000},
+            "capture_state_at_preparation":{"processed":5}
+        }});
+        let snapshot = |value: serde_json::Value| crate::state::db::LegacyPreparationSnapshot {
+            library: "PrimarySync".into(),
+            asset_id: "master".into(),
+            evidence: value.to_string(),
+            paths: Vec::new(),
+        };
+        let baseline =
+            super::inventory_retry_signature("config-a", &[snapshot(original.clone())]).unwrap();
+        let mut counters = original.clone();
+        counters["evidence"]["metadata_capture_retries"]["next_retry_at"] = serde_json::json!(2000);
+        counters["evidence"]["capture_state_at_preparation"]["processed"] = serde_json::json!(6);
+        counters["evidence"]["family_history"]["rows"][0][3] = serde_json::json!(2000);
+        assert_eq!(
+            baseline,
+            super::inventory_retry_signature("config-a", &[snapshot(counters)]).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            super::inventory_retry_signature("config-b", &[snapshot(original.clone())]).unwrap()
+        );
+        for field in ["assets", "family_history", "owners"] {
+            let mut changed = original.clone();
+            changed["evidence"][field] = serde_json::json!("changed");
+            assert_ne!(
+                baseline,
+                super::inventory_retry_signature("config-a", &[snapshot(changed)]).unwrap(),
+                "{field}"
+            );
         }
     }
 }
