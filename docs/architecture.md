@@ -769,6 +769,10 @@ recovery work needed after that checkpoint is durable.
 
 Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
+The iCloud GPS decoder selects the first valid coordinate pair from
+`locationV2Enc`, `locationEnc`, then plain latitude/longitude fields. Coordinates
+must be finite and within inclusive latitude [-90, 90] and longitude [-180, 180]
+bounds. Nonfinite optional altitude is omitted independently of the pair.
 The iCloud adapter retains shared metadata once and compact resource facts for
 each rendition, independently of download URL availability. Catalogue dimensions
 describe the provider-declared resource dimensions, not probed track or displayed
