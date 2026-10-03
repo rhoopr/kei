@@ -376,25 +376,37 @@ async fn run_cycle_multi_zone_reconciliation_preserves_all_active_tokens_on_part
 #[cfg(unix)]
 #[tokio::test]
 async fn run_cycle_reconciliation_rejection_preserves_source_dispatch_and_state() {
-    external_reconciliation_lifecycle(ExternalReconciliationEntry::Symlink).await;
+    Box::pin(external_reconciliation_lifecycle(
+        ExternalReconciliationEntry::Symlink,
+    ))
+    .await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn run_cycle_external_hardlink_reconciliation_restart() {
-    external_reconciliation_lifecycle(ExternalReconciliationEntry::Hardlink).await;
+    Box::pin(external_reconciliation_lifecycle(
+        ExternalReconciliationEntry::Hardlink,
+    ))
+    .await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn run_cycle_external_same_size_replacement_restart() {
-    external_reconciliation_lifecycle(ExternalReconciliationEntry::SameSizeReplacement).await;
+    Box::pin(external_reconciliation_lifecycle(
+        ExternalReconciliationEntry::SameSizeReplacement,
+    ))
+    .await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn run_cycle_external_moved_directory_restart() {
-    external_reconciliation_lifecycle(ExternalReconciliationEntry::MovedDirectory).await;
+    Box::pin(external_reconciliation_lifecycle(
+        ExternalReconciliationEntry::MovedDirectory,
+    ))
+    .await;
 }
 
 #[cfg(unix)]
@@ -456,7 +468,9 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
     std::fs::write(&external, vec![0u8; 1024]).unwrap();
     let original_bytes = std::fs::read(&old_path).unwrap();
     let old_time = UNIX_EPOCH + Duration::from_secs(12345);
-    std::fs::File::open(&old_path)
+    std::fs::File::options()
+        .write(true)
+        .open(&old_path)
         .unwrap()
         .set_times(std::fs::FileTimes::new().set_modified(old_time))
         .unwrap();
@@ -758,7 +772,9 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
             // are valid source evidence on restart; no old inode is reused.
             let replacement = old_dir.path().join("external-replacement.jpg");
             std::fs::write(&replacement, &original_bytes).unwrap();
-            std::fs::File::open(&replacement)
+            std::fs::File::options()
+                .write(true)
+                .open(&replacement)
                 .unwrap()
                 .set_times(
                     std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(23456)),

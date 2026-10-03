@@ -270,7 +270,9 @@ async fn released_v0240_metadata_policy_selection_restart_preserves_siblings() {
     for (library, id, filename, rating, hidden, deleted) in fixtures {
         let path = dir.path().join(filename);
         std::fs::write(&path, bytes).unwrap();
-        std::fs::File::open(&path)
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(time))
             .unwrap();
