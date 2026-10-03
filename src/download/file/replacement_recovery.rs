@@ -499,6 +499,8 @@ fn publish_journal(journal: &Journal, mut hook: impl FnMut(Stage) -> Result<()>)
     move_to_owned_slot(&journal.target, &journal.original)?;
     journal.sync()?;
     hook(Stage::Displaced)?;
+    #[cfg(test)]
+    crate::test_helpers::process_death_point("journal-displaced");
     if read_fingerprint(&journal.original)?.as_ref() != Some(&journal.evidence.original) {
         return Err(ConditionalPublishTargetChanged::AfterPlanning {
             path: journal.target.path().to_path_buf(),
@@ -512,6 +514,8 @@ fn publish_journal(journal: &Journal, mut hook: impl FnMut(Stage) -> Result<()>)
     super::platform::hard_link_confined(&journal.replacement, &journal.target)?;
     journal.sync()?;
     hook(Stage::Installed)?;
+    #[cfg(test)]
+    crate::test_helpers::process_death_point("journal-installed");
     anyhow::ensure!(
         read_fingerprint(&journal.target)?.as_ref() == Some(&journal.evidence.replacement)
             && read_fingerprint(&journal.original)?.as_ref() == Some(&journal.evidence.original),
@@ -522,6 +526,8 @@ fn publish_journal(journal: &Journal, mut hook: impl FnMut(Stage) -> Result<()>)
     commit.sync_all()?;
     journal.sync()?;
     hook(Stage::Committed)?;
+    #[cfg(test)]
+    crate::test_helpers::process_death_point("journal-committed");
     Ok(())
 }
 

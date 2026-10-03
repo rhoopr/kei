@@ -1509,6 +1509,9 @@ pub(crate) async fn run_cycle(
         }
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    crate::test_helpers::process_death_point("checkpoint-persisted");
+
     Ok(CycleResult {
         failed_count: cycle_failed_count,
         session_expired: cycle_session_expired,

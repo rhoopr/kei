@@ -9,3 +9,6 @@ mod recovery_sequences;
 mod released_upgrade;
 
 mod mixed_provider_shapes;
+
+#[cfg(target_os = "linux")]
+mod process_death;

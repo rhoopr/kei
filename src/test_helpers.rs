@@ -1286,3 +1286,34 @@ mod tests {
         assert!(err.to_string().contains("transport failure"));
     }
 }
+
+/// Dedicated Linux subprocess fixture rendezvous; absent from release builds.
+/// The parent uses Child::kill and verifies SIGKILL, so no Rust unwinding or
+/// cooperative cancellation can complete the paused transition.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_death_point(point: &str) {
+    if std::env::var("KEI_TEST_PROCESS_DEATH_POINT").as_deref() != Ok(point) {
+        return;
+    }
+    let root = std::path::PathBuf::from(
+        std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").expect("dedicated fixture root"),
+    );
+    assert_eq!(
+        std::fs::read(root.join("fixture-owner")).unwrap(),
+        b"kei-synthetic-process-death"
+    );
+    std::fs::write(root.join("ready"), point).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_death_force_journal() -> bool {
+    std::env::var("KEI_TEST_PROCESS_DEATH_POINT").is_ok_and(|point| {
+        matches!(
+            point.as_str(),
+            "journal-displaced" | "journal-installed" | "journal-committed"
+        )
+    })
+}

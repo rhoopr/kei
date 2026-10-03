@@ -127,8 +127,9 @@ The initial slice in #873 ran 11 tests in 25.7 seconds on Linux with a warm defa
 build cache. That is below the proposed additional 2-5 minute PR budget. Cold
 compilation is excluded; complete-suite timings remain separate gate evidence.
 
-Broad exploration, semantic fuzzing, process termination, composed filesystem
-recovery, and physical NFS/NAS qualification remain later phases.
+Broad exploration, semantic fuzzing, composed filesystem recovery, and physical
+NFS/NAS qualification remain later phases. The bounded process-death matrix
+below adds actual Linux termination at selected durable transitions.
 SQLite reopen and injected transaction failure do not model abrupt process death
 or power-loss durability.
 
@@ -258,6 +259,51 @@ The existing pagination, tombstone, hidden-sibling, configuration
 reactivation, single-survivor, multi-album and restarted Live Photo proofs remain
 separate lower-level coverage. This small composition matrix does not qualify
 whole-library inventory memory or request cost at production library scale.
+
+### Abrupt process-death recovery
+
+On Linux, `process_death_recovery_matrix` kills six dedicated subprocesses with
+SIGKILL: fallback-journal displacement, installation and commit; media publication
+before state finalization; verified state before checkpoint completion; and
+checkpoint completion. The parent checks signal 9 and independently reopens
+SQLite and reads media before recovery. A worker that exits early or fails to
+reach its marker fails the proof with its synthetic log. Each rendezvous has a
+20-second bound; mock-server bind failures fail normally.
+
+Journal cases start with a successful production cycle, damage only an owned
+synthetic file, and enable the existing explicit truncated-file repair. A test-only
+hook selects the existing journal publication lane after its fingerprint guards;
+existing seccomp coverage separately proves unsupported-rename routing. Other
+cases start from pending media. Every case preserves an independently owned
+same-ID asset and private sidecar in an unselected zone.
+
+Restart promotes interrupted runs through the same owner used by production
+startup, then enters `run_cycle` with reopened SQLite. The first valid cycle must
+restore correct media, exact publication receipts and ownership, metadata retry
+state, and the source checkpoint. A committed replacement can retain a recent
+prepared-file claim under the existing cleanup grace period. The fixture verifies
+those bytes, then ages only that exact claim and file; the next production cycle
+must retire them through normal cleanup. Two further cycles must perform no
+hydration, download or metadata repair and leave durable state and files stable.
+The matrix has at most 28 production cycles including prerequisites, six killed
+cycles, recovery, eligible cleanup and quiet tails. Warm execution initially took 4.7 seconds with all features and 4.5 seconds
+without default features; compilation is excluded.
+
+Replay one complete case, retaining its prerequisite and recovery/quiet tail:
+
+```sh
+KEI_PROCESS_DEATH_REPLAY=journal-committed \
+  cargo test --all-features --lib process_death_recovery_matrix -- --nocapture
+```
+
+Temporary synthetic byte-corruption and premature-checkpoint probes both failed
+at the independent pre-recovery assertions; neither probe is committed.
+The accepted points are the six names printed by the matrix; unknown names fail.
+The ignored worker is invoked only by its exact parent-controlled test name and
+is excluded from the live-test route. Existing lower-level post-publication kill,
+returned-error journal interruptions, cancellation and SQLite-reopen tests remain
+separate coverage. This slice proves process termination at those transitions;
+it does not qualify power-loss durability, arbitrary crash points or real mounts.
 
 ## State-transition proof
 

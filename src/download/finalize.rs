@@ -67,6 +67,8 @@ pub(super) async fn finalize_downloaded<D>(
 where
     D: DownloadFinalizationStore + ?Sized,
 {
+    #[cfg(all(test, target_os = "linux"))]
+    crate::test_helpers::process_death_point("published");
     match db
         .mark_verified_download(
             library,
@@ -88,6 +90,8 @@ where
                 exif_ok,
             )
             .await;
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("state-persisted");
             DownloadedFinalization::Persisted
         }
         Err(error) => DownloadedFinalization::Deferred {
