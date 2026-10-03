@@ -1302,7 +1302,10 @@ pub(crate) fn process_death_point(point: &str) {
         std::fs::read(root.join("fixture-owner")).unwrap(),
         b"kei-synthetic-process-death"
     );
-    std::fs::write(root.join("ready"), point).unwrap();
+    // Publish the rendezvous atomically so the parent cannot read an empty
+    // marker between creation and write. This is process synchronization only.
+    std::fs::write(root.join("ready.tmp"), point).unwrap();
+    std::fs::rename(root.join("ready.tmp"), root.join("ready")).unwrap();
     loop {
         std::thread::park();
     }
