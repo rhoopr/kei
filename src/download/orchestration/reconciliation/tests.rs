@@ -2277,6 +2277,7 @@ async fn path_reconciliation_preserves_mtime_and_metadata_across_retry() {
         ReconciliationMetadataCase::MediaConflict,
         ReconciliationMetadataCase::Conflict,
         ReconciliationMetadataCase::StateFailure,
+        ReconciliationMetadataCase::SourceSidecarEdit,
         ReconciliationMetadataCase::Missing,
         #[cfg(target_os = "linux")]
         ReconciliationMetadataCase::Interrupted,
@@ -2304,6 +2305,7 @@ enum ReconciliationMetadataCase {
     HardLinkedDestination,
     Conflict,
     StateFailure,
+    SourceSidecarEdit,
     Missing,
     #[cfg(target_os = "linux")]
     Interrupted,
@@ -2460,7 +2462,10 @@ async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
         std::fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
         std::fs::hard_link(&old_path, &expected_path).unwrap();
     }
-    if matches!(mode, ReconciliationMetadataCase::StateFailure) {
+    if matches!(
+        mode,
+        ReconciliationMetadataCase::StateFailure | ReconciliationMetadataCase::SourceSidecarEdit
+    ) {
         db.acquire_lock("inject reconciliation finalization failure").unwrap().execute_batch(
             "CREATE TEMP TRIGGER fail_reconciled_path BEFORE UPDATE OF local_path ON assets WHEN NEW.local_path IS NOT OLD.local_path BEGIN SELECT RAISE(FAIL, 'injected reconciliation state failure'); END;"
         ).unwrap();
@@ -2470,6 +2475,7 @@ async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
         mode,
         ReconciliationMetadataCase::Conflict
             | ReconciliationMetadataCase::StateFailure
+            | ReconciliationMetadataCase::SourceSidecarEdit
             | ReconciliationMetadataCase::MediaConflict
             | ReconciliationMetadataCase::HardLinkedDestination
     ) {
@@ -2531,13 +2537,76 @@ async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
                 b"user-owned conflicting sidecar"
             );
             std::fs::remove_file(&new_sidecar).unwrap();
-        } else if matches!(mode, ReconciliationMetadataCase::StateFailure) {
+        } else if matches!(
+            mode,
+            ReconciliationMetadataCase::StateFailure
+                | ReconciliationMetadataCase::SourceSidecarEdit
+        ) {
             db.acquire_lock("restore reconciliation finalization")
                 .unwrap()
                 .execute_batch("DROP TRIGGER fail_reconciled_path")
                 .unwrap();
         }
     }
+    let edited_packet = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:custom="https://example.test/custom/" custom:Note="external editor changed this packet" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="2"/></rdf:RDF></x:xmpmeta>"#;
+    let expected_packet: &[u8] = if matches!(mode, ReconciliationMetadataCase::SourceSidecarEdit) {
+        edited_packet
+    } else {
+        packet
+    };
+    let config = if matches!(mode, ReconciliationMetadataCase::SourceSidecarEdit) {
+        // Media and the original packet were published before finalization
+        // failed. An external editor then changes the old source packet.
+        std::fs::write(&source_sidecar, edited_packet).unwrap();
+        let mut restarted = (*config).clone();
+        restarted.state_db = None;
+        drop(config);
+        drop(db);
+        for retry in 0..2 {
+            restarted.state_db = Some(Arc::new(SqliteStateDb::open(&db_path).await.unwrap()));
+            let rejected = reconcile_catalog_paths(
+                &passes,
+                Arc::new(restarted.clone()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!rejected.complete, "edited source retry {retry}");
+            assert_eq!(rejected.stats.exif_failures, 1);
+            assert_eq!(rejected.stats.downloaded, 0);
+            assert_eq!(rejected.stats.state_write_failures, 0);
+            restarted.state_db = None;
+            let reopened = SqliteStateDb::open(&db_path).await.unwrap();
+            let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].local_path.as_deref(), Some(old_path.as_path()));
+            assert_eq!(
+                rows[0].local_checksum.as_deref(),
+                Some(local_checksum.as_str())
+            );
+            assert_eq!(std::fs::read(&new_sidecar).unwrap(), packet);
+            assert_eq!(std::fs::read(&source_sidecar).unwrap(), edited_packet);
+            assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
+            assert_eq!(std::fs::read(&expected_path).unwrap(), vec![0u8; 1024]);
+            assert_eq!(
+                std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+                old_time
+            );
+            assert_eq!(
+                std::fs::read_dir(expected_path.parent().unwrap())
+                    .unwrap()
+                    .count(),
+                2
+            );
+        }
+        // Explicit fixture resolution keeps the old packet as user evidence;
+        // the owner may now publish the edited packet into the reserved path.
+        std::fs::rename(&new_sidecar, new_sidecar.with_extension("saved-xmp")).unwrap();
+        restarted.state_db = Some(Arc::new(SqliteStateDb::open(&db_path).await.unwrap()));
+        Arc::new(restarted)
+    } else {
+        config
+    };
     let repaired = reconcile_catalog_paths(&passes, Arc::clone(&config), CancellationToken::new())
         .await
         .unwrap();
@@ -2563,8 +2632,8 @@ async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
     if !cfg!(feature = "xmp") || matches!(mode, ReconciliationMetadataCase::Disabled) {
         assert!(!new_sidecar.exists());
     } else if !matches!(mode, ReconciliationMetadataCase::Missing) {
-        assert_eq!(std::fs::read(&source_sidecar).unwrap(), packet);
-        assert_eq!(std::fs::read(&new_sidecar).unwrap(), packet);
+        assert_eq!(std::fs::read(&source_sidecar).unwrap(), expected_packet);
+        assert_eq!(std::fs::read(&new_sidecar).unwrap(), expected_packet);
     } else {
         #[cfg(feature = "xmp")]
         {
@@ -2580,6 +2649,12 @@ async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
         .unwrap()
         .count();
     let sidecar_before = std::fs::read(&new_sidecar).ok();
+    drop(reopened);
+    let mut restarted = (*config).clone();
+    restarted.state_db = None;
+    drop(config);
+    restarted.state_db = Some(Arc::new(SqliteStateDb::open(&db_path).await.unwrap()));
+    let config = Arc::new(restarted);
     let steady = reconcile_catalog_paths(&passes, config, CancellationToken::new())
         .await
         .unwrap();
@@ -2592,6 +2667,13 @@ async fn reconciliation_metadata_transition(mode: ReconciliationMetadataCase) {
         count
     );
     assert_eq!(std::fs::read(&new_sidecar).ok(), sidecar_before);
+    if matches!(mode, ReconciliationMetadataCase::SourceSidecarEdit) {
+        assert_eq!(
+            std::fs::read(new_sidecar.with_extension("saved-xmp")).unwrap(),
+            packet
+        );
+        assert_eq!(std::fs::read(&source_sidecar).unwrap(), edited_packet);
+    }
 }
 
 #[tokio::test]

@@ -307,6 +307,65 @@ returned-error journal interruptions, cancellation and SQLite-reopen tests remai
 separate coverage. This slice proves process termination at those transitions;
 it does not qualify power-loss durability, arbitrary crash points or real mounts.
 
+## Tactical external-state recovery
+
+The next bounded [#862](https://github.com/rhoopr/kei/issues/862) slice extends
+`just test scenario config-reconciliation` with existing fixtures and production
+owners. It adds these specific interactions to coverage already present:
+
+| Existing evidence | Added interaction |
+|-------------------|-------------------|
+| Confined copy races, hardlinked destination refusal, and full-cycle symlink rejection | Full-cycle hardlink and same-size conflict refusal, externally relocated destination directory, SQLite restart, valid same-byte source replacement with altered mtime, local recovery and quiet follow-up |
+| Reconciled sidecar conflicts and failed catalogue finalization | Source packet edited externally after media and sidecar publication but before successful catalogue finalization; restarted retries preserve both packets, then explicit fixture conflict resolution copies the edited packet |
+| Ordinary sidecar publication with failed marker clear | File-backed failure, reopened recovery and quiet follow-up with independent parsed XMP and durable publication/debt assertions |
+| Released-schema upgrade preservation and failed-download recovery | Schema-25 metadata debt composed with disabled/enabled sidecar policy, library selection reactivation, a hidden active item, and a deleted sibling |
+
+The full-cycle external-entry cases preserve source bytes, source mtime,
+unrelated metadata, the previous catalogue path, destination reservations and
+provider/config checkpoints through two refusals. They assert the corresponding
+failure diagnostic and block normal source dispatch. After only fixture
+conflicts are removed, a replaced source inode with identical bytes and a changed
+mtime must reconcile locally. The destination receives capture mtime; the source
+retains the external timestamp. A restarted unchanged cycle must preserve both
+historical and current publication receipts without another media copy.
+
+The external-sidecar case begins with a published media copy and packet whose
+catalogue finalization failed. An edited source packet conflicts with that prior
+packet on two reopened retries. Neither packet may be overwritten or discarded.
+The fixture preserves the prior destination packet under a separate filename
+before retrying, then requires the edited custom packet, source media/date
+preservation, and a reopened quiet tail. This is explicit fixture resolution,
+not automatic conflict resolution or new metadata policy.
+
+Ordinary metadata rewrite debt does not by itself hold a fresh provider
+checkpoint. The incremental-owner test checks the returned checkpoint candidate
+and durable debt together; that owner does not commit the token. Its persisted
+previous token remains unchanged. The released-state test enters the production
+refresh tail, which also does not advance provider checkpoints. It checks exact
+library-scoped identities, dates, hashes, statuses, capture revisions, publication
+receipts, deleted metadata, media bytes/mtime and completed sidecar bytes/mtime.
+
+The schema fixture was emitted by official v0.24.0; all catalogue rows and
+operation histories here are synthetic. These tests do not rerun historical
+provider sync or claim to reproduce a reporter's database. XMP-only scenarios
+run with XMP enabled; the external media cases also run without default features.
+The existing `released_v0240_failed_history_recovers_after_upgrade_and_restart`
+still supplies the separate production-cycle failed-download upgrade proof.
+
+The initial focused scenario passed 71 test invocations in 67.5 seconds,
+including recompilation with a warm dependency cache. The new external media
+cases took 0.34 seconds together; the released-state case took 0.27 seconds and
+the ordinary sidecar lifecycle took 0.25 seconds, excluding compilation.
+Reversible controls removed the hardlink alias guard and ignored the rewrite
+library scope separately. The hardlink test detected falsely completed
+reconciliation in cycle zero; the released-state test detected premature debt
+retirement in the unselected library. Both production files were restored
+exactly. Historical pre-fix revisions were not rerun for these new compositions.
+
+Hardlinks retain current refusal behavior. This slice does not implement #884,
+change product policy, qualify NFS/NAS or power loss, or duplicate the separate
+subprocess-death phase.
+
 ## State-transition proof
 
 Changes to durable configuration, filesystem paths, media publication,
