@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.24.1] - 2026-10-03
+
+### Changed
+
+- State databases now use schema 28 to retain unresolved sparse identities, bounded metadata-capture retries, and protected unattributed legacy evidence. Even `kei status` can migrate the database. Stop all writers and take a matched cold backup of the complete state/configuration directory and media/sidecars before upgrading; older binaries cannot open the upgraded database. Rollback requires that matched set and the old binary.
+- Status, reports, and health now retain evidence of incomplete identity recovery across restarts and successful work in other libraries. Unresolved/deferred retries and unattributed legacy records are visible separately. An unchanged unresolved lookup backs off from one hour to 24 hours without completing capture or bypassing checkpoint holds. ([#829](https://github.com/rhoopr/kei/pull/829), [#834](https://github.com/rhoopr/kei/pull/834), [#835](https://github.com/rhoopr/kei/pull/835), [#856](https://github.com/rhoopr/kei/pull/856), [#869](https://github.com/rhoopr/kei/pull/869))
+
+### Fixed
+
+- Sync and metadata repair recover usable saved sessions before restarting authentication. ([#826](https://github.com/rhoopr/kei/pull/826))
+- Live Photo companions and assets selected through multiple album folders no longer create the demonstrated repeated copies. Pending downloads refresh expired URLs without replaying stale work, and metadata backfill avoids redundant enumeration. Existing duplicates remain untouched. ([#847](https://github.com/rhoopr/kei/pull/847))
+- Legacy identity recovery retains hidden children, rejects invalid capture dates, and guards historical ownership with rendition dates and family history. Eligible ambiguous legacy records retain their original files and evidence while independently identified current children are stored; historical ownership remains unresolved. Preservation inventory bounds retained evidence rather than cumulative page bytes. ([#855](https://github.com/rhoopr/kei/pull/855), [#857](https://github.com/rhoopr/kei/pull/857), [#863](https://github.com/rhoopr/kei/pull/863), [#869](https://github.com/rhoopr/kei/pull/869), [#870](https://github.com/rhoopr/kei/pull/870), [#881](https://github.com/rhoopr/kei/pull/881), [#882](https://github.com/rhoopr/kei/pull/882))
+- Guarded metadata replacements on Linux have a recoverable fallback when an NFS filesystem rejects exchange renames. The fallback requires hard-link support. Actual NFS/NAS mount validation remains pending. ([#859](https://github.com/rhoopr/kei/pull/859))
+- Retained downloads resume through metadata recovery, transfer waits respond promptly to cancellation, and transfer failure handling settles pending writes before returning. ([#879](https://github.com/rhoopr/kei/pull/879), [#889](https://github.com/rhoopr/kei/pull/889))
+- Invalid provider GPS coordinates no longer displace valid fallback metadata. ([#880](https://github.com/rhoopr/kei/pull/880))
+- Streaming sync reports and metrics correctly aggregate transferred bytes and photo/video totals. ([#887](https://github.com/rhoopr/kei/pull/887), fixes [#818](https://github.com/rhoopr/kei/issues/818))
+
+### Known limitations
+
+- Files shared through hard links still block legacy preservation and keep the checkpoint held. The reason is now visible; [#853](https://github.com/rhoopr/kei/issues/853) remains open pending [#884](https://github.com/rhoopr/kei/issues/884). Historical owners, overwritten dates, and existing duplicates are not automatically repaired.
+- Reporter validation for sparse shared-library recovery, duplicate downloads, and NFS replacements remains pending in [#765](https://github.com/rhoopr/kei/issues/765), [#845](https://github.com/rhoopr/kei/issues/845), and [#858](https://github.com/rhoopr/kei/issues/858). Synthetic and bounded live tests do not establish recovery on those private libraries or filesystems.
+- Smart-folder reconciliation, companion naming after enabling Live Photo movies, untouched-sidecar catch-up, full timestamp precision, and HEIF memory limits remain separate work. No general memory ceiling is established.
+
+See [upgrade guidance](https://github.com/rhoopr/kei/blob/v0.24.1/docs/v0.24.1-upgrade.md) for compatibility, rollback and validation limits.
+
 ## [0.24.0] - 2026-09-16
 
 ### Added

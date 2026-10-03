@@ -85,6 +85,9 @@ kei_check "enum config hash stored"
 kei_check "files downloaded"
 BASELINE_ENUM_HASH=$(get_enum_hash)
 BASELINE_TOKEN=$(get_token)
+# Keep a path from the baseline selection. Resolution reconciliation below
+# retains other renditions, which may sort before the currently selected file.
+DRIFT_PATH=$(kei_db_query "SELECT local_path FROM assets WHERE status='downloaded' ORDER BY local_path LIMIT 1")
 echo "  enum_hash=$BASELINE_ENUM_HASH"
 
 # ── 2. Incremental sync: no changes → 0 downloads, token preserved ──────
@@ -170,10 +173,18 @@ fi
 echo ""
 echo "=== 7. Missing file detection ==="
 delete_one_downloaded_file() {
-    local path
-    path=$(kei_db_query "SELECT local_path FROM assets WHERE status='downloaded' ORDER BY local_path LIMIT 1")
-    kei_db_exec "DELETE FROM assets WHERE local_path = $(kei_sql_string "$path")"
-    rm -f "$path"
+    local path="$DRIFT_PATH" count
+    if [[ "$path" != "$DIR/"* ]] || [ ! -f "$path" ]; then
+        echo "ABORT: selected baseline drift fixture is missing or outside scratch" >&2
+        return 1
+    fi
+    count=$(kei_db_query "SELECT COUNT(*) FROM assets WHERE status='downloaded' AND local_path = $(kei_sql_string "$path")") || return 1
+    if ! [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ABORT: selected baseline drift fixture is missing from state" >&2
+        return 1
+    fi
+    kei_db_exec "DELETE FROM assets WHERE local_path = $(kei_sql_string "$path")" || return 1
+    rm -f "$path" || return 1
     echo "  Deleted one selected file from state + disk"
 }
 sync_and_count_downloads() {
@@ -193,7 +204,7 @@ sync_and_count_downloads() {
     DL_RESULT="$dl"
 }
 HAD_TOKEN=$(get_token)
-delete_one_downloaded_file
+delete_one_downloaded_file || exit 1
 sync_and_count_downloads "bounded repeat"
 if [ -n "$HAD_TOKEN" ]; then
     [ "$DL_RESULT" -eq 0 ]
@@ -201,7 +212,7 @@ if [ -n "$HAD_TOKEN" ]; then
 else
     [ "$DL_RESULT" -ge 1 ]
     kei_check "bounded full enumeration finds missing file"
-    delete_one_downloaded_file
+    delete_one_downloaded_file || exit 1
 fi
 KEI_DATA_DIR="$COOKIES" "$KEI" reset sync-token --yes >/dev/null
 [ -z "$(get_token)" ]

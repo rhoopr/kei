@@ -131,7 +131,7 @@ Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-iclou
 ## Docs
 
 - [Install](https://github.com/rhoopr/kei/wiki/Install)
-- [Upgrade and compatibility](docs/v0.24-upgrade.md)
+- [Upgrade and compatibility](docs/v0.24.1-upgrade.md)
 - [Backup maintenance](docs/backup-maintenance.md)
 - [Metadata output](docs/metadata.md)
 - [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
