@@ -891,3 +891,106 @@ async fn resumed_task_rejects_symlink_and_preserves_regular_resume() {
         server.verify().await;
     }
 }
+
+#[tokio::test]
+async fn complete_part_416_recovers_persists_and_skips_after_reopen() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    let body = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
+    let digest = Sha256::digest(&body);
+    let checksum = base64::engine::general_purpose::STANDARD.encode(digest);
+    let expected_hash = data_encoding::HEXLOWER.encode(&digest);
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+    let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+    let mut config = DownloadConfig::test_default();
+    config.directory = Arc::from(dir.path().join("media"));
+    config.state_db = Some(db.clone());
+    config.retry.max_retries = 0;
+    let mut config = Arc::new(config);
+    let asset = TestPhotoAsset::new("COMPLETE-RESUME")
+        .filename("complete.jpg")
+        .orig_size(body.len() as u64)
+        .orig_url(&format!("{}/complete.jpg", server.uri()))
+        .orig_checksum(&checksum)
+        .build();
+    let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+    let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    let task = &plan.tasks[0];
+    let final_path = task.download_path.clone();
+    let part =
+        crate::download::file::temp_download_path(&final_path, &task.checksum, &config.temp_suffix)
+            .unwrap();
+    fs::create_dir_all(part.parent().unwrap()).unwrap();
+    fs::write(&part, &body).unwrap();
+    planner::upsert_seen_for_task(db.as_ref(), &config, &asset, task)
+        .await
+        .unwrap();
+    assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+    assert!(!final_path.exists());
+    let response_body = body.clone();
+    let expected_range = format!("bytes={}-", body.len());
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    Mock::given(method("GET"))
+        .and(path("/complete.jpg"))
+        .respond_with(move |request: &wiremock::Request| {
+            let range = request
+                .headers
+                .get("range")
+                .map(|value| value.to_str().unwrap().to_string());
+            recorded.lock().unwrap().push(range.clone());
+            if let Some(range) = range {
+                assert_eq!(range, expected_range);
+                ResponseTemplate::new(416)
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/jpeg")
+                    .set_body_bytes(response_body.clone())
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = Client::new();
+    for cycle in 0..2 {
+        let result = stream_and_download_from_stream(
+            &client,
+            stream::iter(vec![Ok(asset.clone())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.downloaded, usize::from(cycle == 0));
+        assert!(result.failed.is_empty());
+        assert_eq!(fs::read(&final_path).unwrap(), body);
+        assert!(!part.exists());
+        let reopened = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].local_checksum.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(
+            rows[0].download_checksum.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert!(reopened.get_failed().await.unwrap().is_empty());
+        Arc::make_mut(&mut config).state_db = Some(reopened);
+    }
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![Some(format!("bytes={}-", body.len())), None]
+    );
+    server.verify().await;
+}

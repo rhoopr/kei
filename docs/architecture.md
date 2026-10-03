@@ -697,6 +697,12 @@ must pass before downloaded state can finalize. The task retains the file
 through metadata work and publication; an opt-in metadata replacement must
 match the writer's output fingerprint before it is accepted.
 The durable temporary-path claim alone does not authorize an append.
+A resumed request rejected with HTTP 416 gets at most one fresh request per
+attempt. The retained part stays intact until an acceptable response can
+restart the transfer; a second 416 terminates that attempt. Transfer retry
+pauses and bandwidth waits observe shutdown before another request or chunk
+write. A cancelled bandwidth reservation is refunded, and interruption reports
+the retained byte count without publishing or finalizing the file.
 
 Schema v19 records the exact temporary path before a state-backed download can
 write or resume it. Normal completion and graceful interruption retire that
