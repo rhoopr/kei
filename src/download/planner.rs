@@ -167,9 +167,17 @@ impl TaskPlanner {
                 return Ok(planner);
             }
         };
+        planner.add_downloaded_paths(records);
+        Ok(planner)
+    }
+
+    /// Index every finalized publication, including another selected album's copy.
+    pub(super) fn add_downloaded_paths(
+        &mut self,
+        records: Vec<crate::state::DownloadedFileRecord>,
+    ) {
         for record in records {
-            planner
-                .reconciliation
+            self.reconciliation
                 .downloaded_paths
                 .entry(ReconciliationOwner {
                     library: Arc::from(record.library.as_str()),
@@ -179,7 +187,6 @@ impl TaskPlanner {
                 .or_default()
                 .push(record);
         }
-        Ok(planner)
     }
 
     /// Accept only a current-content receipt in this pass's filename family.
@@ -536,8 +543,27 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
-        self.plan_owned_asset(asset, config, PathPlanningMode::Reconciliation, None)
-            .await
+        let primary_path = if let Some(primary) =
+            super::filter::derive_expected_paths(asset, config)
+                .iter()
+                .find(|path| path.version_size.is_primary_media())
+        {
+            self.verified_downloaded_path(asset, config, primary.version_size)
+                .await
+        } else {
+            None
+        };
+        let primary_filename = primary_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str());
+        self.plan_owned_asset(
+            asset,
+            config,
+            PathPlanningMode::Reconciliation,
+            primary_filename,
+        )
+        .await
     }
 
     async fn plan_owned_asset(

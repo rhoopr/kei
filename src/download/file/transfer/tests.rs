@@ -2098,3 +2098,471 @@ async fn retained_download_can_publish_approved_truncation_repair() {
         );
     }
 }
+// Regression coverage for interrupted retries and retained complete parts.
+struct EofRangeClient {
+    body: Vec<u8>,
+    fresh_status: u16,
+    fresh_content_type: &'static str,
+    requests: std::sync::Mutex<Vec<Option<u64>>>,
+}
+
+#[async_trait::async_trait]
+impl DownloadClient for EofRangeClient {
+    async fn fetch(
+        &self,
+        _url: &str,
+        resume_from: Option<u64>,
+    ) -> Result<DownloadResponse, BoxError> {
+        self.requests.lock().unwrap().push(resume_from);
+        let (status, body) = if resume_from.is_some() {
+            (416, Vec::new())
+        } else {
+            (self.fresh_status, self.body.clone())
+        };
+        Ok(DownloadResponse {
+            status,
+            content_length: Some(body.len() as u64),
+            content_range: None,
+            content_type: Some(self.fresh_content_type.to_string()),
+            stream: Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from(body))])),
+        })
+    }
+}
+
+#[tokio::test]
+async fn tactical_complete_part_416_recovers_with_full_download() {
+    use sha2::{Digest, Sha256};
+    let body = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+    let client = EofRangeClient {
+        fresh_status: 200,
+        fresh_content_type: "image/jpeg",
+        body: body.clone(),
+        requests: std::sync::Mutex::new(Vec::new()),
+    };
+    let dir = TempDir::new().unwrap();
+    let final_path = dir.path().join("complete.jpg");
+    let part = temp_download_path(&final_path, &checksum, ".kei-tmp").unwrap();
+    std::fs::write(&part, &body).unwrap();
+    let config = RetryConfig {
+        max_retries: 2,
+        base_delay_secs: 0,
+        max_delay_secs: 0,
+    };
+    let mut results = Vec::new();
+    // A second invocation proves the retained complete file does not repair itself.
+    for _ in 0..2 {
+        let result = download_file_with_mode(
+            &client,
+            "http://stub/complete.jpg",
+            &final_path,
+            &checksum,
+            &config,
+            ".kei-tmp",
+            DownloadOpts {
+                skip_rename: false,
+                expected_size: Some(body.len() as u64),
+                publication: FinalPublication::NoReplace,
+            },
+            DownloadLimits::default(),
+            crate::personality::Mode::Off,
+        )
+        .await;
+        if result.is_err() {
+            assert!(!final_path.exists(), "failed transfer must not publish");
+            assert_eq!(
+                std::fs::read(&part).unwrap(),
+                body,
+                "failed resume must preserve retained bytes"
+            );
+        }
+        results.push(result);
+        if results.last().unwrap().is_ok() {
+            break;
+        }
+    }
+    eprintln!(
+        "complete-part observation: requests={:?}, results={results:?}",
+        client.requests.lock().unwrap()
+    );
+    assert!(
+        results[0].is_ok(),
+        "416 at EOF must recover in a bounded first invocation"
+    );
+    assert_eq!(
+        *client.requests.lock().unwrap(),
+        vec![Some(body.len() as u64), None]
+    );
+    assert_eq!(std::fs::read(&final_path).unwrap(), body);
+    assert!(!part.exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn tactical_cancel_during_503_backoff_is_prompt_and_preserves_part() {
+    let body = vec![0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46];
+    let client = RetryingStubClient::new(1, 503, body.clone());
+    let dir = TempDir::new().unwrap();
+    let final_path = dir.path().join("backoff.jpg");
+    let part = temp_download_path(&final_path, "AAAA", ".kei-tmp").unwrap();
+    std::fs::write(&part, &body[..4]).unwrap();
+    let config = RetryConfig {
+        max_retries: 1,
+        base_delay_secs: 60,
+        max_delay_secs: 60,
+    };
+    let token = CancellationToken::new();
+    let rate_limited = std::sync::atomic::AtomicUsize::new(0);
+    let download = download_file_with_mode(
+        &client,
+        "http://stub/backoff.jpg",
+        &final_path,
+        "AAAA",
+        &config,
+        ".kei-tmp",
+        DownloadOpts {
+            skip_rename: false,
+            expected_size: Some(body.len() as u64),
+            publication: FinalPublication::NoReplace,
+        },
+        DownloadLimits {
+            shutdown_token: Some(&token),
+            rate_limit_counter: Some(&rate_limited),
+            ..Default::default()
+        },
+        crate::personality::Mode::Off,
+    );
+    tokio::pin!(download);
+    let controller = async {
+        while rate_limited.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        token.cancel();
+    };
+    let observation = async {
+        // Time is paused. This timeout is virtual and far below the 60+ second backoff.
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut download).await
+    };
+    let (prompt, ()) = tokio::join!(observation, controller);
+    let was_prompt = prompt.is_ok();
+    let result = match prompt {
+        Ok(result) => result,
+        Err(_) => download.await,
+    };
+    eprintln!(
+        "backoff observation: prompt={was_prompt}, requests={}, result={result:?}, retained={:?}",
+        client.call_count(),
+        std::fs::read(&part)
+    );
+    assert!(!final_path.exists());
+    assert!(was_prompt, "shutdown must interrupt retry backoff promptly");
+    assert_eq!(
+        client.call_count(),
+        1,
+        "cancelled retry must not fetch again"
+    );
+    assert!(matches!(
+        result,
+        Err(DownloadError::Interrupted {
+            bytes_written: 4,
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(&part).unwrap(), body[..4]);
+}
+
+struct ThrottledChunkClient {
+    delivered: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl DownloadClient for ThrottledChunkClient {
+    async fn fetch(
+        &self,
+        _url: &str,
+        resume_from: Option<u64>,
+    ) -> Result<DownloadResponse, BoxError> {
+        assert_eq!(resume_from, Some(4));
+        let delivered = Arc::clone(&self.delivered);
+        Ok(DownloadResponse {
+            status: 206,
+            content_length: Some(124),
+            content_range: Some("bytes 4-127/128".to_string()),
+            content_type: Some("image/jpeg".to_string()),
+            stream: Box::pin(futures_util::stream::once(async move {
+                delivered.notify_one();
+                Ok(Bytes::from(vec![0; 124]))
+            })),
+        })
+    }
+}
+
+#[tokio::test]
+async fn tactical_cancel_during_bandwidth_wait_is_prompt_and_preserves_part() {
+    let client = ThrottledChunkClient {
+        delivered: Arc::new(tokio::sync::Notify::new()),
+    };
+    let (final_path, part, _dir) = setup_download_dir("bandwidth", "jpg");
+    let initial = [0xff, 0xd8, 0xff, 0xe0];
+    std::fs::write(&part, initial).unwrap();
+    let limiter = BandwidthLimiter::new(1);
+    let token = CancellationToken::new();
+    let download = attempt_download(
+        &client,
+        "http://stub/bandwidth.jpg",
+        &final_path,
+        &part,
+        false,
+        Some(128),
+        Some(&limiter),
+        Some(&token),
+    );
+    tokio::pin!(download);
+    let cancel = async {
+        // Notification comes from polling the ready stream chunk. The same poll
+        // then enters consume(), before this controller can run.
+        client.delivered.notified().await;
+        token.cancel();
+    };
+    let observe =
+        async { tokio::time::timeout(std::time::Duration::from_secs(1), &mut download).await };
+    let (result, ()) = tokio::join!(observe, cancel);
+    assert!(!final_path.exists());
+    assert_eq!(std::fs::read(&part).unwrap(), initial);
+    eprintln!("bandwidth observation: {result:?}");
+    assert!(
+        matches!(
+            result,
+            Ok(Err(DownloadError::Interrupted {
+                bytes_written: 4,
+                ..
+            }))
+        ),
+        "cancellation must interrupt the 124-second bandwidth wait promptly"
+    );
+}
+
+#[tokio::test]
+async fn tactical_416_fresh_failure_is_bounded_and_retains_part() {
+    for fresh_status in [416, 503] {
+        let body = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
+        let client = EofRangeClient {
+            body: body.clone(),
+            requests: std::sync::Mutex::new(Vec::new()),
+            fresh_status,
+            fresh_content_type: "image/jpeg",
+        };
+        let dir = TempDir::new().unwrap();
+        let final_path = dir.path().join("failed-fresh.jpg");
+        let part = temp_download_path(&final_path, "AAAA", ".kei-tmp").unwrap();
+        std::fs::write(&part, &body).unwrap();
+        let result = download_file_with_mode(
+            &client,
+            "http://stub/failed-fresh.jpg",
+            &final_path,
+            "AAAA",
+            &RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            },
+            ".kei-tmp",
+            DownloadOpts {
+                skip_rename: false,
+                expected_size: Some(body.len() as u64),
+                publication: FinalPublication::NoReplace,
+            },
+            DownloadLimits::default(),
+            crate::personality::Mode::Off,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DownloadError::HttpStatus { status, .. }) if status == fresh_status)
+        );
+        assert_eq!(
+            *client.requests.lock().unwrap(),
+            vec![Some(body.len() as u64), None]
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), body);
+        assert!(!final_path.exists());
+    }
+}
+
+struct CancelBeforeResponseClient {
+    token: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl DownloadClient for CancelBeforeResponseClient {
+    async fn fetch(
+        &self,
+        _url: &str,
+        resume_from: Option<u64>,
+    ) -> Result<DownloadResponse, BoxError> {
+        assert_eq!(resume_from, Some(4));
+        self.token.cancel();
+        StubDownloadClient::ok(&[0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4])
+            .fetch("http://stub", None)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn tactical_cancelled_full_response_preserves_resume_before_truncation() {
+    let token = CancellationToken::new();
+    let client = CancelBeforeResponseClient {
+        token: token.clone(),
+    };
+    let (final_path, part, _dir) = setup_download_dir("cancel-response", "jpg");
+    let initial = [0xff, 0xd8, 0xff, 0xe0];
+    std::fs::write(&part, initial).unwrap();
+    let result = attempt_download(
+        &client,
+        "http://stub",
+        &final_path,
+        &part,
+        false,
+        Some(8),
+        None,
+        Some(&token),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(DownloadError::Interrupted {
+            bytes_written: 4,
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(&part).unwrap(), initial);
+    assert!(!final_path.exists());
+}
+
+#[tokio::test]
+async fn tactical_precancelled_transfer_does_not_fetch_or_reset_part() {
+    let client = RetryingStubClient::new(0, 503, vec![0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+    let (final_path, part, _dir) = setup_download_dir("cancel-before-fetch", "jpg");
+    let initial = [0xff, 0xd8, 0xff, 0xe0];
+    std::fs::write(&part, initial).unwrap();
+    let token = CancellationToken::new();
+    token.cancel();
+    let result = attempt_download(
+        &client,
+        "http://stub",
+        &final_path,
+        &part,
+        false,
+        Some(8),
+        None,
+        Some(&token),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(DownloadError::Interrupted {
+            bytes_written: 4,
+            ..
+        })
+    ));
+    assert_eq!(client.call_count(), 0);
+    assert_eq!(std::fs::read(&part).unwrap(), initial);
+    assert!(!final_path.exists());
+}
+
+#[tokio::test]
+async fn tactical_bandwidth_cancel_then_resume_reuses_refunded_limiter() {
+    let client = ThrottledChunkClient {
+        delivered: Arc::new(tokio::sync::Notify::new()),
+    };
+    let (final_path, part, _dir) = setup_download_dir("bandwidth-resume", "jpg");
+    let initial = [0xff, 0xd8, 0xff, 0xe0];
+    std::fs::write(&part, initial).unwrap();
+    let limiter = BandwidthLimiter::new(128);
+    let token = CancellationToken::new();
+    let download = attempt_download(
+        &client,
+        "http://stub",
+        &final_path,
+        &part,
+        false,
+        Some(128),
+        Some(&limiter),
+        Some(&token),
+    );
+    let cancel = async {
+        client.delivered.notified().await;
+        token.cancel();
+    };
+    let (result, ()) = tokio::join!(download, cancel);
+    assert!(matches!(
+        result,
+        Err(DownloadError::Interrupted {
+            bytes_written: 4,
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(&part).unwrap(), initial);
+    assert!(!final_path.exists());
+    let resumed = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        attempt_download(
+            &client,
+            "http://stub",
+            &final_path,
+            &part,
+            false,
+            Some(128),
+            Some(&limiter),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        resumed
+            .expect("cancelled reservation must be refunded before resuming")
+            .unwrap(),
+        128
+    );
+    let mut expected = initial.to_vec();
+    expected.resize(128, 0);
+    assert_eq!(std::fs::read(&final_path).unwrap(), expected);
+    assert!(!part.exists());
+}
+
+#[tokio::test]
+async fn tactical_416_rejected_fresh_content_type_preserves_retained_part() {
+    for content_type in ["text/html", "application/json"] {
+        let body = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
+        let client = EofRangeClient {
+            body: b"error document".to_vec(),
+            fresh_status: 200,
+            fresh_content_type: content_type,
+            requests: std::sync::Mutex::new(Vec::new()),
+        };
+        let dir = TempDir::new().unwrap();
+        let final_path = dir.path().join("rejected-fresh.jpg");
+        let part = temp_download_path(&final_path, "AAAA", ".kei-tmp").unwrap();
+        std::fs::write(&part, &body).unwrap();
+        let result = attempt_download(
+            &client,
+            "http://stub/rejected-fresh.jpg",
+            &final_path,
+            &part,
+            false,
+            Some(body.len() as u64),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(DownloadError::InvalidContent { .. })));
+        assert_eq!(
+            *client.requests.lock().unwrap(),
+            vec![Some(body.len() as u64), None]
+        );
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            body,
+            "a rejected fresh response must preserve retained bytes"
+        );
+        assert!(!final_path.exists());
+    }
+}

@@ -985,7 +985,7 @@ pub(crate) async fn run_cycle(
                 .get_metadata(&lib_state.sync_token_key)
                 .await?
                 .unwrap_or_default();
-            if legacy_cycle
+            if let Err(error) = legacy_cycle
                 .certify(
                     db,
                     &download_config,
@@ -995,11 +995,8 @@ pub(crate) async fn run_cycle(
                     shutdown_token,
                 )
                 .await
-                .is_err()
             {
-                tracing::debug!(
-                    "Legacy family has incomplete current evidence; retaining attribution checkpoint hold"
-                );
+                download::legacy_preservation::log_preservation_hold("certification", &error);
             }
         }
 
@@ -1206,7 +1203,8 @@ pub(crate) async fn run_cycle(
             };
             match qualified {
                 Ok(proofs) => legacy_proofs = proofs,
-                Err(_) => {
+                Err(error) => {
+                    download::legacy_preservation::log_preservation_hold("checkpoint", &error);
                     checkpoint_decision = SourceCheckpointDecision::Preserve {
                         reason: CheckpointHoldReason::LegacyPreservationIncomplete,
                         recovery: RecoveryAction::ReplayFromPriorToken,

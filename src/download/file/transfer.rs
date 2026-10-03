@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::download::error::DownloadError;
 use crate::download::limiter::BandwidthLimiter;
 use crate::fs_util::{ConfinedParents, ConfinedPath, file_identity};
-use crate::retry::{self, RetryAction, RetryConfig};
+use crate::retry::RetryConfig;
 
 use super::fingerprint::{ExistingFileFingerprint, fingerprint_open_file_snapshot_blocking};
 use super::publication::publish_part_to_final;
@@ -162,37 +162,75 @@ pub(in crate::download) async fn download_file_with_mode<C: DownloadClient>(
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
 
-    Box::pin(retry::retry_with_backoff_with_mode(
-        retry_config,
-        |e: &DownloadError| {
-            if e.is_rate_limited()
-                && let Some(counter) = limits.rate_limit_counter
-            {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Keep cancellation at retry pauses, outside filesystem writes whose
+    // completion must be observed before retaining or publishing the part.
+    let total_attempts = retry_config.max_retries.saturating_add(1);
+    let mut attempt = 0;
+    loop {
+        let result = Box::pin(attempt_download_with_publication(
+            client,
+            url,
+            download_path,
+            &part_path,
+            opts.skip_rename,
+            opts.expected_size,
+            limits.bandwidth_limiter,
+            limits.shutdown_token,
+            opts.publication,
+        ))
+        .await;
+        let error = match result {
+            Ok(download) => {
+                if attempt > 0 {
+                    crate::personality::narration::back_on_track_to_stderr(mode);
+                }
+                return Ok(download);
             }
-            if e.is_retryable() {
-                RetryAction::Retry
-            } else {
-                RetryAction::Abort
+            Err(error) => error,
+        };
+        if error.is_rate_limited()
+            && let Some(counter) = limits.rate_limit_counter
+        {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !error.is_retryable() {
+            return Err(error);
+        }
+        if attempt + 1 >= total_attempts {
+            if attempt > 0 {
+                crate::personality::narration::giving_up_to_stderr(mode);
             }
-        },
-        || async {
-            Box::pin(attempt_download_with_publication(
-                client,
-                url,
-                download_path,
-                &part_path,
-                opts.skip_rename,
-                opts.expected_size,
-                limits.bandwidth_limiter,
-                limits.shutdown_token,
-                opts.publication,
-            ))
-            .await
-        },
-        mode,
-    ))
-    .await
+            return Err(error);
+        }
+        let delay = retry_config.delay_for_retry(attempt);
+        tracing::warn!(
+            attempt = attempt + 1,
+            total_attempts,
+            retry_delay_secs = delay.as_secs(),
+            error = %error,
+            "Retryable error, retrying"
+        );
+        crate::personality::narration::retry_pause_to_stderr(mode, delay);
+        if let Some(token) = limits.shutdown_token {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => {
+                    // This only reports retained bytes; never follows a changed
+                    // symlink or uses this pathname as publication evidence.
+                    let bytes_written = fs::symlink_metadata(&part_path).await
+                        .ok().filter(std::fs::Metadata::is_file)
+                        .map_or(0, |meta| meta.len());
+                    return Err(DownloadError::Interrupted {
+                        path: download_path.display().to_string().into(), bytes_written,
+                    });
+                }
+                () = tokio::time::sleep(delay) => {}
+            }
+        } else {
+            tokio::time::sleep(delay).await;
+        }
+        attempt += 1;
+    }
 }
 
 /// Single download attempt with resume support.
@@ -262,8 +300,10 @@ async fn attempt_download_with_publication<C: DownloadClient>(
     .await
     .map_err(|e| DownloadError::Other(e.into()))??;
     let resume_file = resume_file.map(tokio::fs::File::from_std);
+    let mut retained_bytes = 0;
     let resume_offset = if let Some(file) = &resume_file {
         let meta = file.metadata().await?;
+        retained_bytes = meta.len();
         let stale = match meta.modified() {
             Ok(mtime) => {
                 mtime.elapsed().unwrap_or(std::time::Duration::ZERO)
@@ -299,16 +339,45 @@ async fn attempt_download_with_publication<C: DownloadClient>(
         None
     };
 
-    let response = client
-        .fetch(url, resume_from)
-        .await
-        .map_err(|e| DownloadError::Http {
-            source: e,
-            path: path_str.clone().into(),
-            status: 0,
-            content_length: None,
-            bytes_written: 0,
-        })?;
+    let check_shutdown = || {
+        if shutdown_token.is_some_and(CancellationToken::is_cancelled) {
+            Err(DownloadError::Interrupted {
+                path: path_str.clone().into(),
+                bytes_written: retained_bytes,
+            })
+        } else {
+            Ok(())
+        }
+    };
+    check_shutdown()?;
+    let fetch = |offset| {
+        let path_str = &path_str;
+        async move {
+            client
+                .fetch(url, offset)
+                .await
+                .map_err(|source| DownloadError::Http {
+                    source,
+                    path: path_str.clone().into(),
+                    status: 0,
+                    content_length: None,
+                    bytes_written: 0,
+                })
+        }
+    };
+    let mut response = fetch(resume_from).await?;
+    check_shutdown()?;
+    // A complete retained part can produce bytes=N- and 416 after interruption.
+    // Retry once without Range, keeping the retained file until a successful
+    // response is accepted. A second 416 remains an ordinary terminal error.
+    let retry_without_range = response.status == 416 && resume_from.is_some();
+    let resume_offset = if retry_without_range {
+        response = fetch(None).await?;
+        check_shutdown()?;
+        0
+    } else {
+        resume_offset
+    };
 
     let status = response.status;
     let is_success = (200..300).contains(&status);
@@ -337,14 +406,15 @@ async fn attempt_download_with_publication<C: DownloadClient>(
         }
     };
 
-    // Reject content types that prove the body is an error document before
-    // writing to disk. Delete any stale .part file so the next successful
-    // attempt starts fresh rather than appending to data from a previous
-    // (possibly different) response.
+    // Reject error documents before writing. A rejected fresh response after
+    // 416 supplies no replacement bytes, so keep the retained part for retry.
+    // Other responses retain the existing cleanup policy for stale parts.
     if let Some(ct) = &response.content_type
         && let Some(reason) = rejecting_content_type_reason(ct)
     {
-        crate::fs_util::log_remove_async(part_path).await;
+        if !retry_without_range {
+            crate::fs_util::log_remove_async(part_path).await;
+        }
         return Err(DownloadError::InvalidContent {
             path: path_str.into(),
             reason: format!("server returned {reason} content-type: {ct}").into(),
@@ -370,6 +440,7 @@ async fn attempt_download_with_publication<C: DownloadClient>(
     // The offset and writes use the same no-follow regular-file handle.
     // Never reopen a resumed pathname after the request has been sent.
     let file = if truncate {
+        check_shutdown()?;
         drop(resume_file);
         crate::fs_util::log_remove_async(part_path).await;
         // Preserve fresh-download permissions and exclusive creation. create_new
@@ -433,7 +504,16 @@ async fn attempt_download_with_publication<C: DownloadClient>(
                 bytes_written,
             })?;
             if let Some(limiter) = bandwidth_limiter {
-                limiter.consume(chunk.len()).await;
+                if let Some(token) = shutdown_token {
+                    if !limiter.consume_or_cancel(chunk.len(), token).await {
+                        return Err(DownloadError::Interrupted {
+                            path: path_str.clone().into(),
+                            bytes_written,
+                        });
+                    }
+                } else {
+                    limiter.consume(chunk.len()).await;
+                }
             }
             file.write_all(&chunk).await?;
             bytes_written += chunk.len() as u64;
