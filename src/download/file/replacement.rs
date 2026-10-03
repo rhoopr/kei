@@ -175,6 +175,11 @@ fn replace_file_if_unchanged_blocking(
             paths: vec![part_path.to_path_buf()],
         });
     }
+    // Pin the existing fallback lane only in dedicated subprocess tests.
+    #[cfg(all(test, target_os = "linux"))]
+    if crate::test_helpers::process_death_force_journal() {
+        return super::replacement_recovery::publish(part_path, final_path, expected, replacement);
+    }
     let displaced_path = match exchange_repair_files_blocking(part_path, final_path, expected) {
         Ok(displaced_path) => displaced_path,
         #[cfg(target_os = "linux")]
