@@ -270,7 +270,9 @@ capture-owned cursors, durable catalog selection and separate progress remain
 later stages. Historical-version retention, unrecoverable-debt acknowledgment,
 epoch recovery and compaction still require explicit policy and support proof.
 The additive migration preserves existing rows and uses the migration owner's
-savepoint; older binaries supporting only schema 28 must refuse this database.
+savepoint. Re-entry validates the table columns, primary keys and replay key;
+a conflicting unknown table fails without partial schema or version changes.
+Older binaries supporting only schema 28 must refuse this database.
 
 ### Sync and provider checkpoints
 

@@ -154,6 +154,12 @@ async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_p
     let bound = album(body.clone(), capture(&db));
     assert_eq!(collect(&bound.clone()).await, baseline);
     assert_eq!(counts(&db), (1, 5, 1));
+    // Synthetic version rewind exercises migration re-entry with observations
+    // already present, as the established earlier-version controls do.
+    db.acquire_lock("synthetic migration re-entry")
+        .unwrap()
+        .pragma_update(None, "user_version", 28)
+        .unwrap();
     drop(bound);
     drop(db);
     for _ in 0..2 {

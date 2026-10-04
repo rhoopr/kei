@@ -431,8 +431,10 @@ with unresolved checkpoint evidence, recovery under the existing gate and a
 quiet repeat. Media remains intact and no cycle publishes another file. The
 actual CLI startup control captures an unknown source through normal library
 resolution without manually attaching an album. The schema-28 migration fault
-control retains source cursors, debt and an unknown BLOB, rolls back partial DDL,
-then retries and reopens schema 29 twice. Released-schema history fixtures also
+control retains source cursors, debt and an unknown BLOB in a conflicting table
+with matching columns but no durable key. It rolls back partial DDL, then retries
+and reopens schema 29 twice. Payload replay also retains existing observations
+through synthetic migration re-entry. Released-schema history fixtures also
 retain their independent row, media and checkpoint assertions.
 
 Reversible negative controls replace original bytes with typed JSON, remove the

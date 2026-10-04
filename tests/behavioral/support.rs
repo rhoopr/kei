@@ -97,7 +97,7 @@ pub(super) fn create_state_db(data_dir: &std::path::Path, username: &str) -> rus
     conn.execute_batch(
         r"
 
-CREATE TABLE provider_shadow_pages (
+CREATE TABLE IF NOT EXISTS provider_shadow_pages (
     id INTEGER PRIMARY KEY,
     account_key TEXT NOT NULL,
     provider_key TEXT NOT NULL,
@@ -111,7 +111,7 @@ CREATE TABLE provider_shadow_pages (
     observed_at INTEGER NOT NULL,
     UNIQUE(scope,request_cursor,body_hash)
 );
-CREATE TABLE provider_shadow_records (
+CREATE TABLE IF NOT EXISTS provider_shadow_records (
     page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id),
     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
     record_name TEXT NOT NULL CHECK(length(trim(record_name)) > 0),
@@ -119,7 +119,7 @@ CREATE TABLE provider_shadow_records (
     deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
     PRIMARY KEY(page_id,ordinal)
 ) WITHOUT ROWID;
-CREATE TABLE provider_shadow_receipts (
+CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     scope TEXT PRIMARY KEY,
     page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id)
 ) WITHOUT ROWID;

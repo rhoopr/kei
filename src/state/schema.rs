@@ -12,7 +12,7 @@ pub(crate) const SCHEMA_VERSION: i32 = 29;
 fn migrate_provider_shadow_inbox(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(
         r"
-CREATE TABLE provider_shadow_pages (
+CREATE TABLE IF NOT EXISTS provider_shadow_pages (
     id INTEGER PRIMARY KEY,
     account_key TEXT NOT NULL,
     provider_key TEXT NOT NULL,
@@ -26,7 +26,7 @@ CREATE TABLE provider_shadow_pages (
     observed_at INTEGER NOT NULL,
     UNIQUE(scope,request_cursor,body_hash)
 );
-CREATE TABLE provider_shadow_records (
+CREATE TABLE IF NOT EXISTS provider_shadow_records (
     page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id),
     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
     record_name TEXT NOT NULL CHECK(length(trim(record_name)) > 0),
@@ -34,12 +34,32 @@ CREATE TABLE provider_shadow_records (
     deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
     PRIMARY KEY(page_id,ordinal)
 ) WITHOUT ROWID;
-CREATE TABLE provider_shadow_receipts (
+CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     scope TEXT PRIMARY KEY,
     page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id)
 ) WITHOUT ROWID;
 ",
     )?;
+    // Re-entry retains existing observations. A conflicting unknown table must
+    // fail validation inside the migration savepoint instead of being adopted.
+    conn.prepare("SELECT id,account_key,provider_key,scope,request_cursor,successor,more_coming,body_hash,body,charged_bytes,observed_at FROM provider_shadow_pages LIMIT 0")?;
+    conn.prepare("SELECT page_id,ordinal,record_name,record_type,deleted FROM provider_shadow_records LIMIT 0")?;
+    conn.prepare("SELECT scope,page_id FROM provider_shadow_receipts LIMIT 0")?;
+    for (table, expected) in [
+        ("provider_shadow_pages", &["id"][..]),
+        ("provider_shadow_records", &["page_id", "ordinal"][..]),
+        ("provider_shadow_receipts", &["scope"][..]),
+    ] {
+        let actual: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?
+            .query_map([table], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        if actual != expected {
+            return Err(StateError::ProviderInboxInvalid);
+        }
+    }
+    // Preparing the conflict target also verifies the replay uniqueness key.
+    conn.prepare("INSERT INTO provider_shadow_pages(scope,request_cursor,body_hash) VALUES (?1,?2,?3) ON CONFLICT(scope,request_cursor,body_hash) DO NOTHING")?;
     Ok(())
 }
 
@@ -982,7 +1002,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            conn.execute_batch("INSERT INTO metadata(key,value) VALUES('sync_token:PrimarySync','saved'),('pending_sync_token:old:PrimarySync','debt'); CREATE TABLE future_unknown(payload BLOB); INSERT INTO future_unknown VALUES(X'00FF07'); CREATE TABLE provider_shadow_receipts(future_unknown BLOB); INSERT INTO provider_shadow_receipts VALUES(X'0011FF');").unwrap();
+            conn.execute_batch("INSERT INTO metadata(key,value) VALUES('sync_token:PrimarySync','saved'),('pending_sync_token:old:PrimarySync','debt'); CREATE TABLE future_unknown(payload BLOB); INSERT INTO future_unknown VALUES(X'00FF07'); CREATE TABLE provider_shadow_receipts(scope TEXT,page_id INTEGER,future_unknown BLOB); INSERT INTO provider_shadow_receipts(future_unknown) VALUES(X'0011FF');").unwrap();
         }
         assert!(
             crate::state::SqliteStateDb::open_owned(&path, &owner)
