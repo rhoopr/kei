@@ -318,10 +318,16 @@ fn copy_and_bind_legacy(
         return Err(StateError::AccountMigrationInvalid);
     }
     drop(output);
-    let file = std::fs::File::open(stage).map_err(|source| StateError::TempPath {
-        path: stage.to_path_buf(),
-        source,
-    })?;
+    // Windows FlushFileBuffers requires write access. This private stage is
+    // opened without creation or truncation; the legacy source stays read-only.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(stage)
+        .map_err(|source| StateError::TempPath {
+            path: stage.to_path_buf(),
+            source,
+        })?;
     file.sync_all().map_err(|source| StateError::TempPath {
         path: stage.to_path_buf(),
         source,
