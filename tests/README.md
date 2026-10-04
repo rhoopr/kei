@@ -387,6 +387,22 @@ checksum, and temporary-entry count. A historical prepared file stays intact.
 These tests model terminal failures on local storage. They do not prove an NFS
 silly-rename mechanism or physical NAS behavior.
 
+## Strict changes/zone pages
+
+`normal_changes_rejects_entire_malformed_page_before_emission` exercises missing,
+null and non-array records, zone cardinality and owner scope, mixed nested record
+errors, and unusable tokens. Continuation-cycle and valid empty/unknown-record
+controls run beside it. Both incremental consumer strategies reject a malformed
+later page through their production entry point.
+
+`run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_restart`
+seeds file-backed SQLite with a checkpoint, downloaded media and pending retry
+work. It rejects a later wrongly scoped page, reopens the database between cycles,
+checks a quiet provider delta and the watch local-work bypass, resolves the retry
+with explicit provider deletion evidence, then checks an unchanged cycle. Existing
+media bytes remain intact and no cycle publishes another file. The synthetic
+fallback cannot provide authoritative completion during the malformed cycle.
+
 ## State-transition proof
 
 Changes to durable configuration, filesystem paths, media publication,
