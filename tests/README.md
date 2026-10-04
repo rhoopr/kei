@@ -449,6 +449,24 @@ proves legacy refusal, then uses a synthetic owner fixture to test application
 schema upgrades; that fixture is not attributed to real authentication or
 adoption. No provider credentials or reporter data are used.
 
+The overlapping-account CLI matrix seeds distinct catalogues, retries,
+publication receipts and checkpoints under equal zone/asset IDs. It exercises
+status, manifest, verify, reconcile, doctor, import-existing, sync and both
+state/token resets with correct owners and a deliberately misbound database.
+Each correct-owner command preserves the other account's rows, database bytes
+and media. Equal provider pins do not implicitly merge different login strings.
+A separate adopted, owned database runs two production quiet sync cycles across
+reopen with its original media, cursor, master mapping and receipt intact.
+
+On Linux, the real adoption owner pauses a disposable subprocess before backup,
+after the SQLite copy, after stage fsync, after publication and after directory
+fsync. The parent sends SIGKILL, checks committed source WAL and unknown rows,
+then retries unpublished copies or reopens the complete published target twice.
+An interrupted private stage is preserved; after publication it shares the
+canonical database inode. This proves process-interruption recovery, not
+power-loss durability or automatic orphan cleanup. Other platforms run the
+owner, CLI and quiet-cycle tests without the Linux SIGKILL matrix.
+
 ## Running
 
 Choose the route by purpose:
