@@ -535,6 +535,16 @@ existing state without claiming an owner. Cleanup retries carry the child
 record name and reapply the state ID selected by the first pass before they
 rebuild download tasks.
 
+The iCloud adapter validates a complete changes/zone page before pairing records,
+invoking hydration callbacks, or accepting its successor. A page must contain one
+zone matching the requested name and any requested owner, an explicit records
+array without record errors, and a nonblank token. Continuing pages must use a
+new cursor. An empty terminal page may return the request cursor. Rejection
+emits no records from that page; earlier accepted pages remain replayable from
+the durable checkpoint. These checks also protect raw hydration and source
+change validation. Source change validation retains its stricter record identity
+and cancellation requirements. Diagnostics omit provider cursors and identifiers.
+
 Incremental enumeration consumes changes/zone events. It persists provider
 identity mappings before applying created, soft-deleted, hard-deleted, or
 hidden transitions. An asset-only `CPLAsset` creation hydrates its paired

@@ -1642,3 +1642,190 @@ async fn full_checkpoint_pilot_advances_with_durable_transfer_failure() {
     assert_eq!(summary.pending + summary.failed, 1);
     assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
 }
+
+#[derive(Clone)]
+struct ValidatedPageCycleSession {
+    phase: u8,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for ValidatedPageCycleSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        use serde_json::json;
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if url.contains("/changes/zone?") {
+            let token = body["zones"][0]["syncToken"].as_str().unwrap_or("");
+            self.requests.lock().unwrap().push(token.to_owned());
+            let (records, successor, more) = match (self.phase, token) {
+                (0, "saved") => (
+                    json!([{ "recordName": "unrelated-source", "recordType": null, "deleted": true }]),
+                    "accepted-page",
+                    true,
+                ),
+                (0, _) => {
+                    return Ok(json!({"zones": [{
+                        "zoneID": {"zoneName": "WrongZone"}, "records": [],
+                        "syncToken": "rejected-successor", "moreComing": false
+                    }]}));
+                }
+                (1, _) => (json!([]), "saved", false),
+                (2, _) => (
+                    json!([{"recordName": "DEBT", "recordType": null, "deleted": true}]),
+                    "recovered",
+                    false,
+                ),
+                _ => (json!([]), "recovered", false),
+            };
+            return Ok(json!({"zones": [{"zoneID": {"zoneName": "PrimarySync"},
+                "records": records, "syncToken": successor, "moreComing": more}]}));
+        }
+        if url.contains("/records/lookup?") {
+            return Ok(if self.phase < 2 {
+                json!({"records": []})
+            } else {
+                json!({"records": [{
+                    "recordName": "DEBT", "serverErrorCode": "UNKNOWN_ITEM"
+                }]})
+            });
+        }
+        if self.phase == 0 {
+            anyhow::bail!("No authoritative fallback fixture");
+        }
+        if url.contains("/internal/records/query/batch?") {
+            return Ok(album_count_response(0));
+        }
+        Ok(json!({"records": [], "syncToken": if self.phase == 1 {"saved"} else {"recovered"}}))
+    }
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_restart() {
+    let config = make_run_cycle_config();
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.db");
+    let media = dir.path().join("historical.jpg");
+    tokio::fs::write(&media, b"historical media remains intact")
+        .await
+        .unwrap();
+    {
+        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        db.set_metadata("sync_token:PrimarySync", "saved")
+            .await
+            .unwrap();
+        db.set_metadata(
+            ENUM_CONFIG_HASH_KEY,
+            &download::compute_config_hash(&config),
+        )
+        .await
+        .unwrap();
+        db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("asset-HISTORY").build())
+            .await
+            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "asset-HISTORY",
+            "original",
+            &media,
+            "historical-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-HISTORY", "master-HISTORY")
+            .await
+            .unwrap();
+        db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("DEBT").build())
+            .await
+            .unwrap();
+    }
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    for phase in 0..4 {
+        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let library = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_full_album_with_boxed_session(
+                "PrimarySync",
+                Box::new(ValidatedPageCycleSession {
+                    phase,
+                    requests: requests.clone(),
+                }),
+            ),
+        );
+        if phase == 1 {
+            inner
+                .set_metadata(&state::unresolved_identity_key("PrimarySync"), "1")
+                .await
+                .unwrap();
+            let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
+            crate::sync_loop::precheck::include_pending_local_work(
+                &mut precheck,
+                inner.as_ref(),
+                &config.metadata,
+                std::slice::from_ref(&library),
+            )
+            .await;
+            assert!(precheck.should_sync_zone("PrimarySync"));
+        }
+        let builder = make_run_cycle_download_config_builder(dir.path(), db.clone());
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let summary = inner.get_summary().await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&media).await.unwrap(),
+            b"historical media remains intact"
+        );
+        assert_eq!(summary.downloaded, 1, "phase {phase}");
+        assert_eq!(result.stats.downloaded, 0, "phase {phase}");
+        let cursor = inner
+            .get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .unwrap();
+        if phase < 2 {
+            assert_eq!(cursor, "saved", "phase {phase}");
+            assert_eq!(
+                summary.pending + summary.failed,
+                1,
+                "phase {phase}: {summary:?}"
+            );
+            assert_eq!(summary.source_deleted, 0);
+            assert!(
+                !result.can_advance_database_checkpoint(),
+                "phase {phase}: {result:?}"
+            );
+        } else {
+            assert_eq!(cursor, "recovered", "phase {phase}");
+            assert_eq!(summary.pending, 0);
+            assert_eq!(summary.source_deleted, 1);
+            assert!(result.db_sync_token_advance_safe, "phase {phase}");
+        }
+        if phase == 0 {
+            assert_eq!(*requests.lock().unwrap(), ["saved", "accepted-page"]);
+        }
+        if phase == 3 {
+            assert!(result.stats.full_enumeration_reason.is_none());
+        }
+    }
+}

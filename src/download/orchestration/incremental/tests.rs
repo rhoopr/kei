@@ -2457,3 +2457,71 @@ async fn shared_delta_state_streaming_receiver_drop_keeps_completion_uncommitted
     assert!(db.get_pending().await.unwrap().is_empty());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
+    for collecting in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        db.set_metadata("sync_token:PrimarySync", "saved")
+            .await
+            .unwrap();
+        let rejected = incremental_photo_records_with_url(
+            "REJECTED_PAGE",
+            "rejected.jpg",
+            "https://example.invalid/rejected.jpg",
+            1024,
+        );
+        let page = |records: Vec<serde_json::Value>, token: &str, more: bool| {
+            json!({
+                "zones": [{"zoneID": {"zoneName": "PrimarySync"}, "records": records,
+                    "syncToken": token, "moreComing": more}]
+            })
+        };
+        let mut bad = page(rejected, "rejected-successor", false);
+        bad["zones"][0]["records"].as_array_mut().unwrap().push(json!({
+            "recordName": "errored-unknown", "recordType": "FutureType", "serverErrorCode": "UNKNOWN_ITEM"
+        }));
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                crate::test_helpers::MockPhotosSession::new()
+                    .ok(page(vec![], "accepted-page", true))
+                    .ok(bad),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = incremental_test_config(&dir);
+        config.state_db = Some(db.clone());
+        config.recent = collecting.then_some(10);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &[pass],
+            &Arc::new(config),
+            "saved",
+            DownloadControls {
+                run_mode: DownloadRunMode::PrintFilenames,
+                reporting: DownloadReporting::hidden(),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "collecting={collecting}: malformed page completed"
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("saved")
+        );
+        assert!(db.get_all_known_ids().await.unwrap().is_empty());
+    }
+}
