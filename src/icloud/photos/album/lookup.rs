@@ -191,6 +191,8 @@ pub(crate) struct RecordResolutionBatch {
     pub(crate) results: Vec<(ProviderRecordId, RecordResolution)>,
     pub(crate) complete: bool,
     pub(crate) rate_limit_observations: usize,
+    /// Local response observation for each present resource, not provider issuance or expiry.
+    pub(crate) url_observed_at: FxHashMap<ProviderRecordId, std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -222,6 +224,21 @@ fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
     }
 }
 
+// Missing optional zone fields inherit the authenticated lookup request scope.
+// Every supplied field, including an owner, must agree. A bare or malformed
+// zone cannot redirect lookup to another account or library.
+fn lookup_zone_matches(actual: &Value, expected: &Value) -> bool {
+    actual.as_object().is_some_and(|fields| {
+        fields
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
+            && fields
+                .iter()
+                .all(|(key, value)| expected.get(key) == Some(value))
+    })
+}
+
 // Multiple provider records can map to one durable state identity. Merge them
 // conservatively: a present sibling resolves the work, a missing master proves
 // family deletion, and any inconclusive sibling blocks child-only deletion.
@@ -245,6 +262,7 @@ impl PhotoAlbum {
         let mut results = Vec::with_capacity(requests.len());
         let mut identity_diagnostics = std::collections::BTreeMap::new();
         let mut rate_limit_observations = 0usize;
+        let mut url_observed_at = FxHashMap::default();
         let url = format!(
             "{}/records/lookup?{}",
             self.service_endpoint,
@@ -295,6 +313,7 @@ impl PhotoAlbum {
                 }
             };
 
+            let observed_at = std::time::Instant::now();
             let Some(response_records) = response.get("records").and_then(Value::as_array) else {
                 crate::metrics::record_targeted_lookup("transient_failure", batch.len());
                 results.extend(batch.iter().map(|request| {
@@ -346,7 +365,26 @@ impl PhotoAlbum {
 
                 let primary_deleted = explicit_not_found(master) || tombstoned(master);
                 let asset_deleted = explicit_not_found(asset) || tombstoned(asset);
-                let resolution = if primary_deleted || asset_deleted {
+                let scoped = |record: Option<&Value>| {
+                    record.is_none_or(|record| {
+                        record
+                            .get("zoneID")
+                            .is_none_or(|zone| lookup_zone_matches(zone, self.zone_id.as_ref()))
+                            && record
+                                .pointer("/fields/masterRef/value/zoneID")
+                                .is_none_or(|zone| lookup_zone_matches(zone, self.zone_id.as_ref()))
+                    })
+                };
+                let pair_matches = asset_deleted
+                    || asset.is_none_or(|record| {
+                        record
+                            .pointer("/fields/masterRef/value/recordName")
+                            .and_then(Value::as_str)
+                            == Some(request.master_record_name.as_str())
+                    });
+                let resolution = if !scoped(master) || !scoped(asset) || !pair_matches {
+                    RecordResolution::Unknown
+                } else if primary_deleted || asset_deleted {
                     RecordResolution::Deleted {
                         deleted_at,
                         master_family: primary_deleted
@@ -439,6 +477,11 @@ impl PhotoAlbum {
                     }
                     RecordResolution::TransientFailure(_) => "transient_failure",
                 };
+                if matches!(resolution, RecordResolution::Present(_)) {
+                    url_observed_at
+                        .entry(request.state_id.clone())
+                        .or_insert(observed_at);
+                }
                 crate::metrics::record_targeted_lookup(outcome, 1);
                 results.push((request.state_id.clone(), resolution));
             }
@@ -494,6 +537,7 @@ impl PhotoAlbum {
 
         RecordResolutionBatch {
             results: grouped,
+            url_observed_at,
             complete,
             rate_limit_observations,
         }

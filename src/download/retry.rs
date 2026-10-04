@@ -419,6 +419,7 @@ impl PendingRetryPlanning<'_> {
                     RetryTaskKey::from(task),
                     UrlRetrySource {
                         asset_record_name: asset.asset_record_name_arc(),
+                        master_record_name: Arc::from(asset.id()),
                         pass_index,
                     },
                 );
@@ -516,7 +517,6 @@ async fn set_verification_for_state_id(
 pub(super) struct PendingRetryPlan {
     pub(super) tasks: Vec<DownloadTask>,
     pub(super) retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource>,
-    pub(super) pass_configs: Vec<Arc<DownloadConfig>>,
     pub(super) unmatched_targets: Vec<PendingRetryTarget>,
     pub(super) requested: usize,
     pub(super) identity_incomplete: bool,
@@ -1157,7 +1157,6 @@ pub(super) async fn build_pending_retry_download_tasks(
     Ok(PendingRetryPlan {
         tasks,
         retry_sources,
-        pass_configs,
         unmatched_targets: pending_targets.into_iter().collect(),
         requested,
         identity_incomplete,

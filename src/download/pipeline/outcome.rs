@@ -553,6 +553,8 @@ pub(in crate::download) async fn build_download_result(
 
     let phase2_rate_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pass_config = PassConfig {
+        prior_auth_errors: auth_errors,
+        url_obtained_at: retry_plan.url_obtained_at,
         client: download_client,
         retry_config: &config.retry,
         metadata: MetadataFlags::from(config.as_ref()),

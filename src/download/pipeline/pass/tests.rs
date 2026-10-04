@@ -21,6 +21,8 @@ fn pass_config_debug_keeps_runtime_handles_out_of_output() {
     let client = reqwest::Client::new();
     let retry_config = RetryConfig::default();
     let config = PassConfig {
+        prior_auth_errors: 0,
+        url_obtained_at: Default::default(),
         client: &client,
         retry_config: &retry_config,
         metadata: MetadataFlags::DATETIME | MetadataFlags::DESCRIPTION,
@@ -95,6 +97,8 @@ fn test_run_download_pass_skips_all_tasks_when_cancelled() {
                     let retry = RetryConfig::default();
 
                     let pass_config = PassConfig {
+                        prior_auth_errors: 0,
+                        url_obtained_at: Default::default(),
                         client: &client,
                         retry_config: &retry,
                         metadata: MetadataFlags::default(),
@@ -109,7 +113,11 @@ fn test_run_download_pass_skips_all_tasks_when_cancelled() {
                         library: std::sync::Arc::from("PrimarySync"),
                     };
                     let result = run_download_pass(pass_config, tasks).await;
-                    assert!(result.failed.is_empty());
+                    assert_eq!(
+                        result.failed.len(),
+                        2,
+                        "cancelled dispatch must retain every task"
+                    );
                 });
         })
         .unwrap()
@@ -153,6 +161,8 @@ fn test_run_download_pass_processes_tasks_when_not_cancelled() {
                     };
 
                     let pass_config = PassConfig {
+                        prior_auth_errors: 0,
+                        url_obtained_at: Default::default(),
                         client: &client,
                         retry_config: &retry,
                         metadata: MetadataFlags::default(),
@@ -219,6 +229,8 @@ async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
 
     let result = run_download_pass(
         PassConfig {
+            prior_auth_errors: 0,
+            url_obtained_at: Default::default(),
             client: &client,
             retry_config: &retry,
             metadata: MetadataFlags::default(),
@@ -275,7 +287,9 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
         .await;
 
     let dir = TempDir::new().unwrap();
-    let db = Arc::new(FailingDownloadStore::new(usize::MAX / 2));
+    let mut store = FailingDownloadStore::new(usize::MAX / 2);
+    store.track_failed_calls = true;
+    let db = Arc::new(store);
     let state_db: Arc<dyn DownloadStore> = db.clone();
     let client = Client::new();
     let retry = RetryConfig {
@@ -304,6 +318,8 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
 
     let result = run_download_pass(
         PassConfig {
+            prior_auth_errors: 0,
+            url_obtained_at: Default::default(),
             client: &client,
             retry_config: &retry,
             metadata: MetadataFlags::default(),
@@ -322,6 +338,12 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
     .await;
 
     assert_eq!(result.state_write_failures, STATE_DB_UNWRITABLE_THRESHOLD);
+    assert_eq!(
+        result.failed.len(),
+        3,
+        "queued work remains explicit after the state circuit opens"
+    );
+    assert_eq!(db.failed_call_count(), 3);
     assert_eq!(db.success_count(), 0);
     assert!(
         db.call_count() > STATE_DB_UNWRITABLE_THRESHOLD,

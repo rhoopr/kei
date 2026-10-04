@@ -353,16 +353,28 @@ async fn attempt_download_with_publication<C: DownloadClient>(
     let fetch = |offset| {
         let path_str = &path_str;
         async move {
-            client
-                .fetch(url, offset)
-                .await
-                .map_err(|source| DownloadError::Http {
-                    source,
-                    path: path_str.clone().into(),
-                    status: 0,
-                    content_length: None,
-                    bytes_written: 0,
-                })
+            let request = client.fetch(url, offset);
+            let response = if let Some(token) = shutdown_token {
+                tokio::select! {
+                    biased;
+                    () = token.cancelled() => {
+                        return Err(DownloadError::Interrupted {
+                            path: path_str.clone().into(),
+                            bytes_written: retained_bytes,
+                        });
+                    }
+                    response = request => response,
+                }
+            } else {
+                request.await
+            };
+            response.map_err(|source| DownloadError::Http {
+                source,
+                path: path_str.clone().into(),
+                status: 0,
+                content_length: None,
+                bytes_written: 0,
+            })
         }
     };
     let mut response = fetch(resume_from).await?;

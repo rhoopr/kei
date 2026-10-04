@@ -546,6 +546,29 @@ outcome. Refresh rate-limit observations contribute to the cycle count even
 when provider retries are exhausted. The `expired_url_refresh_failed` diagnostic
 reports failure, authentication, and rate-limit counts without provider details.
 
+Collecting incremental preflight and expiry recovery use the same bounded
+child/master lookup owner. The authenticated session and exact requested zone
+scope each lookup. Explicit zone/owner evidence and child/master references
+must agree; incremental recovery also pins the originally selected master.
+Refresh changes only the URL when child, master, rendition, provider checksum
+and size still agree. Unmatched resources retain durable failure work; expiry
+and lookup absence never authorize deletion. No zone enumeration, path
+replanning, or cross-instance mapping import is used for URL refresh.
+
+Explicit-task passes isolate CDN expiry to the failed resource so healthy
+peers finish, including the single cleanup retry. Authentication thresholds,
+user shutdown and fatal state-write failures still stop dispatch. Interrupted
+and queued unfinished tasks remain in the returned failure debt and are
+persisted before checkpoint decisions. Only successful exact tasks retire retry
+debt. A collecting pass makes at most one expiry refresh and retry after its
+optional aged-URL preflight. Failed resources stay durable for the next cycle.
+
+Refresh logs record phase start/completion, counts and elapsed time. Refreshed
+resources carry their lookup-observation time into worker dispatch for a DEBUG
+age measurement. The first enumeration observation is labelled separately;
+it does not measure a refreshed URL's age. Neither observation establishes
+provider issuance time or expiry, which remain unknown.
+
 Full enumeration streams records/query results and gathers a provider token
 from every active pass. Natural stream completion and usable, unanimous pass
 tokens are the authoritative proof. Count probes and pagination differences
