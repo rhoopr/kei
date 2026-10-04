@@ -171,7 +171,12 @@ impl Respond for OfflinePhotos {
         let label = path.split('/').nth(1).unwrap();
         let value = if path.ends_with("/zones/list") {
             json!({"zones":[]})
-        } else if body["query"]["recordType"] == "CheckIndexingState" {
+        } else if body
+            .get("query")
+            .and_then(|query| query.get("recordType"))
+            .and_then(Value::as_str)
+            == Some("CheckIndexingState")
+        {
             json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]})
         } else if path.ends_with("/changes/zone") {
             json!({"zones":[{"zoneID":{"zoneName":"PrimarySync"},"syncToken":format!("{label}-cursor"),"moreComing":false,"records":[]}]})
