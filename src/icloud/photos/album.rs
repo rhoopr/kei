@@ -82,6 +82,7 @@ pub struct PhotoAlbumConfig {
 }
 
 pub struct PhotoAlbum {
+    shadow_capture: Option<(super::inbox::ShadowCapture, Arc<str>)>,
     pub(crate) name: Arc<str>,
     params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
@@ -98,7 +99,7 @@ pub struct PhotoAlbum {
 
 impl Clone for PhotoAlbum {
     fn clone(&self) -> Self {
-        Self::new(
+        let mut cloned = Self::new(
             PhotoAlbumConfig {
                 params: Arc::clone(&self.params),
                 service_endpoint: Arc::clone(&self.service_endpoint),
@@ -113,7 +114,9 @@ impl Clone for PhotoAlbum {
                 cross_zone_sources: self.cross_zone_sources.clone(),
             },
             self.session.clone_box(),
-        )
+        );
+        cloned.shadow_capture = self.shadow_capture.clone();
+        cloned
     }
 }
 
@@ -130,8 +133,17 @@ impl std::fmt::Debug for PhotoAlbum {
 }
 
 impl PhotoAlbum {
+    pub(crate) fn set_shadow_capture(
+        &mut self,
+        capture: super::inbox::ShadowCapture,
+        database: Arc<str>,
+    ) {
+        self.shadow_capture = Some((capture, database));
+    }
+
     pub fn new(config: PhotoAlbumConfig, session: Box<dyn PhotosSession>) -> Self {
         Self {
+            shadow_capture: None,
             name: config.name,
             params: config.params,
             session,

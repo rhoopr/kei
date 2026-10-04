@@ -317,6 +317,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             Ok(db) => {
                 tracing::debug!(path = %db_path.display(), "State database opened");
                 let db = Arc::new(db);
+                photos_service.set_shadow_capture(
+                    crate::icloud::photos::inbox::ShadowCapture::new(
+                        Arc::clone(&db),
+                        account_owner
+                            .as_ref()
+                            .ok_or(state::error::StateError::AccountIdentityUnavailable)?
+                            .clone(),
+                        config.auth.domain.as_str(),
+                    ),
+                );
 
                 // Promote any sync_runs rows left in status='running' from a
                 // prior SIGKILL'd or crashed process. Runs once per process,

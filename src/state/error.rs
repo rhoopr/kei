@@ -8,6 +8,14 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum StateError {
     #[error(
+        "Provider shadow inbox is full; retaining observations and the current checkpoint. No automatic pruning is permitted."
+    )]
+    ProviderInboxFull,
+    #[error(
+        "Provider shadow inbox identity or payload is inconsistent; retaining the current checkpoint."
+    )]
+    ProviderInboxInvalid,
+    #[error(
         "State database has no verified account owner. Use `kei migrate-state --legacy-db <PATH> --confirm-ownership` after stopping other kei processes; legacy files are preserved."
     )]
     AccountOwnerMissing,

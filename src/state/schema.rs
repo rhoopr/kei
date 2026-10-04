@@ -7,7 +7,41 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 28;
+pub(crate) const SCHEMA_VERSION: i32 = 29;
+
+fn migrate_provider_shadow_inbox(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(
+        r"
+CREATE TABLE provider_shadow_pages (
+    id INTEGER PRIMARY KEY,
+    account_key TEXT NOT NULL,
+    provider_key TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    request_cursor TEXT NOT NULL,
+    successor TEXT NOT NULL CHECK(length(trim(successor)) > 0),
+    more_coming INTEGER NOT NULL CHECK(more_coming IN (0,1)),
+    body_hash TEXT NOT NULL,
+    body BLOB NOT NULL,
+    charged_bytes INTEGER NOT NULL CHECK(charged_bytes > 0),
+    observed_at INTEGER NOT NULL,
+    UNIQUE(scope,request_cursor,body_hash)
+);
+CREATE TABLE provider_shadow_records (
+    page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    record_name TEXT NOT NULL CHECK(length(trim(record_name)) > 0),
+    record_type TEXT,
+    deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
+    PRIMARY KEY(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE provider_shadow_receipts (
+    scope TEXT PRIMARY KEY,
+    page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id)
+) WITHOUT ROWID;
+",
+    )?;
+    Ok(())
+}
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -907,6 +941,7 @@ fn migrate_to_version(
         26 => conn.execute_batch(SCHEMA_V26)?,
         27 => conn.execute_batch(SCHEMA_V27)?,
         28 => migrate_legacy_preservation(conn)?,
+        29 => migrate_provider_shadow_inbox(conn)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -954,7 +989,7 @@ mod tests {
         let before: Vec<_> = tables.iter().map(|table| rows(&conn, table)).collect();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 28);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         for (table, original) in tables.iter().zip(before) {
             assert_eq!(rows(&conn, table), original, "{table}");
         }
