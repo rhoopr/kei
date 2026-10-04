@@ -11,6 +11,7 @@
 //! or `connection_tests` for connection lifecycle. Test names are unchanged.
 //! `cargo test state::` includes every relocated test.
 
+pub(crate) mod account;
 mod asset_writes;
 mod assets;
 mod checkpoints;
@@ -85,10 +86,76 @@ impl std::fmt::Debug for SqliteStateDb {
 }
 
 impl SqliteStateDb {
+    pub(crate) async fn open_owned(
+        path: &Path,
+        owner: &account::AccountOwner,
+    ) -> Result<Self, StateError> {
+        let path = path.to_path_buf();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|source| StateError::ParentDir {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+        }
+        let cloned_path = path.clone();
+        let owner = owner.clone();
+        let conn = tokio::task::spawn_blocking(move || {
+            let conn = account::open(&cloned_path, &owner)?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            schema::migrate(&conn)?;
+            Ok::<_, StateError>(conn)
+        })
+        .await??;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path,
+            #[cfg(test)]
+            legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) async fn open_owned_read_only(
+        path: &Path,
+        owner: &account::AccountOwner,
+    ) -> Result<Self, StateError> {
+        let path = path.to_path_buf();
+        let cloned_path = path.clone();
+        let owner = owner.clone();
+        let conn = tokio::task::spawn_blocking(move || {
+            let conn = account::open_read_only(&cloned_path)?;
+            account::validate(&conn, &owner)?;
+            let version = schema::get_schema_version(&conn)?;
+            if version > schema::SCHEMA_VERSION {
+                return Err(StateError::UnsupportedSchemaVersion {
+                    found: version,
+                    expected: schema::SCHEMA_VERSION,
+                });
+            }
+            if version < schema::SCHEMA_VERSION {
+                return Err(StateError::ReadOnlySchemaTooOld {
+                    found: version,
+                    expected: schema::SCHEMA_VERSION,
+                });
+            }
+            Ok::<_, StateError>(conn)
+        })
+        .await??;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path,
+            #[cfg(test)]
+            legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
     /// Open or create a database at the given path.
     ///
     /// Creates the parent directory if it doesn't exist; see
     /// [`StateError::ParentDir`].
+    #[cfg(test)]
     pub async fn open(path: &Path) -> Result<Self, StateError> {
         let path = path.to_path_buf();
 
@@ -142,6 +209,7 @@ impl SqliteStateDb {
     /// commands can prove they do not mutate the state DB. Callers should
     /// check that the file exists before opening so a typo doesn't create a
     /// fresh empty database.
+    #[cfg(test)]
     pub(crate) async fn open_read_only(path: &Path) -> Result<Self, StateError> {
         let path = path.to_path_buf();
         let path_clone = path.clone();

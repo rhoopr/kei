@@ -26,6 +26,7 @@
     )
 )]
 
+mod account;
 mod auth;
 mod cli;
 mod commands;
@@ -518,11 +519,16 @@ fn make_password_provider(
 /// Build a password provider from CLI password args, TOML config, and resolved auth fields.
 ///
 /// Shared by `run_login`, `run_list`, and `run_import_existing`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared credential resolution retains explicit account realm and input mode"
+)]
 fn make_provider_from_auth(
     pw: &cli::PasswordArgs,
     password: Option<String>,
     username: &str,
     cookie_directory: &Path,
+    realm: &str,
     toml: Option<&config::TomlConfig>,
     input_mode: InputMode,
 ) -> password::PasswordProvider {
@@ -533,31 +539,37 @@ fn make_provider_from_auth(
         password.map(SecretString::from).as_ref(),
         password_command.as_deref(),
         password_file.as_deref(),
-        credential::CredentialStore::new(username, cookie_directory),
+        credential::CredentialStore::new(username, cookie_directory, realm),
     );
     make_password_provider(source, input_mode)
 }
 
 use commands::{
     run_config_show, run_doctor, run_import_existing, run_list, run_login, run_manifest,
-    run_password, run_reconcile, run_reset_session, run_reset_state, run_reset_sync_token,
-    run_status, run_verify,
+    run_migrate_state, run_password, run_reconcile, run_reset_session, run_reset_state,
+    run_reset_sync_token, run_status, run_verify,
 };
 
-/// Get the database path for a given auth config, merging with TOML defaults.
-///
-/// Returns an error if the resolved username is empty, since an empty username
-/// produces a `.db` filename that silently operates on the wrong database.
-fn get_db_path(globals: &config::GlobalArgs, toml: Option<&TomlConfig>) -> anyhow::Result<PathBuf> {
-    let (username, _, _, cookie_dir) =
+/// Get the independent owner expected by offline commands.
+fn get_account_owner(
+    globals: &config::GlobalArgs,
+    toml: Option<&TomlConfig>,
+) -> state::db::account::AccountOwner {
+    let (username, _, domain, _) =
+        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
+    state::db::account::AccountOwner::configured(&username, domain.as_str())
+}
+
+async fn get_db_path(
+    globals: &config::GlobalArgs,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<PathBuf> {
+    let (username, _, domain, cookie_dir) =
         config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
     if username.is_empty() {
         anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
     }
-    Ok(cookie_dir.join(format!(
-        "{}.db",
-        auth::session::sanitize_username(&username)
-    )))
+    Ok(state::db::account::state_path(&cookie_dir, &username, domain.as_str()).await?)
 }
 
 /// RAII guard that writes the current PID to a file on creation and removes
@@ -929,6 +941,9 @@ async fn dispatch_command(
                 toml_config_error,
             )
             .await;
+        }
+        Command::MigrateState(args) => {
+            return run_migrate_state(args, globals, toml_config.as_ref(), input_mode).await;
         }
         Command::Manifest(args) => {
             return run_manifest(args, globals, toml_config.as_ref()).await;

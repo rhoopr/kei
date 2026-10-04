@@ -53,13 +53,15 @@ impl CredentialBackend {
 pub(crate) struct CredentialStore {
     username: String,
     config_dir: PathBuf,
+    realm: String,
 }
 
 impl CredentialStore {
-    pub(crate) fn new(username: &str, config_dir: &Path) -> Self {
+    pub(crate) fn new(username: &str, config_dir: &Path, realm: &str) -> Self {
         Self {
             username: username.to_string(),
             config_dir: config_dir.to_path_buf(),
+            realm: realm.to_string(),
         }
     }
 
@@ -180,7 +182,7 @@ impl CredentialStore {
     }
 
     fn credential_file_path(&self) -> PathBuf {
-        let sanitized = crate::auth::session::sanitize_username(&self.username);
+        let sanitized = crate::account::namespace(&self.username, &self.realm);
         self.config_dir.join(format!("{sanitized}.credential"))
     }
 
@@ -424,9 +426,32 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_namespace_does_not_read_copy_or_delete_colliding_legacy_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = "first.last@example.invalid";
+        let b = "firstlast@example.invalid";
+        let legacy = directory.path().join("firstlastexampleinvalid.credential");
+        std::fs::write(&legacy, b"synthetic legacy ciphertext").unwrap();
+        let store = CredentialStore::new(a, directory.path(), "com");
+        let other = CredentialStore::new(b, directory.path(), "com");
+        let china = CredentialStore::new(a, directory.path(), "cn");
+        assert!(store.file_retrieve().unwrap().is_none());
+        assert_ne!(store.credential_file_path(), other.credential_file_path());
+        assert_ne!(store.credential_file_path(), china.credential_file_path());
+        store.file_store("synthetic new password").unwrap();
+        assert!(other.file_retrieve().unwrap().is_none());
+        assert!(china.file_retrieve().unwrap().is_none());
+        store.file_delete_outcome();
+        assert_eq!(
+            std::fs::read(legacy).unwrap(),
+            b"synthetic legacy ciphertext"
+        );
+    }
+
+    #[test]
     fn encrypted_file_store_retrieve_cycle() {
         let (_td, dir) = test_dir("store_retrieve");
-        let store = CredentialStore::new("user@example.com", &dir);
+        let store = CredentialStore::new("user@example.com", &dir, "com");
         store.file_store("super_secret_pw").unwrap();
         let retrieved = store.file_retrieve().unwrap().unwrap();
         assert_eq!(retrieved.expose_secret(), "super_secret_pw");
@@ -435,7 +460,7 @@ mod tests {
     #[test]
     fn encrypted_file_missing_returns_none() {
         let (_td, dir) = test_dir("missing");
-        let store = CredentialStore::new("user@example.com", &dir);
+        let store = CredentialStore::new("user@example.com", &dir, "com");
         let result = store.file_retrieve().unwrap();
         assert!(result.is_none());
     }
@@ -443,7 +468,7 @@ mod tests {
     #[test]
     fn encrypted_file_delete() {
         let (_td, dir) = test_dir("delete");
-        let store = CredentialStore::new("user@example.com", &dir);
+        let store = CredentialStore::new("user@example.com", &dir, "com");
         store.file_store("to_be_deleted").unwrap();
         assert!(store.credential_file_path().exists());
 
@@ -573,7 +598,7 @@ mod tests {
     #[test]
     fn encrypted_file_corrupt_data() {
         let (_td, dir) = test_dir("corrupt");
-        let store = CredentialStore::new("user@example.com", &dir);
+        let store = CredentialStore::new("user@example.com", &dir, "com");
         store.file_store("valid").unwrap();
         // Overwrite credential with garbage (too short)
         std::fs::write(store.credential_file_path(), b"short").unwrap();
@@ -584,7 +609,7 @@ mod tests {
     #[test]
     fn encrypted_file_wrong_key() {
         let (_td, dir) = test_dir("wrong_key");
-        let store = CredentialStore::new("user@example.com", &dir);
+        let store = CredentialStore::new("user@example.com", &dir, "com");
         store.file_store("secret").unwrap();
         // Overwrite key with different random key
         let bad_key: [u8; 32] = rand::random();
@@ -599,7 +624,7 @@ mod tests {
     #[test]
     fn encrypted_file_rejects_valid_decrypt_invalid_utf8() {
         let (_td, dir) = test_dir("invalid_utf8");
-        let store = CredentialStore::new("user@example.com", &dir);
+        let store = CredentialStore::new("user@example.com", &dir, "com");
         std::fs::create_dir_all(&dir).unwrap();
 
         let key_bytes = store.load_or_create_key().unwrap();
@@ -621,7 +646,7 @@ mod tests {
     #[test]
     fn encrypted_file_key_generation() {
         let (_td, dir) = test_dir("keygen");
-        let store = CredentialStore::new("user@example.com", &dir);
+        let store = CredentialStore::new("user@example.com", &dir, "com");
         assert!(!store.key_file_path().exists());
 
         store.file_store("pw").unwrap();
@@ -637,7 +662,7 @@ mod tests {
         let legacy_path = dir.join(".credential-key");
         std::fs::write(&legacy_path, [7u8; 32]).unwrap();
 
-        let store = CredentialStore::new("user@example.com", &dir);
+        let store = CredentialStore::new("user@example.com", &dir, "com");
         let key_path = store.key_file_path();
         assert_eq!(key_path, dir.join(".kei-state"));
         assert!(
@@ -665,7 +690,7 @@ mod tests {
     #[test]
     fn has_credential_with_file() {
         let (_td, dir) = test_dir("has_cred");
-        let store = CredentialStore::new("user@example.com", &dir);
+        let store = CredentialStore::new("user@example.com", &dir, "com");
         assert!(!store.credential_file_path().exists());
 
         store.file_store("pw").unwrap();
@@ -675,7 +700,7 @@ mod tests {
     #[test]
     fn public_api_store_retrieve_round_trips() {
         let (_td, dir) = test_dir("pub_rt");
-        let store = CredentialStore::new("pub-rt@kei-test.invalid", &dir);
+        let store = CredentialStore::new("pub-rt@kei-test.invalid", &dir, "com");
         store.store("public_api_password").unwrap();
         let retrieved = store.retrieve().unwrap().unwrap();
         assert_eq!(retrieved.expose_secret(), "public_api_password");
@@ -685,7 +710,7 @@ mod tests {
     #[test]
     fn public_api_delete_clears_credential() {
         let (_td, dir) = test_dir("pub_delete");
-        let store = CredentialStore::new("pub-del@kei-test.invalid", &dir);
+        let store = CredentialStore::new("pub-del@kei-test.invalid", &dir, "com");
         store.store("to_delete").unwrap();
         assert!(store.retrieve().unwrap().is_some());
 
@@ -706,7 +731,7 @@ mod tests {
     #[test]
     fn public_api_retrieve_empty_returns_none() {
         let (_td, dir) = test_dir("pub_empty");
-        let store = CredentialStore::new("pub-empty@kei-test.invalid", &dir);
+        let store = CredentialStore::new("pub-empty@kei-test.invalid", &dir, "com");
         let result = store.retrieve().unwrap();
         assert!(result.is_none());
     }

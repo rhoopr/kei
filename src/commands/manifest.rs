@@ -59,7 +59,7 @@ pub(crate) async fn run_manifest(
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
-    let db_path = super::super::get_db_path(globals, toml)?;
+    let db_path = super::super::get_db_path(globals, toml).await?;
     if !db_path.exists() {
         anyhow::bail!(
             "No state database found at {}. Run a sync first to create the local catalog.",
@@ -67,7 +67,8 @@ pub(crate) async fn run_manifest(
         );
     }
 
-    let rows = load_manifest_rows(&db_path).await?;
+    let rows =
+        load_owned_manifest_rows(&db_path, &super::super::get_account_owner(globals, toml)).await?;
     match args.format {
         cli::ManifestFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -80,6 +81,20 @@ pub(crate) async fn run_manifest(
     Ok(())
 }
 
+async fn load_owned_manifest_rows(
+    path: &Path,
+    owner: &state::db::account::AccountOwner,
+) -> anyhow::Result<Vec<ManifestRow>> {
+    let db = state::SqliteStateDb::open_owned_read_only(path, owner).await?;
+    Ok(db
+        .get_manifest_assets()
+        .await?
+        .into_iter()
+        .map(ManifestRow::from)
+        .collect())
+}
+
+#[cfg(test)]
 async fn load_manifest_rows(path: &Path) -> anyhow::Result<Vec<ManifestRow>> {
     let db = state::SqliteStateDb::open_read_only(path).await?;
     let rows = db

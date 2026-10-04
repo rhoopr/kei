@@ -11,6 +11,7 @@ enum SyncAuthErrorClass {
     TwoFactorRequired,
     LockContention,
     SessionReset,
+    AccountChanged,
     Other,
 }
 
@@ -27,6 +28,8 @@ fn classify_sync_auth_error(err: &anyhow::Error) -> SyncAuthErrorClass {
         SyncAuthErrorClass::TwoFactorRequired
     } else if auth_err.is_lock_contention() {
         SyncAuthErrorClass::LockContention
+    } else if auth_err.is_account_identity_changed() {
+        SyncAuthErrorClass::AccountChanged
     } else if auth_err.is_session_reset() {
         SyncAuthErrorClass::SessionReset
     } else {
@@ -70,6 +73,15 @@ fn take_pending_auth<T>(pending_auth: &mut Option<T>) -> anyhow::Result<T> {
         .ok_or_else(|| anyhow::anyhow!("internal auth retry state missing before attempt"))
 }
 
+fn take_scoped_pending_auth(
+    pending: &mut Option<auth::AuthResult>,
+    expected: Option<&str>,
+) -> anyhow::Result<auth::AuthResult> {
+    let mut result = take_pending_auth(pending)?;
+    result.session.bind_principal(&result.data, expected)?;
+    Ok(result)
+}
+
 /// Re-authenticate after a session-error signature from CloudKit.
 ///
 /// Drops any live session + service (releasing the file lock), removes only the
@@ -99,7 +111,12 @@ async fn reauth_after_session_error(
         released_generation
     };
 
-    clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
+    clear_validation_cache_for_reauth(
+        &config.auth.cookie_directory,
+        &config.auth.username,
+        config.auth.domain.as_str(),
+    )
+    .await;
     match authenticate_sync_session(config, password_provider, input_mode, expected_generation)
         .await
     {
@@ -147,6 +164,7 @@ async fn reauth_after_session_error(
     auth::strip_session_routing_state(
         &config.auth.cookie_directory,
         &config.auth.username,
+        config.auth.domain.as_str(),
         expected_generation,
     )
     .await?;
@@ -189,13 +207,22 @@ async fn prepare_mid_cycle_reauth(
     shared_session: &auth::SharedSession,
     config: &config::Config,
 ) -> anyhow::Result<()> {
-    clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
+    clear_validation_cache_for_reauth(
+        &config.auth.cookie_directory,
+        &config.auth.username,
+        config.auth.domain.as_str(),
+    )
+    .await;
     shared_session.write().await.reset_http_clients()?;
     Ok(())
 }
 
-async fn clear_validation_cache_for_reauth(cookie_dir: &std::path::Path, username: &str) {
-    let cache_path = auth::validation_cache_file_path(cookie_dir, username);
+async fn clear_validation_cache_for_reauth(
+    cookie_dir: &std::path::Path,
+    username: &str,
+    realm: &str,
+) {
+    let cache_path = auth::validation_cache_file_path(cookie_dir, username, realm);
     match tokio::fs::remove_file(&cache_path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -239,7 +266,12 @@ async fn retry_persisted_session_after_two_factor(
     tracing::debug!(
         "2FA-required auth wrote session state; retrying persisted-session auth once before waiting"
     );
-    clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
+    clear_validation_cache_for_reauth(
+        &config.auth.cookie_directory,
+        &config.auth.username,
+        config.auth.domain.as_str(),
+    )
+    .await;
     match authenticate_sync_session(config, password_provider, input_mode, expected_generation)
         .await
     {
@@ -271,9 +303,12 @@ async fn notify_and_wait_for_2fa(
         None,
         None,
     );
-    wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
-        authenticate_sync_session(config, password_provider, input_mode, expected_generation)
-    })
+    wait_and_retry_2fa(
+        &config.auth.cookie_directory,
+        &config.auth.username,
+        || authenticate_sync_session(config, password_provider, input_mode, expected_generation),
+        config.auth.domain.as_str(),
+    )
     .await
 }
 
@@ -313,6 +348,9 @@ pub(super) async fn reacquire_session(
     )
     .await
     {
+        if classify_sync_auth_error(&e) == SyncAuthErrorClass::AccountChanged {
+            return Err(e);
+        }
         tracing::warn!(error = %e, "Pre-cycle reauth failed, will retry mid-sync");
         reacquire_session_lock_after_idle(shared_session).await?;
     }
@@ -368,14 +406,19 @@ pub(super) async fn authenticate_initial_session(
                 None,
                 None,
             );
-            wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
-                authenticate_sync_session(
-                    config,
-                    password_provider,
-                    input_mode,
-                    expected_generation,
-                )
-            })
+            wait_and_retry_2fa(
+                &config.auth.cookie_directory,
+                &config.auth.username,
+                || {
+                    authenticate_sync_session(
+                        config,
+                        password_provider,
+                        input_mode,
+                        expected_generation,
+                    )
+                },
+                config.auth.domain.as_str(),
+            )
             .await
         }
         Err(e) => Err(e),
@@ -384,7 +427,7 @@ pub(super) async fn authenticate_initial_session(
 
 /// Initialize Photos and selected libraries with one session-recovery retry.
 pub(super) async fn initialize_libraries(
-    auth_result: auth::AuthResult,
+    mut auth_result: auth::AuthResult,
     api_retry_config: crate::retry::RetryConfig,
     config: &config::Config,
     password_provider: &crate::password::PasswordProvider,
@@ -401,10 +444,14 @@ pub(super) async fn initialize_libraries(
     // after a pool reset), first retry the normal persisted-session auth path
     // before falling back to forced SRP. A second CloudKit failure bails cleanly
     // instead of looping under Docker's restart policy.
+    auth_result
+        .session
+        .bind_principal(&auth_result.data, None)?;
+    let expected_principal = auth_result.session.principal().map(str::to_owned);
     let mut pending_auth = Some(auth_result);
     let mut retried_after_session_error = false;
     loop {
-        let this_auth = take_pending_auth(&mut pending_auth)?;
+        let this_auth = take_scoped_pending_auth(&mut pending_auth, expected_principal.as_deref())?;
         let released_generation = this_auth.session.generation();
         let init_result =
             init_photos_service(this_auth, api_retry_config, config.ui.personality_mode).await;
@@ -513,16 +560,21 @@ pub(super) async fn recover_expired_cycle(
                 return Err(e);
             }
 
-            wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
-                attempt_reauth(
-                    shared_session,
-                    &config.auth.cookie_directory,
-                    &config.auth.username,
-                    config.auth.domain.as_str(),
-                    password_provider,
-                    input_mode,
-                )
-            })
+            wait_and_retry_2fa(
+                &config.auth.cookie_directory,
+                &config.auth.username,
+                || {
+                    attempt_reauth(
+                        shared_session,
+                        &config.auth.cookie_directory,
+                        &config.auth.username,
+                        config.auth.domain.as_str(),
+                        password_provider,
+                        input_mode,
+                    )
+                },
+                config.auth.domain.as_str(),
+            )
             .await?;
             Ok(())
         }
@@ -551,6 +603,149 @@ mod tests {
     use crate::sync_loop::test_support::{
         make_run_cycle_config, make_shared_session_for_run_cycle,
     };
+
+    #[tokio::test]
+    async fn watch_principal_change_stops_before_state_work_and_same_principal_reopens() {
+        let (directory, shared) = make_shared_session_for_run_cycle().await;
+        let username = "test@example.com";
+        let data: auth::AccountLoginResponse =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-principal-a"}}))
+                .unwrap();
+        {
+            let mut session = shared.write().await;
+            session.bind_principal(&data, None).unwrap();
+            session
+                .session_data
+                .insert("session_token".into(), "synthetic-session".into());
+        }
+        let owner =
+            crate::state::db::account::AccountOwner::authenticated(username, "com", &data).unwrap();
+        let path = crate::state::db::account::state_path(directory.path(), username, "com")
+            .await
+            .unwrap();
+        let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "retained-cursor")
+            .await
+            .unwrap();
+        db.set_metadata("pending_sync_token:epoch:PrimarySync", "retained-debt")
+            .await
+            .unwrap();
+        let media = directory.path().join("historical.jpg");
+        std::fs::write(&media, b"synthetic preserved media").unwrap();
+        let mut config = make_run_cycle_config();
+        config.auth.cookie_directory = directory.path().to_path_buf();
+        let provider: crate::password::PasswordProvider =
+            std::sync::Arc::new(|| panic!("fresh cache must avoid network/password lookup"));
+        let cache = auth::validation_cache_file_path(directory.path(), username, "com");
+        for dsid in ["synthetic-principal-a", "synthetic-principal-b", ""] {
+            std::fs::write(&cache, serde_json::to_vec(&serde_json::json!({"validated_at":chrono::Utc::now().timestamp(),"account_data":{"dsInfo":{"dsid":dsid}}})).unwrap()).unwrap();
+            let result =
+                super::reacquire_session(&shared, &config, &provider, crate::InputMode::NoInput)
+                    .await;
+            if dsid == "synthetic-principal-a" {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<auth::error::AuthError>()
+                        .is_some_and(auth::error::AuthError::is_account_identity_changed)
+                );
+            }
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("retained-cursor")
+            );
+            assert_eq!(
+                db.get_metadata("pending_sync_token:epoch:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("retained-debt")
+            );
+            assert_eq!(std::fs::read(&media).unwrap(), b"synthetic preserved media");
+        }
+        drop(shared);
+        drop(db);
+        let reopened = crate::state::SqliteStateDb::open_owned(&path, &owner)
+            .await
+            .unwrap();
+        let mut restarted =
+            auth::session::Session::new(directory.path(), username, "https://www.icloud.com", None)
+                .await
+                .unwrap();
+        restarted.bind_principal(&data, None).unwrap();
+        restarted
+            .session_data
+            .insert("session_token".into(), "synthetic-session".into());
+        std::fs::write(&cache, serde_json::to_vec(&serde_json::json!({"validated_at":chrono::Utc::now().timestamp(),"account_data":data})).unwrap()).unwrap();
+        let restarted = std::sync::Arc::new(tokio::sync::RwLock::new(restarted));
+        super::reacquire_session(&restarted, &config, &provider, crate::InputMode::NoInput)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_metadata("pending_sync_token:epoch:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("retained-debt")
+        );
+    }
+
+    #[tokio::test]
+    async fn initialization_retry_checks_retained_principal_before_service_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let data: auth::AccountLoginResponse =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-principal-a"}}))
+                .unwrap();
+        let mut session = auth::session::Session::new(
+            directory.path(),
+            "retry@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        session.bind_principal(&data, None).unwrap();
+        let expected = session.principal().unwrap().to_owned();
+        let mut initial = Some(auth::AuthResult {
+            session,
+            data,
+            requires_2fa: false,
+        });
+        drop(super::take_scoped_pending_auth(&mut initial, Some(&expected)).unwrap());
+        for payload in [
+            serde_json::json!({"dsInfo":{"dsid":"synthetic-principal-b"}}),
+            serde_json::json!({}),
+        ] {
+            let session = auth::session::Session::new(
+                directory.path(),
+                "retry@example.invalid",
+                "https://www.icloud.com",
+                None,
+            )
+            .await
+            .unwrap();
+            let mut pending = Some(auth::AuthResult {
+                session,
+                data: serde_json::from_value(payload).unwrap(),
+                requires_2fa: false,
+            });
+            let error = super::take_scoped_pending_auth(&mut pending, Some(&expected)).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<auth::error::AuthError>()
+                    .is_some_and(auth::error::AuthError::is_account_identity_changed)
+            );
+            assert!(pending.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn watch_reacquire_lock_failure_stops_before_next_cycle() {
@@ -875,7 +1070,7 @@ mod tests {
     async fn clear_validation_cache_for_reauth_preserves_routing_state() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let username = "reauth@example.com";
-        let session_path = auth::session_file_path(tempdir.path(), username);
+        let session_path = auth::session_file_path(tempdir.path(), username, "com");
         let session_json = br#"{
   "session_token": "tok_abc",
   "trust_token": "trust_xyz",
@@ -885,12 +1080,12 @@ mod tests {
         tokio::fs::write(&session_path, session_json)
             .await
             .expect("write session metadata");
-        let cache_path = auth::validation_cache_file_path(tempdir.path(), username);
+        let cache_path = auth::validation_cache_file_path(tempdir.path(), username, "com");
         tokio::fs::write(&cache_path, br#"{"validated_at":1}"#)
             .await
             .expect("write validation cache");
 
-        clear_validation_cache_for_reauth(tempdir.path(), username).await;
+        clear_validation_cache_for_reauth(tempdir.path(), username, "com").await;
 
         assert!(
             !cache_path.exists(),
@@ -1056,7 +1251,7 @@ mod tests {
         let (dir, shared_session) = make_shared_session_for_run_cycle().await;
         let mut config = make_run_cycle_config();
         config.auth.cookie_directory = dir.path().to_path_buf();
-        let cache = auth::validation_cache_file_path(dir.path(), &config.auth.username);
+        let cache = auth::validation_cache_file_path(dir.path(), &config.auth.username, "com");
         tokio::fs::write(&cache, b"cached successful validation")
             .await
             .unwrap();

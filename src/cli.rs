@@ -1,6 +1,7 @@
 use crate::types::LogLevel;
 use clap::{Args, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 
 /// Reject empty strings at CLI parse time.
 fn non_empty_string(s: &str) -> Result<String, String> {
@@ -104,6 +105,22 @@ pub enum RecentLimit {
     Count(u32),
     /// Take assets created in the last N days.
     Days(u32),
+}
+
+/// Explicit legacy-state adoption. No automatic account inference or overwrite.
+#[derive(Debug, Clone, clap::Args)]
+pub struct MigrateStateArgs {
+    /// Legacy SQLite database whose account ownership you have verified
+    #[arg(long)]
+    pub legacy_db: PathBuf,
+    /// Attest that the legacy database belongs to the configured account
+    #[arg(long, required = true)]
+    pub confirm_ownership: bool,
+    /// Verification code for the fresh login, if required
+    #[arg(long)]
+    pub code: Option<String>,
+    #[command(flatten)]
+    pub password: PasswordArgs,
 }
 
 /// Where a count-form `--recent N` limit is applied when filters create
@@ -652,6 +669,9 @@ pub enum Command {
         what: ResetCommand,
     },
 
+    /// Adopt an explicitly confirmed legacy database after fresh authentication
+    MigrateState(MigrateStateArgs),
+
     /// Config management
     #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Config")]
     Config {
@@ -902,6 +922,7 @@ impl Command {
             | Self::List { password, .. }
             | Self::Password { password, .. } => Some(password),
             Self::ImportExisting(args) => Some(&mut args.password),
+            Self::MigrateState(args) => Some(&mut args.password),
             Self::Service {
                 action: ServiceAction::Run(args),
             } => Some(&mut args.password),
@@ -950,6 +971,30 @@ mod tests {
         let mut args = vec!["kei"];
         args.extend_from_slice(tail);
         assert_removed_sync_flag(&args);
+    }
+
+    #[test]
+    fn migrate_state_requires_explicit_source_and_ownership_confirmation() {
+        assert!(Cli::try_parse_from(["kei", "migrate-state", "--legacy-db", "source.db"]).is_err());
+        assert!(Cli::try_parse_from(["kei", "migrate-state", "--confirm-ownership"]).is_err());
+        let cli = Cli::try_parse_from([
+            "kei",
+            "migrate-state",
+            "--legacy-db",
+            "source.db",
+            "--confirm-ownership",
+            "--code",
+            "123456",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::MigrateState(args) => {
+                assert_eq!(args.legacy_db, PathBuf::from("source.db"));
+                assert!(args.confirm_ownership);
+                assert_eq!(args.code.as_deref(), Some("123456"));
+            }
+            _ => panic!("expected migration command"),
+        }
     }
 
     #[test]

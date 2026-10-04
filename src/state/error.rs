@@ -7,6 +7,35 @@ use thiserror::Error;
 /// Errors that can occur during state database operations.
 #[derive(Error, Debug)]
 pub enum StateError {
+    #[error(
+        "State database has no verified account owner. Use `kei migrate-state --legacy-db <PATH> --confirm-ownership` after stopping other kei processes; legacy files are preserved."
+    )]
+    AccountOwnerMissing,
+    #[error(
+        "State database account ownership does not match this configured or authenticated account; refusing state access."
+    )]
+    AccountOwnerMismatch,
+    #[error(
+        "Fresh authentication did not provide a usable account identity; state cannot be bound safely."
+    )]
+    AccountIdentityUnavailable,
+    #[error(
+        "Legacy state requires explicit verified ownership migration. Use `kei migrate-state --legacy-db <PATH> --confirm-ownership`; do not infer ownership from the filename."
+    )]
+    LegacyAccountMigrationRequired,
+    #[error(
+        "Legacy state changed or was busy during adoption. Stop other kei processes and retry; source files remain intact."
+    )]
+    AccountMigrationBusy,
+    #[error(
+        "The staged account migration failed SQLite integrity validation; source files remain intact."
+    )]
+    AccountMigrationInvalid,
+    #[error(
+        "Could not read the explicit legacy database as valid SQLite state; source files remain intact."
+    )]
+    AccountMigrationSourceUnreadable,
+
     /// Failed to create the parent directory for the database file.
     ///
     /// `SqliteStateDb::open` creates the parent directory before opening

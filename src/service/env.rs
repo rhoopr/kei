@@ -114,7 +114,13 @@ pub(crate) fn read_config_username(kei_dir: &Path) -> Option<String> {
 /// default config dir) and passes the resolved path here.
 pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<()> {
     if let Some(username) = read_config_username(kei_dir) {
-        let store = crate::credential::CredentialStore::new(&username, kei_dir);
+        let realm = crate::config::load_toml_config(&kei_dir.join("config.toml"), false)
+            .ok()
+            .flatten()
+            .and_then(|config| config.auth)
+            .and_then(|auth| auth.domain)
+            .unwrap_or(crate::types::Domain::Com);
+        let store = crate::credential::CredentialStore::new(&username, kei_dir, realm.as_str());
         match store.delete() {
             Err(e) => {
                 // delete() bails when neither backend has anything to remove,

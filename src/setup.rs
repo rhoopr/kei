@@ -452,7 +452,14 @@ fn write_setup_files(
         config_path,
         toml_content,
         answers,
-        |username, config_dir, pw| CredentialStore::new(username, config_dir).store(pw),
+        |username, config_dir, pw| {
+            CredentialStore::new(
+                username,
+                config_dir,
+                answers.domain.unwrap_or(Domain::Com).as_str(),
+            )
+            .store(pw)
+        },
     )
 }
 

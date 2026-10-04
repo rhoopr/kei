@@ -30,6 +30,7 @@ pub(crate) async fn run_login(
         password,
         &username,
         &cookie_directory,
+        domain.as_str(),
         toml,
         input_mode,
     );

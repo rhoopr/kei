@@ -36,22 +36,26 @@ pub use self::session::SharedSession;
 pub(crate) use self::session::strip_session_routing_state;
 
 /// Path to the session data file for a given user, without needing a `Session`.
-pub fn session_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
-    auth_file_path(cookie_dir, apple_id, ".session")
+pub fn session_file_path(cookie_dir: &Path, apple_id: &str, realm: &str) -> PathBuf {
+    auth_file_path(cookie_dir, apple_id, ".session", realm)
 }
 
 /// Path to the validation cache file for a given user.
-pub(crate) fn validation_cache_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
-    auth_file_path(cookie_dir, apple_id, ".cache")
+pub(crate) fn validation_cache_file_path(
+    cookie_dir: &Path,
+    apple_id: &str,
+    realm: &str,
+) -> PathBuf {
+    auth_file_path(cookie_dir, apple_id, ".cache", realm)
 }
 
 /// Path to the persisted cookie jar for a given user.
-pub(crate) fn cookiejar_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
-    auth_file_path(cookie_dir, apple_id, "")
+pub(crate) fn cookiejar_file_path(cookie_dir: &Path, apple_id: &str, realm: &str) -> PathBuf {
+    auth_file_path(cookie_dir, apple_id, "", realm)
 }
 
-fn auth_file_path(cookie_dir: &Path, apple_id: &str, suffix: &str) -> PathBuf {
-    let mut filename = session::sanitize_username(apple_id);
+fn auth_file_path(cookie_dir: &Path, apple_id: &str, suffix: &str, realm: &str) -> PathBuf {
+    let mut filename = crate::account::namespace(apple_id, realm);
     filename.push_str(suffix);
     cookie_dir.join(filename)
 }
@@ -247,6 +251,32 @@ pub(crate) async fn authenticate_in_input_mode(
         crate::personality::Mode::Off,
         input_mode,
         None,
+    )
+    .await
+}
+
+/// Explicit legacy adoption requires a fresh password/2FA exchange, even if a
+/// valid session exists in the new namespace. Legacy artifacts are never read.
+pub(crate) async fn authenticate_fresh_for_adoption(
+    directory: &Path,
+    username: &str,
+    provider: &crate::password::PasswordProvider,
+    domain: &str,
+    code: Option<&str>,
+    input_mode: crate::InputMode,
+) -> Result<AuthResult> {
+    let endpoints = Endpoints::for_domain(domain)?;
+    let session = Session::new_fresh(directory, username, endpoints.home).await?;
+    authenticate_inner(
+        session,
+        &endpoints,
+        username,
+        provider,
+        domain,
+        None,
+        code,
+        crate::personality::Mode::Off,
+        input_mode,
     )
     .await
 }
@@ -494,7 +524,7 @@ async fn authenticate_inner(
                 )
             })?;
 
-        tracing::debug!(apple_id = %apple_id, "Authenticating");
+        tracing::debug!("Authenticating");
 
         srp::authenticate_srp(
             &mut session,
@@ -801,13 +831,15 @@ fn already_authenticated() -> Result<()> {
 /// validate endpoint. Returns `true` if valid, `false` if expired.
 pub async fn validate_session(session: &mut Session, domain: &str) -> Result<bool> {
     let endpoints = Endpoints::for_domain(domain)?;
-    if recently_validated(session).await {
+    if let Some(cached) = cached_validation(session).await {
+        session.bind_principal(&cached, None)?;
         tracing::debug!("Session validated recently, skipping idle re-validation");
         return Ok(true);
     }
 
     match twofa::validate_token(session, &endpoints).await {
         Ok(d) => {
+            session.bind_principal(&d, None)?;
             session.save_validation_cache(&d).await;
             Ok(true)
         }
@@ -817,6 +849,7 @@ pub async fn validate_session(session: &mut Session, domain: &str) -> Result<boo
             // (i.e. the trust token is still accepted).
             match twofa::authenticate_with_token(session, &endpoints).await {
                 Ok(d) => {
+                    session.bind_principal(&d, None)?;
                     if check_requires_2fa(&d) {
                         return Ok(false);
                     }
@@ -849,12 +882,13 @@ pub async fn validate_session(session: &mut Session, domain: &str) -> Result<boo
     }
 }
 
-async fn recently_validated(session: &Session) -> bool {
-    session.session_data.contains_key("session_token")
-        && session
-            .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
-            .await
-            .is_some()
+async fn cached_validation(session: &Session) -> Option<AccountLoginResponse> {
+    if !session.session_data.contains_key("session_token") {
+        return None;
+    }
+    session
+        .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
+        .await
 }
 
 /// Apple's HSA2 (two-step verification v2) requires all three conditions:
@@ -1000,7 +1034,7 @@ mod tests {
     async fn map_push_error_only_cleans_persisted_403() {
         let cookies = tempfile::tempdir().expect("tempdir");
         let apple_id = "persisted@example.com";
-        let files = session::persisted_auth_files(cookies.path(), apple_id);
+        let files = session::persisted_auth_files(cookies.path(), apple_id, "com");
         tokio::fs::write(&files[1], b"stale")
             .await
             .expect("session file");
@@ -1219,26 +1253,79 @@ mod tests {
     #[test]
     fn test_session_file_path_sanitizes_username() {
         let dir = Path::new("/tmp/cookies");
-        let path = session_file_path(dir, "user@icloud.com");
-        // sanitize_username strips non-alphanumerics.
-        assert_eq!(path, Path::new("/tmp/cookies/usericloudcom.session"));
+        let path = session_file_path(dir, "user@icloud.com", "com");
+        assert_eq!(
+            path,
+            dir.join(format!(
+                "{}.session",
+                crate::account::namespace("user@icloud.com", "com")
+            ))
+        );
     }
 
     #[test]
     fn test_session_file_path_handles_unicode_and_symbols() {
         let dir = Path::new("/data");
-        // Non-alphanumerics (including unicode) are dropped; alphanumerics kept.
-        let path = session_file_path(dir, "user+tag@example.co.uk");
-        assert_eq!(path, Path::new("/data/usertagexamplecouk.session"));
+        // Exact punctuation is retained in the private namespace fingerprint.
+        let path = session_file_path(dir, "user+tag@example.co.uk", "com");
+        assert_eq!(
+            path,
+            dir.join(format!(
+                "{}.session",
+                crate::account::namespace("user+tag@example.co.uk", "com")
+            ))
+        );
     }
 
     #[test]
     fn test_session_file_path_empty_username_leaves_bare_extension() {
-        // Edge case: an empty username produces `.session` alone in the
-        // cookie dir. Not a useful path but the function shouldn't panic.
+        // The helper is total, though command owners reject empty usernames.
         let dir = Path::new("/var/cookies");
-        let path = session_file_path(dir, "");
-        assert_eq!(path, Path::new("/var/cookies/.session"));
+        let path = session_file_path(dir, "", "com");
+        assert_eq!(
+            path,
+            dir.join(format!("{}.session", crate::account::namespace("", "com")))
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_auth_calls_password_provider_instead_of_reusing_a_valid_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let username = "adoption@example.invalid";
+        let session = session_file_path(directory.path(), username, "com");
+        let cache = validation_cache_file_path(directory.path(), username, "com");
+        std::fs::write(
+            &session,
+            br#"{"session_token":"synthetic-valid-cache-token"}"#,
+        )
+        .unwrap();
+        std::fs::write(&cache, serde_json::to_vec(&serde_json::json!({"validated_at":chrono::Utc::now().timestamp(),"account_data":{"dsInfo":{"dsid":"synthetic-cached-provider"}}})).unwrap()).unwrap();
+        let legacy = directory.path().join("adoptionexampleinvalid.session");
+        std::fs::write(&legacy, b"synthetic legacy auth preserved").unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&called);
+        let provider: crate::password::PasswordProvider = Arc::new(move || {
+            observed.store(true, Ordering::SeqCst);
+            None
+        });
+        let error = authenticate_fresh_for_adoption(
+            directory.path(),
+            username,
+            &provider,
+            "com",
+            None,
+            crate::InputMode::NoInput,
+        )
+        .await
+        .unwrap_err();
+        assert!(called.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("No password was available"));
+        assert!(!session.exists());
+        assert!(!cache.exists());
+        assert_eq!(
+            std::fs::read(legacy).unwrap(),
+            b"synthetic legacy auth preserved"
+        );
     }
 
     #[tokio::test]
@@ -1304,7 +1391,7 @@ mod tests {
         let cookies = tempfile::tempdir().expect("tempdir");
         let apple_id = "cached-get-code@example.com";
         tokio::fs::write(
-            session_file_path(cookies.path(), apple_id),
+            session_file_path(cookies.path(), apple_id, "com"),
             r#"{"session_token":"valid-token"}"#,
         )
         .await
@@ -1315,7 +1402,7 @@ mod tests {
         };
         let cache_json = serde_json::to_vec(&cache).expect("cache json");
         tokio::fs::write(
-            validation_cache_file_path(cookies.path(), apple_id),
+            validation_cache_file_path(cookies.path(), apple_id, "com"),
             cache_json,
         )
         .await
@@ -1358,7 +1445,7 @@ mod tests {
         let cookies = tempfile::tempdir().expect("tempdir");
         let apple_id = "live-get-code@example.com";
         tokio::fs::write(
-            session_file_path(cookies.path(), apple_id),
+            session_file_path(cookies.path(), apple_id, "com"),
             r#"{"session_token":"valid-token"}"#,
         )
         .await
@@ -1428,7 +1515,7 @@ mod tests {
         let cookies = tempfile::tempdir().expect("tempdir");
         let apple_id = "get-code-retry@example.com";
         tokio::fs::write(
-            session_file_path(cookies.path(), apple_id),
+            session_file_path(cookies.path(), apple_id, "com"),
             r#"{"session_token":"stale-token"}"#,
         )
         .await
@@ -1451,7 +1538,7 @@ mod tests {
         let cookies = tempfile::tempdir().expect("tempdir");
         let apple_id = "interactive-retry@example.com";
         tokio::fs::write(
-            session_file_path(cookies.path(), apple_id),
+            session_file_path(cookies.path(), apple_id, "com"),
             r#"{"session_token":"stale-token"}"#,
         )
         .await
@@ -1561,7 +1648,7 @@ mod tests {
             .save_validation_cache(&make_response(2, false, true, true))
             .await;
         assert!(
-            !recently_validated(&session).await,
+            cached_validation(&session).await.is_none(),
             "cache without a session token must not authenticate an empty session"
         );
 
@@ -1569,7 +1656,7 @@ mod tests {
             .session_data
             .insert("session_token".into(), "token".into());
         assert!(
-            recently_validated(&session).await,
+            cached_validation(&session).await.is_some(),
             "fresh validation cache should suppress idle re-validation"
         );
     }

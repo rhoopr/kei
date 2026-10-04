@@ -32,6 +32,18 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7
 /// (HTTP requests) with exclusive writes (session refresh / re-auth).
 pub type SharedSession = Arc<tokio::sync::RwLock<Session>>;
 
+fn realm_for_home(home: &str) -> Result<&'static str> {
+    match home {
+        "https://www.icloud.com" => Ok("com"),
+        "https://www.icloud.com.cn" => Ok("cn"),
+        // Local test servers represent the international realm.
+        #[cfg(test)]
+        _ => Ok("com"),
+        #[cfg(not(test))]
+        _ => anyhow::bail!("Unsupported authentication provider realm"),
+    }
+}
+
 /// Maximum length for sanitized usernames used in file paths.
 /// Long usernames are truncated and suffixed with a hash to stay under OS limits.
 const MAX_SANITIZED_USERNAME_LEN: usize = 64;
@@ -70,8 +82,8 @@ pub fn sanitize_username(username: &str) -> String {
     }
 }
 
-pub(crate) fn persisted_auth_files(cookie_dir: &Path, username: &str) -> [PathBuf; 3] {
-    let sanitized = sanitize_username(username);
+pub(crate) fn persisted_auth_files(cookie_dir: &Path, username: &str, realm: &str) -> [PathBuf; 3] {
+    let sanitized = crate::account::namespace(username, realm);
     [
         cookie_dir.join(&sanitized),
         cookie_dir.join(format!("{sanitized}.session")),
@@ -121,20 +133,21 @@ fn write_lock_generation(file: &std::fs::File, generation: u64) -> Result<()> {
 }
 
 impl SessionStateGuard {
-    pub(crate) async fn acquire(cookie_dir: &Path, username: &str) -> Result<Self> {
-        Self::acquire_with_generation(cookie_dir, username, None).await
+    pub(crate) async fn acquire(cookie_dir: &Path, username: &str, realm: &str) -> Result<Self> {
+        Self::acquire_with_generation(cookie_dir, username, realm, None).await
     }
 
     async fn acquire_with_generation(
         cookie_dir: &Path,
         username: &str,
+        realm: &str,
         expected_generation: Option<SessionGeneration>,
     ) -> Result<Self> {
         let cookie_dir = cookie_dir.to_path_buf();
         fs::create_dir_all(&cookie_dir).await.with_context(|| {
             format!("Could not create cookie directory {}", cookie_dir.display())
         })?;
-        let sanitized_username = sanitize_username(username);
+        let sanitized_username = crate::account::namespace(username, realm);
         let lock_path = cookie_dir.join(format!("{sanitized_username}.lock"));
         let (lock_file, generation) = tokio::task::spawn_blocking(move || {
             let file = std::fs::OpenOptions::new()
@@ -173,7 +186,13 @@ impl SessionStateGuard {
     }
 
     pub(crate) fn files(&self) -> [PathBuf; 3] {
-        persisted_auth_files(&self.cookie_dir, &self.sanitized_username)
+        [
+            self.cookie_dir.join(&self.sanitized_username),
+            self.cookie_dir
+                .join(format!("{}.session", self.sanitized_username)),
+            self.cookie_dir
+                .join(format!("{}.cache", self.sanitized_username)),
+        ]
     }
 
     fn has_replayable_auth(&self) -> bool {
@@ -405,11 +424,16 @@ async fn strip_session_routing_state_file(session_file: &Path) {
 pub(crate) async fn strip_session_routing_state(
     cookie_dir: &Path,
     username: &str,
+    realm: &str,
     expected_generation: Option<SessionGeneration>,
 ) -> Result<()> {
-    let guard =
-        SessionStateGuard::acquire_with_generation(cookie_dir, username, expected_generation)
-            .await?;
+    let guard = SessionStateGuard::acquire_with_generation(
+        cookie_dir,
+        username,
+        realm,
+        expected_generation,
+    )
+    .await?;
     let session_file = guard.files()[1].clone();
     strip_session_routing_state_file(&session_file).await;
     Ok(())
@@ -468,6 +492,7 @@ pub struct Session {
     api_timeout: Duration,
     state_guard: SessionStateGuard,
     loaded_persisted_auth: bool,
+    principal: Option<String>,
 }
 
 impl std::fmt::Debug for Session {
@@ -490,6 +515,27 @@ impl Session {
         timeout_secs: Option<u64>,
     ) -> Result<Self> {
         Self::new_with_generation(cookie_dir, username, home_endpoint, timeout_secs, None).await
+    }
+
+    /// Start an explicit adoption login from empty auth state while retaining
+    /// the account lock. Only new-namespace auth artifacts are discarded.
+    pub(crate) async fn new_fresh(
+        cookie_dir: &Path,
+        username: &str,
+        home_endpoint: &str,
+    ) -> Result<Self> {
+        let realm = realm_for_home(home_endpoint)?;
+        let guard = SessionStateGuard::acquire(cookie_dir, username, realm).await?;
+        guard.discard().await?;
+        Self::build(
+            cookie_dir.to_path_buf(),
+            &crate::account::namespace(username, realm),
+            home_endpoint,
+            None,
+            guard,
+            false,
+        )
+        .await
     }
 
     pub(crate) async fn new_after_release(
@@ -516,12 +562,17 @@ impl Session {
         timeout_secs: Option<u64>,
         expected_generation: Option<SessionGeneration>,
     ) -> Result<Self> {
-        let sanitized = sanitize_username(username);
+        let realm = realm_for_home(home_endpoint)?;
+        let sanitized = crate::account::namespace(username, realm);
         let cookie_dir = cookie_dir.to_path_buf();
 
-        let state_guard =
-            SessionStateGuard::acquire_with_generation(&cookie_dir, username, expected_generation)
-                .await?;
+        let state_guard = SessionStateGuard::acquire_with_generation(
+            &cookie_dir,
+            username,
+            realm,
+            expected_generation,
+        )
+        .await?;
         let loaded_persisted_auth = state_guard.has_replayable_auth();
 
         Self::build(
@@ -658,7 +709,38 @@ impl Session {
             api_timeout: timeout,
             state_guard,
             loaded_persisted_auth,
+            principal: None,
         })
+    }
+
+    /// Pin the authenticated principal in memory. No raw provider ID is
+    /// persisted here, and missing identity cannot replace an existing pin.
+    pub(crate) fn bind_principal(
+        &mut self,
+        data: &super::AccountLoginResponse,
+        expected: Option<&str>,
+    ) -> Result<()> {
+        let realm = realm_for_home(&self.home_endpoint)?;
+        let observed = data
+            .ds_info
+            .as_ref()
+            .and_then(|info| info.dsid.as_deref())
+            .filter(|dsid| !dsid.trim().is_empty())
+            .map(|dsid| crate::account::provider_fingerprint(realm, dsid));
+        if expected.is_some_and(|pin| observed.as_deref() != Some(pin))
+            || self
+                .principal
+                .as_ref()
+                .is_some_and(|pin| observed.as_ref() != Some(pin))
+        {
+            return Err(super::error::AuthError::AccountIdentityChanged.into());
+        }
+        self.principal = observed;
+        Ok(())
+    }
+
+    pub(crate) fn principal(&self) -> Option<&str> {
+        self.principal.as_deref()
     }
 
     pub(crate) fn cookiejar_path(&self) -> PathBuf {
@@ -1050,7 +1132,7 @@ mod tests {
     async fn session_reset_invalidates_a_released_session() {
         let (_td, dir) = test_dir("reset_while_released");
         let username = "user@test.com";
-        let files = persisted_auth_files(&dir, username);
+        let files = persisted_auth_files(&dir, username, "com");
         for path in &files {
             std::fs::write(path, b"stale").unwrap();
         }
@@ -1059,7 +1141,9 @@ mod tests {
             .unwrap();
         session.release_lock().unwrap();
 
-        let reset = SessionStateGuard::acquire(&dir, username).await.unwrap();
+        let reset = SessionStateGuard::acquire(&dir, username, "com")
+            .await
+            .unwrap();
         reset.discard().await.unwrap();
         drop(reset);
 
@@ -1086,7 +1170,9 @@ mod tests {
         session.release_lock().unwrap();
         drop(session);
 
-        let reset = SessionStateGuard::acquire(&dir, username).await.unwrap();
+        let reset = SessionStateGuard::acquire(&dir, username, "com")
+            .await
+            .unwrap();
         reset.discard().await.unwrap();
         drop(reset);
 
@@ -1104,7 +1190,7 @@ mod tests {
     async fn failed_reset_still_invalidates_a_released_session() {
         let (_td, dir) = test_dir("failed_reset_while_released");
         let username = "user@test.com";
-        let files = persisted_auth_files(&dir, username);
+        let files = persisted_auth_files(&dir, username, "com");
         std::fs::create_dir(&files[0]).unwrap();
         std::fs::write(&files[1], b"stale").unwrap();
         let session = Session::new(&dir, username, "https://example.com", None)
@@ -1112,7 +1198,9 @@ mod tests {
             .unwrap();
         session.release_lock().unwrap();
 
-        let reset = SessionStateGuard::acquire(&dir, username).await.unwrap();
+        let reset = SessionStateGuard::acquire(&dir, username, "com")
+            .await
+            .unwrap();
         reset
             .discard()
             .await
@@ -1136,11 +1224,16 @@ mod tests {
     async fn generation_overflow_preserves_auth_files() {
         let (_td, dir) = test_dir("generation_overflow");
         let username = "user@test.com";
-        let files = persisted_auth_files(&dir, username);
+        let files = persisted_auth_files(&dir, username, "com");
         std::fs::write(&files[0], b"cookie").unwrap();
-        let lock_path = dir.join(format!("{}.lock", sanitize_username(username)));
+        let lock_path = dir.join(format!(
+            "{}.lock",
+            crate::account::namespace(username, "com")
+        ));
         std::fs::write(&lock_path, u64::MAX.to_string()).unwrap();
-        let guard = SessionStateGuard::acquire(&dir, username).await.unwrap();
+        let guard = SessionStateGuard::acquire(&dir, username, "com")
+            .await
+            .unwrap();
 
         guard.discard().await.expect_err("generation must not wrap");
 
@@ -1177,7 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn test_cookiejar_directory_at_path_skipped() {
         let (_td, dir) = test_dir("cookie_dir_skip");
-        let sanitized = sanitize_username("user@test.com");
+        let sanitized = crate::account::namespace("user@test.com", "com");
         let cookiejar_path = dir.join(&sanitized);
 
         // Create a directory where the cookiejar file would be
@@ -1195,7 +1288,7 @@ mod tests {
     async fn test_expired_cookies_pruned_on_load() {
         let (_td, dir) = test_dir("cookie_prune");
         let username = "user@test.com";
-        let cookie_path = auth::cookiejar_file_path(&dir, username);
+        let cookie_path = auth::cookiejar_file_path(&dir, username, "com");
 
         // Write a cookie file with one expired and one valid cookie
         let entries = vec![
@@ -1227,8 +1320,8 @@ mod tests {
     async fn corrupt_cookiejar_json_is_removed_on_load() {
         let (_td, dir) = test_dir("cookie_corrupt_json");
         let username = "user@test.com";
-        let cookie_path = auth::cookiejar_file_path(&dir, username);
-        let cache_path = auth::validation_cache_file_path(&dir, username);
+        let cookie_path = auth::cookiejar_file_path(&dir, username, "com");
+        let cache_path = auth::validation_cache_file_path(&dir, username, "com");
         std::fs::write(&cookie_path, "not valid json {{{").unwrap();
         std::fs::write(&cache_path, r#"{"validated_at":1,"account_data":{}}"#).unwrap();
 
@@ -1251,7 +1344,7 @@ mod tests {
     async fn legacy_tab_separated_cookiejar_is_not_loaded() {
         let (_td, dir) = test_dir("cookie_legacy_tab");
         let username = "user@test.com";
-        let cookie_path = auth::cookiejar_file_path(&dir, username);
+        let cookie_path = auth::cookiejar_file_path(&dir, username, "com");
         std::fs::write(
             &cookie_path,
             "https://example.com\tlegacy_cookie=val; Expires=Thu, 01 Jan 2099 00:00:00 GMT",
@@ -1353,12 +1446,12 @@ mod tests {
     #[test]
     fn persisted_auth_files_cover_only_session_artifacts() {
         let dir = Path::new("/data");
-        let files = persisted_auth_files(dir, "user@test.com");
+        let files = persisted_auth_files(dir, "user@test.com", "com");
         let names: Vec<String> = files
             .iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        let sanitized = sanitize_username("user@test.com");
+        let sanitized = crate::account::namespace("user@test.com", "com");
         assert_eq!(
             names,
             vec![
@@ -1370,12 +1463,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collision_and_realm_isolation_preserve_legacy_auth_and_force_fresh_adoption() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = "first.last@example.invalid";
+        let b = "firstlast@example.invalid";
+        let legacy = directory
+            .path()
+            .join(format!("{}.session", sanitize_username(a)));
+        std::fs::write(&legacy, br#"{"session_token":"legacy-synthetic"}"#).unwrap();
+        let mut session = Session::new(directory.path(), a, "https://www.icloud.com", None)
+            .await
+            .unwrap();
+        assert!(!session.loaded_persisted_auth());
+        session
+            .session_data
+            .insert("session_token".into(), "new-synthetic".into());
+        std::fs::write(
+            session.session_path(),
+            serde_json::to_vec(&session.session_data).unwrap(),
+        )
+        .unwrap();
+        let path_a = session.session_path();
+        // Colliding old slug and same login in another realm hold distinct locks.
+        let other = Session::new(directory.path(), b, "https://www.icloud.com", None)
+            .await
+            .unwrap();
+        let china = Session::new(directory.path(), a, "https://www.icloud.com.cn", None)
+            .await
+            .unwrap();
+        assert_ne!(path_a, other.session_path());
+        assert_ne!(path_a, china.session_path());
+        assert!(!other.loaded_persisted_auth());
+        assert!(!china.loaded_persisted_auth());
+        drop(session);
+        let fresh = Session::new_fresh(directory.path(), a, "https://www.icloud.com")
+            .await
+            .unwrap();
+        assert!(!fresh.loaded_persisted_auth());
+        assert!(!fresh.session_data.contains_key("session_token"));
+        assert!(!path_a.exists());
+        assert_eq!(
+            std::fs::read(legacy).unwrap(),
+            br#"{"session_token":"legacy-synthetic"}"#
+        );
+    }
+
+    #[tokio::test]
     async fn validation_cache_alone_is_not_replayable_auth_state() {
         let dir = tempfile::tempdir().unwrap();
-        let files = persisted_auth_files(dir.path(), "user@test.com");
+        let files = persisted_auth_files(dir.path(), "user@test.com", "com");
         std::fs::write(&files[2], b"cache").unwrap();
 
-        let guard = SessionStateGuard::acquire(dir.path(), "user@test.com")
+        let guard = SessionStateGuard::acquire(dir.path(), "user@test.com", "com")
             .await
             .unwrap();
         assert!(!guard.has_replayable_auth());
@@ -1385,7 +1524,7 @@ mod tests {
     async fn discard_persisted_auth_removes_only_session_artifacts() {
         let dir = tempfile::tempdir().unwrap();
         let username = "user@test.com";
-        let files = persisted_auth_files(dir.path(), username);
+        let files = persisted_auth_files(dir.path(), username, "com");
         for path in &files {
             std::fs::write(path, b"auth").unwrap();
         }
@@ -1398,7 +1537,7 @@ mod tests {
         std::fs::write(&credential, b"credential").unwrap();
         std::fs::write(&db, b"database").unwrap();
 
-        let guard = SessionStateGuard::acquire(dir.path(), username)
+        let guard = SessionStateGuard::acquire(dir.path(), username, "com")
             .await
             .unwrap();
         let removed = guard.discard().await.unwrap();
@@ -1416,10 +1555,10 @@ mod tests {
         let session = Session::new(dir.path(), username, "https://example.com", None)
             .await
             .unwrap();
-        let files = persisted_auth_files(dir.path(), username);
+        let files = persisted_auth_files(dir.path(), username, "com");
         std::fs::write(&files[0], b"cookie").unwrap();
 
-        let err = SessionStateGuard::acquire(dir.path(), username)
+        let err = SessionStateGuard::acquire(dir.path(), username, "com")
             .await
             .unwrap_err();
 
@@ -1526,7 +1665,7 @@ mod tests {
     #[tokio::test]
     async fn test_corrupt_session_file_recovers() {
         let (_td, dir) = test_dir("corrupt_session");
-        let sanitized = sanitize_username("user@test.com");
+        let sanitized = crate::account::namespace("user@test.com", "com");
         let session_path = dir.join(format!("{sanitized}.session"));
 
         std::fs::write(&session_path, "not valid json {{{{").unwrap();
