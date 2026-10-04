@@ -620,8 +620,9 @@ async fn targeted_lookup_rejects_conflicting_scope_and_child_master_pair() {
                 child["fields"]["masterRef"]["value"]["zoneID"] =
                     json!({"zoneName":"PrimarySync", "ownerRecordName":"other"})
             }
-            "master_pair" => {
-                child["fields"]["masterRef"]["value"]["recordName"] = json!("other-master")
+            _ => {
+                assert_eq!(fault, "master_pair");
+                child["fields"]["masterRef"]["value"]["recordName"] = json!("other-master");
             }
         }
         let album = make_album_with_session(
