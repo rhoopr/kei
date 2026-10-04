@@ -113,7 +113,7 @@ fn recovery_restores_uncommitted_bytes_at_each_interruption_boundary() {
 #[test]
 fn concurrent_edit_before_displacement_is_restored_and_retained() {
     let dir = TempDir::new().unwrap();
-    let (target, part, journal) = prepare(dir.path());
+    let (target, part, mut journal) = prepare(dir.path());
     let error = publish_journal(&journal, |stage| {
         if stage == Stage::Prepared {
             fs::write(&target, b"user edit")?;
@@ -132,7 +132,7 @@ fn concurrent_edit_before_displacement_is_restored_and_retained() {
 #[test]
 fn concurrent_creation_never_gets_overwritten_by_publication_or_recovery() {
     let dir = TempDir::new().unwrap();
-    let (target, part, journal) = prepare(dir.path());
+    let (target, part, mut journal) = prepare(dir.path());
     assert!(
         publish_journal(&journal, |stage| {
             if stage == Stage::Displaced {
@@ -152,7 +152,7 @@ fn concurrent_creation_never_gets_overwritten_by_publication_or_recovery() {
 fn changed_prepared_bytes_and_second_edit_are_preserved() {
     for change_prepared in [true, false] {
         let dir = TempDir::new().unwrap();
-        let (target, part, journal) = prepare(dir.path());
+        let (target, part, mut journal) = prepare(dir.path());
         assert!(
             publish_journal(&journal, |stage| {
                 if change_prepared && stage == Stage::Prepared {
@@ -634,10 +634,10 @@ fn fallback_refuses_using_the_target_as_its_prepared_file() {
 #[test]
 fn cleanup_failure_retains_unknown_bytes_and_the_prepared_path_for_callers() {
     let dir = TempDir::new().unwrap();
-    let (target, part, journal) = prepare(dir.path());
+    let (target, part, mut journal) = prepare(dir.path());
     publish_journal(&journal, |_| Ok(())).unwrap();
     fs::write(journal.original.path(), b"late user edit").unwrap();
-    let error = super::finish_publication(&journal, &part).unwrap_err();
+    let error = super::finish_publication(&mut journal, &part).unwrap_err();
     let error = super::retain_recovery_error(error, &journal, &part);
     let disposition = crate::download::file::classify_conditional_publish_error(&error);
     assert!(disposition.target_changed);
@@ -660,7 +660,7 @@ fn cleanup_failure_retains_unknown_bytes_and_the_prepared_path_for_callers() {
 fn completed_transaction_releases_locks_even_with_a_fork_inherited_descriptor() {
     let dir = TempDir::new().unwrap();
     let (target, _, journal) = prepare(dir.path());
-    let inherited_descriptor = journal.lock.try_clone().unwrap();
+    let inherited_descriptor = journal.lock.as_ref().unwrap().try_clone().unwrap();
     drop(journal);
     recover_target(&target).unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"original");
@@ -693,7 +693,7 @@ fn renamed_parent_retains_edited_original_and_all_journal_entries() {
     let dir = TempDir::new().unwrap();
     let parent = dir.path().join("photos");
     fs::create_dir(&parent).unwrap();
-    let (target, _, journal) = prepare(&parent);
+    let (target, _, mut journal) = prepare(&parent);
     let mut original = fs::OpenOptions::new().write(true).open(&target).unwrap();
     publish_journal(&journal, |_| Ok(())).unwrap();
     let moved = dir.path().join("moved");
@@ -785,4 +785,304 @@ fn protected_legacy_journal_is_untouched_even_through_root_alias() {
     fs::create_dir(&journal_path).unwrap();
     assert!(super::recover_tree_blocking_with_protection(&root, &[target]).is_err());
     assert!(journal_path.is_dir());
+}
+
+// Dedicated subprocesses scope faults to disposable fixture paths. This models
+// open-unlinked handles and a terminal errno; it does not emulate an NFS server.
+pub(in crate::download::file) fn terminal_fixture_active(path: &std::path::Path) -> bool {
+    std::env::var_os("KEI_TEST_TERMINAL_ROOT")
+        .is_some_and(|root| path.starts_with(std::path::PathBuf::from(root)))
+}
+
+pub(super) fn terminal_rmdir_fault(
+    path: &crate::fs_util::ConfinedPath,
+) -> Option<anyhow::Result<()>> {
+    if !terminal_fixture_active(path.path()) {
+        return None;
+    }
+    let mode = std::env::var("KEI_TEST_TERMINAL_MODE").unwrap();
+    let manifest = path.path().join("manifest.json");
+    let held = fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
+        fs::read_link(entry.unwrap().path()).is_ok_and(|name| {
+            name == manifest
+                || name == std::path::Path::new(&format!("{} (deleted)", manifest.display()))
+        })
+    });
+    if mode == "unknown" {
+        fs::write(path.path().join("user-file"), b"user bytes").unwrap();
+        return Some(Err(
+            std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into()
+        ));
+    }
+    if mode == "namespace" {
+        fs::rename(path.path(), path.path().with_extension("saved")).unwrap();
+        fs::create_dir(path.path()).unwrap();
+        return Some(Err(
+            std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into()
+        ));
+    }
+    if mode == "target" {
+        fs::write(path.path().with_file_name("photo.jpg"), b"late target edit").unwrap();
+        return Some(Err(
+            std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into()
+        ));
+    }
+    if mode == "eio" {
+        return Some(Err(std::io::Error::from_raw_os_error(libc::EIO).into()));
+    }
+    if mode == "descriptors" {
+        assert!(!held, "Manifest descriptor remains open at terminal rmdir");
+    }
+    if mode == "enotempty" {
+        return Some(Err(
+            std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into()
+        ));
+    }
+    None
+}
+
+#[test]
+fn terminal_cleanup_subprocess_regressions() {
+    for mode in [
+        "descriptors",
+        "enotempty",
+        "unknown",
+        "namespace",
+        "target",
+        "eio",
+        "fsync",
+    ] {
+        let root = TempDir::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "download::file::replacement_recovery::tests::terminal_cleanup_worker",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("KEI_TEST_TERMINAL_ROOT", root.path())
+            .env("KEI_TEST_TERMINAL_MODE", mode)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "mode={mode}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn terminal_cleanup_worker() {
+    let Some(root) = std::env::var_os("KEI_TEST_TERMINAL_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let (target, part, mut journal) = prepare(&root);
+    publish_journal(&journal, |_| Ok(())).unwrap();
+    let mode = std::env::var("KEI_TEST_TERMINAL_MODE").unwrap();
+    let result = super::finish_publication(&mut journal, &part);
+    if ["unknown", "namespace", "target", "eio", "fsync"].contains(&mode.as_str()) {
+        let error = super::retain_recovery_error(result.unwrap_err(), &journal, &part);
+        let disposition = crate::download::file::classify_conditional_publish_error(&error);
+        assert!(disposition.target_changed);
+        assert!(disposition.retained_paths.contains(&part));
+        assert!(part.exists());
+        if mode == "unknown" {
+            assert_eq!(
+                fs::read(journal.directory.path().join("user-file")).unwrap(),
+                b"user bytes"
+            );
+        }
+        if mode == "namespace" {
+            assert!(journal.directory.path().with_extension("saved").is_dir());
+        }
+        if mode == "target" {
+            assert_eq!(fs::read(&target).unwrap(), b"late target edit");
+        }
+        if mode == "fsync" {
+            assert!(journal.directory.path().exists());
+        }
+        return;
+    }
+    result.unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"replacement");
+    assert!(!part.exists());
+    drop(journal);
+    let restart = root.join("restart");
+    fs::create_dir(&restart).unwrap();
+    let (restarted_target, restarted_part, restarted_journal) = prepare(&restart);
+    publish_journal(&restarted_journal, |_| Ok(())).unwrap();
+    drop(restarted_journal);
+    recover_target(&restarted_target).unwrap();
+    assert_eq!(fs::read(&restarted_target).unwrap(), b"replacement");
+    // Recovery has no ownership evidence for this unrelated prepared path.
+    assert_eq!(fs::read(&restarted_part).unwrap(), b"replacement");
+    // Empty-manifest initialization must also close both read and lock handles.
+    let empty = root.join("empty.jpg");
+    let directory = directory_path(&empty).unwrap();
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("manifest.json"), b"").unwrap();
+    recover_target(&empty).unwrap();
+    if std::env::var("KEI_TEST_TERMINAL_MODE").as_deref() == Ok("descriptors") {
+        assert!(!directory.exists());
+    }
+}
+
+pub(super) fn terminal_sync_fault(path: &crate::fs_util::ConfinedPath) -> anyhow::Result<()> {
+    if terminal_fixture_active(path.path())
+        && std::env::var("KEI_TEST_TERMINAL_MODE").as_deref() == Ok("fsync")
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "xmp")]
+#[test]
+fn terminal_sidecar_cleanup_retires_marker_across_restarts() {
+    for mode in ["descriptors", "enotempty"] {
+        let root = TempDir::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "download::file::replacement_recovery::tests::terminal_sidecar_worker",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("KEI_TEST_TERMINAL_ROOT", root.path())
+            .env("KEI_TEST_TERMINAL_MODE", mode)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "mode={mode}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn terminal_sidecar_worker() {
+    use crate::download::metadata_rewrite::run_pending;
+    use crate::download::pipeline::MetadataFlags;
+    use crate::state::{SqliteStateDb, types::AssetMetadata};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    let Some(root) = std::env::var_os("KEI_TEST_TERMINAL_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let media = root.join("photo.jpg");
+    fs::write(&media, crate::test_helpers::minimal_jpeg_with_source_gps()).unwrap();
+    let checksum = crate::download::file::compute_sha256(&media).await.unwrap();
+    let historic = root.join(".kei-xmp-historical.kei-tmp");
+    fs::write(&historic, b"historical retained bytes").unwrap();
+    let db_path = root.join("state.db");
+    let db = SqliteStateDb::open(&db_path).await.unwrap();
+    for description in ["Before", "After"] {
+        let record = crate::test_helpers::TestAssetRecord::new("TERMINAL_SIDECAR")
+            .filename("photo.jpg")
+            .metadata(AssetMetadata {
+                description: Some(description.into()),
+                metadata_hash: Some(description.into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        if description == "Before" {
+            db.mark_downloaded(
+                "PrimarySync",
+                "TERMINAL_SIDECAR",
+                "original",
+                &media,
+                &checksum,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.record_metadata_write_failure("PrimarySync", "TERMINAL_SIDECAR", "original")
+            .await
+            .unwrap();
+        let report = run_pending(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".kei-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.failed, 0);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let target = root.join("photo.jpg.xmp");
+    let bytes = fs::read(&target).unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("After"));
+    let snapshot = fs::metadata(&target).unwrap();
+    assert_eq!(snapshot.nlink(), 1);
+    let entries = || {
+        let mut entries: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".kei-"))
+            .collect();
+        entries.sort();
+        entries
+    };
+    let before = entries();
+    assert_eq!(
+        before
+            .iter()
+            .filter(|name| name.to_string_lossy().starts_with(".kei-xmp-"))
+            .count(),
+        1
+    );
+    drop(db);
+    for _ in 0..2 {
+        recover_tree_blocking(&root).unwrap();
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let quiet = run_pending(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".kei-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(quiet.applied, 0);
+        assert_eq!(quiet.failed, 0);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        let current = fs::metadata(&target).unwrap();
+        assert_eq!(
+            (
+                current.ino(),
+                current.mtime(),
+                current.mtime_nsec(),
+                current.nlink()
+            ),
+            (snapshot.ino(), snapshot.mtime(), snapshot.mtime_nsec(), 1)
+        );
+        assert_eq!(entries(), before);
+        assert_eq!(fs::read(&historic).unwrap(), b"historical retained bytes");
+        assert_eq!(
+            crate::download::file::compute_sha256(&media).await.unwrap(),
+            checksum
+        );
+        drop(db);
+    }
 }

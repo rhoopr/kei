@@ -366,6 +366,27 @@ Hardlinks retain current refusal behavior. This slice does not implement #884,
 change product policy, qualify NFS/NAS or power loss, or duplicate the separate
 subprocess-death phase.
 
+## Terminal replacement cleanup
+
+`terminal_cleanup_subprocess_regressions` scopes synthetic faults to disposable
+Linux subprocess fixtures. It detects manifest handles still open at directory
+removal, injects `ENOTEMPTY` on an empty terminal directory, and covers normal
+publication, committed restart recovery and empty-manifest initialization.
+Unknown entries, changed directory identity or target bytes, other removal
+errors and directory sync failures must retain failure classification and the
+prepared path. Existing late-original-edit, active-lock, malformed-manifest,
+symlink and interrupted-publication proofs remain separate.
+
+With XMP enabled, `terminal_sidecar_cleanup_retires_marker_across_restarts`
+seeds a downloaded media row and first sidecar, changes only provider metadata,
+and runs the production queued rewrite owner. Under both descriptor-sensitive
+and deterministic empty-directory faults, the marker must retire and the
+operation's prepared file must disappear. Two reopened SQLite/startup-recovery
+cycles must preserve sidecar bytes, inode, timestamp and link count, media
+checksum, and temporary-entry count. A historical prepared file stays intact.
+These tests model terminal failures on local storage. They do not prove an NFS
+silly-rename mechanism or physical NAS behavior.
+
 ## State-transition proof
 
 Changes to durable configuration, filesystem paths, media publication,

@@ -850,7 +850,14 @@ and sidecar journals before testing existence or checksums. Recovery restores
 uncommitted originals or completes cleanup of committed replacements. Unknown
 versions, malformed manifests, changed bytes, and conflicting destinations
 retain the journal and fail the operation. Journal file locks prevent local
-writers from recovering an active transaction. NFS mounts with `nolock` do not
+writers from recovering an active transaction. Terminal cleanup holds the lock
+through manifest unlink, then closes all manifest handles before directory
+removal. Only `ENOTEMPTY` from removal of a reverified empty, manifest-less
+journal is deferred with a warning; publication still verifies the target and
+removes only its matching prepared inode and bytes. Unknown entries, changed
+bytes or namespaces, other removal errors, and directory fsync failures remain
+errors. Empty journal recovery applies the same bounded cleanup. Historical
+prepared files are not swept by this path. NFS mounts with `nolock` do not
 provide cross-host locking; do not run kei on the same destination from
 multiple NFS clients. Recovery does not authorize provider checkpoint progress
 or downloaded-state finalization by itself.

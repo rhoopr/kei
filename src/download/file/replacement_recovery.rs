@@ -49,7 +49,7 @@ struct Manifest {
 struct Journal {
     directory: ConfinedPath,
     manifest: ConfinedPath,
-    lock: std::fs::File,
+    lock: Option<std::fs::File>,
     target: ConfinedPath,
     original: ConfinedPath,
     replacement: ConfinedPath,
@@ -63,7 +63,9 @@ impl Drop for Journal {
         // Explicit unlock also releases a lock held by descriptors inherited
         // between another thread's fork and exec. Closing our descriptor alone
         // can leave that lock temporarily held after this transaction ends.
-        if let Err(error) = FileExt::unlock(&self.lock) {
+        if let Some(lock) = &self.lock
+            && let Err(error) = FileExt::unlock(lock)
+        {
             tracing::warn!(%error, "Could not release replacement journal lock");
         }
     }
@@ -149,12 +151,57 @@ fn same_entry(left: &ConfinedPath, right: &ConfinedPath) -> Result<bool> {
 }
 
 fn unlink(path: &ConfinedPath, flags: libc::c_int) -> Result<()> {
+    #[cfg(test)]
+    if flags == libc::AT_REMOVEDIR
+        && let Some(result) = tests::terminal_rmdir_fault(path)
+    {
+        return result;
+    }
     // SAFETY: retained directory descriptors and NUL-terminated names outlive
     // the call; unlinkat does not follow the leaf, including directory removal.
     let result = unsafe { libc::unlinkat(path.parent_fd(), path.name_cstr().as_ptr(), flags) };
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    Ok(())
+}
+
+// Only a manifest-less, empty directory is terminal housekeeping. Revalidate
+// through its retained parent capability so a renamed/recreated journal or an
+// unknown entry cannot be mistaken for the completed transaction.
+fn remove_empty_directory(directory: &ConfinedPath, manifest: &ConfinedPath) -> Result<()> {
+    let verify_empty = || -> Result<()> {
+        anyhow::ensure!(
+            manifest.open_optional_regular()?.is_none(),
+            "Replacement manifest reappeared"
+        );
+        anyhow::ensure!(
+            std::fs::read_dir(format!("/proc/self/fd/{}", manifest.parent_fd()))?
+                .next()
+                .transpose()?
+                .is_none(),
+            "Unknown entry in terminal replacement journal; retaining all bytes"
+        );
+        Ok(())
+    };
+    verify_empty()?;
+    // Persist manifest retirement before attempting optional empty-directory
+    // removal. Directory and parent fsync errors still fail the operation.
+    #[cfg(test)]
+    tests::terminal_sync_fault(manifest)?;
+    manifest.sync_parent()?;
+    if let Err(error) = unlink(directory, libc::AT_REMOVEDIR) {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            != Some(libc::ENOTEMPTY)
+        {
+            return Err(error);
+        }
+        verify_empty()?;
+        tracing::warn!("Empty replacement journal directory removal deferred");
+    }
+    directory.sync_parent()?;
     Ok(())
 }
 
@@ -197,7 +244,7 @@ impl Journal {
             commit: manifest.sibling(&directory.path().join("committed"))?,
             directory,
             manifest,
-            lock,
+            lock: Some(lock),
             target,
             evidence,
         })
@@ -261,8 +308,7 @@ impl Journal {
         let Some(read) = manifest.open_optional_regular()? else {
             // mkdir may have succeeded immediately before interruption. Only
             // an empty directory can be removed; unknown contents stay intact.
-            unlink(&directory, libc::AT_REMOVEDIR)?;
-            directory.sync_parent()?;
+            remove_empty_directory(&directory, &manifest)?;
             return Ok(None);
         };
         let expected_identity = file_identity(&read)?;
@@ -292,6 +338,7 @@ impl Journal {
             directory.path().display()
         );
         manifest.validate_identity(expected_identity)?;
+        drop(read);
         let mut bytes = Vec::new();
         Read::by_ref(&mut lock)
             .take(MAX_MANIFEST_BYTES + 1)
@@ -308,8 +355,9 @@ impl Journal {
                 );
             }
             unlink(&manifest, 0)?;
-            unlink(&directory, libc::AT_REMOVEDIR)?;
-            directory.sync_parent()?;
+            FileExt::unlock(&lock)?;
+            drop(lock);
+            remove_empty_directory(&directory, &manifest)?;
             return Ok(None);
         }
         let evidence: Manifest = serde_json::from_slice(&bytes)?;
@@ -353,8 +401,13 @@ impl Journal {
         Ok(!bytes.is_empty())
     }
 
-    fn finish(&self) -> Result<()> {
-        self.committed()?;
+    fn finish(&mut self) -> Result<()> {
+        if self.committed()? {
+            anyhow::ensure!(
+                read_fingerprint(&self.target)?.as_ref() == Some(&self.evidence.replacement),
+                "Committed replacement target changed; retaining recovery bytes"
+            );
+        }
         for entry in std::fs::read_dir(format!("/proc/self/fd/{}", self.manifest.parent_fd()))? {
             let name = entry?.file_name();
             anyhow::ensure!(
@@ -395,15 +448,22 @@ impl Journal {
             unlink(&self.commit, 0)?;
         }
         self.sync()?;
-        self.manifest
-            .validate_identity(file_identity(&self.lock)?)?;
+        let lock = self
+            .lock
+            .as_ref()
+            .context("Replacement journal lock is missing")?;
+        self.manifest.validate_identity(file_identity(lock)?)?;
+        // Keep writer exclusion until every recovery entry is verified and
+        // removed and the manifest is unlinked. Then close the open-unlinked
+        // handle before rmdir so NFS can retire its silly-rename entry.
         unlink(&self.manifest, 0)?;
-        unlink(&self.directory, libc::AT_REMOVEDIR)?;
-        self.directory.sync_parent()?;
+        FileExt::unlock(lock)?;
+        drop(self.lock.take());
+        remove_empty_directory(&self.directory, &self.manifest)?;
         Ok(())
     }
 
-    fn recover(&self) -> Result<()> {
+    fn recover(&mut self) -> Result<()> {
         if self.committed()? {
             anyhow::ensure!(
                 read_fingerprint(&self.target)?.as_ref() == Some(&self.evidence.replacement),
@@ -455,7 +515,7 @@ pub(super) fn publish(
     expected: ExistingFileFingerprint,
     replacement: ExistingFileFingerprint,
 ) -> Result<()> {
-    let journal = Journal::create(&confined(part)?, confined(target)?, expected, replacement)?;
+    let mut journal = Journal::create(&confined(part)?, confined(target)?, expected, replacement)?;
     let result = publish_journal(&journal, |_| Ok(()));
     if let Err(error) = result {
         if let Err(recovery_error) = journal.recover() {
@@ -469,7 +529,8 @@ pub(super) fn publish(
         }
         return Err(error);
     }
-    finish_publication(&journal, part).map_err(|error| retain_recovery_error(error, &journal, part))
+    finish_publication(&mut journal, part)
+        .map_err(|error| retain_recovery_error(error, &journal, part))
 }
 
 fn retain_recovery_error(error: anyhow::Error, journal: &Journal, part: &Path) -> anyhow::Error {
@@ -482,8 +543,12 @@ fn retain_recovery_error(error: anyhow::Error, journal: &Journal, part: &Path) -
         })
 }
 
-fn finish_publication(journal: &Journal, part: &Path) -> Result<()> {
+fn finish_publication(journal: &mut Journal, part: &Path) -> Result<()> {
     journal.finish()?;
+    anyhow::ensure!(
+        read_fingerprint(&journal.target)?.as_ref() == Some(&journal.evidence.replacement),
+        "Published replacement target changed during cleanup"
+    );
     let part = confined(part)?;
     if same_entry(&part, &journal.target)?
         && read_fingerprint(&part)?.as_ref() == Some(&journal.evidence.replacement)
@@ -538,7 +603,7 @@ pub(super) fn recover_target(target: &Path) -> Result<()> {
     {
         return Ok(());
     }
-    if let Some(journal) = Journal::open(&directory)? {
+    if let Some(mut journal) = Journal::open(&directory)? {
         journal.recover()?;
     }
     Ok(())
@@ -609,7 +674,7 @@ fn recover_tree_blocking_with_protection(
                     !protected_journals.contains(&directory.join(entry.file_name())),
                     "Replacement recovery intersects protected legacy evidence; all bytes retained"
                 );
-                if let Some(journal) = Journal::open(&directory.join(entry.file_name()))
+                if let Some(mut journal) = Journal::open(&directory.join(entry.file_name()))
                     .with_context(|| {
                         format!(
                             "Could not open replacement journal {}",
@@ -628,4 +693,4 @@ fn recover_tree_blocking_with_protection(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
