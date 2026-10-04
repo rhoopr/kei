@@ -29,9 +29,20 @@ kei_require_env() {
     fi
 }
 
-# Strip non-alphanumeric characters, matching kei's Session::sanitized_filename().
+# Match the exact account namespace. These suites generate com-realm configs;
+# the optional realm argument also supports isolated codec checks.
 kei_user_slug() {
-    printf '%s' "$ICLOUD_USERNAME" | tr -cd '[:alnum:]'
+    python3 - "${1:-com}" <<'PY'
+import hashlib
+import os
+import sys
+
+digest = hashlib.sha256(b"configured-account-v1")
+for value in [sys.argv[1], os.environ["ICLOUD_USERNAME"]]:
+    encoded = value.encode("utf-8")
+    digest.update(str(len(encoded)).encode("ascii") + b":" + encoded)
+print("account-v1-" + digest.hexdigest(), end="")
+PY
 }
 
 kei_cookie_dir() {
@@ -203,8 +214,7 @@ kei_preflight_session() {
 
 # sqlite3 against the state DB. `kei_db_query` returns the first column
 # of each row on stdout; `kei_db_exec` runs a mutating statement and
-# discards output. Both suppress the "unable to open" error that fires
-# before the first sync has created the DB.
+# discards output. Neither creates an empty unowned database before first sync.
 kei_sql_string() {
     local value="$1"
     value="${value//\'/\'\'}"
@@ -212,11 +222,17 @@ kei_sql_string() {
 }
 
 kei_db_query() {
-    sqlite3 "$(kei_db_path)" "$1" 2>/dev/null
+    local path
+    path="$(kei_db_path)" || return 1
+    [ -f "$path" ] || return 1
+    sqlite3 -readonly "$path" "$1" 2>/dev/null
 }
 
 kei_db_exec() {
-    sqlite3 "$(kei_db_path)" "$1" 2>/dev/null
+    local path
+    path="$(kei_db_path)" || return 1
+    [ -f "$path" ] || return 1
+    sqlite3 "$path" "$1" 2>/dev/null
 }
 
 kei_check_init() {

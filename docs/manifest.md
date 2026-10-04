@@ -14,7 +14,9 @@ kei manifest --format csv
 
 The command still needs to know which account's state DB to read. Set
 `ICLOUD_USERNAME` or `[auth].username` in your config. It doesn't need a
-password or a valid iCloud session.
+password or a valid iCloud session. The database must have a matching account
+owner; [legacy state needs explicit adoption](account-state-migration.md). Configure
+the same realm used when binding the database.
 
 ## JSON
 

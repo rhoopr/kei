@@ -32,6 +32,9 @@ pub(crate) async fn init_photos_service(
     api_retry_config: retry::RetryConfig,
     mode: crate::personality::Mode,
 ) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
+    auth_result
+        .session
+        .bind_principal(&auth_result.data, None)?;
     if auth_result.data.i_cdp_enabled {
         anyhow::bail!(
             "Advanced Data Protection (ADP) is enabled on this account.\n\n\
@@ -198,7 +201,7 @@ pub(crate) async fn attempt_reauth(
     .await?;
 
     let mut session = shared_session.write().await;
-    *session = new_auth.session;
+    replace_authenticated_session(&mut session, new_auth)?;
     tracing::info!("Re-authentication successful");
     Ok(())
 }
@@ -222,6 +225,17 @@ impl Default for TwoFaWaitConfig {
             timeout: Duration::from_secs(TWO_FA_WAIT_TIMEOUT_SECS),
         }
     }
+}
+
+fn replace_authenticated_session(
+    current: &mut auth::session::Session,
+    mut replacement: auth::AuthResult,
+) -> anyhow::Result<()> {
+    replacement
+        .session
+        .bind_principal(&replacement.data, current.principal())?;
+    *current = replacement.session;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,12 +269,9 @@ struct AuthSignalSnapshot {
     contents: Option<Vec<u8>>,
 }
 
-fn auth_signal_paths(cookie_dir: &Path, username: &str) -> [std::path::PathBuf; 3] {
-    [
-        auth::session_file_path(cookie_dir, username),
-        auth::cookiejar_file_path(cookie_dir, username),
-        auth::validation_cache_file_path(cookie_dir, username),
-    ]
+fn auth_signal_paths(cookie_dir: &Path, username: &str, realm: &str) -> [std::path::PathBuf; 3] {
+    let [cookie, session, cache] = auth::session::persisted_auth_files(cookie_dir, username, realm);
+    [session, cookie, cache]
 }
 
 async fn read_required_session_signal(session_path: &Path) -> anyhow::Result<AuthSignalSnapshot> {
@@ -336,8 +347,9 @@ async fn wait_for_2fa_submit_until(
     username: &str,
     config: TwoFaWaitConfig,
     deadline: tokio::time::Instant,
+    realm: &str,
 ) -> anyhow::Result<()> {
-    let signal_paths = auth_signal_paths(cookie_dir, username);
+    let signal_paths = auth_signal_paths(cookie_dir, username, realm);
     let initial = read_auth_signal_snapshot(&signal_paths).await?;
     let session_path = &signal_paths[0];
 
@@ -394,12 +406,20 @@ pub(crate) async fn wait_and_retry_2fa<T, F, Fut>(
     cookie_dir: &Path,
     username: &str,
     auth_fn: F,
+    realm: &str,
 ) -> anyhow::Result<T>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    wait_and_retry_2fa_with_config(cookie_dir, username, auth_fn, TwoFaWaitConfig::default()).await
+    wait_and_retry_2fa_with_config(
+        cookie_dir,
+        username,
+        auth_fn,
+        TwoFaWaitConfig::default(),
+        realm,
+    )
+    .await
 }
 
 async fn wait_and_retry_2fa_with_config<T, F, Fut>(
@@ -407,6 +427,7 @@ async fn wait_and_retry_2fa_with_config<T, F, Fut>(
     username: &str,
     auth_fn: F,
     config: TwoFaWaitConfig,
+    realm: &str,
 ) -> anyhow::Result<T>
 where
     F: Fn() -> Fut,
@@ -415,11 +436,11 @@ where
     let deadline = tokio::time::Instant::now() + config.timeout;
 
     loop {
-        wait_for_2fa_submit_until(cookie_dir, username, config, deadline).await?;
+        wait_for_2fa_submit_until(cookie_dir, username, config, deadline, realm).await?;
 
         // Invalidate the validation cache so authenticate() actually checks
         // with Apple instead of returning stale cached data from before 2FA.
-        let cache_path = auth::validation_cache_file_path(cookie_dir, username);
+        let cache_path = auth::validation_cache_file_path(cookie_dir, username, realm);
         if cache_path.exists()
             && let Err(e) = tokio::fs::remove_file(&cache_path).await
         {
@@ -1451,11 +1472,90 @@ mod tests {
     // ── service 2FA wait tests ────────────────────────────────────────
 
     #[tokio::test]
+    async fn reauth_replacement_preserves_principal_and_refuses_changed_missing_or_wrong_realm() {
+        let directory = tempfile::tempdir().unwrap();
+        let data: auth::AccountLoginResponse =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-principal-a"}}))
+                .unwrap();
+        let mut current = auth::session::Session::new(
+            directory.path(),
+            "principal@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        current.bind_principal(&data, None).unwrap();
+        let pin = current.principal().unwrap().to_owned();
+        current
+            .session_data
+            .insert("marker".into(), "original".into());
+        current.release_lock().unwrap();
+        for (home, payload) in [
+            (
+                "https://www.icloud.com",
+                serde_json::json!({"dsInfo":{"dsid":"synthetic-principal-b"}}),
+            ),
+            ("https://www.icloud.com", serde_json::json!({})),
+            (
+                "https://www.icloud.com.cn",
+                serde_json::json!({"dsInfo":{"dsid":"synthetic-principal-a"}}),
+            ),
+        ] {
+            let session = auth::session::Session::new(
+                directory.path(),
+                "principal@example.invalid",
+                home,
+                None,
+            )
+            .await
+            .unwrap();
+            let result = super::replace_authenticated_session(
+                &mut current,
+                auth::AuthResult {
+                    session,
+                    data: serde_json::from_value(payload).unwrap(),
+                    requires_2fa: false,
+                },
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<auth::error::AuthError>()
+                    .is_some_and(auth::error::AuthError::is_account_identity_changed)
+            );
+            assert_eq!(current.principal(), Some(pin.as_str()));
+            assert_eq!(
+                current.session_data.get("marker").map(String::as_str),
+                Some("original")
+            );
+        }
+        let session = auth::session::Session::new(
+            directory.path(),
+            "principal@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        super::replace_authenticated_session(
+            &mut current,
+            auth::AuthResult {
+                session,
+                data,
+                requires_2fa: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(current.principal(), Some(pin.as_str()));
+    }
+
+    #[tokio::test]
     async fn wait_and_retry_2fa_succeeds_after_session_metadata_update() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let cookie_dir = tempdir.path().to_path_buf();
         let username = "service-wait@example.com";
-        let session_path = auth::session_file_path(&cookie_dir, username);
+        let session_path = auth::session_file_path(&cookie_dir, username, "com");
         tokio::fs::write(&session_path, br#"{"session_token":"before"}"#)
             .await
             .expect("write initial session metadata");
@@ -1476,6 +1576,7 @@ mod tests {
                         }
                     },
                     short_2fa_wait_config(Duration::from_secs(3)),
+                    "com",
                 )
                 .await
             }
@@ -1500,7 +1601,7 @@ mod tests {
     async fn wait_for_2fa_submit_wakes_when_validation_cache_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let username = "user@example.com";
-        let cache_path = auth::validation_cache_file_path(dir.path(), username);
+        let cache_path = auth::validation_cache_file_path(dir.path(), username, "com");
 
         assert_wait_for_2fa_submit_wakes_after_write(
             dir.path(),
@@ -1516,7 +1617,7 @@ mod tests {
     async fn wait_for_2fa_submit_wakes_when_cookiejar_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let username = "user@example.com";
-        let cookiejar_path = auth::cookiejar_file_path(dir.path(), username);
+        let cookiejar_path = auth::cookiejar_file_path(dir.path(), username, "com");
 
         assert_wait_for_2fa_submit_wakes_after_write(
             dir.path(),
@@ -1535,7 +1636,7 @@ mod tests {
         contents: &'static [u8],
         context: &'static str,
     ) {
-        let session_path = auth::session_file_path(cookie_dir, username);
+        let session_path = auth::session_file_path(cookie_dir, username, "com");
         tokio::fs::write(&session_path, br#"{"session_token":"before"}"#)
             .await
             .expect("write initial session metadata");
@@ -1547,6 +1648,7 @@ mod tests {
                     username,
                     short_2fa_wait_config(Duration::from_secs(1)),
                     tokio::time::Instant::now() + Duration::from_secs(1),
+                    "com",
                 ),
                 async {
                     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1578,6 +1680,7 @@ mod tests {
                 }
             },
             short_2fa_wait_config(Duration::from_secs(1)),
+            "com",
         )
         .await
         .expect_err("missing metadata must fail before waiting forever");
@@ -1601,7 +1704,7 @@ mod tests {
 
         let tempdir = tempfile::tempdir().expect("tempdir");
         let username = "unreadable-metadata@example.com";
-        let session_path = auth::session_file_path(tempdir.path(), username);
+        let session_path = auth::session_file_path(tempdir.path(), username, "com");
         tokio::fs::write(&session_path, br#"{"session_token":"before"}"#)
             .await
             .expect("write initial session metadata");
@@ -1614,6 +1717,7 @@ mod tests {
             username,
             || async { Ok::<_, anyhow::Error>(()) },
             short_2fa_wait_config(Duration::from_millis(30)),
+            "com",
         )
         .await
         .expect_err("unreadable metadata must fail instead of waiting forever");
@@ -1637,7 +1741,7 @@ mod tests {
     async fn wait_and_retry_2fa_times_out_when_code_never_submitted() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let username = "timeout@example.com";
-        let session_path = auth::session_file_path(tempdir.path(), username);
+        let session_path = auth::session_file_path(tempdir.path(), username, "com");
         tokio::fs::write(&session_path, br#"{"session_token":"before"}"#)
             .await
             .expect("write initial session metadata");
@@ -1654,6 +1758,7 @@ mod tests {
                 }
             },
             short_2fa_wait_config(Duration::from_millis(30)),
+            "com",
         )
         .await
         .expect_err("never-submitted 2FA must time out");

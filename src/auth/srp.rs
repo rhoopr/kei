@@ -382,7 +382,7 @@ pub async fn authenticate_srp(
         Some(&overrides),
     )?;
 
-    tracing::debug!(apple_id = %apple_id, "Initiating SRP authentication");
+    tracing::debug!("Initiating SRP authentication");
 
     let init_url = format!("{}/signin/init", endpoints.auth);
     let init_body = init_body.to_string();

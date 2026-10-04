@@ -26,7 +26,7 @@ fn run(binary: &Path, root: &Path, args: &[&str], success: bool) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8(output.stdout).unwrap()
+    String::from_utf8(output.stdout).unwrap() + &String::from_utf8(output.stderr).unwrap()
 }
 
 fn rows(db: &Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
@@ -164,6 +164,21 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
             before
         );
     }
+    // Unowned released state is never silently adopted by an offline command.
+    let refusal = run(&current, root, &["verify"], false);
+    assert!(refusal.contains("explicit verified ownership migration"));
+    assert_eq!(schema_version(&db), 25);
+    // Synthetic setup models the post-confirmation owner header only. The
+    // real SQLite backup/adoption transition is tested in state::db::account.
+    let legacy = db;
+    let db = root.join(format!(
+        "{}.db",
+        super::support::sanitize_username("upgrade@example.invalid")
+    ));
+    std::fs::copy(&legacy, &db).unwrap();
+    let adopted = Connection::open(&db).unwrap();
+    super::support::bind_synthetic_owner(&adopted, "upgrade@example.invalid");
+    drop(adopted);
     std::fs::remove_file(media.join("removed.jpg")).unwrap();
     // Config drift is not permission for an offline command to advance tokens.
     super::write_sync_config(&config, root.join("new-destination").to_str().unwrap());

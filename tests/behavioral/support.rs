@@ -41,12 +41,37 @@ pub(super) fn write_sync_config(config_path: &std::path::Path, download_dir: &st
     .unwrap();
 }
 
-/// Sanitize a username the same way the binary does (alphanumeric + underscore).
+/// Account namespace codec mirrored for synthetic CLI fixtures in the com realm.
 pub(super) fn sanitize_username(username: &str) -> String {
-    username
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .collect()
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"configured-account-v1");
+    for value in ["com", username] {
+        hash.update(value.len().to_string().as_bytes());
+        hash.update(b":");
+        hash.update(value.as_bytes());
+    }
+    format!("account-v1-{:x}", hash.finalize())
+}
+
+pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) {
+    conn.execute_batch("CREATE TABLE account_owner (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL, account_key TEXT NOT NULL, provider_key TEXT NOT NULL);").unwrap();
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"authenticated-provider-v1");
+    for value in ["com", "synthetic-cli-provider"] {
+        hash.update(value.len().to_string().as_bytes());
+        hash.update(b":");
+        hash.update(value.as_bytes());
+    }
+    conn.execute(
+        "INSERT INTO account_owner VALUES (1,1,?1,?2)",
+        (
+            sanitize_username(username),
+            format!("{:x}", hash.finalize()),
+        ),
+    )
+    .unwrap();
 }
 
 /// Schema version mirrored by `create_state_db` below. Must equal
@@ -68,6 +93,7 @@ pub(super) fn create_state_db(data_dir: &std::path::Path, username: &str) -> rus
     let db_name = format!("{}.db", sanitize_username(username));
     let db_path = data_dir.join(db_name);
     let conn = rusqlite::Connection::open(&db_path).unwrap();
+    bind_synthetic_owner(&conn, username);
     conn.execute_batch(
         r"
 

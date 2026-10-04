@@ -234,8 +234,12 @@ pub(crate) async fn run_doctor(
     let mut checks = Vec::new();
     checks.push(check_config_parse(config_load_error.as_deref()));
     checks.push(check_download_dir(toml));
-    checks.push(check_state_db(&username, &cookie_dir).await);
-    checks.push(check_session_presence(&username, &cookie_dir));
+    checks.push(check_state_db(&username, &cookie_dir, domain.as_str()).await);
+    checks.push(check_session_presence(
+        &username,
+        &cookie_dir,
+        domain.as_str(),
+    ));
     checks.push(check_health(&cookie_dir));
     checks.push(check_report(report_path.as_deref()));
     if args.live {
@@ -317,14 +321,21 @@ fn check_download_dir(toml: Option<&config::TomlConfig>) -> DoctorCheck {
     }
 }
 
-async fn check_state_db(username: &str, cookie_dir: &Path) -> DoctorCheck {
-    let Some(path) = state_db_path(username, cookie_dir) else {
+async fn check_state_db(username: &str, cookie_dir: &Path, realm: &str) -> DoctorCheck {
+    let Some(path) = state_db_path(username, cookie_dir, realm) else {
         return DoctorCheck {
             name: "state_db",
             status: CheckStatus::Skipped,
             message: "no username configured, so no state DB path could be derived".to_string(),
         };
     };
+    if let Err(error) = state::db::account::state_path(cookie_dir, username, realm).await {
+        return DoctorCheck {
+            name: "state_db",
+            status: CheckStatus::Error,
+            message: error.to_string(),
+        };
+    }
     if !path.exists() {
         return DoctorCheck {
             name: "state_db",
@@ -332,7 +343,12 @@ async fn check_state_db(username: &str, cookie_dir: &Path) -> DoctorCheck {
             message: format!("state DB does not exist yet: {}", path.display()),
         };
     }
-    let summary = match state::SqliteStateDb::open(&path).await {
+    let summary = match state::SqliteStateDb::open_owned(
+        &path,
+        &state::db::account::AccountOwner::configured(username, realm),
+    )
+    .await
+    {
         Ok(db) => db.get_summary().await,
         Err(e) => Err(e),
     };
@@ -353,17 +369,16 @@ async fn check_state_db(username: &str, cookie_dir: &Path) -> DoctorCheck {
     }
 }
 
-fn check_session_presence(username: &str, cookie_dir: &Path) -> DoctorCheck {
-    let sanitized = auth::session::sanitize_username(username);
-    if sanitized.is_empty() {
+fn check_session_presence(username: &str, cookie_dir: &Path, realm: &str) -> DoctorCheck {
+    if username.is_empty() {
         return DoctorCheck {
             name: "session",
             status: CheckStatus::Skipped,
             message: "no username configured, so no session path could be derived".to_string(),
         };
     }
-    let session_path = cookie_dir.join(format!("{sanitized}.session"));
-    let cookie_path = cookie_dir.join(sanitized);
+    let session_path = auth::session_file_path(cookie_dir, username, realm);
+    let cookie_path = auth::cookiejar_file_path(cookie_dir, username, realm);
     let present = session_path.exists() || cookie_path.exists();
     DoctorCheck {
         name: "session",
@@ -381,7 +396,7 @@ fn check_session_presence(username: &str, cookie_dir: &Path) -> DoctorCheck {
 }
 
 async fn check_live_session(username: &str, domain: &str, cookie_dir: &Path) -> DoctorCheck {
-    if auth::session::sanitize_username(username).is_empty() {
+    if username.is_empty() {
         return DoctorCheck {
             name: "live_session",
             status: CheckStatus::Skipped,
@@ -473,9 +488,9 @@ fn check_json_file(name: &'static str, path: &Path) -> DoctorCheck {
     }
 }
 
-fn state_db_path(username: &str, cookie_dir: &Path) -> Option<PathBuf> {
-    let sanitized = auth::session::sanitize_username(username);
-    (!sanitized.is_empty()).then(|| cookie_dir.join(format!("{sanitized}.db")))
+fn state_db_path(username: &str, cookie_dir: &Path, realm: &str) -> Option<PathBuf> {
+    let sanitized = crate::account::namespace(username, realm);
+    (!username.is_empty()).then(|| cookie_dir.join(format!("{sanitized}.db")))
 }
 
 fn detect_install_method() -> &'static str {
@@ -579,12 +594,21 @@ mod tests {
     async fn state_db_check_reads_real_local_db_path() {
         let dir = tempfile::tempdir().expect("temp dir");
         let username = "doctor@example.com";
-        let path = state_db_path(username, dir.path()).expect("state db path");
-        let _db = state::SqliteStateDb::open(&path)
-            .await
-            .expect("create state db");
+        let path = state_db_path(username, dir.path(), "com").expect("state db path");
+        let _db = state::SqliteStateDb::open_owned(
+            &path,
+            &state::db::account::AccountOwner::authenticated(
+                username,
+                "com",
+                &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-doctor"}}))
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("create state db");
 
-        let check = check_state_db(username, dir.path()).await;
+        let check = check_state_db(username, dir.path(), "com").await;
 
         assert_eq!(check.name, "state_db");
         assert_eq!(check.status, CheckStatus::Ok);

@@ -98,6 +98,8 @@ changing behavior.
 | Metadata write execution | `src/download/metadata_rewrite/embedded.rs`, `src/download/metadata_rewrite/sidecar.rs` | Coordinates fingerprint-guarded embedded writes and source-aware sidecar writes through the metadata owners. |
 | Queued metadata retries | `src/download/metadata_rewrite/queued.rs` | Tags durable rewrite work, executes bounded retry pages, and retires completed markers. |
 | Rewrite evidence and groupings | `src/download/metadata_rewrite/capture.rs`, `src/download/metadata_rewrite/grouping.rs` | Verifies capture-repair fingerprints and timestamps; loads current library-scoped groupings for queued work. |
+| Account namespace | `src/account.rs` | Hashes exact configured login and provider realm without alias inference. |
+| Account database boundary | `src/state/db/account.rs`, `src/commands/migrate_state.rs` | Validates an independent owner before state consumption, creates authenticated state, and explicitly adopts a preserved legacy snapshot. |
 | SQLite facade and connection lifecycle | `src/state/mod.rs`, `src/state/db.rs` | Preserves state entry points, opens connections, and dispatches blocking SQLite work. Child owners retain their transaction boundaries. |
 | SQLite schema | `src/state/schema.rs` | Owns schema versions and migrations. |
 | State-store contracts | `src/state/db/contracts.rs` | Defines store roles and records exchanged with callers. |
@@ -196,6 +198,30 @@ detects a changed generation when it wakes and stops before its old in-memory
 session can recreate reset credentials. Reauthentication handoffs carry their
 pre-release generation into replacement-session creation, so a reset in that
 gap also wins.
+
+### Account ownership and legacy adoption
+
+Configured login and realm determine collision-resistant names for state,
+auth artifacts and encrypted credentials. Account-owner format version 1 is
+independent of the application schema version and must be checked before its
+migrations. Production connections require an owner expectation; unbound
+connection helpers are restricted to tests. All state commands, including
+read-only export and reset, enforce this boundary. Sync and import require a
+usable authenticated provider identity and pin it independently of filenames.
+Watch validation, replacement sessions and initialization retries retain that
+principal pin. Changed or missing authenticated identity stops before further
+provider or state work; it cannot become a recoverable quiet-watch warning.
+
+Legacy discovery fails closed rather than creating fresh state over retained
+debt. Explicit `migrate-state` requires verified operator ownership
+confirmation and a fresh login under the account lock. SQLite backup retains
+rows, unknown tables and committed WAL content, then binding, schema migration
+and integrity validation occur in a private stage. Same-directory publication
+refuses replacement and fsyncs the file and parent. The legacy source and
+companions remain. Conflicting scoped provenance is rejected, not rewritten.
+Legacy session and encrypted credential files are preserved and ignored;
+keyring identity remains unchanged. See [account migration](account-state-migration.md)
+for operator steps and compatibility limits.
 
 ### Sync and provider checkpoints
 

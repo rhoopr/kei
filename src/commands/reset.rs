@@ -14,12 +14,19 @@ pub(crate) async fn run_reset_state(
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
-    let db_path = super::super::get_db_path(globals, toml)?;
+    let db_path = super::super::get_db_path(globals, toml).await?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
         return Ok(());
     }
+
+    let _ownership_check = state::SqliteStateDb::open_owned_read_only(
+        &db_path,
+        &super::super::get_account_owner(globals, toml),
+    )
+    .await?;
+    drop(_ownership_check);
 
     if !yes {
         use std::io::Write;
@@ -63,7 +70,7 @@ pub(crate) async fn run_reset_sync_token(
     toml: Option<&config::TomlConfig>,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
-    let db_path = super::super::get_db_path(globals, toml)?;
+    let db_path = super::super::get_db_path(globals, toml).await?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -92,7 +99,9 @@ pub(crate) async fn run_reset_sync_token(
         }
     }
 
-    let db = state::SqliteStateDb::open(&db_path).await?;
+    let db =
+        state::SqliteStateDb::open_owned(&db_path, &super::super::get_account_owner(globals, toml))
+            .await?;
     db.set_metadata("db_sync_token", "").await?;
     let cleared = db.delete_metadata_by_prefix("sync_token:").await?;
     let scoped_cleared = db.delete_scoped_db_sync_tokens().await?;
@@ -123,14 +132,16 @@ pub(crate) async fn run_reset_session(
     // Reset never authenticates; resolve_auth only reads the password from
     // CLI/env args, so empty PasswordArgs are fine here.
     let password_args = cli::PasswordArgs::default();
-    let (username, _, _, cookie_directory) = config::resolve_auth(globals, &password_args, toml);
+    let (username, _, domain, cookie_directory) =
+        config::resolve_auth(globals, &password_args, toml);
 
     if username.is_empty() {
         anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
     }
 
     let state_guard =
-        auth::session::SessionStateGuard::acquire(&cookie_directory, &username).await?;
+        auth::session::SessionStateGuard::acquire(&cookie_directory, &username, domain.as_str())
+            .await?;
     let files = state_guard.files();
     let existing: Vec<_> = files.iter().filter(|p| p.exists()).collect();
 

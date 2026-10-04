@@ -24,9 +24,8 @@ use crate::sync_loop::watch::{
 use crate::sync_loop::{SyncArgs, service_mode_default_interval, should_reconcile_this_cycle};
 use crate::systemd::SystemdNotifier;
 use crate::{
-    PartialSyncError, PidFileGuard, auth, available_disk_space, check_min_disk_space, config,
-    credential, download, health, make_password_provider, notifications, password, retry, shutdown,
-    state,
+    PartialSyncError, PidFileGuard, available_disk_space, check_min_disk_space, config, credential,
+    download, health, make_password_provider, notifications, password, retry, shutdown, state,
 };
 
 /// Run the sync command: authenticate, enumerate photos, download, and
@@ -188,8 +187,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         return Ok(());
     }
 
-    let cred_store =
-        credential::CredentialStore::new(&config.auth.username, &config.auth.cookie_directory);
+    if !config.runtime.dry_run {
+        state::db::account::state_path(
+            &config.auth.cookie_directory,
+            &config.auth.username,
+            config.auth.domain.as_str(),
+        )
+        .await?;
+    }
+    let cred_store = credential::CredentialStore::new(
+        &config.auth.username,
+        &config.auth.cookie_directory,
+        config.auth.domain.as_str(),
+    );
     let source = password::build_password_source(
         config.auth.password.as_ref(),
         config.auth.password_command.as_deref(),
@@ -212,6 +222,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         input_mode,
     )
     .await?;
+    let account_owner = if config.runtime.dry_run {
+        None
+    } else {
+        Some(state::db::account::AccountOwner::authenticated(
+            &config.auth.username,
+            config.auth.domain.as_str(),
+            &auth_result.data,
+        )?)
+    };
     // Post-auth narration. Lands above any future bar; no-op in off mode.
     crate::personality::narration::auth_ok_to_stderr(
         config.ui.personality_mode,
@@ -229,6 +248,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     let store = credential::CredentialStore::new(
                         &config.auth.username,
                         &config.auth.cookie_directory,
+                        config.auth.domain.as_str(),
                     );
                     if let Err(e) = store.store(pw.expose_secret()) {
                         tracing::warn!(error = %e, "Failed to save password to credential store");
@@ -280,11 +300,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let state_db: Option<Arc<dyn download::DownloadStore>> = if config.runtime.dry_run {
         None
     } else {
-        let db_path = config.auth.cookie_directory.join(format!(
-            "{}.db",
-            auth::session::sanitize_username(&config.auth.username)
-        ));
-        match state::SqliteStateDb::open(&db_path).await {
+        let db_path = state::db::account::state_path(
+            &config.auth.cookie_directory,
+            &config.auth.username,
+            config.auth.domain.as_str(),
+        )
+        .await?;
+        match state::SqliteStateDb::open_owned(
+            &db_path,
+            account_owner
+                .as_ref()
+                .ok_or(state::error::StateError::AccountIdentityUnavailable)?,
+        )
+        .await
+        {
             Ok(db) => {
                 tracing::debug!(path = %db_path.display(), "State database opened");
                 let db = Arc::new(db);

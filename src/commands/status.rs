@@ -19,7 +19,7 @@ pub(crate) async fn run_status(
 ) -> anyhow::Result<()> {
     print_service_section().await;
 
-    let db_path = super::super::get_db_path(globals, toml)?;
+    let db_path = super::super::get_db_path(globals, toml).await?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -27,7 +27,9 @@ pub(crate) async fn run_status(
         return Ok(());
     }
 
-    let db = state::SqliteStateDb::open(&db_path).await?;
+    let db =
+        state::SqliteStateDb::open_owned(&db_path, &super::super::get_account_owner(globals, toml))
+            .await?;
     let summary = db.get_summary().await?;
 
     println!("State Database: {}", db_path.display());

@@ -4,7 +4,9 @@ use rusqlite::Connection;
 
 use super::error::StateError;
 
-/// Current schema version. Increment when making schema changes.
+/// Current application-data schema version. Increment when changing its shape.
+/// The preflight account-owner header has an independent format version and
+/// is validated before this schema can be read or migrated.
 pub(crate) const SCHEMA_VERSION: i32 = 28;
 
 /// Schema DDL for version 1.

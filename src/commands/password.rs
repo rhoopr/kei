@@ -16,7 +16,7 @@ pub(crate) fn run_password(
     toml: Option<&config::TomlConfig>,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
-    let (username, _password, _domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
+    let (username, _password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
     if username.is_empty() {
         anyhow::bail!(
@@ -24,7 +24,7 @@ pub(crate) fn run_password(
         );
     }
 
-    let store = credential::CredentialStore::new(&username, &cookie_directory);
+    let store = credential::CredentialStore::new(&username, &cookie_directory, domain.as_str());
 
     match action {
         cli::PasswordAction::Set => {

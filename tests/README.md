@@ -435,6 +435,20 @@ Reports must state whether the destination was empty, whether durable state
 was pre-seeded, what changed between cycles, and whether an unchanged cycle
 was checked.
 
+Account-bound migration qualification uses real file-backed SQLite with a
+live WAL, historical downloaded and pending rows, retained source cursor and
+pending token, sparse identity debt and an unknown future table. It enters
+the production adoption owner, checks source/companion preservation and
+reopens the published state twice. Negative controls cover colliding logins,
+realm and provider-pin mismatches, unowned and interrupted empty files,
+conflicting legacy provenance, missing authentication, occupied destinations,
+and reset/export against a misplaced owned database. Authentication fixtures
+prove that legacy files are ignored and a fresh adoption constructor clears
+only new-namespace auth under its lock. Released-schema CLI history first
+proves legacy refusal, then uses a synthetic owner fixture to test application
+schema upgrades; that fixture is not attributed to real authentication or
+adoption. No provider credentials or reporter data are used.
+
 ## Running
 
 Choose the route by purpose:

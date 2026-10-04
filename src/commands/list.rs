@@ -33,6 +33,7 @@ pub(crate) async fn run_list(
         password,
         &username,
         &cookie_directory,
+        domain.as_str(),
         toml,
         input_mode,
     );

@@ -854,7 +854,7 @@ pub(crate) async fn run_import_existing(
         SystemdNotifier::new(false),
         crate::personality::Mode::Off,
     )?;
-    let db_path = super::super::get_db_path(globals, toml)?;
+    let db_path = super::super::get_db_path(globals, toml).await?;
     let path_config = build_import_path_config(toml)?;
     let directory = Arc::clone(&path_config.directory);
     let strict_import = resolve_import_strict(&args, toml);
@@ -881,9 +881,6 @@ pub(crate) async fn run_import_existing(
         ),
     }
 
-    let db = Arc::new(state::SqliteStateDb::open(&db_path).await?);
-    tracing::debug!(path = %db_path.display(), "State database opened");
-
     let (username, password, domain, cookie_directory) =
         config::resolve_auth(globals, &args.password, toml);
 
@@ -892,6 +889,7 @@ pub(crate) async fn run_import_existing(
         password,
         &username,
         &cookie_directory,
+        domain.as_str(),
         toml,
         input_mode,
     );
@@ -907,6 +905,14 @@ pub(crate) async fn run_import_existing(
         input_mode,
     )
     .await?;
+
+    let owner = state::db::account::AccountOwner::authenticated(
+        &username,
+        domain.as_str(),
+        &auth_result.data,
+    )?;
+    let db = Arc::new(state::SqliteStateDb::open_owned(&db_path, &owner).await?);
+    tracing::debug!(path = %db_path.display(), "State database opened");
 
     // `kei import-existing` runs without the friendly download bar; off-mode
     // keeps the existing diagnostic warn line for journals.

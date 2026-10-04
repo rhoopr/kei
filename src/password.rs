@@ -620,7 +620,8 @@ mod tests {
     #[test]
     fn decide_save_store_skips_as_redundant() {
         let dir = tempfile::tempdir().unwrap();
-        let source = PasswordSource::Store(CredentialStore::new("user@example.com", dir.path()));
+        let source =
+            PasswordSource::Store(CredentialStore::new("user@example.com", dir.path(), "com"));
         match decide_save_password_action(&source) {
             SavePasswordAction::SkipWithWarning(msg) => {
                 assert!(msg.contains("already in the credential store"), "{msg}");

@@ -2600,3 +2600,93 @@ fn docker_album_listing_drains_output_under_pipefail() {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shell_state_helpers_target_exact_account_namespace_and_never_create_missing_state() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let run = |username: &str, script: &str| {
+        Command::new("bash")
+            .args(["-c", script])
+            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .env("ICLOUD_USERNAME", username)
+            .env("ICLOUD_TEST_COOKIE_DIR", root.path())
+            .output()
+            .unwrap()
+    };
+    for username in [
+        "first.last@example.invalid",
+        "firstlast@example.invalid",
+        "é@example.invalid",
+    ] {
+        let output = run(
+            username,
+            r#"source "$PROJECT_DIR/tests/shell/lib.sh"
+kei_db_path"#,
+        );
+        assert!(output.status.success());
+        let mut hash = Sha256::new();
+        hash.update(b"configured-account-v1");
+        for value in ["com", username] {
+            hash.update(value.len().to_string().as_bytes());
+            hash.update(b":");
+            hash.update(value.as_bytes());
+        }
+        let expected = root
+            .path()
+            .join(format!("account-v1-{:x}.db", hash.finalize()));
+        assert_eq!(
+            Path::new(std::str::from_utf8(&output.stdout).unwrap()),
+            expected
+        );
+        let absent = run(
+            username,
+            r#"source "$PROJECT_DIR/tests/shell/lib.sh"
+sqlite3() { echo unexpected-database-creation; }
+kei_db_query 'SELECT value FROM metadata'
+query_status=$?
+kei_db_exec 'DELETE FROM metadata'
+exec_status=$?
+[ "$query_status" -ne 0 ] && [ "$exec_status" -ne 0 ]"#,
+        );
+        assert!(absent.status.success());
+        assert!(absent.stdout.is_empty());
+        assert!(!expected.exists());
+        let db = rusqlite::Connection::open(&expected).unwrap();
+        db.execute_batch(
+            "CREATE TABLE metadata(value TEXT); INSERT INTO metadata VALUES ('retained');",
+        )
+        .unwrap();
+        drop(db);
+        let query = run(
+            username,
+            r#"source "$PROJECT_DIR/tests/shell/lib.sh"
+sqlite3() { printf '%s\n' "$@"; }
+kei_db_query 'SELECT value FROM metadata'"#,
+        );
+        assert!(query.status.success());
+        let text = String::from_utf8(query.stdout).unwrap();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "-readonly",
+                expected.to_str().unwrap(),
+                "SELECT value FROM metadata"
+            ]
+        );
+        let execute = run(
+            username,
+            r#"source "$PROJECT_DIR/tests/shell/lib.sh"
+sqlite3() { printf '%s\n' "$@"; }
+kei_db_exec 'DELETE FROM metadata'"#,
+        );
+        assert!(execute.status.success());
+        let text = String::from_utf8(execute.stdout).unwrap();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [expected.to_str().unwrap(), "DELETE FROM metadata"]
+        );
+    }
+    assert!(!root.path().join("firstlastexampleinvalid.db").exists());
+}

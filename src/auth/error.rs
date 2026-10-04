@@ -71,6 +71,11 @@ pub enum AuthError {
     )]
     SessionReset,
 
+    #[error(
+        "Authenticated account identity changed or became unavailable; stopping before further state or provider work. Restart with the intended account."
+    )]
+    AccountIdentityChanged,
+
     #[error(transparent)]
     Http(Box<reqwest::Error>),
 
@@ -110,6 +115,10 @@ impl AuthError {
     /// Check if this error indicates lock contention with another kei instance.
     pub const fn is_lock_contention(&self) -> bool {
         matches!(self, Self::LockContention(_))
+    }
+
+    pub(crate) const fn is_account_identity_changed(&self) -> bool {
+        matches!(self, Self::AccountIdentityChanged)
     }
 
     pub(crate) const fn is_session_reset(&self) -> bool {
