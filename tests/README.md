@@ -424,6 +424,14 @@ cancellation captures nothing and retains the legacy cursor before restart.
 Actual HTTP tests preserve original bytes and enforce both declared-length and
 chunked page limits.
 
+An actual CLI matrix starts without pending retry debt, offers a valid rank EOF
+and replacement anchor, and injects a receipt-write failure, exhausted logical
+budget, malformed source identity or duplicate JSON key. Two process attempts
+retain the cursor, existing media and observations without issuing rank queries.
+Removing only the injected fault permits recovery and two quiet repeats. The
+capacity case charges a real previously captured page; it does not simulate a
+physical disk-full condition.
+
 `run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_restart`
 seeds historical media, mapping, downloaded state and pending debt. Four
 production cycles across reopen cover capture failure, captured observations
@@ -434,11 +442,15 @@ resolution without manually attaching an album. The schema-28 migration fault
 control retains source cursors, debt and an unknown BLOB in a conflicting table
 with matching columns but no durable key. It rolls back partial DDL, then retries
 and reopens schema 29 twice. Payload replay also retains existing observations
-through synthetic migration re-entry. Released-schema history fixtures also
+through synthetic migration re-entry. Owned migration controls also reject TEXT,
+inline descending integer and WITHOUT ROWID page keys on two reopens, preserving
+schema 28, source cursor, old debt, conflicting DDL and unknown BLOB bytes.
+Released-schema history fixtures also
 retain their independent row, media and checkpoint assertions.
 
 Reversible negative controls replace original bytes with typed JSON, remove the
-capture transaction and bypass owner validation. Each corresponding assertion
+capture transaction and bypass owner validation, the rowid guard or the refusal
+classification. Each corresponding assertion
 must fail before source restoration. Bounded exact-resource URL refresh tests,
 including RAW/JPEG provider rendition and per-file retry isolation, remain part
 of qualification. These synthetic controls do not qualify power-loss durability,

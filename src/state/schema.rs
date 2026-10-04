@@ -58,6 +58,16 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
             return Err(StateError::ProviderInboxInvalid);
         }
     }
+    // Capture omits id and uses last_insert_rowid for source/receipt links.
+    // TEXT, inline INTEGER PRIMARY KEY DESC and WITHOUT ROWID keys cannot
+    // supply that identity, despite having the expected primary-key name.
+    let assigns_rowid: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('provider_shadow_pages') WHERE name='id' AND upper(type)='INTEGER' AND pk=1) AND NOT EXISTS(SELECT 1 FROM pragma_index_list('provider_shadow_pages') WHERE origin='pk')",
+        [], |row| row.get(0),
+    )?;
+    if !assigns_rowid {
+        return Err(StateError::ProviderInboxInvalid);
+    }
     // Preparing the conflict target also verifies the replay uniqueness key.
     conn.prepare("INSERT INTO provider_shadow_pages(scope,request_cursor,body_hash) VALUES (?1,?2,?3) ON CONFLICT(scope,request_cursor,body_hash) DO NOTHING")?;
     Ok(())
@@ -1079,6 +1089,115 @@ mod tests {
                     .unwrap(),
                     0
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shadow_v29_migration_rejects_non_rowid_keys_without_promoting_history() {
+        for key in [
+            "TEXT PRIMARY KEY",
+            "INTEGER PRIMARY KEY DESC",
+            "WITHOUT ROWID",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("owned.db");
+            let data =
+                serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"key-provider"}}))
+                    .unwrap();
+            let owner = crate::state::db::account::AccountOwner::authenticated(
+                "key@example.invalid",
+                "com",
+                &data,
+            )
+            .unwrap();
+            let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            db.set_metadata("sync_token:PrimarySync", "saved")
+                .await
+                .unwrap();
+            db.set_metadata("pending_sync_token:old:PrimarySync", "debt")
+                .await
+                .unwrap();
+            let conflicting_sql = {
+                let conn = db.acquire_lock("synthetic conflicting rowid key").unwrap();
+                let sql: String = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_schema WHERE name='provider_shadow_pages'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let sql = if key == "WITHOUT ROWID" {
+                    format!("{sql} WITHOUT ROWID")
+                } else {
+                    sql.replace("id INTEGER PRIMARY KEY", &format!("id {key}"))
+                };
+                // Only empty, disposable shadow tables are replaced by the
+                // fixture. Existing owned history and unknown bytes remain.
+                conn.execute_batch("DROP TABLE provider_shadow_receipts; DROP TABLE provider_shadow_records; DROP TABLE provider_shadow_pages;").unwrap();
+                conn.execute_batch(&sql).unwrap();
+                conn.execute_batch("CREATE TABLE future_unknown(payload BLOB); INSERT INTO future_unknown VALUES(X'00FF19');").unwrap();
+                conn.pragma_update(None, "user_version", 28).unwrap();
+                sql
+            };
+            drop(db);
+            for _ in 0..2 {
+                assert!(
+                    matches!(
+                        crate::state::SqliteStateDb::open_owned(&path, &owner).await,
+                        Err(StateError::ProviderInboxInvalid)
+                    ),
+                    "{key}: unsupported identity must refuse migration"
+                );
+                let conn = Connection::open(&path).unwrap();
+                assert_eq!(get_schema_version(&conn).unwrap(), 28, "{key}");
+                assert_eq!(
+                    conn.query_row::<String, _, _>(
+                        "SELECT sql FROM sqlite_schema WHERE name='provider_shadow_pages'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                    conflicting_sql
+                );
+                assert_eq!(
+                    conn.query_row::<Vec<u8>, _, _>(
+                        "SELECT payload FROM future_unknown",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                    [0, 255, 25]
+                );
+                for (name, expected) in [
+                    ("sync_token:PrimarySync", "saved"),
+                    ("pending_sync_token:old:PrimarySync", "debt"),
+                ] {
+                    assert_eq!(
+                        conn.query_row::<String, _, _>(
+                            "SELECT value FROM metadata WHERE key=?1",
+                            [name],
+                            |row| row.get(0),
+                        )
+                        .unwrap(),
+                        expected,
+                        "{key}"
+                    );
+                }
+                for table in ["provider_shadow_records", "provider_shadow_receipts"] {
+                    assert!(
+                        !conn
+                            .query_row::<bool, _, _>(
+                                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
+                                [table],
+                                |row| row.get(0),
+                            )
+                            .unwrap(),
+                        "{key}: no partial schema"
+                    );
+                }
             }
         }
     }

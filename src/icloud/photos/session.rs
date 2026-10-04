@@ -60,7 +60,9 @@ pub trait PhotosSession: Send + Sync {
         let body = serde_json::to_vec(&self.post(url, body, headers).await?)?;
         anyhow::ensure!(
             body.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
-            "Provider changes page exceeded the capture byte limit"
+            super::error::ShadowPageError::from(anyhow::anyhow!(
+                "Provider changes page exceeded the capture byte limit"
+            ))
         );
         Ok(body)
     }
@@ -102,13 +104,17 @@ impl PhotosSession for reqwest::Client {
             response
                 .content_length()
                 .is_none_or(|size| size <= limit as u64),
-            "Provider changes page exceeded the capture byte limit"
+            super::error::ShadowPageError::from(anyhow::anyhow!(
+                "Provider changes page exceeded the capture byte limit"
+            ))
         );
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
             anyhow::ensure!(
                 chunk.len() <= limit.saturating_sub(bytes.len()),
-                "Provider changes page exceeded the capture byte limit"
+                super::error::ShadowPageError::from(anyhow::anyhow!(
+                    "Provider changes page exceeded the capture byte limit"
+                ))
             );
             bytes.extend_from_slice(&chunk);
         }
@@ -542,7 +548,9 @@ pub(crate) async fn retry_post_changes_body(
             .await?;
         anyhow::ensure!(
             bytes.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
-            "Provider changes page exceeded the capture byte limit"
+            super::error::ShadowPageError::from(anyhow::anyhow!(
+                "Provider changes page exceeded the capture byte limit"
+            ))
         );
         let value = super::changes_json::parse(&bytes)?;
         check_cloudkit_errors(value)?;

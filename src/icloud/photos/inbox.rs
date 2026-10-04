@@ -44,7 +44,8 @@ impl ShadowCapture {
     pub(crate) async fn capture(&self, page: ObservedPage) -> anyhow::Result<()> {
         self.db
             .capture_shadow_page(self.owner.clone(), page, self.capacity)
-            .await?;
+            .await
+            .map_err(|error| super::error::ShadowPageError::from(anyhow::Error::new(error)))?;
         Ok(())
     }
 }

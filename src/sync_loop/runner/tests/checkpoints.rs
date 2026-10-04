@@ -2081,8 +2081,47 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
             &shared_session,
             &CancellationToken::new(),
         )
-        .await
-        .unwrap();
+        .await;
+        if phase == 0 {
+            let error =
+                result.expect_err("capture refusal must propagate, not run a rank fallback");
+            assert!(format!("{error:#}").contains("synthetic capture fault"));
+            assert_eq!(*requests.lock().unwrap(), ["saved"]);
+            let summary = inner.get_summary().await.unwrap();
+            assert_eq!(summary.downloaded, 1);
+            assert_eq!(summary.pending + summary.failed, 1);
+            assert_eq!(summary.source_deleted, 0);
+            assert_eq!(
+                inner
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("saved")
+            );
+            assert_eq!(
+                tokio::fs::read(&media).await.unwrap(),
+                b"historical media remains intact"
+            );
+            let conn = inner.acquire_lock("no partial capture or receipt").unwrap();
+            for table in [
+                "provider_shadow_pages",
+                "provider_shadow_records",
+                "provider_shadow_receipts",
+            ] {
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        &format!("SELECT count(*) FROM {table}"),
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+            continue;
+        }
+        let result = result.unwrap();
         let summary = inner.get_summary().await.unwrap();
         assert_eq!(
             tokio::fs::read(&media).await.unwrap(),
@@ -2112,18 +2151,6 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
             assert_eq!(summary.pending, 0);
             assert_eq!(summary.source_deleted, 1);
             assert!(result.db_sync_token_advance_safe, "phase {phase}");
-        }
-        if phase == 0 {
-            assert_eq!(*requests.lock().unwrap(), ["saved"]);
-            assert_eq!(
-                inner
-                    .acquire_lock("no partial capture")
-                    .unwrap()
-                    .query_row::<i64, _, _>("SELECT count(*) FROM provider_shadow_pages", [], |r| r
-                        .get(0))
-                    .unwrap(),
-                0
-            );
         }
         if phase == 3 {
             assert!(result.stats.full_enumeration_reason.is_none());

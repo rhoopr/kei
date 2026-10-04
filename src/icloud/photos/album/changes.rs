@@ -287,6 +287,19 @@ impl PhotoAlbum {
             let mut buffer = DeltaRecordBuffer::new();
             let mut current_token = initial_token;
             let mut visited = FxHashSet::from_iter([current_token.clone()]);
+            let shadow_error = |error: anyhow::Error| {
+                // Preserve the existing typed token fallback contract. A new
+                // refused observation cannot be replaced by an uncaptured scan.
+                if shadow_capture.is_some()
+                    && error
+                        .downcast_ref::<crate::icloud::photos::SyncTokenError>()
+                        .is_none()
+                {
+                    super::super::error::ShadowPageError::from(error).into()
+                } else {
+                    error
+                }
+            };
 
             let url = format!(
                 "{}/changes/zone?{}",
@@ -324,10 +337,10 @@ impl PhotoAlbum {
                 };
                 let zone_result = match ValidatedChangesPage::parse(response, &zone_id) {
                     Ok(page) => page,
-                    Err(error) => break Some(error),
+                    Err(error) => break Some(shadow_error(error)),
                 };
                 if let Err(error) = zone_result.check_continuation(&mut visited) {
-                    break Some(error);
+                    break Some(shadow_error(error));
                 }
 
                 if let Some((capture, database)) = &shadow_capture {
@@ -338,14 +351,14 @@ impl PhotoAlbum {
                         });
                     let page = match page {
                         Ok(page) => page,
-                        Err(error) => break Some(error),
+                        Err(error) => break Some(shadow_error(error)),
                     };
                     if tx.is_closed() {
                         let _ = token_tx.send(current_token);
                         return;
                     }
                     if let Err(error) = capture.capture(page).await {
-                        break Some(error);
+                        break Some(shadow_error(error));
                     }
                 }
 

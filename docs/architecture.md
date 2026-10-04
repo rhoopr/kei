@@ -249,8 +249,10 @@ Original decoded response bytes are limited to 16 MiB per page. The inbox allows
 512 MiB of charged payload and provenance bytes, including source identities.
 This is a logical budget, not a physical SQLite/WAL file quota. An oversized
 page, full inbox, failed write or unusable identity stops that page before
-emission or successor acceptance. Exact already-captured replay remains possible
-at capacity. No observations are automatically pruned. SQLite WAL `NORMAL`
+emission or successor acceptance. Such a refusal propagates through orchestration;
+an uncaptured rank inventory cannot replace it and advance the checkpoint.
+Existing typed invalid-token fallback and authentication handling remain intact.
+Exact already-captured replay remains possible at capacity. No observations are automatically pruned. SQLite WAL `NORMAL`
 remains unchanged; a successful commit does not promise that every acknowledged
 observation survives power loss. Network filesystems are not newly qualified.
 
@@ -270,8 +272,9 @@ capture-owned cursors, durable catalog selection and separate progress remain
 later stages. Historical-version retention, unrecoverable-debt acknowledgment,
 epoch recovery and compaction still require explicit policy and support proof.
 The additive migration preserves existing rows and uses the migration owner's
-savepoint. Re-entry validates the table columns, primary keys and replay key;
-a conflicting unknown table fails without partial schema or version changes.
+savepoint. Re-entry validates the table columns, primary keys, replay key and
+SQLite-assigned page identity required by source and receipt links. A conflicting
+unknown table fails without partial schema or version changes.
 Older binaries supporting only schema 28 must refuse this database.
 
 ### Sync and provider checkpoints

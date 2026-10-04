@@ -35,6 +35,7 @@ enum IncrementalErrorClass {
     SessionExpired,
     TransientFailure,
     StaticFallback,
+    CaptureRefused,
 }
 
 /// Classify incremental-enumeration failures before deciding whether to fall
@@ -47,6 +48,12 @@ enum IncrementalErrorClass {
 fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
     if is_provider_session_error(error) {
         return IncrementalErrorClass::SessionExpired;
+    }
+    if error
+        .downcast_ref::<crate::icloud::photos::error::ShadowPageError>()
+        .is_some()
+    {
+        return IncrementalErrorClass::CaptureRefused;
     }
     if error
         .downcast_ref::<SyncTokenError>()
@@ -454,7 +461,8 @@ pub async fn download_photos_with_sync(
                                 .await
                             }
                             IncrementalErrorClass::SessionExpired
-                            | IncrementalErrorClass::TransientFailure => Err(e),
+                            | IncrementalErrorClass::TransientFailure
+                            | IncrementalErrorClass::CaptureRefused => Err(e),
                         },
                     }
                 }
