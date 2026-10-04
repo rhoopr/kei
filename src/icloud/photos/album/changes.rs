@@ -287,18 +287,8 @@ impl PhotoAlbum {
             let mut buffer = DeltaRecordBuffer::new();
             let mut current_token = initial_token;
             let mut visited = FxHashSet::from_iter([current_token.clone()]);
-            let shadow_error = |error: anyhow::Error| {
-                // Preserve the existing typed token fallback contract. A new
-                // refused observation cannot be replaced by an uncaptured scan.
-                if shadow_capture.is_some()
-                    && error
-                        .downcast_ref::<crate::icloud::photos::SyncTokenError>()
-                        .is_none()
-                {
-                    super::super::error::ShadowPageError::from(error).into()
-                } else {
-                    error
-                }
+            let shadow_error = |error| {
+                super::super::error::classify_shadow_page_error(error, shadow_capture.is_some())
             };
 
             let url = format!(
