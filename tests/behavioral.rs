@@ -26,6 +26,8 @@
 
 mod common;
 
+#[path = "behavioral/account_ownership.rs"]
+mod account_ownership;
 #[path = "behavioral/authentication.rs"]
 mod authentication;
 #[path = "behavioral/configuration.rs"]

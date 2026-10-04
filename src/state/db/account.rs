@@ -227,12 +227,16 @@ pub(crate) async fn adopt_legacy(
                 path: destination.clone(),
                 source,
             })?;
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("account-adoption-published");
             crate::fs_util::fsync_parent_dir(&destination).map_err(|source| {
                 StateError::TempPath {
                     path: destination.clone(),
                     source,
                 }
             })?;
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("account-adoption-directory-synced");
             Ok(())
         })();
         // Only our private stage is removed. Never remove a published target
@@ -298,12 +302,16 @@ fn copy_and_bind_legacy(
             },
         )?;
     }
+    #[cfg(all(test, target_os = "linux"))]
+    crate::test_helpers::process_death_point("account-adoption-stage-open");
     // One bounded backup step returns Busy/Locked instead of waiting
     // indefinitely. SQLite copies a consistent snapshot, including WAL.
     match rusqlite::backup::Backup::new(&input, &mut output)?.step(-1)? {
         rusqlite::backup::StepResult::Done => {}
         _ => return Err(StateError::AccountMigrationBusy),
     }
+    #[cfg(all(test, target_os = "linux"))]
+    crate::test_helpers::process_death_point("account-adoption-copied");
     let after: i64 = input.pragma_query_value(None, "data_version", |row| row.get(0))?;
     if before != after {
         return Err(StateError::AccountMigrationBusy);
@@ -332,8 +340,13 @@ fn copy_and_bind_legacy(
         path: stage.to_path_buf(),
         source,
     })?;
+    #[cfg(all(test, target_os = "linux"))]
+    crate::test_helpers::process_death_point("account-adoption-stage-synced");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod interruption_tests;

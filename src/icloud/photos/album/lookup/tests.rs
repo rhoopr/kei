@@ -595,3 +595,108 @@ fn targeted_record_lookup_preserves_typed_http_failures() {
         ProviderLookupError::Authentication { status: 421, .. }
     ));
 }
+
+#[tokio::test]
+async fn targeted_lookup_rejects_conflicting_scope_and_child_master_pair() {
+    for fault in [
+        "record_zone",
+        "record_owner",
+        "reference_zone",
+        "reference_owner",
+        "master_pair",
+    ] {
+        let master = test_master_record("master");
+        let mut child = test_asset_record_for("child", "master");
+        match fault {
+            "record_zone" => child["zoneID"] = json!({"zoneName":"SharedSync-other"}),
+            "record_owner" => {
+                child["zoneID"] = json!({"zoneName":"PrimarySync", "ownerRecordName":"other"})
+            }
+            "reference_zone" => {
+                child["fields"]["masterRef"]["value"]["zoneID"] =
+                    json!({"zoneName":"SharedSync-other"})
+            }
+            "reference_owner" => {
+                child["fields"]["masterRef"]["value"]["zoneID"] =
+                    json!({"zoneName":"PrimarySync", "ownerRecordName":"other"})
+            }
+            _ => {
+                assert_eq!(fault, "master_pair");
+                child["fields"]["masterRef"]["value"]["recordName"] = json!("other-master");
+            }
+        }
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":[master, child]}))),
+        );
+        let result = album
+            .resolve_records(&[lookup_request("master", "master", "child")])
+            .await;
+        assert!(!result.complete, "{fault}");
+        assert!(
+            matches!(result.results[0].1, RecordResolution::Unknown),
+            "{fault}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn targeted_lookup_retains_per_response_url_observation_across_batches() {
+    #[derive(Clone)]
+    struct BatchSession;
+    #[async_trait::async_trait]
+    impl PhotosSession for BatchSession {
+        async fn post(
+            &self,
+            _url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let body: Value = serde_json::from_str(&body)?;
+            let names: Vec<_> = body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["recordName"].as_str().unwrap())
+                .collect();
+            if names.contains(&"master-100") {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            }
+            let records: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    if let Some(index) = name.strip_prefix("master-") {
+                        test_master_record(&format!("master-{index}"))
+                    } else {
+                        let index = name.strip_prefix("child-").unwrap();
+                        test_asset_record_for(name, &format!("master-{index}"))
+                    }
+                })
+                .collect();
+            Ok(json!({"records":records}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let album = make_album_with_session(100, Box::new(BatchSession));
+    let requests: Vec<_> = (0..101)
+        .map(|i| {
+            lookup_request(
+                &format!("master-{i}"),
+                &format!("master-{i}"),
+                &format!("child-{i}"),
+            )
+        })
+        .collect();
+    let result = album.resolve_records(&requests).await;
+    assert!(result.complete);
+    assert_eq!(result.url_observed_at.len(), 101);
+    let early = result.url_observed_at[&requests[0].state_id];
+    let late = result.url_observed_at[&requests[100].state_id];
+    assert!(late.duration_since(early) >= std::time::Duration::from_millis(70));
+    assert!(
+        early.elapsed() > late.elapsed(),
+        "earlier URLs must not inherit the later batch completion time"
+    );
+}

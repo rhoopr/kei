@@ -1831,6 +1831,151 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
 }
 
 #[tokio::test]
+async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycles() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let config = make_run_cycle_config();
+    let directory = tempfile::tempdir().unwrap();
+    let username = config.auth.username.as_str();
+    let source = directory.path().join(format!(
+        "{}.db",
+        crate::auth::session::sanitize_username(username)
+    ));
+    let destination = directory
+        .path()
+        .join(format!("{}.db", crate::account::namespace(username, "com")));
+    let media = directory.path().join("kept.jpg");
+    let bytes = b"preexisting adopted media stays exact";
+    std::fs::write(&media, bytes).unwrap();
+    let provider_checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+    let local_checksum = format!("{:x}", Sha256::digest(bytes));
+    {
+        let legacy = state::SqliteStateDb::open(&source).await.unwrap();
+        legacy
+            .set_metadata("sync_token:PrimarySync", "adopted-cursor")
+            .await
+            .unwrap();
+        legacy
+            .set_metadata(
+                ENUM_CONFIG_HASH_KEY,
+                &download::compute_config_hash(&config),
+            )
+            .await
+            .unwrap();
+        legacy
+            .upsert_seen(
+                &crate::test_helpers::TestAssetRecord::new("adopted")
+                    .filename("kept.jpg")
+                    .size(bytes.len() as u64)
+                    .checksum(&provider_checksum)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        legacy
+            .mark_downloaded(
+                "PrimarySync",
+                "adopted",
+                "original",
+                &media,
+                &local_checksum,
+                Some(&provider_checksum),
+            )
+            .await
+            .unwrap();
+        legacy
+            .upsert_asset_master_mapping("PrimarySync", "adopted", "master-adopted")
+            .await
+            .unwrap();
+    }
+    let source_bytes = std::fs::read(&source).unwrap();
+    let authenticated: crate::auth::AccountLoginResponse = serde_json::from_value(
+        serde_json::json!({"dsInfo":{"dsid":"synthetic-adoption-provider"}}),
+    )
+    .unwrap();
+    let owner =
+        state::db::account::AccountOwner::authenticated(username, "com", &authenticated).unwrap();
+    state::db::account::adopt_legacy(&source, &destination, &owner, username, "com")
+        .await
+        .unwrap();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    shared
+        .write()
+        .await
+        .bind_principal(&authenticated, None)
+        .unwrap();
+    for cycle in 0..2 {
+        assert_eq!(
+            state::db::account::state_path(directory.path(), username, "com")
+                .await
+                .unwrap(),
+            destination
+        );
+        let inner = Arc::new(
+            state::SqliteStateDb::open_owned(&destination, &owner)
+                .await
+                .unwrap(),
+        );
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        // The quiet synthetic source reports the retained cursor, rather than
+        // creating an artificial full-scan anchor or replacing historical work.
+        let library=make_run_cycle_library_state_with_album("PrimarySync","sync_token:PrimarySync",
+            make_full_album_with_session("PrimarySync",crate::test_helpers::MockPhotosSession::new()
+                .ok(serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync"},"records":[],"syncToken":"adopted-cursor","moreComing":false}]}))));
+        let builder = make_run_cycle_download_config_builder(directory.path(), db.clone());
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stats.downloaded, 0, "cycle {cycle}");
+        assert_eq!(result.failed_count, 0, "cycle {cycle}");
+        assert!(
+            result.stats.full_enumeration_reason.is_none(),
+            "cycle {cycle}: {result:?}"
+        );
+        assert!(
+            result.db_sync_token_advance_safe,
+            "cycle {cycle}: {result:?}"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("adopted-cursor")
+        );
+        assert_eq!(inner.get_summary().await.unwrap().downloaded, 1);
+        let conn = inner.acquire_lock("adopted completion receipt").unwrap();
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT local_checksum FROM asset_metadata_paths WHERE id='adopted'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            local_checksum
+        );
+        assert_eq!(conn.query_row::<String,_,_>("SELECT master_record_name FROM asset_master_mappings WHERE asset_record_name='adopted'",[],|r|r.get(0)).unwrap(),"master-adopted");
+        drop(conn);
+        drop(builder);
+        drop(library);
+        drop(db);
+        drop(inner);
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(std::fs::read(&media).unwrap(), bytes);
+    }
+}
+
+#[tokio::test]
 async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_restart() {
     let config = make_run_cycle_config();
     let owner = state::db::account::AccountOwner::authenticated(

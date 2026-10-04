@@ -85,13 +85,16 @@ impl SharedChangesZoneSession {
 impl PhotosSession for SharedChangesZoneSession {
     async fn post(
         &self,
-        _url: &str,
+        url: &str,
         _body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
-        self.responses
-            .lock()
-            .expect("poisoned")
+        let mut responses = self.responses.lock().expect("poisoned");
+        if url.contains("/records/lookup?") {
+            let current = responses.front().expect("fresh lookup fixture");
+            return Ok(json!({"records": current["zones"][0]["records"]}));
+        }
+        responses
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("unexpected extra changes/zone call"))
     }
@@ -120,10 +123,15 @@ impl SplitChangesZoneSession {
 impl PhotosSession for SplitChangesZoneSession {
     async fn post(
         &self,
-        _url: &str,
+        url: &str,
         body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        if url.contains("/records/lookup?") {
+            let responses = self.hydrate_responses.lock().expect("poisoned");
+            let current = responses.front().expect("fresh lookup fixture");
+            return Ok(json!({"records": current["zones"][0]["records"]}));
+        }
         let responses = if body.contains("\"syncToken\"") {
             &self.delta_responses
         } else {
@@ -146,6 +154,7 @@ struct AssetOnlyExpiredUrlSession {
     delta_records: Arc<Vec<Value>>,
     lookup_records: Arc<Vec<Value>>,
     hydration_records: Arc<Vec<Value>>,
+    lookup_calls: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -157,7 +166,10 @@ impl PhotosSession for AssetOnlyExpiredUrlSession {
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         if url.contains("/records/lookup?") {
-            return Ok(json!({"records": self.lookup_records.as_ref().clone()}));
+            let call = self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            return Ok(
+                json!({"records": if call < 2 { self.lookup_records.as_ref() } else { self.hydration_records.as_ref() }}),
+            );
         }
         if url.contains("/changes/zone?") {
             let request: Value = serde_json::from_str(&body)?;
@@ -230,7 +242,7 @@ impl PhotosSession for PendingRetryExpiredUrlSession {
                     "syncToken": "ignored-query-token"
                 })
             } else {
-                json!({"records": [], "syncToken": "ignored-query-token"})
+                json!({"records": self.fresh_records.as_ref(), "syncToken": "ignored-query-token"})
             });
         }
 
@@ -571,6 +583,7 @@ async fn incremental_asset_only_expired_url_retry_preserves_child_state_identity
         delta_records: Arc::new(vec![asset_only_delta]),
         lookup_records: Arc::new(stale_records),
         hydration_records: Arc::new(fresh_records),
+        lookup_calls: Arc::new(AtomicUsize::new(0)),
     };
     let passes = vec![AlbumPass {
         kind: PassKind::Unfiled,

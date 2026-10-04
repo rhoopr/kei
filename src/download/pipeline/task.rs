@@ -51,11 +51,10 @@ pub(super) enum DownloadTaskErrorClass {
 
 /// Classify per-task download errors at the worker orchestration boundary.
 ///
-/// The stream and cleanup workers share the same behavioral split: interrupted
-/// downloads are drain-only, session expiry contributes to the reauth abort
-/// threshold, expired CDN URLs abort the current URL batch, and ordinary
-/// failures are recorded on the task. The original error is still propagated
-/// to state/logging unchanged.
+/// Session expiry contributes to the reauth threshold; interruption and other
+/// failures retain task debt. Streaming expiry can stop stale enumeration,
+/// while explicit-task passes isolate expiry so healthy peers finish. The
+/// original error reaches state and logging unchanged.
 pub(super) fn classify_download_task_error(error: &anyhow::Error) -> DownloadTaskErrorClass {
     let Some(download_err) = error.downcast_ref::<DownloadError>() else {
         return DownloadTaskErrorClass::Other;

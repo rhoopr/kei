@@ -449,6 +449,24 @@ proves legacy refusal, then uses a synthetic owner fixture to test application
 schema upgrades; that fixture is not attributed to real authentication or
 adoption. No provider credentials or reporter data are used.
 
+The overlapping-account CLI matrix seeds distinct catalogues, retries,
+publication receipts and checkpoints under equal zone/asset IDs. It exercises
+status, manifest, verify, reconcile, doctor, import-existing, sync and both
+state/token resets with correct owners and a deliberately misbound database.
+Each correct-owner command preserves the other account's rows, database bytes
+and media. Equal provider pins do not implicitly merge different login strings.
+A separate adopted, owned database runs two production quiet sync cycles across
+reopen with its original media, cursor, master mapping and receipt intact.
+
+On Linux, the real adoption owner pauses a disposable subprocess before backup,
+after the SQLite copy, after stage fsync, after publication and after directory
+fsync. The parent sends SIGKILL, checks committed source WAL and unknown rows,
+then retries unpublished copies or reopens the complete published target twice.
+An interrupted private stage is preserved; after publication it shares the
+canonical database inode. This proves process-interruption recovery, not
+power-loss durability or automatic orphan cleanup. Other platforms run the
+owner, CLI and quiet-cycle tests without the Linux SIGKILL matrix.
+
 ## Running
 
 Choose the route by purpose:
@@ -885,3 +903,20 @@ data paths. Cargo uses `--offline`, so dependencies must already be cached.
 The qualifier fails if user/network namespaces are unavailable; it does not
 silently fall back to a externally network-enabled run. The cycle test uses a strict wiremock bind
 so unavailable loopback fails qualification instead of skipping the proof.
+
+## Bounded incremental URL refresh
+
+Synthetic Photos-session and loopback-CDN fixtures reproduce tokenless refresh
+scans and persistent HTTP 410 cancellation of a delayed healthy peer on the
+unchanged implementation. The fixed production collecting and explicit-pass
+paths use bounded child/master lookup and preserve exact selected task evidence.
+File-backed SQLite tests seed pending work and unrelated media, reopen after
+refusal, repair the provider fixture, download exact bytes, and check an unchanged
+tail without repeated completed provider work. Negative controls change master,
+child, zone/owner, rendition, checksum, size and lookup presence. RAW/JPEG
+preference swaps are exercised in both aged preflight and expiry recovery,
+with the original provider rendition pinned independently of logical task keys. Authentication
+and stalled-lookup cancellation retain debt, and cancellation during an active
+transfer accounts for both in-flight and queued tasks after reopen. These are
+synthetic runtime proofs; they do not validate reporter data or resolve sparse
+Shared Library ownership.
