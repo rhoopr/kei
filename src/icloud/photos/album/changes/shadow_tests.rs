@@ -109,7 +109,7 @@ async fn collect(album: &crate::icloud::photos::PhotoAlbum) -> (Vec<String>, Vec
 }
 
 #[tokio::test]
-async fn shadow_source_payload_reopens_losslessly_and_replays_legacy_parity() {
+async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_parity() {
     use crate::icloud::photos::album::test_support::{changes_asset, changes_master};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owned.db");
@@ -329,4 +329,159 @@ async fn shadow_rejects_unusable_or_ambiguous_identity_before_any_page_write() {
         assert_eq!(token, "saved");
         assert_eq!(counts(&db), (0, 0, 0));
     }
+}
+
+#[tokio::test]
+async fn shadow_scopes_and_revisions_remain_distinct_and_owner_is_rechecked() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("owned.db")).await;
+    assert!(
+        collect(&album(unknown_page(), capture(&db)))
+            .await
+            .1
+            .is_empty()
+    );
+    let mut shared = album(unknown_page(), capture(&db));
+    shared.set_shadow_capture(capture(&db), Arc::from("shared"));
+    assert!(collect(&shared).await.1.is_empty());
+    let mut changed: Value = serde_json::from_slice(&unknown_page()).unwrap();
+    changed["zones"][0]["zoneID"]["futureMetadata"] = json!({"version":"next"});
+    assert!(
+        collect(&album(serde_json::to_vec(&changed).unwrap(), capture(&db)))
+            .await
+            .1
+            .is_empty()
+    );
+    assert_eq!(counts(&db), (3, 3, 2));
+    {
+        let conn = db
+            .acquire_lock("independent stable scope and version facts")
+            .unwrap();
+        let scopes: Vec<String> = conn
+            .prepare("SELECT scope FROM provider_shadow_pages ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            scopes[0], scopes[2],
+            "unknown zone metadata remains payload, not identity"
+        );
+        assert_ne!(scopes[0], scopes[1], "private/shared scopes must not alias");
+        let raw: Vec<u8> = conn
+            .query_row(
+                "SELECT body FROM provider_shadow_pages ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(String::from_utf8_lossy(&raw).contains("futureMetadata"));
+        conn.execute(
+            "UPDATE account_owner SET provider_key=?1",
+            [crate::account::provider_fingerprint(
+                "com",
+                "different-provider",
+            )],
+        )
+        .unwrap();
+    }
+    let (events, errors, token) = collect(&album(unknown_page(), capture(&db))).await;
+    assert!(events.is_empty());
+    assert_eq!(token, "saved");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("account ownership does not match"));
+    assert!(
+        !errors[0].contains("synthetic@example.invalid")
+            && !errors[0].contains("different-provider")
+    );
+    assert_eq!(
+        counts(&db),
+        (3, 3, 2),
+        "wrong owner cannot even acknowledge an existing page"
+    );
+}
+
+#[derive(Clone)]
+struct DelayedBody {
+    requested: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl PhotosSession for DelayedBody {
+    async fn post(&self, _: &str, _: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        anyhow::bail!("unexpected value-based request")
+    }
+    async fn post_changes_body(
+        &self,
+        _: &str,
+        _: String,
+        _: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<u8>> {
+        self.requested.notify_one();
+        self.release.notified().await;
+        Ok(unknown_page())
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn shadow_cancelled_receiver_before_capture_preserves_page_and_legacy_cursor() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("owned.db");
+    let db = open(&path).await;
+    db.set_metadata("sync_token:PrimarySync", "saved")
+        .await
+        .unwrap();
+    let requested = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut bound = make_album_with_session(
+        100,
+        Box::new(DelayedBody {
+            requested: requested.clone(),
+            release: release.clone(),
+        }),
+    );
+    bound.set_shadow_capture(capture(&db), Arc::from("private"));
+    let (stream, token) = bound.changes_stream("saved");
+    tokio::time::timeout(std::time::Duration::from_secs(5), requested.notified())
+        .await
+        .unwrap();
+    drop(stream);
+    release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), token)
+            .await
+            .unwrap()
+            .unwrap(),
+        "saved"
+    );
+    assert_eq!(counts(&db), (0, 0, 0));
+    drop(bound);
+    drop(db);
+    let db = open(&path).await;
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("saved")
+    );
+    assert!(
+        collect(&album(unknown_page(), capture(&db)))
+            .await
+            .1
+            .is_empty()
+    );
+    assert_eq!(counts(&db), (1, 1, 1));
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("saved"),
+        "capture is not checkpoint authority"
+    );
 }

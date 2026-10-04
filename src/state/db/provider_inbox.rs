@@ -58,11 +58,11 @@ impl SqliteStateDb {
                 let used: i64 = tx.query_row(
                     "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages", [], |row| row.get(0),
                 )?;
-                let used = u64::try_from(used).map_err(|_| StateError::ProviderInboxInvalid)?;
+                let used = u64::try_from(used).map_err(|_error| StateError::ProviderInboxInvalid)?;
                 if charge > capacity.saturating_sub(used) {
                     return Err(StateError::ProviderInboxFull);
                 }
-                let charge = i64::try_from(charge).map_err(|_| StateError::ProviderInboxFull)?;
+                let charge = i64::try_from(charge).map_err(|_error| StateError::ProviderInboxFull)?;
                 tx.execute(
                     "INSERT INTO provider_shadow_pages(account_key,provider_key,scope,request_cursor,successor,more_coming,body_hash,body,charged_bytes,observed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     params![account_key, provider_key, page.scope, page.request_cursor,
@@ -70,7 +70,7 @@ impl SqliteStateDb {
                 )?;
                 let id = tx.last_insert_rowid();
                 for (ordinal, identity) in page.identities.iter().enumerate() {
-                    let ordinal = i64::try_from(ordinal).map_err(|_| StateError::ProviderInboxInvalid)?;
+                    let ordinal = i64::try_from(ordinal).map_err(|_error| StateError::ProviderInboxInvalid)?;
                     tx.execute(
                         "INSERT INTO provider_shadow_records(page_id,ordinal,record_name,record_type,deleted) VALUES (?1,?2,?3,?4,?5)",
                         params![id, ordinal, identity.name, identity.record_type, identity.deleted],

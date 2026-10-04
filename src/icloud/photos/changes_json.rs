@@ -78,7 +78,7 @@ pub(crate) fn parse(bytes: &[u8]) -> anyhow::Result<Value> {
         parser.end()?;
         Ok(value.0)
     });
-    parsed.map_err(|_| anyhow::anyhow!("Invalid or ambiguous provider changes JSON"))
+    parsed.map_err(|_error| anyhow::anyhow!("Invalid or ambiguous provider changes JSON"))
 }
 
 #[cfg(test)]

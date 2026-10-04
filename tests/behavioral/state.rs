@@ -1130,6 +1130,13 @@ fn behavioral_helper_carries_every_migrated_column() {
             "v20 column assets.{column} must exist in the behavioral helper's DDL"
         );
     }
+    for sql in [
+        "SELECT id,account_key,provider_key,scope,request_cursor,successor,more_coming,body_hash,body,charged_bytes,observed_at FROM provider_shadow_pages LIMIT 0",
+        "SELECT page_id,ordinal,record_name,record_type,deleted FROM provider_shadow_records LIMIT 0",
+        "SELECT scope,page_id FROM provider_shadow_receipts LIMIT 0",
+    ] {
+        conn.prepare(sql).unwrap();
+    }
     let path_key: Vec<String> = conn
         .prepare(
             "SELECT name FROM pragma_table_info('asset_metadata_paths') WHERE pk > 0 ORDER BY pk",

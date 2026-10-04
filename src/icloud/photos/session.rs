@@ -79,8 +79,15 @@ impl PhotosSession for reqwest::Client {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
-        let bytes = post_response_body(self, url, body, headers, None).await?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let (response, _dump) = post_response(self, url, body, headers).await?;
+        // Keep reqwest's decode error type and the existing retry classification
+        // for ordinary JSON requests such as bounded resource lookups.
+        let json: Value = response.json().await?;
+        #[cfg(debug_assertions)]
+        if let Some((dir, id)) = &_dump {
+            dump_body(dir, *id, "res", &json.to_string()).await;
+        }
+        Ok(json)
     }
 
     async fn post_changes_body(
@@ -89,14 +96,27 @@ impl PhotosSession for reqwest::Client {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Vec<u8>> {
-        post_response_body(
-            self,
-            url,
-            body,
-            headers,
-            Some(super::inbox::MAX_CHANGES_PAGE_BYTES),
-        )
-        .await
+        let (mut response, _dump) = post_response(self, url, body, headers).await?;
+        let limit = super::inbox::MAX_CHANGES_PAGE_BYTES;
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| size <= limit as u64),
+            "Provider changes page exceeded the capture byte limit"
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                chunk.len() <= limit.saturating_sub(bytes.len()),
+                "Provider changes page exceeded the capture byte limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        #[cfg(debug_assertions)]
+        if let Some((dir, id)) = &_dump {
+            dump_body(dir, *id, "res", &String::from_utf8_lossy(&bytes)).await;
+        }
+        Ok(bytes)
     }
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -104,13 +124,14 @@ impl PhotosSession for reqwest::Client {
     }
 }
 
-async fn post_response_body(
+type BodyDump = Option<(std::path::PathBuf, usize)>;
+
+async fn post_response(
     client: &reqwest::Client,
     url: &str,
     body: String,
     headers: &[(&str, &str)],
-    limit: Option<usize>,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<(reqwest::Response, BodyDump)> {
     #[cfg(debug_assertions)]
     let dump = std::env::var_os("KEI_REQUEST_DUMP_DIR")
         .filter(|dir| !dir.is_empty())
@@ -129,7 +150,7 @@ async fn post_response_body(
     for &(k, v) in headers {
         builder = builder.header(k, v);
     }
-    let mut resp = builder.send().await?;
+    let resp = builder.send().await?;
     let status = resp.status();
 
     if status.is_client_error() || status.is_server_error() {
@@ -175,28 +196,9 @@ async fn post_response_body(
         .into());
     }
 
-    let mut bytes = Vec::new();
-    if let Some(limit) = limit {
-        anyhow::ensure!(
-            resp.content_length()
-                .is_none_or(|size| size <= limit as u64),
-            "Provider changes page exceeded the capture byte limit"
-        );
-        while let Some(chunk) = resp.chunk().await? {
-            anyhow::ensure!(
-                chunk.len() <= limit.saturating_sub(bytes.len()),
-                "Provider changes page exceeded the capture byte limit"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-    } else {
-        bytes = resp.bytes().await?.to_vec();
-    }
-    #[cfg(debug_assertions)]
-    if let Some((dir, id)) = &dump {
-        dump_body(dir, *id, "res", &String::from_utf8_lossy(&bytes)).await;
-    }
-    Ok(bytes)
+    #[cfg(not(debug_assertions))]
+    let dump = None;
+    Ok((resp, dump))
 }
 
 // SharedSession delegates to the inner Session's http_client(). The read lock
@@ -631,6 +633,111 @@ pub fn check_changes_zone_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn normal_photos_transport_retains_decode_error_retry_classification() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/records/lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{"))
+            .mount(&server)
+            .await;
+        let error = PhotosSession::post(
+            &reqwest::Client::new(),
+            &format!("{}/records/lookup", server.uri()),
+            "{}".into(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<reqwest::Error>());
+        assert!(matches!(classify_api_error(&error), RetryAction::Retry));
+    }
+
+    #[tokio::test]
+    async fn raw_changes_transport_preserves_bytes_and_bounds_content_length() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let body = br#" { "number":9007199254740993.0, "unknown":[true,null] } "#;
+        Mock::given(method("POST"))
+            .and(path("/original"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_slice()))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        assert_eq!(
+            PhotosSession::post_changes_body(
+                &client,
+                &format!("{}/original", server.uri()),
+                "{}".into(),
+                &[]
+            )
+            .await
+            .unwrap(),
+            body
+        );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let oversized = super::super::inbox::MAX_CHANGES_PAGE_BYTES + 1;
+        let response = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {oversized}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let error = PhotosSession::post_changes_body(
+            &client,
+            &format!("http://{address}"),
+            "{}".into(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        response.await.unwrap();
+        assert!(error.to_string().contains("capture byte limit"));
+    }
+
+    #[tokio::test]
+    async fn raw_changes_transport_bounds_chunked_response_without_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..17 {
+                if socket.write_all(b"100000\r\n").await.is_err()
+                    || socket.write_all(&chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        let error = PhotosSession::post_changes_body(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "{}".into(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("capture byte limit"));
+        server.await.unwrap();
+    }
 
     #[test]
     fn provider_session_error_classification_uses_typed_status_not_body() {

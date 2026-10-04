@@ -102,19 +102,24 @@ impl ValidatedChangesPage {
     ) -> anyhow::Result<crate::state::db::provider_inbox::ObservedPage> {
         use crate::state::db::provider_inbox::{ObservedPage, SourceIdentity};
         let response = super::super::changes_json::parse(&body)?;
-        let records = response["zones"][0]["records"]
-            .as_array()
+        let records = response
+            .get("zones")
+            .and_then(Value::as_array)
+            .and_then(|zones| zones.first())
+            .and_then(|zone| zone.get("records"))
+            .and_then(Value::as_array)
             .context("Missing capture records")?;
         for record in records {
             anyhow::ensure!(
-                record["recordName"]
-                    .as_str()
+                record
+                    .get("recordName")
+                    .and_then(Value::as_str)
                     .is_some_and(|name| !name.trim().is_empty()),
                 "Missing provider capture source identity"
             );
             if let Some(zone) = record.get("zoneID") {
                 anyhow::ensure!(
-                    zone["zoneName"] == self.zone_scope["zoneName"]
+                    zone.get("zoneName") == self.zone_scope.get("zoneName")
                         && zone
                             .get("ownerRecordName")
                             .is_none_or(

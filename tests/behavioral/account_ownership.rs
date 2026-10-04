@@ -390,3 +390,68 @@ fn account_ownership_exact_alias_spellings_remain_separate_with_same_provider_pi
         assert_eq!(state(&b.path), b_state);
     }
 }
+
+#[derive(Clone)]
+struct UnknownChanges;
+impl Respond for UnknownChanges {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if request.url.path().ends_with("/changes/zone") {
+            ResponseTemplate::new(200).set_body_json(json!({"zones":[{
+                "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                "syncToken":"A-cursor","moreComing":false,
+                "records":[{"recordName":"future-source","recordType":"FutureRecord",
+                    "futureEnvelope":{"relationship":{"recordName":"unresolved-peer"}}}]
+            }]}))
+        } else {
+            OfflinePhotos.respond(request)
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadow_actual_sync_captures_unknown_source_after_library_resolution() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(UnknownChanges)
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path().ends_with("/changes/zone")),
+        "production sync must observe an incremental page"
+    );
+    let conn =
+        Connection::open_with_flags(&account.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    // The startup path, not a manually attached test album, must capture the
+    // unknown record before the existing stream drops its lossy projection.
+    let records: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM provider_shadow_records WHERE record_name='future-source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        records, 1,
+        "resolved library clones must carry capture composition"
+    );
+    let body: Vec<u8> = conn
+        .query_row("SELECT body FROM provider_shadow_pages", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("unresolved-peer"));
+    assert_eq!(
+        std::fs::read(&account.media).unwrap(),
+        b"known media belonging only to account A"
+    );
+}

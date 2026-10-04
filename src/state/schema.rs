@@ -958,6 +958,111 @@ fn migrate_to_version(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn shadow_v29_migration_failure_rolls_back_then_reopens_without_losing_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owned.db");
+        let username = "migration@example.invalid";
+        let data =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"migration-provider"}}))
+                .unwrap();
+        let owner =
+            crate::state::db::account::AccountOwner::authenticated(username, "com", &data).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            for version in 1..=28 {
+                migrate_to_version(&conn, 0, version).unwrap();
+            }
+            conn.execute_batch("CREATE TABLE account_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,account_key TEXT NOT NULL,provider_key TEXT NOT NULL);").unwrap();
+            conn.execute(
+                "INSERT INTO account_owner VALUES(1,1,?1,?2)",
+                rusqlite::params![
+                    crate::account::namespace(username, "com"),
+                    crate::account::provider_fingerprint("com", "migration-provider")
+                ],
+            )
+            .unwrap();
+            conn.execute_batch("INSERT INTO metadata(key,value) VALUES('sync_token:PrimarySync','saved'),('pending_sync_token:old:PrimarySync','debt'); CREATE TABLE future_unknown(payload BLOB); INSERT INTO future_unknown VALUES(X'00FF07'); CREATE TABLE provider_shadow_receipts(future_unknown BLOB); INSERT INTO provider_shadow_receipts VALUES(X'0011FF');").unwrap();
+        }
+        assert!(
+            crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .is_err()
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), 28);
+            for table in ["provider_shadow_pages", "provider_shadow_records"] {
+                assert!(
+                    !conn
+                        .query_row::<bool, _, _>(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
+                            [table],
+                            |row| row.get(0)
+                        )
+                        .unwrap(),
+                    "{table}: failed migration must not leave partial schema"
+                );
+            }
+            assert_eq!(
+                conn.query_row::<Vec<u8>, _, _>(
+                    "SELECT future_unknown FROM provider_shadow_receipts",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                [0, 17, 255]
+            );
+            conn.execute_batch("DROP TABLE provider_shadow_receipts")
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("saved")
+            );
+            assert_eq!(
+                db.get_metadata("pending_sync_token:old:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("debt")
+            );
+            let conn = db
+                .acquire_lock("independent migration recovery facts")
+                .unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), 29);
+            assert_eq!(
+                conn.query_row::<Vec<u8>, _, _>("SELECT payload FROM future_unknown", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+                [0, 255, 7]
+            );
+            for table in [
+                "provider_shadow_pages",
+                "provider_shadow_records",
+                "provider_shadow_receipts",
+            ] {
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        &format!("SELECT count(*) FROM {table}"),
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
     #[test]
     fn v28_preservation_migration_is_empty_and_retains_schema27_evidence() {
         let conn = Connection::open_in_memory().unwrap();

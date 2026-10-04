@@ -36,7 +36,8 @@ impl ShadowCapture {
         );
         Ok(serde_json::to_string(&json!({
             "format": 1, "realm": &*self.realm, "container": "com.apple.photos.cloud",
-            "environment": "production", "database": database, "zone": zone,
+            "environment": "production", "database": database,
+            "zone": {"zoneName": zone.get("zoneName"), "ownerRecordName": zone.get("ownerRecordName")},
         }))?)
     }
 
