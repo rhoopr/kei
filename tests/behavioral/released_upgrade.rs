@@ -184,7 +184,7 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
     super::write_sync_config(&config, root.join("new-destination").to_str().unwrap());
     let verification = run(&current, root, &["verify", "--checksums"], false);
     assert!(verification.contains("Missing:   1"), "{verification}");
-    assert_eq!(schema_version(&db), 28);
+    assert_eq!(schema_version(&db), 29);
     assert_eq!(
         rows(&db, "SELECT * FROM assets ORDER BY library,id,version_size"),
         before
@@ -241,7 +241,7 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
             rows(&db, "SELECT * FROM metadata ORDER BY key"),
             checkpoints
         );
-        assert_eq!(schema_version(&db), 28);
+        assert_eq!(schema_version(&db), 29);
         for (_, _, _, filename, bytes) in entries {
             assert_eq!(std::fs::read(media.join(filename)).unwrap(), bytes);
         }

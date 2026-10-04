@@ -1,5 +1,8 @@
 //! Sequential CloudKit change scans and incremental event streams.
 
+#[cfg(test)]
+mod shadow_tests;
+
 use super::lookup::ProviderRecordId;
 use anyhow::Context;
 use rustc_hash::FxHashSet;
@@ -19,6 +22,7 @@ use tokio::sync::mpsc;
 /// A complete, scoped page checked before pairing, callbacks or cursor acceptance.
 #[must_use]
 struct ValidatedChangesPage {
+    zone_scope: Value,
     records: Vec<cloudkit::Record>,
     sync_token: String,
     more_coming: bool,
@@ -70,6 +74,7 @@ impl ValidatedChangesPage {
                 .all(|record| record.get("serverErrorCode").is_none_or(Value::is_null)),
             "Changes/zone record failed"
         );
+        let zone_scope = zone_id.clone();
         let response: ChangesZoneResponse = serde_json::from_value(response)
             .map_err(|_invalid_shape| anyhow::anyhow!("Invalid changes/zone page shape"))?;
         let zone = response
@@ -82,9 +87,70 @@ impl ValidatedChangesPage {
             "Missing changes/zone successor"
         );
         Ok(Self {
+            zone_scope,
             records: zone.records,
             sync_token: zone.sync_token,
             more_coming: zone.more_coming,
+        })
+    }
+
+    fn observed_page(
+        &self,
+        body: Vec<u8>,
+        scope: String,
+        request_cursor: &str,
+    ) -> anyhow::Result<crate::state::db::provider_inbox::ObservedPage> {
+        use crate::state::db::provider_inbox::{ObservedPage, SourceIdentity};
+        let response = super::super::changes_json::parse(&body)?;
+        let records = response
+            .get("zones")
+            .and_then(Value::as_array)
+            .and_then(|zones| zones.first())
+            .and_then(|zone| zone.get("records"))
+            .and_then(Value::as_array)
+            .context("Missing capture records")?;
+        for record in records {
+            anyhow::ensure!(
+                record
+                    .get("recordName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.trim().is_empty()),
+                "Missing provider capture source identity"
+            );
+            if let Some(zone) = record.get("zoneID") {
+                anyhow::ensure!(
+                    zone.get("zoneName") == self.zone_scope.get("zoneName")
+                        && zone
+                            .get("ownerRecordName")
+                            .is_none_or(
+                                |owner| self.zone_scope.get("ownerRecordName") == Some(owner)
+                            ),
+                    "Unexpected provider capture source scope"
+                );
+            }
+        }
+        anyhow::ensure!(
+            self.zone_scope
+                .get("ownerRecordName")
+                .is_none_or(|owner| owner.as_str().is_some_and(|name| !name.trim().is_empty())),
+            "Missing provider capture zone owner"
+        );
+        Ok(ObservedPage {
+            scope,
+            request_cursor: request_cursor.to_owned(),
+            successor: self.sync_token.clone(),
+            more_coming: self.more_coming,
+            body,
+            identities: self
+                .records
+                .iter()
+                .map(|record| SourceIdentity {
+                    name: record.record_name.clone(),
+                    record_type: (!record.record_type.is_empty())
+                        .then(|| record.record_type.clone()),
+                    deleted: record.deleted.unwrap_or(false),
+                })
+                .collect(),
         })
     }
 
@@ -215,11 +281,15 @@ impl PhotoAlbum {
         let initial_token = sync_token.to_string();
         let album_name = Arc::clone(&self.name);
         let retry_config = self.retry_config;
+        let shadow_capture = self.shadow_capture.clone();
 
         tokio::spawn(async move {
             let mut buffer = DeltaRecordBuffer::new();
             let mut current_token = initial_token;
             let mut visited = FxHashSet::from_iter([current_token.clone()]);
+            let shadow_error = |error| {
+                super::super::error::classify_shadow_page_error(error, shadow_capture.is_some())
+            };
 
             let url = format!(
                 "{}/changes/zone?{}",
@@ -228,13 +298,17 @@ impl PhotoAlbum {
             );
 
             let stream_error: Option<anyhow::Error> = loop {
+                if tx.is_closed() {
+                    let _ = token_tx.send(current_token);
+                    return;
+                }
                 let body = build_changes_zone_request(&zone_id, Some(&current_token), 200);
                 tracing::debug!(target: "kei::icloud::photos::album",
                     album = %album_name,
                     "changes/zone request"
                 );
 
-                let response = match session::retry_post(
+                let raw_body = match session::retry_post_changes_body(
                     session.as_ref(),
                     &url,
                     &body.to_string(),
@@ -247,12 +321,35 @@ impl PhotoAlbum {
                     Err(e) => break Some(e),
                 };
 
-                let zone_result = match ValidatedChangesPage::parse(response, &zone_id) {
-                    Ok(page) => page,
+                let response = match super::super::changes_json::parse(&raw_body) {
+                    Ok(value) => value,
                     Err(error) => break Some(error),
                 };
+                let zone_result = match ValidatedChangesPage::parse(response, &zone_id) {
+                    Ok(page) => page,
+                    Err(error) => break Some(shadow_error(error)),
+                };
                 if let Err(error) = zone_result.check_continuation(&mut visited) {
-                    break Some(error);
+                    break Some(shadow_error(error));
+                }
+
+                if let Some((capture, database)) = &shadow_capture {
+                    let page = capture
+                        .scope(database, &zone_result.zone_scope)
+                        .and_then(|scope| {
+                            zone_result.observed_page(raw_body, scope, &current_token)
+                        });
+                    let page = match page {
+                        Ok(page) => page,
+                        Err(error) => break Some(shadow_error(error)),
+                    };
+                    if tx.is_closed() {
+                        let _ = token_tx.send(current_token);
+                        return;
+                    }
+                    if let Err(error) = capture.capture(page).await {
+                        break Some(shadow_error(error));
+                    }
                 }
 
                 current_token = zone_result.sync_token;

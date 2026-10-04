@@ -403,6 +403,59 @@ with explicit provider deletion evidence, then checks an unchanged cycle. Existi
 media bytes remain intact and no cycle publishes another file. The synthetic
 fallback cannot provide authoritative completion during the malformed cycle.
 
+## Observed incremental shadow capture
+
+The shadow fixtures open account-owned, file-backed SQLite and retain exact
+original JSON bytes through two reopens, including an unknown record, tombstone,
+unresolved cross-zone relationship and a numeric lexeme changed by typed
+re-encoding. Stored source ordinal, type, deletion flag and account/provider/scope
+facts are independent oracles. Replay through the legacy stream preserves its
+paired events and does not alter seeded media, downloaded rows or old-epoch debt.
+Private/shared scopes remain separate; unknown zone metadata does not create a
+new stable identity. Changed payload revisions remain separate observations.
+
+A receipt-write trigger fails after page and source inserts and proves complete
+rollback. Reopen, remove only that fault, refuse an exhausted inbox, recover and
+replay idempotently at capacity. A changed revision at capacity is refused
+without overwriting existing observations. Malformed identities, duplicate JSON
+keys and record-scope mismatches refuse the entire page. Account provenance is
+rechecked even for an existing page. A delayed provider response after receiver
+cancellation captures nothing and retains the legacy cursor before restart.
+Actual HTTP tests preserve original bytes and enforce both declared-length and
+chunked page limits.
+
+An actual CLI matrix starts without pending retry debt, offers a valid rank EOF
+and replacement anchor, and injects a receipt-write failure, exhausted logical
+budget, malformed source identity or duplicate JSON key. Two process attempts
+retain the cursor, existing media and observations without issuing rank queries.
+Removing only the injected fault permits recovery and two quiet repeats. The
+capacity case charges a real previously captured page; it does not simulate a
+physical disk-full condition.
+
+`run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_restart`
+seeds historical media, mapping, downloaded state and pending debt. Four
+production cycles across reopen cover capture failure, captured observations
+with unresolved checkpoint evidence, recovery under the existing gate and a
+quiet repeat. Media remains intact and no cycle publishes another file. The
+actual CLI startup control captures an unknown source through normal library
+resolution without manually attaching an album. The schema-28 migration fault
+control retains source cursors, debt and an unknown BLOB in a conflicting table
+with matching columns but no durable key. It rolls back partial DDL, then retries
+and reopens schema 29 twice. Payload replay also retains existing observations
+through synthetic migration re-entry. Owned migration controls also reject TEXT,
+inline descending integer and WITHOUT ROWID page keys on two reopens, preserving
+schema 28, source cursor, old debt, conflicting DDL and unknown BLOB bytes.
+Released-schema history fixtures also
+retain their independent row, media and checkpoint assertions.
+
+Reversible negative controls replace original bytes with typed JSON, remove the
+capture transaction and bypass owner validation, the rowid guard or the refusal
+classification. Each corresponding assertion
+must fail before source restoration. Bounded exact-resource URL refresh tests,
+including RAW/JPEG provider rendition and per-file retry isolation, remain part
+of qualification. These synthetic controls do not qualify power-loss durability,
+full-zone history, expired-epoch completeness or inbox-driven materialization.
+
 ## State-transition proof
 
 Changes to durable configuration, filesystem paths, media publication,
@@ -844,7 +897,7 @@ completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 28.
+binary (schema 25), then executes the current production CLI through schema 29.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,

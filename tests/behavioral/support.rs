@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 28;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 29;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -96,6 +96,33 @@ pub(super) fn create_state_db(data_dir: &std::path::Path, username: &str) -> rus
     bind_synthetic_owner(&conn, username);
     conn.execute_batch(
         r"
+
+CREATE TABLE IF NOT EXISTS provider_shadow_pages (
+    id INTEGER PRIMARY KEY,
+    account_key TEXT NOT NULL,
+    provider_key TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    request_cursor TEXT NOT NULL,
+    successor TEXT NOT NULL CHECK(length(trim(successor)) > 0),
+    more_coming INTEGER NOT NULL CHECK(more_coming IN (0,1)),
+    body_hash TEXT NOT NULL,
+    body BLOB NOT NULL,
+    charged_bytes INTEGER NOT NULL CHECK(charged_bytes > 0),
+    observed_at INTEGER NOT NULL,
+    UNIQUE(scope,request_cursor,body_hash)
+);
+CREATE TABLE IF NOT EXISTS provider_shadow_records (
+    page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    record_name TEXT NOT NULL CHECK(length(trim(record_name)) > 0),
+    record_type TEXT,
+    deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
+    PRIMARY KEY(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
+    scope TEXT PRIMARY KEY,
+    page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS asset_metadata_paths (
     library TEXT NOT NULL,

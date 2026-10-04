@@ -3,9 +3,11 @@
 
 mod album;
 pub(crate) mod asset;
+mod changes_json;
 pub mod cloudkit;
 pub(crate) mod enc;
 pub mod error;
+pub(crate) mod inbox;
 mod library;
 pub(crate) mod metadata;
 pub mod queries;
@@ -41,6 +43,7 @@ use crate::icloud::photos::queries::encode_params;
 use crate::retry::RetryConfig;
 
 pub struct PhotosService {
+    shadow_capture: Option<inbox::ShadowCapture>,
     service_root: String,
     session: Box<dyn PhotosSession>,
     params: Arc<HashMap<String, Value>>,
@@ -68,6 +71,19 @@ fn is_photo_library_zone(zone_name: &str) -> bool {
 }
 
 impl PhotosService {
+    pub(crate) fn set_shadow_capture(&mut self, capture: inbox::ShadowCapture) {
+        self.primary_library.shadow_capture = Some(capture.clone());
+        for libraries in [&mut self.private_libraries, &mut self.shared_libraries]
+            .into_iter()
+            .flatten()
+        {
+            for library in libraries.values_mut() {
+                library.shadow_capture = Some(capture.clone());
+            }
+        }
+        self.shadow_capture = Some(capture);
+    }
+
     /// Create a new `PhotosService`.
     ///
     /// This checks that the primary library has finished indexing.
@@ -97,6 +113,7 @@ impl PhotosService {
         .await?;
 
         Ok(Self {
+            shadow_capture: None,
             service_root,
             session,
             params,
@@ -230,7 +247,8 @@ impl PhotosService {
             )
             .await
             {
-                Ok(lib) => {
+                Ok(mut lib) => {
+                    lib.shadow_capture = self.shadow_capture.clone();
                     tracing::debug!(zone = %zone_name, "Loaded library zone");
                     libraries.insert(zone_name, lib);
                 }
@@ -288,6 +306,7 @@ impl PhotosService {
     ) -> Self {
         let dummy_library = PhotoLibrary::new_stub(session.clone_box());
         Self {
+            shadow_capture: None,
             service_root: "https://p00-ckdatabasews.icloud.com".to_string(),
             session,
             params: Arc::new(params),
@@ -308,6 +327,7 @@ impl PhotosService {
         shared: HashMap<String, PhotoLibrary>,
     ) -> Self {
         Self {
+            shadow_capture: None,
             service_root: "https://p00-ckdatabasews.icloud.com".to_string(),
             session,
             params: Arc::new(HashMap::new()),
@@ -365,6 +385,7 @@ mod tests {
         let dummy_library = PhotoLibrary::new_stub(Box::new(PanicSession));
 
         PhotosService {
+            shadow_capture: None,
             service_root: "https://p00-ckdatabasews.icloud.com".to_string(),
             session,
             params: Arc::new(params),

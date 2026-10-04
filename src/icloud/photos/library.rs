@@ -90,6 +90,7 @@ fn log_fido_security_key_hint(http_err: &crate::icloud::photos::session::HttpSta
 }
 
 pub struct PhotoLibrary {
+    pub(crate) shadow_capture: Option<super::inbox::ShadowCapture>,
     service_endpoint: Arc<str>,
     params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
@@ -101,6 +102,7 @@ pub struct PhotoLibrary {
 impl Clone for PhotoLibrary {
     fn clone(&self) -> Self {
         Self {
+            shadow_capture: self.shadow_capture.clone(),
             service_endpoint: Arc::clone(&self.service_endpoint),
             params: Arc::clone(&self.params),
             session: self.session.clone_box(),
@@ -172,6 +174,7 @@ impl PhotoLibrary {
         }
 
         Ok(Self {
+            shadow_capture: None,
             service_endpoint,
             params,
             session,
@@ -276,11 +279,16 @@ impl PhotoLibrary {
             }
         }
 
+        if let Some(capture) = &self.shadow_capture {
+            for album in albums.values_mut() {
+                album.set_shadow_capture(capture.clone(), Arc::clone(&self.library_type));
+            }
+        }
         Ok(albums)
     }
 
     pub fn all(&self) -> PhotoAlbum {
-        PhotoAlbum::new(
+        let mut album = PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::clone(&self.params),
                 service_endpoint: Arc::clone(&self.service_endpoint),
@@ -295,7 +303,11 @@ impl PhotoLibrary {
                 cross_zone_sources: Vec::new(),
             },
             self.clone_session(),
-        )
+        );
+        if let Some(capture) = &self.shadow_capture {
+            album.set_shadow_capture(capture.clone(), Arc::clone(&self.library_type));
+        }
+        album
     }
 
     async fn fetch_folders(&self) -> anyhow::Result<Vec<super::cloudkit::Record>> {
@@ -393,6 +405,7 @@ impl PhotoLibrary {
     /// Test-only constructor that bypasses the indexing check.
     pub(crate) fn new_stub(session: Box<dyn PhotosSession>) -> Self {
         Self {
+            shadow_capture: None,
             service_endpoint: Arc::from("https://stub.example.com"),
             params: Arc::new(HashMap::new()),
             session,
@@ -407,6 +420,7 @@ impl PhotoLibrary {
     /// exercise selector matching.
     pub(crate) fn new_stub_with_zone(session: Box<dyn PhotosSession>, zone_name: &str) -> Self {
         Self {
+            shadow_capture: None,
             service_endpoint: Arc::from("https://stub.example.com"),
             params: Arc::new(HashMap::new()),
             session,
@@ -537,6 +551,7 @@ mod tests {
     /// Build a `PhotoLibrary` directly (bypassing `new()` which requires a live session).
     fn make_library(zone_id: Value) -> PhotoLibrary {
         PhotoLibrary {
+            shadow_capture: None,
             service_endpoint: Arc::from("https://example.com"),
             params: Arc::new(HashMap::new()),
             session: Box::new(StubSession),
@@ -1055,6 +1070,7 @@ mod tests {
 
     fn make_library_with_session(session: Box<dyn PhotosSession>) -> PhotoLibrary {
         PhotoLibrary {
+            shadow_capture: None,
             service_endpoint: Arc::from("https://example.com"),
             params: Arc::new(HashMap::new()),
             session,

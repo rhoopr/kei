@@ -1974,3 +1974,201 @@ async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycl
         assert_eq!(std::fs::read(&media).unwrap(), bytes);
     }
 }
+
+#[tokio::test]
+async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_restart() {
+    let config = make_run_cycle_config();
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-provider"}}))
+            .unwrap(),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.db");
+    let media = dir.path().join("historical.jpg");
+    tokio::fs::write(&media, b"historical media remains intact")
+        .await
+        .unwrap();
+    {
+        let db = state::SqliteStateDb::open_owned(&database, &owner)
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "saved")
+            .await
+            .unwrap();
+        db.set_metadata(
+            ENUM_CONFIG_HASH_KEY,
+            &download::compute_config_hash(&config),
+        )
+        .await
+        .unwrap();
+        db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("asset-HISTORY").build())
+            .await
+            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "asset-HISTORY",
+            "original",
+            &media,
+            "historical-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-HISTORY", "master-HISTORY")
+            .await
+            .unwrap();
+        db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("DEBT").build())
+            .await
+            .unwrap();
+    }
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    for phase in 0..4 {
+        let inner = Arc::new(
+            state::SqliteStateDb::open_owned(&database, &owner)
+                .await
+                .unwrap(),
+        );
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        if phase == 0 {
+            inner.acquire_lock("inject shadow receipt failure").unwrap().execute_batch(
+                "CREATE TRIGGER shadow_cycle_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'synthetic capture fault'); END").unwrap();
+        } else if phase == 1 {
+            inner
+                .acquire_lock("remove injected capture fault")
+                .unwrap()
+                .execute_batch("DROP TRIGGER shadow_cycle_fault")
+                .unwrap();
+        }
+        let capture =
+            crate::icloud::photos::inbox::ShadowCapture::new(inner.clone(), owner.clone(), "com");
+        let mut album = make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(ValidatedPageCycleSession {
+                phase,
+                requests: requests.clone(),
+            }),
+        );
+        album.set_shadow_capture(capture, Arc::from("private"));
+        let library =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        if phase == 1 {
+            inner
+                .set_metadata(&state::unresolved_identity_key("PrimarySync"), "1")
+                .await
+                .unwrap();
+            let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
+            crate::sync_loop::precheck::include_pending_local_work(
+                &mut precheck,
+                inner.as_ref(),
+                &config.metadata,
+                std::slice::from_ref(&library),
+            )
+            .await;
+            assert!(precheck.should_sync_zone("PrimarySync"));
+        }
+        let builder = make_run_cycle_download_config_builder(dir.path(), db.clone());
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await;
+        if phase == 0 {
+            let error =
+                result.expect_err("capture refusal must propagate, not run a rank fallback");
+            assert!(format!("{error:#}").contains("synthetic capture fault"));
+            assert_eq!(*requests.lock().unwrap(), ["saved"]);
+            let summary = inner.get_summary().await.unwrap();
+            assert_eq!(summary.downloaded, 1);
+            assert_eq!(summary.pending + summary.failed, 1);
+            assert_eq!(summary.source_deleted, 0);
+            assert_eq!(
+                inner
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("saved")
+            );
+            assert_eq!(
+                tokio::fs::read(&media).await.unwrap(),
+                b"historical media remains intact"
+            );
+            let conn = inner.acquire_lock("no partial capture or receipt").unwrap();
+            for table in [
+                "provider_shadow_pages",
+                "provider_shadow_records",
+                "provider_shadow_receipts",
+            ] {
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        &format!("SELECT count(*) FROM {table}"),
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+            continue;
+        }
+        let result = result.unwrap();
+        let summary = inner.get_summary().await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&media).await.unwrap(),
+            b"historical media remains intact"
+        );
+        assert_eq!(summary.downloaded, 1, "phase {phase}");
+        assert_eq!(result.stats.downloaded, 0, "phase {phase}");
+        let cursor = inner
+            .get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .unwrap();
+        if phase < 2 {
+            assert_eq!(cursor, "saved", "phase {phase}");
+            assert_eq!(
+                summary.pending + summary.failed,
+                1,
+                "phase {phase}: {summary:?}"
+            );
+            assert_eq!(summary.source_deleted, 0);
+            assert!(
+                !result.can_advance_database_checkpoint(),
+                "phase {phase}: {result:?}"
+            );
+        } else {
+            assert_eq!(cursor, "recovered", "phase {phase}");
+            assert_eq!(summary.pending, 0);
+            assert_eq!(summary.source_deleted, 1);
+            assert!(result.db_sync_token_advance_safe, "phase {phase}");
+        }
+        if phase == 3 {
+            assert!(result.stats.full_enumeration_reason.is_none());
+            assert_eq!(*requests.lock().unwrap(), ["recovered"]);
+            let conn = inner
+                .acquire_lock("capture does not clear historical debt")
+                .unwrap();
+            let receipt: String = conn.query_row("SELECT p.successor FROM provider_shadow_receipts r JOIN provider_shadow_pages p ON p.id=r.page_id",[],|r|r.get(0)).unwrap();
+            assert_eq!(receipt, "recovered");
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_shadow_pages",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+                3
+            );
+        }
+    }
+}

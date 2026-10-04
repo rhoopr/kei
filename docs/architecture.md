@@ -101,6 +101,7 @@ changing behavior.
 | Account namespace | `src/account.rs` | Hashes exact configured login and provider realm without alias inference. |
 | Account database boundary | `src/state/db/account.rs`, `src/commands/migrate_state.rs` | Validates an independent owner before state consumption, creates authenticated state, and explicitly adopts a preserved legacy snapshot. |
 | SQLite facade and connection lifecycle | `src/state/mod.rs`, `src/state/db.rs` | Preserves state entry points, opens connections, and dispatches blocking SQLite work. Child owners retain their transaction boundaries. |
+| Observed provider pages | `src/icloud/photos/inbox.rs`, `src/state/db/provider_inbox.rs` | Binds validated incremental observations to the account, retains source identities and original bytes atomically with a shadow receipt, and applies bounded backpressure. It does not authorize provider checkpoints. |
 | SQLite schema | `src/state/schema.rs` | Owns schema versions and migrations. |
 | State-store contracts | `src/state/db/contracts.rs` | Defines store roles and records exchanged with callers. |
 | Asset state transitions | `src/state/db/assets.rs` | Owns asset lifecycle, download finalization, retry eligibility, and provider source-state transitions. |
@@ -222,6 +223,59 @@ companions remain. Conflicting scoped provenance is rejected, not rewritten.
 Legacy session and encrypted credential files are preserved and ignored;
 keyring identity remains unchanged. See [account migration](account-state-migration.md)
 for operator steps and compatibility limits.
+
+### Observed incremental shadow capture
+
+After opening an authenticated, account-owned database, sync attaches capture to
+its Photos service and libraries. Normal incremental `changes/zone` responses
+are bounded and validated before `DeltaRecordBuffer` pairing or selection. The
+adapter rejects ambiguous JSON keys and unusable source identity or scope for
+the whole page. Original response bytes retain unknown fields, tombstones and
+unresolved relationships, including numeric lexemes that a typed JSON re-encode
+could alter. Cookies and authentication headers are not captured; resource URLs
+remain transient payload, never durable identity.
+
+Schema 29 adds `provider_shadow_pages`, ordinal source identities in
+`provider_shadow_records`, and a per-scope last-observed pointer in
+`provider_shadow_receipts`. An immediate SQLite transaction rechecks the
+independent account owner and commits all three together. Provenance includes the
+account namespace and authenticated provider fingerprint, versioned realm,
+CloudKit container and environment, private/shared database, validated zone and
+returned owner when present, request cursor and successor. Unknown zone metadata
+is retained in the payload without changing the scope key. Exact page replay is
+idempotent; a changed payload remains a separate observation.
+
+Original decoded response bytes are limited to 16 MiB per page. The inbox allows
+512 MiB of charged payload and provenance bytes, including source identities.
+This is a logical budget, not a physical SQLite/WAL file quota. An oversized
+page, full inbox, failed write or unusable identity stops that page before
+emission or successor acceptance. Such a refusal propagates through orchestration;
+an uncaptured rank inventory cannot replace it and advance the checkpoint.
+Existing typed invalid-token fallback and authentication handling remain intact.
+Exact already-captured replay remains possible at capacity. No observations are automatically pruned. SQLite WAL `NORMAL`
+remains unchanged; a successful commit does not promise that every acknowledged
+observation survives power loss. Network filesystems are not newly qualified.
+
+A shadow receipt is only the last observed page, and replay can move it back. It
+is not a coverage frontier, materialization receipt or verified filesystem
+progress. Existing `CheckpointEvidence`, sparse and legacy generation proofs,
+recovery debt and filesystem guards retain checkpoint authority. Capturing a
+tombstone cannot authorize local media deletion. Existing download and metadata
+queues still consume the current stream; they do not replay this inbox yet.
+
+Capture covers only incremental pages observed by existing sync in selected
+scopes. Rank inventories, bootstrap, lookup and deletion-validation scans are
+not represented as complete zone capture or historical completeness. Rank EOF
+plus a delta bridge is not an atomic snapshot or proof of absence. New future
+observations cannot retire old expired-epoch debt. Transactional projection,
+capture-owned cursors, durable catalog selection and separate progress remain
+later stages. Historical-version retention, unrecoverable-debt acknowledgment,
+epoch recovery and compaction still require explicit policy and support proof.
+The additive migration preserves existing rows and uses the migration owner's
+savepoint. Re-entry validates the table columns, primary keys, replay key and
+SQLite-assigned page identity required by source and receipt links. A conflicting
+unknown table fails without partial schema or version changes.
+Older binaries supporting only schema 28 must refuse this database.
 
 ### Sync and provider checkpoints
 

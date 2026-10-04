@@ -187,10 +187,10 @@ or rendition evidence becomes eligible immediately. Status reports unresolved
 identities and deferred retries separately from failed repair attempts.
 Deferral keeps the capture revision and checkpoint pending; it is not recovery.
 
-This state uses schema 28. Even `kei status` can migrate the database. Stop
+This state uses schema 29. Even `kei status` can migrate the database. Stop
 all workers and take a matched cold backup of the complete configuration/state
 directory and media/sidecars before upgrading. Binaries that support only
-schema 27 or earlier cannot open the upgraded database. Rollback requires
+schema 28 or earlier cannot open the upgraded database. Rollback requires
 the matched old state and media with the retained old binary; switching only
 the binary or restoring only the database is unsafe. Do not reset state or
 lower its schema version to bypass this check. See the

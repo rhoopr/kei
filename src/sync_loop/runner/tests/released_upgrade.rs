@@ -188,7 +188,7 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            28
+            29
         );
         let (status, local_path): (String, Option<String>) = conn.query_row(
             "SELECT status,local_path FROM assets WHERE library='PrimarySync' AND id='asset-recovered' AND version_size='original'",
@@ -345,7 +345,7 @@ async fn released_v0240_metadata_policy_selection_restart_preserves_siblings() {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            28
+            29
         );
         assert_eq!(immutable_rows(&conn), before, "cycle {cycle}");
         for (library, id, filename, rating, _, deleted) in fixtures {

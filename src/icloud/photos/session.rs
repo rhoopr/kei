@@ -49,6 +49,24 @@ pub trait PhotosSession: Send + Sync {
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value>;
 
+    /// Bounded original changes response. Value-based test/session adapters can
+    /// use the default; live reqwest and SharedSession preserve original bytes.
+    async fn post_changes_body(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<u8>> {
+        let body = serde_json::to_vec(&self.post(url, body, headers).await?)?;
+        anyhow::ensure!(
+            body.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
+            super::error::ShadowPageError::from(anyhow::anyhow!(
+                "Provider changes page exceeded the capture byte limit"
+            ))
+        );
+        Ok(body)
+    }
+
     /// Clone this session into a new boxed trait object.
     fn clone_box(&self) -> Box<dyn PhotosSession>;
 }
@@ -63,81 +81,130 @@ impl PhotosSession for reqwest::Client {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        let (response, _dump) = post_response(self, url, body, headers).await?;
+        // Keep reqwest's decode error type and the existing retry classification
+        // for ordinary JSON requests such as bounded resource lookups.
+        let json: Value = response.json().await?;
         #[cfg(debug_assertions)]
-        let dump = std::env::var_os("KEI_REQUEST_DUMP_DIR")
-            .filter(|dir| !dir.is_empty())
-            .map(|dir| {
-                static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-                (
-                    std::path::PathBuf::from(dir),
-                    NEXT_ID.fetch_add(1, Ordering::Relaxed),
-                )
-            });
-        #[cfg(debug_assertions)]
-        if let Some((dir, id)) = &dump {
-            dump_body(dir, *id, "req", &body).await;
-        }
-        let mut builder = self.post(url).body(body);
-        for &(k, v) in headers {
-            builder = builder.header(k, v);
-        }
-        let resp = builder.send().await?;
-        let status = resp.status();
-
-        if status.is_client_error() || status.is_server_error() {
-            let url = resp.url().to_string();
-            let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
-            let resp_body = read_bounded_error_body(resp, &url).await;
-            #[cfg(debug_assertions)]
-            if let Some((dir, id)) = &dump {
-                dump_body(dir, *id, "res", &resp_body).await;
-            }
-            if !resp_body.is_empty() {
-                // 421 bodies are the most diagnostic signal for distinguishing
-                // ADP-class from session-class misdirected requests (e.g. the
-                // "Missing X-APPLE-WEBAUTH-USER cookie" string from issue
-                // #199). Surface at WARN so reporters don't need RUST_LOG=debug.
-                if status.as_u16() == 421 {
-                    tracing::warn!(
-                        status = %status,
-                        url = %url,
-                        body = %resp_body,
-                        "CloudKit 421 Misdirected Request response body"
-                    );
-                } else {
-                    tracing::debug!(
-                        status = %status,
-                        url = %url,
-                        body = %resp_body,
-                        "CloudKit error response body"
-                    );
-                }
-            }
-            let preserved = if resp_body.is_empty() {
-                None
-            } else {
-                Some(truncate_body(&resp_body))
-            };
-            return Err(HttpStatusError {
-                status: status.as_u16(),
-                url,
-                retry_after,
-                body: preserved,
-            }
-            .into());
-        }
-
-        let json: Value = resp.json().await?;
-        #[cfg(debug_assertions)]
-        if let Some((dir, id)) = &dump {
+        if let Some((dir, id)) = &_dump {
             dump_body(dir, *id, "res", &json.to_string()).await;
         }
         Ok(json)
     }
 
+    async fn post_changes_body(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<u8>> {
+        let (mut response, _dump) = post_response(self, url, body, headers).await?;
+        let limit = super::inbox::MAX_CHANGES_PAGE_BYTES;
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| size <= limit as u64),
+            super::error::ShadowPageError::from(anyhow::anyhow!(
+                "Provider changes page exceeded the capture byte limit"
+            ))
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                chunk.len() <= limit.saturating_sub(bytes.len()),
+                super::error::ShadowPageError::from(anyhow::anyhow!(
+                    "Provider changes page exceeded the capture byte limit"
+                ))
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        #[cfg(debug_assertions)]
+        if let Some((dir, id)) = &_dump {
+            dump_body(dir, *id, "res", &String::from_utf8_lossy(&bytes)).await;
+        }
+        Ok(bytes)
+    }
+
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
     }
+}
+
+type BodyDump = Option<(std::path::PathBuf, usize)>;
+
+async fn post_response(
+    client: &reqwest::Client,
+    url: &str,
+    body: String,
+    headers: &[(&str, &str)],
+) -> anyhow::Result<(reqwest::Response, BodyDump)> {
+    #[cfg(debug_assertions)]
+    let dump = std::env::var_os("KEI_REQUEST_DUMP_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+            (
+                std::path::PathBuf::from(dir),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            )
+        });
+    #[cfg(debug_assertions)]
+    if let Some((dir, id)) = &dump {
+        dump_body(dir, *id, "req", &body).await;
+    }
+    let mut builder = client.post(url).body(body);
+    for &(k, v) in headers {
+        builder = builder.header(k, v);
+    }
+    let resp = builder.send().await?;
+    let status = resp.status();
+
+    if status.is_client_error() || status.is_server_error() {
+        let url = resp.url().to_string();
+        let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
+        let resp_body = read_bounded_error_body(resp, &url).await;
+        #[cfg(debug_assertions)]
+        if let Some((dir, id)) = &dump {
+            dump_body(dir, *id, "res", &resp_body).await;
+        }
+        if !resp_body.is_empty() {
+            // 421 bodies are the most diagnostic signal for distinguishing
+            // ADP-class from session-class misdirected requests (e.g. the
+            // "Missing X-APPLE-WEBAUTH-USER cookie" string from issue
+            // #199). Surface at WARN so reporters don't need RUST_LOG=debug.
+            if status.as_u16() == 421 {
+                tracing::warn!(
+                    status = %status,
+                    url = %url,
+                    body = %resp_body,
+                    "CloudKit 421 Misdirected Request response body"
+                );
+            } else {
+                tracing::debug!(
+                    status = %status,
+                    url = %url,
+                    body = %resp_body,
+                    "CloudKit error response body"
+                );
+            }
+        }
+        let preserved = if resp_body.is_empty() {
+            None
+        } else {
+            Some(truncate_body(&resp_body))
+        };
+        return Err(HttpStatusError {
+            status: status.as_u16(),
+            url,
+            retry_after,
+            body: preserved,
+        }
+        .into());
+    }
+
+    #[cfg(not(debug_assertions))]
+    let dump = None;
+    Ok((resp, dump))
 }
 
 // SharedSession delegates to the inner Session's http_client(). The read lock
@@ -153,6 +220,16 @@ impl PhotosSession for crate::auth::SharedSession {
     ) -> anyhow::Result<Value> {
         let client = self.read().await.http_client().clone();
         PhotosSession::post(&client, url, body, headers).await
+    }
+
+    async fn post_changes_body(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<u8>> {
+        let client = self.read().await.http_client().clone();
+        PhotosSession::post_changes_body(&client, url, body, headers).await
     }
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -458,6 +535,30 @@ pub async fn retry_post(
     .await
 }
 
+pub(crate) async fn retry_post_changes_body(
+    session: &dyn PhotosSession,
+    url: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+    retry_config: &RetryConfig,
+) -> anyhow::Result<Vec<u8>> {
+    retry::retry_with_backoff(retry_config, classify_api_error, || async {
+        let bytes = session
+            .post_changes_body(url, body.to_owned(), headers)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
+            super::error::ShadowPageError::from(anyhow::anyhow!(
+                "Provider changes page exceeded the capture byte limit"
+            ))
+        );
+        let value = super::changes_json::parse(&bytes)?;
+        check_cloudkit_errors(value)?;
+        Ok(bytes)
+    })
+    .await
+}
+
 /// Retry transport and HTTP failures while leaving record-level CloudKit
 /// errors in the response for a batch-aware caller to classify. This is used
 /// by `/records/lookup`, where one explicit `UNKNOWN_ITEM` is a successful
@@ -540,6 +641,111 @@ pub fn check_changes_zone_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn normal_photos_transport_retains_decode_error_retry_classification() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/records/lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{"))
+            .mount(&server)
+            .await;
+        let error = PhotosSession::post(
+            &reqwest::Client::new(),
+            &format!("{}/records/lookup", server.uri()),
+            "{}".into(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<reqwest::Error>());
+        assert!(matches!(classify_api_error(&error), RetryAction::Retry));
+    }
+
+    #[tokio::test]
+    async fn raw_changes_transport_preserves_bytes_and_bounds_content_length() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let body = br#" { "number":9007199254740993.0, "unknown":[true,null] } "#;
+        Mock::given(method("POST"))
+            .and(path("/original"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_slice()))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        assert_eq!(
+            PhotosSession::post_changes_body(
+                &client,
+                &format!("{}/original", server.uri()),
+                "{}".into(),
+                &[]
+            )
+            .await
+            .unwrap(),
+            body
+        );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let oversized = super::super::inbox::MAX_CHANGES_PAGE_BYTES + 1;
+        let response = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {oversized}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let error = PhotosSession::post_changes_body(
+            &client,
+            &format!("http://{address}"),
+            "{}".into(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        response.await.unwrap();
+        assert!(error.to_string().contains("capture byte limit"));
+    }
+
+    #[tokio::test]
+    async fn raw_changes_transport_bounds_chunked_response_without_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..17 {
+                if socket.write_all(b"100000\r\n").await.is_err()
+                    || socket.write_all(&chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        let error = PhotosSession::post_changes_body(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "{}".into(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("capture byte limit"));
+        server.await.unwrap();
+    }
 
     #[test]
     fn provider_session_error_classification_uses_typed_status_not_body() {

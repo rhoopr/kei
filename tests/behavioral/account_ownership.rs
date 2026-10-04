@@ -390,3 +390,279 @@ fn account_ownership_exact_alias_spellings_remain_separate_with_same_provider_pi
         assert_eq!(state(&b.path), b_state);
     }
 }
+
+#[derive(Clone)]
+struct UnknownChanges;
+impl Respond for UnknownChanges {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if request.url.path().ends_with("/changes/zone") {
+            ResponseTemplate::new(200).set_body_json(json!({"zones":[{
+                "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                "syncToken":"A-cursor","moreComing":false,
+                "records":[{"recordName":"future-source","recordType":"FutureRecord",
+                    "futureEnvelope":{"relationship":{"recordName":"unresolved-peer"}}}]
+            }]}))
+        } else {
+            OfflinePhotos.respond(request)
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadow_actual_sync_captures_unknown_source_after_library_resolution() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(UnknownChanges)
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path().ends_with("/changes/zone")),
+        "production sync must observe an incremental page"
+    );
+    let conn =
+        Connection::open_with_flags(&account.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    // The startup path, not a manually attached test album, must capture the
+    // unknown record before the existing stream drops its lossy projection.
+    let records: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM provider_shadow_records WHERE record_name='future-source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        records, 1,
+        "resolved library clones must carry capture composition"
+    );
+    let body: Vec<u8> = conn
+        .query_row("SELECT body FROM provider_shadow_pages", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("unresolved-peer"));
+    assert_eq!(
+        std::fs::read(&account.media).unwrap(),
+        b"known media belonging only to account A"
+    );
+}
+
+#[derive(Clone)]
+struct ShadowHoldProvider {
+    failure: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    kind: &'static str,
+}
+impl Respond for ShadowHoldProvider {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        if request.url.path().ends_with("/changes/zone") {
+            let quiet = body.pointer("/zones/0/syncToken").and_then(Value::as_str)
+                == Some("delta-successor");
+            let mut response = json!({"zones":[{
+                "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                "syncToken":"delta-successor","moreComing":false,
+                "records":if quiet { json!([]) } else { json!([{
+                    "recordName":"future-source","recordType":"FutureRecord",
+                    "futureEnvelope":{"relationship":{"recordName":"unresolved-peer"}}
+                }]) }
+            }]});
+            if self.failure.load(std::sync::atomic::Ordering::SeqCst) && !quiet {
+                if self.kind == "identity" {
+                    *response
+                        .pointer_mut("/zones/0/records/0/recordName")
+                        .expect("known source fixture") = json!("");
+                } else if self.kind == "json" {
+                    return ResponseTemplate::new(200).set_body_string(
+                        response.to_string().replace(
+                            "\"recordName\":\"future-source\"",
+                            "\"recordName\":\"private-other\",\"recordName\":\"future-source\"",
+                        ),
+                    );
+                }
+            }
+            ResponseTemplate::new(200).set_body_json(response)
+        } else if request.url.path().ends_with("/records/query")
+            && body
+                .pointer("/query/recordType")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("CPLAsset"))
+        {
+            // A valid rank EOF/new anchor is deliberately available. It cannot
+            // stand in for an incremental observation that was refused.
+            ResponseTemplate::new(200).set_body_json(json!({
+                "records":[],"syncToken":"inventory-after-uncaptured-page"
+            }))
+        } else {
+            OfflinePhotos.respond(request)
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quietly() {
+    for (kind, expected) in [
+        ("write", "synthetic CLI receipt failure"),
+        ("capacity", "inbox is full"),
+        ("identity", "Missing provider capture source identity"),
+        ("json", "Invalid or ambiguous provider changes JSON"),
+    ] {
+        let failure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ShadowHoldProvider {
+                failure: failure.clone(),
+                kind,
+            })
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+        {
+            let conn = Connection::open(&account.path).unwrap();
+            // Remove fixture-only debt before establishing initial state so it
+            // cannot mask an otherwise eligible rank checkpoint.
+            conn.execute_batch("DELETE FROM assets WHERE id='retry'; DELETE FROM metadata WHERE key LIKE 'pending_sync_token:%';").unwrap();
+            if kind == "write" {
+                conn.execute_batch("CREATE TRIGGER shadow_cli_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'synthetic CLI receipt failure'); END;").unwrap();
+            }
+        }
+        let original_charge = if kind == "capacity" {
+            // Start from a real captured page with usable provenance. Inject
+            // logical charge exhaustion without a 512 MiB physical fixture.
+            success(&command(root, &account, &["sync", "--no-progress-bar"]));
+            let conn = Connection::open(&account.path).unwrap();
+            let charge: i64 = conn
+                .query_row(
+                    "SELECT charged_bytes FROM provider_shadow_pages",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE provider_shadow_pages SET charged_bytes=536870912",
+                [],
+            )
+            .unwrap();
+            Some(charge)
+        } else {
+            None
+        };
+        let before = state(&account.path);
+        let initial_pages = i64::from(kind == "capacity");
+        for _ in 0..2 {
+            let out = command(root, &account, &["sync", "--no-progress-bar"]);
+            let diagnostics = String::from_utf8_lossy(&out.stderr);
+            assert!(diagnostics.contains(expected), "{kind}: {diagnostics}");
+            assert!(
+                !diagnostics.contains("falling back to full enumeration"),
+                "{kind}: {diagnostics}"
+            );
+            assert!(!diagnostics.contains("private-other"));
+            assert_eq!(
+                state(&account.path),
+                before,
+                "{kind}: retained owned history/checkpoint"
+            );
+            let conn = Connection::open(&account.path).unwrap();
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_shadow_pages",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                initial_pages,
+                "{kind}"
+            );
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_shadow_records",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                initial_pages,
+                "{kind}"
+            );
+            assert_eq!(
+                std::fs::read(&account.media).unwrap(),
+                b"known media belonging only to account A"
+            );
+        }
+        {
+            let conn = Connection::open(&account.path).unwrap();
+            if kind == "write" {
+                conn.execute_batch("DROP TRIGGER shadow_cli_fault").unwrap();
+            } else if kind == "capacity" {
+                conn.execute(
+                    "UPDATE provider_shadow_pages SET charged_bytes=?1",
+                    [original_charge.unwrap()],
+                )
+                .unwrap();
+            }
+        }
+        failure.store(false, std::sync::atomic::Ordering::SeqCst);
+        success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        for _ in 0..2 {
+            // Actual CLI processes reopen independently; the second empty
+            // page replay must not grow observations or repeat publication.
+            success(&command(root, &account, &["sync", "--no-progress-bar"]));
+            let conn = Connection::open(&account.path).unwrap();
+            assert_eq!(
+                conn.query_row::<String, _, _>(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                "delta-successor",
+                "{kind}"
+            );
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_shadow_pages",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                2,
+                "{kind}"
+            );
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_shadow_records WHERE record_name='future-source'",[],|row|row.get(0)).unwrap(), 1, "{kind}");
+            assert_eq!(
+                rows(&account.path, "SELECT * FROM asset_metadata_paths"),
+                before[3]
+            );
+            assert_eq!(
+                std::fs::read(&account.media).unwrap(),
+                b"known media belonging only to account A"
+            );
+            assert_eq!(
+                std::fs::read_dir(account.media.parent().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+        for request in server.received_requests().await.unwrap() {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(
+                !(request.url.path().ends_with("/records/query")
+                    && body["query"]["recordType"]
+                        .as_str()
+                        .is_some_and(|kind| kind.starts_with("CPLAsset"))),
+                "{kind}: rank fallback must never run"
+            );
+        }
+    }
+}
