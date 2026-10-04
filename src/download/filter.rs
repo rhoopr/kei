@@ -46,4 +46,6 @@ pub(crate) use metadata::AssetGroupings;
 pub(super) use metadata::MetadataPayload;
 pub(super) use tasks::{DownloadTask, filter_asset_to_tasks, filter_asset_to_tasks_with_primary};
 pub(super) use versions::{VersionsView, extract_skip_candidates};
-pub(crate) use versions::{metadata_capture, metadata_for_selected_version};
+pub(crate) use versions::{
+    metadata_capture, metadata_for_selected_version, provider_version_for_selected,
+};

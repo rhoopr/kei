@@ -903,3 +903,20 @@ data paths. Cargo uses `--offline`, so dependencies must already be cached.
 The qualifier fails if user/network namespaces are unavailable; it does not
 silently fall back to a externally network-enabled run. The cycle test uses a strict wiremock bind
 so unavailable loopback fails qualification instead of skipping the proof.
+
+## Bounded incremental URL refresh
+
+Synthetic Photos-session and loopback-CDN fixtures reproduce tokenless refresh
+scans and persistent HTTP 410 cancellation of a delayed healthy peer on the
+unchanged implementation. The fixed production collecting and explicit-pass
+paths use bounded child/master lookup and preserve exact selected task evidence.
+File-backed SQLite tests seed pending work and unrelated media, reopen after
+refusal, repair the provider fixture, download exact bytes, and check an unchanged
+tail without repeated completed provider work. Negative controls change master,
+child, zone/owner, rendition, checksum, size and lookup presence. RAW/JPEG
+preference swaps are exercised in both aged preflight and expiry recovery,
+with the original provider rendition pinned independently of logical task keys. Authentication
+and stalled-lookup cancellation retain debt, and cancellation during an active
+transfer accounts for both in-flight and queued tasks after reopen. These are
+synthetic runtime proofs; they do not validate reporter data or resolve sparse
+Shared Library ownership.

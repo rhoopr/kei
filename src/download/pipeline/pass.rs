@@ -22,6 +22,9 @@ use super::task::{
 
 /// Configuration for a download pass.
 pub(in crate::download) struct PassConfig<'a> {
+    pub(in crate::download) prior_auth_errors: usize,
+    pub(in crate::download) url_obtained_at:
+        rustc_hash::FxHashMap<crate::download::RetryTaskKey, std::time::Instant>,
     pub(in crate::download) client: &'a Client,
     pub(in crate::download) retry_config: &'a RetryConfig,
     pub(in crate::download) metadata: MetadataFlags,
@@ -69,7 +72,8 @@ pub(in crate::download) struct PassResult {
     pub(in crate::download) bytes_downloaded: u64,
     pub(in crate::download) disk_bytes_written: u64,
     pub(in crate::download) rate_limit_observations: usize,
-    pub(in crate::download) url_expired_abort: bool,
+    pub(in crate::download) url_expired: bool,
+    pub(in crate::download) expired_tasks: Vec<DownloadTask>,
     /// Photos / videos / recap observed during this pass, mirroring
     /// `StreamingResult`. Folded into the cycle's `SyncStats` at the
     /// caller. Defaults are zero / empty so the existing cleanup-pass
@@ -108,6 +112,8 @@ pub(in crate::download) async fn run_download_pass(
     let bandwidth_limiter = config.bandwidth_limiter.clone();
     let library: Arc<str> = Arc::clone(&config.library);
     let mode = config.reporting.personality_mode;
+    let url_obtained_at = &config.url_obtained_at;
+    let planned_tasks = tasks.clone();
 
     let mut download_stream = stream::iter(tasks)
         .take_while(|_| std::future::ready(!pass_shutdown.is_cancelled()))
@@ -119,6 +125,14 @@ pub(in crate::download) async fn run_download_pass(
             let bandwidth_limiter = bandwidth_limiter.clone();
             let shutdown_token = pass_shutdown.clone();
             async move {
+                if let Some(obtained_at) =
+                    url_obtained_at.get(&crate::download::RetryTaskKey::from(&task))
+                {
+                    tracing::debug!(target: "kei::download::pipeline",
+                        refreshed_url_observed_age_secs = obtained_at.elapsed().as_secs_f64(),
+                        "Dispatching task with a refreshed URL; provider expiry is unknown"
+                    );
+                }
                 let result = Box::pin(download_single_task(
                     &client,
                     &task,
@@ -151,7 +165,9 @@ pub(in crate::download) async fn run_download_pass(
     let mut videos_downloaded = 0usize;
     let mut recap = crate::download::recap::RunRecap::default();
     let mut state_write_circuit_open = false;
-    let mut url_expired_abort = false;
+    let mut url_expired = false;
+    let mut expired_tasks = Vec::new();
+    let mut failure_state_writes = 0usize;
     // Cleanup pass doesn't carry an album label (it's a flat retry list);
     // recap.observe gets the library name so a recovered asset still
     // counts toward the per-album newest tracker rather than vanishing.
@@ -233,26 +249,31 @@ pub(in crate::download) async fn run_download_pass(
                 match classify_download_task_error(e) {
                     DownloadTaskErrorClass::Interrupted => {
                         log_interrupted_download(&pb, &task, e);
-                        pb.inc(1);
-                        continue;
+                        // Interrupted transfers remain explicit retry debt.
+                        // The common failure path persists them before returning.
                     }
                     DownloadTaskErrorClass::SessionExpired => {
                         auth_errors += 1;
+                        if auth_errors + config.prior_auth_errors
+                            >= super::task::AUTH_ERROR_THRESHOLD
+                        {
+                            pass_shutdown.cancel();
+                        }
                         pb.suspend(|| {
                             tracing::warn!(target: "kei::download::pipeline", path = %task.download_path.display(), error = %e, "Auth error");
                         });
                     }
                     DownloadTaskErrorClass::ExpiredUrl => {
-                        url_expired_abort = true;
+                        url_expired = true;
+                        expired_tasks.push(task.clone());
                         pb.suspend(|| {
                             tracing::warn!(target: "kei::download::pipeline",
                                 asset_id = %task.asset_id,
                                 path = %task.download_path.display(),
                                 error = %e,
-                                "Download URL expired; aborting current URL batch"
+                                "Download URL expired; retaining task for bounded refresh"
                             );
                         });
-                        pass_shutdown.cancel();
                     }
                     DownloadTaskErrorClass::Other => {
                         pb.suspend(|| {
@@ -264,6 +285,8 @@ pub(in crate::download) async fn run_download_pass(
                     && let Err(e) =
                         finalize_failed(db.as_ref(), &task.library, &task, &e.to_string()).await
                 {
+                    failure_state_writes += 1;
+                    pass_shutdown.cancel();
                     tracing::warn!(target: "kei::download::pipeline",
                         asset_id = %task.asset_id,
                         error = %e,
@@ -274,6 +297,32 @@ pub(in crate::download) async fn run_download_pass(
             }
         }
         pb.inc(1);
+    }
+
+    // Cancellation can leave queued tasks unpolled. Keep every unfinished
+    // dispatch in the returned debt and persist its failure before checkpointing.
+    let completed: rustc_hash::FxHashSet<_> = downloaded_tasks
+        .iter()
+        .chain(&failed)
+        .map(crate::download::RetryTaskKey::from)
+        .collect();
+    for task in planned_tasks {
+        if completed.contains(&crate::download::RetryTaskKey::from(&task)) {
+            continue;
+        }
+        if let Some(db) = &state_db
+            && finalize_failed(
+                db.as_ref(),
+                &task.library,
+                &task,
+                "Download dispatch interrupted",
+            )
+            .await
+            .is_err()
+        {
+            failure_state_writes += 1;
+        }
+        failed.push(task);
     }
 
     // Retry any state writes that failed during the pass
@@ -294,11 +343,12 @@ pub(in crate::download) async fn run_download_pass(
         exif_failures,
         failed,
         auth_errors,
-        state_write_failures,
+        state_write_failures: state_write_failures + failure_state_writes,
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
         rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
-        url_expired_abort,
+        url_expired,
+        expired_tasks,
         photos_downloaded,
         videos_downloaded,
         recap,

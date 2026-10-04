@@ -280,6 +280,8 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
     let winner_store: Arc<dyn DownloadStore> = winner_db.clone();
     let winner_result = run_download_pass(
         PassConfig {
+            prior_auth_errors: 0,
+            url_obtained_at: Default::default(),
             client: &client,
             retry_config: &retry,
             metadata,
@@ -304,6 +306,8 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
     let loser_store: Arc<dyn DownloadStore> = loser_db.clone();
     let loser_result = run_download_pass(
         PassConfig {
+            prior_auth_errors: 0,
+            url_obtained_at: Default::default(),
             client: &client,
             retry_config: &retry,
             metadata,
@@ -441,6 +445,8 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
             .collect();
         let recovered = run_download_pass(
             PassConfig {
+                prior_auth_errors: 0,
+                url_obtained_at: Default::default(),
                 client: &client,
                 retry_config: &config.retry,
                 metadata: MetadataFlags::default(),

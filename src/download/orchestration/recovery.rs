@@ -5,10 +5,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use reqwest::Client;
-use rustc_hash::FxHashSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::download::filter::DownloadTask;
 use crate::download::metadata_rewrite::CaptureTimestampRepair;
 use crate::download::pipeline::{
     AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, run_download_pass,
@@ -22,7 +20,7 @@ use super::models::{
     SyncResult, SyncStats, merge_download_outcomes,
 };
 use super::url_refresh::{
-    RetryTaskKey, build_incremental_expired_url_retry_tasks, merge_expired_url_retry_result,
+    build_incremental_expired_url_retry_tasks, merge_expired_url_retry_result,
 };
 
 async fn run_targeted_recovery_pass(
@@ -43,7 +41,6 @@ async fn run_targeted_recovery_pass(
     let PendingRetryPlan {
         tasks,
         retry_sources,
-        pass_configs,
         unmatched_targets,
         requested,
         identity_incomplete,
@@ -99,6 +96,8 @@ async fn run_targeted_recovery_pass(
     }
 
     let pass_config = PassConfig {
+        prior_auth_errors: 0,
+        url_obtained_at: Default::default(),
         client: download_client,
         retry_config: &config.retry,
         metadata: MetadataFlags::from(config.as_ref()),
@@ -115,49 +114,34 @@ async fn run_targeted_recovery_pass(
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
     };
-    let planned_tasks = tasks.clone();
+    let mut provider_auth_errors = 0usize;
     let mut pass_result = run_download_pass(pass_config, tasks).await;
-    if pass_result.url_expired_abort
+    if pass_result.url_expired
         && pass_result.auth_errors < AUTH_ERROR_THRESHOLD
+        && provider_auth_errors == 0
+        && pass_result.state_write_failures == 0
         && !shutdown_token.is_cancelled()
     {
-        let downloaded_keys: FxHashSet<RetryTaskKey> = pass_result
-            .downloaded_tasks
-            .iter()
-            .map(RetryTaskKey::from)
-            .collect();
-        let expired_retry_candidates: Vec<DownloadTask> = planned_tasks
-            .iter()
-            .filter(|task| !downloaded_keys.contains(&RetryTaskKey::from(*task)))
-            .cloned()
-            .collect();
-        let retry_tasks = match build_incremental_expired_url_retry_tasks(
+        let expired_retry_candidates = pass_result.expired_tasks.clone();
+        let retry_plan = build_incremental_expired_url_retry_tasks(
             passes,
-            &pass_configs,
             &retry_sources,
             &expired_retry_candidates,
             shutdown_token.clone(),
         )
-        .await
-        {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Could not refresh expired pending-retry download URLs; leaving failures for replay"
-                );
-                Vec::new()
-            }
-        };
+        .await;
+        provider_auth_errors += retry_plan.provider_auth_errors;
+        pass_result.rate_limit_observations += retry_plan.rate_limit_observations;
+        let retry_tasks = retry_plan.tasks;
         if !retry_tasks.is_empty() {
             let retry_task_count = retry_tasks.len();
             tracing::info!(
                 count = retry_task_count,
-                "Refreshing expired pending-retry download URLs and retrying failed tasks"
+                "Retrying tasks after targeted pending URL refresh"
             );
-            let refreshed_keys: FxHashSet<RetryTaskKey> =
-                retry_tasks.iter().map(RetryTaskKey::from).collect();
             let retry_pass_config = PassConfig {
+                prior_auth_errors: pass_result.auth_errors,
+                url_obtained_at: retry_plan.url_obtained_at,
                 client: download_client,
                 retry_config: &config.retry,
                 metadata: MetadataFlags::from(config.as_ref()),
@@ -178,11 +162,8 @@ async fn run_targeted_recovery_pass(
             merge_expired_url_retry_result(
                 &mut pass_result,
                 expired_retry_candidates,
-                refreshed_keys,
                 retry_result,
             );
-        } else if !expired_retry_candidates.is_empty() {
-            pass_result.failed = expired_retry_candidates;
         }
     }
     let failed = pass_result.failed.len();
@@ -201,7 +182,7 @@ async fn run_targeted_recovery_pass(
         identity_incomplete,
         state_write_failures: pass_result.state_write_failures,
         interrupted: shutdown_token.is_cancelled()
-            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
+            || (pass_result.auth_errors >= AUTH_ERROR_THRESHOLD || provider_auth_errors > 0),
         revalidate_records: checkpoint_revalidate_records,
         ..CheckpointEvidence::default()
     };
@@ -220,9 +201,9 @@ async fn run_targeted_recovery_pass(
     };
     let failed_count =
         failed + remaining_unmatched + pass_result.exif_failures + pass_result.state_write_failures;
-    let outcome = if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
+    let outcome = if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD || provider_auth_errors > 0 {
         DownloadOutcome::SessionExpired {
-            auth_error_count: pass_result.auth_errors,
+            auth_error_count: pass_result.auth_errors + provider_auth_errors,
         }
     } else if failed_count > 0 {
         DownloadOutcome::PartialFailure { failed_count }

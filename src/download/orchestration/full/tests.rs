@@ -647,6 +647,14 @@ struct WorkerBudgetProbe {
 
 struct WorkerBudgetServer(tokio::task::JoinHandle<()>);
 
+struct WorkerBudgetRequest(Arc<WorkerBudgetProbe>);
+
+impl Drop for WorkerBudgetRequest {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Drop for WorkerBudgetServer {
     fn drop(&mut self) {
         self.0.abort();
@@ -657,12 +665,12 @@ async fn worker_budget_media(
     axum::extract::State(probe): axum::extract::State<Arc<WorkerBudgetProbe>>,
 ) -> Vec<u8> {
     let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+    let _request = WorkerBudgetRequest(Arc::clone(&probe));
     probe.peak.fetch_max(active, Ordering::SeqCst);
     probe.requests.fetch_add(1, Ordering::SeqCst);
     // Hold the first wave until the test has observed concurrent admission.
     probe.release.cancelled().await;
     tokio::time::sleep(Duration::from_millis(10)).await;
-    probe.active.fetch_sub(1, Ordering::SeqCst);
     WORKER_BUDGET_JPEG.to_vec()
 }
 
@@ -789,6 +797,17 @@ async fn check_full_sync_worker_budget(workers: usize, pass_count: usize, run: W
         assert_eq!(result.sync_token.as_deref(), Some("budget-token"));
         assert_eq!(probe.requests.load(Ordering::SeqCst), total);
     }
+
+    // Cancellation can drop the client's header wait before the server has
+    // returned its delayed response. Drain that wave before measuring a new
+    // worker budget; abandoned server handlers are not active client workers.
+    tokio::time::timeout(WORKER_BUDGET_TIMEOUT, async {
+        while probe.active.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("cancelled server wave must drain before restart");
 
     // Reopen file-backed state, recover interrupted work, then prove that
     // an unchanged full cycle does not request or rewrite completed media.
