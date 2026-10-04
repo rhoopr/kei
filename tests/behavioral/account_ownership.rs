@@ -230,6 +230,16 @@ async fn account_ownership_overlapping_state_isolated_through_every_cli_path() {
         let before_rows = state(&b.path);
         let request_count = server.received_requests().await.unwrap().len();
         let out = command(root, &b, args);
+        assert_eq!(
+            std::fs::read(&a.media).unwrap(),
+            b"known media belonging only to account A",
+            "{args:?}: refused original owner media"
+        );
+        assert_eq!(
+            std::fs::read(&b.media).unwrap(),
+            b"known media belonging only to account B",
+            "{args:?}: refused requesting owner media"
+        );
         let diagnostics = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -296,6 +306,16 @@ async fn account_ownership_overlapping_state_isolated_through_every_cli_path() {
             let other_bytes = std::fs::read(&other.path).unwrap();
             let out = command(root, selected, args);
             success(&out);
+            assert_eq!(
+                std::fs::read(&a.media).unwrap(),
+                b"known media belonging only to account A",
+                "{args:?}: A media before fixture restoration"
+            );
+            assert_eq!(
+                std::fs::read(&b.media).unwrap(),
+                b"known media belonging only to account B",
+                "{args:?}: B media before fixture restoration"
+            );
             assert_eq!(
                 state(&other.path),
                 other_state,
