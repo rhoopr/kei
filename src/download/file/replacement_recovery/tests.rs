@@ -796,7 +796,7 @@ pub(in crate::download::file) fn terminal_fixture_active(path: &std::path::Path)
 
 pub(super) fn terminal_rmdir_fault(
     path: &crate::fs_util::ConfinedPath,
-) -> Option<anyhow::Result<()>> {
+) -> Option<std::io::Result<()>> {
     if !terminal_fixture_active(path.path()) {
         return None;
     }
@@ -810,33 +810,25 @@ pub(super) fn terminal_rmdir_fault(
     });
     if mode == "unknown" {
         fs::write(path.path().join("user-file"), b"user bytes").unwrap();
-        return Some(Err(
-            std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into()
-        ));
+        return Some(Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY)));
     }
     if mode == "namespace" {
         fs::rename(path.path(), path.path().with_extension("saved")).unwrap();
         fs::create_dir(path.path()).unwrap();
-        return Some(Err(
-            std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into()
-        ));
+        return Some(Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY)));
     }
     if mode == "target" {
         fs::write(path.path().with_file_name("photo.jpg"), b"late target edit").unwrap();
-        return Some(Err(
-            std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into()
-        ));
+        return Some(Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY)));
     }
     if mode == "eio" {
-        return Some(Err(std::io::Error::from_raw_os_error(libc::EIO).into()));
+        return Some(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     }
     if mode == "descriptors" {
         assert!(!held, "Manifest descriptor remains open at terminal rmdir");
     }
     if mode == "enotempty" {
-        return Some(Err(
-            std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into()
-        ));
+        return Some(Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY)));
     }
     None
 }

@@ -150,7 +150,7 @@ fn same_entry(left: &ConfinedPath, right: &ConfinedPath) -> Result<bool> {
     Ok(left.is_some() && left == identity(right)?)
 }
 
-fn unlink(path: &ConfinedPath, flags: libc::c_int) -> Result<()> {
+fn unlink(path: &ConfinedPath, flags: libc::c_int) -> std::io::Result<()> {
     #[cfg(test)]
     if flags == libc::AT_REMOVEDIR
         && let Some(result) = tests::terminal_rmdir_fault(path)
@@ -161,7 +161,7 @@ fn unlink(path: &ConfinedPath, flags: libc::c_int) -> Result<()> {
     // the call; unlinkat does not follow the leaf, including directory removal.
     let result = unsafe { libc::unlinkat(path.parent_fd(), path.name_cstr().as_ptr(), flags) };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -191,12 +191,8 @@ fn remove_empty_directory(directory: &ConfinedPath, manifest: &ConfinedPath) -> 
     tests::terminal_sync_fault(manifest)?;
     manifest.sync_parent()?;
     if let Err(error) = unlink(directory, libc::AT_REMOVEDIR) {
-        if error
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error)
-            != Some(libc::ENOTEMPTY)
-        {
-            return Err(error);
+        if error.raw_os_error() != Some(libc::ENOTEMPTY) {
+            return Err(error.into());
         }
         verify_empty()?;
         tracing::warn!("Empty replacement journal directory removal deferred");
