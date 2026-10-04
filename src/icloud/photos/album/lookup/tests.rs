@@ -623,7 +623,6 @@ async fn targeted_lookup_rejects_conflicting_scope_and_child_master_pair() {
             "master_pair" => {
                 child["fields"]["masterRef"]["value"]["recordName"] = json!("other-master")
             }
-            _ => unreachable!(),
         }
         let album = make_album_with_session(
             100,

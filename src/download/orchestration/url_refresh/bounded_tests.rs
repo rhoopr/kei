@@ -246,7 +246,7 @@ async fn incremental_refresh_is_bounded_and_persistent_expiry_keeps_durable_debt
         BYTES
     );
     assert!(!config.directory.join("poison.JPG").exists());
-    let calls = requests.lock().unwrap();
+    let calls = requests.lock().unwrap().clone();
     assert_eq!(
         calls.len(),
         5,
@@ -257,7 +257,6 @@ async fn incremental_refresh_is_bounded_and_persistent_expiry_keeps_durable_debt
         1,
         "healthy completed work is not refreshed again"
     );
-    drop(calls);
     drop(config);
     drop(db);
     let reopened = SqliteStateDb::open(&state_path).await.unwrap();
@@ -323,13 +322,13 @@ async fn incremental_refresh_refuses_changed_or_missing_resources_and_recovers_a
                     json!({"zoneName":"SharedSync-other", "ownerRecordName":"_defaultOwner"})
             }
             "missing" => fresh.clear(),
-            "rendition" => {
+            _ => {
+                assert_eq!(fault, "rendition");
                 fresh[0]["fields"]
                     .as_object_mut()
                     .unwrap()
                     .remove("resOriginalRes");
             }
-            _ => unreachable!(),
         }
         let dir = TempDir::new().unwrap();
         let state_path = dir.path().join("state.db");
