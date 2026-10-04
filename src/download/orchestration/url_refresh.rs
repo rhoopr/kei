@@ -33,6 +33,7 @@ pub(in crate::download) struct UrlRetrySource {
     pub(in crate::download) asset_record_name: Arc<str>,
     pub(in crate::download) pass_index: usize,
     pub(in crate::download) master_record_name: Arc<str>,
+    pub(in crate::download) provider_version: VersionSizeKey,
 }
 
 impl From<&DownloadTask> for RetryTaskKey {
@@ -234,8 +235,11 @@ async fn refresh_failed_download_urls(
                 }) {
                     continue;
                 }
+                let provider_version = retry_sources
+                    .and_then(|sources| sources.get(&RetryTaskKey::from(task)))
+                    .map_or(task.version_size, |source| source.provider_version);
                 let Some((_, version)) = asset.versions().iter().find(|(size, version)| {
-                    VersionSizeKey::from(*size) == task.version_size
+                    VersionSizeKey::from(*size) == provider_version
                         && version.checksum == task.checksum
                         && version.size == task.size
                 }) else {

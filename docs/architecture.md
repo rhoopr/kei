@@ -549,7 +549,10 @@ reports failure, authentication, and rate-limit counts without provider details.
 Collecting incremental preflight and expiry recovery use the same bounded
 child/master lookup owner. The authenticated session and exact requested zone
 scope each lookup. Explicit zone/owner evidence and child/master references
-must agree; incremental recovery also pins the originally selected master.
+must agree; incremental recovery also pins the originally selected master and
+provider rendition. The selection owner translates virtual RAW/JPEG task keys
+back to provider keys once, before refresh; later provider policy changes cannot
+retarget the selected resource.
 Refresh changes only the URL when child, master, rendition, provider checksum
 and size still agree. Unmatched resources retain durable failure work; expiry
 and lookup absence never authorize deletion. No zone enumeration, path

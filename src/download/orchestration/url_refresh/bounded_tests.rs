@@ -704,6 +704,7 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
         UrlRetrySource {
             asset_record_name: task.asset_record_name.clone(),
             master_record_name: "MASTER".into(),
+            provider_version: VersionSizeKey::Original,
             pass_index: 0,
         },
     );
@@ -902,4 +903,147 @@ async fn explicit_retry_enforces_cumulative_auth_threshold_and_retains_queued_de
     let reopened = SqliteStateDb::open(&db_path).await.unwrap();
     assert_eq!(reopened.get_summary().await.unwrap().failed, 2);
     server.verify().await;
+}
+
+#[tokio::test]
+async fn incremental_refresh_preserves_frozen_raw_jpeg_provider_renditions() {
+    use crate::types::RawPolicy;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    const RAW_BYTES: &[u8] = &[0x49, 0x49, 0x2a, 0x00, 8, 0, 0, 0];
+    for policy in [RawPolicy::PreferRaw, RawPolicy::PreferJpeg] {
+        for expiry_retry in [false, true] {
+            for fault in ["none", "checksum", "size"] {
+                let server = crate::start_wiremock_or_skip!();
+                let (original_type, alternative_type, original_bytes, alternative_bytes) =
+                    if policy == RawPolicy::PreferRaw {
+                        ("public.jpeg", "com.adobe.raw-image", BYTES, RAW_BYTES)
+                    } else {
+                        ("com.adobe.raw-image", "public.jpeg", RAW_BYTES, BYTES)
+                    };
+                for (resource, bytes) in [
+                    ("original", original_bytes),
+                    ("alternative", alternative_bytes),
+                ] {
+                    Mock::given(method("GET"))
+                        .and(path(format!("/old-{resource}")))
+                        .respond_with(ResponseTemplate::new(410))
+                        .expect(u64::from(expiry_retry))
+                        .mount(&server)
+                        .await;
+                    Mock::given(method("GET"))
+                        .and(path(format!("/new-{resource}")))
+                        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                        .expect(u64::from(resource == "original" || fault == "none"))
+                        .mount(&server)
+                        .await;
+                }
+                let mut delta = incremental_photo_records_with_url(
+                    "SWAPPED",
+                    "paired.jpg",
+                    &format!("{}/old-original", server.uri()),
+                    8,
+                );
+                delta[0]["fields"]["resOriginalFileType"] = json!({"value": original_type});
+                delta[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                    json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+                delta[0]["fields"]["resOriginalAltFileType"] = json!({"value": alternative_type});
+                delta[0]["fields"]["resOriginalAltRes"] = json!({"value": {"downloadURL":format!("{}/old-alternative", server.uri()), "fileChecksum":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", "size":8}});
+                let mut fresh = delta.clone();
+                fresh[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+                    json!(format!("{}/new-original", server.uri()));
+                fresh[0]["fields"]["resOriginalAltRes"]["value"]["downloadURL"] =
+                    json!(format!("{}/new-alternative", server.uri()));
+                if fault == "checksum" {
+                    fresh[0]["fields"]["resOriginalAltRes"]["value"]["fileChecksum"] =
+                        json!("changed");
+                }
+                if fault == "size" {
+                    fresh[0]["fields"]["resOriginalAltRes"]["value"]["size"] = json!(9);
+                }
+                let passes = vec![AlbumPass {
+                    kind: PassKind::Unfiled,
+                    album: album_with_session(
+                        "PrimarySync",
+                        "",
+                        Box::new(BoundedSession {
+                            delta: Arc::new(delta),
+                            fresh: Arc::new(fresh),
+                            requests: Arc::new(Mutex::new(Vec::new())),
+                        }),
+                    ),
+                    exclude_ids: Arc::new(FxHashSet::default()),
+                }];
+                let dir = TempDir::new().unwrap();
+                let state_path = dir.path().join("state.db");
+                let db = Arc::new(SqliteStateDb::open(&state_path).await.unwrap());
+                std::fs::create_dir_all(dir.path().join("media")).unwrap();
+                std::fs::write(dir.path().join("media/unrelated.jpg"), b"existing media").unwrap();
+                let mut config = test_config();
+                config.directory = Arc::from(dir.path().join("media"));
+                config.folder_structure = String::new();
+                config.raw_policy = policy;
+                config.alternative = true;
+                config.state_db = Some(db.clone());
+                let config = Arc::new(config);
+                let result = download_photos_incremental_collecting_inner(
+                    &reqwest::Client::new(),
+                    &passes,
+                    &config,
+                    "previous",
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
+                    if expiry_retry {
+                        Duration::from_secs(3600)
+                    } else {
+                        Duration::ZERO
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.stats.downloaded,
+                    if fault == "none" { 2 } else { 1 },
+                    "{policy:?}, expiry_retry={expiry_retry}, fault={fault}; failures={:?}; stats={:?}",
+                    db.get_failed().await.unwrap(),
+                    result.stats
+                );
+                assert_eq!(result.stats.failed, usize::from(fault != "none"));
+                drop(config);
+                drop(db);
+                let reopened = SqliteStateDb::open(&state_path).await.unwrap();
+                let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(rows.len(), if fault == "none" { 2 } else { 1 });
+                for row in rows {
+                    let bytes = std::fs::read(row.local_path.unwrap()).unwrap();
+                    match row.version_size {
+                        VersionSizeKey::Original => {
+                            assert_eq!(
+                                &*row.checksum,
+                                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+                            );
+                            assert_eq!(bytes, alternative_bytes);
+                        }
+                        _ => {
+                            assert_eq!(row.version_size, VersionSizeKey::Alternative);
+                            assert_eq!(
+                                &*row.checksum,
+                                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                            );
+                            assert_eq!(bytes, original_bytes);
+                        }
+                    }
+                }
+                assert_eq!(
+                    reopened.get_summary().await.unwrap().failed,
+                    u64::from(fault != "none")
+                );
+                assert_eq!(
+                    std::fs::read(dir.path().join("media/unrelated.jpg")).unwrap(),
+                    b"existing media"
+                );
+                server.verify().await;
+            }
+        }
+    }
 }

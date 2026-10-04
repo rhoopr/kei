@@ -103,7 +103,18 @@ pub(crate) fn metadata_for_selected_version(
     config: &(impl PathDerivationSource + ?Sized),
     version: VersionSizeKey,
 ) -> Arc<crate::state::AssetMetadata> {
-    let provider_version = if apply_raw_policy(asset.versions(), config.raw_policy())
+    asset.metadata_arc(provider_version_for_selected(asset, config, version))
+}
+
+/// Freeze the provider rendition behind a logical task key at selection time.
+/// RAW preference may virtually relabel Original and Alternative, while
+/// provider resource and metadata keys retain their original meaning.
+pub(crate) fn provider_version_for_selected(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &(impl PathDerivationSource + ?Sized),
+    version: VersionSizeKey,
+) -> VersionSizeKey {
+    if apply_raw_policy(asset.versions(), config.raw_policy())
         .swap
         .is_some()
     {
@@ -114,8 +125,7 @@ pub(crate) fn metadata_for_selected_version(
         }
     } else {
         version
-    };
-    asset.metadata_arc(provider_version)
+    }
 }
 
 /// Historical original/alternative keys may have been swapped by RAW policy.

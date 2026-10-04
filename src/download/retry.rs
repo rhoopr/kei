@@ -420,6 +420,11 @@ impl PendingRetryPlanning<'_> {
                     UrlRetrySource {
                         asset_record_name: asset.asset_record_name_arc(),
                         master_record_name: Arc::from(asset.id()),
+                        provider_version: filter::provider_version_for_selected(
+                            asset,
+                            pass_config.as_ref(),
+                            task.version_size,
+                        ),
                         pass_index,
                     },
                 );
