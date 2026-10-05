@@ -1040,11 +1040,37 @@ with no repeated source lookups.
 Snapshot-token, changed-link, stale-generation, redaction, and versioned
 completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.
 
+## Selection generation shadow
+
+`selection_shadow` tests enter the real retained-work admission owner against
+account-owned file-backed SQLite, historical source records, existing media and
+sidecars, a retained cursor, sparse debt and an unknown BLOB table. Current lookup
+confirmation differs from the historical trigger. Replay must preserve the
+original confirmation numeric lexeme and the current resource checksum. Two
+released-handle reopens retain pending queue status, source cursor and original
+media; repeat admission performs no current lookup or duplicate shadow insert.
+
+The bounded storage tests represent the same child/rendition in two pass paths,
+refuse new evidence at capacity, replay exact evidence at capacity, and roll back
+all manifest, source, decision and destination rows on a second-destination SQL
+failure. Corrupted rows, source bytes, confirmation identity and foreign owners
+cannot replay. A capture failure precedes queue admission; valid recovery and two
+quiet admission cycles retain all source and unrelated work. Relative download
+roots retain the existing admission contract; shadow destinations are anchored
+without changing the task path. The schema-32 live
+WAL test preserves queue work, original confirmation and unknown tables across a
+refused conflicting migration and a subsequent successful migration.
+
+These tests prove shadow representation and parity for the existing sole Unfiled
+profile. They do not qualify album selection, multi-destination publication,
+late filesystem faults, catalog selection activation or cursor ownership. Those
+are acceptance requirements for the next PR in the same phase.
+
 ## Released schema upgrade history
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 32.
+binary (schema 25), then executes the current production CLI through schema 33.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,

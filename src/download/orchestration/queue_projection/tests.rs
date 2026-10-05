@@ -9,6 +9,7 @@ use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
 use crate::state::SqliteStateDb;
 use crate::state::db::account::AccountOwner;
+use crate::state::db::provider_selection::{MAX_SELECTION_BYTES, SelectionOutcome};
 use crate::state::db::provider_work::{WorkAdmission, WorkPlan};
 use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
@@ -1809,4 +1810,409 @@ async fn queue_projection_admitted_before_dispatch_reopens_materializes_and_stay
         }
         f.preserved().await;
     }
+}
+
+async fn selection_manifest(
+    fixture: &Fixture,
+) -> (
+    String,
+    crate::state::db::provider_selection::SelectionManifest,
+) {
+    let id: String = fixture
+        .db
+        .acquire_lock("shadow generation identity")
+        .unwrap()
+        .query_row(
+            "SELECT id FROM provider_selection_generations ORDER BY id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let manifest = fixture
+        .db
+        .replay_selection_shadow(owner(), id.clone())
+        .await
+        .unwrap();
+    (id, manifest)
+}
+
+#[tokio::test]
+async fn selection_shadow_current_authority_original_bytes_and_two_reopens_preserve_progress() {
+    let fixture = Fixture::new().await;
+    fixture
+        .capture(records("m", OLD, "historical"), "old-page")
+        .await;
+    fixture.cycle().await.unwrap();
+    let (id, manifest) = selection_manifest(&fixture).await;
+    assert_eq!(manifest.profile["coverage"], "confirmed_sources_only");
+    assert_eq!(manifest.decisions.len(), 1);
+    let decision = &manifest.decisions[0];
+    assert_eq!(decision.outcome, SelectionOutcome::Selected);
+    assert_eq!(decision.child, "asset-m");
+    assert_eq!(decision.master.as_deref(), Some("m"));
+    let body = decision.confirmation.as_ref().unwrap();
+    assert!(
+        std::str::from_utf8(body)
+            .unwrap()
+            .contains("\"futureExact\":1.2300e+30")
+    );
+    assert_eq!(decision.destinations.len(), 1);
+    assert_eq!(decision.destinations[0].checksum, CURRENT);
+    assert!(
+        std::path::Path::new(&decision.destinations[0].path).starts_with(&fixture.config.directory)
+    );
+    assert_eq!(fixture.count("provider_selection_sources"), 1);
+    assert_eq!(fixture.count("provider_selection_destinations"), 1);
+    let pending: String = fixture
+        .db
+        .acquire_lock("selection is not byte completion")
+        .unwrap()
+        .query_row("SELECT status FROM assets WHERE id='asset-m'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(pending, "pending");
+    fixture.preserved().await;
+    let calls = fixture.session.calls.load(Ordering::SeqCst);
+    fixture.cycle().await.unwrap();
+    assert_eq!(fixture.session.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(fixture.count("provider_selection_generations"), 1);
+    let database = fixture.dir.path().join("state.db");
+    let media = fixture.config.directory.to_path_buf();
+    let Fixture {
+        dir,
+        db,
+        capture,
+        session,
+        pass,
+        config,
+    } = fixture;
+    drop(config);
+    drop(pass);
+    drop(capture);
+    drop(db);
+    drop(session);
+    for _ in 0..2 {
+        let reopened = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .replay_selection_shadow(owner(), id.clone())
+                .await
+                .unwrap(),
+            manifest
+        );
+        assert_eq!(
+            reopened
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("old-cursor")
+        );
+        assert_eq!(
+            std::fs::read(media.join("existing.jpg")).unwrap(),
+            b"existing-media"
+        );
+        drop(reopened);
+    }
+    drop(dir);
+}
+
+#[tokio::test]
+async fn selection_shadow_multiple_destinations_capacity_and_atomic_failure_do_not_admit_work() {
+    let fixture = Fixture::new().await;
+    fixture
+        .capture(records("m", OLD, "historical"), "source")
+        .await;
+    fixture.cycle().await.unwrap();
+    let (id, mut manifest) = selection_manifest(&fixture).await;
+    let original_queue = fixture.queue();
+    assert_eq!(
+        fixture
+            .db
+            .capture_selection_shadow(owner(), manifest.clone(), 0)
+            .await
+            .unwrap(),
+        id
+    );
+    let mut second = manifest.decisions[0].clone();
+    manifest.decisions[0].pass_key = "album-A".to_owned();
+    second.pass_key = "album-B".to_owned();
+    second.destinations[0].path = fixture
+        .config
+        .directory
+        .join("B/photo.jpg")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    manifest.decisions.push(second);
+    assert!(matches!(
+        fixture
+            .db
+            .capture_selection_shadow(owner(), manifest.clone(), 0)
+            .await,
+        Err(crate::state::error::StateError::ProviderSelectionFull)
+    ));
+    assert_eq!(fixture.count("provider_selection_generations"), 1);
+    fixture.db.acquire_lock("fault second destination").unwrap().execute_batch(
+        "CREATE TRIGGER selection_fault BEFORE INSERT ON provider_selection_destinations WHEN NEW.pass_key='album-B' BEGIN SELECT RAISE(ABORT,'synthetic destination failure'); END;"
+    ).unwrap();
+    assert!(
+        fixture
+            .db
+            .capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
+            .await
+            .is_err()
+    );
+    for (table, count) in [
+        ("provider_selection_generations", 1),
+        ("provider_selection_sources", 1),
+        ("provider_selection_decisions", 1),
+        ("provider_selection_destinations", 1),
+    ] {
+        assert_eq!(
+            fixture.count(table),
+            count,
+            "partial shadow insert into {table}"
+        );
+    }
+    fixture
+        .db
+        .acquire_lock("restore destination writes")
+        .unwrap()
+        .execute_batch("DROP TRIGGER selection_fault;")
+        .unwrap();
+    let generation = fixture
+        .db
+        .capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .replay_selection_shadow(owner(), generation)
+            .await
+            .unwrap(),
+        manifest
+    );
+    assert_eq!(fixture.count("provider_selection_destinations"), 3);
+    assert_eq!(fixture.queue(), original_queue);
+    assert_eq!(fixture.count("provider_work_receipts"), 1);
+    fixture.preserved().await;
+}
+
+#[tokio::test]
+async fn selection_shadow_replay_rejects_corrupt_rows_sources_confirmations_and_foreign_owner() {
+    let fixture = Fixture::new().await;
+    fixture
+        .capture(records("m", OLD, "historical"), "source")
+        .await;
+    fixture.cycle().await.unwrap();
+    let (id, manifest) = selection_manifest(&fixture).await;
+    let original_queue = fixture.queue();
+    let wrong = AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"queue-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture.db.replay_selection_shadow(wrong, id.clone()).await,
+        Err(crate::state::error::StateError::AccountOwnerMismatch)
+    ));
+    for mutation in [
+        "UPDATE provider_selection_destinations SET checksum='wrong'",
+        "DELETE FROM provider_selection_destinations",
+        "UPDATE provider_selection_sources SET body_hash='wrong'",
+        "UPDATE provider_selection_generations SET config_hash='wrong'",
+        "UPDATE provider_shadow_pages SET body=X'7B7D'",
+    ] {
+        fixture
+            .db
+            .acquire_lock("shadow corruption probe")
+            .unwrap()
+            .execute_batch(&format!("SAVEPOINT corruption; {mutation};"))
+            .unwrap();
+        assert!(
+            fixture
+                .db
+                .replay_selection_shadow(owner(), id.clone())
+                .await
+                .is_err(),
+            "accepted {mutation}"
+        );
+        fixture
+            .db
+            .acquire_lock("restore shadow corruption")
+            .unwrap()
+            .execute_batch("ROLLBACK TO corruption; RELEASE corruption;")
+            .unwrap();
+    }
+    let mut wrong = manifest.clone();
+    wrong.decisions[0].confirmation = Some(b"{\"records\":[]}".to_vec());
+    assert!(matches!(
+        fixture
+            .db
+            .capture_selection_shadow(owner(), wrong, MAX_SELECTION_BYTES)
+            .await,
+        Err(crate::state::error::StateError::ProviderSelectionInvalid)
+    ));
+    let mut wrong = manifest;
+    wrong.scope = wrong.scope.replace("PrimarySync", "OtherZone");
+    assert!(matches!(
+        fixture
+            .db
+            .capture_selection_shadow(owner(), wrong, MAX_SELECTION_BYTES)
+            .await,
+        Err(crate::state::error::StateError::ProviderSelectionInvalid)
+    ));
+    assert_eq!(fixture.queue(), original_queue);
+    fixture.preserved().await;
+}
+
+#[tokio::test]
+async fn selection_shadow_failure_precedes_queue_admission_then_recovers_quietly() {
+    let fixture = Fixture::new().await;
+    fixture
+        .capture(records("m", OLD, "historical"), "source")
+        .await;
+    fixture.db.acquire_lock("shadow manifest fault").unwrap().execute_batch(
+        "CREATE TRIGGER selection_manifest_fault BEFORE INSERT ON provider_selection_generations BEGIN SELECT RAISE(ABORT,'synthetic selection failure'); END;"
+    ).unwrap();
+    assert!(fixture.cycle().await.is_err());
+    assert_eq!(fixture.count("provider_selection_generations"), 0);
+    assert_eq!(fixture.count("assets"), 0);
+    assert_eq!(fixture.count("provider_work_receipts"), 0);
+    assert_eq!(fixture.count("provider_catalog_records"), 2);
+    fixture.preserved().await;
+    fixture
+        .db
+        .acquire_lock("remove shadow fault")
+        .unwrap()
+        .execute_batch("DROP TRIGGER selection_manifest_fault;")
+        .unwrap();
+    fixture.cycle().await.unwrap();
+    assert_eq!(fixture.count("assets"), 1);
+    assert_eq!(fixture.count("provider_work_receipts"), 1);
+    let calls = fixture.session.calls.load(Ordering::SeqCst);
+    fixture.cycle().await.unwrap();
+    fixture.cycle().await.unwrap();
+    assert_eq!(fixture.session.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(fixture.count("provider_selection_generations"), 1);
+    fixture.preserved().await;
+}
+
+#[tokio::test]
+async fn selection_shadow_schema32_migration_preserves_live_wal_work_and_unknown_collision() {
+    let fixture = Fixture::new().await;
+    fixture
+        .capture(records("m", OLD, "historical"), "source")
+        .await;
+    fixture.cycle().await.unwrap();
+    let queue = fixture.queue();
+    let work: Vec<u8> = fixture
+        .db
+        .acquire_lock("retained work bytes")
+        .unwrap()
+        .query_row(
+            "SELECT confirmation FROM provider_work_receipts LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    fixture.db.acquire_lock("synthetic schema32 and unknown table").unwrap().execute_batch(
+        "PRAGMA wal_autocheckpoint=0; DROP TABLE provider_selection_destinations; DROP TABLE provider_selection_decisions; DROP TABLE provider_selection_sources; DROP TABLE provider_selection_generations; PRAGMA user_version=32; CREATE TABLE provider_selection_generations(payload BLOB); INSERT INTO provider_selection_generations VALUES(X'00FF09');"
+    ).unwrap();
+    let database = fixture.dir.path().join("state.db");
+    assert!(
+        SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .is_err()
+    );
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("migration rollback oracle")
+            .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            32
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT payload FROM provider_selection_generations",
+                [],
+                |r| r.get::<_, Vec<u8>>(0)
+            )
+            .unwrap(),
+            [0, 255, 9]
+        );
+        assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('provider_selection_sources','provider_selection_decisions','provider_selection_destinations')", [], |r|r.get::<_,i64>(0)).unwrap(), 0);
+        conn.execute_batch(
+            "ALTER TABLE provider_selection_generations RENAME TO retained_future_selection;",
+        )
+        .unwrap();
+    }
+    let migrated = SqliteStateDb::open_owned(&database, &owner())
+        .await
+        .unwrap();
+    assert_eq!(fixture.queue(), queue);
+    assert_eq!(
+        fixture
+            .db
+            .acquire_lock("work preserved after migration")
+            .unwrap()
+            .query_row(
+                "SELECT confirmation FROM provider_work_receipts LIMIT 1",
+                [],
+                |r| r.get::<_, Vec<u8>>(0)
+            )
+            .unwrap(),
+        work
+    );
+    assert_eq!(
+        migrated
+            .acquire_lock("future table preserved")
+            .unwrap()
+            .query_row("SELECT payload FROM retained_future_selection", [], |r| r
+                .get::<_, Vec<
+                u8,
+            >>(
+                0
+            ))
+            .unwrap(),
+        [0, 255, 9]
+    );
+    assert_eq!(fixture.count("provider_selection_generations"), 0);
+    fixture.preserved().await;
+    drop(migrated);
+    fixture.cycle().await.unwrap(); // Previously admitted work is not recreated.
+    assert_eq!(fixture.count("provider_selection_generations"), 0);
+    assert_eq!(fixture.queue(), queue);
+}
+
+#[tokio::test]
+async fn selection_shadow_relative_download_root_keeps_existing_admission_contract() {
+    let mut fixture = Fixture::new().await;
+    let relative = tempfile::tempdir_in(".scratch").unwrap();
+    let root = relative.path().join("media");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("existing.jpg"), b"existing-media").unwrap();
+    std::fs::write(root.join("existing.xmp"), b"retained-sidecar").unwrap();
+    let absolute = std::path::absolute(&root).unwrap();
+    let current = std::env::current_dir().unwrap();
+    fixture.config.directory = Arc::from(absolute.strip_prefix(current).unwrap());
+    assert!(!fixture.config.directory.is_absolute());
+    fixture
+        .capture(records("m", OLD, "historical"), "relative-source")
+        .await;
+    fixture.cycle().await.unwrap();
+    let (_, manifest) = selection_manifest(&fixture).await;
+    assert!(
+        std::path::Path::new(&manifest.decisions[0].destinations[0].path).starts_with(&absolute)
+    );
+    fixture.preserved().await;
 }

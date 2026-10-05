@@ -103,6 +103,7 @@ changing behavior.
 | SQLite facade and connection lifecycle | `src/state/mod.rs`, `src/state/db.rs` | Preserves state entry points, opens connections, and dispatches blocking SQLite work. Child owners retain their transaction boundaries. |
 | Observed provider pages | `src/icloud/photos/inbox.rs`, `src/state/db/provider_inbox.rs` | Binds validated incremental observations to the account, retains source identities and original bytes atomically with a shadow receipt, and applies bounded backpressure. It does not authorize provider checkpoints. |
 | Provider source catalog | `src/icloud/photos/projection.rs`, `src/state/db/provider_catalog.rs` | Validates replay provenance, derives versioned source facts, and atomically indexes records, references and unresolved evidence. Its receipt does not authorize queues or checkpoints. |
+| Selection shadow manifests | `src/state/db/provider_selection.rs`, `src/download/orchestration/queue_projection.rs` | Retains account-bound current planning evidence and per-pass destinations, then validates lossless replay. This shadow receipt has no selection, publication or checkpoint authority. |
 | Provider work admission | `src/icloud/photos/album/work.rs`, `src/download/orchestration/queue_projection.rs`, `src/state/db/provider_work.rs` | Confirms retained identities against current provider records, applies current task planning, and atomically admits guarded existing queue obligations and retained conflict debt. Checkpoint authority stays with the existing cycle. |
 | SQLite schema | `src/state/schema.rs` | Owns schema versions and migrations. |
 | State-store contracts | `src/state/db/contracts.rs` | Defines store roles and records exchanged with callers. |
@@ -413,6 +414,42 @@ of a current version does not prove historical completeness, acknowledge old
 unrecoverable debt, authorize local tombstone deletion or select a historical
 retention policy. Existing CheckpointEvidence, sparse/legacy proofs, opt-in
 metadata writes, publication guards and WAL NORMAL qualification remain in force.
+
+### Selection generation shadow
+
+Schema 33 adds account-bound `provider_selection_generations`, source links in
+`provider_selection_sources`, per-pass `provider_selection_decisions`, and
+rendition/path obligations in `provider_selection_destinations`. The existing
+private library-wide retained-work path captures its planning result before
+queue admission and compares exact replay with that result. Original current
+child/master confirmation bytes retain unknown fields and numeric lexemes.
+Current confirmation is separate from the historical trigger observation;
+source order, page IDs and opaque cursors cannot establish a current version.
+
+Manifest format 1 explicitly records `confirmed_sources_only` coverage. It does
+not represent a complete library inventory, a global recent frontier, album
+membership coverage or absence. Selected, excluded and deferred decisions remain
+separate from admitted queue work and verified media. Destinations include the
+pass, child, logical rendition and path so one rendition can have distinct
+copies without changing the canonical asset identity. This stage captures only
+the existing admission profile. Multi-pass selection and activation require the
+next qualified stage.
+
+Capture and replay independently check authenticated account ownership, complete
+private source scope, indexed original source bytes and identity, current paired
+confirmation, resource and metadata fingerprints, and all normalized manifest
+rows. One immediate transaction commits a manifest and its source, decision and
+destination rows. Failure retains source observations and the existing cursor;
+no queue admission can substitute for missing shadow evidence. Exact replay is
+idempotent at capacity. A manifest is bounded to 16 MiB of serialized evidence
+and this store has a separate 512 MiB logical charge budget including normalized
+row payload. These are backpressure limits, not physical SQLite/WAL quotas.
+
+Nothing is pruned, retired or acknowledged. Existing work receipts, unfinished
+generation fences, metadata queues, filesystem publication guards and checkpoint
+proofs remain authoritative. WAL NORMAL and filesystem support are unchanged.
+This shadow storage is the first PR of the selection phase, not completion of
+replay-driven multi-pass materialization.
 
 ### Sync and provider checkpoints
 

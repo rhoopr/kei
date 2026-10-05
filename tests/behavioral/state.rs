@@ -9,7 +9,7 @@ use rusqlite::OptionalExtension;
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 32). The shared helper
+/// `state::schema::SCHEMA_VERSION` (currently 33). The shared helper
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -27,7 +27,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 32;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 33;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -1131,6 +1131,10 @@ fn behavioral_helper_carries_every_migrated_column() {
         );
     }
     for sql in [
+        "SELECT id,account_key,provider_key,format,scope,config_hash,manifest,charged_bytes FROM provider_selection_generations LIMIT 0",
+        "SELECT generation,page_id,ordinal,body_hash FROM provider_selection_sources LIMIT 0",
+        "SELECT generation,pass_key,child,outcome,reason FROM provider_selection_decisions LIMIT 0",
+        "SELECT generation,pass_key,child,version_size,path,checksum,size_bytes,metadata_hash FROM provider_selection_destinations LIMIT 0",
         "SELECT id,account_key,provider_key,scope,request_cursor,successor,more_coming,body_hash,body,charged_bytes,observed_at FROM provider_shadow_pages LIMIT 0",
         "SELECT page_id,ordinal,record_name,record_type,deleted FROM provider_shadow_records LIMIT 0",
         "SELECT scope,page_id FROM provider_shadow_receipts LIMIT 0",
