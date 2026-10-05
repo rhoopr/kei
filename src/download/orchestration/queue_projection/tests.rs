@@ -22,6 +22,8 @@ struct CurrentSession {
     records: Arc<Mutex<Vec<Value>>>,
     calls: Arc<AtomicUsize>,
     corrupt: Arc<Mutex<Option<&'static str>>>,
+    discovery: bool,
+    zone_name: Arc<str>,
 }
 
 #[async_trait::async_trait]
@@ -32,13 +34,33 @@ impl PhotosSession for CurrentSession {
         body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        if self.discovery && url.ends_with("/zones/list") {
+            let zones = if url.contains("/private/") {
+                json!([
+                    {"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}},
+                    {"zoneID":{"zoneName":"SharedSync-queue","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}},
+                    {"zoneID":{"zoneName":"SharedSync-no-owner"}},
+                    {"zoneID":{"zoneName":"SharedSync-other-owner","ownerRecordName":"other"}}
+                ])
+            } else {
+                json!([{"zoneID":{"zoneName":"SharedSync-foreign","ownerRecordName":"_defaultOwner"}}])
+            };
+            return Ok(json!({"zones":zones}));
+        }
+        if self.discovery && url.contains("/records/query?") {
+            let request: Value = serde_json::from_str(&body)?;
+            assert_eq!(request["query"]["recordType"], "CheckIndexingState");
+            return Ok(
+                json!({"records":[{"recordName":"index-state","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
         anyhow::ensure!(
             url.contains("/records/lookup?"),
             "unexpected enumeration in catalog work"
         );
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request: Value = serde_json::from_str(&body)?;
-        assert_eq!(request["zoneID"]["zoneName"], "PrimarySync");
+        assert_eq!(request["zoneID"]["zoneName"], self.zone_name.as_ref());
         assert_eq!(request["zoneID"]["ownerRecordName"], "_defaultOwner");
         let names: Vec<_> = request["records"]
             .as_array()
@@ -143,6 +165,8 @@ impl Fixture {
             records: Arc::new(Mutex::new(records("m", CURRENT, "current"))),
             calls: Arc::new(AtomicUsize::new(0)),
             corrupt: Arc::new(Mutex::new(None)),
+            discovery: false,
+            zone_name: Arc::from("PrimarySync"),
         };
         let mut album = PhotoAlbum::new(
             PhotoAlbumConfig {
@@ -440,6 +464,12 @@ async fn queue_projection_original_receipt_replay_and_shared_admission_never_reg
     stale.checksum = OLD.into();
     assert!(matches!(
         f.db.upsert_seen(&stale).await,
+        Err(crate::state::error::StateError::ProviderWorkConflict)
+    ));
+    let mut oversized = record.clone();
+    oversized.size_bytes = u64::MAX;
+    assert!(matches!(
+        f.db.upsert_seen(&oversized).await,
         Err(crate::state::error::StateError::ProviderWorkConflict)
     ));
     let mut stale_metadata = record.clone();
@@ -1132,5 +1162,116 @@ async fn queue_projection_derived_plan_budget_rejects_without_partial_admission(
     ] {
         assert_eq!(f.count(table), 0, "{table}");
     }
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_same_generation_collision_replans_without_stranding_work() {
+    let f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    let current = f.pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+    let config = f.config.with_pass(&f.pass);
+    let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+        .await
+        .unwrap();
+    let initial = planner
+        .plan_download_asset(&current.asset, &config)
+        .await
+        .unwrap();
+    let original_path = initial.tasks.first().unwrap().download_path.clone();
+    f.cycle().await.unwrap();
+    std::fs::create_dir_all(original_path.parent().unwrap()).unwrap();
+    std::fs::write(&original_path, b"independent-conflicting-file").unwrap();
+    for _ in 0..2 {
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let plan = planner
+            .plan_download_asset(&current.asset, &config)
+            .await
+            .unwrap();
+        let task = plan.tasks.first().unwrap();
+        assert_ne!(task.download_path, original_path);
+        crate::download::planner::upsert_seen_for_task(&*f.db, &config, &current.asset, task)
+            .await
+            .unwrap();
+        assert_eq!(f.count("assets"), 1);
+        assert_eq!(f.count("provider_work_obligations"), 1);
+        assert_eq!(
+            std::fs::read(&original_path).unwrap(),
+            b"independent-conflicting-file"
+        );
+        f.preserved().await;
+    }
+    let calls = f.session.calls.load(Ordering::SeqCst);
+    f.cycle().await.unwrap();
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
+}
+
+#[tokio::test]
+async fn queue_projection_actual_discovery_preserves_owner_and_skips_default_primary() {
+    let mut f = Fixture::new().await;
+    f.session.discovery = true;
+    f.session.zone_name = Arc::from("SharedSync-queue");
+    for record in f.session.records.lock().unwrap().iter_mut() {
+        if let Some(zone) = record.pointer_mut("/fields/masterRef/value/zoneID") {
+            *zone = json!({"zoneName":"SharedSync-queue","ownerRecordName":"_defaultOwner"});
+        }
+    }
+
+    let mut service = crate::icloud::photos::PhotosService::new(
+        "https://example.invalid".into(),
+        Box::new(f.session.clone()),
+        std::collections::HashMap::new(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    service.set_shadow_capture(f.capture.clone());
+    let libraries = service.all_libraries().await.unwrap();
+    assert_eq!(
+        libraries
+            .iter()
+            .filter(|library| library.zone_name() == "PrimarySync")
+            .count(),
+        1
+    );
+    for library in &libraries {
+        let eligible = library.zone_name() == "SharedSync-queue";
+        assert_eq!(
+            library.all().catalog_work_scope().unwrap().is_some(),
+            eligible,
+            "{}",
+            library.zone_name()
+        );
+    }
+    f.pass.album = service.get_library("PrimarySync").await.unwrap().all();
+    assert!(f.pass.album.catalog_work_scope().unwrap().is_none());
+    f.cycle().await.unwrap();
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.count("provider_work_receipts"), 0);
+    f.pass.album = service.get_library("SharedSync-queue").await.unwrap().all();
+    f.config.library = Arc::from("SharedSync-queue");
+    let mut source = records("m", OLD, "source");
+    for record in &mut source {
+        if let Some(zone) = record.pointer_mut("/fields/masterRef/value/zoneID") {
+            *zone = json!({"zoneName":"SharedSync-queue","ownerRecordName":"_defaultOwner"});
+        }
+    }
+    f.capture(source, "discovered").await;
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 1);
+    assert_eq!(f.count("provider_work_receipts"), 1);
+    assert_eq!(f.count("provider_work_obligations"), 1);
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        f.db.acquire_lock("discovered scope oracle")
+            .unwrap()
+            .query_row::<String, _, _>("SELECT library FROM assets", [], |row| row.get(0))
+            .unwrap(),
+        "SharedSync-queue"
+    );
+    f.cycle().await.unwrap();
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), 2);
     f.preserved().await;
 }

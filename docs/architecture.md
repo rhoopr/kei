@@ -263,20 +263,22 @@ is not a coverage frontier, materialization receipt or verified filesystem
 progress. Existing `CheckpointEvidence`, sparse and legacy generation proofs,
 recovery debt and filesystem guards retain checkpoint authority. Capturing a
 tombstone cannot authorize local media deletion. Existing download and metadata
-queues still consume the current stream; they do not replay this inbox yet.
+queues still consume the current stream. Capture alone cannot admit queue work;
+the bounded retained-source admission below is a separately validated owner.
 
 Capture covers only incremental pages observed by existing sync in selected
 scopes. Rank inventories, bootstrap, lookup and deletion-validation scans are
 not represented as complete zone capture or historical completeness. Rank EOF
 plus a delta bridge is not an atomic snapshot or proof of absence. New future
-observations cannot retire old expired-epoch debt. Queue projection, capture-owned cursors, durable catalog selection and separate
-progress remain later stages. Historical-version retention, unrecoverable-debt acknowledgment,
+observations cannot retire old expired-epoch debt. Complete queue projection,
+capture-owned cursors, durable catalog selection and separate progress remain
+later stages; the bounded current-generation slice below does not complete them. Historical-version retention, unrecoverable-debt acknowledgment,
 epoch recovery and compaction still require explicit policy and support proof.
 The additive migration preserves existing rows and uses the migration owner's
 savepoint. Re-entry validates the table columns, primary keys, replay key and
 SQLite-assigned page identity required by source and receipt links. A conflicting
 unknown table fails without partial schema or version changes.
-Older binaries supporting only schema 29 must refuse the current database.
+Older binaries supporting only schema 30 must refuse the current database.
 
 ### Transactional source catalog and replay
 
@@ -329,7 +331,14 @@ work. Provider confirmation is an observation, not an atomic provider snapshot.
 
 This first slice supports one private library-wide pass with an explicit default
 owner, without recent caps, album exclusions, retry-only selection or metadata
-backfill-only execution. Other selections retain observations and use their
+backfill-only execution. The default `PrimarySync` constructor omits an explicit
+owner and is skipped; this slice does not infer owner identity. Real eligible
+production paths start with private `/zones/list` discovery of a non-primary
+photo zone (`SharedSync-*`) retaining explicit `_defaultOwner`, pass through
+`PhotoLibrary::all`, and resolve to one Unfiled pass. Library name, shared-selector
+or all-library selection can reach that private discovery route. Discovery does
+not replace the constructor's ownerless `PrimarySync`; shared-endpoint zones,
+ownerless zones and different owners remain outside this slice. Other selections retain observations and use their
 existing pipeline; they receive no admission receipt from this stage. Current
 media/date/filename filters and RAW, companion and path planning use the existing
 owners. The work configuration fingerprint binds their frozen evidence separately
@@ -349,6 +358,8 @@ admission, not download completion, metadata publication or verified media.
 
 Matching unfinished projected generations fence shared asset admission, identity
 mapping and metadata refresh, including independent path publication receipts.
+Content and metadata fences permit safe collision-leaf replanning by the existing
+path owners; the original receipt still retains its admission-time filename.
 Completed generations do not indefinitely pin the mutable canonical queue.
 A rotating bounded scan retries unresolved early sources without starving later
 identities. Its position is scheduling evidence and cannot promote a cursor.

@@ -213,11 +213,34 @@ impl SqliteStateDb {
 // downloaded row does not complete a failed or prepared publication elsewhere.
 const UNFINISHED_GENERATION: &str = "a.checksum=w.checksum AND a.size_bytes=w.size_bytes AND a.metadata_hash IS w.metadata_hash AND (a.status IN ('pending','failed') OR a.metadata_write_failed_at IS NOT NULL OR a.capture_repair_metadata_hash IS NOT NULL OR a.capture_repair_output_checksum IS NOT NULL OR a.capture_repair_output_size IS NOT NULL OR EXISTS(SELECT 1 FROM asset_metadata_paths p WHERE p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.provider_checksum=a.checksum AND (p.metadata_write_failed_at IS NOT NULL OR p.capture_repair_metadata_hash IS NOT NULL OR p.capture_repair_output_checksum IS NOT NULL OR p.capture_repair_output_size IS NOT NULL)))";
 
+// Keep the existing writer contract when this additive owner has no evidence.
+fn has_projected_obligation(
+    conn: &rusqlite::Connection,
+    library: &str,
+    asset: &str,
+    version: Option<&str>,
+) -> Result<bool, StateError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_work_obligations WHERE library=?1 AND asset_id=?2 AND (?3 IS NULL OR version_size=?3))",
+        params![library, asset, version], |row| row.get(0),
+    )?)
+}
+
 /// Historical admissions of completed generations cannot block ordinary updates.
 pub(super) fn guard_projected_generation(
     conn: &rusqlite::Connection,
     record: &AssetRecord,
 ) -> Result<(), StateError> {
+    if !has_projected_obligation(
+        conn,
+        &record.library,
+        &record.id,
+        Some(record.version_size.as_str()),
+    )? {
+        return Ok(());
+    }
+    // A collision-resolved leaf is path-planner evidence, not a content
+    // generation. Existing reservations and publication still own that path.
     let computed_hash = record.metadata.compute_hash();
     let metadata_hash = record
         .metadata
@@ -225,8 +248,8 @@ pub(super) fn guard_projected_generation(
         .as_deref()
         .unwrap_or(&computed_hash);
     let conflict:bool=conn.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM provider_work_obligations w JOIN assets a ON a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND {UNFINISHED_GENERATION} AND (w.checksum<>?4 OR w.size_bytes<>?5 OR w.filename<>?6 OR w.created_at IS NOT ?7 OR w.added_at IS NOT ?8 OR w.metadata_hash IS NOT ?9))"),
-        params![record.library,record.id,record.version_size.as_str(),record.checksum,i64::try_from(record.size_bytes).map_err(|_invalid|StateError::ProviderWorkInvalid)?,record.filename,encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),metadata_hash],|r|r.get(0),
+        &format!("SELECT EXISTS(SELECT 1 FROM provider_work_obligations w JOIN assets a ON a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND {UNFINISHED_GENERATION} AND (w.checksum<>?4 OR w.size_bytes IS NOT ?5 OR w.created_at IS NOT ?6 OR w.added_at IS NOT ?7 OR w.metadata_hash IS NOT ?8))"),
+        params![record.library,record.id,record.version_size.as_str(),record.checksum,i64::try_from(record.size_bytes).ok(),encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),metadata_hash],|r|r.get(0),
     )?;
     if conflict {
         Err(StateError::ProviderWorkConflict)
@@ -241,6 +264,9 @@ pub(super) fn guard_projected_mapping(
     child: &str,
     master: &str,
 ) -> Result<(), StateError> {
+    if !has_projected_obligation(conn, library, child, None)? {
+        return Ok(());
+    }
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_work_obligations w JOIN provider_work_receipts r USING(page_id,ordinal,config_hash,confirmation_hash) JOIN assets a ON a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size WHERE a.library=?1 AND a.id=?2 AND {UNFINISHED_GENERATION} AND r.master_record_name<>?3)"),params![library,child,master],|r|r.get(0))?;
     if conflict {
         Err(StateError::ProviderWorkConflict)
@@ -258,6 +284,9 @@ pub(super) fn guard_projected_metadata(
     created: f64,
     added: Option<f64>,
 ) -> Result<(), StateError> {
+    if !has_projected_obligation(conn, library, asset, Some(version))? {
+        return Ok(());
+    }
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_work_obligations w JOIN assets a ON a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND {UNFINISHED_GENERATION} AND (w.metadata_hash IS NOT ?4 OR w.created_at IS NOT ?5 OR w.added_at IS NOT ?6))"),params![library,asset,version,metadata.metadata_hash.as_deref(),created,added],|r|r.get(0))?;
     if conflict {
         Err(StateError::ProviderWorkConflict)

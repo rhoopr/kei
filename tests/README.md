@@ -506,7 +506,10 @@ replan filtered observations without replacing retained historical source facts.
 Pending/failed content and metadata conflicts retain retry text, attempts and
 prepared publication evidence. Replaying an admitted source never restores an
 old queue generation; shared asset, mapping and metadata writers preserve
-unfinished projected work. Scope/account/provider, changed-source and corrupted
+unfinished projected work. A real conflicting file forces safe current-generation
+leaf replanning through the shared planner/upsert without stranding the queue.
+Fixtures supply an explicit private default owner; the owner-omitting default
+`PrimarySync` constructor remains outside this slice. Scope/account/provider, changed-source and corrupted
 confirmation controls refuse admission. Unsupported selection and read-only
 modes perform no new work publication. The bounded scan advances past unresolved
 identities and returns to them without inferring coverage.
@@ -972,7 +975,7 @@ completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 30.
+binary (schema 25), then executes the current production CLI through schema 31.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,

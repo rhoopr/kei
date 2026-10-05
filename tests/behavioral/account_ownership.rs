@@ -739,7 +739,7 @@ async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_
         assert_eq!(
             conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
                 .unwrap(),
-            30
+            i64::from(super::support::HELPER_SCHEMA_VERSION)
         );
         assert_eq!(
             conn.query_row::<i64, _, _>(
