@@ -1259,3 +1259,261 @@ fn quiet_media_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::System
     media.sort_by(|a, b| a.0.cmp(&b.0));
     media
 }
+
+#[derive(Clone)]
+struct RecentCliPhotos {
+    first_delta: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RecentCliPhotos {
+    fn pair(&self, number: usize) -> Vec<Value> {
+        let master = format!("recent-{number}");
+        let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        vec![
+            json!({"recordName":master,"recordType":"CPLMaster","zoneID":zone,"fields":{
+                "filenameEnc":{"value":format!("recent-{number}.jpg"),"type":"STRING"},
+                "resOriginalRes":{"value":{"downloadURL":format!("https://p01.icloud-content.com/synthetic-never-fetch-recent-{number}"),"size":QUIET_MEDIA.len(),
+                    "fileChecksum":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(QUIET_MEDIA))}},
+                "resOriginalWidth":{"value":1},"resOriginalHeight":{"value":1},"resOriginalFileType":{"value":"public.jpeg"},
+                "itemType":{"value":"public.jpeg"},"adjustmentRenderType":{"value":0}},"recordChangeTag":"recent-master"}),
+            json!({"recordName":format!("asset-{master}"),"recordType":"CPLAsset","zoneID":zone,"fields":{
+                "masterRef":{"value":{"recordName":master,"zoneID":zone},"type":"REFERENCE"},
+                "assetDate":{"value":1_600_000_000_000i64 + number as i64*50_000_000_000,"type":"TIMESTAMP"},
+                "addedDate":{"value":1_700_000_000_000i64,"type":"TIMESTAMP"}},"recordChangeTag":"recent-asset"}),
+        ]
+    }
+}
+
+impl Respond for RecentCliPhotos {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        use std::sync::atomic::Ordering;
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let path = request.url.path();
+        let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        let value = if path.ends_with("/changes/zone") {
+            let continued =
+                body.pointer("/zones/0/syncToken").and_then(Value::as_str) == Some("recent-page-1");
+            let first = !continued && self.first_delta.swap(false, Ordering::SeqCst);
+            let records = if first {
+                self.pair(0)
+            } else if continued {
+                [self.pair(1), self.pair(2)].concat()
+            } else {
+                vec![]
+            };
+            json!({"zones":[{"zoneID":zone,"records":records,"syncToken":if first {"recent-page-1"}else{"recent-delta-successor"},"moreComing":first}]})
+        } else if path.ends_with("/records/lookup") {
+            let names: Vec<_> = body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["recordName"].as_str().unwrap())
+                .collect();
+            let records: Vec<_> = (0..3)
+                .flat_map(|n| self.pair(n))
+                .filter(|r| names.contains(&r["recordName"].as_str().unwrap()))
+                .collect();
+            json!({"records":records})
+        } else if path.ends_with("/internal/records/query/batch") {
+            json!({"batch":[{"records":[{"fields":{"itemCount":{"value":3}}}]}]})
+        } else if path.ends_with("/records/query")
+            && body.pointer("/query/recordType").and_then(Value::as_str)
+                == Some("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted")
+        {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            let filters = body["query"]["filterBy"].as_array().unwrap();
+            let offset = filters
+                .iter()
+                .find(|f| f["fieldName"] == "startRank")
+                .unwrap()["fieldValue"]["value"]
+                .as_u64()
+                .unwrap() as usize;
+            let limit = body["resultsLimit"].as_u64().unwrap() as usize / 2;
+            let records: Vec<_> = [2, 1, 0]
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .flat_map(|n| self.pair(n))
+                .collect();
+            json!({"records":records,"syncToken":"recent-rank-token"})
+        } else {
+            return OfflinePhotos.respond(request);
+        };
+        ResponseTemplate::new(200).set_body_json(value)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_other_account() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let server = MockServer::start().await;
+    let photos = RecentCliPhotos {
+        first_delta: Arc::new(AtomicBool::new(true)),
+        queries: Arc::new(AtomicUsize::new(0)),
+    };
+    Mock::given(method("POST"))
+        .respond_with(photos.clone())
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(QUIET_MEDIA))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    let other = seed(root, ACCOUNTS[1], "B", &server.uri());
+    // The actual binary enforces HTTPS CDN URLs. Exercise its existing local
+    // name-id7 existing-file skip owner, never the synthetic URL.
+    let text = std::fs::read_to_string(&account.config).unwrap();
+    std::fs::write(
+        &account.config,
+        text.replace(
+            "[ui]",
+            "folder_structure=\"\"\n[photos]\nfile_match_policy=\"name-id7\"\n[ui]",
+        ),
+    )
+    .unwrap();
+    for number in 0..3 {
+        std::fs::write(
+            account
+                .media
+                .parent()
+                .unwrap()
+                .join(format!("recent-{number}_YXNzZXQ.JPG")),
+            QUIET_MEDIA,
+        )
+        .unwrap();
+    }
+    Connection::open(&account.path).unwrap().execute_batch(
+        "UPDATE assets SET library='OldUnknownScope' WHERE id='retry';
+         UPDATE metadata SET key='sync_token:OldUnknownScope' WHERE key='pending_sync_token:old:PrimarySync';"
+    ).unwrap();
+    let other_before = state(&other.path);
+    let old_media = quiet_media_snapshot(account.media.parent().unwrap());
+    for cycle in 0..5 {
+        let arguments = match cycle {
+            0 => vec![
+                "sync",
+                "--recent",
+                "2",
+                "--recent-scope",
+                "global",
+                "--no-progress-bar",
+            ],
+            1 => vec![
+                "sync",
+                "--recent",
+                "3",
+                "--recent-scope",
+                "global",
+                "--no-progress-bar",
+            ],
+            _ => vec!["sync", "--no-progress-bar"],
+        };
+        let before_queries = photos.queries.load(Ordering::SeqCst);
+        let output = clean_cmd()
+            .env("KEI_DATA_DIR", root)
+            .env("ICLOUD_USERNAME", account.username)
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .args(["--config", account.config.to_str().unwrap()])
+            .args(&arguments)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap();
+        success(&output);
+        let conn = Connection::open(&account.path).unwrap();
+        // name-id7's existing-file policy skips without inventing downloaded
+        // state. Trace the actual selected byte paths; fresh publication and
+        // finalization are qualified by the dispatcher companion/overflow tests.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let names: Vec<_> = (0..3)
+            .map(|n| format!("recent-{n}_YXNzZXQ.JPG"))
+            .filter(|name| stderr.contains(name))
+            .collect();
+        if cycle == 0 {
+            assert_eq!(names, ["recent-1_YXNzZXQ.JPG", "recent-2_YXNzZXQ.JPG"]);
+            let cursor: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(cursor, "A-cursor");
+            let raw: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='recent_selection_recovery:PrimarySync'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&raw).unwrap()["complete"],
+                false
+            );
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_catalog_records WHERE record_type='CPLAsset'",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+                3
+            );
+        } else {
+            if cycle <= 2 {
+                assert_eq!(
+                    names,
+                    [
+                        "recent-0_YXNzZXQ.JPG",
+                        "recent-1_YXNzZXQ.JPG",
+                        "recent-2_YXNzZXQ.JPG"
+                    ]
+                );
+            } else {
+                assert!(names.is_empty());
+            }
+            let cursor: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                cursor, "recent-delta-successor",
+                "rank token cannot replace the source delta"
+            );
+            if cycle >= 3 {
+                assert_eq!(
+                    photos.queries.load(Ordering::SeqCst),
+                    before_queries,
+                    "quiet unchanged reopened CLI must not repeat inventory"
+                );
+            }
+        }
+        assert_eq!(conn.query_row::<String,_,_>("SELECT last_error FROM assets WHERE library='OldUnknownScope' AND id='retry' AND status='pending'",[],|r|r.get(0)).unwrap(), "A-retry-error");
+        assert_eq!(state(&other.path), other_before);
+        for (path, bytes, modified) in &old_media {
+            assert_eq!(std::fs::read(path).unwrap(), *bytes);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                *modified
+            );
+        }
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM metadata WHERE key='sync_token:OldUnknownScope'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "A-historical-debt"
+        );
+    }
+}

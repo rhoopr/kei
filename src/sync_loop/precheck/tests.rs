@@ -642,3 +642,43 @@ async fn check_changes_database_unselected_zone_token_persist_failure_still_skip
             .await;
     assert_eq!(precheck, WatchPrecheck::SkipAll);
 }
+
+#[tokio::test]
+async fn pending_recent_selection_wakes_only_its_selected_zone_on_unchanged_precheck() {
+    let db = make_state_db();
+    db.set_metadata(
+        "recent_selection_recovery:PrimarySync",
+        "malformed legacy recovery receipt",
+    )
+    .await
+    .unwrap();
+    let selected = make_run_cycle_library_state("PrimarySync", "sync_token:PrimarySync", "prior");
+    let other = make_run_cycle_library_state(
+        "SharedSync-OTHER",
+        "sync_token:SharedSync-OTHER",
+        "other-prior",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let builder = crate::sync_loop::test_support::make_run_cycle_download_config_builder(
+        directory.path(),
+        db.clone(),
+    );
+    let mut precheck = WatchPrecheck::SkipAll;
+    super::include_pending_provider_work(
+        &mut precheck,
+        &[selected, other],
+        &builder,
+        download::DownloadControls::download_hidden(),
+    )
+    .await;
+    assert!(precheck.should_sync_zone("PrimarySync"));
+    assert!(!precheck.should_sync_zone("SharedSync-OTHER"));
+    assert!(precheck.db_sync_token_after_success().is_none());
+    assert_eq!(
+        db.get_metadata("recent_selection_recovery:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("malformed legacy recovery receipt")
+    );
+}

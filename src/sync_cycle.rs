@@ -1000,11 +1000,12 @@ pub(crate) async fn run_cycle(
             }
         }
 
-        let mut checkpoint_basis = if sync_result.full_enumeration_ran {
-            CheckpointBasis::CompleteInventory
-        } else {
-            CheckpointBasis::IncrementalDelta
-        };
+        let mut checkpoint_basis =
+            if sync_result.full_enumeration_ran && !sync_result.checkpoint.completed_delta_replay {
+                CheckpointBasis::CompleteInventory
+            } else {
+                CheckpointBasis::IncrementalDelta
+            };
 
         // Eligibility reconciliation begins from a trusted prior cursor when
         // one exists. The inventory covers unchanged newly eligible assets;
@@ -1066,7 +1067,9 @@ pub(crate) async fn run_cycle(
                     sync_result.outcome =
                         merge_download_outcomes(&sync_result.outcome, &bridge_result.outcome);
                     sync_result.accumulate(&bridge_result);
-                    if !bridge_result.full_enumeration_ran {
+                    if !bridge_result.full_enumeration_ran
+                        || bridge_result.checkpoint.completed_delta_replay
+                    {
                         if let SourceCheckpointDecision::Advance { token, .. } = bridge_decision {
                             sync_result.sync_token = Some(token);
                             checkpoint_basis = CheckpointBasis::InventoryWithDeltaBridge;

@@ -50,8 +50,11 @@ fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
         return IncrementalErrorClass::SessionExpired;
     }
     if error
-        .downcast_ref::<crate::icloud::photos::error::ShadowPageError>()
+        .downcast_ref::<super::recent::RecentSelectionError>()
         .is_some()
+        || error
+            .downcast_ref::<crate::icloud::photos::error::ShadowPageError>()
+            .is_some()
     {
         return IncrementalErrorClass::CaptureRefused;
     }
@@ -421,7 +424,10 @@ pub async fn download_photos_with_sync(
                     let has_smart_folder_pass = passes
                         .iter()
                         .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
-                    let incremental_result = if has_smart_folder_pass {
+                    let recent_selection = super::recent::active(&config)
+                        .await
+                        .map_err(super::recent::RecentSelectionError)?;
+                    let incremental_result = if has_smart_folder_pass && !recent_selection {
                         download_photos_incremental_with_smart_folder_refresh(
                             download_client,
                             passes,

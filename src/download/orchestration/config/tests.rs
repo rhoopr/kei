@@ -501,16 +501,16 @@ fn test_compute_config_hash_path_only_changes_same_hash() {
 }
 
 #[test]
-fn test_compute_config_hash_different_recent_same_hash() {
+fn test_compute_config_hash_different_recent_requires_inventory() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
         s.recent = Some(crate::cli::RecentLimit::Count(100));
     });
-    assert_eq!(
+    assert_ne!(
         compute_config_hash(&a),
         compute_config_hash(&b),
-        "recent is intentionally excluded from the config hash"
+        "recent changes require inventory and a preserved-cursor bridge"
     );
 }
 
@@ -876,7 +876,7 @@ fn golden_compute_config_hash_defaults() {
     let config = build_config_with(tmp.path(), "/photos", |_| {});
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "9c00642f0507dce7",
+        hash, "ad7d38163f7d7bad",
         "compute_config_hash golden hash changed -- this will invalidate sync tokens"
     );
 }
@@ -893,7 +893,7 @@ fn golden_compute_config_hash_with_albums() {
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "9c00642f0507dce7",
+        hash, "ad7d38163f7d7bad",
         "album selection should not change the CloudKit zone-token hash"
     );
 }
@@ -908,7 +908,7 @@ fn golden_compute_config_hash_with_smart_folders() {
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "9c00642f0507dce7",
+        hash, "ad7d38163f7d7bad",
         "smart-folder selection should not change the CloudKit zone-token hash"
     );
 }
@@ -925,7 +925,34 @@ fn golden_compute_config_hash_with_unfiled_false() {
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "c9ea2589956cbb98",
+        hash, "08d06f84680c44b9",
         "compute_config_hash golden hash changed -- this will invalidate sync tokens"
+    );
+}
+
+#[test]
+fn enumeration_hash_binds_recent_scope_only_when_the_count_is_active() {
+    let tmp = TempDir::new().unwrap();
+    let global = build_config_with(tmp.path(), "/photos", |s| {
+        s.recent = Some(crate::cli::RecentLimit::Count(3));
+        s.recent_scope = Some(crate::cli::RecentScope::Global);
+    });
+    let per_filter = build_config_with(tmp.path(), "/photos", |s| {
+        s.recent = Some(crate::cli::RecentLimit::Count(3));
+        s.recent_scope = Some(crate::cli::RecentScope::PerFilter);
+    });
+    assert_ne!(
+        compute_config_hash(&global),
+        compute_config_hash(&per_filter)
+    );
+    // Public CLI rejects scope without a count; the resolved hash must still
+    // ignore its inactive stored/default value.
+    let mut disabled_global = build_config_with(tmp.path(), "/photos", |_| {});
+    disabled_global.filters.recent_scope = crate::cli::RecentScope::Global;
+    let mut disabled_per_filter = build_config_with(tmp.path(), "/photos", |_| {});
+    disabled_per_filter.filters.recent_scope = crate::cli::RecentScope::PerFilter;
+    assert_eq!(
+        compute_config_hash(&disabled_global),
+        compute_config_hash(&disabled_per_filter)
     );
 }

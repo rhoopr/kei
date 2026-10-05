@@ -202,6 +202,9 @@ pub(crate) struct CheckpointEvidence {
     pub(crate) retry_passes: Vec<PassKey>,
     pub(crate) revalidate_records: Vec<ProviderRecordId>,
     pub(crate) sparse_identity_proofs: Vec<crate::state::SparseIdentityProof>,
+    /// This result's successor came from completed changes/zone replay, even
+    /// when a recent-selection inventory also ran. A rank query never sets it.
+    pub(crate) completed_delta_replay: bool,
 }
 
 impl CheckpointEvidence {
@@ -227,6 +230,7 @@ impl CheckpointEvidence {
         self.interrupted |= other.interrupted;
         self.identity_incomplete |= other.identity_incomplete;
         self.sync_token_blocked |= other.sync_token_blocked;
+        self.completed_delta_replay |= other.completed_delta_replay;
         self.retry_passes.extend(other.retry_passes.iter().cloned());
         self.revalidate_records
             .extend(other.revalidate_records.iter().cloned());

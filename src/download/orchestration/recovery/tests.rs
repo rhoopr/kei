@@ -1501,7 +1501,6 @@ async fn bounded_full_sync_adopts_filtered_legacy_pending_file() {
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
     config.sync_mode = SyncMode::Full;
-    config.recent = Some(300);
     config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
         Utc.timestamp_opt(1_800_000_000, 0).unwrap(),
     ));
@@ -1589,7 +1588,6 @@ async fn bounded_full_sync_revalidates_policy_excluded_asset_after_later_deletio
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
     config.sync_mode = SyncMode::Full;
-    config.recent = Some(300);
     config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
         Utc.timestamp_opt(1_800_000_000, 0).unwrap(),
     ));
@@ -1938,7 +1936,7 @@ async fn pending_retry_deleted_sibling_does_not_tombstone_present_master_state()
     assert_eq!(summary.pending, 1);
 }
 
-async fn run_bounded_incremental_sync(
+async fn run_date_bounded_incremental_sync(
     db: Arc<crate::state::SqliteStateDb>,
     records: Vec<Value>,
 ) -> SyncResult {
@@ -1958,7 +1956,6 @@ async fn run_bounded_incremental_sync(
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
-    config.recent = Some(300);
     config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
         Utc.timestamp_opt(1_746_994_800, 0).unwrap(),
     ));
@@ -1984,7 +1981,7 @@ async fn incremental_source_delete_prunes_pending_row_in_bounded_sync() {
         .build();
     db.upsert_seen(&record).await.expect("seed pending row");
 
-    let result = run_bounded_incremental_sync(
+    let result = run_date_bounded_incremental_sync(
         db.clone(),
         vec![hard_deleted_change_record("PENDING_SOURCE_DELETED")],
     )
@@ -2013,7 +2010,7 @@ async fn incremental_prunes_existing_source_deleted_pending_row_without_wide_syn
         .await
         .expect("simulate old source-deleted pending row");
 
-    let result = run_bounded_incremental_sync(db.clone(), Vec::new()).await;
+    let result = run_date_bounded_incremental_sync(db.clone(), Vec::new()).await;
 
     assert!(
         !result.full_enumeration_ran,
@@ -2090,7 +2087,7 @@ async fn metadata_backfill_in_another_library_does_not_force_full_enumeration() 
     .await
     .unwrap();
     db.clear_metadata_hash_for_test("SharedSync-OTHER", "OTHER_LIBRARY_BACKFILL", "original");
-    let result = run_bounded_incremental_sync(db.clone(), Vec::new()).await;
+    let result = run_date_bounded_incremental_sync(db.clone(), Vec::new()).await;
     assert!(!result.full_enumeration_ran);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
     assert!(

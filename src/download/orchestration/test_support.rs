@@ -97,7 +97,29 @@ pub(super) fn changes_zone_session(
     changes_zone_calls: Arc<AtomicUsize>,
     records: Vec<Value>,
 ) -> CountingChangesZoneSession {
-    changes_zone_session_with_query_page(changes_zone_calls, records, json!({"records": []}), 0)
+    // These fixtures model their paired live delta records as the current
+    // inventory too. Selection queries use a distinct rank token; tombstones
+    // and relationship/unknown records remain delta-only evidence.
+    let current: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record["recordType"].as_str(),
+                Some("CPLMaster" | "CPLAsset")
+            ) && record["deleted"] != true
+        })
+        .cloned()
+        .collect();
+    let count = current
+        .iter()
+        .filter(|record| record["recordType"] == "CPLAsset")
+        .count() as u64;
+    changes_zone_session_with_query_page(
+        changes_zone_calls,
+        records,
+        json!({"records": current, "syncToken": "rank-selection-token"}),
+        count,
+    )
 }
 
 pub(super) fn changes_zone_session_with_query_page(
@@ -131,7 +153,7 @@ impl PhotosSession for CountingChangesZoneSession {
     async fn post(
         &self,
         url: &str,
-        _body: String,
+        body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         if url.contains("/changes/zone?") {
@@ -155,6 +177,23 @@ impl PhotosSession for CountingChangesZoneSession {
 
         if url.contains("/records/lookup?") || url.contains("/records/query?") {
             self.records_query_calls.fetch_add(1, Ordering::SeqCst);
+            if url.contains("/records/query?") {
+                let request: Value = serde_json::from_str(&body)?;
+                let offset = request["query"]["filterBy"]
+                    .as_array()
+                    .and_then(|filters| {
+                        filters
+                            .iter()
+                            .find(|filter| filter["fieldName"] == "startRank")
+                    })
+                    .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                    .unwrap_or(0);
+                if offset > 0 {
+                    let mut page = self.query_page.clone();
+                    page["records"] = json!([]);
+                    return Ok(page);
+                }
+            }
             return Ok(self.query_page.clone());
         }
 

@@ -596,18 +596,20 @@ async fn incremental_asset_only_expired_url_retry_preserves_child_state_identity
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 1;
-    config.recent = Some(10);
+    // Enter the actual collecting owner directly; recent selection now owns a separate inventory.
     config.state_db = Some(db.clone());
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
 
-    let result = download_photos_with_sync(
+    let result = download_photos_incremental_collecting_inner(
         &Client::new(),
         &passes,
-        Arc::new(config),
+        &Arc::new(config),
+        "zone-token-prev",
         DownloadControls::download_hidden(),
         CancellationToken::new(),
+        super::INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER,
     )
     .await
     .expect("asset-only retry should keep its child state identity");
@@ -676,18 +678,20 @@ async fn incremental_expired_url_retry_hydrates_instead_of_replaying_stale_delta
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 1;
-    config.recent = Some(10);
+    // Enter the actual collecting owner directly; recent selection now owns a separate inventory.
     config.state_db = Some(db.clone());
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
 
-    let result = download_photos_with_sync(
+    let result = download_photos_incremental_collecting_inner(
         &Client::new(),
         &passes,
-        Arc::new(config),
+        &Arc::new(config),
+        "zone-token-prev",
         DownloadControls::download_hidden(),
         CancellationToken::new(),
+        super::INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER,
     )
     .await
     .expect("expired URL retry should hydrate current records, not replay stale delta URLs");

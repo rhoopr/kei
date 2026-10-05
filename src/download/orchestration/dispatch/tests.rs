@@ -400,30 +400,51 @@ async fn smart_folder_refresh_blank_query_token_does_not_block_incremental_zone_
 }
 
 #[tokio::test]
-async fn smart_folder_incremental_recent_global_does_not_build_library_frontier() {
+async fn smart_folder_incremental_recent_global_uses_library_frontier_before_filter() {
     let changes_calls = Arc::new(AtomicUsize::new(0));
     let smart_session = CountingQuerySession::new(
         mock_photo_query_page("SMART_CHANGED", Some("zone-token")),
         1,
     );
-    let passes = smart_folder_unfiled_passes(
+    let mut passes = smart_folder_unfiled_passes(
         Arc::clone(&changes_calls),
         Vec::new(),
         smart_session.clone(),
     );
+    let library_session = changes_zone_session(
+        Arc::clone(&changes_calls),
+        incremental_photo_records("NEWER_LIBRARY_ASSET"),
+    );
+    passes[1].album = changes_album("", library_session.clone());
     let dir = TempDir::new().expect("temp dir");
     let mut config = incremental_test_config(&dir);
     config.recent = Some(1);
     config.recent_scope = crate::cli::RecentScope::Global;
 
-    let result = run_print_incremental_sync(&passes, config).await;
+    let result = download_photos_with_sync(
+        &Client::new(),
+        &passes,
+        Arc::new(config),
+        DownloadControls::dry_run_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     assert!(matches!(result.outcome, DownloadOutcome::Success));
     assert_eq!(changes_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        library_session.records_query_count() > 0,
+        "global recent selection requires the library frontier"
+    );
+    assert_eq!(
+        result.stats.downloaded, 1,
+        "SMART_CHANGED is outside the library-wide recent window"
+    );
     assert_eq!(
         smart_session.records_query_count(),
         1 + crate::icloud::photos::MAX_EMPTY_PAGE_PROBES as usize,
-        "smart-folder refresh must enumerate only the selected smart-folder stream"
+        "the selected smart-folder stream is still evaluated against the global frontier"
     );
 }
 
