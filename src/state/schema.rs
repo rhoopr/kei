@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 30;
+pub(crate) const SCHEMA_VERSION: i32 = 31;
 
 fn migrate_provider_shadow_inbox(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(
@@ -70,6 +70,84 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     }
     // Preparing the conflict target also verifies the replay uniqueness key.
     conn.prepare("INSERT INTO provider_shadow_pages(scope,request_cursor,body_hash) VALUES (?1,?2,?3) ON CONFLICT(scope,request_cursor,body_hash) DO NOTHING")?;
+    Ok(())
+}
+
+fn migrate_provider_work(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(r"
+CREATE TABLE IF NOT EXISTS provider_work_receipts (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    config_hash TEXT NOT NULL,
+    confirmation_hash TEXT NOT NULL,
+    confirmation BLOB,
+    state TEXT NOT NULL CHECK(state IN ('admitted','deferred')),
+    reason TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    master_record_name TEXT,
+    charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0),
+    PRIMARY KEY(page_id,ordinal,config_hash,confirmation_hash),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_catalog_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_work_obligations (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    config_hash TEXT NOT NULL,
+    confirmation_hash TEXT NOT NULL,
+    version_size TEXT NOT NULL,
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    added_at REAL,
+    metadata_hash TEXT NOT NULL,
+    PRIMARY KEY(page_id,ordinal,config_hash,confirmation_hash,version_size),
+    FOREIGN KEY(page_id,ordinal,config_hash,confirmation_hash) REFERENCES provider_work_receipts(page_id,ordinal,config_hash,confirmation_hash) DEFERRABLE INITIALLY DEFERRED
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_provider_work_queue ON provider_work_obligations(library,asset_id,version_size);
+CREATE TABLE IF NOT EXISTS provider_work_scan (
+    scope TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY(scope,config_hash)
+) WITHOUT ROWID;
+")?;
+    for sql in [
+        "SELECT page_id,ordinal,config_hash,confirmation_hash,confirmation,state,reason,scope,source_hash,master_record_name,charged_bytes FROM provider_work_receipts LIMIT 0",
+        "SELECT page_id,ordinal,config_hash,confirmation_hash,version_size,library,asset_id,checksum,size_bytes,filename,created_at,added_at,metadata_hash FROM provider_work_obligations LIMIT 0",
+        "SELECT scope,config_hash,page_id,ordinal FROM provider_work_scan LIMIT 0",
+    ] {
+        conn.prepare(sql)?;
+    }
+    for (table, expected) in [
+        (
+            "provider_work_receipts",
+            &["page_id", "ordinal", "config_hash", "confirmation_hash"][..],
+        ),
+        (
+            "provider_work_obligations",
+            &[
+                "page_id",
+                "ordinal",
+                "config_hash",
+                "confirmation_hash",
+                "version_size",
+            ][..],
+        ),
+        ("provider_work_scan", &["scope", "config_hash"][..]),
+    ] {
+        let actual: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
+            .query_map([table], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        if actual != expected {
+            return Err(StateError::ProviderWorkInvalid);
+        }
+    }
     Ok(())
 }
 
@@ -1046,6 +1124,7 @@ fn migrate_to_version(
         28 => migrate_legacy_preservation(conn)?,
         29 => migrate_provider_shadow_inbox(conn)?,
         30 => migrate_provider_catalog(conn)?,
+        31 => migrate_provider_work(conn)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,

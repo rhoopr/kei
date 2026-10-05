@@ -78,6 +78,16 @@ pub(super) fn validate(conn: &Connection, owner: &AccountOwner) -> Result<(), St
     Ok(())
 }
 
+pub(super) fn validate_authenticated(
+    conn: &Connection,
+    owner: &AccountOwner,
+) -> Result<(), StateError> {
+    if owner.provider.is_none() {
+        return Err(StateError::AccountIdentityUnavailable);
+    }
+    validate(conn, owner)
+}
+
 fn bind(conn: &Connection, owner: &AccountOwner) -> Result<(), StateError> {
     let provider = owner
         .provider

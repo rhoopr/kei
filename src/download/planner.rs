@@ -930,8 +930,17 @@ where
 {
     upsert_asset_master_mapping(db, &task.library, asset).await?;
 
+    db.upsert_seen(&pending_record_for_task(config, asset, task))
+        .await
+}
+
+pub(super) fn pending_record_for_task(
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task: &DownloadTask,
+) -> AssetRecord {
     let media_type = determine_media_type(task.version_size, asset);
-    let record = AssetRecord::new_pending(
+    AssetRecord::new_pending(
         Arc::clone(&task.library),
         task.asset_id.to_string(),
         task.version_size,
@@ -950,8 +959,7 @@ where
         asset,
         config,
         task.version_size,
-    ));
-    db.upsert_seen(&record).await
+    ))
 }
 
 /// Persist the durable CloudKit identifier bridge used to resolve future

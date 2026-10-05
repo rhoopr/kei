@@ -18,9 +18,16 @@ impl SqliteStateDb {
         let library = library.to_owned();
         let asset_record_name = asset_record_name.to_owned();
         let master_record_name = master_record_name.to_owned();
-        self.with_conn("upsert_asset_master_mapping", move |conn| {
+        self.with_conn_mut("upsert_asset_master_mapping", move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            super::provider_work::guard_projected_mapping(
+                &tx,
+                &library,
+                &asset_record_name,
+                &master_record_name,
+            )?;
             let now = Utc::now().timestamp();
-            conn.execute(
+            tx.execute(
                 "INSERT INTO asset_master_mappings \
                     (library, asset_record_name, master_record_name, updated_at) \
                  VALUES (?1, ?2, ?3, ?4) \
@@ -30,6 +37,7 @@ impl SqliteStateDb {
                 rusqlite::params![library, asset_record_name, master_record_name, now],
             )
             .map_err(|e| StateError::query("upsert_asset_master_mapping", e))?;
+            tx.commit()?;
             Ok(())
         })
         .await

@@ -16,3 +16,5 @@ run_scenario_test lib print_and_dry_run_preserve_downloaded_child_identity
 run_scenario_test lib selected_relation_add_without_photo
 run_scenario_test lib master_family_soft_delete
 run_scenario_test lib shared_delta_state
+
+run_scenario_test lib queue_projection

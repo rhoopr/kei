@@ -23,6 +23,8 @@ pub use album::PhotoAlbum;
 pub use album::PhotoAlbumConfig;
 #[cfg(test)]
 pub(crate) use album::ProviderLookupError;
+pub(crate) use album::catalog_observed_page;
+pub(crate) use album::work::current_asset;
 pub(crate) use album::{CompleteLegacyInventory, classify_legacy_inventory_error};
 pub(crate) use album::{
     ProviderRecordId, RecordLookupRequest, RecordResolution, RecordResolutionBatch,

@@ -343,6 +343,9 @@ pub async fn download_photos_with_sync(
         }
     }
 
+    super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
+        .await?;
+
     let result = match &config.sync_mode {
         SyncMode::Full => {
             download_photos_full_with_token(

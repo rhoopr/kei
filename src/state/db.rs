@@ -24,6 +24,7 @@ mod metadata;
 mod metadata_capture_retry;
 pub(crate) mod provider_catalog;
 pub(crate) mod provider_inbox;
+pub(crate) mod provider_work;
 pub(crate) use legacy_preservation::{
     LegacyActivationProof, LegacyFileEvidence, LegacyPreparationSnapshot, LegacyPreservation,
 };

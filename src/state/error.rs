@@ -8,6 +8,18 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum StateError {
     #[error(
+        "Provider work projection is full; source observations and unfinished obligations are retained."
+    )]
+    ProviderWorkFull,
+    #[error(
+        "Provider work provenance or admission evidence is inconsistent; unfinished obligations are retained."
+    )]
+    ProviderWorkInvalid,
+    #[error(
+        "Provider generation conflicts with unfinished projected work; retaining the original obligation."
+    )]
+    ProviderWorkConflict,
+    #[error(
         "Provider catalog projection is full; retaining captured observations and the current checkpoint. No automatic pruning is permitted."
     )]
     ProviderCatalogFull,

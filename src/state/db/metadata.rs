@@ -428,6 +428,9 @@ impl SqliteStateDb {
                         detail: "missing metadata snapshot for stored rendition".into(),
                     })
             };
+            for (version,_,_,_,_) in &rows {
+                super::provider_work::guard_projected_metadata(conn,&library,&asset_id,version,snapshot(version)?,created_at,added_at)?;
+            }
             // Validate the entire family, including additional paths, before any
             // write. Each prepared publication belongs to its rendition's hash and
             // to the capture timestamp it was prepared against.
