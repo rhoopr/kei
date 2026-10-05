@@ -8,6 +8,14 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum StateError {
     #[error(
+        "Provider catalog projection is full; retaining captured observations and the current checkpoint. No automatic pruning is permitted."
+    )]
+    ProviderCatalogFull,
+    #[error(
+        "Provider catalog source provenance or projection is inconsistent; retaining observations and the current checkpoint."
+    )]
+    ProviderCatalogInvalid,
+    #[error(
         "Provider shadow inbox is full; retaining observations and the current checkpoint. No automatic pruning is permitted."
     )]
     ProviderInboxFull,

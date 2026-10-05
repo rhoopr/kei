@@ -666,3 +666,237 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_stays_quiet() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(OfflinePhotos)
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+        "syncToken":"retained-source-successor","moreComing":false,"records":[
+            {"recordName":"retained-master","recordType":"CPLMaster","fields":{"futureBits":{"value":[1,2,3]}}},
+            {"recordName":"retained-child","recordType":"CPLAsset","fields":{"masterRef":{"value":{"recordName":"retained-master"}}}},
+            {"recordName":"retained-future","recordType":"FutureRecord","fields":{"peer":{"value":{"recordName":"external-peer","zoneID":{"zoneName":"external-zone","ownerRecordName":"external-owner"}}}}},
+            {"recordName":"retained-tomb","deleted":true,"futureTombBytes":[5,9]}
+        ]}]})).unwrap();
+    let scope=serde_json::to_string(&json!({"format":1,"realm":"com","container":"com.apple.photos.cloud","environment":"production","database":"private","zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}})).unwrap();
+    {
+        let conn = Connection::open(&account.path).unwrap();
+        // Keep durable retry/old-epoch obligations in an unrelated scope so a
+        // quiet PrimarySync cycle does not independently process those rows.
+        // The seed's pending_sync_token key is a config candidate, not debt;
+        // replace it with actual unresolved source evidence for this fixture.
+        conn.execute_batch("UPDATE assets SET library='OldUnknownScope' WHERE id='retry'; DELETE FROM metadata WHERE key='pending_sync_token:old:PrimarySync';").unwrap();
+        let original =
+            json!([1, "retained-original", "OldUnknownScope", "private-owner"]).to_string();
+        let observed =
+            json!([1, "retained-observed", "OldUnknownScope", "private-owner"]).to_string();
+        conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at) VALUES('OldUnknownScope','historical-source',?1,?2,1,1700000000)",params![original,observed]).unwrap();
+        let owner: (String, String) = conn
+            .query_row(
+                "SELECT account_key,provider_key FROM account_owner",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let identities = [
+            ("retained-master", Some("CPLMaster"), false),
+            ("retained-child", Some("CPLAsset"), false),
+            ("retained-future", Some("FutureRecord"), false),
+            ("retained-tomb", None, true),
+        ];
+        let charge = raw.len()
+            + scope.len()
+            + "A-cursor".len()
+            + "retained-source-successor".len()
+            + owner.0.len()
+            + owner.1.len()
+            + 128
+            + identities
+                .iter()
+                .map(|(name, kind, _)| name.len() + kind.map_or(0, str::len) + 32)
+                .sum::<usize>();
+        conn.execute("INSERT INTO provider_shadow_pages(account_key,provider_key,scope,request_cursor,successor,more_coming,body_hash,body,charged_bytes,observed_at) VALUES(?1,?2,?3,'A-cursor','retained-source-successor',0,?4,?5,?6,1700000000)",params![owner.0,owner.1,scope,format!("{:x}",Sha256::digest(&raw)),raw,charge as i64]).unwrap();
+        let id = conn.last_insert_rowid();
+        for (ordinal, (name, kind, deleted)) in identities.iter().enumerate() {
+            conn.execute("INSERT INTO provider_shadow_records(page_id,ordinal,record_name,record_type,deleted) VALUES(?1,?2,?3,?4,?5)",params![id,ordinal as i64,name,kind,deleted]).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO provider_shadow_receipts VALUES(?1,?2)",
+            params![scope, id],
+        )
+        .unwrap();
+        conn.execute_batch("DROP TABLE provider_catalog_pages; DROP TABLE provider_catalog_debt; DROP TABLE provider_catalog_references; DROP TABLE provider_catalog_records; PRAGMA user_version=29;").unwrap();
+    }
+    success(&command(root, &account, &["status"]));
+    {
+        let conn = Connection::open(&account.path).unwrap();
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            30
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_catalog_records",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            0,
+            "status migration must not invent indexing proof"
+        );
+        conn.execute_batch("CREATE TRIGGER catalog_cli_fault BEFORE INSERT ON provider_catalog_pages BEGIN SELECT RAISE(ABORT,'synthetic CLI catalog receipt failure'); END;").unwrap();
+    }
+    let before = state(&account.path);
+    let debt_before = rows(
+        &account.path,
+        "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name",
+    );
+    for _ in 0..2 {
+        let out = command(root, &account, &["sync", "--no-progress-bar"]);
+        let diagnostics = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            diagnostics.contains("synthetic CLI catalog receipt failure"),
+            "{diagnostics}"
+        );
+        assert!(!diagnostics.contains("falling back to full enumeration"));
+        assert_eq!(state(&account.path), before);
+        assert_eq!(
+            rows(
+                &account.path,
+                "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name"
+            ),
+            debt_before
+        );
+        assert_eq!(
+            std::fs::read(&account.media).unwrap(),
+            b"known media belonging only to account A"
+        );
+        let conn = Connection::open(&account.path).unwrap();
+        for table in [
+            "provider_catalog_records",
+            "provider_catalog_references",
+            "provider_catalog_debt",
+            "provider_catalog_pages",
+        ] {
+            assert_eq!(
+                conn.query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>("SELECT body FROM provider_shadow_pages", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+            raw
+        );
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.url.path().ends_with("/changes/zone")),
+        "startup replay refusal must happen before live delta dispatch"
+    );
+    Connection::open(&account.path)
+        .unwrap()
+        .execute_batch("DROP TRIGGER catalog_cli_fault")
+        .unwrap();
+    let recover_with_retained_debt = || {
+        let out = command(root, &account, &["sync", "--no-progress-bar"]);
+        let diagnostics = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "retained sparse debt must keep the overall cycle incomplete"
+        );
+        assert!(diagnostics.contains("1 sync failures"), "{diagnostics}");
+        assert!(
+            !diagnostics.contains("synthetic CLI catalog receipt failure"),
+            "{diagnostics}"
+        );
+        assert!(
+            !diagnostics.contains("falling back to full enumeration"),
+            "{diagnostics}"
+        );
+    };
+    recover_with_retained_debt();
+    let frozen = rows(
+        &account.path,
+        "SELECT * FROM provider_catalog_pages ORDER BY page_id",
+    );
+    for _ in 0..2 {
+        recover_with_retained_debt();
+        assert_eq!(state(&account.path), before);
+        assert_eq!(
+            rows(
+                &account.path,
+                "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name"
+            ),
+            debt_before
+        );
+        let conn = Connection::open(&account.path).unwrap();
+        for (table, count) in [
+            ("provider_catalog_records", 4),
+            ("provider_catalog_references", 2),
+            ("provider_catalog_debt", 4),
+            ("provider_catalog_pages", 2),
+        ] {
+            assert_eq!(
+                conn.query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+                count
+            );
+        }
+        assert_eq!(
+            rows(
+                &account.path,
+                "SELECT * FROM provider_catalog_pages ORDER BY page_id"
+            ),
+            frozen
+        );
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>(
+                "SELECT body FROM provider_shadow_pages ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            raw
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            "A-cursor",
+            "retained observation successor never owns current checkpoint"
+        );
+        assert_eq!(
+            std::fs::read(&account.media).unwrap(),
+            b"known media belonging only to account A"
+        );
+        assert_eq!(
+            std::fs::read_dir(account.media.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+}

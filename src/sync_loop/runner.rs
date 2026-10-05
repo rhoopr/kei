@@ -495,6 +495,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     );
 
     let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
+    photos_service.replay_catalog(&shutdown_token).await?;
+    if shutdown_token.is_cancelled() {
+        return Ok(());
+    }
 
     // Suppress the tty driver's `^C` echo for the lifetime of this sync run.
     // Without this, the echoed `^C` overflows the bar's right-edge filler

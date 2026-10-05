@@ -102,6 +102,7 @@ changing behavior.
 | Account database boundary | `src/state/db/account.rs`, `src/commands/migrate_state.rs` | Validates an independent owner before state consumption, creates authenticated state, and explicitly adopts a preserved legacy snapshot. |
 | SQLite facade and connection lifecycle | `src/state/mod.rs`, `src/state/db.rs` | Preserves state entry points, opens connections, and dispatches blocking SQLite work. Child owners retain their transaction boundaries. |
 | Observed provider pages | `src/icloud/photos/inbox.rs`, `src/state/db/provider_inbox.rs` | Binds validated incremental observations to the account, retains source identities and original bytes atomically with a shadow receipt, and applies bounded backpressure. It does not authorize provider checkpoints. |
+| Provider source catalog | `src/icloud/photos/projection.rs`, `src/state/db/provider_catalog.rs` | Validates replay provenance, derives versioned source facts, and atomically indexes records, references and unresolved evidence. Its receipt does not authorize queues or checkpoints. |
 | SQLite schema | `src/state/schema.rs` | Owns schema versions and migrations. |
 | State-store contracts | `src/state/db/contracts.rs` | Defines store roles and records exchanged with callers. |
 | Asset state transitions | `src/state/db/assets.rs` | Owns asset lifecycle, download finalization, retry eligibility, and provider source-state transitions. |
@@ -267,15 +268,51 @@ Capture covers only incremental pages observed by existing sync in selected
 scopes. Rank inventories, bootstrap, lookup and deletion-validation scans are
 not represented as complete zone capture or historical completeness. Rank EOF
 plus a delta bridge is not an atomic snapshot or proof of absence. New future
-observations cannot retire old expired-epoch debt. Transactional projection,
-capture-owned cursors, durable catalog selection and separate progress remain
-later stages. Historical-version retention, unrecoverable-debt acknowledgment,
+observations cannot retire old expired-epoch debt. Queue projection, capture-owned cursors, durable catalog selection and separate
+progress remain later stages. Historical-version retention, unrecoverable-debt acknowledgment,
 epoch recovery and compaction still require explicit policy and support proof.
 The additive migration preserves existing rows and uses the migration owner's
 savepoint. Re-entry validates the table columns, primary keys, replay key and
 SQLite-assigned page identity required by source and receipt links. A conflicting
 unknown table fails without partial schema or version changes.
-Older binaries supporting only schema 28 must refuse this database.
+Older binaries supporting only schema 29 must refuse the current database.
+
+### Transactional source catalog and replay
+
+Schema 30 adds `provider_catalog_records`, literal source references in
+`provider_catalog_references`, unresolved indexing evidence in
+`provider_catalog_debt`, and versioned per-page receipts in
+`provider_catalog_pages`. Records refer to the original captured page and source
+ordinal. All payload versions remain separate observations; replay order and
+opaque provider cursors do not establish a current version. Original inbox bytes
+retain fields that the catalog does not interpret.
+
+Startup replays pending captured pages before planning libraries, one page at a
+time with cancellation between transactions. Live capture indexes its committed
+page before lossy pairing. The provider adapter revalidates account-bound scope,
+original hash, page metadata and source identities, then derives facts on the
+blocking pool. Read transactions provide a coherent source snapshot; the immediate
+write transaction rechecks ownership and reloads the source before inserting all
+records, reference facts, unresolved evidence and the final receipt together. A
+failed projection retains the captured page and existing checkpoint for restart.
+It cannot trigger an uncaptured rank fallback.
+
+Unknown kinds, typeless tombstones, malformed references and incomplete asset or
+container links retain unresolved evidence. A literal target name is not proof of
+that target's identity or materialization. No tombstone authorizes local deletion.
+Receipt version 1 means source facts were indexed, including unresolved evidence;
+it does not mean selected, downloaded, rewritten, verified, historically complete
+or acknowledged recovery debt. Existing queues still consume the live stream.
+
+Derived page facts have a 16 MiB logical charge limit and a separate 512 MiB
+catalog index budget. These are operational backpressure limits, not physical
+SQLite/WAL quotas or a retention promise. A full index holds the checkpoint and
+retains pending source observations; exact completed-page replay validates facts
+and remains possible at capacity. Startup has no fixed latency guarantee. Nothing
+is automatically pruned or discarded. WAL `NORMAL`, filesystem qualifications,
+existing checkpoint evidence, publication receipts and metadata obligations are
+unchanged. Historical intermediate retention and unrecoverable-debt acknowledgment
+still require explicit policy decisions before dependent stages.
 
 ### Sync and provider checkpoints
 

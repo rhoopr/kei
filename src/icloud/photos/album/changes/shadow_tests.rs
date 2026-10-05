@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 #[derive(Clone)]
-struct BodySession(Vec<u8>);
+pub(super) struct BodySession(pub(super) Vec<u8>);
 
 #[async_trait::async_trait]
 impl PhotosSession for BodySession {
@@ -54,7 +54,7 @@ async fn legacy_unknown_delta_loses_source_before_successor_control() {
     assert_eq!(token.await.unwrap(), "successor");
 }
 
-fn owner() -> AccountOwner {
+pub(super) fn owner() -> AccountOwner {
     AccountOwner::authenticated(
         "synthetic@example.invalid",
         "com",
@@ -63,15 +63,15 @@ fn owner() -> AccountOwner {
     .unwrap()
 }
 
-async fn open(path: &std::path::Path) -> Arc<SqliteStateDb> {
+pub(super) async fn open(path: &std::path::Path) -> Arc<SqliteStateDb> {
     Arc::new(SqliteStateDb::open_owned(path, &owner()).await.unwrap())
 }
 
-fn capture(db: &Arc<SqliteStateDb>) -> ShadowCapture {
+pub(super) fn capture(db: &Arc<SqliteStateDb>) -> ShadowCapture {
     ShadowCapture::new(Arc::clone(db), owner(), "com")
 }
 
-fn album(body: Vec<u8>, capture: ShadowCapture) -> crate::icloud::photos::PhotoAlbum {
+pub(super) fn album(body: Vec<u8>, capture: ShadowCapture) -> crate::icloud::photos::PhotoAlbum {
     let mut album = make_album_with_session(100, Box::new(BodySession(body)));
     album.set_shadow_capture(capture, Arc::from("private"));
     album
@@ -95,7 +95,9 @@ fn counts(db: &SqliteStateDb) -> (i64, i64, i64) {
     )
 }
 
-async fn collect(album: &crate::icloud::photos::PhotoAlbum) -> (Vec<String>, Vec<String>, String) {
+pub(super) async fn collect(
+    album: &crate::icloud::photos::PhotoAlbum,
+) -> (Vec<String>, Vec<String>, String) {
     let (stream, token) = album.changes_stream("saved");
     let mut events = Vec::new();
     let mut errors = Vec::new();

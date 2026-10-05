@@ -1,11 +1,12 @@
 //! Additive observations; these receipts never authorize a legacy checkpoint.
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use super::{SqliteStateDb, account};
 use crate::state::error::StateError;
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SourceIdentity {
     pub(crate) name: String,
     pub(crate) record_type: Option<String>,
@@ -13,6 +14,7 @@ pub(crate) struct SourceIdentity {
 }
 
 /// Constructed by the provider adapter only after complete page validation.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ObservedPage {
     pub(crate) scope: String,
     pub(crate) request_cursor: String,
@@ -22,13 +24,86 @@ pub(crate) struct ObservedPage {
     pub(crate) identities: Vec<SourceIdentity>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CapturedPageId(pub(crate) i64);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StoredPage {
+    pub(crate) id: CapturedPageId,
+    pub(crate) account_key: String,
+    pub(crate) provider_key: String,
+    pub(crate) body_hash: String,
+    pub(crate) page: ObservedPage,
+}
+
+pub(super) fn load_page(
+    conn: &Connection,
+    id: CapturedPageId,
+    max_body_bytes: usize,
+) -> Result<StoredPage, StateError> {
+    let body_len: i64 = conn.query_row(
+        "SELECT length(body) FROM provider_shadow_pages WHERE id=?1",
+        [id.0],
+        |row| row.get(0),
+    )?;
+    if u64::try_from(body_len).map_or(true, |len| len > max_body_bytes as u64) {
+        return Err(StateError::ProviderCatalogInvalid);
+    }
+    let (account_key, provider_key, scope, request_cursor, successor, more, body_hash, body):
+        (String,String,String,String,String,i64,String,Vec<u8>) = conn.query_row(
+        "SELECT account_key,provider_key,scope,request_cursor,successor,more_coming,body_hash,body FROM provider_shadow_pages WHERE id=?1",
+        [id.0], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+    )?;
+    let owner: (String, String) = conn.query_row(
+        "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if (&account_key, &provider_key) != (&owner.0, &owner.1)
+        || !matches!(more, 0 | 1)
+        || body_hash != format!("{:x}", Sha256::digest(&body))
+    {
+        return Err(StateError::ProviderCatalogInvalid);
+    }
+    let identities = conn.prepare(
+        "SELECT ordinal,record_name,record_type,deleted FROM provider_shadow_records WHERE page_id=?1 ORDER BY ordinal",
+    )?.query_map([id.0], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,
+        row.get::<_,Option<String>>(2)?,row.get::<_,i64>(3)?)))?.collect::<Result<Vec<_>,_>>()?;
+    for (expected, (ordinal, _, _, deleted)) in identities.iter().enumerate() {
+        if i64::try_from(expected).ok() != Some(*ordinal) || !matches!(deleted, 0 | 1) {
+            return Err(StateError::ProviderCatalogInvalid);
+        }
+    }
+    Ok(StoredPage {
+        id,
+        account_key,
+        provider_key,
+        body_hash,
+        page: ObservedPage {
+            scope,
+            request_cursor,
+            successor,
+            more_coming: more == 1,
+            body,
+            identities: identities
+                .into_iter()
+                .map(|(_, name, record_type, deleted)| SourceIdentity {
+                    name,
+                    record_type,
+                    deleted: deleted == 1,
+                })
+                .collect(),
+        },
+    })
+}
+
 impl SqliteStateDb {
     pub(crate) async fn capture_shadow_page(
         &self,
         owner: account::AccountOwner,
         page: ObservedPage,
         capacity: u64,
-    ) -> Result<(), StateError> {
+    ) -> Result<CapturedPageId, StateError> {
         self.with_conn_mut("capturing provider shadow page", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate(&tx, &owner)?;
@@ -85,7 +160,7 @@ impl SqliteStateDb {
                 params![page.scope, page_id],
             )?;
             tx.commit()?;
-            Ok(())
+            Ok(CapturedPageId(page_id))
         }).await
     }
 }
