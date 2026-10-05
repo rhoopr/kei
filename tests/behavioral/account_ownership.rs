@@ -1688,8 +1688,10 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         ));
     }
     drop(conn);
-    // The behavioral state factory models released schema25. Let the actual
-    // binary run its migration before installing a fault in the additive table.
+    // Deliberately turn the current-shape synthetic seed into an owned schema33
+    // fixture, then let the actual binary run schema34's additive migration.
+    // The independent released-upgrade history covers schema25 preservation.
+    Connection::open(&account.path).unwrap().execute_batch("DROP TABLE provider_active_sources; DROP TABLE provider_active_destinations; DROP TABLE provider_active_decisions; DROP TABLE provider_selection_rank_records; DROP TABLE provider_selection_rank_pages; DROP TABLE provider_active_generations; PRAGMA user_version=33;").unwrap();
     success(&command(root, &account, &["status"]));
     let conn = Connection::open(&account.path).unwrap();
     conn.execute_batch("CREATE TRIGGER private_cli_destination_fault BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN NEW.verified_media=1 AND replace(NEW.compat_path,char(92),'/') LIKE '%/B/%' BEGIN SELECT RAISE(ABORT,'synthetic private B receipt interruption'); END;").unwrap();

@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 33;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 34;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -96,6 +96,67 @@ pub(super) fn create_state_db(data_dir: &std::path::Path, username: &str) -> rus
     bind_synthetic_owner(&conn, username);
     conn.execute_batch(
         r"
+
+CREATE TABLE IF NOT EXISTS provider_active_generations (
+ id TEXT PRIMARY KEY, account_key TEXT NOT NULL, provider_key TEXT NOT NULL,
+ scope TEXT NOT NULL, config_hash TEXT NOT NULL, basis TEXT NOT NULL,
+ metadata_enabled INTEGER NOT NULL CHECK(metadata_enabled IN (0,1)),
+ specification BLOB NOT NULL, specification_hash TEXT NOT NULL,
+ sealed INTEGER NOT NULL DEFAULT 0 CHECK(sealed IN (0,1)),
+ checkpoint_ready INTEGER NOT NULL DEFAULT 0 CHECK(checkpoint_ready IN (0,1)),
+ checkpoint_veto TEXT, seal_hash TEXT, seal_header_hash TEXT, created_at INTEGER NOT NULL,
+ replay_after TEXT, last_replayed_at INTEGER NOT NULL DEFAULT 0 CHECK(last_replayed_at>=0),
+ charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_rank_pages (
+ id TEXT PRIMARY KEY, generation TEXT NOT NULL REFERENCES provider_active_generations(id),
+ pass_key TEXT NOT NULL, request BLOB NOT NULL, request_hash TEXT NOT NULL,
+ body BLOB NOT NULL, body_hash TEXT NOT NULL,
+ charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0),
+ UNIQUE(generation,pass_key,request_hash,body_hash)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_rank_records (
+ page_id TEXT NOT NULL REFERENCES provider_selection_rank_pages(id),
+ ordinal INTEGER NOT NULL CHECK(ordinal>=0), record_name TEXT NOT NULL,
+ record_type TEXT, deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
+ PRIMARY KEY(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_selection_rank_identity ON provider_selection_rank_records(record_name,page_id);
+CREATE TABLE IF NOT EXISTS provider_active_decisions (
+ generation TEXT NOT NULL REFERENCES provider_active_generations(id), pass_key TEXT NOT NULL,
+ child TEXT NOT NULL, manifest BLOB NOT NULL, manifest_hash TEXT NOT NULL,
+ outcome TEXT NOT NULL CHECK(outcome IN ('selected','excluded','deferred')),
+ admission TEXT NOT NULL CHECK(admission IN ('admitted','excluded','deferred')),
+ reason TEXT NOT NULL, admission_hash TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+ next_retry_at INTEGER NOT NULL DEFAULT 0,
+ charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0),
+ PRIMARY KEY(generation,pass_key,child)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_active_sources (
+ generation TEXT NOT NULL, pass_key TEXT NOT NULL, child TEXT NOT NULL,
+ page_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+ PRIMARY KEY(generation,pass_key,child,page_id,ordinal),
+ FOREIGN KEY(generation,pass_key,child) REFERENCES provider_active_decisions(generation,pass_key,child),
+ FOREIGN KEY(page_id,ordinal) REFERENCES provider_selection_rank_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_active_destinations (
+ generation TEXT NOT NULL, pass_key TEXT NOT NULL, child TEXT NOT NULL,
+ library TEXT NOT NULL, asset_id TEXT NOT NULL, master TEXT NOT NULL,
+ version_size TEXT NOT NULL, path TEXT NOT NULL, compat_path TEXT NOT NULL,
+ checksum TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK(size_bytes>=0),
+ created_at REAL NOT NULL, added_at REAL, metadata_hash TEXT NOT NULL,
+ admitted INTEGER NOT NULL CHECK(admitted IN (0,1)),
+ verified_media INTEGER NOT NULL DEFAULT 0 CHECK(verified_media IN (0,1)),
+ verified_metadata INTEGER NOT NULL DEFAULT 0 CHECK(verified_metadata IN (0,1)),
+ local_checksum TEXT, source_checksum TEXT, grouping_hash TEXT, intent_hash TEXT, progress_hash TEXT,
+ prepared_checksum TEXT, prepared_size INTEGER, prepared_hash TEXT,
+ CHECK((prepared_checksum IS NULL AND prepared_size IS NULL AND prepared_hash IS NULL)
+    OR (prepared_checksum IS NOT NULL AND prepared_size IS NOT NULL AND prepared_hash IS NOT NULL
+        AND length(prepared_checksum)=64 AND prepared_size>=0 AND length(prepared_hash)=64)),
+ PRIMARY KEY(generation,pass_key,child,version_size,path),
+ FOREIGN KEY(generation,pass_key,child) REFERENCES provider_active_decisions(generation,pass_key,child)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_active_destination_identity ON provider_active_destinations(library,asset_id,version_size,admitted,verified_media,verified_metadata);
 
 CREATE TABLE IF NOT EXISTS provider_selection_generations (
     id TEXT PRIMARY KEY,
