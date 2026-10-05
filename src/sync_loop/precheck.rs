@@ -132,6 +132,40 @@ pub(super) async fn include_pending_local_work(
     }
 }
 
+/// Retained current-config work is scheduled locally even when the provider is
+/// quiet. Unsupported selection remains with its existing owner.
+pub(super) async fn include_pending_provider_work(
+    watch_precheck: &mut WatchPrecheck,
+    library_states: &[LibraryState],
+    build_download_config: &crate::sync_cycle::BuildDownloadConfigFn<'_>,
+    controls: download::DownloadControls,
+) {
+    let mut zones = rustc_hash::FxHashSet::default();
+    for library in library_states {
+        let config = build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from(library.zone_name.as_str()),
+        );
+        let pending = match download::has_due_retained_work(&library.plan.passes, &config, controls)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                // Wake the normal owner to revalidate and report the failure;
+                // an inspection failure cannot authorize skipping local work.
+                tracing::warn!(error = %error, "Could not inspect retained provider work before watch pre-check");
+                true
+            }
+        };
+        if pending {
+            zones.insert(library.zone_name.clone());
+        }
+    }
+    watch_precheck.include_local_work_zones(zones);
+}
+
 /// Legacy metadata key for the unscoped database-level token used by
 /// `/changes/database` before scoped provenance rows.
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use super::{admit_retained_work, config_hash};
+use super::{admit_retained_work, config_hash, has_due_retained_work};
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::orchestration::models::{
     DownloadControls, DownloadReporting, DownloadRunMode, DownloadStore,
@@ -53,6 +53,14 @@ impl PhotosSession for CurrentSession {
             return Ok(
                 json!({"records":[{"recordName":"index-state","fields":{"state":{"value":"FINISHED"}}}]}),
             );
+        }
+        if url.contains("/changes/zone?") {
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone_name.as_ref(),"ownerRecordName":"_defaultOwner"},"records":[],"syncToken":"quiet-zone-cursor","moreComing":false}]}),
+            );
+        }
+        if url.contains("/internal/records/query/batch?") {
+            return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]}));
         }
         anyhow::ensure!(
             url.contains("/records/lookup?"),
@@ -425,6 +433,7 @@ async fn queue_projection_receipt_fault_rolls_back_real_queue_mapping_and_scan_w
         "provider_work_obligations",
         "provider_work_receipts",
         "provider_work_scan",
+        "provider_work_retries",
     ] {
         assert_eq!(f.count(table), 0, "{table}");
     }
@@ -585,6 +594,15 @@ async fn queue_projection_lookup_failures_retain_fixed_debt_and_recover_current_
             "current_lookup_unresolved"
         );
         *f.session.corrupt.lock().unwrap() = None;
+        assert!(
+            !has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+                .await
+                .unwrap()
+        );
+        f.db.acquire_lock("synthetic retry clock")
+            .unwrap()
+            .execute_batch("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1")
+            .unwrap();
         f.cycle().await.unwrap();
         assert_eq!(f.count("assets"), 1);
         assert_eq!(f.count("provider_work_obligations"), 1);
@@ -640,6 +658,11 @@ async fn queue_projection_unsupported_selection_and_read_only_modes_do_not_publi
         assert_eq!(f.count("assets"), 0);
         assert_eq!(f.count("provider_work_receipts"), 0);
         assert_eq!(f.session.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls)
+                .await
+                .unwrap()
+        );
         f.preserved().await;
     }
 }
@@ -700,7 +723,7 @@ async fn queue_projection_schema30_migration_and_conflict_preserve_unknown_histo
                         .unwrap()
                         .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                         .unwrap(),
-                    31
+                    i64::from(crate::state::schema::SCHEMA_VERSION)
                 );
             }
             f.preserved().await;
@@ -1159,6 +1182,7 @@ async fn queue_projection_derived_plan_budget_rejects_without_partial_admission(
         "provider_work_obligations",
         "provider_work_receipts",
         "provider_work_scan",
+        "provider_work_retries",
     ] {
         assert_eq!(f.count(table), 0, "{table}");
     }
@@ -1339,6 +1363,7 @@ async fn queue_projection_default_primary_uses_discovered_owner_and_retained_sou
         "provider_work_obligations",
         "provider_work_receipts",
         "provider_work_scan",
+        "provider_work_retries",
     ] {
         assert_eq!(f.count(table), 0, "{table}");
     }
@@ -1399,6 +1424,386 @@ async fn queue_projection_default_primary_uses_discovered_owner_and_retained_sou
                 )
                 .unwrap();
         assert_eq!(retained, ownerless_body);
+        f.preserved().await;
+    }
+}
+
+#[tokio::test]
+async fn queue_projection_retry_deadline_survives_reopen_is_bounded_and_is_not_completion() {
+    let f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    *f.session.corrupt.lock().unwrap() = Some("missing");
+    for attempt in 1..=7 {
+        assert!(
+            has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+                .await
+                .unwrap()
+        );
+        f.cycle().await.unwrap();
+        let (attempts, last, next): (u32, i64, i64) =
+            f.db.acquire_lock("retry schedule")
+                .unwrap()
+                .query_row(
+                    "SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(attempts, attempt);
+        assert_eq!(
+            next - last,
+            (3600 * (1_i64 << (attempt - 1).min(5))).min(86400)
+        );
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let (_, scope, zone) = f.pass.album.catalog_work_scope().unwrap().unwrap();
+        let hash = config_hash(&f.config.with_pass(&f.pass), &zone);
+        assert!(
+            !reopened
+                .has_due_provider_work(owner(), scope, hash)
+                .await
+                .unwrap()
+        );
+        let calls = f.session.calls.load(Ordering::SeqCst);
+        f.cycle().await.unwrap();
+        assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(f.count("assets"), 0);
+        assert_eq!(f.count("provider_work_obligations"), 0);
+        f.preserved().await;
+        f.db.acquire_lock("synthetic due deadline")
+            .unwrap()
+            .execute_batch("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1")
+            .unwrap();
+    }
+    *f.session.corrupt.lock().unwrap() = None;
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 1);
+    assert_eq!(f.count("provider_work_retries"), 0);
+    assert!(
+        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap(),
+        "admission before dispatch remains local queue work"
+    );
+}
+
+#[tokio::test]
+async fn queue_projection_due_early_retry_is_revisited_behind_scan_and_new_tail() {
+    let f = Fixture::new().await;
+    f.capture(records("early", OLD, "source"), "early").await;
+    *f.session.corrupt.lock().unwrap() = Some("missing");
+    f.cycle().await.unwrap();
+    *f.session.corrupt.lock().unwrap() = None;
+    let mut current = Vec::new();
+    let mut original = Vec::new();
+    for index in 0..70 {
+        current.extend(records(&format!("late-{index}"), CURRENT, "current"));
+        original.extend(records(&format!("late-{index}"), OLD, "source"));
+    }
+    *f.session.records.lock().unwrap() = current;
+    f.capture(original, "late").await;
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 64);
+    f.db.acquire_lock("due behind historical scan")
+        .unwrap()
+        .execute_batch("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1")
+        .unwrap();
+    let (_, scope, zone) = f.pass.album.catalog_work_scope().unwrap().unwrap();
+    let source =
+        f.db.next_work_source(
+            owner(),
+            scope,
+            config_hash(&f.config.with_pass(&f.pass), &zone),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        source.page.page.identities[usize::try_from(source.ordinal).unwrap()].name,
+        "asset-early"
+    );
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 70);
+    assert_eq!(
+        f.db.acquire_lock("due attempt oracle")
+            .unwrap()
+            .query_row::<u32, _, _>("SELECT attempts FROM provider_work_retries", [], |r| r
+                .get(0))
+            .unwrap(),
+        2
+    );
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_wake_requires_current_scope_config_and_unfinished_generation() {
+    let mut f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    assert!(
+        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap()
+    );
+    f.cycle().await.unwrap();
+    assert!(
+        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap()
+    );
+    let (_, scope, zone) = f.pass.album.catalog_work_scope().unwrap().unwrap();
+    let hash = config_hash(&f.config.with_pass(&f.pass), &zone);
+    assert!(
+        !f.db
+            .has_due_provider_work(owner(), "different-scope".into(), hash.clone())
+            .await
+            .unwrap()
+    );
+    let mut unselected = f.plan().await;
+    unselected.config_hash = "f".repeat(64);
+    unselected.records.clear();
+    unselected.reason = "currently_filtered";
+    f.db.project_provider_work(owner(), unselected, 512 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        !f.db
+            .has_due_provider_work(owner(), scope.clone(), "f".repeat(64))
+            .await
+            .unwrap()
+    );
+    f.db.acquire_lock("synthetic queue completion")
+        .unwrap()
+        .execute_batch("UPDATE assets SET status='downloaded'")
+        .unwrap();
+    assert!(
+        !has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap()
+    );
+    f.db.acquire_lock("independent unfinished path proof").unwrap().execute_batch("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,metadata_write_failed_at) SELECT library,id,version_size,'synthetic-path',checksum,1700000000 FROM assets").unwrap();
+    assert!(
+        !has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap(),
+        "metadata-only retry remains with the option-aware metadata precheck"
+    );
+    f.db.acquire_lock("different current queue generation")
+        .unwrap()
+        .execute_batch("UPDATE assets SET checksum='later-generation',status='pending'")
+        .unwrap();
+    assert!(
+        !has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap()
+    );
+    let other_owner = AccountOwner::authenticated(
+        "queue-stage@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"wrong-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        f.db.has_due_provider_work(other_owner, scope, hash)
+            .await
+            .is_err()
+    );
+    f.config.filename_exclude = Arc::from([glob::Pattern::new("changed.jpg").unwrap()]);
+    assert!(
+        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap(),
+        "new config has its own unconsumed source"
+    );
+}
+
+#[tokio::test]
+async fn queue_projection_deferred_retry_and_scan_roll_back_with_receipt_fault() {
+    let f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    *f.session.corrupt.lock().unwrap() = Some("missing");
+    f.db.acquire_lock("deferred receipt fault").unwrap().execute_batch("CREATE TRIGGER retry_receipt_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic deferred receipt fault'); END;").unwrap();
+    assert!(
+        f.cycle()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("synthetic deferred receipt fault")
+    );
+    for table in [
+        "provider_work_retries",
+        "provider_work_scan",
+        "provider_work_receipts",
+        "assets",
+    ] {
+        assert_eq!(f.count(table), 0);
+    }
+    f.preserved().await;
+    f.db.acquire_lock("clear fault")
+        .unwrap()
+        .execute_batch("DROP TRIGGER retry_receipt_fault")
+        .unwrap();
+    f.cycle().await.unwrap();
+    f.db.acquire_lock("retry due and failed receipt").unwrap().execute_batch("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1; CREATE TRIGGER retry_receipt_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic deferred receipt fault'); END;").unwrap();
+    assert!(f.cycle().await.is_err());
+    let retry: (u32, i64, i64) =
+        f.db.acquire_lock("rollback previous schedule")
+            .unwrap()
+            .query_row(
+                "SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(retry, (1, 0, 1));
+    assert_eq!(f.count("provider_work_receipts"), 1);
+    assert_eq!(f.count("provider_work_obligations"), 0);
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_schema31_retry_migration_preserves_receipts_and_conflicting_history() {
+    for conflict in [false, true] {
+        let f = Fixture::new().await;
+        f.capture(records("m", OLD, "source"), "old").await;
+        *f.session.corrupt.lock().unwrap() = Some("missing");
+        f.cycle().await.unwrap();
+        f.db.acquire_lock("schema31 retained receipt")
+            .unwrap()
+            .execute_batch("DROP TABLE provider_work_retries; PRAGMA user_version=31;")
+            .unwrap();
+        if conflict {
+            f.db.acquire_lock("unknown retry schema").unwrap().execute_batch("CREATE TABLE provider_work_retries(page_id INTEGER,ordinal INTEGER,config_hash TEXT,attempts INTEGER,last_attempt_at INTEGER,next_retry_at INTEGER,future_blob BLOB); INSERT INTO provider_work_retries(future_blob) VALUES(X'01FE');").unwrap();
+        }
+        for _ in 0..2 {
+            let opened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner()).await;
+            if conflict {
+                assert!(opened.is_err());
+                let conn = rusqlite::Connection::open(f.dir.path().join("state.db")).unwrap();
+                assert_eq!(
+                    conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                        .unwrap(),
+                    31
+                );
+                assert_eq!(
+                    conn.query_row::<Vec<u8>, _, _>(
+                        "SELECT future_blob FROM provider_work_retries",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    [1, 254]
+                );
+            } else {
+                let opened = opened.unwrap();
+                let (_, scope, zone) = f.pass.album.catalog_work_scope().unwrap().unwrap();
+                assert!(
+                    opened
+                        .has_due_provider_work(
+                            owner(),
+                            scope,
+                            config_hash(&f.config.with_pass(&f.pass), &zone)
+                        )
+                        .await
+                        .unwrap(),
+                    "legacy deferred receipt is not silently acknowledged"
+                );
+            }
+            assert_eq!(f.count("provider_work_receipts"), 1);
+            assert_eq!(f.count("assets"), 0);
+            f.preserved().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn queue_projection_admitted_before_dispatch_reopens_materializes_and_stays_quiet() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    Mock::given(method("GET"))
+        .and(path("/fresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    {
+        let mut current = f.session.records.lock().unwrap();
+        current[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/fresh",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
+    }
+    f.capture(records("m", OLD, "source"), "old").await;
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("provider_work_receipts"), 1);
+    assert_eq!(
+        f.db.acquire_lock("pre-dispatch interruption oracle")
+            .unwrap()
+            .query_row::<String, _, _>("SELECT status FROM assets", [], |r| r.get(0))
+            .unwrap(),
+        "pending"
+    );
+    assert_eq!(std::fs::read_dir(&f.config.directory).unwrap().count(), 2);
+    f.config.sync_mode = crate::download::SyncMode::Incremental {
+        zone_sync_token: "old-cursor".into(),
+    };
+    let client = reqwest::Client::new();
+    let mut quiet_calls = None;
+    for reopen in 0..3 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        f.capture = ShadowCapture::new(db.clone(), owner(), "com");
+        f.pass
+            .album
+            .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+        f.config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+        f.db = db;
+        assert_eq!(
+            has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+                .await
+                .unwrap(),
+            reopen == 0
+        );
+        let result = crate::download::download_photos_with_sync(
+            &client,
+            std::slice::from_ref(&f.pass),
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result.outcome,
+            crate::download::DownloadOutcome::Success
+        ));
+        assert_eq!(result.stats.downloaded, if reopen == 0 { 1 } else { 0 });
+        let (saved, checksum): (String, String) =
+            f.db.acquire_lock("download publication oracle")
+                .unwrap()
+                .query_row(
+                    "SELECT local_path,local_checksum FROM assets WHERE status='downloaded'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+        assert_eq!(std::fs::read(saved).unwrap(), media);
+        assert_eq!(checksum, format!("{:x}", Sha256::digest(media)));
+        assert!(
+            !has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+                .await
+                .unwrap()
+        );
+        let calls = f.session.calls.load(Ordering::SeqCst);
+        if let Some(quiet_calls) = quiet_calls {
+            assert_eq!(calls, quiet_calls);
+        } else {
+            quiet_calls = Some(calls);
+        }
         f.preserved().await;
     }
 }

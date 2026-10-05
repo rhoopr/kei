@@ -900,3 +900,357 @@ async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_
         );
     }
 }
+
+// A real service process, real 60-second watch cadence, synthetic account only.
+// The receipt fault interrupts between durable capture and stream emission.
+const QUIET_MEDIA: &[u8] = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\x01\0\0\xff\xd9";
+
+#[derive(Clone)]
+struct QuietCatalogPhotos {
+    capture_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl QuietCatalogPhotos {
+    fn pair(&self, number: usize) -> Vec<Value> {
+        let master = format!("quiet-{number}");
+        let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        vec![
+            json!({"recordName":master,"recordType":"CPLMaster","zoneID":zone,"fields":{
+            "filenameEnc":{"value":format!("quiet-{number}.jpg"),"type":"STRING"},
+            "resOriginalRes":{"value":{"downloadURL":"https://p01.icloud-content.com/synthetic-never-fetch","size":QUIET_MEDIA.len(),
+                "fileChecksum":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(QUIET_MEDIA))}},
+            "resOriginalWidth":{"value":1,"type":"INT64"},"resOriginalHeight":{"value":1,"type":"INT64"},
+            "resOriginalFileType":{"value":"public.jpeg"},"itemType":{"value":"public.jpeg"},
+            "adjustmentRenderType":{"value":0,"type":"INT64"}},"recordChangeTag":"master-current"}),
+            json!({"recordName":format!("asset-{master}"),"recordType":"CPLAsset","zoneID":zone,"fields":{
+                "masterRef":{"value":{"recordName":master,"zoneID":zone},"type":"REFERENCE"},
+                "assetDate":{"value":1700000000000i64,"type":"TIMESTAMP"},
+                "addedDate":{"value":1700000000000i64,"type":"TIMESTAMP"}},"recordChangeTag":"asset-current"}),
+        ]
+    }
+}
+impl Respond for QuietCatalogPhotos {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        use std::sync::atomic::Ordering;
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let path = request.url.path();
+        let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        let value = if path.ends_with("/zones/list") {
+            json!({"zones":if path.contains("/private/"){vec![json!({"zoneID":zone})]}else{vec![]}})
+        } else if body["query"]["recordType"] == "CheckIndexingState" {
+            json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]})
+        } else if path.ends_with("/changes/database") {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            json!({"syncToken":"quiet-database-cursor","moreComing":false,"zones":[]})
+        } else if path.ends_with("/changes/zone") {
+            let records = if self.capture_once.swap(false, Ordering::SeqCst) {
+                let mut records = vec![
+                    json!({"recordName":"asset-unresolved-first","recordType":"CPLAsset","fields":{"masterRef":{"value":{"recordName":"unresolved-master","zoneID":zone}}}}),
+                ];
+                for number in 0..66 {
+                    records.extend(self.pair(number));
+                }
+                records.push(json!({"recordName":"future-source","recordType":"FutureRecord","opaque":[1,2,3]}));
+                records.push(json!({"recordName":"explicit-tomb","deleted":true,"opaque":[4,5]}));
+                records
+            } else {
+                vec![]
+            };
+            json!({"zones":[{"zoneID":zone,"syncToken":"A-cursor","moreComing":false,"records":records}]})
+        } else if path.ends_with("/records/lookup") {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let mut records = Vec::new();
+            for identity in body["records"].as_array().unwrap() {
+                let name = identity["recordName"].as_str().unwrap();
+                let master = name.strip_prefix("asset-").unwrap_or(name);
+                if let Some(number) = master
+                    .strip_prefix("quiet-")
+                    .and_then(|n| n.parse::<usize>().ok())
+                {
+                    records.extend(
+                        self.pair(number)
+                            .into_iter()
+                            .filter(|r| r["recordName"] == name),
+                    );
+                } else {
+                    records.push(
+                        json!({"recordName":name,"zoneID":zone,"serverErrorCode":"UNKNOWN_ITEM"}),
+                    );
+                }
+            }
+            json!({"records":records})
+        } else if path.ends_with("/internal/records/query/batch") {
+            json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]})
+        } else if path.ends_with("/records/query") {
+            json!({"records":[]})
+        } else {
+            panic!("unexpected quiet catalog request: {path}")
+        };
+        ResponseTemplate::new(200).set_body_json(value)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quiet_watch_tail() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let server = MockServer::start().await;
+    let photos = QuietCatalogPhotos {
+        capture_once: Arc::new(AtomicBool::new(true)),
+        lookups: Arc::new(AtomicUsize::new(0)),
+        checks: Arc::new(AtomicUsize::new(0)),
+    };
+    Mock::given(method("POST"))
+        .respond_with(photos.clone())
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    // Current filename selection is intentionally filtered; its source work
+    // must still be durably classified without being discarded or downloaded.
+    let config = format!(
+        "{}[filters]\nfilename_exclude=[\"quiet-*\"]\n",
+        std::fs::read_to_string(&account.config).unwrap()
+    );
+    std::fs::write(&account.config, &config).unwrap();
+    {
+        let conn = Connection::open(&account.path).unwrap();
+        conn.execute_batch("UPDATE assets SET library='OldUnknownScope' WHERE id='retry'; DELETE FROM metadata WHERE key='pending_sync_token:old:PrimarySync'; CREATE TRIGGER interrupt_after_capture BEFORE INSERT ON provider_catalog_pages BEGIN SELECT RAISE(ABORT,'synthetic interruption after capture'); END;").unwrap();
+    }
+    let before = state(&account.path);
+    let out = command(root, &account, &["sync", "--no-progress-bar"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("synthetic interruption after capture"),
+        "{:?}",
+        out
+    );
+    assert_eq!(state(&account.path), before);
+    assert_eq!(photos.lookups.load(Ordering::SeqCst), 0);
+    let count = |sql: &str| {
+        Connection::open(&account.path)
+            .unwrap()
+            .query_row::<i64, _, _>(sql, [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("SELECT count(*) FROM provider_shadow_pages"), 1);
+    assert_eq!(count("SELECT count(*) FROM provider_catalog_records"), 0);
+    assert_eq!(count("SELECT count(*) FROM provider_work_receipts"), 0);
+    let captured = rows(
+        &account.path,
+        "SELECT * FROM provider_shadow_pages ORDER BY id",
+    );
+    Connection::open(&account.path)
+        .unwrap()
+        .execute_batch("DROP TRIGGER interrupt_after_capture")
+        .unwrap();
+    // First restart admits at most 64 sources. A second quiet watch cycle must
+    // wake retained work instead of depending on a new provider change.
+    let mut config = std::fs::read_to_string(&account.config).unwrap();
+    config.push_str("[watch]\ninterval=60\n[server]\nport=0\n");
+    std::fs::write(&account.config, &config).unwrap();
+    let log = root.join("quiet-service.log");
+    let stderr = std::fs::File::create(&log).unwrap();
+    let mut child = QuietServiceChild(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin!("kei"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", root)
+            .env("KEI_DATA_DIR", root)
+            .env("ICLOUD_USERNAME", account.username)
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .args([
+                "--config",
+                account.config.to_str().unwrap(),
+                "service",
+                "run",
+                "--no-progress-bar",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    );
+    let started = std::time::Instant::now();
+    let mut first_wave = false;
+    let mut classified_lookups = None;
+    while photos.checks.load(Ordering::SeqCst) < 3 && started.elapsed() < Duration::from_secs(210) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "service exited: {}",
+            std::fs::read_to_string(&log).unwrap()
+        );
+        if !first_wave
+            && photos.checks.load(Ordering::SeqCst) == 1
+            && std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("Waiting before next cycle")
+        {
+            assert_eq!(
+                count("SELECT count(*) FROM provider_work_receipts"),
+                64,
+                "64-attempt bound"
+            );
+            first_wave = true;
+        }
+        if classified_lookups.is_none()
+            && photos.checks.load(Ordering::SeqCst) >= 2
+            && count("SELECT count(*) FROM provider_work_receipts") == 67
+        {
+            classified_lookups = Some(photos.lookups.load(Ordering::SeqCst));
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let diagnostics = std::fs::read_to_string(&log).unwrap();
+    assert!(photos.checks.load(Ordering::SeqCst) >= 3, "{diagnostics}");
+    assert!(first_wave, "{diagnostics}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(119),
+        "production watch cadence must not hot-loop"
+    );
+    assert_eq!(
+        classified_lookups,
+        Some(photos.lookups.load(Ordering::SeqCst)),
+        "no due work means no repeated provider lookup"
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM provider_work_receipts"),
+        67,
+        "quiet provider must not strand retained tail: {diagnostics}"
+    );
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM assets WHERE library='PrimarySync' AND id LIKE 'asset-quiet-%'"
+        ),
+        0,
+        "{diagnostics}"
+    );
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM assets WHERE library='OldUnknownScope' AND id='retry' AND status='pending'"
+        ),
+        1
+    );
+    assert_eq!(
+        std::fs::read(&account.media).unwrap(),
+        b"known media belonging only to account A"
+    );
+    assert_eq!(
+        rows(
+            &account.path,
+            "SELECT * FROM provider_shadow_pages ORDER BY id LIMIT 1"
+        ),
+        captured
+    );
+    assert_eq!(
+        rows(
+            &account.path,
+            "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'"
+        ),
+        vec![vec![rusqlite::types::Value::Text("A-cursor".into())]]
+    );
+    assert!(count("SELECT count(*) FROM provider_catalog_debt") >= 3);
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM provider_work_receipts WHERE state='deferred' AND reason='currently_filtered'"
+        ),
+        66
+    );
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM provider_work_receipts WHERE reason='current_lookup_unresolved'"
+        ),
+        1
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM provider_work_obligations"),
+        0,
+        "filtered evidence is not materialized work"
+    );
+    // Plain sync honors a configured watch interval; remove only scheduling
+    // before the independent one-cycle restarts. Admission configuration stays
+    // identical, including the filename filter and source/config retry key.
+    std::fs::write(&account.config, config.replace("interval=60\n", "")).unwrap();
+    let frozen = state(&account.path);
+    let work = rows(
+        &account.path,
+        "SELECT * FROM provider_work_receipts ORDER BY page_id,ordinal,config_hash,confirmation_hash",
+    );
+    let debt = rows(
+        &account.path,
+        "SELECT * FROM provider_catalog_debt ORDER BY page_id,ordinal,reason",
+    );
+    let media = quiet_media_snapshot(account.media.parent().unwrap());
+    let calls = photos.lookups.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        assert_eq!(photos.lookups.load(Ordering::SeqCst), calls);
+        assert_eq!(state(&account.path), frozen);
+        assert_eq!(
+            rows(
+                &account.path,
+                "SELECT * FROM provider_work_receipts ORDER BY page_id,ordinal,config_hash,confirmation_hash"
+            ),
+            work
+        );
+        assert_eq!(
+            rows(
+                &account.path,
+                "SELECT * FROM provider_catalog_debt ORDER BY page_id,ordinal,reason"
+            ),
+            debt
+        );
+        assert_eq!(quiet_media_snapshot(account.media.parent().unwrap()), media);
+    }
+    let retry:(i64,i64,i64)=Connection::open(&account.path).unwrap().query_row("SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries WHERE ordinal=0",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(retry.0, 1);
+    assert_eq!(retry.2 - retry.1, 3600);
+    Connection::open(&account.path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1 WHERE ordinal=0",
+        )
+        .unwrap();
+    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    assert_eq!(photos.lookups.load(Ordering::SeqCst), calls + 1);
+    let retry:(i64,i64,i64)=Connection::open(&account.path).unwrap().query_row("SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries WHERE ordinal=0",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(retry.0, 2);
+    assert_eq!(retry.2 - retry.1, 7200);
+    assert_eq!(state(&account.path), frozen);
+    assert_eq!(quiet_media_snapshot(account.media.parent().unwrap()), media);
+    assert_eq!(
+        rows(
+            &account.path,
+            "SELECT * FROM provider_catalog_debt ORDER BY page_id,ordinal,reason"
+        ),
+        debt
+    );
+}
+
+struct QuietServiceChild(std::process::Child);
+impl Drop for QuietServiceChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn quiet_media_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
+    let mut media = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes, modified)
+        })
+        .collect::<Vec<_>>();
+    media.sort_by(|a, b| a.0.cmp(&b.0));
+    media
+}

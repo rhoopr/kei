@@ -380,8 +380,28 @@ mapping and metadata refresh, including independent path publication receipts.
 Content and metadata fences permit safe collision-leaf replanning by the existing
 path owners; the original receipt still retains its admission-time filename.
 Completed generations do not indefinitely pin the mutable canonical queue.
-A rotating bounded scan retries unresolved early sources without starving later
-identities. Its position is scheduling evidence and cannot promote a cursor.
+Schema 32 adds source/config retry deadlines in `provider_work_retries`.
+Deferred admission commits its attempt and deadline with the receipt and scan
+bookkeeping; admission clears that retry schedule in the same transaction.
+The first delay is one hour, doubles on repeated deferral and stops at 24 hours.
+A new source or current configuration has its own immediately eligible work.
+Each bounded admission selects the oldest due unadmitted source independently
+of the historical scan position. A due early source can be retried while new
+observations continue to arrive; a future retry does not consume the 64-attempt
+budget or block fresh tail work. The SQL query can scan a mostly admitted
+source prefix; the attempt limit bounds provider/planner work, not SQLite VM
+steps or retained-catalog scan latency. Retry schedules never acknowledge debt
+or promote a cursor.
+
+The watch precheck includes due retained work for the same eligible selected
+passes and current work fingerprint as admission. Matching unfinished
+pending/failed download obligations also wake normal dispatch after restart.
+The existing targeted recovery pass owns their publication. Metadata-only
+markers keep the existing option-aware metadata precheck owner. Local wake-up
+adds selected zones without inventing a provider database successor; provider
+and zone checkpoints retain their existing gates. No due local work permits the
+normal no-change shortcut. Deferred sources remain retained and become due at
+their deadlines; an idle cycle does not imply materialization or completeness.
 Work plans have a 16 MiB logical charge limit and work evidence has a separate
 512 MiB logical budget. Nothing is automatically pruned; backpressure retains
 source observations, unfinished work and the current checkpoint. These are not

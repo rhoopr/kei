@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 31;
+pub(crate) const SCHEMA_VERSION: i32 = 32;
 
 fn migrate_provider_shadow_inbox(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(
@@ -70,6 +70,35 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     }
     // Preparing the conflict target also verifies the replay uniqueness key.
     conn.prepare("INSERT INTO provider_shadow_pages(scope,request_cursor,body_hash) VALUES (?1,?2,?3) ON CONFLICT(scope,request_cursor,body_hash) DO NOTHING")?;
+    Ok(())
+}
+
+/// Scheduling evidence neither completes work nor changes checkpoint authority.
+fn migrate_provider_work_retries(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(
+        r"
+CREATE TABLE IF NOT EXISTS provider_work_retries (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    config_hash TEXT NOT NULL,
+    attempts INTEGER NOT NULL CHECK(attempts BETWEEN 1 AND 32),
+    last_attempt_at INTEGER NOT NULL,
+    next_retry_at INTEGER NOT NULL CHECK(next_retry_at > last_attempt_at),
+    PRIMARY KEY(page_id,ordinal,config_hash),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_catalog_records(page_id,ordinal)
+) WITHOUT ROWID;
+",
+    )?;
+    conn.prepare("SELECT page_id,ordinal,config_hash,attempts,last_attempt_at,next_retry_at FROM provider_work_retries LIMIT 0")?;
+    let actual: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM pragma_table_info('provider_work_retries') WHERE pk>0 ORDER BY pk",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if actual != ["page_id", "ordinal", "config_hash"] {
+        return Err(StateError::ProviderWorkInvalid);
+    }
     Ok(())
 }
 
@@ -1125,6 +1154,7 @@ fn migrate_to_version(
         29 => migrate_provider_shadow_inbox(conn)?,
         30 => migrate_provider_catalog(conn)?,
         31 => migrate_provider_work(conn)?,
+        32 => migrate_provider_work_retries(conn)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,

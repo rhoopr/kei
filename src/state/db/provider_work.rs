@@ -12,6 +12,13 @@ use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
 pub(crate) const MAX_WORK_BYTES: u64 = 512 * 1024 * 1024;
+// Match the existing ambiguous-metadata retry cadence. This is an operational
+// deadline, not retirement or proof of absence. A new source/config is due now.
+const INITIAL_RETRY_SECONDS: i64 = 60 * 60;
+const MAX_RETRY_SECONDS: i64 = 24 * INITIAL_RETRY_SECONDS;
+
+const DUE_SOURCE_SQL: &str = "SELECT c.page_id,c.ordinal FROM provider_catalog_records c JOIN provider_shadow_pages p ON p.id=c.page_id JOIN provider_catalog_pages projected ON projected.page_id=c.page_id AND projected.projector_version=1 AND projected.body_hash=p.body_hash WHERE p.scope=?1 AND c.kind='asset' AND c.deleted=0 AND NOT EXISTS(SELECT 1 FROM provider_work_receipts w WHERE w.page_id=c.page_id AND w.ordinal=c.ordinal AND w.config_hash=?2 AND w.state='admitted') AND NOT EXISTS(SELECT 1 FROM provider_work_retries r WHERE r.page_id=c.page_id AND r.ordinal=c.ordinal AND r.config_hash=?2 AND r.next_retry_at>?3)";
+
 const MAX_WORK_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(crate) struct WorkSource {
@@ -61,30 +68,61 @@ fn record_matches(
 }
 
 impl SqliteStateDb {
+    /// Only current-config due source work or unfinished exact-generation
+    /// download obligations wake the existing watch/queue owners.
+    /// Metadata-only work keeps its existing option-aware precheck owner.
+    pub(crate) async fn has_due_provider_work(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+    ) -> Result<bool, StateError> {
+        self.with_conn("inspecting retained work schedule", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let sql = format!("SELECT EXISTS({DUE_SOURCE_SQL}) OR EXISTS(SELECT 1 FROM provider_work_receipts r JOIN provider_work_obligations w USING(page_id,ordinal,config_hash,confirmation_hash) JOIN assets a ON a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size WHERE r.scope=?1 AND r.config_hash=?2 AND r.state='admitted' AND a.status IN ('pending','failed') AND ({UNFINISHED_GENERATION}))");
+            Ok(conn.query_row(&sql, params![scope, config_hash, Utc::now().timestamp()], |row|row.get(0))?)
+        }).await
+    }
+
     pub(crate) async fn next_work_source(
         &self,
         owner: account::AccountOwner,
         scope: String,
         config_hash: String,
     ) -> Result<Option<WorkSource>, StateError> {
-        self.with_conn_mut("reading retained work source",move |conn| {
-            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            account::validate_authenticated(&tx,&owner)?;
-            let after:(i64,i64)=tx.query_row("SELECT page_id,ordinal FROM provider_work_scan WHERE scope=?1 AND config_hash=?2",params![scope,config_hash],|row|Ok((row.get(0)?,row.get(1)?))).optional()?.unwrap_or((0,-1));
-            let id:Option<(i64,i64)>=tx.query_row(
-                "SELECT c.page_id,c.ordinal FROM provider_catalog_records c JOIN provider_shadow_pages p ON p.id=c.page_id JOIN provider_catalog_pages projected ON projected.page_id=c.page_id AND projected.projector_version=1 AND projected.body_hash=p.body_hash WHERE p.scope=?1 AND c.kind='asset' AND c.deleted=0 AND (c.page_id,c.ordinal)>(?3,?4) AND NOT EXISTS(SELECT 1 FROM provider_work_receipts w WHERE w.page_id=c.page_id AND w.ordinal=c.ordinal AND w.config_hash=?2 AND w.state='admitted') ORDER BY c.page_id,c.ordinal LIMIT 1",
-                params![scope,config_hash,after.0,after.1],|row|Ok((row.get(0)?,row.get(1)?)),
-            ).optional()?;
-            let out=if let Some((page,ordinal))=id {
-                Some(WorkSource{page:load_page(&tx,CapturedPageId(page),crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES)?,ordinal})
+        self.with_conn_mut("reading retained work source", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            // Oldest due work is considered independently of the historical
+            // scan position. A due early source cannot hide behind a growing tail.
+            let id: Option<(i64, i64)> = tx
+                .query_row(
+                    &format!("{DUE_SOURCE_SQL} ORDER BY c.page_id,c.ordinal LIMIT 1"),
+                    params![scope, config_hash, Utc::now().timestamp()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let out = if let Some((page, ordinal)) = id {
+                Some(WorkSource {
+                    page: load_page(
+                        &tx,
+                        CapturedPageId(page),
+                        crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
+                    )?,
+                    ordinal,
+                })
             } else {
                 // Fair scheduling only. Reset at EOF without declaring coverage.
-                tx.execute("DELETE FROM provider_work_scan WHERE scope=?1 AND config_hash=?2",params![scope,config_hash])?;
+                tx.execute(
+                    "DELETE FROM provider_work_scan WHERE scope=?1 AND config_hash=?2",
+                    params![scope, config_hash],
+                )?;
                 None
             };
             tx.commit()?;
             Ok(out)
-        }).await
+        })
+        .await
     }
 
     pub(crate) async fn project_provider_work(
@@ -199,6 +237,14 @@ impl SqliteStateDb {
                 tx.execute("INSERT INTO asset_master_mappings(library,asset_record_name,master_record_name,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(library,asset_record_name) DO NOTHING",params![library,identity.name,plan.master,now])?;
             }
             tx.execute("INSERT INTO provider_work_scan(scope,config_hash,page_id,ordinal) VALUES (?1,?2,?3,?4) ON CONFLICT(scope,config_hash) DO UPDATE SET page_id=excluded.page_id,ordinal=excluded.ordinal",params![plan.scope,plan.config_hash,current.id.0,plan.source.ordinal])?;
+            if admitted {
+                tx.execute("DELETE FROM provider_work_retries WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3",params![current.id.0,plan.source.ordinal,plan.config_hash])?;
+            } else {
+                let attempts: u32=tx.query_row("SELECT attempts FROM provider_work_retries WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3",params![current.id.0,plan.source.ordinal,plan.config_hash],|r|r.get(0)).optional()?.unwrap_or(0);
+                let delay=(INITIAL_RETRY_SECONDS * (1_i64 << attempts.min(5))).min(MAX_RETRY_SECONDS);
+                let now=Utc::now().timestamp();
+                tx.execute("INSERT INTO provider_work_retries(page_id,ordinal,config_hash,attempts,last_attempt_at,next_retry_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(page_id,ordinal,config_hash) DO UPDATE SET attempts=excluded.attempts,last_attempt_at=excluded.last_attempt_at,next_retry_at=excluded.next_retry_at",params![current.id.0,plan.source.ordinal,plan.config_hash,attempts.saturating_add(1).min(32),now,now+delay])?;
+            }
             #[cfg(test)]
             pause_before_receipt(&database)?;
             // Last write: queue/mapping/debt/scan and receipt commit together.

@@ -533,15 +533,41 @@ recovers and reopens quietly twice. This proves process-interruption recovery,
 not power-loss survival. The private test child is ignored unless its parent
 explicitly invokes it with an isolated marker and disk-backed temporary root.
 
-Schema-30 fixtures upgrade to 31 through two reopens. A conflicting unknown work
-table fails migration without changing the schema version, captured sources or
+Schema-30 fixtures upgrade through the current schema through two reopens.
+A conflicting unknown work table fails migration without changing the schema version, captured sources or
 unknown bytes. Work receipt and derived metadata byte budgets retain unresolved
 sources and existing obligations at capacity.
 
-These tests qualify bounded work admission into the existing queues. They do not
-claim media materialization/verification, recent-cap semantics, named-album or
-shared-zone admission, cursor ownership, snapshot absence, pruning, historical
-retention or acknowledgment of unrecoverable debt.
+Schema-31 fixtures retain old deferred receipts through the schema-32 retry
+migration and two reopens. Conflicting unknown retry tables fail without
+changing their bytes or schema version. Receipt faults roll back retry deadlines
+and scan writes together, including a failed repeated deferral. Reopens preserve
+future deadlines; due early retries are reconsidered behind a historical scan
+position while fresh tail work remains. Retry delays double from one hour to a
+24-hour ceiling. Current configuration, account, scope and exact queue-generation
+controls distinguish eligible work from historical admitted receipts.
+
+The actual `service run` CLI fixture captures a complete synthetic PrimarySync
+page, then aborts its catalog receipt before emission/admission. Restart with no
+provider changes replays that source. Real 60-second watch cycles classify 64
+then three remaining sources despite an unresolved first identity; the third
+cycle and two one-shot reopens perform no repeated lookup while deadlines are
+future. Its 66 current records are filename-filtered and remain deferred evidence,
+with no media obligation or completeness claim. Making the unresolved deadline
+due performs one new lookup and persists the next backoff. Old cursor, source
+bytes, unselected pending work, catalog debt and media bytes/mtime remain intact.
+
+A separate owned fresh-generation fixture interrupts after real admission and
+before dispatch. Reopening uses the actual download dispatcher and targeted
+recovery to publish and verify new synthetic media bytes. Two later reopens
+perform no new lookup or download and preserve existing media, sidecar, old
+cursor and unrelated debt. Metadata-only wake-up remains with its option-aware
+precheck rather than forcing disabled writers to run.
+
+These tests qualify bounded supported-path admission and targeted queue recovery.
+They do not claim recent-cap semantics, named-album or shared-endpoint admission,
+capture-owned cursor promotion, snapshot absence, pruning, historical retention
+or acknowledgment of unrecoverable debt.
 
 ## State-transition proof
 
@@ -984,7 +1010,7 @@ completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 31.
+binary (schema 25), then executes the current production CLI through schema 32.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,

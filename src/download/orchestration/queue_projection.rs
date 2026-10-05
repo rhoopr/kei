@@ -24,12 +24,20 @@ fn config_hash(config: &DownloadConfig, zone: &serde_json::Value) -> String {
     format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
 }
 
-pub(super) async fn admit_retained_work(
+struct WorkContext {
+    capture: crate::icloud::photos::inbox::ShadowCapture,
+    scope: String,
+    zone: serde_json::Value,
+    effective: DownloadConfig,
+    config_hash: String,
+}
+
+// Scheduling and admission share the same scope and selection boundary.
+fn work_context(
     passes: &[AlbumPass],
     config: &DownloadConfig,
     controls: DownloadControls,
-    cancel: &CancellationToken,
-) -> Result<()> {
+) -> Result<Option<WorkContext>> {
     // Selection that needs rank or membership evidence remains with its existing
     // owner. These observations are retained without an admission receipt.
     if !controls.run_mode.downloads_files()
@@ -38,17 +46,17 @@ pub(super) async fn admit_retained_work(
         || config.refresh_metadata
         || !config.exclude_asset_ids.is_empty()
     {
-        return Ok(());
+        return Ok(None);
     }
-    let [pass] = passes else { return Ok(()) };
+    let [pass] = passes else { return Ok(None) };
     if pass.kind != PassKind::Unfiled || !pass.exclude_ids.is_empty() {
-        return Ok(());
-    };
+        return Ok(None);
+    }
     let Some((capture, scope, zone)) = pass.album.catalog_work_scope()? else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(db) = &config.state_db else {
-        return Ok(());
+        return Ok(None);
     };
     let capture_store =
         std::sync::Arc::clone(&capture.db) as std::sync::Arc<dyn crate::download::DownloadStore>;
@@ -61,6 +69,48 @@ pub(super) async fn admit_retained_work(
     }
     let effective = config.with_pass(pass);
     let config_hash = config_hash(&effective, &zone);
+    Ok(Some(WorkContext {
+        capture,
+        scope,
+        zone,
+        effective,
+        config_hash,
+    }))
+}
+
+pub(crate) async fn has_due_retained_work(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+) -> Result<bool> {
+    let Some(context) = work_context(passes, config, controls)? else {
+        return Ok(false);
+    };
+    Ok(context
+        .capture
+        .db
+        .has_due_provider_work(context.capture.owner, context.scope, context.config_hash)
+        .await?)
+}
+
+pub(super) async fn admit_retained_work(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let Some(WorkContext {
+        capture,
+        scope,
+        zone,
+        effective,
+        config_hash,
+    }) = work_context(passes, config, controls)?
+    else {
+        return Ok(());
+    };
+    // The context above proves the sole Unfiled pass exists.
+    let pass = &passes[0];
     let mut planner = TaskPlanner::for_download(effective.state_db.as_deref()).await?;
     let mut admitted = 0usize;
     let mut deferred = 0usize;
