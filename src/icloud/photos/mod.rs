@@ -51,6 +51,7 @@ pub struct PhotosService {
     session: Box<dyn PhotosSession>,
     params: Arc<HashMap<String, Value>>,
     primary_library: PhotoLibrary,
+    private_zones: Option<Vec<cloudkit::Zone>>,
     private_libraries: Option<HashMap<String, PhotoLibrary>>,
     shared_libraries: Option<HashMap<String, PhotoLibrary>>,
     retry_config: RetryConfig,
@@ -131,6 +132,7 @@ impl PhotosService {
             session,
             params,
             primary_library,
+            private_zones: None,
             private_libraries: None,
             shared_libraries: None,
             retry_config,
@@ -148,13 +150,13 @@ impl PhotosService {
 
     /// Look up a library by zone name.
     ///
-    /// Checks the primary library first ("`PrimarySync`"), then searches private
-    /// and shared libraries. Lazily fetches library lists on first call.
+    /// Primary lookup validates private discovery and initializes its selected
+    /// scope only. Other names search complete initialized private/shared maps.
     pub async fn get_library(&mut self, name: &str) -> anyhow::Result<&PhotoLibrary> {
         if name == PRIMARY_ZONE_NAME {
             // The constructor deliberately has no owner. Only authenticated
             // private discovery may replace it with explicit provider scope.
-            self.fetch_private_libraries().await?;
+            self.qualify_primary_library().await?;
             return Ok(&self.primary_library);
         }
         // Ensure both library lists are fetched
@@ -192,12 +194,59 @@ impl PhotosService {
         Ok(libs)
     }
 
+    /// Validate the complete private listing without initializing unrelated libraries.
+    async fn fetch_private_zones(&mut self) -> anyhow::Result<()> {
+        if self.private_zones.is_none() {
+            self.private_zones = Some(self.fetch_zone_list("private").await?);
+        }
+        Ok(())
+    }
+
+    async fn qualify_primary_library(&mut self) -> anyhow::Result<()> {
+        if self.primary_library.is_private_default_owner() {
+            return Ok(());
+        }
+        if let Some(libraries) = &self.private_libraries {
+            if let Some(primary) = libraries.get(PRIMARY_ZONE_NAME)
+                && primary.is_private_default_owner()
+            {
+                self.primary_library = primary.clone();
+            }
+            return Ok(());
+        }
+        self.fetch_private_zones().await?;
+        let zones = self
+            .private_zones
+            .as_ref()
+            .context("Private zone list was not cached")?;
+        if let Some(zone) = zones.iter().find(|zone| {
+            zone.zone_id.zone_name == PRIMARY_ZONE_NAME
+                && !zone.deleted.unwrap_or(false)
+                && zone
+                    .zone_id
+                    .extra
+                    .get("ownerRecordName")
+                    .and_then(Value::as_str)
+                    == Some("_defaultOwner")
+        }) {
+            // Publish qualification only after this exact selected scope passes
+            // its own indexing check. A validated listing is not indexing proof.
+            self.primary_library = self.initialize_library(zone, "private").await?;
+        }
+        Ok(())
+    }
+
     /// Fetch private libraries (lazily, first call triggers the HTTP request).
     pub async fn fetch_private_libraries(
         &mut self,
     ) -> anyhow::Result<&HashMap<String, PhotoLibrary>> {
         if self.private_libraries.is_none() {
-            let libs = self.fetch_libraries("private").await?;
+            self.fetch_private_zones().await?;
+            let zones = self
+                .private_zones
+                .as_ref()
+                .context("Private zone list was not cached")?;
+            let libs = self.initialize_libraries(zones, "private").await?;
             if let Some(primary) = libs.get(PRIMARY_ZONE_NAME)
                 && primary.is_private_default_owner()
             {
@@ -215,7 +264,8 @@ impl PhotosService {
         &mut self,
     ) -> anyhow::Result<&HashMap<String, PhotoLibrary>> {
         if self.shared_libraries.is_none() {
-            let libs = self.fetch_libraries("shared").await?;
+            let zones = self.fetch_zone_list("shared").await?;
+            let libs = self.initialize_libraries(&zones, "shared").await?;
             self.shared_libraries = Some(libs);
         }
         self.shared_libraries
@@ -223,11 +273,7 @@ impl PhotosService {
             .context("Internal error: shared iCloud Photos libraries were not cached")
     }
 
-    async fn fetch_libraries(
-        &self,
-        library_type: &str,
-    ) -> anyhow::Result<HashMap<String, PhotoLibrary>> {
-        let mut libraries = HashMap::new();
+    async fn fetch_zone_list(&self, library_type: &str) -> anyhow::Result<Vec<cloudkit::Zone>> {
         let service_endpoint = self.get_service_endpoint(library_type);
         let url = format!("{service_endpoint}/zones/list");
 
@@ -271,44 +317,51 @@ impl PhotosService {
             );
         }
 
-        for zone in &zone_list.zones {
+        Ok(zone_list.zones)
+    }
+
+    async fn initialize_library(
+        &self,
+        zone: &cloudkit::Zone,
+        library_type: &str,
+    ) -> anyhow::Result<PhotoLibrary> {
+        let zone_name = &zone.zone_id.zone_name;
+        let mut library = PhotoLibrary::new(
+            self.get_service_endpoint(library_type),
+            Arc::clone(&self.params),
+            self.session.clone_box(),
+            Arc::new(serde_json::to_value(&zone.zone_id)?),
+            library_type.to_string(),
+            self.retry_config,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(zone = %zone_name, error = %error, "Failed to load library zone");
+            anyhow::anyhow!("Could not load iCloud Photos library zone {zone_name}: {error}")
+        })?;
+        library.shadow_capture = self.shadow_capture.clone();
+        tracing::debug!(zone = %zone_name, "Loaded library zone");
+        Ok(library)
+    }
+
+    async fn initialize_libraries(
+        &self,
+        zones: &[cloudkit::Zone],
+        library_type: &str,
+    ) -> anyhow::Result<HashMap<String, PhotoLibrary>> {
+        let mut libraries = HashMap::new();
+        for zone in zones {
             if zone.deleted.unwrap_or(false) {
                 continue;
             }
-            let zone_name = zone.zone_id.zone_name.clone();
-            if !is_photo_library_zone(&zone_name) {
-                tracing::debug!(
-                    zone = %zone_name,
-                    "Skipping zone that is not a photo library"
-                );
+            let zone_name = &zone.zone_id.zone_name;
+            if !is_photo_library_zone(zone_name) {
+                tracing::debug!(zone = %zone_name, "Skipping zone that is not a photo library");
                 continue;
             }
-            let zone_id = Arc::new(serde_json::to_value(&zone.zone_id)?);
-            let ep = self.get_service_endpoint(library_type);
-            let lib_session = self.session.clone_box();
-
-            match PhotoLibrary::new(
-                ep,
-                Arc::clone(&self.params),
-                lib_session,
-                zone_id,
-                library_type.to_string(),
-                self.retry_config,
-            )
-            .await
-            {
-                Ok(mut lib) => {
-                    lib.shadow_capture = self.shadow_capture.clone();
-                    tracing::debug!(zone = %zone_name, "Loaded library zone");
-                    libraries.insert(zone_name, lib);
-                }
-                Err(e) => {
-                    tracing::error!(zone = %zone_name, error = %e, "Failed to load library zone");
-                    anyhow::bail!("Could not load iCloud Photos library zone {zone_name}: {e}");
-                }
-            }
+            let library = self.initialize_library(zone, library_type).await?;
+            libraries.insert(zone_name.clone(), library);
         }
-
         Ok(libraries)
     }
 
@@ -361,6 +414,7 @@ impl PhotosService {
             session,
             params: Arc::new(params),
             primary_library: dummy_library,
+            private_zones: None,
             private_libraries: None,
             shared_libraries: None,
             retry_config: RetryConfig::default(),
@@ -382,6 +436,7 @@ impl PhotosService {
             session,
             params: Arc::new(HashMap::new()),
             primary_library: primary,
+            private_zones: None,
             private_libraries: Some(private),
             shared_libraries: Some(shared),
             retry_config: RetryConfig::default(),
@@ -440,6 +495,7 @@ mod tests {
             session,
             params: Arc::new(params),
             primary_library: dummy_library,
+            private_zones: None,
             private_libraries: None,
             shared_libraries: None,
             retry_config: RetryConfig::default(),
@@ -670,6 +726,163 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct UnrelatedIndexingSession {
+        discovery: RawDiscoverySession,
+        indexing_requests: Arc<Mutex<Vec<Value>>>,
+        blocked_zone: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for UnrelatedIndexingSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let request: Value = serde_json::from_str(&body)?;
+            assert_eq!(request["query"]["recordType"], "CheckIndexingState");
+            self.indexing_requests
+                .lock()
+                .unwrap()
+                .push(request["zoneID"].clone());
+            if request["zoneID"]["ownerRecordName"] == "_defaultOwner"
+                && self.blocked_zone.lock().unwrap().as_deref()
+                    == request["zoneID"]["zoneName"].as_str()
+            {
+                return Ok(json!({"records":[{"fields":{"state":{"value":"RUNNING"}}}]}));
+            }
+            self.discovery.post(url, body, headers).await
+        }
+        async fn post_changes_body(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Vec<u8>> {
+            self.discovery.post_changes_body(url, body, headers).await
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_discovery_default_selection_does_not_initialize_unselected_private_libraries()
+    {
+        let session = UnrelatedIndexingSession {
+            discovery: raw_discovery(serde_json::to_vec(&json!({"zones":[
+                {"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}},
+                {"zoneID":{"zoneName":"SharedSync-unselected","ownerRecordName":"_defaultOwner"}}
+            ]})).unwrap()),
+            indexing_requests: Arc::new(Mutex::new(Vec::new())),
+            blocked_zone: Arc::new(Mutex::new(Some("SharedSync-unselected".into()))),
+        };
+        let mut service = PhotosService::new(
+            "https://example.invalid".into(),
+            Box::new(session.clone()),
+            HashMap::new(),
+            RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        let selected = crate::commands::resolve_libraries(
+            &crate::selection::LibrarySelector::default(),
+            &mut service,
+        )
+        .await
+        .expect("unselected private library indexing must not block selected primary ownership");
+        assert_eq!(selected.len(), 1);
+        assert!(
+            selected[0].is_private_default_owner(),
+            "ownership must remain explicitly provider-qualified"
+        );
+        let requests = session.indexing_requests.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .all(|zone| zone["zoneName"] == PRIMARY_ZONE_NAME)
+        );
+        assert_eq!(requests.last().unwrap()["ownerRecordName"], "_defaultOwner");
+        assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
+        assert!(
+            service
+                .get_library(PRIMARY_ZONE_NAME)
+                .await
+                .unwrap()
+                .is_private_default_owner()
+        );
+        assert_eq!(*session.indexing_requests.lock().unwrap(), requests);
+        assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
+        // Full discovery still initializes its requested complete library map.
+        let error = service.all_libraries().await.unwrap_err();
+        assert!(error.to_string().contains("RUNNING"));
+        assert!(
+            service.private_libraries.is_none(),
+            "failed full initialization must not publish a partial library map"
+        );
+        assert!(
+            service
+                .get_library(PRIMARY_ZONE_NAME)
+                .await
+                .unwrap()
+                .is_private_default_owner()
+        );
+        assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
+        *session.blocked_zone.lock().unwrap() = None;
+        assert_eq!(service.all_libraries().await.unwrap().len(), 3);
+        assert!(service.private_libraries.is_some());
+        assert_eq!(session.discovery.listings.lock().unwrap().len(), 2);
+        let requests = session.indexing_requests.lock().unwrap().len();
+        assert_eq!(service.all_libraries().await.unwrap().len(), 3);
+        assert_eq!(session.indexing_requests.lock().unwrap().len(), requests);
+        assert_eq!(session.discovery.listings.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn primary_discovery_selected_indexing_failure_does_not_publish_ownership() {
+        let session = UnrelatedIndexingSession {
+            discovery: raw_discovery(
+                serde_json::to_vec(&json!({"zones":[
+                    {"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}
+                ]}))
+                .unwrap(),
+            ),
+            indexing_requests: Arc::new(Mutex::new(Vec::new())),
+            blocked_zone: Arc::new(Mutex::new(Some(PRIMARY_ZONE_NAME.into()))),
+        };
+        let mut service = PhotosService::new(
+            "https://example.invalid".into(),
+            Box::new(session.clone()),
+            HashMap::new(),
+            RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            service
+                .get_library(PRIMARY_ZONE_NAME)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("RUNNING")
+        );
+        assert!(!service.primary_library.is_private_default_owner());
+        assert!(service.private_zones.is_some());
+        assert!(service.private_libraries.is_none());
+        *session.blocked_zone.lock().unwrap() = None;
+        assert!(
+            service
+                .get_library(PRIMARY_ZONE_NAME)
+                .await
+                .unwrap()
+                .is_private_default_owner()
+        );
+        assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
+        assert_eq!(session.indexing_requests.lock().unwrap().len(), 3);
+    }
+
     #[tokio::test]
     async fn primary_discovery_requires_unique_complete_error_free_zone_list_before_caching() {
         let invalid = [
@@ -701,6 +914,7 @@ mod tests {
                 "{error}"
             );
             assert!(svc.private_libraries.is_none());
+            assert!(svc.private_zones.is_none());
             assert!(!svc.primary_library.is_private_default_owner());
             // Failure did not publish a cache; valid evidence can recover.
             *session.private.lock().unwrap() = serde_json::to_vec(&json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}]})).unwrap();
@@ -781,7 +995,7 @@ mod tests {
     }
 
     /// Cloneable capturing session - unlike CapturingSession above,
-    /// clone_box produces a working clone so fetch_libraries can hand
+    /// clone_box produces a working clone so library initialization can hand
     /// sessions to each constructed PhotoLibrary.
     struct CloneableSession {
         response: Value,

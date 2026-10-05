@@ -1060,3 +1060,14 @@ and stalled-lookup cancellation retain debt, and cancellation during an active
 transfer accounts for both in-flight and queued tasks after reopen. These are
 synthetic runtime proofs; they do not validate reporter data or resolve sparse
 Shared Library ownership.
+
+Primary discovery availability is covered by
+`primary_discovery_default_selection_does_not_initialize_unselected_private_libraries`:
+default selection with an unrelated private zone still indexing succeeds with
+explicit primary ownership, while a full-map request fails without publishing a
+partial map. The qualified primary survives that failure, and a later full-map
+request recovers when indexing finishes. The selected-primary indexing failure
+test separately proves that cached valid descriptors cannot publish ownership
+before the selected scope passes its own check. Malformed-list tests prove that
+invalid complete-list evidence is never cached. Existing queue admission tests
+cover capture attachment, durable receipts, rollback, replay and unchanged follow-up.
