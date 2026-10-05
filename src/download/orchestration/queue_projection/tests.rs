@@ -1563,9 +1563,12 @@ async fn queue_projection_wake_requires_current_scope_config_and_unfinished_gene
     unselected.config_hash = "f".repeat(64);
     unselected.records.clear();
     unselected.reason = "currently_filtered";
-    f.db.project_provider_work(owner(), unselected, 512 * 1024 * 1024)
-        .await
-        .unwrap();
+    assert!(matches!(
+        f.db.project_provider_work(owner(), unselected, 512 * 1024 * 1024)
+            .await
+            .unwrap(),
+        WorkAdmission::Deferred
+    ));
     assert!(
         !f.db
             .has_due_provider_work(owner(), scope.clone(), "f".repeat(64))

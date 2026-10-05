@@ -938,7 +938,9 @@ impl Respond for QuietCatalogPhotos {
         let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
         let value = if path.ends_with("/zones/list") {
             json!({"zones":if path.contains("/private/"){vec![json!({"zoneID":zone})]}else{vec![]}})
-        } else if body["query"]["recordType"] == "CheckIndexingState" {
+        } else if body.pointer("/query/recordType").and_then(Value::as_str)
+            == Some("CheckIndexingState")
+        {
             json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]})
         } else if path.ends_with("/changes/database") {
             self.checks.fetch_add(1, Ordering::SeqCst);
@@ -961,8 +963,8 @@ impl Respond for QuietCatalogPhotos {
         } else if path.ends_with("/records/lookup") {
             self.lookups.fetch_add(1, Ordering::SeqCst);
             let mut records = Vec::new();
-            for identity in body["records"].as_array().unwrap() {
-                let name = identity["recordName"].as_str().unwrap();
+            for identity in body.get("records").and_then(Value::as_array).unwrap() {
+                let name = identity.get("recordName").and_then(Value::as_str).unwrap();
                 let master = name.strip_prefix("asset-").unwrap_or(name);
                 if let Some(number) = master
                     .strip_prefix("quiet-")
@@ -971,7 +973,7 @@ impl Respond for QuietCatalogPhotos {
                     records.extend(
                         self.pair(number)
                             .into_iter()
-                            .filter(|r| r["recordName"] == name),
+                            .filter(|r| r.get("recordName").and_then(Value::as_str) == Some(name)),
                     );
                 } else {
                     records.push(
