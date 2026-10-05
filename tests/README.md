@@ -593,7 +593,10 @@ cursor and historical media, then reopen through the same production owner.
 Actual cycle tests cover exact EOF and enumeration-hash drift with a rank token
 that differs from the completed changes/zone successor. Quiet watch prechecks
 wake only the affected selected zone. Unknown catalog records and old-epoch debt
-remain retained; these histories grant no absence, deletion or expired-history
+remain retained. Sparse/deletion cycle controls keep recent enabled and provide
+coherent current inventories. A valid media asset still publishes while an
+unrelated source identity remains unresolved; its source checkpoint and recent
+receipt remain held. These histories grant no absence, deletion or expired-history
 proof. Truncated windows still hold the existing checkpoint and may repeat
 inventory. Catalog-owned selection generations remain a later stage.
 

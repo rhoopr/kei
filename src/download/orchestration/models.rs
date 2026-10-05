@@ -202,8 +202,9 @@ pub(crate) struct CheckpointEvidence {
     pub(crate) retry_passes: Vec<PassKey>,
     pub(crate) revalidate_records: Vec<ProviderRecordId>,
     pub(crate) sparse_identity_proofs: Vec<crate::state::SparseIdentityProof>,
-    /// This result's successor came from completed changes/zone replay, even
-    /// when a recent-selection inventory also ran. A rank query never sets it.
+    /// Complete changes/zone replay ran for this result, even when current
+    /// selection also ran or source progress remains held. Any offered successor
+    /// belongs to that replay. A rank query never sets this evidence.
     pub(crate) completed_delta_replay: bool,
 }
 

@@ -149,7 +149,10 @@ fn owner() -> AccountOwner {
     .unwrap()
 }
 
-fn passes(session: SelectionSession, db: &Arc<SqliteStateDb>) -> Vec<AlbumPass> {
+fn passes(
+    session: impl PhotosSession + Clone + 'static,
+    db: &Arc<SqliteStateDb>,
+) -> Vec<AlbumPass> {
     [Some("A"), Some("B"), None].into_iter().map(|scope| {
         let mut album = PhotoAlbum::new(PhotoAlbumConfig {
             params: Arc::new(HashMap::new()), service_endpoint: Arc::from("https://example.invalid"),
@@ -817,4 +820,162 @@ async fn recent_receipt_roundtrip_binds_scope_exclusions_and_future_versions() {
             .unwrap(),
         future
     );
+}
+
+#[tokio::test]
+async fn recent_mixed_identity_and_source_write_vetoes_keep_healthy_jobs_and_debt() {
+    #[derive(Clone)]
+    struct MixedSession(SelectionSession);
+    #[async_trait::async_trait]
+    impl PhotosSession for MixedSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/lookup?") {
+                let request: Value = serde_json::from_str(&body)?;
+                if request["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["recordName"] == "unresolved-child")
+                {
+                    return Ok(json!({"records":[]}));
+                }
+            }
+            let mut page = self.0.post(url, body, headers).await?;
+            if self.0.changed
+                && url.contains("/changes/zone?")
+                && page["zones"][0]["moreComing"] == true
+            {
+                let records = page["zones"][0]["records"].as_array_mut().unwrap();
+                records.insert(
+                    0,
+                    json!({"recordName":"unresolved-child","recordType":"CPLAsset","fields":{}}),
+                );
+                records
+                    .push(json!({"recordName":"previous","recordType":"CPLMaster","deleted":true}));
+            }
+            Ok(page)
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(5)
+        .mount(&server)
+        .await;
+    let inventory = inventory(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("owned.db");
+    let mut config = test_config();
+    config.directory = Arc::from(directory.path().join("media"));
+    config.folder_structure = String::new();
+    config.recent = Some(5);
+    let kept;
+    {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &owner())
+                .await
+                .unwrap(),
+        );
+        let mut selected = passes(
+            SelectionSession {
+                inventory: inventory.clone(),
+                changed: false,
+                cancel_at_selection: None,
+                queries: Arc::default(),
+            },
+            &db,
+        );
+        let mut pass = selected.pop().unwrap();
+        pass.exclude_ids = Arc::default();
+        let old = incremental_photo_records("previous");
+        kept = seed_downloaded_metadata_asset(
+            &db,
+            &config,
+            &pass,
+            &PhotoAsset::new(old[0].clone(), old[1].clone()),
+        )
+        .await;
+        db.set_metadata("sync_token:PrimarySync", "saved-cursor")
+            .await
+            .unwrap();
+        db.acquire_lock("inject unrelated source-state fault")
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER mixed_source_fault BEFORE UPDATE ON assets
+             WHEN NEW.filename='changed.JPG'
+             BEGIN SELECT RAISE(ABORT,'synthetic unrelated source write'); END;",
+            )
+            .unwrap();
+    }
+    let bytes = tokio::fs::read(&kept).await.unwrap();
+    for cycle in 0..2 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &owner())
+                .await
+                .unwrap(),
+        );
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "saved-cursor".into(),
+        };
+        let mut selected = passes(
+            MixedSession(SelectionSession {
+                inventory: inventory.clone(),
+                changed: true,
+                cancel_at_selection: None,
+                queries: Arc::default(),
+            }),
+            &db,
+        );
+        let mut pass = selected.pop().unwrap();
+        pass.exclude_ids = Arc::default();
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &[pass],
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.checkpoint.identity_incomplete);
+        assert!(result.checkpoint.state_write_failures > 0, "{result:?}");
+        assert!(result.checkpoint.sync_token_blocked);
+        assert!(result.sync_token.is_none());
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { .. }
+        ));
+        assert_eq!(result.stats.downloaded, if cycle == 0 { 5 } else { 0 });
+        assert_eq!(paths(&db).len(), 6);
+        assert_eq!(tokio::fs::read(&kept).await.unwrap(), bytes);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("saved-cursor")
+        );
+        let raw = db
+            .get_metadata("recent_selection_recovery:PrimarySync")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap()["complete"],
+            false
+        );
+        let connection = db
+            .acquire_lock("verify unresolved source retention")
+            .unwrap();
+        assert_eq!(connection.query_row::<i64,_,_>("SELECT count(*) FROM provider_catalog_records WHERE record_name='unresolved-child'",[],|r|r.get(0)).unwrap(),1);
+    }
 }

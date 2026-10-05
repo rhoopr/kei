@@ -15,9 +15,9 @@ use crate::sync_loop::test_support::{
     album_count_response, full_album_page, full_album_page_with_download,
     make_full_album_with_boxed_session, make_full_album_with_session, make_run_cycle_config,
     make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,
-    make_run_cycle_library_state, make_run_cycle_library_state_with_album,
-    make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle, make_state_db,
-    media_without_photo_downloads, run_cycle_expected_date_dir,
+    make_run_cycle_library_state_with_album, make_run_cycle_library_state_with_passes,
+    make_shared_session_for_run_cycle, make_state_db, media_without_photo_downloads,
+    run_cycle_expected_date_dir,
 };
 use crate::{download, retry, state};
 
@@ -333,7 +333,7 @@ async fn run_cycle_provider_metadata_write_failure_preserves_zone_checkpoint() {
                 "moreComing": false,
                 "records": page["records"].clone()
             }]
-        })),
+        })).ok(serde_json::json!({"records":page["records"].clone(),"syncToken":"metadata-rank-token"})),
     );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
@@ -454,6 +454,32 @@ fn run_cycle_captioned_asset_page() -> serde_json::Value {
     page
 }
 
+// Current ranked inventories complement sparse source/lookup fixtures. Rank
+// EOF is deliberately distinct from the source successor and never clears debt.
+fn sparse_fixture_inventory(
+    url: &str,
+    request: &serde_json::Value,
+    records: &[serde_json::Value],
+) -> Option<serde_json::Value> {
+    if url.contains("/internal/records/query/batch?") {
+        return Some(album_count_response((records.len() / 2) as u64));
+    }
+    if !url.contains("/records/query?") {
+        return None;
+    }
+    let offset = request["query"]["filterBy"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|filter| filter["fieldName"] == "startRank")
+        .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+        .unwrap_or(0);
+    Some(
+        serde_json::json!({"records": if offset == 0 {records} else {&[]},
+        "syncToken":"sparse-fixture-rank"}),
+    )
+}
+
 #[tokio::test]
 async fn unresolved_identity_survives_restart_and_other_zone_success_then_recovers() {
     use crate::state::SparseIdentityStore as _;
@@ -489,6 +515,10 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            if let Some(page) = sparse_fixture_inventory(url, &request, &self.valid) {
+                return Ok(page);
+            }
             if url.contains("/records/lookup?") {
                 self.lookups
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -708,10 +738,33 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     }),
                 ),
             );
-            let shared = make_run_cycle_library_state(
+            #[derive(Clone)]
+            struct QuietShared;
+            #[async_trait::async_trait]
+            impl crate::icloud::photos::PhotosSession for QuietShared {
+                async fn post(
+                    &self,
+                    url: &str,
+                    body: String,
+                    _: &[(&str, &str)],
+                ) -> anyhow::Result<serde_json::Value> {
+                    let request = serde_json::from_str(&body)?;
+                    if let Some(page) = sparse_fixture_inventory(url, &request, &[]) {
+                        return Ok(page);
+                    }
+                    assert!(url.contains("/changes/zone?"));
+                    Ok(
+                        serde_json::json!({"zones":[{"zoneID":{"zoneName":"SharedSync-test","ownerRecordName":"_defaultOwner"},"records":[],"syncToken":"shared-after","moreComing":false}]}),
+                    )
+                }
+                fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                    Box::new(self.clone())
+                }
+            }
+            let shared = make_run_cycle_library_state_with_album(
                 "SharedSync-test",
                 "sync_token:SharedSync-test",
-                "shared-after",
+                make_full_album_with_boxed_session("SharedSync-test", Box::new(QuietShared)),
             );
             let libraries = if phase == 1 {
                 vec![&shared]
@@ -754,7 +807,8 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 );
             assert_eq!(
                 lookups.load(std::sync::atomic::Ordering::Relaxed),
-                usize::from(phase != 1 && !deferred && !(phase >= 3 && deletion_delta))
+                usize::from(phase != 1 && !deferred && !(phase >= 3 && deletion_delta)),
+                "recent={recent:?} evidence={evidence:?} cycle={cycle} phase={phase}"
             );
             let retained = inner.sparse_identities("PrimarySync").await.unwrap();
             let stable_link = matches!(
@@ -835,7 +889,24 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     .as_deref(),
                 Some("shared-after")
             );
-            assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+            if recent.is_some() && phase < recovery_phase {
+                let raw = inner
+                    .get_metadata("recent_selection_recovery:PrimarySync")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&raw).unwrap()["complete"],
+                    false,
+                    "healthy materialization never clears unrelated source identity debt"
+                );
+            }
+            assert_eq!(
+                result.stats.downloaded,
+                usize::from(cycle == 0),
+                "recent={recent:?} evidence={evidence:?} cycle={cycle}: {:?}",
+                result.stats
+            );
             let files = snapshot_files(&media);
             for (path, contents) in &before {
                 assert_eq!(files.get(path), Some(contents));
@@ -2598,6 +2669,9 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if let Some(page) = sparse_fixture_inventory(url, &body, &[]) {
+                return Ok(page);
+            }
             if url.contains("/changes/zone?") {
                 let mut records = Vec::new();
                 if self.replay && body["zones"][0]["syncToken"] == "before" {
@@ -2806,6 +2880,9 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
             let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if let Some(page) = sparse_fixture_inventory(url, &request, &[]) {
+                return Ok(page);
+            }
             if url.contains("/changes/zone?") {
                 let from = request["zones"][0]["syncToken"].as_str().unwrap();
                 let mut records = Vec::new();
@@ -3020,6 +3097,12 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
             body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            if let Some(page) =
+                sparse_fixture_inventory(url, &request, self.records.as_array().unwrap())
+            {
+                return Ok(page);
+            }
             if url.contains("/changes/zone?") {
                 return Ok(
                     serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":[]}]}),

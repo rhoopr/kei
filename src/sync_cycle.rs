@@ -1023,6 +1023,7 @@ pub(crate) async fn run_cycle(
             || unresolved_identity
             || legacy_cycle.requires_inventory())
             && sync_result.full_enumeration_ran
+            && !sync_result.checkpoint.completed_delta_replay
             && checkpoint_transition_state_safe
         {
             let prior_token = if let Some(db) = state_db {

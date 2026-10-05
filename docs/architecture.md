@@ -834,7 +834,11 @@ Selection rank tokens prove only the existing selection EOF contract. The
 combined result returns the delta successor and carries separate completed
 replay evidence for configuration bridges; a pure full fallback has no such
 evidence. Existing identity, state-write, interruption, sparse/legacy and
-bounded-inventory vetoes remain authoritative. A truncated count window keeps
+bounded-inventory vetoes remain authoritative. Unresolved delta identity does
+not starve independently valid recent media selected by current inventory;
+its source veto, failed-write counters and pending recovery receipt remain in
+force. Current queue/publication guards remain authoritative for each job. A
+truncated count window keeps
 its recovery obligation and prior cursor; repeated bounded inventory remains a
 known cost until a larger catalog selection generation stage qualifies it.
 This receipt neither claims an atomic rank snapshot nor proves absence or

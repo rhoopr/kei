@@ -707,12 +707,11 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .await
                 .map_err(super::recent::RecentSelectionError)?;
         }
-        if delta_summary.state_transition_failures > 0
-            || delta_summary.identity_incomplete
-            || delta_summary.token_unsafe_reason.is_some()
-            || delta_summary.sync_token.is_none()
-            || shutdown_token.is_cancelled()
-        {
+        // Completed delta evidence can hold source progress while independent
+        // current selection still materializes healthy media. Preserve every
+        // delta veto below; the reused queue/publication owner guards each job.
+        // Do not infer failure kind from the first-wins diagnostic reason.
+        if delta_summary.sync_token.is_none() || shutdown_token.is_cancelled() {
             let mut stats = SyncStats {
                 state_write_failures: delta_summary.state_transition_failures,
                 identity_incomplete: delta_summary.identity_incomplete,
@@ -770,6 +769,13 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         );
         selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
         selected.accumulate(&delta_result);
+        if let Some(reason) = delta_summary.token_unsafe_reason {
+            selected.block_incremental_token(reason);
+        }
+        // The validated source stream completed even when unresolved identity
+        // still holds its successor. Keep the cycle owner from replaying an
+        // already completed delta as though this were a pure rank inventory.
+        selected.checkpoint.completed_delta_replay = true;
         // The rank query's token is only an EOF proof for selection. It never
         // replaces the actual completed changes/zone successor. Preserve every
         // full-selection and delta veto, including a bounded recent inventory.
@@ -791,7 +797,6 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             .await
             .map_err(super::recent::RecentSelectionError)?;
             selected.sync_token = Some(successor);
-            selected.checkpoint.completed_delta_replay = true;
         }
         return Ok(selected);
     }
