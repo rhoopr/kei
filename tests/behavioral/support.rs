@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 29;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 30;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -123,6 +123,45 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     scope TEXT PRIMARY KEY,
     page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id)
 ) WITHOUT ROWID;
+
+
+CREATE TABLE IF NOT EXISTS provider_catalog_records (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    record_name TEXT NOT NULL,
+    record_type TEXT,
+    deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
+    kind TEXT NOT NULL CHECK(kind IN ('master','asset','album','relation','unknown')),
+    PRIMARY KEY(page_id,ordinal),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_shadow_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_catalog_references (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    field_path TEXT NOT NULL,
+    target_record_name TEXT NOT NULL CHECK(length(trim(target_record_name))>0),
+    target_zone_name TEXT,
+    target_zone_owner TEXT,
+    PRIMARY KEY(page_id,ordinal,field_path),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_catalog_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_catalog_debt (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    field_path TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    PRIMARY KEY(page_id,ordinal,field_path,reason),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_catalog_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_catalog_pages (
+    page_id INTEGER PRIMARY KEY REFERENCES provider_shadow_pages(id),
+    projector_version INTEGER NOT NULL CHECK(projector_version>0),
+    body_hash TEXT NOT NULL,
+    record_count INTEGER NOT NULL CHECK(record_count>=0),
+    reference_count INTEGER NOT NULL CHECK(reference_count>=0),
+    debt_count INTEGER NOT NULL CHECK(debt_count>=0),
+    charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0)
+);
 
 CREATE TABLE IF NOT EXISTS asset_metadata_paths (
     library TEXT NOT NULL,

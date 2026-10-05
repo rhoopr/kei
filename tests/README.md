@@ -441,7 +441,7 @@ actual CLI startup control captures an unknown source through normal library
 resolution without manually attaching an album. The schema-28 migration fault
 control retains source cursors, debt and an unknown BLOB in a conflicting table
 with matching columns but no durable key. It rolls back partial DDL, then retries
-and reopens schema 29 twice. Payload replay also retains existing observations
+and reopens the current schema twice. Payload replay also retains existing observations
 through synthetic migration re-entry. Owned migration controls also reject TEXT,
 inline descending integer and WITHOUT ROWID page keys on two reopens, preserving
 schema 28, source cursor, old debt, conflicting DDL and unknown BLOB bytes.
@@ -455,6 +455,43 @@ must fail before source restoration. Bounded exact-resource URL refresh tests,
 including RAW/JPEG provider rendition and per-file retry isolation, remain part
 of qualification. These synthetic controls do not qualify power-loss durability,
 full-zone history, expired-epoch completeness or inbox-driven materialization.
+
+## Transactional source catalog replay
+
+Owned file-backed fixtures replay schema-29 captured sources through migration
+and two quiet reopens. Independent expected facts include masters, assets,
+albums, membership, unknown records, typeless tombstones and incomplete links.
+Literal references retain escaped source field paths and cross-zone provenance;
+original JSON bytes and numeric lexemes remain unchanged. Distinct revisions and
+private/shared scopes stay separate; replaying an old page cannot overwrite facts.
+
+A receipt trigger aborts after real record, reference and unresolved-evidence
+writes. The index rolls back completely while the original capture survives.
+An actual CLI fixture starts with a schema-29 backlog, fails projection in two
+processes, removes only the injected trigger, recovers and repeats quietly twice.
+Existing media, downloaded receipts, metadata revisions, pending retry and old
+scope sparse debt remain intact. That retained debt keeps the overall CLI cycle
+incomplete even after indexing recovers; projection cannot acknowledge it. Only the existing current stream can advance its token;
+the old captured successor is never installed as the checkpoint.
+
+Controls reject owner, provider, hash, scope, source ordinal and page-metadata
+mismatches, including a source changed after planning but before the transaction.
+Completed replay refuses a corrupted receipt, facts or unsupported projector
+version without rewriting the retained evidence.
+A conflicting schema-30 table preserves schema 29, captured bytes and unknown
+BLOB history through two failures and recovers after removing only the injected
+fixture conflict. Logical index exhaustion retains pending sources, allows exact
+completed replay at capacity, and recovers with available capacity. A page that
+fits the raw limit but expands derived reference paths beyond the per-page budget
+is refused without partial indexing. Cancelled replay leaves work for restart.
+
+Reversible bypass controls remove the catalog transaction, raw/source equality,
+transaction source recheck or startup replay. Each fails its intended runtime
+assertion before source restoration; the complete positive matrix then passes.
+
+These fixtures qualify additive source indexing, not inbox-driven queue
+materialization, selection generations, snapshot completeness, historical debt
+acknowledgment, local deletion or stronger power-loss durability.
 
 ## State-transition proof
 
@@ -897,7 +934,7 @@ completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 29.
+binary (schema 25), then executes the current production CLI through schema 30.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,

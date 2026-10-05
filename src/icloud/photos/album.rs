@@ -9,6 +9,7 @@
 //! `test_support`. All external paths and tracing targets remain unchanged.
 
 mod changes;
+pub(crate) use changes::catalog_observed_page;
 mod completion;
 mod counts;
 mod enumeration;

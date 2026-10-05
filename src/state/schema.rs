@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 29;
+pub(crate) const SCHEMA_VERSION: i32 = 30;
 
 fn migrate_provider_shadow_inbox(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(
@@ -70,6 +70,79 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     }
     // Preparing the conflict target also verifies the replay uniqueness key.
     conn.prepare("INSERT INTO provider_shadow_pages(scope,request_cursor,body_hash) VALUES (?1,?2,?3) ON CONFLICT(scope,request_cursor,body_hash) DO NOTHING")?;
+    Ok(())
+}
+
+fn migrate_provider_catalog(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(
+        r"
+CREATE TABLE IF NOT EXISTS provider_catalog_records (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    record_name TEXT NOT NULL,
+    record_type TEXT,
+    deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
+    kind TEXT NOT NULL CHECK(kind IN ('master','asset','album','relation','unknown')),
+    PRIMARY KEY(page_id,ordinal),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_shadow_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_catalog_references (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    field_path TEXT NOT NULL,
+    target_record_name TEXT NOT NULL CHECK(length(trim(target_record_name))>0),
+    target_zone_name TEXT,
+    target_zone_owner TEXT,
+    PRIMARY KEY(page_id,ordinal,field_path),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_catalog_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_catalog_debt (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    field_path TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    PRIMARY KEY(page_id,ordinal,field_path,reason),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_catalog_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_catalog_pages (
+    page_id INTEGER PRIMARY KEY REFERENCES provider_shadow_pages(id),
+    projector_version INTEGER NOT NULL CHECK(projector_version>0),
+    body_hash TEXT NOT NULL,
+    record_count INTEGER NOT NULL CHECK(record_count>=0),
+    reference_count INTEGER NOT NULL CHECK(reference_count>=0),
+    debt_count INTEGER NOT NULL CHECK(debt_count>=0),
+    charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0)
+);
+",
+    )?;
+    for sql in [
+        "SELECT page_id,ordinal,record_name,record_type,deleted,kind FROM provider_catalog_records LIMIT 0",
+        "SELECT page_id,ordinal,field_path,target_record_name,target_zone_name,target_zone_owner FROM provider_catalog_references LIMIT 0",
+        "SELECT page_id,ordinal,field_path,reason FROM provider_catalog_debt LIMIT 0",
+        "SELECT page_id,projector_version,body_hash,record_count,reference_count,debt_count,charged_bytes FROM provider_catalog_pages LIMIT 0",
+    ] {
+        conn.prepare(sql)?;
+    }
+    for (table, expected) in [
+        ("provider_catalog_records", &["page_id", "ordinal"][..]),
+        (
+            "provider_catalog_references",
+            &["page_id", "ordinal", "field_path"][..],
+        ),
+        (
+            "provider_catalog_debt",
+            &["page_id", "ordinal", "field_path", "reason"][..],
+        ),
+        ("provider_catalog_pages", &["page_id"][..]),
+    ] {
+        let actual: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
+            .query_map([table], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        if actual != expected {
+            return Err(StateError::ProviderCatalogInvalid);
+        }
+    }
     Ok(())
 }
 
@@ -972,6 +1045,7 @@ fn migrate_to_version(
         27 => conn.execute_batch(SCHEMA_V27)?,
         28 => migrate_legacy_preservation(conn)?,
         29 => migrate_provider_shadow_inbox(conn)?,
+        30 => migrate_provider_catalog(conn)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1067,7 +1141,7 @@ mod tests {
             let conn = db
                 .acquire_lock("independent migration recovery facts")
                 .unwrap();
-            assert_eq!(get_schema_version(&conn).unwrap(), 29);
+            assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
             assert_eq!(
                 conn.query_row::<Vec<u8>, _, _>("SELECT payload FROM future_unknown", [], |row| {
                     row.get(0)

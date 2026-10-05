@@ -1,6 +1,8 @@
 //! Sequential CloudKit change scans and incremental event streams.
 
 #[cfg(test)]
+mod catalog_tests;
+#[cfg(test)]
 mod shadow_tests;
 
 use super::lookup::ProviderRecordId;
@@ -161,6 +163,32 @@ impl ValidatedChangesPage {
         );
         Ok(())
     }
+}
+
+/// Reuse the live scoped validation contract for a retained source page.
+pub(crate) fn catalog_observed_page(
+    body: Vec<u8>,
+    scope: &str,
+    request_cursor: &str,
+) -> anyhow::Result<crate::state::db::provider_inbox::ObservedPage> {
+    let scope_value: Value = serde_json::from_str(scope)
+        .map_err(|_invalid_scope| anyhow::anyhow!("Invalid catalog source scope"))?;
+    let mut zone = scope_value
+        .get("zone")
+        .cloned()
+        .context("Missing catalog source zone")?;
+    if zone.get("ownerRecordName").is_some_and(Value::is_null) {
+        zone.as_object_mut()
+            .context("Invalid catalog source zone")?
+            .remove("ownerRecordName");
+    }
+    let page = ValidatedChangesPage::parse(super::super::changes_json::parse(&body)?, &zone)?;
+    anyhow::ensure!(
+        !request_cursor.trim().is_empty()
+            && (!page.more_coming || page.sync_token != request_cursor),
+        "Invalid catalog source continuation"
+    );
+    page.observed_page(body, scope.to_owned(), request_cursor)
 }
 
 impl PhotoAlbum {

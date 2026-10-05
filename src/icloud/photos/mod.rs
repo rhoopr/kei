@@ -10,6 +10,7 @@ pub mod error;
 pub(crate) mod inbox;
 mod library;
 pub(crate) mod metadata;
+mod projection;
 pub mod queries;
 pub mod session;
 pub(crate) mod smart_folders;
@@ -71,6 +72,16 @@ fn is_photo_library_zone(zone_name: &str) -> bool {
 }
 
 impl PhotosService {
+    pub(crate) async fn replay_catalog(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        if let Some(capture) = &self.shadow_capture {
+            capture.replay_catalog(cancel).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_shadow_capture(&mut self, capture: inbox::ShadowCapture) {
         self.primary_library.shadow_capture = Some(capture.clone());
         for libraries in [&mut self.private_libraries, &mut self.shared_libraries]
