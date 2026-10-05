@@ -172,6 +172,19 @@ impl PhotoAlbum {
             .unwrap_or("")
     }
 
+    /// Provider scope used to bind durable selection recovery to its query owners.
+    pub(crate) fn selection_scope(&self) -> Value {
+        serde_json::json!({
+            "zone": self.zone_id.as_ref(),
+            "name": self.name.as_ref(),
+            "list_type": self.list_type.as_ref(),
+            "obj_type": self.obj_type.as_ref(),
+            "query_filter": self.query_filter.as_deref(),
+            "container_id": self.container_id.as_deref(),
+            "cross_zone_sources": self.cross_zone_sources.iter().map(Self::selection_scope).collect::<Vec<_>>(),
+        })
+    }
+
     pub(crate) fn container_id(&self) -> Option<&str> {
         self.container_id.as_deref()
     }

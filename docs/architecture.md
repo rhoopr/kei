@@ -812,7 +812,39 @@ unchanged provider record remains retryable, and neither route counts the
 record as a policy, filename, or date skip.
 
 Recent and date-bounded runs may advance only when the producer proves the
-bound did not truncate the stream.
+bound did not truncate the stream. Incremental count-form recent selection
+uses the full selection owner after complete strict delta replay. Global uses
+the library-wide ranked window before filters; per-filter uses each pass's
+window. Delta arrival order and asset/pass-pair counts never define that window.
+
+`orchestration/recent.rs` stores a fixed-size `recent_selection_recovery:<zone>`
+receipt in the account-owned database. It binds the resolved provider/pass
+scope, exclusions, selection and download configuration, and the source cursor
+hash. Missing, malformed, mismatched or pending receipts require current
+inventory even when the next delta has no changes. The pending receipt is
+written before selection. A completed receipt is usable only after its actual
+changes/zone successor becomes the requested cursor, so a failed checkpoint
+commit cannot skip recovery. Cap increases and removal consume this obligation
+without a manual token reset. Watch prechecks include this local recovery even
+when the provider reports no changed zones. Enumeration safety hash version 3
+includes count and recent scope, forcing one conservative inventory/bridge for
+legacy cursors, including prior cap removal, before trusting quiet streams.
+
+Selection rank tokens prove only the existing selection EOF contract. The
+combined result returns the delta successor and carries separate completed
+replay evidence for configuration bridges; a pure full fallback has no such
+evidence. Existing identity, state-write, interruption, sparse/legacy and
+bounded-inventory vetoes remain authoritative. Unresolved delta identity does
+not starve independently valid recent media selected by current inventory;
+its source veto, failed-write counters and pending recovery receipt remain in
+force. Current queue/publication guards remain authoritative for each job. A
+truncated count window keeps
+its recovery obligation and prior cursor; repeated bounded inventory remains a
+known cost until a larger catalog selection generation stage qualifies it.
+Typed provider session errors retain the existing bounded reauthentication
+route across current selection; other selection failures do not trigger fallback.
+This receipt neither claims an atomic rank snapshot nor proves absence or
+permits local deletion.
 
 ### Download and publication
 

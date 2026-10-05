@@ -569,6 +569,40 @@ They do not claim recent-cap semantics, named-album or shared-endpoint admission
 capture-owned cursor promotion, snapshot absence, pruning, historical retention
 or acknowledgment of unrecoverable debt.
 
+## Recent count selection recovery
+
+The recent overflow fixture starts with owned, populated SQLite/media and a
+retained source cursor. Shuffled multi-page deltas, overlapping albums and an
+unfiled pass enter the actual dispatcher. Independent expected paths distinguish
+library-wide top N before filters from up to N per filter; duplicate album copies
+and a Live Photo companion distinguish assets from output-file counts. Reopening
+with unchanged provider deltas increases and removes the cap, recovers omitted
+work, and checks two quiet cycles without additional byte requests or inventory
+once current EOF evidence qualifies the receipt.
+The actual CLI history uses its existing name-id7 skip policy for synthetic
+local files and checks the selected paths, scoped catalog/receipt/checkpoint,
+unchanged bytes/mtime, other account and unselected pending scope. It does not
+claim that a filename skip creates downloaded-state or verifies source bytes;
+fresh publication/checksum/finalization are asserted in dispatcher histories.
+
+The recent recovery receipt is fixed-size hashed account-database-local evidence,
+not a retained list of selected or discarded records. Pending, malformed, future
+version, changed scope/exclusions and failed successor commits force current
+inventory. Receipt/task write failures and cancellation preserve the prior
+cursor and historical media, then reopen through the same production owner.
+Actual cycle tests cover exact EOF and enumeration-hash drift with a rank token
+that differs from the completed changes/zone successor. Quiet watch prechecks
+wake only the affected selected zone. Unknown catalog records and old-epoch debt
+remain retained. Sparse/deletion cycle controls keep recent enabled and provide
+coherent current inventories. A valid media asset still publishes while an
+unrelated source identity remains unresolved; its source checkpoint and recent
+receipt remain held. These histories grant no absence, deletion or expired-history
+proof. Truncated windows still hold the existing checkpoint and may repeat
+inventory. Catalog-owned selection generations remain a later stage.
+Global-frontier dispatcher controls cover 401/403/421 session recovery and a
+non-session failure with no fallback, preserving the cursor, pending receipt
+and existing media across database reopen.
+
 ## State-transition proof
 
 Changes to durable configuration, filesystem paths, media publication,

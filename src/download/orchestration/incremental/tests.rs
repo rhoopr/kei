@@ -2379,7 +2379,9 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
         album: mock_album(
             "Library",
             MockPhotosFlow::new()
-                .changes_zone_page(changed_records, "zone-token-next", false)
+                .changes_zone_page(changed_records.clone(), "zone-token-next", false)
+                .album_count(1)
+                .query_page(changed_records, Some("rank-selection-token"))
                 .build(),
         ),
         exclude_ids: Arc::new(FxHashSet::default()),
@@ -2524,4 +2526,114 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
         );
         assert!(db.get_all_known_ids().await.unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = crate::start_wiremock_or_skip!();
+    let body = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ];
+    for name in ["oldest", "middle", "newest"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}.jpg")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+    }
+    let records = |id: &str, date: i64| {
+        let mut records = incremental_photo_records_with_url(
+            id,
+            &format!("{id}.jpg"),
+            &format!("{}/{id}.jpg", server.uri()),
+            body.len() as u64,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
+        records[1]["fields"]["assetDate"]["value"] = json!(date);
+        records
+    };
+    let oldest = records("oldest", 1_600_000_000_000);
+    let middle = records("middle", 1_650_000_000_000);
+    let newest = records("newest", 1_700_000_000_000);
+    let dir = TempDir::new().unwrap();
+    let database = dir.path().join("state.db");
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path().join("media"));
+    config.recent = Some(1);
+    config.sync_mode = SyncMode::Incremental {
+        zone_sync_token: "saved-cursor".to_string(),
+    };
+    let previous_records = incremental_photo_records("previous");
+    let previous = PhotoAsset::new(previous_records[0].clone(), previous_records[1].clone());
+    let previous_path;
+    {
+        let db = SqliteStateDb::open(&database).await.unwrap();
+        db.set_metadata("sync_token:PrimarySync", "saved-cursor")
+            .await
+            .unwrap();
+        let pass = unused_unfiled_changes_pass();
+        previous_path = seed_downloaded_metadata_asset(&db, &config, &pass, &previous).await;
+    }
+    let previous_bytes = tokio::fs::read(&previous_path).await.unwrap();
+    let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+    config.state_db = Some(db.clone());
+    let session = MockPhotosFlow::new()
+        .changes_zone_page(oldest.clone(), "delta-page-1", true)
+        .changes_zone_page(
+            [middle.clone(), newest.clone()].concat(),
+            "delta-terminal",
+            false,
+        )
+        .album_count(3)
+        .query_page([newest, middle, oldest].concat(), Some("inventory-token"))
+        .build();
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: mock_album("", session),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let result = download_photos_with_sync(
+        &Client::new(),
+        &[pass],
+        Arc::new(config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
+    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+    let mut names: Vec<_> = rows.iter().map(|row| row.filename.as_ref()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["changed.JPG", "newest.JPG"],
+        "production recent selection must use current descending inventory, not shuffled delta arrival: {result:?}"
+    );
+    assert_eq!(
+        result.sync_token, None,
+        "bounded current inventory cannot accept a successor: {result:?}"
+    );
+    assert!(result.checkpoint.sync_token_blocked);
+    assert_eq!(
+        tokio::fs::read(&previous_path).await.unwrap(),
+        previous_bytes
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("saved-cursor")
+    );
 }

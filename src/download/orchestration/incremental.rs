@@ -54,7 +54,7 @@ fn single_unfiled_streaming_pass<'a>(
 ) -> Option<&'a crate::commands::AlbumPass> {
     // Keep relation-sensitive cases on the collecting path: selected albums
     // need all relation deltas applied before routing created assets, and
-    // `--recent` currently caps after the full delta is known. The unfiled-only
+    // recent selection uses a separate current inventory. The unfiled-only
     // path can stream created assets immediately because album relation deltas
     // update state for future cycles but do not change this pass's routing.
     if config.recent.is_some()
@@ -308,7 +308,11 @@ pub(super) async fn download_photos_incremental(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let routing = IncrementalPassRouting::from_passes(passes);
-    if let Some(pass) = single_unfiled_streaming_pass(passes, config, &routing) {
+    if !super::recent::active(config)
+        .await
+        .map_err(super::recent::RecentSelectionError)?
+        && let Some(pass) = single_unfiled_streaming_pass(passes, config, &routing)
+    {
         let pass_config = Arc::new(config.with_pass(pass));
         return download_photos_incremental_streaming(
             download_client,
@@ -459,11 +463,23 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     let routing = IncrementalPassRouting::from_passes(passes);
     let selected_container_ids = routing.selected_container_refs();
 
+    let recent_active = super::recent::active(config)
+        .await
+        .map_err(super::recent::RecentSelectionError)?;
+    let delta_pass = if recent_active {
+        passes
+            .iter()
+            .find(|pass| pass.kind == crate::commands::PassKind::Unfiled)
+            .or_else(|| passes.first())
+    } else {
+        passes.first()
+    };
+
     // `changes_stream` is zone-scoped, not album-scoped. Query it once and
     // fan created assets out through the selected passes locally; querying
     // once per pass repeats the same `/changes/zone` pages on every watch
     // cycle with work.
-    if let Some(pass) = passes.first() {
+    if let Some(pass) = delta_pass {
         let phase_started = Instant::now();
         let (change_stream, token_rx) = pass.album.changes_stream(zone_sync_token);
         tokio::pin!(change_stream);
@@ -503,7 +519,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     }
     hydrate_unpaired_created_asset_deltas(
         &mut change_events,
-        passes.first(),
+        delta_pass,
         config,
         &mut delta.summary,
         controls.run_mode,
@@ -676,6 +692,123 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         ));
     }
 
+    if recent_active
+        && super::recent::needs_inventory(
+            passes,
+            config,
+            zone_sync_token,
+            delta_summary.total_events > 0,
+        )
+        .await
+        .map_err(super::recent::RecentSelectionError)?
+    {
+        if controls.run_mode.downloads_files() {
+            super::recent::record(passes, config, zone_sync_token, false)
+                .await
+                .map_err(super::recent::RecentSelectionError)?;
+        }
+        // Completed delta evidence can hold source progress while independent
+        // current selection still materializes healthy media. Preserve every
+        // delta veto below; the reused queue/publication owner guards each job.
+        // Do not infer failure kind from the first-wins diagnostic reason.
+        if delta_summary.sync_token.is_none() || shutdown_token.is_cancelled() {
+            let mut stats = SyncStats {
+                state_write_failures: delta_summary.state_transition_failures,
+                identity_incomplete: delta_summary.identity_incomplete,
+                interrupted: shutdown_token.is_cancelled(),
+                ..SyncStats::default()
+            };
+            if let Some(reason) = delta_summary.token_unsafe_reason {
+                block_sync_token_for_incremental_delta(&mut stats, reason);
+            }
+            return Ok(SyncResult::from_incremental_execution(
+                if delta_summary.state_transition_failures > 0 {
+                    DownloadOutcome::PartialFailure {
+                        failed_count: delta_summary.state_transition_failures,
+                    }
+                } else {
+                    DownloadOutcome::Success
+                },
+                None,
+                stats,
+                delta_summary.sparse_identity_proofs,
+            ));
+        }
+        // Delta arrival is not an ordered library/pass inventory. Reuse the
+        // recent selection owner for all currently eligible assets, including
+        // unchanged assets that entered the window after a removal.
+        let mut selected = Box::pin(super::full::download_photos_full_with_token(
+            download_client,
+            passes,
+            config,
+            controls,
+            shutdown_token.clone(),
+        ))
+        .await
+        .map_err(|error| {
+            // Keep typed session failures visible to the dispatcher so its
+            // existing bounded reauthentication path can retain the receipt.
+            if crate::icloud::photos::session::is_session_error(&error) {
+                error
+            } else {
+                super::recent::RecentSelectionError(error).into()
+            }
+        })?;
+        let mut delta_stats = SyncStats {
+            state_write_failures: delta_summary.state_transition_failures,
+            identity_incomplete: delta_summary.identity_incomplete,
+            interrupted: shutdown_token.is_cancelled(),
+            ..SyncStats::default()
+        };
+        if let Some(reason) = delta_summary.token_unsafe_reason {
+            block_sync_token_for_incremental_delta(&mut delta_stats, reason);
+        }
+        let delta_result = SyncResult::from_incremental_execution(
+            if delta_summary.state_transition_failures > 0 {
+                DownloadOutcome::PartialFailure {
+                    failed_count: delta_summary.state_transition_failures,
+                }
+            } else {
+                DownloadOutcome::Success
+            },
+            None,
+            delta_stats,
+            delta_summary.sparse_identity_proofs,
+        );
+        selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
+        selected.accumulate(&delta_result);
+        if let Some(reason) = delta_summary.token_unsafe_reason {
+            selected.block_incremental_token(reason);
+        }
+        // The validated source stream completed even when unresolved identity
+        // still holds its successor. Keep the cycle owner from replaying an
+        // already completed delta as though this were a pure rank inventory.
+        selected.checkpoint.completed_delta_replay = true;
+        // The rank query's token is only an EOF proof for selection. It never
+        // replaces the actual completed changes/zone successor. Preserve every
+        // full-selection and delta veto, including a bounded recent inventory.
+        let selection_complete = selected.sync_token.take().is_some()
+            && !selected.checkpoint.sync_token_blocked
+            && !selected.checkpoint.identity_incomplete
+            && !selected.checkpoint.interrupted
+            && !selected.checkpoint.enumeration_incomplete
+            && selected.checkpoint.enumeration_errors == 0
+            && selected.checkpoint.state_write_failures == 0
+            && controls.run_mode.downloads_files();
+        if selection_complete && let Some(successor) = delta_summary.sync_token {
+            super::recent::record(
+                passes,
+                config,
+                &successor,
+                matches!(selected.outcome, DownloadOutcome::Success),
+            )
+            .await
+            .map_err(super::recent::RecentSelectionError)?;
+            selected.sync_token = Some(successor);
+        }
+        return Ok(selected);
+    }
+
     if downloadable_assets.is_empty() {
         let rewrite_failures =
             run_collecting_metadata_rewrite_batch(config, controls.run_mode, &shutdown_token).await;
@@ -699,6 +832,21 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .then_some(delta_summary.sync_token)
                 .flatten()
         };
+        if recent_active
+            && controls.run_mode.downloads_files()
+            && let Some(successor) = sync_token.as_deref()
+        {
+            super::recent::record(
+                passes,
+                config,
+                successor,
+                delta_summary.state_transition_failures == 0
+                    && !stats.interrupted
+                    && !stats.identity_incomplete,
+            )
+            .await
+            .map_err(super::recent::RecentSelectionError)?;
+        }
         return Ok(SyncResult::from_incremental_execution(
             if delta_summary.state_transition_failures > 0 || rewrite_failures > 0 {
                 DownloadOutcome::PartialFailure {
@@ -720,19 +868,6 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         None => preload_download_context(config).await,
     };
     let mut planning_state_write_failures = 0usize;
-
-    // Respect --recent: cap the number of assets to download
-    if let Some(recent) = config.recent {
-        let limit = recent as usize;
-        if downloadable_assets.len() > limit {
-            tracing::debug!(
-                total = downloadable_assets.len(),
-                limit,
-                "Capping incremental assets to --recent limit"
-            );
-            downloadable_assets.truncate(limit);
-        }
-    }
 
     tracing::debug!(
         count = downloadable_assets.len(),

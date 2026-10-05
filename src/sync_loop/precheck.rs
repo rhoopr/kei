@@ -148,8 +148,19 @@ pub(super) async fn include_pending_provider_work(
             Arc::new(download::AssetGroupings::default()),
             Arc::from(library.zone_name.as_str()),
         );
-        let pending = match download::has_due_retained_work(&library.plan.passes, &config, controls)
-            .await
+        let pending = match async {
+            if download::recent_selection_requires_recovery(
+                &library.plan.passes,
+                &config,
+                &library.sync_token_key,
+            )
+            .await?
+            {
+                return Ok(true);
+            }
+            download::has_due_retained_work(&library.plan.passes, &config, controls).await
+        }
+        .await
         {
             Ok(pending) => pending,
             Err(error) => {

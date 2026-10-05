@@ -78,7 +78,7 @@ const LEGACY_PATH_DERIVATION_HASH_VERSION: u8 = 2;
 
 const PATH_DERIVATION_HASH_VERSION: u8 = 3;
 
-const ENUMERATION_SAFETY_HASH_VERSION: u8 = 2;
+const ENUMERATION_SAFETY_HASH_VERSION: u8 = 3;
 
 pub(crate) const DOWNLOAD_CONFIG_HASH_KEY: &str = "config_hash";
 
@@ -411,11 +411,18 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     for pattern in &sorted_excludes {
         hash_bytes(&mut hasher, pattern.as_bytes());
     }
-    // Note: `recent` is intentionally excluded from this enum hash.
-    // Changing --recent should not invalidate sync tokens because the
-    // incremental path already applies the recent cap post-fetch.
-    // `recent` IS included in hash_download_config (trust-state) so
-    // changing it still triggers filesystem re-verification.
+    // Recent eligibility drift must recover assets omitted before this owner
+    // persisted scoped recovery evidence. Version 3 also forces one conservative
+    // inventory/bridge on legacy cursors, including legacy cap removal.
+    hash_optional_u32(&mut hasher, config.filters.recent);
+    if config.filters.recent.is_some() {
+        hasher.update(b"recent_scope:");
+        hasher.update(match config.filters.recent_scope {
+            crate::cli::RecentScope::Global => b"global".as_slice(),
+            crate::cli::RecentScope::PerFilter => b"per-filter".as_slice(),
+        });
+        hasher.update(b"\0");
+    }
 
     // The unfiled selector is still unsafe to classify from the current state
     // alone: switching it on can make old, never-enumerated unfiled assets

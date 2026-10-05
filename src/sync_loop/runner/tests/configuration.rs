@@ -1930,3 +1930,194 @@ async fn unresolved_identity_inventory_requires_a_delta_bridge() {
         }
     }
 }
+
+#[tokio::test]
+async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet_reopen() {
+    use crate::icloud::photos::PhotosSession;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct CountedBridge {
+        inner: ConfigBridgeSession,
+        queries: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for CountedBridge {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/records/query?") {
+                self.queries.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.post(url, body, headers).await
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    for drift in [false, true] {
+        let mut config = make_run_cycle_config();
+        config.filters.recent = Some(2);
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("state.db");
+        let media = directory.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let kept = media.join("previous.jpg");
+        std::fs::write(
+            &kept,
+            include_bytes!("../../../../tests/data/media/pattern.jpg"),
+        )
+        .unwrap();
+        let previous_bytes = std::fs::read(&kept).unwrap();
+        {
+            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            let record = crate::test_helpers::TestAssetRecord::new("asset-PREVIOUS")
+                .filename("previous.jpg")
+                .size(previous_bytes.len() as u64)
+                .build();
+            let checksum = download::file::compute_sha256(&kept).await.unwrap();
+            db.upsert_seen(&record).await.unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", "asset-PREVIOUS", "PREVIOUS")
+                .await
+                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "asset-PREVIOUS",
+                "original",
+                &kept,
+                &checksum,
+                Some(&checksum),
+            )
+            .await
+            .unwrap();
+            let initial_hash = if drift {
+                "old-enumeration-generation".to_string()
+            } else {
+                download::compute_config_hash(&config)
+            };
+            db.set_metadata(ENUM_CONFIG_HASH_KEY, &initial_hash)
+                .await
+                .unwrap();
+            db.set_metadata("sync_token:PrimarySync", "preserved-prior")
+                .await
+                .unwrap();
+        }
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        for cycle in 0..3 {
+            let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            if cycle == 0 {
+                db.acquire_lock("recent bridge cursor commit fault")
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER fail_recent_cursor BEFORE UPDATE ON metadata
+                 WHEN NEW.key='sync_token:PrimarySync' AND NEW.value='bridge-source'
+                 BEGIN SELECT RAISE(ABORT,'synthetic checkpoint commit fault'); END;",
+                    )
+                    .unwrap();
+            }
+            let queries = Arc::new(AtomicUsize::new(0));
+            let album = make_full_album_with_boxed_session(
+                "PrimarySync",
+                Box::new(CountedBridge {
+                    inner: ConfigBridgeSession::new(
+                        "PrimarySync",
+                        "inventory-rank",
+                        "bridge-source",
+                    ),
+                    queries: queries.clone(),
+                }),
+            );
+            let library = make_run_cycle_library_state_with_album(
+                "PrimarySync",
+                "sync_token:PrimarySync",
+                album,
+            );
+            let builder = make_run_cycle_download_config_builder_with_options(
+                &media,
+                db.clone(),
+                RunCycleDownloadConfigOptions {
+                    recent: Some(2),
+                    ..RunCycleDownloadConfigOptions::default()
+                },
+            );
+            let result = run_cycle(
+                &[&library],
+                &config,
+                Some(db.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &shared_session,
+                &CancellationToken::new(),
+            )
+            .await;
+            if cycle == 0 {
+                assert!(
+                    result.is_err()
+                        || result
+                            .as_ref()
+                            .is_ok_and(|result| !result.db_sync_token_advance_safe),
+                    "injected commit fault must be reached: {result:#?}"
+                );
+                assert_eq!(
+                    db.get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("preserved-prior")
+                );
+                db.acquire_lock("remove synthetic checkpoint fault")
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER fail_recent_cursor")
+                    .unwrap();
+                let raw = db
+                    .get_metadata("recent_selection_recovery:PrimarySync")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&raw).unwrap()["complete"],
+                    true,
+                    "an early completed receipt still cannot match the uncommitted prior cursor"
+                );
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+                assert_eq!(
+                    db.get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("bridge-source")
+                );
+                assert_eq!(
+                    db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(download::compute_config_hash(&config).as_str())
+                );
+                if cycle == 1 && !drift {
+                    assert!(
+                        queries.load(Ordering::SeqCst) > 0,
+                        "uncommitted receipt must retry inventory"
+                    );
+                }
+                if cycle == 2 {
+                    assert_eq!(
+                        queries.load(Ordering::SeqCst),
+                        0,
+                        "qualified quiet reopened bridge must not query inventory again"
+                    );
+                }
+                assert_eq!(result.stats.downloaded, 0);
+            }
+            assert_eq!(std::fs::read(&kept).unwrap(), previous_bytes);
+            assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 1);
+        }
+    }
+}
