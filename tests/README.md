@@ -1057,8 +1057,11 @@ failure. Corrupted rows, source bytes, confirmation identity and foreign owners
 cannot replay. A capture failure precedes queue admission; valid recovery and two
 quiet admission cycles retain all source and unrelated work. Relative download
 roots retain the existing admission contract; shadow destinations are anchored
-without changing the task path. Unix non-UTF-8 roots round-trip native path bytes
-and preserve existing admission. Corruption probes commit their mutations before
+without changing the task path. Linux non-UTF-8 roots preserve actual filesystem
+admission. A separate native Unix/Windows path fixture round-trips manifest and
+normalized destination bytes through two released-handle SQLite reopens without
+creating a filesystem name; macOS filesystems can reject invalid UTF-8 names
+before admission. Corruption probes commit their mutations before
 replay, include a healthy replay control, and assert the specific validation
 error rather than a transaction-entry failure. The schema-32 live
 WAL test preserves queue work, original confirmation and unknown tables across a

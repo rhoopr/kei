@@ -2251,7 +2251,7 @@ async fn selection_shadow_relative_download_root_keeps_existing_admission_contra
     fixture.preserved().await;
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn selection_shadow_non_utf8_download_root_preserves_native_path() {
     use std::os::unix::ffi::OsStringExt;
@@ -2285,4 +2285,79 @@ async fn selection_shadow_non_utf8_download_root_preserves_native_path() {
     );
     assert_eq!(fixture.count("assets"), 1);
     fixture.preserved().await;
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn selection_shadow_native_path_storage_reopens_without_filesystem_creation() {
+    let fixture = Fixture::new().await;
+    fixture
+        .capture(records("m", OLD, "historical"), "native-storage-source")
+        .await;
+    fixture.cycle().await.unwrap();
+    let (_, mut manifest) = selection_manifest(&fixture).await;
+    let component = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(b"native-root-\xff".to_vec())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x006e, 0x0061, 0x0074, 0xd800])
+        }
+    };
+    // Native encoding is a storage contract even when the current filesystem
+    // cannot create this name. This fixture deliberately never creates it.
+    let destination = fixture.dir.path().join(component).join("selected.jpg");
+    assert!(destination.is_absolute());
+    assert!(destination.to_str().is_none());
+    manifest.decisions[0].destinations[0].path = SelectionPath::from_path(&destination);
+    let queue = fixture.queue();
+    let generation = fixture
+        .db
+        .capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
+        .await
+        .unwrap();
+    assert_eq!(fixture.queue(), queue);
+    fixture.preserved().await;
+    let database = fixture.dir.path().join("state.db");
+    let Fixture {
+        dir,
+        db,
+        capture,
+        session,
+        pass,
+        config,
+    } = fixture;
+    drop(config);
+    drop(pass);
+    drop(capture);
+    drop(db);
+    drop(session);
+    for _ in 0..2 {
+        let reopened = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let replay = reopened
+            .replay_selection_shadow(owner(), generation.clone())
+            .await
+            .unwrap();
+        assert_eq!(replay, manifest);
+        assert_eq!(
+            replay.decisions[0].destinations[0].path.to_path(),
+            destination
+        );
+        assert_eq!(
+            reopened
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("old-cursor")
+        );
+        drop(reopened);
+    }
+    drop(dir);
 }
