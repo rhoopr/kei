@@ -24,10 +24,59 @@ pub(crate) struct SelectionSource {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SelectionDestination {
     pub(crate) version_size: String,
-    pub(crate) path: String,
+    pub(crate) path: SelectionPath,
     pub(crate) checksum: String,
     pub(crate) size: u64,
     pub(crate) metadata_hash: String,
+}
+
+/// Preserve native path identity without imposing a new UTF-8 root policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "encoding", content = "path", rename_all = "snake_case")]
+pub(crate) enum SelectionPath {
+    Utf8(String),
+    #[cfg(unix)]
+    UnixBytes(Vec<u8>),
+    #[cfg(windows)]
+    WindowsUnits(Vec<u16>),
+}
+
+impl SelectionPath {
+    pub(crate) fn from_path(path: &std::path::Path) -> Self {
+        if let Some(path) = path.to_str() {
+            return Self::Utf8(path.to_owned());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            Self::UnixBytes(path.as_os_str().as_bytes().to_vec())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            Self::WindowsUnits(path.as_os_str().encode_wide().collect())
+        }
+    }
+
+    pub(crate) fn to_path(&self) -> std::path::PathBuf {
+        match self {
+            Self::Utf8(path) => std::path::PathBuf::from(path),
+            #[cfg(unix)]
+            Self::UnixBytes(bytes) => {
+                use std::os::unix::ffi::OsStringExt;
+                std::ffi::OsString::from_vec(bytes.clone()).into()
+            }
+            #[cfg(windows)]
+            Self::WindowsUnits(units) => {
+                use std::os::windows::ffi::OsStringExt;
+                std::ffi::OsString::from_wide(units).into()
+            }
+        }
+    }
+
+    fn key(&self) -> Result<String, StateError> {
+        serde_json::to_string(self).map_err(|_invalid| StateError::ProviderSelectionInvalid)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,11 +210,11 @@ fn validate(conn: &Connection, manifest: &SelectionManifest) -> Result<(), State
             let Some(version) = VersionSizeKey::from_str(&destination.version_size) else {
                 return invalid();
             };
-            let path = std::path::Path::new(&destination.path);
+            let path = destination.path.to_path();
             if version.as_str() != destination.version_size
                 || !path.is_absolute()
                 || path.file_name().is_none()
-                || !destinations.insert((&destination.version_size, &destination.path))
+                || !destinations.insert((&destination.version_size, destination.path.key()?))
             {
                 return invalid();
             }
@@ -227,17 +276,19 @@ impl SqliteStateDb {
                 tx.commit()?;
                 return Ok(id);
             }
-            let charge = u64::try_from(bytes.len()).map_err(|_invalid| StateError::ProviderSelectionFull)?
-                + u64::try_from(id.len() + account_key.len() + provider_key.len()
-                    + manifest.scope.len() + manifest.config_hash.len()
-                    + manifest.sources.iter().map(|s| s.body_hash.len() + 16).sum::<usize>()
-                    + manifest.decisions.iter().map(|d| d.pass_key.len() + d.child.len() + d.reason.len()
-                        + outcome_name(d.outcome).len() + d.destinations.iter().map(|p|
-                            d.pass_key.len() + d.child.len() + p.version_size.len() + p.path.len()
-                            + p.checksum.len() + p.metadata_hash.len() + 8).sum::<usize>()).sum::<usize>()
-                    + id.len() * (manifest.sources.len() + manifest.decisions.len()
-                        + manifest.decisions.iter().map(|d| d.destinations.len()).sum::<usize>()))
-                    .map_err(|_invalid| StateError::ProviderSelectionFull)?;
+            let mut charge = bytes.len() + id.len() + account_key.len() + provider_key.len()
+                + manifest.scope.len() + manifest.config_hash.len();
+            for source in &manifest.sources { charge += id.len() + source.body_hash.len() + 16; }
+            for decision in &manifest.decisions {
+                charge += id.len() + decision.pass_key.len() + decision.child.len()
+                    + decision.reason.len() + outcome_name(decision.outcome).len();
+                for destination in &decision.destinations {
+                    charge += id.len() + decision.pass_key.len() + decision.child.len()
+                        + destination.version_size.len() + destination.path.key()?.len()
+                        + destination.checksum.len() + destination.metadata_hash.len() + 8;
+                }
+            }
+            let charge = u64::try_from(charge).map_err(|_invalid| StateError::ProviderSelectionFull)?;
             let used: i64 = tx.query_row("SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations", [], |r| r.get(0))?;
             if charge > capacity.saturating_sub(u64::try_from(used).map_err(|_invalid| StateError::ProviderSelectionInvalid)?) {
                 return Err(StateError::ProviderSelectionFull);
@@ -251,7 +302,7 @@ impl SqliteStateDb {
                 let outcome = outcome_name(decision.outcome);
                 tx.execute("INSERT INTO provider_selection_decisions(generation,pass_key,child,outcome,reason) VALUES(?1,?2,?3,?4,?5)", params![id,decision.pass_key,decision.child,outcome,decision.reason])?;
                 for destination in &decision.destinations {
-                    tx.execute("INSERT INTO provider_selection_destinations(generation,pass_key,child,version_size,path,checksum,size_bytes,metadata_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![id,decision.pass_key,decision.child,destination.version_size,destination.path,destination.checksum,i64::try_from(destination.size).map_err(|_invalid| StateError::ProviderSelectionInvalid)?,destination.metadata_hash])?;
+                    tx.execute("INSERT INTO provider_selection_destinations(generation,pass_key,child,version_size,path,checksum,size_bytes,metadata_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![id,decision.pass_key,decision.child,destination.version_size,destination.path.key()?,destination.checksum,i64::try_from(destination.size).map_err(|_invalid| StateError::ProviderSelectionInvalid)?,destination.metadata_hash])?;
                 }
             }
             tx.commit()?;
@@ -331,7 +382,7 @@ fn validate_rows(
             return invalid();
         }
         for destination in &decision.destinations {
-            let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_selection_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND checksum=?6 AND size_bytes=?7 AND metadata_hash=?8)", params![id,decision.pass_key,decision.child,destination.version_size,destination.path,destination.checksum,i64::try_from(destination.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,destination.metadata_hash], |r|r.get(0))?;
+            let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_selection_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND checksum=?6 AND size_bytes=?7 AND metadata_hash=?8)", params![id,decision.pass_key,decision.child,destination.version_size,destination.path.key()?,destination.checksum,i64::try_from(destination.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,destination.metadata_hash], |r|r.get(0))?;
             if !valid {
                 return invalid();
             }

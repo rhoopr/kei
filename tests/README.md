@@ -1057,7 +1057,10 @@ failure. Corrupted rows, source bytes, confirmation identity and foreign owners
 cannot replay. A capture failure precedes queue admission; valid recovery and two
 quiet admission cycles retain all source and unrelated work. Relative download
 roots retain the existing admission contract; shadow destinations are anchored
-without changing the task path. The schema-32 live
+without changing the task path. Unix non-UTF-8 roots round-trip native path bytes
+and preserve existing admission. Corruption probes commit their mutations before
+replay, include a healthy replay control, and assert the specific validation
+error rather than a transaction-entry failure. The schema-32 live
 WAL test preserves queue work, original confirmation and unknown tables across a
 refused conflicting migration and a subsequent successful migration.
 

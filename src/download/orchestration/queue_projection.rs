@@ -10,7 +10,7 @@ use crate::commands::{AlbumPass, PassKind};
 use crate::download::planner::{TaskPlanner, pending_record_for_task};
 use crate::state::db::provider_selection::{
     MAX_SELECTION_BYTES, SelectionDecision, SelectionDestination, SelectionManifest,
-    SelectionOutcome, SelectionSource,
+    SelectionOutcome, SelectionPath, SelectionSource,
 };
 use crate::state::db::provider_work::{MAX_WORK_BYTES, WorkPlan};
 
@@ -185,12 +185,9 @@ pub(super) async fn admit_retained_work(
                         .map(|(task, record): (_, &crate::state::AssetRecord)| {
                             Ok(SelectionDestination {
                                 version_size: task.version_size.as_str().to_owned(),
-                                path: std::path::absolute(&task.download_path)?
-                                    .to_str()
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("Selection destination is not UTF-8")
-                                    })?
-                                    .to_owned(),
+                                path: SelectionPath::from_path(&std::path::absolute(
+                                    &task.download_path,
+                                )?),
                                 checksum: task.checksum.to_string(),
                                 size: task.size,
                                 metadata_hash: record.metadata.metadata_hash.clone().ok_or_else(

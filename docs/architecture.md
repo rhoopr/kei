@@ -431,7 +431,9 @@ not represent a complete library inventory, a global recent frontier, album
 membership coverage or absence. Selected, excluded and deferred decisions remain
 separate from admitted queue work and verified media. Destinations include the
 pass, child, logical rendition and path so one rendition can have distinct
-copies without changing the canonical asset identity. This stage captures only
+copies without changing the canonical asset identity. Native path encoding is
+lossless, including non-UTF-8 roots; relative task destinations are anchored
+without changing the task path. This stage captures only
 the existing admission profile. Multi-pass selection and activation require the
 next qualified stage.
 

@@ -9,7 +9,7 @@ use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
 use crate::state::SqliteStateDb;
 use crate::state::db::account::AccountOwner;
-use crate::state::db::provider_selection::{MAX_SELECTION_BYTES, SelectionOutcome};
+use crate::state::db::provider_selection::{MAX_SELECTION_BYTES, SelectionOutcome, SelectionPath};
 use crate::state::db::provider_work::{WorkAdmission, WorkPlan};
 use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
@@ -1859,7 +1859,10 @@ async fn selection_shadow_current_authority_original_bytes_and_two_reopens_prese
     assert_eq!(decision.destinations.len(), 1);
     assert_eq!(decision.destinations[0].checksum, CURRENT);
     assert!(
-        std::path::Path::new(&decision.destinations[0].path).starts_with(&fixture.config.directory)
+        decision.destinations[0]
+            .path
+            .to_path()
+            .starts_with(&fixture.config.directory)
     );
     assert_eq!(fixture.count("provider_selection_sources"), 1);
     assert_eq!(fixture.count("provider_selection_destinations"), 1);
@@ -1940,13 +1943,8 @@ async fn selection_shadow_multiple_destinations_capacity_and_atomic_failure_do_n
     let mut second = manifest.decisions[0].clone();
     manifest.decisions[0].pass_key = "album-A".to_owned();
     second.pass_key = "album-B".to_owned();
-    second.destinations[0].path = fixture
-        .config
-        .directory
-        .join("B/photo.jpg")
-        .to_str()
-        .unwrap()
-        .to_owned();
+    second.destinations[0].path =
+        SelectionPath::from_path(&fixture.config.directory.join("B/photo.jpg"));
     manifest.decisions.push(second);
     assert!(matches!(
         fixture
@@ -2029,27 +2027,60 @@ async fn selection_shadow_replay_rejects_corrupt_rows_sources_confirmations_and_
         "UPDATE provider_selection_generations SET config_hash='wrong'",
         "UPDATE provider_shadow_pages SET body=X'7B7D'",
     ] {
-        fixture
-            .db
-            .acquire_lock("shadow corruption probe")
-            .unwrap()
-            .execute_batch(&format!("SAVEPOINT corruption; {mutation};"))
-            .unwrap();
-        assert!(
-            fixture
+        let probe = Fixture::new().await;
+        probe
+            .capture(records("m", OLD, "historical"), "corruption-source")
+            .await;
+        probe.cycle().await.unwrap();
+        let (probe_id, healthy) = selection_manifest(&probe).await;
+        assert_eq!(
+            probe
                 .db
-                .replay_selection_shadow(owner(), id.clone())
+                .replay_selection_shadow(owner(), probe_id.clone())
                 .await
-                .is_err(),
-            "accepted {mutation}"
+                .unwrap(),
+            healthy
         );
+        let queue = probe.queue();
+        probe
+            .db
+            .acquire_lock("committed shadow corruption probe")
+            .unwrap()
+            .execute_batch(mutation)
+            .unwrap();
+        let error = probe
+            .db
+            .replay_selection_shadow(owner(), probe_id)
+            .await
+            .expect_err("corrupted evidence cannot replay");
+        if mutation.contains("provider_shadow_pages") {
+            assert!(
+                matches!(
+                    error,
+                    crate::state::error::StateError::ProviderCatalogInvalid
+                ),
+                "wrong validation error: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    crate::state::error::StateError::ProviderSelectionInvalid
+                ),
+                "wrong validation error: {error:?}"
+            );
+        }
+        assert_eq!(probe.queue(), queue);
+        probe.preserved().await;
+    }
+    assert_eq!(
         fixture
             .db
-            .acquire_lock("restore shadow corruption")
-            .unwrap()
-            .execute_batch("ROLLBACK TO corruption; RELEASE corruption;")
-            .unwrap();
-    }
+            .replay_selection_shadow(owner(), id)
+            .await
+            .unwrap(),
+        manifest
+    );
     let mut wrong = manifest.clone();
     wrong.decisions[0].confirmation = Some(b"{\"records\":[]}".to_vec());
     assert!(matches!(
@@ -2212,7 +2243,46 @@ async fn selection_shadow_relative_download_root_keeps_existing_admission_contra
     fixture.cycle().await.unwrap();
     let (_, manifest) = selection_manifest(&fixture).await;
     assert!(
-        std::path::Path::new(&manifest.decisions[0].destinations[0].path).starts_with(&absolute)
+        manifest.decisions[0].destinations[0]
+            .path
+            .to_path()
+            .starts_with(&absolute)
     );
+    fixture.preserved().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selection_shadow_non_utf8_download_root_preserves_native_path() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut fixture = Fixture::new().await;
+    let root = fixture
+        .dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"native-root-\xff".to_vec()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("existing.jpg"), b"existing-media").unwrap();
+    std::fs::write(root.join("existing.xmp"), b"retained-sidecar").unwrap();
+    fixture.config.directory = Arc::from(root.as_path());
+    assert!(fixture.config.directory.to_str().is_none());
+    fixture
+        .capture(records("m", OLD, "historical"), "native-source")
+        .await;
+    fixture.cycle().await.unwrap();
+    let (generation, manifest) = selection_manifest(&fixture).await;
+    let path = manifest.decisions[0].destinations[0].path.to_path();
+    assert!(path.starts_with(&root));
+    assert!(path.to_str().is_none());
+    let reopened = SqliteStateDb::open_owned(&fixture.dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .replay_selection_shadow(owner(), generation)
+            .await
+            .unwrap(),
+        manifest
+    );
+    assert_eq!(fixture.count("assets"), 1);
     fixture.preserved().await;
 }
