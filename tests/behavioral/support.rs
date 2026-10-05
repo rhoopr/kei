@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 31;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 32;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -158,6 +158,16 @@ CREATE TABLE IF NOT EXISTS provider_work_obligations (
     FOREIGN KEY(page_id,ordinal,config_hash,confirmation_hash) REFERENCES provider_work_receipts(page_id,ordinal,config_hash,confirmation_hash) DEFERRABLE INITIALLY DEFERRED
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_provider_work_queue ON provider_work_obligations(library,asset_id,version_size);
+CREATE TABLE IF NOT EXISTS provider_work_retries (
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    config_hash TEXT NOT NULL,
+    attempts INTEGER NOT NULL CHECK(attempts BETWEEN 1 AND 32),
+    last_attempt_at INTEGER NOT NULL,
+    next_retry_at INTEGER NOT NULL CHECK(next_retry_at > last_attempt_at),
+    PRIMARY KEY(page_id,ordinal,config_hash),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_catalog_records(page_id,ordinal)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS provider_work_scan (
     scope TEXT NOT NULL,
     config_hash TEXT NOT NULL,

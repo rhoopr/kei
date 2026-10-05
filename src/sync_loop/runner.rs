@@ -10,7 +10,7 @@ use crate::sync_cycle::{LibraryState, run_cycle};
 use crate::sync_loop::planning::{maybe_notify_shared_libraries, refresh_needed_library_plans};
 use crate::sync_loop::precheck::{
     DbPrecheckScope, WatchPrecheck, check_changes_database, include_pending_local_work,
-    store_scoped_db_sync_token,
+    include_pending_provider_work, store_scoped_db_sync_token,
 };
 use crate::sync_loop::reconcile::{run_bounded_local_drift_probe, run_periodic_reconcile};
 #[cfg(debug_assertions)]
@@ -632,6 +632,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         {
             include_pending_local_work(&mut watch_precheck, db, &config.metadata, &library_states)
                 .await;
+            include_pending_provider_work(
+                &mut watch_precheck,
+                &library_states,
+                &build_download_config,
+                download_controls,
+            )
+            .await;
         }
 
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
