@@ -151,7 +151,10 @@ impl PhotosService {
     /// Checks the primary library first ("`PrimarySync`"), then searches private
     /// and shared libraries. Lazily fetches library lists on first call.
     pub async fn get_library(&mut self, name: &str) -> anyhow::Result<&PhotoLibrary> {
-        if name == "PrimarySync" {
+        if name == PRIMARY_ZONE_NAME {
+            // The constructor deliberately has no owner. Only authenticated
+            // private discovery may replace it with explicit provider scope.
+            self.fetch_private_libraries().await?;
             return Ok(&self.primary_library);
         }
         // Ensure both library lists are fetched
@@ -171,6 +174,7 @@ impl PhotosService {
 
     /// Return all available libraries: primary + private (non-PrimarySync) + shared.
     pub async fn all_libraries(&mut self) -> anyhow::Result<Vec<PhotoLibrary>> {
+        self.fetch_private_libraries().await?;
         let mut libs = vec![self.primary_library.clone()];
 
         let private = self.fetch_private_libraries().await?;
@@ -194,6 +198,11 @@ impl PhotosService {
     ) -> anyhow::Result<&HashMap<String, PhotoLibrary>> {
         if self.private_libraries.is_none() {
             let libs = self.fetch_libraries("private").await?;
+            if let Some(primary) = libs.get(PRIMARY_ZONE_NAME)
+                && primary.is_private_default_owner()
+            {
+                self.primary_library = primary.clone();
+            }
             self.private_libraries = Some(libs);
         }
         self.private_libraries
@@ -222,7 +231,7 @@ impl PhotosService {
         let service_endpoint = self.get_service_endpoint(library_type);
         let url = format!("{service_endpoint}/zones/list");
 
-        let response = session::retry_post(
+        let body = session::retry_post_changes_body(
             self.session.as_ref(),
             &url,
             "{}",
@@ -231,8 +240,36 @@ impl PhotosService {
         )
         .await?;
 
-        let zone_list: cloudkit::ZoneListResponse =
-            serde_json::from_value(response).context("failed to parse zone list response")?;
+        let response = changes_json::parse(&body)?;
+        let zones = response
+            .get("zones")
+            .and_then(Value::as_array)
+            .context("Missing or invalid library zone list")?;
+        anyhow::ensure!(
+            response
+                .get("moreComing")
+                .is_none_or(|value| value.as_bool() == Some(false))
+                && response
+                    .get("continuationMarker")
+                    .is_none_or(Value::is_null),
+            "Unsupported library zone list continuation"
+        );
+        anyhow::ensure!(
+            zones
+                .iter()
+                .all(|zone| zone.get("serverErrorCode").is_none_or(Value::is_null)),
+            "Library zone discovery failed"
+        );
+        let zone_list: cloudkit::ZoneListResponse = serde_json::from_value(response)
+            .map_err(|_invalid| anyhow::anyhow!("Invalid library zone list shape"))?;
+        let mut names = std::collections::HashSet::with_capacity(zone_list.zones.len());
+        for zone in &zone_list.zones {
+            anyhow::ensure!(
+                !zone.zone_id.zone_name.trim().is_empty()
+                    && names.insert(zone.zone_id.zone_name.as_str()),
+                "Ambiguous library zone discovery"
+            );
+        }
 
         for zone in &zone_list.zones {
             if zone.deleted.unwrap_or(false) {
@@ -576,15 +613,171 @@ mod tests {
         );
     }
 
-    /// `get_library("PrimarySync")` short-circuits and returns the
-    /// pre-built primary library without hitting the network.
+    /// Cached private discovery keeps default selection from repeating network
+    /// work; an empty list cannot synthesize a primary owner.
     #[tokio::test]
-    async fn test_get_library_primary_sync_short_circuits() {
-        // A session that panics on clone confirms we never spin up a
-        // new PhotoLibrary for PrimarySync.
+    async fn test_get_library_primary_sync_uses_cached_private_discovery() {
         let mut svc = make_service(Box::new(PanicSession), HashMap::new());
+        svc.private_libraries = Some(HashMap::new());
         let lib = svc.get_library("PrimarySync").await.unwrap();
         assert_eq!(lib.zone_name(), "PrimarySync");
+        assert!(!lib.is_private_default_owner());
+    }
+
+    #[derive(Clone)]
+    struct RawDiscoverySession {
+        private: Arc<Mutex<Vec<u8>>>,
+        shared: Vec<u8>,
+        listings: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for RawDiscoverySession {
+        async fn post(
+            &self,
+            _url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let request: Value = serde_json::from_str(&body)?;
+            assert_eq!(request["query"]["recordType"], "CheckIndexingState");
+            Ok(json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]}))
+        }
+        async fn post_changes_body(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Vec<u8>> {
+            assert!(url.ends_with("/zones/list"));
+            self.listings.lock().unwrap().push(url.to_owned());
+            Ok(if url.contains("/private/") {
+                self.private.lock().unwrap().clone()
+            } else {
+                self.shared.clone()
+            })
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn raw_discovery(private: Vec<u8>) -> RawDiscoverySession {
+        RawDiscoverySession {
+            private: Arc::new(Mutex::new(private)),
+            shared: serde_json::to_vec(&json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}]})).unwrap(),
+            listings: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_discovery_requires_unique_complete_error_free_zone_list_before_caching() {
+        let invalid = [
+            "{}",
+            r#"{"zones":null}"#,
+            r#"{"zones":{}}"#,
+            r#"{"zones":[{"zoneID":{"zoneName":""}}]}"#,
+            r#"{"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}},{"zoneID":{"zoneName":"PrimarySync"}}]}"#,
+            r#"{"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}},{"zoneID":{"zoneName":"PrimarySync"},"deleted":true}]}"#,
+            r#"{"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"other","ownerRecordName":"_defaultOwner"}}]}"#,
+            r#"{"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"serverErrorCode":"PRIVATE-ERROR"}]}"#,
+            r#"{"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"deleted":"false"}]}"#,
+            r#"{"zones":[],"moreComing":true}"#,
+            r#"{"zones":[],"moreComing":null}"#,
+            r#"{"zones":[],"continuationMarker":"PRIVATE-CURSOR"}"#,
+        ];
+        for body in invalid {
+            let session = raw_discovery(body.as_bytes().to_vec());
+            let mut svc = make_service(Box::new(session.clone()), HashMap::new());
+            let error = svc
+                .get_library(PRIMARY_ZONE_NAME)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !error.contains("PRIVATE-ERROR")
+                    && !error.contains("PRIVATE-CURSOR")
+                    && !error.contains("PrimarySync"),
+                "{error}"
+            );
+            assert!(svc.private_libraries.is_none());
+            assert!(!svc.primary_library.is_private_default_owner());
+            // Failure did not publish a cache; valid evidence can recover.
+            *session.private.lock().unwrap() = serde_json::to_vec(&json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}]})).unwrap();
+            assert!(
+                svc.get_library(PRIMARY_ZONE_NAME)
+                    .await
+                    .unwrap()
+                    .is_private_default_owner()
+            );
+            assert_eq!(session.listings.lock().unwrap().len(), 2);
+            assert!(
+                svc.get_library(PRIMARY_ZONE_NAME)
+                    .await
+                    .unwrap()
+                    .is_private_default_owner()
+            );
+            assert_eq!(session.listings.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_discovery_does_not_infer_owner_or_use_shared_database_evidence() {
+        for zones in [
+            json!([]),
+            json!([{"zoneID":{"zoneName":"PrimarySync"}}]),
+            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":null}}]),
+            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":""}}]),
+            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"different"}}]),
+            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"deleted":true}]),
+            json!([{"zoneID":{"zoneName":"PrimarySyncExtra","ownerRecordName":"_defaultOwner"}}]),
+        ] {
+            let session = raw_discovery(serde_json::to_vec(&json!({"zones":zones})).unwrap());
+            let mut svc = make_service(Box::new(session.clone()), HashMap::new());
+            let primary = svc.get_library(PRIMARY_ZONE_NAME).await.unwrap();
+            assert!(!primary.is_private_default_owner());
+            assert_eq!(
+                session.listings.lock().unwrap().len(),
+                1,
+                "default lookup needs only private discovery"
+            );
+            let all = svc.all_libraries().await.unwrap();
+            // Shared discovery contains an explicit PrimarySync owner. It must
+            // never replace or authorize the selected private primary library.
+            assert!(
+                !svc.get_library(PRIMARY_ZONE_NAME)
+                    .await
+                    .unwrap()
+                    .is_private_default_owner()
+            );
+            assert_eq!(
+                all.iter()
+                    .filter(|lib| lib.zone_name() == PRIMARY_ZONE_NAME
+                        && lib.is_private_default_owner())
+                    .count(),
+                0
+            );
+            assert_eq!(session.listings.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_discovery_qualifies_all_first_and_reuses_cached_owner() {
+        let session = raw_discovery(serde_json::to_vec(&json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}}]})).unwrap());
+        let mut svc = make_service(Box::new(session.clone()), HashMap::new());
+        let all = svc.all_libraries().await.unwrap();
+        let primary = all
+            .iter()
+            .find(|lib| lib.is_private_default_owner())
+            .unwrap();
+        assert_eq!(primary.zone_name(), PRIMARY_ZONE_NAME);
+        assert!(
+            svc.get_library(PRIMARY_ZONE_NAME)
+                .await
+                .unwrap()
+                .is_private_default_owner()
+        );
+        assert_eq!(session.listings.lock().unwrap().len(), 2);
     }
 
     /// Cloneable capturing session - unlike CapturingSession above,

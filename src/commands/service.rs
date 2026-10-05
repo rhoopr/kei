@@ -544,9 +544,8 @@ pub(crate) async fn resolve_libraries(
 ) -> anyhow::Result<Vec<icloud::photos::PhotoLibrary>> {
     use crate::download::paths::truncate_library_zone;
 
-    // Fast path for the default `--library primary`: skip the private +
-    // shared library HTTP listings. Saves two requests per sync for the
-    // common single-library case.
+    // Default selection qualifies primary ownership through cached private
+    // discovery. It does not need the shared database listing.
     if selector == &crate::selection::LibrarySelector::default() {
         let lib = photos_service
             .get_library(crate::icloud::photos::PRIMARY_ZONE_NAME)

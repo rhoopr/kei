@@ -329,17 +329,29 @@ are retained. Duplicate keys, duplicate or omitted records, provider errors,
 wrong owners, wrong zones and changed child/master relationships cannot confirm
 work. Provider confirmation is an observation, not an atomic provider snapshot.
 
-This first slice supports one private library-wide pass with an explicit default
+This slice supports one private library-wide pass with an explicit default
 owner, without recent caps, album exclusions, retry-only selection or metadata
-backfill-only execution. The default `PrimarySync` constructor omits an explicit
-owner and is skipped; this slice does not infer owner identity. Real eligible
-production paths start with private `/zones/list` discovery of a non-primary
-photo zone (`SharedSync-*`) retaining explicit `_defaultOwner`, pass through
-`PhotoLibrary::all`, and resolve to one Unfiled pass. Library name, shared-selector
-or all-library selection can reach that private discovery route. Discovery does
-not replace the constructor's ownerless `PrimarySync`; shared-endpoint zones,
-ownerless zones and different owners remain outside this slice. Other selections retain observations and use their
-existing pipeline; they receive no admission receipt from this stage. Current
+backfill-only execution. Default `PrimarySync` selection lazily discovers the
+private `/zones/list` response using the pinned authenticated session. Discovery
+requires bounded original JSON with unique keys, an explicit zones array, unique
+zone names, no zone errors and no unsupported continuation. Only a live exact
+`PrimarySync` entry with explicit `_defaultOwner` replaces the constructor's
+ownerless primary library. Private and shared discovery caches publish only after
+all returned library initialization succeeds. Shared endpoint evidence cannot
+replace private primary ownership. Missing, deleted or different-owner primary
+entries preserve the ownerless constructor and skip admission; no owner is
+inferred from a name. Default selection needs only the cached private listing.
+
+The discovered primary flows through default library selection, `get_library`,
+`all_libraries`, `PhotoLibrary::all`, and the existing sole Unfiled admission
+checks. Private-discovered non-primary photo zones (`SharedSync-*`) retain their
+existing explicit-owner route. Attaching capture before or after discovery
+preserves the owned DB context. Retained primary source pages with explicit
+returned ownership already use the qualified scope and can confirm current work;
+ownerless source pages remain separate retained observations. No source scope is
+rewritten or history acknowledged. Shared-endpoint zones, ownerless zones and
+different owners remain outside this slice. Other selections retain observations
+and use their existing pipeline without an admission receipt. Current
 media/date/filename filters and RAW, companion and path planning use the existing
 owners. The work configuration fingerprint binds their frozen evidence separately
 from enumeration and checkpoint hashes. Hidden or deleted current records retain
