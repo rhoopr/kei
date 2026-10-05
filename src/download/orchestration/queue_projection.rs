@@ -109,8 +109,7 @@ pub(super) async fn admit_retained_work(
     else {
         return Ok(());
     };
-    // The context above proves the sole Unfiled pass exists.
-    let pass = &passes[0];
+    let [pass] = passes else { return Ok(()) };
     let mut planner = TaskPlanner::for_download(effective.state_db.as_deref()).await?;
     let mut admitted = 0usize;
     let mut deferred = 0usize;
