@@ -143,6 +143,21 @@ async fn refresh_failed_download_urls(
     };
     let mut pending_keys: FxHashSet<_> = failed_tasks.iter().map(RetryTaskKey::from).collect();
     let requested_count = pending_keys.len();
+    let mut planned_unique_child_requests = 0usize;
+    let mut child_master_references = 0usize;
+    let mut child_lookup_results = 0usize;
+    let mut paired_lookup_results = 0usize;
+    let mut planned_paired_requests = 0usize;
+    let mut present_pairs = 0usize;
+    let mut rejected_children = std::collections::BTreeMap::<&'static str, usize>::new();
+    let mut rejected_tasks =
+        std::collections::BTreeMap::<&'static str, FxHashSet<RetryTaskKey>>::new();
+    for task in failed_tasks.iter().filter(|task| !source_matches(task)) {
+        rejected_tasks
+            .entry("selection_source_mismatch")
+            .or_default()
+            .insert(RetryTaskKey::from(task));
+    }
     tracing::info!(
         requested = requested_count,
         "Starting targeted download URL refresh"
@@ -164,12 +179,19 @@ async fn refresh_failed_download_urls(
             .into_iter()
             .map(|name| RecordLookupRequest::asset_only(ProviderRecordId::new(name)))
             .collect();
+        planned_unique_child_requests += requests.len();
         let resolutions = tokio::select! {
             biased;
             () = shutdown_token.cancelled() => break,
             batch = pass.album.resolve_records(&requests) => batch,
         };
         retry.observe_lookup(&resolutions);
+        child_lookup_results += resolutions.results.len();
+        child_master_references += resolutions
+            .results
+            .iter()
+            .filter(|(_, resolution)| matches!(resolution, RecordResolution::AssetPresent { .. }))
+            .count();
         if retry.provider_auth_errors > 0 {
             retry.tasks.clear();
             retry.url_obtained_at.clear();
@@ -199,18 +221,44 @@ async fn refresh_failed_download_urls(
                         source,
                     ))
                 }
-                _ => None,
+                RecordResolution::AssetPresent { .. } => {
+                    *rejected_children
+                        .entry("selected_master_mismatch")
+                        .or_default() += 1;
+                    None
+                }
+                RecordResolution::Deleted { .. } => {
+                    *rejected_children.entry("child_deleted").or_default() += 1;
+                    None
+                }
+                RecordResolution::TransientFailure(_) => {
+                    *rejected_children.entry("child_lookup_failed").or_default() += 1;
+                    None
+                }
+                _ => {
+                    *rejected_children
+                        .entry("child_identity_unresolved")
+                        .or_default() += 1;
+                    None
+                }
             })
             .collect();
         if shutdown_token.is_cancelled() {
             break;
         }
+        planned_paired_requests += paired.len();
         let resolutions = tokio::select! {
             biased;
             () = shutdown_token.cancelled() => break,
             batch = pass.album.resolve_records(&paired) => batch,
         };
         retry.observe_lookup(&resolutions);
+        paired_lookup_results += resolutions.results.len();
+        present_pairs += resolutions
+            .results
+            .iter()
+            .filter(|(_, resolution)| matches!(resolution, RecordResolution::Present(_)))
+            .count();
         if retry.provider_auth_errors > 0 {
             retry.tasks.clear();
             retry.url_obtained_at.clear();
@@ -233,6 +281,10 @@ async fn refresh_failed_download_urls(
                         .get(&RetryTaskKey::from(task))
                         .is_none_or(|source| source.master_record_name.as_ref() != asset.id())
                 }) {
+                    rejected_tasks
+                        .entry("selected_master_mismatch")
+                        .or_default()
+                        .insert(RetryTaskKey::from(task));
                     continue;
                 }
                 let provider_version = retry_sources
@@ -243,6 +295,22 @@ async fn refresh_failed_download_urls(
                         && version.checksum == task.checksum
                         && version.size == task.size
                 }) else {
+                    let reason = asset
+                        .versions()
+                        .iter()
+                        .find(|(size, _)| VersionSizeKey::from(*size) == provider_version)
+                        .map_or("rendition_missing", |(_, version)| {
+                            match (version.checksum == task.checksum, version.size == task.size) {
+                                (false, false) => "checksum_and_size_mismatch",
+                                (false, true) => "checksum_mismatch",
+                                (true, false) => "size_mismatch",
+                                (true, true) => "resource_unresolved",
+                            }
+                        });
+                    rejected_tasks
+                        .entry(reason)
+                        .or_default()
+                        .insert(RetryTaskKey::from(task));
                     continue;
                 };
                 if pending_keys.remove(&RetryTaskKey::from(task)) {
@@ -260,6 +328,37 @@ async fn refresh_failed_download_urls(
         }
     }
     let refreshed_keys: FxHashSet<_> = retry.tasks.iter().map(RetryTaskKey::from).collect();
+    for (reason, rejected_child_requests) in rejected_children {
+        tracing::info!(
+            diagnostic = "exact_refresh_child_rejection_v1",
+            reason,
+            rejected_child_requests,
+            "Exact URL refresh retained child lookup work"
+        );
+    }
+    for (reason, keys) in rejected_tasks {
+        tracing::info!(
+            diagnostic = "exact_refresh_task_rejection_v1",
+            reason,
+            rejected_task_keys = keys.len(),
+            "Exact URL refresh retained selected task work"
+        );
+    }
+    tracing::info!(
+        diagnostic = "exact_refresh_outcomes_v1",
+        requested_task_keys = requested_count,
+        planned_unique_child_requests,
+        child_master_references,
+        child_lookup_results,
+        planned_paired_requests,
+        paired_lookup_results,
+        present_pairs,
+        refreshed_task_keys = refreshed_keys.len(),
+        remaining_task_keys = requested_count.saturating_sub(refreshed_keys.len()),
+        cancellation_observed = shutdown_token.is_cancelled(),
+        authentication_failed = retry.provider_auth_errors > 0,
+        "Exact URL refresh request and task counts"
+    );
     retry.unrefreshed = failed_tasks
         .iter()
         .filter(|task| !refreshed_keys.contains(&RetryTaskKey::from(*task)))
@@ -453,3 +552,6 @@ mod tests;
 
 #[cfg(test)]
 mod bounded_tests;
+
+#[cfg(test)]
+mod diagnostics_tests;

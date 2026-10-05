@@ -125,6 +125,12 @@ pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) 
         tracing::warn!(
             stage,
             reason = diagnostic.reason,
+            diagnostic = "legacy_inventory_failure_v2",
+            phase = diagnostic.phase,
+            subreason = diagnostic.subreason,
+            eof_observed = diagnostic.eof_observed,
+            family_context = diagnostic.family_context,
+            child_soft_deleted = diagnostic.child_soft_deleted,
             pages = diagnostic.pages,
             records = diagnostic.records,
             transferred_bytes = diagnostic.transferred_bytes,

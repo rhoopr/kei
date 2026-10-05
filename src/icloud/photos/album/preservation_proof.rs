@@ -33,6 +33,11 @@ struct InventoryBudget {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LegacyInventoryDiagnostic {
     pub(crate) reason: &'static str,
+    pub(crate) phase: &'static str,
+    pub(crate) subreason: &'static str,
+    pub(crate) eof_observed: bool,
+    pub(crate) family_context: &'static str,
+    pub(crate) child_soft_deleted: bool,
     pub(crate) pages: usize,
     pub(crate) records: usize,
     pub(crate) transferred_bytes: usize,
@@ -49,6 +54,8 @@ struct LegacyInventoryFailure {
 
 #[derive(Debug, thiserror::Error)]
 enum InventoryFailureKind {
+    #[error("Invalid preservation inventory evidence: {0}")]
+    Evidence(&'static str),
     #[error("Preservation inventory cancelled")]
     Cancelled,
     #[error("Preservation inventory provider request failed")]
@@ -66,12 +73,20 @@ enum InventoryFailureKind {
 impl InventoryFailureKind {
     fn as_str(&self) -> &'static str {
         match self {
+            Self::Evidence(_) => "invalid_inventory_evidence",
             Self::Cancelled => "cancelled",
             Self::Provider => "provider_request_failed",
             Self::Pages => "page_budget",
             Self::Records => "record_budget",
             Self::PageBytes => "response_page_byte_budget",
             Self::RetainedBytes => "retained_byte_budget",
+        }
+    }
+
+    fn subreason(&self) -> &'static str {
+        match self {
+            Self::Evidence(reason) => reason,
+            _ => self.as_str(),
         }
     }
 }
@@ -86,6 +101,7 @@ pub(crate) fn classify_legacy_inventory_error(
         .downcast_ref::<InventoryFailureKind>()
         .map(|kind| LegacyInventoryDiagnostic {
             reason: kind.as_str(),
+            subreason: kind.subreason(),
             ..LegacyInventoryDiagnostic::default()
         })
 }
@@ -181,12 +197,26 @@ impl PhotoAlbum {
         cancel: &CancellationToken,
         budget: InventoryBudget,
     ) -> anyhow::Result<CompleteLegacyInventory> {
-        let mut progress = LegacyInventoryDiagnostic::default();
+        let mut progress = LegacyInventoryDiagnostic {
+            phase: "initialization",
+            subreason: "unclassified",
+            family_context: "not_applicable",
+            ..LegacyInventoryDiagnostic::default()
+        };
         self.scan_legacy_preservation_inventory(masters, cancel, budget, &mut progress)
             .await
             .map_err(|source: anyhow::Error| {
-                progress.reason = classify_legacy_inventory_error(&source)
-                    .map_or("invalid_inventory_evidence", |diagnostic| diagnostic.reason);
+                if let Some(diagnostic) = classify_legacy_inventory_error(&source) {
+                    progress.reason = diagnostic.reason;
+                    progress.subreason = diagnostic.subreason;
+                } else {
+                    progress.reason = "invalid_inventory_evidence";
+                    progress.subreason = if progress.phase == "decode" {
+                        "response_decode_failed"
+                    } else {
+                        "unclassified"
+                    };
+                }
                 LegacyInventoryFailure {
                     diagnostic: progress,
                     source,
@@ -202,7 +232,10 @@ impl PhotoAlbum {
         budget: InventoryBudget,
         progress: &mut LegacyInventoryDiagnostic,
     ) -> anyhow::Result<CompleteLegacyInventory> {
-        anyhow::ensure!(!masters.is_empty(), "Missing preservation scope");
+        anyhow::ensure!(
+            !masters.is_empty(),
+            InventoryFailureKind::Evidence("missing_candidate_scope")
+        );
         let url = format!(
             "{}/changes/zone?{}",
             self.service_endpoint,
@@ -212,6 +245,7 @@ impl PhotoAlbum {
         let mut seen_cursors = FxHashSet::default();
         let mut latest = FxHashMap::<String, (Record, usize)>::default();
         for _ in 0..budget.pages {
+            progress.phase = "request";
             let body =
                 build_changes_zone_request(&self.zone_id, cursor.as_deref(), 200).to_string();
             let response = tokio::select! {
@@ -220,6 +254,7 @@ impl PhotoAlbum {
                 response = session::retry_post(self.session.as_ref(), &url, &body, &[("Content-type", "text/plain")], &self.retry_config) => response.context(InventoryFailureKind::Provider)?,
             };
             progress.pages += 1;
+            progress.phase = "response_budget";
             let page_bytes = serialized_bytes(&response)?;
             progress.transferred_bytes = progress
                 .transferred_bytes
@@ -229,33 +264,38 @@ impl PhotoAlbum {
                 page_bytes <= budget.page_bytes,
                 InventoryFailureKind::PageBytes
             );
+            progress.phase = "envelope";
             let zones = response
                 .get("zones")
                 .and_then(Value::as_array)
                 .filter(|zones| zones.len() == 1)
-                .context("Invalid preservation inventory zones")?;
+                .context(InventoryFailureKind::Evidence("invalid_zone_envelope"))?;
             let zone = zones
                 .first()
-                .context("Missing preservation inventory zone")?;
+                .context(InventoryFailureKind::Evidence("missing_zone_scope"))?;
             let zone_id = zone
                 .get("zoneID")
-                .context("Missing preservation inventory zone")?;
+                .context(InventoryFailureKind::Evidence("missing_zone_scope"))?;
+            progress.phase = "scope";
             anyhow::ensure!(
                 zone_id.get("zoneName") == self.zone_id.get("zoneName")
                     && self
                         .zone_id
                         .get("ownerRecordName")
                         .is_none_or(|owner| zone_id.get("ownerRecordName") == Some(owner)),
-                "Preservation inventory scope mismatch"
+                InventoryFailureKind::Evidence("zone_scope_mismatch")
             );
+            progress.phase = "envelope";
             anyhow::ensure!(
                 zone.get("moreComing").and_then(Value::as_bool).is_some(),
-                "Missing preservation inventory completion marker"
+                InventoryFailureKind::Evidence("completion_marker_missing")
             );
+            // Observation only. EOF does not authorize this inventory or a checkpoint.
+            progress.eof_observed = zone.get("moreComing").and_then(Value::as_bool) == Some(false);
             let records = zone
                 .get("records")
                 .and_then(Value::as_array)
-                .context("Missing preservation inventory records")?;
+                .context(InventoryFailureKind::Evidence("records_array_missing"))?;
             progress.records = progress
                 .records
                 .checked_add(records.len())
@@ -264,6 +304,7 @@ impl PhotoAlbum {
                 progress.records <= budget.records,
                 InventoryFailureKind::Records
             );
+            progress.phase = "record_envelope";
             for record in records {
                 anyhow::ensure!(
                     record.get("deleted").and_then(Value::as_bool) == Some(true)
@@ -271,39 +312,44 @@ impl PhotoAlbum {
                             .get("recordType")
                             .and_then(Value::as_str)
                             .is_some_and(|kind| !kind.trim().is_empty()),
-                    "Missing preservation record type"
+                    InventoryFailureKind::Evidence("record_type_missing")
                 );
                 anyhow::ensure!(
                     record.get("serverErrorCode").is_none_or(Value::is_null),
-                    "Preservation inventory record error"
+                    InventoryFailureKind::Evidence("record_provider_error")
                 );
                 anyhow::ensure!(
                     record
                         .get("recordName")
                         .and_then(Value::as_str)
                         .is_some_and(|id| !id.trim().is_empty()),
-                    "Missing preservation record identity"
+                    InventoryFailureKind::Evidence("record_identity_missing")
                 );
             }
+            progress.phase = "decode";
             let response: ChangesZoneResponse = serde_json::from_value(response)?;
             let zone = response
                 .zones
                 .into_iter()
                 .next()
-                .context("Missing preservation inventory zone")?;
+                .context(InventoryFailureKind::Evidence("missing_zone_scope"))?;
+            progress.phase = "provider_status";
             check_changes_zone_error(
                 zone.server_error_code.as_deref(),
                 zone.reason.as_deref(),
                 &zone.zone_id.zone_name,
-            )?;
+            )
+            .context(InventoryFailureKind::Evidence("zone_provider_error"))?;
+            progress.phase = "cursor";
             anyhow::ensure!(
                 !zone.sync_token.trim().is_empty(),
-                "Missing preservation inventory cursor"
+                InventoryFailureKind::Evidence("cursor_missing")
             );
             anyhow::ensure!(
                 seen_cursors.insert(zone.sync_token.clone()),
-                "Non-progressing preservation inventory"
+                InventoryFailureKind::Evidence("cursor_repeated")
             );
+            progress.phase = "retention";
             let cursor_bytes = zone
                 .sync_token
                 .len()
@@ -349,16 +395,33 @@ impl PhotoAlbum {
                 .map(|(record, _)| record)
                 .filter(|record| record.record_type == "CPLAsset" && record.deleted != Some(true))
             {
+                progress.phase = "child_reference";
+                progress.family_context = "unknown";
+                progress.child_soft_deleted = record
+                    .fields
+                    .get("isDeleted")
+                    .and_then(|field| field.get("value"))
+                    .and_then(Value::as_i64)
+                    == Some(1);
                 let reference = record
                     .fields
                     .get("masterRef")
                     .and_then(|field| field.get("value"))
-                    .context("Unsupported preservation identity")?;
+                    .context(InventoryFailureKind::Evidence(
+                        "child_master_reference_missing",
+                    ))?;
                 let master = reference
                     .get("recordName")
                     .and_then(Value::as_str)
                     .filter(|id| !id.trim().is_empty())
-                    .context("Unsupported preservation identity")?;
+                    .context(InventoryFailureKind::Evidence(
+                        "child_master_identity_invalid",
+                    ))?;
+                progress.family_context = if masters.contains(master) {
+                    "candidate"
+                } else {
+                    "unrelated"
+                };
                 anyhow::ensure!(
                     reference.get("zoneID").is_none_or(|zone| {
                         zone.get("zoneName")
@@ -367,7 +430,7 @@ impl PhotoAlbum {
                                 self.zone_id.get("ownerRecordName") == Some(owner)
                             })
                     }),
-                    "Cross-library preservation reference"
+                    InventoryFailureKind::Evidence("child_reference_scope_mismatch")
                 );
                 if masters.contains(master)
                     && record
@@ -382,6 +445,9 @@ impl PhotoAlbum {
             }
             // Compact unrelated records prove completeness only. Hydration must
             // consume complete candidate-family records, never their projections.
+            progress.phase = "family_hydration";
+            progress.family_context = "candidate";
+            progress.child_soft_deleted = false;
             let family_records = latest
                 .into_values()
                 .map(|(record, _)| record)
@@ -402,28 +468,32 @@ impl PhotoAlbum {
                 if let Some(asset) = event.asset
                     && masters.contains(asset.id())
                 {
+                    progress.phase = "capture_date";
                     anyhow::ensure!(
                         asset.asset_date_evidence().is_some(),
-                        "Missing preservation capture date"
+                        InventoryFailureKind::Evidence("capture_date_missing")
                     );
+                    progress.phase = "family_hydration";
                     anyhow::ensure!(
                         expected.remove(asset.asset_record_name()),
-                        "Unexpected preservation child"
+                        InventoryFailureKind::Evidence("unexpected_child")
                     );
                     children.push(asset.with_source_zone(Arc::from(self.zone_name())));
                 }
             }
+            progress.phase = "family_hydration";
             anyhow::ensure!(
                 expected.is_empty(),
-                "Incomplete preservation family hydration"
+                InventoryFailureKind::Evidence("family_hydration_incomplete")
             );
             children.sort_by(|a, b| a.asset_record_name().cmp(b.asset_record_name()));
             return Ok(CompleteLegacyInventory {
                 library: self.zone_name().to_owned(),
-                cursor: cursor.context("Missing preservation inventory cursor")?,
+                cursor: cursor.context(InventoryFailureKind::Evidence("cursor_missing"))?,
                 children,
             });
         }
+        progress.phase = "pagination";
         anyhow::bail!(InventoryFailureKind::Pages)
     }
 }
