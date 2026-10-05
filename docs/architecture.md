@@ -453,6 +453,112 @@ proofs remain authoritative. WAL NORMAL and filesystem support are unchanged.
 This shadow storage is the first PR of the selection phase, not completion of
 replay-driven multi-pass materialization.
 
+
+### Private selection and destination replay
+
+Schema 34 adds active generations in `provider_active_generations`, original
+validated rank pages and record indexes in `provider_selection_rank_pages` and
+`provider_selection_rank_records`, bounded decisions in
+`provider_active_decisions`, source links in `provider_active_sources`, and exact
+physical obligations in `provider_active_destinations`. These tables supplement
+the schema-33 shadow store and the existing source inbox and catalog.
+`icloud/photos/album/selection_capture.rs` validates complete bounded query
+responses before the existing pairing and filtering stream consumes them.
+`download/orchestration/generation.rs` composes existing selection policy,
+current confirmation, transactional queue projection and destination replay.
+`state/db/provider_generations.rs` owns stored declaration, provenance,
+admission, frozen metadata intent and completion validation.
+
+Activation requires an authenticated account-owned database and one exact
+private provider scope with an explicit default owner. Every selected pass must
+be a supported private named album or Unfiled query using the same concrete
+store and scope. Mixed, shared, smart-folder and unsupported profiles keep the
+whole existing dispatcher. Retry-only, metadata backfill, read-only execution
+and capture-local timestamp replacement keep their existing owners. Ordinary
+explicit metadata refresh with preservation can use active destinations.
+
+A generation binds account and provider ownership, full zone identity, selected
+passes and queries, source dependencies and selection, rendition, path and
+metadata configuration. Lossless native destination paths are independently
+anchored. A rank page records its exact request and original response bytes,
+including unknown fields and tombstones. Rank pagination remains an observation
+window. EOF plus a delta bridge does not establish a snapshot or prove absence.
+Current paired confirmation determines resource identity; observed order and
+opaque rank or source tokens do not select versions. Ambiguous or incompatible
+facts remain deferred. Existing global/per-filter recent, ties, exclusions,
+RAW, companion and naming owners decide eligibility.
+
+An immediate projection transaction commits the validated decision, source
+links, per-pass/rendition/path obligations, existing queue records, mappings and
+grouping changes together. Unfinished old versions and frozen grouping/writer
+intent fence incompatible newer work. Independent healthy work can proceed.
+Current query coverage is sealed only from that generation's own evidence;
+replaying a newer inventory cannot seal an interrupted old window. Configuration
+or source changes create a distinct generation or require existing validated
+reseed. They cannot acknowledge omitted eligibility or old unresolved debt.
+
+Destination media completion requires an actual confined file fingerprint and
+independently verified selected source checksum. An exact active physical
+receipt can be reused across compatible passes after current selection and
+file verification; another path retains its own obligation. Imported generic
+local checksums cannot establish source provenance. Metadata completion is
+separate and uses the existing option-aware rewrite owner with the exact native
+path, frozen grouping and writer flags. Disabled flags cannot finish older
+writer debt or enable writes implicitly. Before an embedded replacement, the
+active receipt stores the measured prepared output tied to the exact intent,
+input and source. Reopen can recognize only that operation-owned output;
+arbitrary damage cannot become publication proof. Filesystem publication and
+receipt finalization retain their existing compare-and-swap guards.
+
+Legacy TEXT paths remain compatibility projections. A non-UTF-8 receipt cannot
+update a checksum or clear markers through a lossy text path. Both legacy
+metadata queues retain ambiguous native-path markers without dispatching that
+text path to a sibling file; exact native work uses its active receipt. These
+markers are retained evidence, not an acknowledgment of another physical path.
+XMPFiles retains its existing UTF-8 filename requirement. Native-capable HEIF
+and sidecar owners use native paths without granting additional rewrite options.
+
+Startup and watch can wake unfinished selected work even when the canonical
+asset row already has one downloaded destination. An unchanged completed
+coverage window reuses exact selection and publication evidence. Historical
+scheduling visits one due old root per cycle, at most 64 decisions and 16 MiB of
+serialized manifests, with a persisted continuation and retry deadlines. Within
+that transaction, each unique original rank page is strictly decoded and its
+complete ordered record index audited once. Compact page proofs are discarded
+when the operation ends; new reads use a stable read transaction. The existing
+512 MiB evidence quota bounds unique serialized input, without retaining all
+parsed pages. Original-fact reconstruction separately limits retained serialized
+page inputs to 64 MiB; unavailable bounded evidence remains deferred debt.
+The current generation receives a bounded priority metadata lane; remaining writers
+share the existing physical writer budget and persisted general continuation.
+HTTP 401, 403 and 421 current-confirmation failures stop additional hydration in
+the selected run and preserve the existing bounded reauthentication route.
+Non-authentication proof failures retain their own deferred debt. Active cleanup
+reconstructs original failed tasks' child/master and provider-rendition binding
+from their validated declarations, then uses the existing exact URL-refresh
+owner. A refreshed URL cannot replace frozen selection, metadata, path or
+publication authorization. A transient per-invocation registry composes failed
+historical and current runs; it is not durable identity or a separate memory quota.
+
+The active store has a separate 512 MiB logical evidence charge budget and
+16 MiB page/manifest limits. Capacity refusal rolls back the whole observation or
+projection; no partial page can authorize progress. No records or debt are
+pruned. Logical charges do not bound physical SQLite files or WAL usage. Seals
+and retained source audits can still read substantial history; no fixed startup
+latency or constant total decode-work guarantee is advertised.
+
+Captured observations, admitted decisions, verified media and verified metadata
+are separate durable facts. CLI download counts retain the existing task
+semantics and do not claim unique-file counts or full-zone completion. Active
+progress cannot replace `CheckpointEvidence`, legacy/sparse generation proofs,
+filesystem guards or source checkpoint policy. Unfinished old selection debt
+vetoes the source successor, including when later configuration uses the legacy
+dispatcher. Local wake-up cannot invent a provider cursor. Tombstones do not
+authorize local media deletion. WAL `NORMAL`, filesystem support and power-loss
+limits remain unchanged. Capture-owned cursor promotion, historical intermediate
+retention, unrecoverable-debt acknowledgment, expired-epoch replacement,
+full-scan absence and compaction require separate decisions and qualification.
+
 ### Sync and provider checkpoints
 
 ```text
@@ -1386,9 +1492,11 @@ A later rewrite deletes a cleared property only when that marker proves kei
 owned the prior value. Unmarked standard properties and unrelated third-party
 namespaces remain unchanged. An existing sidecar must be readable and parseable,
 and its bytes must still match the writer's initial read at publication. A
-failed check preserves the sidecar and its durable rewrite marker. Each attempt
-uses a new temporary path so retained ambiguous bytes cannot block a later
-retry.
+failed check preserves the sidecar and its durable rewrite marker. When the
+complete merged packet already matches the existing bytes, a retained regular
+file snapshot rechecks identity, parent confinement and exact bytes before
+reporting success. This avoids republishing an unchanged packet. Changed packets
+use a new temporary path so retained ambiguous bytes cannot block a later retry.
 
 Source GPS facts for sidecars are read through file-backed parsers. JPEG APP1,
 TIFF-based RAW, PNG `eXIf`, and HEIF Exif items use checked seeks and

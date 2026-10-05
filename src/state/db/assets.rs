@@ -237,6 +237,18 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("mark_downloaded::source_checksum", e))?;
             }
 
+            if let Some(source) = &source_checksum {
+                super::provider_generations::record_verified_destination(
+                    &tx,
+                    &library,
+                    &id,
+                    &version_size,
+                    &local_path,
+                    &local_checksum,
+                    source,
+                )?;
+            }
+
             record_metadata_capture_revision(
                 &tx,
                 &library,
@@ -478,7 +490,8 @@ impl SqliteStateDb {
             let pruned = conn
                 .execute(
                     "DELETE FROM assets \
-                     WHERE library = ?1 AND status = 'pending' AND last_seen_at < ?2",
+                     WHERE library = ?1 AND status = 'pending' AND last_seen_at < ?2 \
+                     AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.library=assets.library AND w.asset_id=assets.id AND w.version_size=assets.version_size AND w.admitted=1 AND (w.verified_media=0 OR w.verified_metadata=0))",
                     rusqlite::params![library, seen_since],
                 )
                 .map_err(|e| StateError::query("prune_stale_pending_not_seen_since", e))?
@@ -508,7 +521,8 @@ impl SqliteStateDb {
                     .prepare_cached(
                         "DELETE FROM assets \
                          WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
-                           AND status = 'pending'",
+                           AND status = 'pending' \
+                           AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.library=assets.library AND w.asset_id=assets.id AND w.version_size=assets.version_size AND w.admitted=1 AND (w.verified_media=0 OR w.verified_metadata=0))",
                     )
                     .map_err(|e| StateError::query("prune_pending_asset_versions::prepare", e))?;
                 let mut pruned = 0u64;

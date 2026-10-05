@@ -1627,6 +1627,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     let metadata_flags = MetadataFlags::from(config.as_ref());
     if controls.run_mode.downloads_files()
         && !config.refresh_metadata
+        && config.selection_run.is_none()
         && metadata_flags.has_any_write()
         && let Some(db) = &config.state_db
     {

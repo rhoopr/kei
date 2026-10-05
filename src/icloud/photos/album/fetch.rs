@@ -145,6 +145,7 @@ impl PhotoAlbum {
         let query_filter = self.query_filter.as_ref().map(Arc::clone);
         let retry_config = self.retry_config;
         let zone_id = Arc::clone(&self.zone_id);
+        let rank_capture = self.rank_capture.clone();
 
         tokio::spawn(async move {
             let FetcherRange {
@@ -208,13 +209,30 @@ impl PhotoAlbum {
                     offset,
                     "Fetcher POST"
                 );
-                let response = match session::retry_post(
-                    session.as_ref(),
-                    &url,
-                    &body.to_string(),
-                    &[("Content-type", "text/plain")],
-                    &retry_config,
-                )
+                let response = match async {
+                    if let Some(capture) = &rank_capture {
+                        let raw = session::retry_post_changes_body(
+                            session.as_ref(),
+                            &url,
+                            &body.to_string(),
+                            &[("Content-type", "text/plain")],
+                            &retry_config,
+                        )
+                        .await?;
+                        capture.capture(body.clone(), raw).await.map_err(|error| {
+                            super::super::error::classify_shadow_page_error(error, true)
+                        })
+                    } else {
+                        session::retry_post(
+                            session.as_ref(),
+                            &url,
+                            &body.to_string(),
+                            &[("Content-type", "text/plain")],
+                            &retry_config,
+                        )
+                        .await
+                    }
+                }
                 .await
                 {
                     Ok(r) => r,

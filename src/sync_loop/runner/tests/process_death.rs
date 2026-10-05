@@ -245,7 +245,7 @@ async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
     let mut config = make_run_cycle_config();
     config.runtime.repair_truncated = true;
-    let result = crate::sync_cycle::run_cycle(
+    let result = Box::pin(crate::sync_cycle::run_cycle(
         &[&library],
         &config,
         Some(db.as_ref()),
@@ -254,7 +254,7 @@ async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
         download::DownloadControls::download_hidden(),
         &session,
         &CancellationToken::new(),
-    )
+    ))
     .await
     .unwrap();
     assert_eq!(result.failed_count, 0);

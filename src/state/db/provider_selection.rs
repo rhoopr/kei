@@ -74,7 +74,7 @@ impl SelectionPath {
         }
     }
 
-    fn key(&self) -> Result<String, StateError> {
+    pub(crate) fn key(&self) -> Result<String, StateError> {
         serde_json::to_string(self).map_err(|_invalid| StateError::ProviderSelectionInvalid)
     }
 }

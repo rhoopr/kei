@@ -57,7 +57,8 @@ fn single_unfiled_streaming_pass<'a>(
     // recent selection uses a separate current inventory. The unfiled-only
     // path can stream created assets immediately because album relation deltas
     // update state for future cycles but do not change this pass's routing.
-    if config.recent.is_some()
+    if config.selection_context.is_some()
+        || config.recent.is_some()
         || routing.has_selected_albums()
         || routing.unfiled_passes.len() != 1
         || passes.len() != 1
@@ -690,6 +691,19 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             stats,
             delta_summary.sparse_identity_proofs,
         ));
+    }
+
+    if config.selection_context.is_some() {
+        return Box::pin(super::generation::after_delta(
+            download_client,
+            passes,
+            config,
+            controls,
+            shutdown_token,
+            delta_summary,
+            zone_sync_token,
+        ))
+        .await;
     }
 
     if recent_active

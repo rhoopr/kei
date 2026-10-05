@@ -96,6 +96,27 @@ pub(crate) fn current_asset(
         )))
 }
 
+pub(crate) fn same_selected_facts(left: &PhotoAsset, right: &PhotoAsset) -> bool {
+    left.asset_record_name() == right.asset_record_name()
+        && left.id() == right.id()
+        && left.created() == right.created()
+        && left.added_date() == right.added_date()
+        && left.versions().len() == right.versions().len()
+        && left.versions().iter().all(|(key, resource)| {
+            right.versions().iter().any(|(other, value)| {
+                other == key
+                    && value.checksum == resource.checksum
+                    && value.size == resource.size
+                    && right
+                        .metadata_arc(crate::state::VersionSizeKey::from(*other))
+                        .metadata_hash
+                        == left
+                            .metadata_arc(crate::state::VersionSizeKey::from(*key))
+                            .metadata_hash
+            })
+        })
+}
+
 impl PhotoAlbum {
     /// This first work stage admits only an unambiguous private library-wide
     /// source. Other passes retain their source facts for later qualification.

@@ -653,7 +653,8 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | RECENT_LIMITED_FULL_ENUMERATION_REASON
         | SMART_FOLDER_REFRESH_FAILED_REASON
         | TARGETED_ALBUM_BACKFILL_FAILED_REASON
-        | PENDING_RETRY_UNMATCHED_REASON => "kei",
+        | PENDING_RETRY_UNMATCHED_REASON
+        | "selection_generation_deferred" => "kei",
         INCREMENTAL_DELETE_ZERO_ROWS_REASON
         | INCREMENTAL_HIDDEN_ZERO_ROWS_REASON
         | ICLOUD_ALBUM_COUNT_ERROR_REASON
@@ -671,6 +672,9 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
 
 pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
     match reason {
+        "selection_generation_deferred" => {
+            "kei retained unfinished selected destination or identity work, so it held token advancement"
+        }
         PAGINATION_SHORTFALL_REASON => {
             "enumeration counts did not line up safely, so kei blocked token advancement"
         }

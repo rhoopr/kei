@@ -273,7 +273,27 @@ pub async fn download_photos_with_sync(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    // Bound the complete cycle's new selection/replay state at its owner,
+    // preserving one opaque public future and avoiding caller-specific boxing.
+    Box::pin(download_photos_with_sync_inner(
+        download_client,
+        passes,
+        config,
+        controls,
+        shutdown_token,
+    ))
+    .await
+}
+
+async fn download_photos_with_sync_inner(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: Arc<DownloadConfig>,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
+    super::generation::freeze_before_sync(passes, &config, controls).await?;
     if matches!(controls.run_mode, super::models::DownloadRunMode::Download) {
         let protected = crate::download::legacy_preservation::protected_replacement_paths(
             config.state_db.as_deref(),
@@ -346,10 +366,69 @@ pub async fn download_photos_with_sync(
         }
     }
 
+    let config =
+        if let Some(context) = super::generation::context(passes, &config, controls).await? {
+            Arc::new(DownloadConfig {
+                selection_context: Some(Arc::new(context)),
+                ..config.as_ref().clone()
+            })
+        } else {
+            config
+        };
+
     super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
         .await?;
 
     let result = match &config.sync_mode {
+        SyncMode::Full if config.selection_context.is_some() => {
+            Box::pin(super::generation::inventory(
+                download_client,
+                passes,
+                &config,
+                controls,
+                shutdown_token.clone(),
+            ))
+            .await
+        }
+        SyncMode::Incremental { zone_sync_token } if config.selection_context.is_some() => {
+            match download_photos_incremental(
+                download_client,
+                passes,
+                &config,
+                zone_sync_token,
+                controls,
+                shutdown_token.clone(),
+            )
+            .await
+            {
+                Ok(result) => Ok(result),
+                // An activation state refusal cannot be repaired by starting
+                // another rank inventory in the same cycle.
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::state::error::StateError>()
+                        .is_some() =>
+                {
+                    Err(error)
+                }
+                Err(error) => match classify_incremental_error(&error) {
+                    IncrementalErrorClass::TokenFallback
+                    | IncrementalErrorClass::StaticFallback => {
+                        Box::pin(super::generation::inventory(
+                            download_client,
+                            passes,
+                            &config,
+                            controls,
+                            shutdown_token.clone(),
+                        ))
+                        .await
+                    }
+                    IncrementalErrorClass::SessionExpired
+                    | IncrementalErrorClass::TransientFailure
+                    | IncrementalErrorClass::CaptureRefused => Err(error),
+                },
+            }
+        }
         SyncMode::Full => {
             download_photos_full_with_token(
                 download_client,
@@ -531,6 +610,8 @@ pub async fn download_photos_with_sync(
     if repair.checkpoint.sync_token_blocked {
         result.sync_token = None;
     }
+
+    super::generation::hold_retained_debt(passes, &config, controls, &mut result).await?;
 
     // Pending is transient — anything still pending after a complete sync either
     // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.

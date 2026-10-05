@@ -436,6 +436,9 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
 /// Decoupled from CLI parsing so the engine can be tested independently.
 #[derive(Clone)]
 pub(crate) struct DownloadConfig {
+    pub(crate) selection_context: Option<Arc<super::generation::SelectionContext>>,
+    pub(crate) selection_run: Option<Arc<super::generation::SelectionRun>>,
+    pub(crate) selection_pass: Option<String>,
     /// Behind `Arc` so per-pass clones (`with_album_name`, `with_pass`,
     /// `with_exclude_ids`) refcount-bump instead of deep-cloning the
     /// PathBuf. Same pattern as `asset_groupings` and `exclude_asset_ids`.
@@ -542,7 +545,8 @@ impl DownloadConfig {
             paths::TOKEN_LIBRARY,
         ];
         let any_token = |s: &str| PER_PASS_TOKENS.iter().any(|t| s.contains(t));
-        any_token(&self.folder_structure)
+        self.selection_run.is_some()
+            || any_token(&self.folder_structure)
             || any_token(&self.folder_structure_albums)
             || any_token(&self.folder_structure_smart_folders)
             || self.folder_structure_albums.as_ref() != self.folder_structure.as_str()
@@ -568,6 +572,10 @@ impl DownloadConfig {
             pass,
         );
         Self {
+            selection_pass: self
+                .selection_run
+                .as_ref()
+                .map(|_| super::generation::pass_key(pass)),
             album_name: Some(Arc::clone(&pass.album.name)),
             folder_structure,
             exclude_asset_ids: Arc::clone(&pass.exclude_ids),
@@ -683,6 +691,9 @@ impl DownloadConfig {
             filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
             temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
+            selection_context: None,
+            selection_run: None,
+            selection_pass: None,
             retry_only: false,
             max_download_attempts: 10,
             sync_mode: SyncMode::Full,

@@ -365,7 +365,113 @@ where
                     // so the skip sites must not re-stamp it from the stale
                     // context.
                     let mut metadata_refresh_attempted = false;
-                    if let Some(db) = &producer_state_db {
+                    let mut selected_plan = None;
+                    if let Some(run) = &config.selection_run {
+                        if run
+                            .session_expired
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            return skips;
+                        }
+                        let Some(key) = config.selection_pass.as_deref() else {
+                            enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(target: "kei::download::pipeline",
+                                "Selection producer has no original pass owner");
+                            producer_pb.inc(1);
+                            continue;
+                        };
+                        let observed_child = asset.asset_record_name().to_owned();
+                        let (current, body) = match run.confirm(key, asset).await {
+                            Ok(confirmed) => confirmed,
+                            Err(error) => {
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if is_provider_session_error(&error) {
+                                    provider_auth_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    run.session_expired
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    producer_pb.inc(1);
+                                    tracing::warn!(target: "kei::download::pipeline",
+                                        "Current selection confirmation requires session recovery");
+                                    return skips;
+                                }
+                                if !is_provider_session_error(&error)
+                                    && error.downcast_ref::<crate::download::orchestration::generation::SelectionRetryDeferred>().is_none()
+                                    && let Err(state_error)=run.defer_confirmation(key,observed_child).await {
+                                    state_write_failures_producer.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(target:"kei::download::pipeline",%state_error,"Could not persist deferred current identity");
+                                }
+                                run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                tracing::warn!(target: "kei::download::pipeline", %error,
+                                    "Current selection confirmation refused producer mutation");
+                                producer_pb.inc(1);
+                                continue;
+                            }
+                        };
+                        asset = current;
+                        if let Some(db) = &producer_state_db {
+                            let library = effective_asset_library(&asset, config).to_owned();
+                            match download_ctx
+                                .select_asset_state_record_name_for_download(
+                                    Some(db.as_ref()),
+                                    &library,
+                                    &asset,
+                                    &mut claimed_legacy_master_states,
+                                )
+                                .await
+                            {
+                                Ok(state_record_name) => {
+                                    asset = asset.with_state_record_name(state_record_name)
+                                }
+                                Err(error) => {
+                                    state_write_failures_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(target: "kei::download::pipeline", %error,
+                                        "Selection could not preserve legacy state ownership");
+                                    producer_pb.inc(1);
+                                    continue;
+                                }
+                            }
+                        }
+                        let mut plan = match task_planner.plan_download_asset(&asset, config).await
+                        {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                state_write_failures_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(target: "kei::download::pipeline", %error,
+                                    "Failed to plan selection destinations");
+                                return skips;
+                            }
+                        };
+                        match run
+                            .project(key, &asset, body, &mut plan, &mut task_planner, config)
+                            .await
+                        {
+                            Ok(true) => selected_plan = Some(plan),
+                            Ok(false) => {
+                                producer_pb.inc(1);
+                                continue;
+                            }
+                            Err(error) => {
+                                state_write_failures_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                tracing::warn!(target: "kei::download::pipeline", %error,
+                                    "Selection projection refused canonical mutation");
+                                producer_pb.inc(1);
+                                continue;
+                            }
+                        }
+                        metadata_refresh_attempted = true;
+                    }
+                    if config.selection_run.is_none()
+                        && let Some(db) = &producer_state_db
+                    {
                         let library = effective_asset_library(&asset, config).to_owned();
                         if let Err(e) =
                             planner::upsert_asset_master_mapping(db.as_ref(), &library, &asset)
@@ -474,7 +580,8 @@ where
                     }
 
                     // Persist membership even when planning skips already-landed media.
-                    if let Some(db) = &producer_state_db
+                    if config.selection_run.is_none()
+                        && let Some(db) = &producer_state_db
                         && let Err(e) =
                             planner::record_album_membership_if_named(db.as_ref(), config, &asset)
                                 .await
@@ -490,13 +597,17 @@ where
                         );
                     }
 
-                    let plan = match task_planner.plan_download_asset(&asset, config).await {
-                        Ok(plan) => plan,
-                        Err(error) => {
-                            state_write_failures_producer
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::error!(target: "kei::download::pipeline", %error, "Failed to plan reserved download paths");
-                            return skips;
+                    let plan = if let Some(plan) = selected_plan {
+                        plan
+                    } else {
+                        match task_planner.plan_download_asset(&asset, config).await {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                state_write_failures_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(target: "kei::download::pipeline", %error, "Failed to plan reserved download paths");
+                                return skips;
+                            }
                         }
                     };
                     if let Some(db) = &producer_state_db

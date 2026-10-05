@@ -17,6 +17,7 @@ mod fetch;
 mod hydration;
 mod lookup;
 mod planning;
+pub(crate) mod selection_capture;
 pub(crate) mod work;
 
 mod preservation_proof;
@@ -85,6 +86,7 @@ pub struct PhotoAlbumConfig {
 
 pub struct PhotoAlbum {
     shadow_capture: Option<(super::inbox::ShadowCapture, Arc<str>)>,
+    rank_capture: Option<selection_capture::RankCapture>,
     pub(crate) name: Arc<str>,
     params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
@@ -118,6 +120,7 @@ impl Clone for PhotoAlbum {
             self.session.clone_box(),
         );
         cloned.shadow_capture = self.shadow_capture.clone();
+        cloned.rank_capture = self.rank_capture.clone();
         cloned
     }
 }
@@ -146,6 +149,7 @@ impl PhotoAlbum {
     pub fn new(config: PhotoAlbumConfig, session: Box<dyn PhotosSession>) -> Self {
         Self {
             shadow_capture: None,
+            rank_capture: None,
             name: config.name,
             params: config.params,
             session,
@@ -203,7 +207,7 @@ impl PhotoAlbum {
     }
 
     pub(crate) fn clone_as_library_wide(&self) -> PhotoAlbum {
-        PhotoAlbum::new(
+        let mut album = PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::clone(&self.params),
                 service_endpoint: Arc::clone(&self.service_endpoint),
@@ -218,7 +222,13 @@ impl PhotoAlbum {
                 cross_zone_sources: Vec::new(),
             },
             self.session.clone_box(),
-        )
+        );
+        album.shadow_capture = self.shadow_capture.clone();
+        album.rank_capture = self.rank_capture.clone().map(|mut capture| {
+            capture.pass_key = "global-frontier".to_owned();
+            capture
+        });
+        album
     }
 
     /// Return total item count for this album via `HyperionIndexCountLookup`.

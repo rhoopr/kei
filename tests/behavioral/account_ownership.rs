@@ -1521,3 +1521,300 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
         );
     }
 }
+
+#[derive(Clone)]
+struct PrivateSelectionCliPhotos {
+    ranks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl PrivateSelectionCliPhotos {
+    fn pair(&self, number: usize) -> Vec<Value> {
+        let mut pair = RecentCliPhotos {
+            first_delta: Default::default(),
+            queries: Default::default(),
+        }
+        .pair(number);
+        let master = pair.get_mut(0).expect("released fixture has a master");
+        *master
+            .get_mut("recordName")
+            .expect("master record identity") = json!(format!("private-{number}"));
+        *master
+            .pointer_mut("/fields/filenameEnc/value")
+            .expect("master filename") = json!(format!("private-{number}.jpg"));
+        let child = pair.get_mut(1).expect("released fixture has a child");
+        *child.get_mut("recordName").expect("child record identity") =
+            json!(format!("asset-private-{number}"));
+        *child
+            .pointer_mut("/fields/masterRef/value/recordName")
+            .expect("child master relationship") = json!(format!("private-{number}"));
+        pair
+    }
+    fn members(scope: Option<&str>) -> Vec<usize> {
+        match scope {
+            Some("A") => vec![0, 1],
+            Some("B") => vec![0, 2],
+            _ => vec![0, 1, 2, 3],
+        }
+    }
+}
+impl Respond for PrivateSelectionCliPhotos {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        use std::sync::atomic::Ordering;
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let path = request.url.path();
+        let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        let value = if path.ends_with("/zones/list") {
+            json!({"zones":if path.contains("/private/"){vec![json!({"zoneID":zone})]}else{vec![]}})
+        } else if body.pointer("/query/recordType").and_then(Value::as_str)
+            == Some("CheckIndexingState")
+        {
+            json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]})
+        } else if path.ends_with("/changes/database") {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            json!({"syncToken":"private-db-cursor","moreComing":false,"zones":[]})
+        } else if path.ends_with("/changes/zone") {
+            json!({"zones":[{"zoneID":zone,"records":[],"syncToken":"private-source-cursor","moreComing":false}]})
+        } else if body.pointer("/query/recordType").and_then(Value::as_str)
+            == Some("CPLAlbumByPositionLive")
+        {
+            let folders: Vec<_> = ["A", "B"].into_iter().map(|name| json!({
+                "recordName": name, "recordType": "CPLAlbum", "fields": {
+                    "albumNameEnc": {"value": base64::engine::general_purpose::STANDARD.encode(name), "type": "STRING"}
+                }
+            })).collect();
+            json!({"records": folders})
+        } else if path.ends_with("/records/lookup") {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let names: Vec<_> = body
+                .get("records")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["recordName"].as_str().unwrap())
+                .collect();
+            json!({"records":(0..4).flat_map(|n|self.pair(n)).filter(|r|names.contains(&r["recordName"].as_str().unwrap())).collect::<Vec<_>>()})
+        } else if path.ends_with("/internal/records/query/batch") {
+            json!({"batch":body.get("batch").unwrap().as_array().unwrap().iter().map(|q|{
+                let object=q.pointer("/query/filterBy/fieldValue/value/0").and_then(Value::as_str).unwrap();
+                let scope=object.rsplit(':').next().unwrap();
+                json!({"records":[{"fields":{"itemCount":{"value":Self::members(Some(scope)).len()}}}]})
+            }).collect::<Vec<_>>()})
+        } else if path.ends_with("/records/query") {
+            self.ranks.fetch_add(1, Ordering::SeqCst);
+            let filters = body
+                .pointer("/query/filterBy")
+                .and_then(Value::as_array)
+                .unwrap();
+            let field = |name: &str| {
+                filters
+                    .iter()
+                    .find(|f| f["fieldName"] == name)
+                    .and_then(|f| f.pointer("/fieldValue/value"))
+            };
+            let scope = field("parentId").and_then(Value::as_str);
+            let offset = field("startRank").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let limit =
+                usize::try_from(body.get("resultsLimit").unwrap().as_u64().unwrap()).unwrap() / 2;
+            json!({"records":Self::members(scope).into_iter().skip(offset).take(limit).flat_map(|n|self.pair(n)).collect::<Vec<_>>(),"syncToken":"private-observational-rank"})
+        } else {
+            panic!("unexpected private selection CLI endpoint: {path}")
+        };
+        ResponseTemplate::new(200).set_body_json(value)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_selection_actual_cli_and_watch_reopen_independent_destination_debt() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let server = MockServer::start().await;
+    let photos = PrivateSelectionCliPhotos {
+        ranks: Arc::new(AtomicUsize::new(0)),
+        lookups: Arc::new(AtomicUsize::new(0)),
+        checks: Arc::new(AtomicUsize::new(0)),
+    };
+    Mock::given(method("POST"))
+        .respond_with(photos.clone())
+        .mount(&server)
+        .await;
+    // Production URL validation remains in force. Real previously verified
+    // synthetic local bytes qualify receipt replay; fresh transfers are proved
+    // separately through the dispatcher publication histories.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(QUIET_MEDIA))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    let media_root = account.media.parent().unwrap();
+    let old_bytes = std::fs::read(&account.media).unwrap();
+    let checksum = format!("{:x}", Sha256::digest(QUIET_MEDIA));
+    let provider_checksum =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(QUIET_MEDIA));
+    let mut seeded = Vec::new();
+    let conn = Connection::open(&account.path).unwrap();
+    conn.execute_batch("UPDATE assets SET library='OldUnknownScope' WHERE id='retry'; DELETE FROM metadata WHERE key='pending_sync_token:old:PrimarySync';").unwrap();
+    for (album, number) in [("A", 0), ("A", 1), ("B", 0), ("B", 2), ("", 3)] {
+        let folder = media_root.join(album);
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(format!("private-{number}.JPG"));
+        std::fs::write(&path, QUIET_MEDIA).unwrap();
+        let id = format!("asset-private-{number}");
+        if album != "B" || number != 0 {
+            insert_asset(
+                &conn,
+                &id,
+                "downloaded",
+                &format!("private-{number}.JPG"),
+                Some(path.to_str().unwrap()),
+                None,
+                Some(&checksum),
+            );
+            conn.execute(
+                "UPDATE assets SET size_bytes=?1,checksum=?2 WHERE id=?3",
+                params![QUIET_MEDIA.len() as i64, provider_checksum, id],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO asset_metadata_capture_revisions(library,asset_id,revision,updated_at) VALUES('PrimarySync',?1,1,1700000000)",[&id]).unwrap();
+        }
+        conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum,source_checksum) VALUES('PrimarySync',?1,'original',?2,?3,?4,?4,?4)",params![id,path.to_str().unwrap(),provider_checksum,checksum]).unwrap();
+        seeded.push((
+            path.clone(),
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+        ));
+    }
+    drop(conn);
+    // The behavioral state factory models released schema25. Let the actual
+    // binary run its migration before installing a fault in the additive table.
+    success(&command(root, &account, &["status"]));
+    let conn = Connection::open(&account.path).unwrap();
+    conn.execute_batch("CREATE TRIGGER private_cli_destination_fault BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN NEW.verified_media=1 AND replace(NEW.compat_path,char(92),'/') LIKE '%/B/%' BEGIN SELECT RAISE(ABORT,'synthetic private B receipt interruption'); END;").unwrap();
+    drop(conn);
+    let config=std::fs::read_to_string(&account.config).unwrap().replace("[ui]","folder_structure=\"\"\nfolder_structure_albums=\"{album}\"\n[filters]\nalbums=[\"A\",\"B\"]\nunfiled=true\n[ui]");
+    std::fs::write(&account.config, &config).unwrap();
+    let out = command(root, &account, &["sync", "--no-progress-bar"]);
+    let diagnostics = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        diagnostics.contains("synthetic private B receipt interruption"),
+        "{diagnostics}"
+    );
+    let count = |sql: &str| {
+        Connection::open(&account.path)
+            .unwrap()
+            .query_row::<i64, _, _>(sql, [], |r| r.get(0))
+            .unwrap()
+    };
+    assert!(
+        count("SELECT count(*) FROM provider_active_generations") > 0,
+        "actual startup must activate named private passes"
+    );
+    assert!(
+        count(
+            "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND replace(compat_path,char(92),'/') LIKE '%/A/%'"
+        ) > 0
+    );
+    assert!(
+        count(
+            "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0 AND replace(compat_path,char(92),'/') LIKE '%/B/%'"
+        ) > 0
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM assets WHERE id='asset-private-0' AND status='downloaded'"),
+        1,
+        "canonical A completion cannot hide independent B debt"
+    );
+    assert_eq!(
+        rows(
+            &account.path,
+            "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'"
+        ),
+        vec![vec![rusqlite::types::Value::Text("A-cursor".into())]]
+    );
+    Connection::open(&account.path)
+        .unwrap()
+        .execute_batch("DROP TRIGGER private_cli_destination_fault;")
+        .unwrap();
+    std::fs::write(
+        &account.config,
+        format!("{config}[watch]\ninterval=60\n[server]\nport=0\n"),
+    )
+    .unwrap();
+    let log = root.join("private-selection-service.log");
+    let mut child = QuietServiceChild(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin!("kei"))
+            .env_clear()
+            .envs(std::env::var_os("SystemRoot").map(|v| ("SystemRoot", v)))
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", root)
+            .env("KEI_DATA_DIR", root)
+            .env("ICLOUD_USERNAME", account.username)
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .args([
+                "--config",
+                account.config.to_str().unwrap(),
+                "service",
+                "run",
+                "--no-progress-bar",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let started = std::time::Instant::now();
+    let mut recovered = None;
+    while photos.checks.load(Ordering::SeqCst) < 3 && started.elapsed() < Duration::from_secs(210) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{}",
+            std::fs::read_to_string(&log).unwrap()
+        );
+        if recovered.is_none()
+            && count("SELECT count(*) FROM provider_active_destinations WHERE verified_media=0")
+                == 0
+        {
+            recovered = Some((
+                photos.ranks.load(Ordering::SeqCst),
+                photos.lookups.load(Ordering::SeqCst),
+            ));
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let diagnostics = std::fs::read_to_string(&log).unwrap();
+    assert!(photos.checks.load(Ordering::SeqCst) >= 3, "{diagnostics}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(119),
+        "real watch cadence"
+    );
+    assert_eq!(
+        recovered,
+        Some((
+            photos.ranks.load(Ordering::SeqCst),
+            photos.lookups.load(Ordering::SeqCst)
+        )),
+        "two unchanged watch cycles must not repeat completed selection/hydration"
+    );
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1"
+        ),
+        5,
+        "all pass destinations, not canonical asset count"
+    );
+    for (path, modified) in seeded {
+        assert_eq!(std::fs::read(&path).unwrap(), QUIET_MEDIA);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+    assert_eq!(std::fs::read(&account.media).unwrap(), old_bytes);
+}

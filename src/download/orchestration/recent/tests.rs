@@ -32,6 +32,7 @@ const MEDIA: &[u8] = &[
 struct SelectionSession {
     inventory: Arc<Vec<Vec<Value>>>,
     changed: bool,
+    memberships: Option<Arc<HashMap<String, FxHashSet<String>>>>,
     cancel_at_selection: Option<CancellationToken>,
     queries: Arc<Mutex<Vec<String>>>,
 }
@@ -42,6 +43,11 @@ impl SelectionSession {
             .iter()
             .filter(|pair| {
                 let id = pair[0]["recordName"].as_str().unwrap();
+                if let Some(memberships) = &self.memberships {
+                    return memberships
+                        .get(scope)
+                        .is_none_or(|names| names.contains(id));
+                }
                 match scope {
                     "A" => ["alpha", "delta"].contains(&id),
                     "B" => ["alpha", "beta", "epsilon"].contains(&id),
@@ -128,8 +134,14 @@ impl PhotosSession for SelectionSession {
             return Ok(json!({"records":records,"syncToken":"rank-query-token"}));
         }
         if url.contains("/records/lookup?") {
+            let names: FxHashSet<_> = request["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|record| record["recordName"].as_str())
+                .collect();
             return Ok(
-                json!({"records":self.inventory.iter().flatten().cloned().collect::<Vec<_>>()}),
+                json!({"records":self.inventory.iter().flatten().filter(|record|names.contains(record["recordName"].as_str().unwrap())).cloned().collect::<Vec<_>>()}),
             );
         }
         anyhow::bail!("Unexpected fixture owner endpoint")
@@ -252,6 +264,7 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
             let session = SelectionSession {
                 inventory: inventory.clone(),
                 changed: false,
+                memberships: None,
                 cancel_at_selection: None,
                 queries: Arc::default(),
             };
@@ -307,6 +320,7 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
             let session = SelectionSession {
                 inventory: inventory.clone(),
                 changed: cycle == 0,
+                memberships: None,
                 cancel_at_selection: None,
                 queries: queries.clone(),
             };
@@ -431,6 +445,16 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
             let conn = db
                 .acquire_lock("recent source evidence remains retained")
                 .unwrap();
+            assert!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_generations",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap()
+                    > 0,
+                "the supported owned recent history must exercise active selection, not just the legacy route"
+            );
             assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_catalog_records WHERE record_name='future-retained'",[],|r|r.get(0)).unwrap(),1);
             assert_eq!(
                 conn.query_row::<i64, _, _>(
@@ -444,6 +468,550 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
             drop(conn);
             config.state_db = None;
         }
+    }
+}
+
+#[tokio::test]
+async fn private_recent_equal_dates_preserve_provider_ties_and_recover_after_cap_removal() {
+    for scope in [
+        crate::cli::RecentScope::Global,
+        crate::cli::RecentScope::PerFilter,
+    ] {
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .mount(&server)
+            .await;
+        let mut source = (*inventory(&server.uri())).clone();
+        source[1][1]["fields"]["assetDate"] = source[0][1]["fields"]["assetDate"].clone();
+        source.swap(0, 1);
+        let source = Arc::new(source);
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("ties.db");
+        let mut config = test_config();
+        config.directory = Arc::from(directory.path().join("media"));
+        config.folder_structure = String::new();
+        config.folder_structure_albums = Arc::from("{album}");
+        config.recent_scope = scope;
+        std::fs::create_dir_all(&*config.directory).unwrap();
+        let old = config.directory.join("old-untracked.jpg");
+        std::fs::write(&old, b"old-independent-media").unwrap();
+        for cycle in 0..4 {
+            let db = Arc::new(
+                SqliteStateDb::open_owned(&database, &owner())
+                    .await
+                    .unwrap(),
+            );
+            config.state_db = Some(db.clone());
+            config.recent = (cycle == 0).then_some(1);
+            if cycle == 0 {
+                db.set_metadata("sync_token:PrimarySync", "saved-tie-cursor")
+                    .await
+                    .unwrap();
+            }
+            config.sync_mode = SyncMode::Incremental {
+                zone_sync_token: db
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            };
+            let queries = Arc::new(Mutex::new(Vec::new()));
+            let selected = passes(
+                SelectionSession {
+                    inventory: source.clone(),
+                    changed: false,
+                    memberships: None,
+                    cancel_at_selection: None,
+                    queries: queries.clone(),
+                },
+                &db,
+            );
+            let result = download_photos_with_sync(
+                &Client::new(),
+                &selected,
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let mut expected = if cycle == 0 {
+                if scope == crate::cli::RecentScope::Global {
+                    vec!["B/beta.JPG"]
+                } else {
+                    vec!["A/alpha.JPG", "B/beta.JPG"]
+                }
+            } else {
+                vec![
+                    "A/alpha.JPG",
+                    "A/delta.JPG",
+                    "B/alpha.JPG",
+                    "B/beta.JPG",
+                    "B/epsilon.JPG",
+                    "media/gamma.JPG",
+                ]
+            };
+            expected.sort_unstable();
+            assert_eq!(
+                paths(&db),
+                expected,
+                "scope={scope:?} cycle={cycle}: {result:?}"
+            );
+            assert_eq!(
+                result.stats.downloaded,
+                match (cycle, scope) {
+                    (0, crate::cli::RecentScope::Global) => 1,
+                    (0, _) => 2,
+                    (1, crate::cli::RecentScope::Global) => 5,
+                    (1, _) => 4,
+                    _ => 0,
+                }
+            );
+            if cycle == 0 {
+                assert!(result.sync_token.is_none());
+                assert_eq!(
+                    db.get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("saved-tie-cursor")
+                );
+            } else {
+                let successor = result
+                    .sync_token
+                    .expect("uncapped complete coverage retains existing checkpoint bridge");
+                db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+                    legacy_preservation_proofs: Vec::new(),
+                    legacy_config_hash: None,
+                    sparse_identity_proofs: Vec::new(),
+                    metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],
+                    metadata_deletes: Vec::new(),
+                })
+                .await
+                .unwrap();
+            }
+            if cycle >= 2 {
+                assert!(queries.lock().unwrap().is_empty());
+            }
+            assert_eq!(std::fs::read(&old).unwrap(), b"old-independent-media");
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                expected.len()
+            );
+            assert!(
+                db.acquire_lock("active tie selection")
+                    .unwrap()
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM provider_active_generations",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap()
+                    > 0
+            );
+            config.state_db = None;
+        }
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn private_master_metadata_and_relationship_only_invalidation_reseeds_current_facts_without_deletion()
+ {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dependencies.db");
+    let mut config = test_config();
+    config.directory = Arc::from(directory.path().join("media"));
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("{album}");
+    config.metadata.xmp_sidecar = true;
+    let mut current = (*inventory(&server.uri())).clone();
+    let mut stable_sidecars = None;
+    for cycle in 0..7 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &owner())
+                .await
+                .unwrap(),
+        );
+        config.state_db = Some(db.clone());
+        if cycle == 1 {
+            current[0][0]["futureMasterDependency"] = json!({"unknown":[0,255,9]});
+        }
+        if cycle == 2 {
+            current[0][1]["fields"]["captionEnc"] =
+                json!({"value":"Current alpha title","type":"STRING"});
+        }
+        let memberships: HashMap<String, FxHashSet<String>> = [
+            (
+                "A",
+                if cycle < 3 {
+                    vec!["alpha", "delta"]
+                } else {
+                    vec!["alpha"]
+                },
+            ),
+            (
+                "B",
+                if cycle < 3 {
+                    vec!["alpha", "beta", "epsilon"]
+                } else {
+                    vec!["alpha", "beta", "epsilon", "gamma"]
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(name, ids)| {
+            (
+                name.to_owned(),
+                ids.into_iter().map(str::to_owned).collect(),
+            )
+        })
+        .collect();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let session = SelectionSession {
+            inventory: Arc::new(current.clone()),
+            changed: false,
+            memberships: Some(Arc::new(memberships.clone())),
+            cancel_at_selection: None,
+            queries: queries.clone(),
+        };
+        let mut selected = passes(session, &db);
+        selected[2].exclude_ids = Arc::new(
+            memberships
+                .values()
+                .flatten()
+                .flat_map(|name| [name.clone(), format!("asset-{name}")])
+                .collect(),
+        );
+        let (_, scope, zone) = selected[0].album.owned_private_scope().unwrap().unwrap();
+        let capture = ShadowCapture::new(db.clone(), owner(), "com");
+        let observed = match cycle {
+            1 => vec![current[0][0].clone()],
+            2 => vec![current[0][1].clone()],
+            3 => {
+                let add = relation_delta_record("B", "asset-gamma");
+                let mut remove = relation_delta_record("A", "asset-delta");
+                remove["deleted"] = json!(true);
+                vec![add, remove]
+            }
+            4 => vec![
+                current[0][1].clone(),
+                current[2][0].clone(),
+                current[0][1].clone(),
+            ],
+            _ => Vec::new(),
+        };
+        if !observed.is_empty() {
+            let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":zone,"records":observed,"syncToken":format!("dependency-{cycle}-successor"),"moreComing":false}]})).unwrap();
+            capture
+                .capture(
+                    crate::icloud::photos::catalog_observed_page(
+                        raw,
+                        &scope,
+                        &format!("dependency-{cycle}"),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        if cycle == 4 {
+            let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":zone,"records":[current[0][0].clone(),current[2][1].clone()],"syncToken":"split-dependency-successor","moreComing":false}]})).unwrap();
+            capture
+                .capture(
+                    crate::icloud::photos::catalog_observed_page(raw, &scope, "split-dependency")
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        if cycle > 0 {
+            config.sync_mode = SyncMode::Incremental {
+                zone_sync_token: db
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            };
+        }
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &selected,
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "cycle{cycle}: {result:?}"
+        );
+        assert_eq!(
+            result.stats.downloaded,
+            match cycle {
+                0 => 6,
+                3 => 2,
+                _ => 0,
+            },
+            "cycle{cycle}: {result:?}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            if cycle < 3 { 6 } else { 8 }
+        );
+        let mut expected = vec![
+            "A/alpha.JPG",
+            "A/delta.JPG",
+            "B/alpha.JPG",
+            "B/beta.JPG",
+            "B/epsilon.JPG",
+            "media/gamma.JPG",
+        ];
+        if cycle >= 3 {
+            expected.extend(["B/gamma.JPG", "media/delta.JPG"]);
+        }
+        expected.sort_unstable();
+        assert_eq!(
+            paths(&db),
+            expected,
+            "historical local files are not absence-authorized deletions"
+        );
+        for relative in &expected {
+            let relative = relative.strip_prefix("media/").unwrap_or(relative);
+            assert_eq!(
+                std::fs::read(config.directory.join(relative)).unwrap(),
+                MEDIA
+            );
+        }
+        if cycle >= 2 {
+            for album in ["A", "B"] {
+                assert!(
+                    std::fs::read_to_string(config.directory.join(album).join("alpha.JPG.xmp"))
+                        .unwrap()
+                        .contains("Current alpha title")
+                );
+            }
+        }
+        if cycle == 1 || cycle == 2 || cycle == 3 {
+            assert!(
+                !queries.lock().unwrap().is_empty(),
+                "dependency-only source must dirty and reseed scoped selection"
+            );
+        }
+        let sidecars: Vec<_> = expected
+            .iter()
+            .map(|relative| {
+                let relative = relative.strip_prefix("media/").unwrap_or(relative);
+                let media = config.directory.join(relative);
+                let path = media.with_file_name(format!(
+                    "{}.xmp",
+                    media.file_name().unwrap().to_str().unwrap()
+                ));
+                (
+                    path.clone(),
+                    std::fs::read(&path).unwrap(),
+                    std::fs::metadata(path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        if cycle >= 5 {
+            assert!(queries.lock().unwrap().is_empty());
+            assert_eq!(
+                stable_sidecars.as_ref().unwrap(),
+                &sidecars,
+                "quiet cycles cannot repeat completed metadata writes"
+            );
+        }
+        if cycle == 4 {
+            stable_sidecars = Some(sidecars);
+        }
+        let successor = result
+            .sync_token
+            .expect("complete current coverage preserves source checkpoint gate");
+        db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+            legacy_preservation_proofs: Vec::new(),
+            legacy_config_hash: None,
+            sparse_identity_proofs: Vec::new(),
+            metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],
+            metadata_deletes: Vec::new(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.acquire_lock("active dependency history")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_generations",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap()
+                > 0
+        );
+        config.state_db = None;
+    }
+}
+
+#[tokio::test]
+async fn private_filter_expansion_reopens_retained_coverage_and_converges_without_source_changes() {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    let inventory = inventory(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("filter-history.db");
+    let mut config = test_config();
+    config.directory = Arc::from(directory.path().join("media"));
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("{album}");
+    config.recent = None;
+    config.filename_exclude = Arc::from([glob::Pattern::new("epsilon.*").unwrap()]);
+    let existing;
+    {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &owner())
+                .await
+                .unwrap(),
+        );
+        let session = SelectionSession {
+            inventory: inventory.clone(),
+            changed: false,
+            memberships: None,
+            cancel_at_selection: None,
+            queries: Arc::default(),
+        };
+        let passes = passes(session, &db);
+        let previous = incremental_photo_records("previous");
+        existing = seed_downloaded_metadata_asset(
+            &db,
+            &config,
+            &passes[2],
+            &PhotoAsset::new(previous[0].clone(), previous[1].clone()),
+        )
+        .await;
+        std::fs::write(existing.with_extension("xmp"), b"retained-old-sidecar").unwrap();
+        db.set_metadata("sync_token:PrimarySync", "saved-cursor")
+            .await
+            .unwrap();
+    }
+    let old_media = std::fs::read(&existing).unwrap();
+    for cycle in 0..4 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &owner())
+                .await
+                .unwrap(),
+        );
+        config.state_db = Some(db.clone());
+        if cycle > 0 {
+            config.filename_exclude = Arc::from([]);
+            config.sync_mode = SyncMode::Incremental {
+                zone_sync_token: db
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            };
+        }
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let session = SelectionSession {
+            inventory: inventory.clone(),
+            changed: false,
+            memberships: None,
+            cancel_at_selection: None,
+            queries: queries.clone(),
+        };
+        let passes = passes(session, &db);
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "cycle={cycle}: {result:?}"
+        );
+        assert_eq!(
+            result.stats.downloaded,
+            match cycle {
+                0 => 5,
+                1 => 1,
+                _ => 0,
+            }
+        );
+        let mut expected = vec![
+            "A/alpha.JPG",
+            "A/delta.JPG",
+            "B/alpha.JPG",
+            "B/beta.JPG",
+            "media/changed.JPG",
+            "media/gamma.JPG",
+        ];
+        if cycle > 0 {
+            expected.push("B/epsilon.JPG");
+        }
+        expected.sort_unstable();
+        assert_eq!(paths(&db), expected, "cycle={cycle}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            if cycle == 0 { 5 } else { 6 }
+        );
+        if cycle >= 2 {
+            assert!(
+                queries.lock().unwrap().is_empty(),
+                "unchanged complete coverage must not reselect inventory"
+            );
+        }
+        let successor = result
+            .sync_token
+            .expect("complete unbounded selection retains the existing source bridge");
+        assert_eq!(
+            successor,
+            if cycle == 0 {
+                "rank-query-token"
+            } else {
+                "delta-successor"
+            },
+            "retain the existing full-query and incremental source checkpoint owners"
+        );
+        db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+            legacy_preservation_proofs: Vec::new(),
+            legacy_config_hash: None,
+            sparse_identity_proofs: Vec::new(),
+            metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],
+            metadata_deletes: Vec::new(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.acquire_lock("active filtered and expanded generations")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_generations",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap()
+                > 0
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), old_media);
+        assert_eq!(
+            std::fs::read(existing.with_extension("xmp")).unwrap(),
+            b"retained-old-sidecar"
+        );
+        config.state_db = None;
     }
 }
 
@@ -476,6 +1044,7 @@ async fn recent_recovery_receipt_task_fault_and_cancellation_preserve_then_reope
             let session = SelectionSession {
                 inventory: inventory.clone(),
                 changed: false,
+                memberships: None,
                 cancel_at_selection: None,
                 queries: Arc::default(),
             };
@@ -542,6 +1111,7 @@ async fn recent_recovery_receipt_task_fault_and_cancellation_preserve_then_reope
             let session = SelectionSession {
                 inventory: inventory.clone(),
                 changed: cycle == 0,
+                memberships: None,
                 cancel_at_selection: (cycle == 0 && fault == "cancel").then(|| cancel.clone()),
                 queries: queries.clone(),
             };
@@ -679,6 +1249,7 @@ async fn recent_one_asset_keeps_both_companion_renditions_and_recovers_unchanged
             SelectionSession {
                 inventory: inventory.clone(),
                 changed: cycle == 0,
+                memberships: None,
                 cancel_at_selection: None,
                 queries: queries.clone(),
             },
@@ -750,6 +1321,7 @@ async fn recent_receipt_roundtrip_binds_scope_exclusions_and_future_versions() {
             SelectionSession {
                 inventory: inventory("https://example.invalid"),
                 changed: false,
+                memberships: None,
                 cancel_at_selection: None,
                 queries: Arc::default(),
             },
@@ -769,6 +1341,7 @@ async fn recent_receipt_roundtrip_binds_scope_exclusions_and_future_versions() {
         SelectionSession {
             inventory: inventory("https://example.invalid"),
             changed: false,
+            memberships: None,
             cancel_at_selection: None,
             queries: Arc::default(),
         },
@@ -888,6 +1461,7 @@ async fn recent_mixed_identity_and_source_write_vetoes_keep_healthy_jobs_and_deb
             SelectionSession {
                 inventory: inventory.clone(),
                 changed: false,
+                memberships: None,
                 cancel_at_selection: None,
                 queries: Arc::default(),
             },
@@ -930,6 +1504,7 @@ async fn recent_mixed_identity_and_source_write_vetoes_keep_healthy_jobs_and_deb
             MixedSession(SelectionSession {
                 inventory: inventory.clone(),
                 changed: true,
+                memberships: None,
                 cancel_at_selection: None,
                 queries: Arc::default(),
             }),
@@ -1028,6 +1603,7 @@ async fn recent_global_frontier_auth_failure_preserves_session_recovery_and_rece
             inner: SelectionSession {
                 inventory: inventory("https://example.invalid"),
                 changed: false,
+                memberships: None,
                 cancel_at_selection: None,
                 queries: Arc::default(),
             },
