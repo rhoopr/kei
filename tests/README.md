@@ -1063,8 +1063,10 @@ Shared Library ownership.
 
 Primary discovery availability is covered by
 `primary_discovery_default_selection_does_not_initialize_unselected_private_libraries`:
-default selection with an unrelated private zone still indexing succeeds with
-explicit primary ownership, while a full-map request fails without publishing a
+default selection and the selected library album query succeed with explicit
+primary ownership while an unrelated private zone is still indexing. The query
+returns a synthetic named user album from the exact selected scope. A full-map
+request fails without publishing a
 partial map. The qualified primary survives that failure, and a later full-map
 request recovers when indexing finishes. The selected-primary indexing failure
 test separately proves that cached valid descriptors cannot publish ownership

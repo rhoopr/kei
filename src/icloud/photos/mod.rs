@@ -731,6 +731,7 @@ mod tests {
         discovery: RawDiscoverySession,
         indexing_requests: Arc<Mutex<Vec<Value>>>,
         blocked_zone: Arc<Mutex<Option<String>>>,
+        folder_requests: Arc<Mutex<Vec<Value>>>,
     }
 
     #[async_trait::async_trait]
@@ -742,6 +743,19 @@ mod tests {
             headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             let request: Value = serde_json::from_str(&body)?;
+            if request["query"]["recordType"] == "CPLAlbumByPositionLive" {
+                assert!(url.contains("/private/records/query?"));
+                assert_eq!(request["zoneID"]["zoneName"], PRIMARY_ZONE_NAME);
+                assert_eq!(request["zoneID"]["ownerRecordName"], "_defaultOwner");
+                self.folder_requests
+                    .lock()
+                    .unwrap()
+                    .push(request["zoneID"].clone());
+                return Ok(json!({"records":[{
+                    "recordName":"synthetic-user-album", "recordType":"CPLAlbum",
+                    "fields":{"albumNameEnc":{"value":"Rml4dHVyZSBhbGJ1bQ=="}}
+                }]}));
+            }
             assert_eq!(request["query"]["recordType"], "CheckIndexingState");
             self.indexing_requests
                 .lock()
@@ -778,6 +792,7 @@ mod tests {
             ]})).unwrap()),
             indexing_requests: Arc::new(Mutex::new(Vec::new())),
             blocked_zone: Arc::new(Mutex::new(Some("SharedSync-unselected".into()))),
+            folder_requests: Arc::new(Mutex::new(Vec::new())),
         };
         let mut service = PhotosService::new(
             "https://example.invalid".into(),
@@ -798,6 +813,13 @@ mod tests {
             selected[0].is_private_default_owner(),
             "ownership must remain explicitly provider-qualified"
         );
+        // This is run_list(Albums)' selected-library path after authentication.
+        let albums = selected[0].albums().await.unwrap();
+        assert!(albums.contains_key("Fixture album"));
+        let folder_requests = session.folder_requests.lock().unwrap().clone();
+        assert_eq!(folder_requests.len(), 1);
+        assert_eq!(folder_requests[0]["zoneName"], PRIMARY_ZONE_NAME);
+        assert_eq!(folder_requests[0]["ownerRecordName"], "_defaultOwner");
         let requests = session.indexing_requests.lock().unwrap().clone();
         assert!(
             requests
@@ -851,6 +873,7 @@ mod tests {
             ),
             indexing_requests: Arc::new(Mutex::new(Vec::new())),
             blocked_zone: Arc::new(Mutex::new(Some(PRIMARY_ZONE_NAME.into()))),
+            folder_requests: Arc::new(Mutex::new(Vec::new())),
         };
         let mut service = PhotosService::new(
             "https://example.invalid".into(),
