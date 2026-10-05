@@ -508,9 +508,18 @@ prepared publication evidence. Replaying an admitted source never restores an
 old queue generation; shared asset, mapping and metadata writers preserve
 unfinished projected work. A real conflicting file forces safe current-generation
 leaf replanning through the shared planner/upsert without stranding the queue.
-Fixtures supply an explicit private default owner; the owner-omitting default
-`PrimarySync` constructor remains outside this slice. Scope/account/provider, changed-source and corrupted
-confirmation controls refuse admission. Unsupported selection and read-only
+Fixtures qualify default `PrimarySync` through actual `PhotosService::new` and
+`resolve_libraries` before and after capture attachment. Authenticated private
+zone discovery supplies an explicit owner; missing, deleted and different-owner
+entries never infer one, and shared endpoint evidence cannot qualify primary.
+Malformed, duplicate, errored and unsupported-continuation listings fail before
+cache publication, then valid discovery recovers and remains cached. A retained
+explicit-owner source triggers current admission on the default route. A real
+receipt-write fault rolls back all queue, mapping, obligation and scan writes;
+recovery and two reopened quiet cycles preserve prior checkpoints, debt, original
+ownerless observations, nonempty media, sidecars and unknown BLOB history.
+Scope/account/provider, changed-source and corrupted confirmation controls refuse
+admission. Unsupported selection and read-only
 modes perform no new work publication. The bounded scan advances past unresolved
 identities and returns to them without inferring coverage.
 

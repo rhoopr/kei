@@ -1209,7 +1209,7 @@ async fn queue_projection_same_generation_collision_replans_without_stranding_wo
 }
 
 #[tokio::test]
-async fn queue_projection_actual_discovery_preserves_owner_and_skips_default_primary() {
+async fn queue_projection_actual_discovery_qualifies_primary_and_private_shared() {
     let mut f = Fixture::new().await;
     f.session.discovery = true;
     f.session.zone_name = Arc::from("SharedSync-queue");
@@ -1237,7 +1237,7 @@ async fn queue_projection_actual_discovery_preserves_owner_and_skips_default_pri
         1
     );
     for library in &libraries {
-        let eligible = library.zone_name() == "SharedSync-queue";
+        let eligible = matches!(library.zone_name(), "PrimarySync" | "SharedSync-queue");
         assert_eq!(
             library.all().catalog_work_scope().unwrap().is_some(),
             eligible,
@@ -1246,7 +1246,8 @@ async fn queue_projection_actual_discovery_preserves_owner_and_skips_default_pri
         );
     }
     f.pass.album = service.get_library("PrimarySync").await.unwrap().all();
-    assert!(f.pass.album.catalog_work_scope().unwrap().is_none());
+    assert!(f.pass.album.catalog_work_scope().unwrap().is_some());
+    // No primary source exists, so qualified ownership alone admits nothing.
     f.cycle().await.unwrap();
     assert_eq!(f.session.calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.count("provider_work_receipts"), 0);
@@ -1274,4 +1275,130 @@ async fn queue_projection_actual_discovery_preserves_owner_and_skips_default_pri
     f.cycle().await.unwrap();
     assert_eq!(f.session.calls.load(Ordering::SeqCst), 2);
     f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_default_primary_uses_discovered_owner_and_retained_source() {
+    let mut f = Fixture::new().await;
+    f.session.discovery = true;
+    f.capture(records("m", OLD, "retained-old"), "primary-history")
+        .await;
+    // An ownerless observation remains separate history, never inferred into
+    // the qualified scope or counted as admitted work.
+    let ownerless_zone = json!({"zoneName":"PrimarySync"});
+    let ownerless_scope = f.capture.scope("private", &ownerless_zone).unwrap();
+    let ownerless_body = serde_json::to_vec(&json!({"zones":[{"zoneID":ownerless_zone,"records":records("ownerless",OLD,"unresolved-history"),"syncToken":"ownerless-successor","moreComing":false}]})).unwrap();
+    f.capture
+        .capture(
+            crate::icloud::photos::catalog_observed_page(
+                ownerless_body.clone(),
+                &ownerless_scope,
+                "ownerless-before",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let source_count = f.count("provider_shadow_pages");
+    let debt_count = f.count("provider_catalog_debt");
+    let mut service = crate::icloud::photos::PhotosService::new(
+        "https://example.invalid".into(),
+        Box::new(f.session.clone()),
+        std::collections::HashMap::new(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    // Actual startup resolves the default selection before attaching capture.
+    let selected = crate::commands::resolve_libraries(
+        &crate::selection::LibrarySelector::default(),
+        &mut service,
+    )
+    .await
+    .unwrap();
+    assert_eq!(selected.len(), 1);
+    service.set_shadow_capture(f.capture.clone());
+    f.pass.album = service.get_library("PrimarySync").await.unwrap().all();
+    assert!(
+        f.pass.album.catalog_work_scope().unwrap().is_some(),
+        "default primary must use explicit authenticated private discovery evidence"
+    );
+    // Fault after real queue writes must roll back even on the newly reachable
+    // default primary route, preserving the existing checkpoint and debt.
+    f.db.acquire_lock("primary receipt fault").unwrap().execute_batch("CREATE TRIGGER primary_receipt_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'primary receipt fault'); END;").unwrap();
+    assert!(
+        f.cycle()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("primary receipt fault")
+    );
+    for table in [
+        "assets",
+        "asset_master_mappings",
+        "provider_work_obligations",
+        "provider_work_receipts",
+        "provider_work_scan",
+    ] {
+        assert_eq!(f.count(table), 0, "{table}");
+    }
+    assert_eq!(f.count("provider_shadow_pages"), source_count);
+    assert_eq!(f.count("provider_catalog_debt"), debt_count);
+    f.preserved().await;
+    f.db.acquire_lock("remove synthetic primary fault")
+        .unwrap()
+        .execute_batch("DROP TRIGGER primary_receipt_fault;")
+        .unwrap();
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 1);
+    assert_eq!(f.count("provider_work_receipts"), 1);
+    assert_eq!(f.count("provider_work_obligations"), 1);
+    assert!(f.queue()[0].contains(CURRENT));
+    assert!(f.queue()[0].contains("current"));
+    let queue = f.queue();
+    let calls = f.session.calls.load(Ordering::SeqCst);
+    assert_eq!(calls, 4);
+    for _ in 0..2 {
+        f.db = Arc::new(
+            SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        f.capture = ShadowCapture::new(Arc::clone(&f.db), owner(), "com");
+        f.config.state_db = Some(Arc::clone(&f.db) as Arc<dyn DownloadStore>);
+        // A fresh service requalifies ownership, as process restart does.
+        let mut service = crate::icloud::photos::PhotosService::new(
+            "https://example.invalid".into(),
+            Box::new(f.session.clone()),
+            std::collections::HashMap::new(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        service.set_shadow_capture(f.capture.clone());
+        let libraries = crate::commands::resolve_libraries(
+            &crate::selection::LibrarySelector::default(),
+            &mut service,
+        )
+        .await
+        .unwrap();
+        f.pass.album = libraries[0].all();
+        f.cycle().await.unwrap();
+        assert_eq!(f.queue(), queue);
+        assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(f.count("provider_work_receipts"), 1);
+        assert_eq!(f.count("provider_shadow_pages"), source_count);
+        assert_eq!(f.count("provider_catalog_debt"), debt_count);
+        let retained: Vec<u8> =
+            f.db.acquire_lock("ownerless history oracle")
+                .unwrap()
+                .query_row(
+                    "SELECT body FROM provider_shadow_pages WHERE scope=?1",
+                    [&ownerless_scope],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(retained, ownerless_body);
+        f.preserved().await;
+    }
 }

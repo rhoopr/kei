@@ -184,6 +184,12 @@ impl PhotoLibrary {
         })
     }
 
+    /// An explicit private owner is provider evidence, never a zone-name default.
+    pub(super) fn is_private_default_owner(&self) -> bool {
+        self.library_type.as_ref() == "private"
+            && self.zone_id.get("ownerRecordName").and_then(Value::as_str) == Some("_defaultOwner")
+    }
+
     /// Return smart-folder albums plus user-created albums.
     pub async fn albums(&self) -> anyhow::Result<HashMap<String, PhotoAlbum>> {
         let mut albums = HashMap::new();
