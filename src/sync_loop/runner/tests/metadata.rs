@@ -468,8 +468,7 @@ fn sparse_fixture_inventory(
         return None;
     }
     let offset = request["query"]["filterBy"]
-        .as_array()
-        .unwrap()
+        .as_array()?
         .iter()
         .find(|filter| filter["fieldName"] == "startRank")
         .and_then(|filter| filter["fieldValue"]["value"].as_u64())
