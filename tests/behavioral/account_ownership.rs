@@ -1058,6 +1058,9 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     let mut child = QuietServiceChild(
         std::process::Command::new(assert_cmd::cargo::cargo_bin!("kei"))
             .env_clear()
+            // Preserve the Windows runtime root without inheriting account/auth
+            // environment. The cleared service process still needs networking.
+            .envs(std::env::var_os("SystemRoot").map(|value| ("SystemRoot", value)))
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", root)
             .env("KEI_DATA_DIR", root)
