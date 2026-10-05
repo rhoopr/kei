@@ -8,6 +8,14 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum StateError {
     #[error(
+        "Provider selection storage is full; observations, obligations and checkpoints are retained."
+    )]
+    ProviderSelectionFull,
+    #[error(
+        "Provider selection provenance or replay is inconsistent; retained work cannot be consumed."
+    )]
+    ProviderSelectionInvalid,
+    #[error(
         "Provider work projection is full; source observations and unfinished obligations are retained."
     )]
     ProviderWorkFull,

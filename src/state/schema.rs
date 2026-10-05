@@ -7,7 +7,82 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 32;
+pub(crate) const SCHEMA_VERSION: i32 = 33;
+
+fn migrate_provider_selection(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(r"
+CREATE TABLE IF NOT EXISTS provider_selection_generations (
+    id TEXT PRIMARY KEY,
+    account_key TEXT NOT NULL,
+    provider_key TEXT NOT NULL,
+    format INTEGER NOT NULL CHECK(format=1),
+    scope TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    manifest BLOB NOT NULL,
+    charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_sources (
+    generation TEXT NOT NULL REFERENCES provider_selection_generations(id),
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    body_hash TEXT NOT NULL,
+    PRIMARY KEY(generation,page_id,ordinal),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_catalog_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_decisions (
+    generation TEXT NOT NULL REFERENCES provider_selection_generations(id),
+    pass_key TEXT NOT NULL,
+    child TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('selected','excluded','deferred')),
+    reason TEXT NOT NULL,
+    PRIMARY KEY(generation,pass_key,child)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_destinations (
+    generation TEXT NOT NULL,
+    pass_key TEXT NOT NULL,
+    child TEXT NOT NULL,
+    version_size TEXT NOT NULL,
+    path TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes>=0),
+    metadata_hash TEXT NOT NULL,
+    PRIMARY KEY(generation,pass_key,child,version_size,path),
+    FOREIGN KEY(generation,pass_key,child) REFERENCES provider_selection_decisions(generation,pass_key,child)
+) WITHOUT ROWID;
+")?;
+    conn.prepare("SELECT id,account_key,provider_key,format,scope,config_hash,manifest,charged_bytes FROM provider_selection_generations LIMIT 0")?;
+    conn.prepare(
+        "SELECT generation,page_id,ordinal,body_hash FROM provider_selection_sources LIMIT 0",
+    )?;
+    conn.prepare(
+        "SELECT generation,pass_key,child,outcome,reason FROM provider_selection_decisions LIMIT 0",
+    )?;
+    conn.prepare("SELECT generation,pass_key,child,version_size,path,checksum,size_bytes,metadata_hash FROM provider_selection_destinations LIMIT 0")?;
+    for (table, expected) in [
+        ("provider_selection_generations", &["id"][..]),
+        (
+            "provider_selection_sources",
+            &["generation", "page_id", "ordinal"][..],
+        ),
+        (
+            "provider_selection_decisions",
+            &["generation", "pass_key", "child"][..],
+        ),
+        (
+            "provider_selection_destinations",
+            &["generation", "pass_key", "child", "version_size", "path"][..],
+        ),
+    ] {
+        let actual: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
+            .query_map([table], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        if actual != expected {
+            return Err(StateError::ProviderSelectionInvalid);
+        }
+    }
+    Ok(())
+}
 
 fn migrate_provider_shadow_inbox(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(
@@ -1155,6 +1230,7 @@ fn migrate_to_version(
         30 => migrate_provider_catalog(conn)?,
         31 => migrate_provider_work(conn)?,
         32 => migrate_provider_work_retries(conn)?,
+        33 => migrate_provider_selection(conn)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,

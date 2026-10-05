@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 32;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 33;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -96,6 +96,45 @@ pub(super) fn create_state_db(data_dir: &std::path::Path, username: &str) -> rus
     bind_synthetic_owner(&conn, username);
     conn.execute_batch(
         r"
+
+CREATE TABLE IF NOT EXISTS provider_selection_generations (
+    id TEXT PRIMARY KEY,
+    account_key TEXT NOT NULL,
+    provider_key TEXT NOT NULL,
+    format INTEGER NOT NULL CHECK(format=1),
+    scope TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    manifest BLOB NOT NULL,
+    charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_sources (
+    generation TEXT NOT NULL REFERENCES provider_selection_generations(id),
+    page_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    body_hash TEXT NOT NULL,
+    PRIMARY KEY(generation,page_id,ordinal),
+    FOREIGN KEY(page_id,ordinal) REFERENCES provider_catalog_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_decisions (
+    generation TEXT NOT NULL REFERENCES provider_selection_generations(id),
+    pass_key TEXT NOT NULL,
+    child TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('selected','excluded','deferred')),
+    reason TEXT NOT NULL,
+    PRIMARY KEY(generation,pass_key,child)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_destinations (
+    generation TEXT NOT NULL,
+    pass_key TEXT NOT NULL,
+    child TEXT NOT NULL,
+    version_size TEXT NOT NULL,
+    path TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes>=0),
+    metadata_hash TEXT NOT NULL,
+    PRIMARY KEY(generation,pass_key,child,version_size,path),
+    FOREIGN KEY(generation,pass_key,child) REFERENCES provider_selection_decisions(generation,pass_key,child)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS provider_shadow_pages (
     id INTEGER PRIMARY KEY,

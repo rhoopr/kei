@@ -8,6 +8,10 @@ use super::config::{DownloadConfig, hash_download_config};
 use super::models::DownloadControls;
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::planner::{TaskPlanner, pending_record_for_task};
+use crate::state::db::provider_selection::{
+    MAX_SELECTION_BYTES, SelectionDecision, SelectionDestination, SelectionManifest,
+    SelectionOutcome, SelectionPath, SelectionSource,
+};
 use crate::state::db::provider_work::{MAX_WORK_BYTES, WorkPlan};
 
 const MAX_WORK_ATTEMPTS_PER_CYCLE: usize = 64;
@@ -151,7 +155,7 @@ pub(super) async fn admit_retained_work(
             ()=cancel.cancelled()=>break,
             confirmation=pass.album.confirm_catalog_asset(&identity.name)=>confirmation,
         };
-        let (body, master, records, reason) = match confirmation {
+        let (body, master, records, destinations, reason) = match confirmation {
             Ok(current) => {
                 let plan = planner
                     .plan_download_asset(&current.asset, &effective)
@@ -174,18 +178,90 @@ pub(super) async fn admit_retained_work(
                 } else {
                     Vec::new()
                 };
+                let destinations = if reason.is_empty() {
+                    plan.tasks
+                        .iter()
+                        .zip(&records)
+                        .map(|(task, record): (_, &crate::state::AssetRecord)| {
+                            Ok(SelectionDestination {
+                                version_size: task.version_size.as_str().to_owned(),
+                                path: SelectionPath::from_path(&std::path::absolute(
+                                    &task.download_path,
+                                )?),
+                                checksum: task.checksum.to_string(),
+                                size: task.size,
+                                metadata_hash: record.metadata.metadata_hash.clone().ok_or_else(
+                                    || {
+                                        anyhow::anyhow!(
+                                            "Selection metadata fingerprint is unavailable"
+                                        )
+                                    },
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
                 (
                     Some(current.body),
                     Some(current.asset.id().to_owned()),
                     records,
+                    destinations,
                     reason,
                 )
             }
-            Err(_unresolved) => (None, None, Vec::new(), "current_lookup_unresolved"),
+            Err(_unresolved) => (
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                "current_lookup_unresolved",
+            ),
         };
         if cancel.is_cancelled() {
             break;
         }
+        let manifest = SelectionManifest {
+            scope: scope.clone(),
+            zone: zone.clone(),
+            config_hash: config_hash.clone(),
+            profile: serde_json::json!({"format":1,"coverage":"confirmed_sources_only",
+                "selection":"private-library-wide-without-exclusions","pass":"unfiled"}),
+            sources: vec![SelectionSource {
+                page_id: source.page.id.0,
+                ordinal: source.ordinal,
+                body_hash: source.page.body_hash.clone(),
+            }],
+            decisions: vec![SelectionDecision {
+                pass_key: "unfiled".to_owned(),
+                child: identity.name.clone(),
+                master: master.clone(),
+                confirmation: body.clone(),
+                destinations,
+                outcome: if reason.is_empty() {
+                    SelectionOutcome::Selected
+                } else if matches!(reason, "currently_filtered" | "current_library_ineligible") {
+                    SelectionOutcome::Excluded
+                } else {
+                    SelectionOutcome::Deferred
+                },
+                reason: reason.to_owned(),
+            }],
+        };
+        let generation = capture
+            .db
+            .capture_selection_shadow(capture.owner.clone(), manifest.clone(), MAX_SELECTION_BYTES)
+            .await?;
+        anyhow::ensure!(
+            capture
+                .db
+                .replay_selection_shadow(capture.owner.clone(), generation)
+                .await?
+                == manifest,
+            "Selection shadow replay differs from current planning"
+        );
+        // Shadow parity cannot authorize queue admission or a source cursor.
         let admission = capture
             .db
             .project_provider_work(
