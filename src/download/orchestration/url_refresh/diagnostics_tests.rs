@@ -250,6 +250,13 @@ async fn exact_refresh_diagnostics_cancel_and_auth_keep_task_counts() {
         assert!(summary.contains("remaining_task_keys=1"));
         assert!(summary.contains("refreshed_task_keys=0"));
         assert!(summary.contains("planned_paired_requests=0"));
+        assert!(summary.contains("paired_lookup_results=0"));
+        assert!(summary.contains("present_pairs=0"));
+        assert!(summary.contains("child_master_references=0"));
+        assert!(summary.contains(&format!(
+            "child_lookup_results={}",
+            usize::from(fault == "auth")
+        )));
         assert!(summary.contains(&format!(
             "planned_unique_child_requests={}",
             usize::from(fault == "auth")
@@ -454,8 +461,33 @@ async fn exact_refresh_diagnostics_scope_and_resource_matrix() {
                     .unwrap();
                 assert!(summary.contains("requested_task_keys=3"));
                 assert!(summary.contains("planned_unique_child_requests=2"));
+                assert!(summary.contains("child_lookup_results=2"));
+                let expected_child_references = match fault {
+                    "bare" | "missing_master" | "checksum" | "size" | "rendition"
+                    | "master_name" => 2,
+                    "same_owner" if discover_owner => 2,
+                    _ => 1,
+                };
+                let expected_paired =
+                    expected_child_references - usize::from(fault == "master_name");
+                let expected_present_pairs =
+                    expected_paired - usize::from(fault == "missing_master");
+                assert!(summary.contains(&format!(
+                    "child_master_references={expected_child_references}"
+                )));
+                assert!(summary.contains(&format!("planned_paired_requests={expected_paired}")));
+                assert!(summary.contains(&format!("paired_lookup_results={expected_paired}")));
+                assert!(summary.contains(&format!("present_pairs={expected_present_pairs}")));
                 assert!(summary.contains(&format!("refreshed_task_keys={}", 1 + expected_family)));
                 assert!(summary.contains(&format!("remaining_task_keys={}", 2 - expected_family)));
+                if matches!(fault, "checksum" | "size" | "rendition") {
+                    let rejection = log
+                        .lines()
+                        .find(|line| line.contains("exact_refresh_task_rejection_v1"))
+                        .unwrap();
+                    // Two identical checksum inputs still represent one rejected task key.
+                    assert!(rejection.contains("rejected_task_keys=1"));
+                }
                 let calls = fixture.calls.lock().unwrap();
                 let lookups: Vec<_> = calls
                     .iter()
