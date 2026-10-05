@@ -17,6 +17,7 @@ mod fetch;
 mod hydration;
 mod lookup;
 mod planning;
+pub(crate) mod work;
 
 mod preservation_proof;
 pub(crate) use preservation_proof::{CompleteLegacyInventory, classify_legacy_inventory_error};

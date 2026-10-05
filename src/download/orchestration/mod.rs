@@ -9,6 +9,7 @@ pub(super) mod full;
 pub(super) mod incremental;
 pub(super) mod maintenance;
 pub(super) mod models;
+pub(super) mod queue_projection;
 pub(super) mod reconciliation;
 pub(super) mod recovery;
 pub(super) mod selection;

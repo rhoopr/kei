@@ -37,6 +37,7 @@ pub(super) fn upsert_asset_row(
         None
     };
     let metadata_hash: Option<&str> = meta.metadata_hash.as_deref().or(computed_hash.as_deref());
+    super::provider_work::guard_projected_generation(conn, record)?;
     let source = metadata_rewrite_source_sql();
     let blocked_capture_repair: i64 = conn
         .query_row(

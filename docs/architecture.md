@@ -103,6 +103,7 @@ changing behavior.
 | SQLite facade and connection lifecycle | `src/state/mod.rs`, `src/state/db.rs` | Preserves state entry points, opens connections, and dispatches blocking SQLite work. Child owners retain their transaction boundaries. |
 | Observed provider pages | `src/icloud/photos/inbox.rs`, `src/state/db/provider_inbox.rs` | Binds validated incremental observations to the account, retains source identities and original bytes atomically with a shadow receipt, and applies bounded backpressure. It does not authorize provider checkpoints. |
 | Provider source catalog | `src/icloud/photos/projection.rs`, `src/state/db/provider_catalog.rs` | Validates replay provenance, derives versioned source facts, and atomically indexes records, references and unresolved evidence. Its receipt does not authorize queues or checkpoints. |
+| Provider work admission | `src/icloud/photos/album/work.rs`, `src/download/orchestration/queue_projection.rs`, `src/state/db/provider_work.rs` | Confirms retained identities against current provider records, applies current task planning, and atomically admits guarded existing queue obligations and retained conflict debt. Checkpoint authority stays with the existing cycle. |
 | SQLite schema | `src/state/schema.rs` | Owns schema versions and migrations. |
 | State-store contracts | `src/state/db/contracts.rs` | Defines store roles and records exchanged with callers. |
 | Asset state transitions | `src/state/db/assets.rs` | Owns asset lifecycle, download finalization, retry eligibility, and provider source-state transitions. |
@@ -302,7 +303,8 @@ container links retain unresolved evidence. A literal target name is not proof o
 that target's identity or materialization. No tombstone authorizes local deletion.
 Receipt version 1 means source facts were indexed, including unresolved evidence;
 it does not mean selected, downloaded, rewritten, verified, historically complete
-or acknowledged recovery debt. Existing queues still consume the live stream.
+or acknowledged recovery debt. Existing queues also accept the bounded current
+work admission described below; source indexing alone cannot authorize it.
 
 Derived page facts have a 16 MiB logical charge limit and a separate 512 MiB
 catalog index budget. These are operational backpressure limits, not physical
@@ -313,6 +315,54 @@ is automatically pruned or discarded. WAL `NORMAL`, filesystem qualifications,
 existing checkpoint evidence, publication receipts and metadata obligations are
 unchanged. Historical intermediate retention and unrecoverable-debt acknowledgment
 still require explicit policy decisions before dependent stages.
+
+### Current provider work admission
+
+Schema 31 adds `provider_work_receipts`, generation-bound
+`provider_work_obligations`, and the `provider_work_scan` scheduling position.
+Before normal dispatch, up to 64 retained, indexed CPLAsset observations per
+cycle can trigger scoped child lookup followed by a complete current child/master
+lookup. Original bounded confirmation bytes and source page/ordinal provenance
+are retained. Duplicate keys, duplicate or omitted records, provider errors,
+wrong owners, wrong zones and changed child/master relationships cannot confirm
+work. Provider confirmation is an observation, not an atomic provider snapshot.
+
+This first slice supports one private library-wide pass with an explicit default
+owner, without recent caps, album exclusions, retry-only selection or metadata
+backfill-only execution. Other selections retain observations and use their
+existing pipeline; they receive no admission receipt from this stage. Current
+media/date/filename filters and RAW, companion and path planning use the existing
+owners. The work configuration fingerprint binds their frozen evidence separately
+from enumeration and checkpoint hashes. Hidden or deleted current records retain
+deferred evidence without new media work.
+
+An immediate transaction independently validates authenticated account ownership,
+source bytes, indexed identity, complete scope and current confirmation. Frozen
+resource checksums, sizes and metadata must match the retained confirmation.
+New rows, asset/master mappings, grouping/retry markers, work obligations,
+deferred conflict evidence and the final receipt commit together. Any conflicting
+existing generation, metadata, mapping or legacy identity defers unchanged.
+Identical existing queue rows retain their retry and publication metadata.
+Admitted-receipt replay verifies frozen obligations and never reconstructs an old
+generation over a queue that has since advanced. Receipt state describes work
+admission, not download completion, metadata publication or verified media.
+
+Matching unfinished projected generations fence shared asset admission, identity
+mapping and metadata refresh, including independent path publication receipts.
+Completed generations do not indefinitely pin the mutable canonical queue.
+A rotating bounded scan retries unresolved early sources without starving later
+identities. Its position is scheduling evidence and cannot promote a cursor.
+Work plans have a 16 MiB logical charge limit and work evidence has a separate
+512 MiB logical budget. Nothing is automatically pruned; backpressure retains
+source observations, unfinished work and the current checkpoint. These are not
+physical database/WAL quotas or fixed startup latency promises.
+
+Current versions under current configuration are the approved materialization
+scope. Historical observations and all unfinished debt remain retained. Admission
+of a current version does not prove historical completeness, acknowledge old
+unrecoverable debt, authorize local tombstone deletion or select a historical
+retention policy. Existing CheckpointEvidence, sparse/legacy proofs, opt-in
+metadata writes, publication guards and WAL NORMAL qualification remain in force.
 
 ### Sync and provider checkpoints
 

@@ -77,7 +77,7 @@ full set with `just test scenarios`.
 | `config-reconciliation` | Config-hash staging, local catalog path reconciliation, and repeat-cycle stability | Download config hashes, path reconciliation, config drift, or local reconciliation copies |
 | `fulltest-harness` | Full-test phase reachability and rejection of stale or empty scenario filters | `just` dispatch, full-test orchestration, or scenario-runner helpers |
 | `identity-recovery` | Malformed capture dates, ambiguous historical owners, deferred retries, restart, and eventual recovery | Metadata capture, pending recovery, identity evidence, or their checkpoint gates |
-| `identity-deltas` | Incremental identity mapping, hard and soft deletion, selected relations, and master-family transitions | CloudKit change parsing, identity mapping, membership, or tombstone policy |
+| `identity-deltas` | Incremental identity mapping, hard and soft deletion, selected relations, master-family transitions, and current catalog work admission | CloudKit change parsing, identity mapping, membership, or tombstone policy |
 | `path-family` | Collision suffixes and primary, Live Photo, import, and pending-file family matching | Path rendering, collision handling, import matching, or on-disk adoption |
 | `pending-recovery` | Durable pending hydration, policy-excluded deletion proof, ambiguous identity retention, and sibling recovery | Retry resolution, pending or policy-excluded state, provider identity, or targeted hydration |
 | `service-health` | Health and metrics facts exposed by unattended operation | Health checks, metrics, cycle reporting, or service monitoring |
@@ -492,6 +492,44 @@ assertion before source restoration; the complete positive matrix then passes.
 These fixtures qualify additive source indexing, not inbox-driven queue
 materialization, selection generations, snapshot completeness, historical debt
 acknowledgment, local deletion or stronger power-loss durability.
+
+## Current catalog work admission
+
+The `queue_projection` slice enters the actual current lookup, task planner and
+SQLite admission owners with an owned file-backed database, historical captured
+facts, pre-seeded cursor/debt, unknown BLOB history and nonempty media plus an
+unrelated sidecar. Older source payloads confirm the current provider generation;
+its checksum, size and metadata bind the admitted queue obligation. Two reopens
+then perform no repeated lookup or admission. Current configuration changes
+replan filtered observations without replacing retained historical source facts.
+
+Pending/failed content and metadata conflicts retain retry text, attempts and
+prepared publication evidence. Replaying an admitted source never restores an
+old queue generation; shared asset, mapping and metadata writers preserve
+unfinished projected work. Scope/account/provider, changed-source and corrupted
+confirmation controls refuse admission. Unsupported selection and read-only
+modes perform no new work publication. The bounded scan advances past unresolved
+identities and returns to them without inferring coverage.
+
+A receipt trigger fails after real queue, mapping, obligation and scan writes.
+The complete transaction rolls back with source/catalog/checkpoint and media
+intact. Normal dispatch encounters the same fault without a rank fallback.
+On Linux, an isolated parent kills the test child while the production admission
+transaction is paused immediately before its receipt. Another connection sees
+only committed source history; restart rolls back all work publication, then
+recovers and reopens quietly twice. This proves process-interruption recovery,
+not power-loss survival. The private test child is ignored unless its parent
+explicitly invokes it with an isolated marker and disk-backed temporary root.
+
+Schema-30 fixtures upgrade to 31 through two reopens. A conflicting unknown work
+table fails migration without changing the schema version, captured sources or
+unknown bytes. Work receipt and derived metadata byte budgets retain unresolved
+sources and existing obligations at capacity.
+
+These tests qualify bounded work admission into the existing queues. They do not
+claim media materialization/verification, recent-cap semantics, named-album or
+shared-zone admission, cursor ownership, snapshot absence, pruning, historical
+retention or acknowledgment of unrecoverable debt.
 
 ## State-transition proof
 
