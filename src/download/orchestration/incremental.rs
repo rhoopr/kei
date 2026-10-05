@@ -738,13 +738,13 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         // Delta arrival is not an ordered library/pass inventory. Reuse the
         // recent selection owner for all currently eligible assets, including
         // unchanged assets that entered the window after a removal.
-        let mut selected = super::full::download_photos_full_with_token(
+        let mut selected = Box::pin(super::full::download_photos_full_with_token(
             download_client,
             passes,
             config,
             controls,
             shutdown_token.clone(),
-        )
+        ))
         .await
         .map_err(super::recent::RecentSelectionError)?;
         let mut delta_stats = SyncStats {

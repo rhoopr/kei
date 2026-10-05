@@ -1304,7 +1304,9 @@ impl Respond for RecentCliPhotos {
             };
             json!({"zones":[{"zoneID":zone,"records":records,"syncToken":if first {"recent-page-1"}else{"recent-delta-successor"},"moreComing":first}]})
         } else if path.ends_with("/records/lookup") {
-            let names: Vec<_> = body["records"]
+            let names: Vec<_> = body
+                .get("records")
+                .unwrap()
                 .as_array()
                 .unwrap()
                 .iter()
@@ -1322,14 +1324,16 @@ impl Respond for RecentCliPhotos {
                 == Some("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted")
         {
             self.queries.fetch_add(1, Ordering::SeqCst);
-            let filters = body["query"]["filterBy"].as_array().unwrap();
+            let filters = body.pointer("/query/filterBy").unwrap().as_array().unwrap();
             let offset = filters
                 .iter()
                 .find(|f| f["fieldName"] == "startRank")
-                .unwrap()["fieldValue"]["value"]
+                .unwrap()
+                .pointer("/fieldValue/value")
+                .unwrap()
                 .as_u64()
                 .unwrap() as usize;
-            let limit = body["resultsLimit"].as_u64().unwrap() as usize / 2;
+            let limit = body.get("resultsLimit").unwrap().as_u64().unwrap() as usize / 2;
             let records: Vec<_> = [2, 1, 0]
                 .into_iter()
                 .skip(offset)
