@@ -2228,13 +2228,13 @@ async fn selection_shadow_schema32_migration_preserves_live_wal_work_and_unknown
 #[tokio::test]
 async fn selection_shadow_relative_download_root_keeps_existing_admission_contract() {
     let mut fixture = Fixture::new().await;
-    let relative = tempfile::tempdir_in(".scratch").unwrap();
+    let current = std::env::current_dir().unwrap();
+    let relative = tempfile::tempdir_in(&current).unwrap();
     let root = relative.path().join("media");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("existing.jpg"), b"existing-media").unwrap();
     std::fs::write(root.join("existing.xmp"), b"retained-sidecar").unwrap();
     let absolute = std::path::absolute(&root).unwrap();
-    let current = std::env::current_dir().unwrap();
     fixture.config.directory = Arc::from(absolute.strip_prefix(current).unwrap());
     assert!(!fixture.config.directory.is_absolute());
     fixture
