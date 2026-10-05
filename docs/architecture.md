@@ -841,6 +841,8 @@ force. Current queue/publication guards remain authoritative for each job. A
 truncated count window keeps
 its recovery obligation and prior cursor; repeated bounded inventory remains a
 known cost until a larger catalog selection generation stage qualifies it.
+Typed provider session errors retain the existing bounded reauthentication
+route across current selection; other selection failures do not trigger fallback.
 This receipt neither claims an atomic rank snapshot nor proves absence or
 permits local deletion.
 

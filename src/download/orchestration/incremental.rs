@@ -745,7 +745,15 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             shutdown_token.clone(),
         ))
         .await
-        .map_err(super::recent::RecentSelectionError)?;
+        .map_err(|error| {
+            // Keep typed session failures visible to the dispatcher so its
+            // existing bounded reauthentication path can retain the receipt.
+            if crate::icloud::photos::session::is_session_error(&error) {
+                error
+            } else {
+                super::recent::RecentSelectionError(error).into()
+            }
+        })?;
         let mut delta_stats = SyncStats {
             state_write_failures: delta_summary.state_transition_failures,
             identity_incomplete: delta_summary.identity_incomplete,

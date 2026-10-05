@@ -599,6 +599,9 @@ unrelated source identity remains unresolved; its source checkpoint and recent
 receipt remain held. These histories grant no absence, deletion or expired-history
 proof. Truncated windows still hold the existing checkpoint and may repeat
 inventory. Catalog-owned selection generations remain a later stage.
+Global-frontier dispatcher controls cover 401/403/421 session recovery and a
+non-session failure with no fallback, preserving the cursor, pending receipt
+and existing media across database reopen.
 
 ## State-transition proof
 

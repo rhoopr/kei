@@ -979,3 +979,152 @@ async fn recent_mixed_identity_and_source_write_vetoes_keep_healthy_jobs_and_deb
         assert_eq!(connection.query_row::<i64,_,_>("SELECT count(*) FROM provider_catalog_records WHERE record_name='unresolved-child'",[],|r|r.get(0)).unwrap(),1);
     }
 }
+
+#[tokio::test]
+async fn recent_global_frontier_auth_failure_preserves_session_recovery_and_receipt() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct FrontierFailure {
+        inner: SelectionSession,
+        status: u16,
+        requests: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for FrontierFailure {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/query?") {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                return Err(crate::icloud::photos::session::HttpStatusError {
+                    status: self.status,
+                    url: "https://example.invalid/current-rank".to_string(),
+                    retry_after: None,
+                    body: None,
+                }
+                .into());
+            }
+            self.inner.post(url, body, headers).await
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    for status in [401, 403, 421, 400] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("owned.db");
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &owner())
+                .await
+                .unwrap(),
+        );
+        let requests = Arc::new(AtomicUsize::new(0));
+        let session = FrontierFailure {
+            inner: SelectionSession {
+                inventory: inventory("https://example.invalid"),
+                changed: false,
+                cancel_at_selection: None,
+                queries: Arc::default(),
+            },
+            status,
+            requests: requests.clone(),
+        };
+        let selected = passes(session, &db);
+        for album in ["A", "B"] {
+            seed_complete_album_snapshot(&db, album, album, &[]).await;
+        }
+        let mut config = test_config();
+        config.state_db = Some(db.clone());
+        config.directory = Arc::from(directory.path().join("media"));
+        config.folder_structure = String::new();
+        config.folder_structure_albums = Arc::from("{album}");
+        config.recent = Some(2);
+        config.recent_scope = crate::cli::RecentScope::Global;
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "saved-cursor".to_string(),
+        };
+        let old = incremental_photo_records("previous");
+        let [_, _, unfiled] = selected.as_slice() else {
+            panic!("fixture requires two albums and an unfiled pass");
+        };
+        let [master, asset] = old.as_slice() else {
+            panic!("fixture requires one master and one asset");
+        };
+        let old_path = seed_downloaded_metadata_asset(
+            &db,
+            &config,
+            unfiled,
+            &PhotoAsset::new(master.clone(), asset.clone()),
+        )
+        .await;
+        let old_bytes = tokio::fs::read(&old_path).await.unwrap();
+        db.set_metadata("sync_token:PrimarySync", "saved-cursor")
+            .await
+            .unwrap();
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &selected,
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await;
+        if status == 400 {
+            assert!(
+                result.is_err(),
+                "non-session failure must remain a no-fallback error"
+            );
+        } else {
+            let result = result.unwrap_or_else(|error| {
+                panic!("HTTP {status} must route through bounded session recovery: {error:#}")
+            });
+            assert!(matches!(
+                result.outcome,
+                DownloadOutcome::SessionExpired {
+                    auth_error_count: 1
+                }
+            ));
+            assert!(result.sync_token.is_none());
+            assert_eq!(result.stats.downloaded, 0);
+        }
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "no duplicate rank fallback after a frontier failure"
+        );
+        assert_eq!(tokio::fs::read(&old_path).await.unwrap(), old_bytes);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("saved-cursor")
+        );
+        drop(selected);
+        config.state_db = None;
+        drop(db);
+        let reopened = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let raw = reopened
+            .get_metadata("recent_selection_recovery:PrimarySync")
+            .await
+            .unwrap()
+            .unwrap();
+        let receipt: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(*receipt.get("complete").unwrap(), false);
+        assert_eq!(
+            reopened
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("saved-cursor")
+        );
+    }
+}
