@@ -510,6 +510,10 @@ They distinguish omitted records, unexpected types, decode failures, invalid
 master references, and record-level provider errors. Reference-zone context is
 classified without logging provider identifiers or response bodies. These
 observations do not authorize identity guesses or cross-zone retries.
+`exact_lookup_rejection_v1` describes a rejected lookup request with fixed
+scope/pairing/presence labels and an expected-owner category. It applies the
+existing scope matcher; the older reference-zone JSON-equality classification
+alone does not establish rejection. No owner or record value is emitted.
 
 Unpaired asset deltas retain typed sparse-share evidence from
 `isSparsePrivateRecord` and the `linkedShare*` fields. Targeted record lookups
@@ -709,6 +713,14 @@ Reconciliation retries the selected destination and leaves conflicting media
 or sidecars untouched; it does not allocate another collision filename on each
 attempt. Ordinary download collision naming and on-disk skip rules are unchanged.
 
+Legacy preservation inventory failures retain the existing reason and budgets.
+`legacy_inventory_failure_v2` adds fixed phase/subreason labels, whether a valid
+terminal marker was observed, and the failing child reference's known family
+context and soft-deletion flag. A missing master reference leaves family
+membership unknown. Context describes the failed validation, not counts for
+all records. EOF observation is not successful hydration or checkpoint proof.
+These fields exclude identifiers, tokens, URLs, paths and provider error text.
+
 ### Full and incremental enumeration
 
 Debug builds can set `KEI_REQUEST_DUMP_DIR` to capture Photos session
@@ -732,6 +744,13 @@ authorization. The library, child identity, rendition, checksum, and size must
 still match. Changed resources, missing lookups, a second expiry, and cancelled
 tasks retain durable retry work. Successful
 cleanup does not convert incomplete enumeration into checkpoint proof.
+`exact_refresh_outcomes_v1` separates requested/refreshed/remaining task keys
+from planned unique child identities, observed child results, planned paired
+identities and observed paired results. These are identity counts, not HTTP
+request counts. Planned counts may include work cancelled before a result.
+Fixed child/task rejection categories distinguish selected-master, rendition,
+checksum and size mismatches. Task rejection counts deduplicate durable task
+keys; categories are observations, not permission to change selection or retry.
 Authentication failures during refresh stop cleanup and return a session-expired
 outcome. Refresh rate-limit observations contribute to the cycle count even
 when provider retries are exhausted. The `expired_url_refresh_failed` diagnostic

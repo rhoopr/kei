@@ -239,6 +239,76 @@ fn lookup_zone_matches(actual: &Value, expected: &Value) -> bool {
     })
 }
 
+// Classify only a rejected scope. Acceptance remains owned by the matcher above.
+fn lookup_scope_rejection(actual: &Value, expected: &Value) -> &'static str {
+    if !actual.is_object() {
+        "malformed_scope"
+    } else if actual
+        .get("zoneName")
+        .and_then(Value::as_str)
+        .is_none_or(|name| name.trim().is_empty())
+    {
+        "partial_scope"
+    } else if actual.get("zoneName") != expected.get("zoneName") {
+        "zone_conflict"
+    } else if actual.get("ownerRecordName").is_some() && expected.get("ownerRecordName").is_none() {
+        "owner_unqualified"
+    } else if actual
+        .get("ownerRecordName")
+        .is_some_and(|owner| expected.get("ownerRecordName") != Some(owner))
+    {
+        "owner_conflict"
+    } else {
+        "scope_component_conflict"
+    }
+}
+
+fn lookup_rejection(
+    master: Option<&Value>,
+    asset: Option<&Value>,
+    request: &RecordLookupRequest,
+    expected: &Value,
+    pair_matches: bool,
+) -> (&'static str, &'static str) {
+    for record in master.into_iter().chain(asset) {
+        for (zone, component) in [
+            (record.get("zoneID"), "record_scope"),
+            (
+                record.pointer("/fields/masterRef/value/zoneID"),
+                "master_reference_scope",
+            ),
+        ] {
+            if let Some(zone) = zone
+                && !lookup_zone_matches(zone, expected)
+            {
+                return (lookup_scope_rejection(zone, expected), component);
+            }
+        }
+    }
+    if !pair_matches {
+        ("child_master_mismatch", "pairing")
+    } else if master.into_iter().chain(asset).any(|record| {
+        record
+            .get("serverErrorCode")
+            .is_some_and(|code| !code.is_null())
+    }) {
+        ("record_provider_error", "record_error")
+    } else if master.is_none() {
+        (
+            if request.target == RecordLookupTarget::Asset {
+                "child_record_omitted"
+            } else {
+                "master_record_omitted"
+            },
+            "record_presence",
+        )
+    } else if request.asset_record_name.is_some() && asset.is_none() {
+        ("child_record_omitted", "record_presence")
+    } else {
+        ("record_identity_incomplete", "record_decode_or_reference")
+    }
+}
+
 // Multiple provider records can map to one durable state identity. Merge them
 // conservatively: a present sibling resolves the work, a missing master proves
 // family deletion, and any inconclusive sibling blocks child-only deletion.
@@ -261,6 +331,7 @@ impl PhotoAlbum {
     ) -> RecordResolutionBatch {
         let mut results = Vec::with_capacity(requests.len());
         let mut identity_diagnostics = std::collections::BTreeMap::new();
+        let mut rejection_diagnostics = std::collections::BTreeMap::new();
         let mut rate_limit_observations = 0usize;
         let mut url_observed_at = FxHashMap::default();
         let url = format!(
@@ -461,6 +532,20 @@ impl PhotoAlbum {
                 } else {
                     RecordResolution::Unknown
                 };
+                if matches!(resolution, RecordResolution::Unknown) {
+                    let (reason, stage) =
+                        lookup_rejection(master, asset, request, &self.zone_id, pair_matches);
+                    let target = match request.target {
+                        RecordLookupTarget::Asset => "child",
+                        RecordLookupTarget::Master if request.asset_record_name.is_some() => {
+                            "paired"
+                        }
+                        RecordLookupTarget::Master => "master",
+                    };
+                    *rejection_diagnostics
+                        .entry((target, stage, reason))
+                        .or_insert(0usize) += 1;
+                }
                 if request.target == RecordLookupTarget::Asset
                     && !matches!(resolution, RecordResolution::Deleted { .. })
                 {
@@ -492,6 +577,18 @@ impl PhotoAlbum {
             Some(name) if name.starts_with("SharedSync") => "shared",
             _ => "other",
         };
+        let expected_owner = match self.zone_id.get("ownerRecordName") {
+            None => "absent",
+            Some(owner) if owner.as_str() == Some("_defaultOwner") => "private_default",
+            Some(_) => "other",
+        };
+        for ((target, stage, reason), rejected_requests) in rejection_diagnostics {
+            tracing::info!(target: "kei::icloud::photos::album",
+                diagnostic = "exact_lookup_rejection_v1",
+                target, stage, reason, expected_owner, lookup_zone, rejected_requests,
+                "Targeted identity lookup retained unresolved requests"
+            );
+        }
         // One line per fixed diagnostic class per lookup, not one per asset.
         for ((diagnostic, reference_zone), count) in identity_diagnostics {
             if diagnostic == "master_reference_present" {
