@@ -583,6 +583,7 @@ pub trait DownloadStateStore: Send + Sync {
 /// Import-time adoption and imported-file snapshot reads.
 #[async_trait]
 pub trait ImportStateStore: Send + Sync {
+    /// Adopt the file and optional provider (child, master) identity atomically.
     async fn import_adopt(
         &self,
         record: &AssetRecord,
@@ -590,6 +591,7 @@ pub trait ImportStateStore: Send + Sync {
         local_checksum: &str,
         imported_size: u64,
         imported_mtime: Option<i64>,
+        identity: Option<(&str, &str)>,
     ) -> Result<(), StateError>;
 
     async fn get_all_imported_records(

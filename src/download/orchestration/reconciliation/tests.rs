@@ -123,7 +123,9 @@ async fn import_refusal_preserves_reserved_retry_across_restart() {
     .await
     .unwrap();
     assert_eq!(stats.total, 1);
-    assert_eq!(stats.unmatched, 0);
+    // Complete import occupancy refuses this foreign path before the
+    // transaction reservation guard; the durable retry assertions stay intact.
+    assert_eq!(stats.unmatched, 1);
     assert_eq!(stats.filtered, 0);
     assert_eq!(stats.hash_errors, 0);
     assert_eq!(stats.matched, 0);

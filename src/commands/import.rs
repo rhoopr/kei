@@ -16,13 +16,12 @@ use crate::download::filter::{
     ExpectedAssetPath, PathDerivationConfig, PathDerivationSource, expected_paths_for,
     is_asset_filtered,
 };
-use crate::download::paths::{DirCache, normalize_ampm};
+use crate::download::paths::DirCache;
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
 use crate::state::{ImportStateStore, VersionSizeKey};
 use crate::systemd::SystemdNotifier;
-use crate::types::{FileMatchPolicy, LivePhotoMovFilenamePolicy};
 
 use super::service::{
     build_collection_context, collection_libraries, init_photos_service, pass_scope_for_zone,
@@ -31,7 +30,7 @@ use super::service::{
 };
 
 /// Value of the `stage` field on the one-shot tracing event emitted by
-/// [`import_assets`] when the first asset is dequeued. Operators (and the
+/// [`collect_import_assets`] when the first asset is dequeued. Operators (and the
 /// live SIGINT idempotency test) sync on this token to know real scan
 /// work has started, distinct from process-spawn or auth completion.
 pub(crate) const SCAN_STARTED_STAGE: &str = "scan_started";
@@ -42,7 +41,7 @@ pub(crate) const SCAN_STARTED_STAGE: &str = "scan_started";
 /// from per-asset debug/warn lines.
 const HEARTBEAT_STAGE: &str = "heartbeat";
 
-/// Per-library counters returned by [`import_assets`].
+/// Per-library counters returned by [`collect_import_assets`].
 ///
 /// Counters span asset- and expected-path levels so that divergent
 /// totals in the summary surface silently dropped work instead of
@@ -261,7 +260,7 @@ struct HeartbeatSnapshot {
     last_seen_id: Option<String>,
 }
 
-/// RAII handle for the heartbeat task spawned by [`import_assets`].
+/// RAII handle for the heartbeat task spawned by [`collect_import_assets`].
 ///
 /// On drop, cancels the cancellation token so the task exits even if the
 /// scan loop bails early. The task itself is fire-and-forget; we don't
@@ -339,168 +338,371 @@ fn log_progress_milestone(library_label: &str, matched: u64, show_progress: bool
     }
 }
 
-/// Find the on-disk path that satisfies the expected size: primary, then
-/// collision-family shapes under `NameSizeDedupWithSuffix`, then AM/PM
-/// whitespace siblings. macOS screenshots use NARROW NO-BREAK SPACE
-/// (`\u{202F}`) before AM/PM; trees synced through other tools may have
-/// normalized to a regular space (or vice versa).
-async fn resolve_match_path(
-    candidate: &ImportPathCandidate<'_>,
-    all_expected: &[ExpectedAssetPath],
-    asset_id: &str,
-    path_config: &(impl PathDerivationSource + ?Sized),
-    dir_cache: &mut DirCache,
-) -> Option<(PathBuf, std::fs::Metadata)> {
-    let mut candidates = import_match_candidates(candidate, all_expected, asset_id, path_config);
-    candidates.sort();
-    candidates.dedup();
+/// Prepared rows retain selected-version metadata and candidate paths, not provider JSON.
+/// Memory is proportional to selected renditions, durable catalogue paths and
+/// current receipts, and cached directory entries. No state
+/// writes happen until every selected pass has completed its enumeration.
+#[derive(Default)]
+struct ImportPreflight {
+    candidates: Vec<PreparedImport>,
+    durable: Option<ImportDurableSnapshot>,
+    legacy_master_owners: std::collections::HashMap<(Arc<str>, Arc<str>), Arc<str>>,
+}
 
-    for path in &candidates {
-        if let Some(found) =
-            match_exact_or_ampm_variant(path, candidate.expected_size, dir_cache).await
-        {
-            return Some(found);
+struct PreparedImport {
+    record: state::AssetRecord,
+    root: Arc<PathBuf>,
+    child: Arc<str>,
+    master: Arc<str>,
+    url: Box<str>,
+    expected_path: PathBuf,
+    matches: Vec<(PathBuf, bool)>,
+    owned_files: Arc<[OwnedImportFile]>,
+    prior_import: Option<state::db::ImportedRecord>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ImportOwner {
+    library: Arc<str>,
+    id: String,
+    version: VersionSizeKey,
+    checksum: Box<str>,
+}
+
+#[derive(Clone)]
+struct OwnedImportFile {
+    path: Arc<PathBuf>,
+    local_checksum: Arc<str>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ImportPhysicalOwner {
+    library: Arc<str>,
+    id: String,
+    version: VersionSizeKey,
+}
+
+struct ImportDurableSnapshot {
+    occupied_paths:
+        std::collections::HashMap<String, std::collections::HashSet<ImportPhysicalOwner>>,
+    receipts: std::collections::HashMap<ImportOwner, Arc<[OwnedImportFile]>>,
+}
+
+impl ImportDurableSnapshot {
+    async fn load(db: &state::SqliteStateDb) -> anyhow::Result<Self> {
+        use std::collections::{HashMap, HashSet};
+        // Occupancy includes historical paths and owners outside this import's
+        // selection. Only current provider-matching receipts may prove reuse.
+        let paths = state::ReconciliationStateStore::get_reconciliation_catalog_paths(db).await?;
+        let mut occupied_paths: HashMap<String, HashSet<ImportPhysicalOwner>> = HashMap::new();
+        for (index, path) in paths.into_iter().enumerate() {
+            if index.is_multiple_of(1024) {
+                tokio::task::yield_now().await;
+            }
+            occupied_paths
+                .entry(import_path_key(&path.path)?)
+                .or_default()
+                .insert(ImportPhysicalOwner {
+                    library: path.library,
+                    id: path.asset_id.to_string(),
+                    version: path.version_size,
+                });
         }
-    }
-
-    if path_config.file_match_policy() == FileMatchPolicy::NameSizeDedupWithSuffix {
-        for path in candidates {
-            if let Some(found) =
-                find_identity_ordinal_sibling(&path, asset_id, candidate.expected_size).await
-            {
-                return Some(found);
+        let mut records = state::DownloadContextStateStore::get_downloaded_file_records(db).await?;
+        records.extend(state::DownloadContextStateStore::get_downloaded_path_records(db).await?);
+        let mut receipts: HashMap<ImportOwner, Vec<OwnedImportFile>> = HashMap::new();
+        for (index, record) in records.into_iter().enumerate() {
+            if index.is_multiple_of(1024) {
+                tokio::task::yield_now().await;
+            }
+            if let (Some(path), Some(hash)) = (record.local_path, record.local_checksum) {
+                receipts
+                    .entry(ImportOwner {
+                        library: Arc::from(record.library),
+                        id: record.id,
+                        version: record.version_size,
+                        checksum: record.checksum.into_boxed_str(),
+                    })
+                    .or_default()
+                    .push(OwnedImportFile {
+                        path: Arc::new(path),
+                        local_checksum: Arc::from(hash),
+                    });
             }
         }
+        Ok(Self {
+            occupied_paths,
+            receipts: receipts
+                .into_iter()
+                .map(|(owner, files)| (owner, Arc::from(files)))
+                .collect(),
+        })
     }
-
-    None
 }
 
-struct ImportPathCandidate<'a> {
-    path: &'a Path,
-    expected_size: u64,
-    version_size: VersionSizeKey,
+impl PreparedImport {
+    fn physical_owner(&self) -> ImportPhysicalOwner {
+        ImportPhysicalOwner {
+            library: Arc::clone(&self.record.library),
+            id: self.record.id.to_string(),
+            version: self.record.version_size,
+        }
+    }
+    fn owner(&self) -> ImportOwner {
+        ImportOwner {
+            library: Arc::clone(&self.record.library),
+            id: self.record.id.to_string(),
+            version: self.record.version_size,
+            checksum: self.record.checksum.clone(),
+        }
+    }
 }
 
-fn import_match_candidates(
-    candidate: &ImportPathCandidate<'_>,
+fn import_path_key(path: &Path) -> anyhow::Result<String> {
+    // Share reconciliation's checked absolute key, including platform case
+    // normalization. Relative spellings cannot hide an existing physical owner.
+    crate::fs_util::confined_path_key(path).context("Invalid import ownership path")
+}
+
+async fn import_match_paths(
+    expected: &ExpectedAssetPath,
     all_expected: &[ExpectedAssetPath],
     asset_id: &str,
-    path_config: &(impl PathDerivationSource + ?Sized),
-) -> Vec<PathBuf> {
-    let mut candidates = vec![candidate.path.to_path_buf()];
-    if path_config.file_match_policy() != FileMatchPolicy::NameSizeDedupWithSuffix {
-        return candidates;
-    }
-
-    let Some(parent) = candidate.path.parent() else {
-        return candidates;
+    config: &(impl PathDerivationSource + ?Sized),
+    dir_cache: &mut DirCache,
+) -> Vec<(PathBuf, bool)> {
+    let Some(parent) = expected.path.parent() else {
+        return Vec::new();
     };
-    let Some(fname) = candidate.path.file_name().and_then(|f| f.to_str()) else {
-        tracing::debug!(
-            path = %candidate.path.display(),
-            "Skipping collision-family fallback: filename is not valid UTF-8",
-        );
-        return candidates;
-    };
-
-    candidates.push(parent.join(download::paths::add_dedup_suffix(
-        fname,
-        candidate.expected_size,
-    )));
-    candidates.push(parent.join(download::paths::insert_asset_identity_suffix(
-        fname, asset_id,
-    )));
-
-    if candidate.version_size.is_live_photo_motion()
-        && let Some(primary) = primary_expected_path(all_expected)
-        && let Some(primary_fname) = primary.path.file_name().and_then(|f| f.to_str())
+    dir_cache.ensure_import_dir_async(parent).await;
+    let prefixes = download::filter::import_collision_family_prefixes(
+        asset_id,
+        expected,
+        all_expected,
+        config,
+    );
+    let mut matches: Vec<_> = dir_cache
+        .matching_paths(parent, expected.size, &prefixes)
+        .into_iter()
+        .filter_map(|path| {
+            download::filter::import_collision_family_match(
+                asset_id,
+                expected,
+                all_expected,
+                config,
+                &path,
+            )
+            .map(|qualified| (path, qualified))
+        })
+        .collect();
+    // Preserve import's existing direct symlink-to-file behavior; directory
+    // caches intentionally include regular entries only.
+    if let Ok(metadata) = tokio::fs::metadata(&expected.path).await
+        && metadata.len() == expected.size
+        && !matches.iter().any(|(path, _)| path == &expected.path)
     {
-        let primary_collision_filenames = [
-            download::paths::add_dedup_suffix(primary_fname, primary.size),
-            download::paths::insert_asset_identity_suffix(primary_fname, asset_id),
-        ];
-        for primary_filename in primary_collision_filenames {
-            let mov_filename = match path_config.live_photo_mov_filename_policy() {
-                LivePhotoMovFilenamePolicy::Suffix => {
-                    download::paths::live_photo_mov_path_suffix(&primary_filename)
+        matches.push((expected.path.clone(), false));
+    }
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+impl ImportPreflight {
+    async fn adopt(
+        self,
+        db: &state::SqliteStateDb,
+        options: ImportRunOptions<'_>,
+    ) -> anyhow::Result<ImportStats> {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::atomic::Ordering;
+        if self.candidates.is_empty() {
+            return Ok(ImportStats::default());
+        }
+        let mut expected_owners: HashMap<(String, u64), HashSet<ImportOwner>> = HashMap::new();
+        let mut path_owners: HashMap<String, HashSet<ImportOwner>> = HashMap::new();
+        let durable = self
+            .durable
+            .context("Import preflight has no durable ownership snapshot")?;
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            if index.is_multiple_of(1024) {
+                tokio::task::yield_now().await;
+            }
+            let owner = candidate.owner();
+            expected_owners
+                .entry((
+                    import_path_key(&candidate.expected_path)?,
+                    candidate.record.size_bytes,
+                ))
+                .or_default()
+                .insert(owner.clone());
+            for (path, _) in &candidate.matches {
+                path_owners
+                    .entry(import_path_key(path)?)
+                    .or_default()
+                    .insert(owner.clone());
+            }
+        }
+        let heartbeat_state = Arc::new(HeartbeatState::default());
+        let _heartbeat = HeartbeatGuard::spawn(
+            Arc::clone(&heartbeat_state),
+            "adoption".to_owned(),
+            HEARTBEAT_INTERVAL,
+        );
+        let mut stats = ImportStats::default();
+        for candidate in self.candidates {
+            if options
+                .shutdown_token
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                anyhow::bail!("Import was interrupted before adopting the next file.");
+            }
+            let library_label = candidate.record.library.as_ref();
+            let physical_owner = candidate.physical_owner();
+            let mut safe = Vec::new();
+            let mut owned = None;
+            for (path, qualified) in &candidate.matches {
+                let key = import_path_key(path)?;
+                let conflicting_durable_owner = durable
+                    .occupied_paths
+                    .get(&key)
+                    .is_some_and(|owners| owners.iter().any(|other| other != &physical_owner));
+                if conflicting_durable_owner {
+                    continue;
                 }
-                LivePhotoMovFilenamePolicy::Original => {
-                    download::paths::live_photo_mov_path_original(&primary_filename)
+                let needs_owned_proof =
+                    path_owners.get(&key).is_some_and(|owners| owners.len() > 1)
+                        || expected_owners
+                            .get(&(
+                                import_path_key(&candidate.expected_path)?,
+                                candidate.record.size_bytes,
+                            ))
+                            .is_some_and(|owners| owners.len() > 1)
+                        || candidate.matches.len() > 1;
+                if needs_owned_proof
+                    && let Some(receipt) = candidate.owned_files.iter().find(|receipt| {
+                        import_path_key(&receipt.path).is_ok_and(|value| value == key)
+                    })
+                    && download::file::imported_path_matches_receipt(
+                        &candidate.root,
+                        path,
+                        candidate.record.size_bytes,
+                        &receipt.local_checksum,
+                    )
+                    .await
+                {
+                    owned = Some(path.clone());
+                    break;
+                }
+                let unique_match = path_owners
+                    .get(&key)
+                    .is_some_and(|owners| owners.len() == 1);
+                let unique_base = expected_owners
+                    .get(&(
+                        import_path_key(&candidate.expected_path)?,
+                        candidate.record.size_bytes,
+                    ))
+                    .is_some_and(|owners| owners.len() == 1);
+                if unique_match && (*qualified || unique_base) {
+                    safe.push(path.clone());
+                }
+            }
+            // Never choose an arbitrary ordinal sibling. A verified durable row
+            // selects its exact file; otherwise precisely one safe file is required.
+            let path = match owned.or_else(|| (safe.len() == 1).then(|| safe.remove(0))) {
+                Some(path) => path,
+                None => {
+                    if !candidate.matches.is_empty() {
+                        tracing::warn!(version = ?candidate.record.version_size,
+                            "Import refused an ambiguous collision-family file");
+                    }
+                    stats.unmatched += 1;
+                    heartbeat_state.unmatched.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
             };
-            candidates.push(parent.join(&mov_filename));
-            candidates.push(parent.join(download::paths::insert_asset_identity_suffix(
-                &mov_filename,
-                asset_id,
-            )));
+            let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                stats.unmatched += 1;
+                continue;
+            };
+            if metadata.len() != candidate.record.size_bytes {
+                stats.unmatched += 1;
+                continue;
+            }
+            if let Some(verifier) = options.strict_verifier {
+                match verifier
+                    .verify(&path, &candidate.url, candidate.record.size_bytes)
+                    .await
+                {
+                    Ok(StrictImportDecision::Accepted) => {}
+                    result => {
+                        tracing::warn!(?result, "Strict import refused file");
+                        record_strict_refusal(&mut stats, &heartbeat_state);
+                        continue;
+                    }
+                }
+            }
+            if !options.dry_run {
+                let mtime_epoch = file_mtime_epoch(&metadata);
+                if candidate.prior_import.as_ref().is_some_and(|rec| {
+                    rec.local_path == path
+                        && candidate.owned_files.iter().any(|receipt| {
+                            receipt.path.as_ref() == &rec.local_path
+                                && receipt.local_checksum.as_ref() == rec.local_checksum
+                        })
+                        && rec.imported_size == Some(metadata.len())
+                        && rec.imported_mtime.is_some()
+                        && rec.imported_mtime == mtime_epoch
+                }) {
+                    stats.matched += 1;
+                    stats.skipped_already_imported += 1;
+                    heartbeat_state.matched.fetch_add(1, Ordering::Relaxed);
+                    heartbeat_state
+                        .skipped_already_imported
+                        .fetch_add(1, Ordering::Relaxed);
+                    log_progress_milestone(library_label, stats.matched, options.show_progress);
+                    continue;
+                }
+                let local_checksum = match download::file::compute_sha256(&path).await {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "Failed to hash file");
+                        stats.hash_errors += 1;
+                        heartbeat_state.hash_errors.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let mut record = candidate.record;
+                record.filename = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .into();
+                if let Err(e) = ImportStateStore::import_adopt(
+                    db,
+                    &record,
+                    &path,
+                    &local_checksum,
+                    metadata.len(),
+                    mtime_epoch,
+                    Some((&candidate.child, &candidate.master)),
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "Failed to adopt asset");
+                    continue;
+                }
+                stats.matched += 1;
+                heartbeat_state.matched.fetch_add(1, Ordering::Relaxed);
+                log_progress_milestone(&record.library, stats.matched, options.show_progress);
+            } else {
+                stats.matched += 1;
+                heartbeat_state.matched.fetch_add(1, Ordering::Relaxed);
+                log_progress_milestone(library_label, stats.matched, options.show_progress);
+            }
         }
+        Ok(stats)
     }
-
-    candidates
-}
-
-fn primary_expected_path(expected: &[ExpectedAssetPath]) -> Option<&ExpectedAssetPath> {
-    expected
-        .iter()
-        .find(|path| path.version_size.is_primary_media())
-}
-
-async fn match_exact_or_ampm_variant(
-    path: &Path,
-    expected_size: u64,
-    dir_cache: &mut DirCache,
-) -> Option<(PathBuf, std::fs::Metadata)> {
-    if let Ok(m) = tokio::fs::metadata(path).await
-        && m.len() == expected_size
-    {
-        return Some((path.to_path_buf(), m));
-    }
-
-    let needs_probe = path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .is_some_and(|f| normalize_ampm(f) != f);
-    if !needs_probe {
-        return None;
-    }
-    let parent = path.parent()?;
-    dir_cache.ensure_dir_async(parent).await;
-    let variant = dir_cache.find_ampm_variant(path)?;
-    if dir_cache.file_size(&variant) != Some(expected_size) {
-        return None;
-    }
-    let m = tokio::fs::metadata(&variant).await.ok()?;
-    tracing::info!(
-        primary = %path.display(),
-        variant = %variant.display(),
-        "Matched AM/PM whitespace variant on disk",
-    );
-    Some((variant, m))
-}
-
-async fn find_identity_ordinal_sibling(
-    base_path: &Path,
-    asset_id: &str,
-    expected_size: u64,
-) -> Option<(PathBuf, std::fs::Metadata)> {
-    let parent = base_path.parent()?;
-    let base = base_path.file_name()?.to_str()?;
-    let mut entries = tokio::fs::read_dir(parent).await.ok()?;
-    while let Some(entry) = entries.next_entry().await.ok()? {
-        let candidate_name = entry.file_name();
-        let Some(candidate_name) = candidate_name.to_str() else {
-            continue;
-        };
-        if !download::paths::filename_matches_identity_collision(base, asset_id, candidate_name) {
-            continue;
-        }
-        let metadata = entry.metadata().await.ok()?;
-        if metadata.len() == expected_size {
-            return Some((entry.path(), metadata));
-        }
-    }
-    None
 }
 
 /// Run the import-existing matching loop over a stream of `PhotoAsset`s.
@@ -515,10 +717,11 @@ async fn find_identity_ordinal_sibling(
 /// `photo_stream` -- after the stream is drained, we check it and bail
 /// loudly if any fetcher task panicked, since a panicked fetcher closes
 /// the stream early and would otherwise read as a clean enumeration.
-pub(crate) async fn import_assets<S, D>(
+#[cfg(test)]
+pub(crate) async fn import_assets<S>(
     stream: S,
     panic_rx: tokio::sync::oneshot::Receiver<bool>,
-    db: &D,
+    db: &state::SqliteStateDb,
     path_config: &(impl PathDerivationSource + ?Sized),
     library_label: &str,
     dir_cache: &mut DirCache,
@@ -526,7 +729,39 @@ pub(crate) async fn import_assets<S, D>(
 ) -> anyhow::Result<ImportStats>
 where
     S: futures_util::Stream<Item = anyhow::Result<PhotoAsset>>,
-    D: ImportStateStore + ?Sized,
+{
+    let mut preflight = ImportPreflight::default();
+    let mut stats = collect_import_assets(
+        stream,
+        panic_rx,
+        db,
+        path_config,
+        library_label,
+        dir_cache,
+        options,
+        &mut preflight,
+    )
+    .await?;
+    stats += preflight.adopt(db, options).await?;
+    Ok(stats)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "enumeration carries the shared preflight across selected passes"
+)]
+async fn collect_import_assets<S>(
+    stream: S,
+    panic_rx: tokio::sync::oneshot::Receiver<bool>,
+    db: &state::SqliteStateDb,
+    path_config: &(impl PathDerivationSource + ?Sized),
+    library_label: &str,
+    dir_cache: &mut DirCache,
+    options: ImportRunOptions<'_>,
+    preflight: &mut ImportPreflight,
+) -> anyhow::Result<ImportStats>
+where
+    S: futures_util::Stream<Item = anyhow::Result<PhotoAsset>>,
 {
     use futures_util::StreamExt;
     use std::sync::atomic::Ordering;
@@ -534,6 +769,12 @@ where
     tokio::pin!(stream);
     let mut stats = ImportStats::default();
     let mut scan_started_emitted = false;
+    let identity_context = download::DownloadContext::load(db, false).await;
+    let import_root = Arc::new(path_config.directory().to_path_buf());
+    let mut claimed_legacy_master_states = download::ClaimedLegacyMasterStates::default();
+    if preflight.durable.is_none() {
+        preflight.durable = Some(ImportDurableSnapshot::load(db).await?);
+    }
 
     let heartbeat_state = Arc::new(HeartbeatState::default());
     let _heartbeat = HeartbeatGuard::spawn(
@@ -548,7 +789,7 @@ where
     // path falls straight through to the real hash, so this costs one
     // single-row no-op query for first-time imports and saves N queries
     // (and N SHA-256 reads) on every subsequent pass.
-    let imported_index = match db.get_all_imported_records(library_label).await {
+    let imported_index = match ImportStateStore::get_all_imported_records(db, library_label).await {
         Ok(map) => map,
         Err(e) => {
             tracing::warn!(
@@ -563,6 +804,7 @@ where
     loop {
         let result = if let Some(shutdown_token) = options.shutdown_token {
             tokio::select! {
+                biased;
                 () = shutdown_token.cancelled() => {
                     anyhow::bail!(
                         "Import was interrupted while scanning library `{library_label}`."
@@ -627,6 +869,33 @@ where
             continue;
         }
 
+        // Sync's claim set is scoped to a pass. A repeated child in another
+        // pass must rerun the same checksum/date/owner guards. Keep a separate
+        // census owner only to stop a DIFFERENT child claiming the same master
+        // before any pass has committed its adoption.
+        let master_key = (Arc::from(library_label), Arc::from(asset.id()));
+        let transient_claim = preflight
+            .legacy_master_owners
+            .get(&master_key)
+            .is_some_and(|child| child.as_ref() != asset.asset_record_name())
+            && claimed_legacy_master_states.insert(master_key.clone());
+        let selected = identity_context.select_asset_state_record_name_checked(
+            library_label,
+            &asset,
+            &mut claimed_legacy_master_states,
+        );
+        // A synthetic sibling guard must not prevent the real owner appearing
+        // later in this pass; retain only claims naturally made by the selector.
+        if transient_claim {
+            claimed_legacy_master_states.remove(&master_key);
+        }
+        let state_record_name = selected?;
+        if state_record_name.as_ref() == asset.id() && asset.asset_record_name() != asset.id() {
+            preflight
+                .legacy_master_owners
+                .insert(master_key, asset.asset_record_name_arc());
+        }
+        let asset = asset.with_state_record_name(state_record_name);
         let expected = expected_paths_for(&asset, path_config);
         if expected.is_empty() {
             // WARN, not debug: an asset silently dropped here is invisible
@@ -643,178 +912,68 @@ where
         }
 
         for expected_path in &expected {
-            let ExpectedAssetPath {
-                path: primary_path,
-                size: expected_size,
-                checksum,
-                url,
-                version_size,
-            } = expected_path;
-            let expected_size = *expected_size;
-            let version_size = *version_size;
-            // For `NameSizeDedupWithSuffix`, when two iCloud assets share
-            // a filename, icloudpd renames the second's download to
-            // `<stem>-<size><ext>` (it stat's the existing file at
-            // download time, sees the wrong size, falls back). kei's
-            // `expected_paths_for` is single-asset and emits only the
-            // bare path, so the size-suffixed file would read as
-            // unmatched on import even though it's what kei would also
-            // have written under the same collision. Try the suffix
-            // shape as a fallback.
-            let candidate = ImportPathCandidate {
-                path: primary_path,
-                expected_size,
-                version_size,
-            };
-            let (expected_path, metadata) = match resolve_match_path(
-                &candidate,
+            let matches = import_match_paths(
+                expected_path,
                 &expected,
                 asset.state_id(),
                 path_config,
                 dir_cache,
             )
-            .await
-            {
-                Some(found) => found,
-                None => {
-                    stats.unmatched += 1;
-                    heartbeat_state.unmatched.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+            .await;
+            let record = state::AssetRecord::new_pending(
+                Arc::from(library_label),
+                asset.state_id().to_string(),
+                expected_path.version_size,
+                expected_path.checksum.to_string(),
+                String::new(),
+                asset.created(),
+                Some(asset.added_date()),
+                expected_path.size,
+                download::determine_media_type(expected_path.version_size, &asset),
+            )
+            .with_metadata_arc(download::filter::metadata_for_selected_version(
+                &asset,
+                path_config,
+                expected_path.version_size,
+            ));
+            let owner = ImportOwner {
+                library: Arc::from(library_label),
+                id: record.id.to_string(),
+                version: record.version_size,
+                checksum: record.checksum.clone(),
             };
-
-            if let Some(verifier) = options.strict_verifier {
-                match verifier
-                    .verify(&expected_path, url.as_ref(), expected_size)
-                    .await
-                {
-                    Ok(StrictImportDecision::Accepted) => {}
-                    Ok(StrictImportDecision::Refused) => {
-                        tracing::warn!(
-                            asset_id = %asset.id(),
-                            version = ?version_size,
-                            path = %expected_path.display(),
-                            "Strict import refused same-name, same-size file: local prefix differs from cloud prefix",
-                        );
-                        record_strict_refusal(&mut stats, &heartbeat_state);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            asset_id = %asset.id(),
-                            version = ?version_size,
-                            path = %expected_path.display(),
-                            error = %e,
-                            "Strict import refused same-name, same-size file: prefix verification failed",
-                        );
-                        record_strict_refusal(&mut stats, &heartbeat_state);
-                        continue;
-                    }
-                }
-            }
-
-            if !options.dry_run {
-                // Skip-rehash short-circuit: if a prior adopt left a row
-                // for this (library, id, version_size) at the same path
-                // with the same on-disk size + mtime, the file hasn't
-                // changed and re-hashing buys nothing. Skipping is what
-                // makes restart-after-interrupt tolerable on slow storage
-                // (e.g. /photos on HDD).
-                let mtime_epoch = file_mtime_epoch(&metadata);
-                let already_imported = imported_index
+            let owned_files = preflight
+                .durable
+                .as_ref()
+                .and_then(|snapshot| snapshot.receipts.get(&owner))
+                .cloned()
+                .unwrap_or_default();
+            let prior_import = (!owned_files.is_empty()
+                && (asset.state_id() == asset.asset_record_name()
+                    || identity_context
+                        .select_existing_asset_state_record_name(library_label, &asset)
+                        .as_ref()
+                        == asset.state_id()))
+            .then(|| {
+                imported_index
                     .get(&(
                         asset.state_id().to_string(),
-                        version_size.as_str().to_string(),
+                        expected_path.version_size.as_str().to_string(),
                     ))
-                    .filter(|rec| {
-                        rec.local_path == expected_path
-                            && rec.imported_size == Some(metadata.len())
-                            && rec.imported_mtime.is_some()
-                            && rec.imported_mtime == mtime_epoch
-                    });
-
-                if let Some(rec) = already_imported {
-                    tracing::debug!(
-                        asset_id = %asset.id(),
-                        version = ?version_size,
-                        path = %expected_path.display(),
-                        prior_checksum = %rec.local_checksum,
-                        "Skipping re-hash: file unchanged since last import",
-                    );
-                    stats.matched += 1;
-                    stats.skipped_already_imported += 1;
-                    heartbeat_state.matched.fetch_add(1, Ordering::Relaxed);
-                    heartbeat_state
-                        .skipped_already_imported
-                        .fetch_add(1, Ordering::Relaxed);
-                    log_progress_milestone(library_label, stats.matched, options.show_progress);
-                    continue;
-                }
-
-                // Hash the file BEFORE creating the pending row. If the read
-                // fails (permissions, vanished file, I/O error), bailing
-                // here leaves no orphan `pending` row that a future sync
-                // would wrongly skip.
-                let local_checksum = match download::file::compute_sha256(&expected_path).await {
-                    Ok(hash) => hash,
-                    Err(e) => {
-                        tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
-                        stats.hash_errors += 1;
-                        heartbeat_state.hash_errors.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
-
-                let media_type = download::determine_media_type(version_size, &asset);
-                let filename = expected_path
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or_else(|| {
-                        tracing::warn!(
-                            asset_id = %asset.id(),
-                            version = ?version_size,
-                            path = %expected_path.display(),
-                            "Recording empty filename: expected path has no UTF-8 file_name component"
-                        );
-                        ""
-                    })
-                    .to_string();
-                let record = state::AssetRecord::new_pending(
-                    Arc::from(library_label),
-                    asset.state_id().to_string(),
-                    version_size,
-                    checksum.to_string(),
-                    filename,
-                    asset.created(),
-                    Some(asset.added_date()),
-                    expected_size,
-                    media_type,
-                )
-                .with_metadata_arc(
-                    download::filter::metadata_for_selected_version(
-                        &asset,
-                        path_config,
-                        version_size,
-                    ),
-                );
-                if let Err(e) = db
-                    .import_adopt(
-                        &record,
-                        &expected_path,
-                        &local_checksum,
-                        metadata.len(),
-                        mtime_epoch,
-                    )
-                    .await
-                {
-                    tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to adopt asset");
-                    continue;
-                }
-            }
-
-            stats.matched += 1;
-            heartbeat_state.matched.fetch_add(1, Ordering::Relaxed);
-            log_progress_milestone(library_label, stats.matched, options.show_progress);
+                    .cloned()
+            })
+            .flatten();
+            preflight.candidates.push(PreparedImport {
+                record,
+                root: Arc::clone(&import_root),
+                child: Arc::from(asset.asset_record_name()),
+                master: Arc::from(asset.id()),
+                url: expected_path.url.clone(),
+                expected_path: expected_path.path.clone(),
+                matches,
+                owned_files,
+                prior_import,
+            });
         }
     }
 
@@ -826,7 +985,15 @@ where
     // sending, i.e. the prefetch task exited cleanly. The only writer to
     // this channel is the panic guard in `photo_stream`, which sends `true`
     // on panic; absence of a send is the clean-exit signal.
-    if panic_rx.await.unwrap_or(false) {
+    let fetcher_panicked = if let Some(token) = options.shutdown_token {
+        tokio::select! { biased;
+            () = token.cancelled() => anyhow::bail!("Import was interrupted while scanning library `{library_label}`."),
+            result = panic_rx => result.unwrap_or(false),
+        }
+    } else {
+        panic_rx.await.unwrap_or(false)
+    };
+    if fetcher_panicked {
         anyhow::bail!(
             "Import scan stopped for library `{library_label}` because a fetcher task crashed. Results are incomplete; see the earlier error log."
         );
@@ -971,6 +1138,7 @@ pub(crate) async fn run_import_existing(
     }
 
     let mut totals = ImportStats::default();
+    let mut preflight = ImportPreflight::default();
     // Hoisted across passes: a multi-album asset's parent dir is read_dir'd
     // once per library scan, not once per pass.
     let mut dir_cache = DirCache::new();
@@ -1006,7 +1174,7 @@ pub(crate) async fn run_import_existing(
                 "Importing pass"
             );
             let (stream, panic_rx) = pass.album.photo_stream(recent_count, None, 1);
-            let stats = import_assets(
+            let stats = collect_import_assets(
                 stream,
                 panic_rx,
                 db.as_ref(),
@@ -1021,11 +1189,26 @@ pub(crate) async fn run_import_existing(
                         .map(|v| v as &dyn StrictImportVerifier),
                     shutdown_token: Some(&shutdown_token),
                 },
+                &mut preflight,
             )
             .await?;
             totals += stats;
         }
     }
+
+    totals += preflight
+        .adopt(
+            db.as_ref(),
+            ImportRunOptions {
+                dry_run: args.dry_run,
+                show_progress: !args.no_progress_bar,
+                strict_verifier: strict_verifier
+                    .as_ref()
+                    .map(|v| v as &dyn StrictImportVerifier),
+                shutdown_token: Some(&shutdown_token),
+            },
+        )
+        .await?;
 
     println!();
     if args.dry_run {
@@ -1356,8 +1539,8 @@ mod wiremock_tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        ImportRunOptions, ImportStats, StrictImportDecision, StrictImportVerifier, import_assets,
-        verify_strict_prefix,
+        ImportPreflight, ImportRunOptions, ImportStats, StrictImportDecision, StrictImportVerifier,
+        collect_import_assets, import_assets, verify_strict_prefix,
     };
     use crate::download::filter::expected_paths_for;
     use crate::download::paths::DirCache;
@@ -1365,9 +1548,7 @@ mod wiremock_tests {
     use crate::icloud::photos::session::PhotosSession;
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotoAsset};
     use crate::retry::RetryConfig;
-    use crate::state::{
-        AssetStatus, ImportStateStore, ReportStateStore, SqliteStateDb, VersionSizeKey,
-    };
+    use crate::state::{AssetStatus, ReportStateStore, SqliteStateDb, VersionSizeKey};
     use crate::types::{
         AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
     };
@@ -1381,6 +1562,7 @@ mod wiremock_tests {
     #[derive(Clone)]
     struct WiremockAsset {
         record_name: String,
+        child_record_name: String,
         filename: String,
         item_type: String,
         orig_size: u64,
@@ -1400,6 +1582,7 @@ mod wiremock_tests {
         fn new(record_name: &str, filename: &str, item_type: &str) -> Self {
             Self {
                 record_name: record_name.to_string(),
+                child_record_name: format!("{record_name}_asset"),
                 filename: filename.to_string(),
                 item_type: item_type.to_string(),
                 orig_size: 1024,
@@ -1472,6 +1655,7 @@ mod wiremock_tests {
                 "fields": self.master_fields(),
             });
             let mut asset = json!({
+                "recordName": &self.child_record_name,
                 "fields": {
                     "assetDate": {"value": self.asset_date},
                     "addedDate": {"value": self.asset_date},
@@ -1494,7 +1678,7 @@ mod wiremock_tests {
                 "fields": self.master_fields(),
             });
             let mut asset = json!({
-                "recordName": format!("{}_asset", self.record_name),
+                "recordName": &self.child_record_name,
                 "recordType": "CPLAsset",
                 "fields": {
                     "masterRef": {"value": {"recordName": &self.record_name}},
@@ -1725,7 +1909,7 @@ mod wiremock_tests {
     async fn run_import(
         server: &MockServer,
         assets: &[WiremockAsset],
-        db: &dyn ImportStateStore,
+        db: &SqliteStateDb,
         config: &DownloadConfig,
         dry_run: bool,
     ) -> ImportStats {
@@ -1735,7 +1919,7 @@ mod wiremock_tests {
     async fn run_import_with_strict(
         server: &MockServer,
         assets: &[WiremockAsset],
-        db: &dyn ImportStateStore,
+        db: &SqliteStateDb,
         config: &DownloadConfig,
         dry_run: bool,
         strict_verifier: Option<&dyn StrictImportVerifier>,
@@ -1851,7 +2035,7 @@ mod wiremock_tests {
         let rows = all_downloaded(db.as_ref()).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, AssetStatus::Downloaded);
-        assert_eq!(&*rows[0].id, "A1");
+        assert_eq!(&*rows[0].id, "A1_asset");
     }
 
     #[tokio::test]
@@ -1931,6 +2115,443 @@ mod wiremock_tests {
         let rows = all_downloaded(db.as_ref()).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(&*rows[0].filename, fname);
+    }
+
+    #[tokio::test]
+    async fn name_id7_import_uses_distinct_child_identity() {
+        let server = crate::start_wiremock_or_skip!();
+        let mut asset = WiremockAsset::new("master-913", "IMG_913.JPG", "public.jpeg").orig(
+            1024,
+            "checksum-913",
+            "public.jpeg",
+        );
+        asset.child_record_name = "child-913".to_string();
+        let tmp = TempDir::new().unwrap();
+        let mut config = base_config(tmp.path());
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        config.folder_structure = "none".to_string();
+        // Independent URL-safe Base64 prefixes: master-913 = bWFzdGV,
+        // child-913 = Y2hpbGQ. REC123 and REC123_asset both start UkVDMTI.
+        let path = tmp.path().join("IMG_913_Y2hpbGQ.JPG");
+        stage_file(&path, 1024);
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats.matched, 1);
+        assert_eq!(stats.unmatched, 0);
+        let rows = all_downloaded(db.as_ref()).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_ref(), "child-913");
+        assert_eq!(rows[0].filename.as_ref(), "IMG_913_Y2hpbGQ.JPG");
+        assert_eq!(rows[0].local_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn import_legacy_identity_claim_is_guarded_and_atomic_with_adoption() {
+        let server = crate::start_wiremock_or_skip!();
+        let tmp = TempDir::new().unwrap();
+        let mut asset = WiremockAsset::new("master-913", "legacy.JPG", "public.jpeg").orig(
+            32,
+            "legacy-checksum",
+            "public.jpeg",
+        );
+        asset.child_record_name = "child-913".to_string();
+        let photo = asset.to_photo_asset();
+        let mut config = base_config(tmp.path());
+        config.folder_structure = "none".to_string();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let master_path = tmp.path().join("legacy_bWFzdGV.JPG");
+        stage_file(&master_path, 32);
+        let db = open_db(&tmp).await;
+        let record = crate::state::AssetRecord::new_pending(
+            Arc::from("test-all"),
+            "master-913".to_string(),
+            VersionSizeKey::Original,
+            "legacy-checksum".to_string(),
+            "legacy_bWFzdGV.JPG".to_string(),
+            photo.created(),
+            Some(photo.added_date()),
+            32,
+            crate::state::MediaType::Photo,
+        );
+        db.import_adopt(
+            &record,
+            &master_path,
+            "retained-checksum",
+            32,
+            super::file_mtime_epoch(&std::fs::metadata(&master_path).unwrap()),
+        )
+        .await
+        .unwrap();
+        let stats = run_import(
+            &server,
+            std::slice::from_ref(&asset),
+            db.as_ref(),
+            &config,
+            true,
+        )
+        .await;
+        assert_eq!(stats.matched, 1);
+        assert!(
+            db.get_legacy_master_state_owners()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+        server.reset().await;
+        let conn = rusqlite::Connection::open(tmp.path().join("state.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER refuse_adoption BEFORE UPDATE ON assets BEGIN SELECT RAISE(ABORT,'injected adoption failure'); END;").unwrap();
+        let stats = run_import(
+            &server,
+            std::slice::from_ref(&asset),
+            db.as_ref(),
+            &config,
+            false,
+        )
+        .await;
+        assert_eq!(stats.matched, 0);
+        assert_eq!(
+            stats.skipped_already_imported, 0,
+            "unclaimed legacy imports must complete adoption"
+        );
+        assert!(
+            db.get_legacy_master_state_owners()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+        let rows = all_downloaded(db.as_ref()).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_checksum.as_deref(), Some("retained-checksum"));
+        assert!(db.get_pending().await.unwrap().is_empty());
+        assert_eq!(std::fs::read(&master_path).unwrap(), vec![0; 32]);
+        conn.execute_batch("DROP TRIGGER refuse_adoption;").unwrap();
+        drop(conn);
+        server.reset().await;
+        let stats = run_import(
+            &server,
+            std::slice::from_ref(&asset),
+            db.as_ref(),
+            &config,
+            false,
+        )
+        .await;
+        assert_eq!(stats.matched, 1);
+        assert_eq!(stats.skipped_already_imported, 0);
+        assert_eq!(
+            db.get_legacy_master_state_owners().await.unwrap(),
+            std::collections::HashSet::from([(
+                "test-all".to_string(),
+                "master-913".to_string(),
+                "child-913".to_string()
+            )])
+        );
+        db.upsert_asset_master_mapping("test-all", "other-child", "master-913")
+            .await
+            .unwrap();
+        drop(db);
+        let db = open_db(&tmp).await;
+        server.reset().await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats.matched, 1);
+        assert_eq!(stats.skipped_already_imported, 1);
+        let rows = all_downloaded(db.as_ref()).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_ref(), "master-913");
+        assert_eq!(rows[0].local_path.as_deref(), Some(master_path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn import_repeated_legacy_child_across_passes_preserves_sync_identity_and_sibling_guard()
+    {
+        for (persisted_owner, sibling_first) in
+            [(false, true), (false, false), (true, true), (true, false)]
+        {
+            let tmp = TempDir::new().unwrap();
+            let mut fixture = WiremockAsset::new("master-913", "legacy.JPG", "public.jpeg").orig(
+                32,
+                "legacy-checksum",
+                "public.jpeg",
+            );
+            fixture.child_record_name = "child-913".to_owned();
+            let photo = fixture.to_photo_asset();
+            let db = open_db(&tmp).await;
+            let record = crate::state::AssetRecord::new_pending(
+                Arc::from("test-all"),
+                "master-913".to_owned(),
+                VersionSizeKey::Original,
+                "legacy-checksum".to_owned(),
+                "legacy_bWFzdGV.JPG".to_owned(),
+                photo.created(),
+                Some(photo.added_date()),
+                32,
+                crate::state::MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+            if persisted_owner {
+                assert!(
+                    db.claim_legacy_master_state_owner("test-all", "master-913", "child-913")
+                        .await
+                        .unwrap()
+                );
+            }
+            let mut preflight = ImportPreflight::default();
+            let mut sibling = fixture.clone();
+            sibling.child_record_name = "other-child".to_owned();
+            let changed = fixture
+                .clone()
+                .orig(32, "changed-provider-generation", "public.jpeg");
+            let mut files = Vec::new();
+            let mixed_pass = if sibling_first {
+                vec![sibling, fixture.clone()]
+            } else {
+                vec![fixture.clone(), sibling]
+            };
+            for (index, observations) in [
+                vec![fixture.clone()],
+                vec![fixture],
+                mixed_pass,
+                vec![changed],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let root = tmp.path().join(format!("pass-{index}"));
+                let mut config = base_config(&root);
+                config.folder_structure = "none".to_owned();
+                config.file_match_policy = FileMatchPolicy::NameId7;
+                let path = root.join("legacy_bWFzdGV.JPG");
+                stage_file(&path, 32);
+                files.push(path);
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                drop(sender);
+                collect_import_assets(
+                    futures_util::stream::iter(
+                        observations
+                            .into_iter()
+                            .map(|observation| Ok(observation.to_photo_asset())),
+                    ),
+                    receiver,
+                    db.as_ref(),
+                    &config,
+                    "test-all",
+                    &mut DirCache::new(),
+                    ImportRunOptions::default(),
+                    &mut preflight,
+                )
+                .await
+                .unwrap();
+                assert_eq!(db.get_summary().await.unwrap().total_assets, 1);
+                assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+            }
+            assert_eq!(
+                preflight
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.record.id.as_ref())
+                    .collect::<Vec<_>>(),
+                if sibling_first {
+                    [
+                        "master-913",
+                        "master-913",
+                        "other-child",
+                        "master-913",
+                        "child-913",
+                    ]
+                } else {
+                    [
+                        "master-913",
+                        "master-913",
+                        "master-913",
+                        "other-child",
+                        "child-913",
+                    ]
+                }
+            );
+            let stats = preflight
+                .adopt(db.as_ref(), ImportRunOptions::default())
+                .await
+                .unwrap();
+            assert_eq!((stats.matched, stats.unmatched), (3, 2));
+            drop(db);
+            let db = open_db(&tmp).await;
+            let rows = all_downloaded(db.as_ref()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "master-913");
+            assert_eq!(rows[0].local_path.as_ref(), Some(&files[2]));
+            assert_eq!(db.get_asset_master_mappings().await.unwrap().len(), 1);
+            assert_eq!(
+                db.get_legacy_master_state_owners().await.unwrap(),
+                std::collections::HashSet::from([(
+                    "test-all".to_owned(),
+                    "master-913".to_owned(),
+                    "child-913".to_owned()
+                )])
+            );
+            assert!(db.get_pending().await.unwrap().is_empty());
+            for path in files {
+                assert_eq!(std::fs::read(path).unwrap(), vec![0; 32]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn import_ambiguous_legacy_family_uses_child_and_preserves_master() {
+        let server = crate::start_wiremock_or_skip!();
+        let tmp = TempDir::new().unwrap();
+        let mut asset = WiremockAsset::new("master-913", "legacy.JPG", "public.jpeg").orig(
+            32,
+            "legacy-checksum",
+            "public.jpeg",
+        );
+        asset.child_record_name = "child-913".to_string();
+        let photo = asset.to_photo_asset();
+        let mut config = base_config(tmp.path());
+        config.folder_structure = "none".to_string();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let master_path = tmp.path().join("legacy_bWFzdGV.JPG");
+        let child_path = tmp.path().join("legacy_Y2hpbGQ.JPG");
+        stage_file(&master_path, 32);
+        stage_file(&child_path, 32);
+        let db = open_db(&tmp).await;
+        let record = crate::state::AssetRecord::new_pending(
+            Arc::from("test-all"),
+            "master-913".to_string(),
+            VersionSizeKey::Original,
+            "legacy-checksum".to_string(),
+            "legacy_bWFzdGV.JPG".to_string(),
+            photo.created(),
+            Some(photo.added_date()),
+            32,
+            crate::state::MediaType::Photo,
+        );
+        db.import_adopt(&record, &master_path, "retained-checksum", 32, None)
+            .await
+            .unwrap();
+        for child in ["child-913", "other-child"] {
+            db.upsert_asset_master_mapping("test-all", child, "master-913")
+                .await
+                .unwrap();
+        }
+        for cycle in 0..2 {
+            server.reset().await;
+            let stats = run_import(
+                &server,
+                std::slice::from_ref(&asset),
+                db.as_ref(),
+                &config,
+                false,
+            )
+            .await;
+            assert_eq!(stats.matched, 1);
+            assert_eq!(stats.skipped_already_imported, cycle);
+            assert!(
+                db.get_legacy_master_state_owners()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let rows = all_downloaded(db.as_ref()).await;
+            assert_eq!(rows.len(), 2);
+            let master = rows
+                .iter()
+                .find(|row| row.id.as_ref() == "master-913")
+                .unwrap();
+            assert_eq!(master.local_checksum.as_deref(), Some("retained-checksum"));
+            assert_eq!(master.local_path.as_deref(), Some(master_path.as_path()));
+            let child = rows
+                .iter()
+                .find(|row| row.id.as_ref() == "child-913")
+                .unwrap();
+            assert_eq!(child.local_path.as_deref(), Some(child_path.as_path()));
+        }
+    }
+
+    #[tokio::test]
+    async fn import_owner_query_failure_and_interruption_do_not_claim_legacy_state() {
+        let tmp = TempDir::new().unwrap();
+        let mut asset = WiremockAsset::new("master-913", "legacy.JPG", "public.jpeg").orig(
+            32,
+            "legacy-checksum",
+            "public.jpeg",
+        );
+        asset.child_record_name = "child-913".to_string();
+        let photo = asset.to_photo_asset();
+        let mut config = base_config(tmp.path());
+        config.folder_structure = "none".to_string();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let db = open_db(&tmp).await;
+        let record = crate::state::AssetRecord::new_pending(
+            Arc::from("test-all"),
+            "master-913".to_string(),
+            VersionSizeKey::Original,
+            "legacy-checksum".to_string(),
+            "legacy_bWFzdGV.JPG".to_string(),
+            photo.created(),
+            Some(photo.added_date()),
+            32,
+            crate::state::MediaType::Photo,
+        );
+        db.upsert_seen(&record).await.unwrap();
+        stage_file(&tmp.path().join("legacy_bWFzdGV.JPG"), 32);
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(sender);
+        let result = import_assets(
+            futures_util::stream::iter(vec![Ok(photo.clone())]),
+            receiver,
+            db.as_ref(),
+            &config,
+            "test-all",
+            &mut DirCache::new(),
+            ImportRunOptions {
+                shutdown_token: Some(&cancelled),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("interrupted"));
+        assert!(
+            db.get_legacy_master_state_owners()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+        let conn = rusqlite::Connection::open(tmp.path().join("state.db")).unwrap();
+        conn.execute_batch("ALTER TABLE legacy_master_state_owners RENAME TO retained_owners;")
+            .unwrap();
+        stage_file(&tmp.path().join("legacy_Y2hpbGQ.JPG"), 32);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(sender);
+        let stats = import_assets(
+            futures_util::stream::iter(vec![Ok(photo)]),
+            receiver,
+            db.as_ref(),
+            &config,
+            "test-all",
+            &mut DirCache::new(),
+            ImportRunOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.matched, 1);
+        let rows = all_downloaded(db.as_ref()).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_ref(), "child-913");
+        assert_eq!(
+            db.get_pending().await.unwrap().len(),
+            1,
+            "legacy retry remains pending"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM retained_owners", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     /// If `file_match_policy` defaults are used (NameSizeDedupWithSuffix),
@@ -2192,7 +2813,7 @@ mod wiremock_tests {
             .path
             .with_file_name(crate::download::paths::insert_suffix(
                 &mov_collision_base,
-                "LIVE6-2",
+                "LIVE6_asset-2",
             ));
         stage_file(&primary_collision, primary.size);
         stage_file(&mov_collision, mov.size);
@@ -2208,7 +2829,7 @@ mod wiremock_tests {
         );
         assert!(
             rows.iter()
-                .any(|r| r.filename.as_ref() == "IMG_0600-3000_HEVC-LIVE6-2.MOV")
+                .any(|r| r.filename.as_ref() == "IMG_0600-3000_HEVC-LIVE6_asset-2.MOV")
         );
     }
 
@@ -2238,7 +2859,7 @@ mod wiremock_tests {
                 .path
                 .with_file_name(crate::download::paths::insert_asset_identity_suffix(
                     primary_name,
-                    "LIVE/SLASH6",
+                    "LIVE/SLASH6_asset",
                 ));
         let mov_collision_base = crate::download::paths::live_photo_mov_path_suffix(
             primary_collision
@@ -2249,7 +2870,7 @@ mod wiremock_tests {
         let mov_collision = mov.path.with_file_name(
             crate::download::paths::insert_asset_identity_ordinal_suffix(
                 &mov_collision_base,
-                "LIVE/SLASH6",
+                "LIVE/SLASH6_asset",
                 22,
             ),
         );
@@ -2263,11 +2884,11 @@ mod wiremock_tests {
         let rows = all_downloaded(db.as_ref()).await;
         assert!(
             rows.iter()
-                .any(|r| r.filename.as_ref() == "IMG_0610-LIVE_SLASH6.HEIC")
+                .any(|r| r.filename.as_ref() == "IMG_0610-LIVE_SLASH6_asset.HEIC")
         );
         assert!(
-            rows.iter()
-                .any(|r| r.filename.as_ref() == "IMG_0610-LIVE_SLASH6_HEVC-LIVE_SLASH6-22.MOV")
+            rows.iter().any(|r| r.filename.as_ref()
+                == "IMG_0610-LIVE_SLASH6_asset_HEVC-LIVE_SLASH6_asset-22.MOV")
         );
     }
 
@@ -3303,6 +3924,363 @@ mod wiremock_tests {
         );
     }
 
+    #[tokio::test]
+    async fn import_refuses_foreign_owner_omitted_from_selection_including_historical_album_paths()
+    {
+        for receipt_kind in 0..3 {
+            let server = crate::start_wiremock_or_skip!();
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("photos");
+            let mut config = base_config(&root);
+            config.folder_structure = "none".to_owned();
+            config.file_match_policy = FileMatchPolicy::NameId7;
+            let mut fixture = WiremockAsset::new("master-second", "photo.JPG", "public.jpeg").orig(
+                12,
+                "provider-second",
+                "public.jpeg",
+            );
+            fixture.child_record_name = "alpha-second".to_owned();
+            let photo = fixture.to_photo_asset();
+            let path = root.join("photo_YWxwaGE.JPG");
+            stage_file(&path, 12);
+            let hash = crate::download::file::compute_sha256(&path).await.unwrap();
+            let db = open_db(&tmp).await;
+            let mut existing = crate::state::AssetRecord::new_pending(
+                Arc::from("test-all"),
+                "alpha-first".to_owned(),
+                VersionSizeKey::Original,
+                "provider-first".to_owned(),
+                "photo_YWxwaGE.JPG".to_owned(),
+                photo.created(),
+                Some(photo.added_date()),
+                12,
+                crate::state::MediaType::Photo,
+            );
+            db.import_adopt(&existing, &path, &hash, 12, None)
+                .await
+                .unwrap();
+            if receipt_kind != 0 {
+                let other = tmp.path().join("other-album/photo_YWxwaGE.JPG");
+                stage_file(&other, 12);
+                if receipt_kind == 2 {
+                    existing.checksum = "new-provider-generation".into();
+                }
+                db.import_adopt(&existing, &other, &hash, 12, None)
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..2 {
+                server.reset().await;
+                let stats = run_import(
+                    &server,
+                    std::slice::from_ref(&fixture),
+                    db.as_ref(),
+                    &config,
+                    false,
+                )
+                .await;
+                assert_eq!(
+                    (stats.matched, stats.unmatched),
+                    (0, 1),
+                    "receipt kind {receipt_kind}: {stats:?}"
+                );
+                assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+            }
+            drop(db);
+            let db = open_db(&tmp).await;
+            let rows = all_downloaded(db.as_ref()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "alpha-first");
+            assert_eq!(rows[0].checksum, existing.checksum);
+            assert_eq!(std::fs::read(path).unwrap(), vec![0; 12]);
+            assert!(db.get_pending().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn import_foreign_occupancy_uses_one_absolute_key_for_relative_and_absolute_root_spellings()
+     {
+        std::fs::create_dir_all(".scratch").unwrap();
+        for relative_receipt in [false, true] {
+            let server = crate::start_wiremock_or_skip!();
+            let tmp = TempDir::new_in(".scratch").unwrap();
+            let absolute = crate::fs_util::absolute_confined_path(tmp.path()).unwrap();
+            let cwd = std::env::current_dir().unwrap();
+            let relative = absolute.strip_prefix(&cwd).unwrap().to_path_buf();
+            let (existing_root, selected_root) = if relative_receipt {
+                (relative, absolute)
+            } else {
+                (absolute, relative)
+            };
+            let mut config = base_config(&selected_root.join("photos"));
+            config.folder_structure = "none".to_owned();
+            config.file_match_policy = FileMatchPolicy::NameId7;
+            let mut fixture = WiremockAsset::new("master-second", "photo.JPG", "public.jpeg").orig(
+                12,
+                "provider-second",
+                "public.jpeg",
+            );
+            fixture.child_record_name = "alpha-second".to_owned();
+            let photo = fixture.to_photo_asset();
+            let path = existing_root.join("photos/photo_YWxwaGE.JPG");
+            stage_file(&path, 12);
+            let hash = crate::download::file::compute_sha256(&path).await.unwrap();
+            let db = open_db(&tmp).await;
+            let existing = crate::state::AssetRecord::new_pending(
+                Arc::from("test-all"),
+                "alpha-first".to_owned(),
+                VersionSizeKey::Original,
+                "provider-first".to_owned(),
+                "photo_YWxwaGE.JPG".to_owned(),
+                photo.created(),
+                Some(photo.added_date()),
+                12,
+                crate::state::MediaType::Photo,
+            );
+            db.import_adopt(&existing, &path, &hash, 12, None)
+                .await
+                .unwrap();
+            let stats = run_import(&server, &[fixture], db.as_ref(), &config, false).await;
+            assert_eq!((stats.matched, stats.unmatched), (0, 1));
+            let rows = all_downloaded(db.as_ref()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "alpha-first");
+            assert_eq!(rows[0].local_path.as_ref(), Some(&path));
+            assert_eq!(std::fs::read(&path).unwrap(), vec![0; 12]);
+            assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn import_current_extra_album_receipt_resolves_ambiguous_base_but_stale_or_corrupt_receipt_does_not()
+     {
+        for proof_kind in 0..3 {
+            let server = crate::start_wiremock_or_skip!();
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("album-a");
+            let mut config = base_config(&root);
+            config.folder_structure = "none".to_owned();
+            config.file_match_policy = FileMatchPolicy::NameId7;
+            let mut first = WiremockAsset::new("master-first", "photo.JPG", "public.jpeg").orig(
+                12,
+                "provider-first",
+                "public.jpeg",
+            );
+            first.child_record_name = "alpha-first".to_owned();
+            let mut second = WiremockAsset::new("master-second", "photo.JPG", "public.jpeg").orig(
+                12,
+                "provider-second",
+                "public.jpeg",
+            );
+            second.child_record_name = "alpha-second".to_owned();
+            let photo = first.to_photo_asset();
+            let path = root.join("photo_YWxwaGE.JPG");
+            stage_file(&path, 12);
+            let hash = crate::download::file::compute_sha256(&path).await.unwrap();
+            let db = open_db(&tmp).await;
+            let mut record = crate::state::AssetRecord::new_pending(
+                Arc::from("test-all"),
+                "alpha-first".to_owned(),
+                VersionSizeKey::Original,
+                "provider-first".to_owned(),
+                "photo_YWxwaGE.JPG".to_owned(),
+                photo.created(),
+                Some(photo.added_date()),
+                12,
+                crate::state::MediaType::Photo,
+            );
+            db.import_adopt(&record, &path, &hash, 12, None)
+                .await
+                .unwrap();
+            let canonical = tmp.path().join("album-b/photo_YWxwaGE.JPG");
+            stage_file(&canonical, 12);
+            if proof_kind == 1 {
+                record.checksum = "stale-provider-generation".into();
+            }
+            db.import_adopt(&record, &canonical, &hash, 12, None)
+                .await
+                .unwrap();
+            if proof_kind == 2 {
+                std::fs::write(&path, vec![1; 12]).unwrap();
+            }
+            let stats = run_import(&server, &[first, second], db.as_ref(), &config, false).await;
+            assert_eq!(
+                (stats.matched, stats.unmatched),
+                if proof_kind == 0 { (1, 1) } else { (0, 2) },
+                "proof {proof_kind}: {stats:?}"
+            );
+            drop(db);
+            let db = open_db(&tmp).await;
+            let rows = all_downloaded(db.as_ref()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "alpha-first");
+            assert_eq!(rows[0].checksum, record.checksum);
+            assert_eq!(
+                rows[0].local_path.as_ref(),
+                Some(if proof_kind == 0 { &path } else { &canonical })
+            );
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                vec![if proof_kind == 2 { 1 } else { 0 }; 12]
+            );
+            assert_eq!(std::fs::read(canonical).unwrap(), vec![0; 12]);
+            assert!(db.get_pending().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn import_preflight_late_error_panic_and_cancel_leave_no_ownership() {
+        for mode in 0..3 {
+            let tmp = TempDir::new().unwrap();
+            let dl = tmp.path().join("photos");
+            let config = base_config(&dl);
+            let fixture = WiremockAsset::new("master-late", "late.JPG", "public.jpeg").orig(
+                12,
+                "provider-late",
+                "public.jpeg",
+            );
+            stage_expected(&fixture.to_photo_asset(), &config);
+            let asset = fixture.to_photo_asset();
+            let token = tokio_util::sync::CancellationToken::new();
+            let cancel = token.clone();
+            let stream = futures_util::stream::unfold(0, move |index| {
+                let asset = asset.clone();
+                let cancel = cancel.clone();
+                async move {
+                    if index == 0 {
+                        return Some((Ok(asset), 1));
+                    }
+                    if mode == 0 {
+                        return Some((Err(anyhow::anyhow!("late page failure")), 2));
+                    }
+                    if mode == 2 {
+                        cancel.cancel();
+                    }
+                    None
+                }
+            });
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            if mode == 1 {
+                sender.send(true).unwrap();
+            } else {
+                drop(sender);
+            }
+            let db = open_db(&tmp).await;
+            import_assets(
+                stream,
+                receiver,
+                db.as_ref(),
+                &config,
+                "test-all",
+                &mut DirCache::new(),
+                ImportRunOptions {
+                    shutdown_token: Some(&token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("incomplete enumeration cannot adopt");
+            assert_eq!(db.get_summary().await.unwrap().total_assets, 0);
+            assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+            assert!(
+                db.get_legacy_master_state_owners()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_preflight_censuses_late_pass_collisions_before_any_adoption() {
+        for (first_id, second_id, disk_name) in [
+            ("alpha-child", "alpha-second", "same_YWxwaGE.JPG"),
+            (
+                "alpha-/child",
+                "alpha-_child",
+                "same_YWxwaGE-alpha-_child.JPG",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let dl = tmp.path().join("photos");
+            let mut config = base_config(&dl);
+            config.folder_structure = "none".to_owned();
+            config.file_match_policy = FileMatchPolicy::NameId7;
+            let mut first = WiremockAsset::new("master-first", "same.JPG", "public.jpeg").orig(
+                12,
+                "provider-first",
+                "public.jpeg",
+            );
+            first.child_record_name = first_id.to_owned();
+            let mut second = WiremockAsset::new("master-second", "same.JPG", "public.jpeg").orig(
+                12,
+                "provider-second",
+                "public.jpeg",
+            );
+            second.child_record_name = second_id.to_owned();
+            let path = dl.join(disk_name);
+            stage_file(&path, 12);
+            let db = open_db(&tmp).await;
+            let mut preflight = ImportPreflight::default();
+            for fixture in [first, second] {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                drop(sender);
+                collect_import_assets(
+                    futures_util::stream::iter([Ok(fixture.to_photo_asset())]),
+                    receiver,
+                    db.as_ref(),
+                    &config,
+                    "test-all",
+                    &mut DirCache::new(),
+                    ImportRunOptions::default(),
+                    &mut preflight,
+                )
+                .await
+                .unwrap();
+                assert_eq!(db.get_summary().await.unwrap().total_assets, 0);
+            }
+            let stats = preflight
+                .adopt(db.as_ref(), ImportRunOptions::default())
+                .await
+                .unwrap();
+            assert_eq!((stats.matched, stats.unmatched), (0, 2));
+            assert_eq!(db.get_summary().await.unwrap().total_assets, 0);
+            assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn import_refuses_multiple_identity_ordinals_without_a_durable_receipt() {
+        let server = crate::start_wiremock_or_skip!();
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        let mut config = base_config(&dl);
+        config.folder_structure = "none".to_owned();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let mut fixture = WiremockAsset::new("master-ordinal", "same.JPG", "public.jpeg").orig(
+            12,
+            "provider-ordinal",
+            "public.jpeg",
+        );
+        fixture.child_record_name = "alpha-child".to_owned();
+        for ordinal in [1, 2] {
+            stage_file(
+                &dl.join(
+                    crate::download::paths::insert_asset_identity_ordinal_suffix(
+                        "same_YWxwaGE.JPG",
+                        "alpha-child",
+                        ordinal,
+                    ),
+                ),
+                12,
+            );
+        }
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[fixture], db.as_ref(), &config, false).await;
+        assert_eq!((stats.matched, stats.unmatched), (0, 1));
+        assert_eq!(db.get_summary().await.unwrap().total_assets, 0);
+    }
+
     // ── cancellation / fetcher-panic propagation ──────────────────────
     //
     // import_assets accepts `panic_rx`, the receiver from
@@ -3467,6 +4445,8 @@ mod wiremock_tests {
             "public.jpeg",
         );
 
+        stage_expected(&asset1.to_photo_asset(), &config);
+        stage_expected(&asset2.to_photo_asset(), &config);
         let server = crate::start_wiremock_or_skip!();
         Mock::given(wm_method("POST"))
             .and(wm_path("/records/query"))
@@ -3491,7 +4471,7 @@ mod wiremock_tests {
             "test-all",
             &mut dir_cache,
             ImportRunOptions {
-                dry_run: true,
+                dry_run: false,
                 ..Default::default()
             },
         )

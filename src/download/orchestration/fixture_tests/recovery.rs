@@ -18,7 +18,7 @@ async fn bundled_import_media_filter_roundtrip() {
         let mut h = Harness::new().await;
         h.config.file_match_policy = policy;
         let filename = if policy == crate::types::FileMatchPolicy::NameId7 {
-            "Photo_cGhvdG8.JPG"
+            "Photo_YXNzZXQ.JPG"
         } else {
             "Photo.JPG"
         };
@@ -75,6 +75,7 @@ async fn bundled_import_media_filter_roundtrip() {
             assert_eq!(result.stats.downloaded, 0);
             let rows = h.db().get_downloaded_page(0, 10).await.unwrap();
             assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "asset-photo");
             assert_eq!(
                 rows[0].local_path.as_ref(),
                 Some(&h.config.directory.join(filename))

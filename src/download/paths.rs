@@ -597,12 +597,14 @@ fn read_dir_entries(dir: &Path) -> FxHashMap<String, u64> {
 #[derive(Debug)]
 pub(crate) struct DirCache {
     dirs: FxHashMap<PathBuf, FxHashMap<String, u64>>,
+    import_names: FxHashMap<PathBuf, Vec<(String, String, u64)>>,
 }
 
 impl DirCache {
     pub fn new() -> Self {
         Self {
             dirs: FxHashMap::default(),
+            import_names: FxHashMap::default(),
         }
     }
 
@@ -610,6 +612,7 @@ impl DirCache {
     #[cfg(test)]
     pub fn clear(&mut self) {
         self.dirs.clear();
+        self.import_names.clear();
     }
 
     /// Pre-populate the cache for `dir` on the blocking threadpool.
@@ -632,6 +635,60 @@ impl DirCache {
             FxHashMap::default()
         });
         self.dirs.insert(dir_buf, entries);
+    }
+
+    /// Build import's sorted prefix index off the async runtime. Move the
+    /// cached listing into the worker and return it with the index, avoiding
+    /// another scan or a synchronous whole-directory clone.
+    pub(crate) async fn ensure_import_dir_async(&mut self, dir: &Path) {
+        self.ensure_dir_async(dir).await;
+        if self.import_names.contains_key(dir) {
+            return;
+        }
+        let entries = self.dirs.remove(dir).unwrap_or_default();
+        let (entries, names) = tokio::task::spawn_blocking(move || {
+            let mut names: Vec<_> = entries
+                .iter()
+                .map(|(name, bytes)| (normalize_ampm(name), name.clone(), *bytes))
+                .collect();
+            names.sort();
+            (entries, names)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Failed to build import directory index");
+            (FxHashMap::default(), Vec::new())
+        });
+        self.dirs.insert(dir.to_owned(), entries);
+        self.import_names.insert(dir.to_owned(), names);
+    }
+
+    /// Indexed collision candidates. Ensure the import index first. Prefix
+    /// probes avoid scanning every directory entry for each selected rendition.
+    pub(crate) fn matching_paths(
+        &self,
+        dir: &Path,
+        size: u64,
+        prefixes: &[String],
+    ) -> Vec<PathBuf> {
+        let Some(names) = self.import_names.get(dir) else {
+            return Vec::new();
+        };
+        let mut paths = Vec::new();
+        for prefix in prefixes {
+            let start = names.partition_point(|(name, _, _)| name.as_str() < prefix.as_str());
+            paths.extend(
+                names
+                    .iter()
+                    .skip(start)
+                    .take_while(|(name, _, _)| name.starts_with(prefix))
+                    .filter(|(_, _, bytes)| *bytes == size)
+                    .map(|(_, name, _)| dir.join(name)),
+            );
+        }
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Check whether `path` exists on disk, using cached directory listings.

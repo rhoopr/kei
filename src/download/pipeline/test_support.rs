@@ -248,6 +248,7 @@ impl ImportStateStore for FailingDownloadStore {
         _: &str,
         _: u64,
         _: Option<i64>,
+        _: Option<(&str, &str)>,
     ) -> Result<(), StateError> {
         unimplemented!()
     }

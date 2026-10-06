@@ -53,6 +53,23 @@ the paths kei would use for each asset, and adopts any local file with the
 right path and size into the SQLite state database. The next `kei sync` skips
 those adopted files and downloads only new or previously failed assets.
 
+Import completes enumeration of every selected library and album pass before
+writing adoption rows. An interrupted or failed listing leaves those rows
+unwritten. The preflight uses memory proportional to selected renditions, all
+durable catalogue paths and current receipts, and cached directory entries.
+There is no fixed memory cap or disk spool. Existing owners, including omitted
+assets and historical album paths, prevent another asset adopting their files.
+
+The `name-id7` suffix uses the same selected child identity as sync, including
+its guarded legacy compatibility behavior. When two children share a short
+suffix, import can use a unique full child-ID collision filename. A shared
+short-name file needs an existing current state record whose local hash verifies
+that exact file; otherwise import reports the rendition as unmatched and logs
+an ambiguity warning. Multiple same-size ordinal siblings and colliding
+sanitized child IDs also remain unmatched without verified durable ownership.
+Import does not rename or overwrite these files.
+
+
 Run a dry import first when you're not sure the config matches the old tree:
 
 ```sh
