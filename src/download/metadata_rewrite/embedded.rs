@@ -144,7 +144,7 @@ pub(super) async fn publish_embed_metadata(
 ) -> EmbedWriteResult {
     let embed_path = path.to_path_buf();
     match tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "xmp"))]
         publication_pause::wait(&embed_path);
         prepared.publish(&embed_path)
     })
@@ -206,7 +206,7 @@ pub(super) async fn write_embed_metadata(
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "xmp"))]
 pub(in crate::download) mod publication_pause {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
