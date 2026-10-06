@@ -48,13 +48,17 @@ fn test_temp_download_path_derives_from_checksum() {
 }
 
 #[test]
-fn test_temp_download_path_same_checksum_same_result() {
+fn test_temp_download_path_same_checksum_independent_destinations() {
     let path1 = PathBuf::from("/photos/a.jpg");
     let path2 = PathBuf::from("/photos/b.jpg");
     let result1 = temp_download_path(&path1, "AAAA", ".kei-tmp").unwrap();
     let result2 = temp_download_path(&path2, "AAAA", ".kei-tmp").unwrap();
-    // Same checksum, same directory -> same temp file (for resume)
-    assert_eq!(result1, result2);
+    // Independent destinations must never share staging bytes.
+    assert_ne!(result1, result2);
+    assert_eq!(
+        result1,
+        temp_download_path(&path1, "AAAA", ".kei-tmp").unwrap()
+    );
 }
 
 #[test]
@@ -107,8 +111,8 @@ fn temp_download_path_different_directories_produce_different_paths() {
     assert_eq!(result_a.parent().unwrap(), Path::new("/photos/2024"));
     assert_eq!(result_b.parent().unwrap(), Path::new("/photos/2025"));
     assert_ne!(result_a, result_b);
-    // But the filename portion (base32 + suffix) should be identical
-    assert_eq!(result_a.file_name(), result_b.file_name());
+    // The absolute destination is part of the staging identity.
+    assert_ne!(result_a.file_name(), result_b.file_name());
 }
 
 #[test]
@@ -126,10 +130,14 @@ fn temp_download_path_url_unsafe_base64_chars_produce_safe_filename() {
     assert!(!filename.contains('+'), "filename should not contain '+'");
     assert!(!filename.contains('/'), "filename should not contain '/'");
     // Base32 alphabet is A-Z, 2-7 — verify the stem uses only those
-    let stem = filename.strip_suffix(".kei-tmp").unwrap();
+    let stem = filename
+        .strip_suffix(".kei-tmp")
+        .unwrap()
+        .strip_prefix("kei-v1-")
+        .unwrap();
     assert!(
         stem.chars()
-            .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)),
+            .all(|c| c == '-' || c.is_ascii_uppercase() || ('2'..='7').contains(&c)),
         "base32 stem should only contain A-Z and 2-7, got: {stem}"
     );
 }
@@ -2754,4 +2762,53 @@ async fn tactical_416_rejected_fresh_content_type_preserves_retained_part() {
         );
         assert!(!final_path.exists());
     }
+}
+
+#[test]
+fn staging_identity_is_bounded_stable_and_generation_sensitive() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join(format!("{}.jpg", "x".repeat(200)));
+    let checksum = base64::engine::general_purpose::STANDARD.encode([7u8; 1024]);
+    let part = temp_download_path(&path, &checksum, ".custom").unwrap();
+    assert_eq!(part.file_name().unwrap().len(), 119);
+    assert_eq!(
+        part,
+        temp_download_path(&path, &checksum, ".custom").unwrap()
+    );
+    assert_ne!(part, temp_download_path(&path, "AAAA", ".custom").unwrap());
+    assert_eq!(
+        part,
+        temp_download_path(
+            &dir.path().join(".").join(path.file_name().unwrap()),
+            &checksum,
+            ".custom"
+        )
+        .unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_identity_preserves_non_utf8_destination_names() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = TempDir::new().unwrap();
+    let a = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"a-\xff.jpg".to_vec()));
+    let b = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"a-\xfe.jpg".to_vec()));
+    assert_ne!(
+        temp_download_path(&a, "AAAA", ".part").unwrap(),
+        temp_download_path(&b, "AAAA", ".part").unwrap()
+    );
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn staging_identity_coordinates_case_equivalent_destinations() {
+    let dir = TempDir::new().unwrap();
+    let a = temp_download_path(&dir.path().join("A.jpg"), "AAAA", ".part").unwrap();
+    let b = temp_download_path(&dir.path().join("a.JPG"), "AAAA", ".part").unwrap();
+    assert_eq!(a.file_name(), b.file_name());
 }

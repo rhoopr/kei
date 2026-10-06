@@ -129,6 +129,18 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
         context.temp_suffix,
     )
     .context("Could not compute temporary download path")?;
+    let _staging_guard = crate::download::file::lock_download_destination(
+        &task.download_path,
+        context.shutdown_token,
+    )
+    .await?;
+    if context.shutdown_token.is_cancelled() {
+        return Err(DownloadError::Interrupted {
+            path: task.download_path.display().to_string().into(),
+            bytes_written: 0,
+        }
+        .into());
+    }
     if let Some(db) = context.state_db {
         db.claim_temp_file(&owned_part_path)
             .await
@@ -312,3 +324,6 @@ fn download_file_times(path: &Path, timestamp: i64) -> FileTimes {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod staging_tests;
