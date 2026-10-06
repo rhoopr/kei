@@ -1,0 +1,238 @@
+name: Publish #853 frozen-release diagnostics
+
+on:
+  push:
+    branches:
+      - automation/853-diagnostic-publisher-feb441bb
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnostic-853-feb441bb
+  cancel-in-progress: false
+
+env:
+  SOURCE_REVISION: feb441bbd6f9f1dd7ae4fa100fbe69c17beb2f98
+  BASE_REVISION: 0fef3db2deed8e4d611cb08aaf6ccbda504b16d9
+  IMAGE: ghcr.io/rhoopr/kei:diag-853-v0241-feb441bbd6f9f1dd7ae4fa100fbe69c17beb2f98
+
+jobs:
+  build:
+    if: >-
+      github.repository == 'rhoopr/kei' &&
+      github.actor == 'rhoopr' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/automation/853-diagnostic-publisher-feb441bb' &&
+      github.event.created == true &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      image_id: ${{ steps.identity.outputs.image_id }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rhoopr/kei
+          ref: feb441bbd6f9f1dd7ae4fa100fbe69c17beb2f98
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Archive only the frozen reviewed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          test "$(git rev-parse HEAD^)" = "$BASE_REVISION"
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/context" "$RUNNER_TEMP/evidence"
+          git archive "$SOURCE_REVISION" | tar -xf - -C "$RUNNER_TEMP/context"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          context = pathlib.Path(os.environ["RUNNER_TEMP"]) / "context"
+          original = (context / "Dockerfile").read_bytes()
+          assert hashlib.sha256(original).hexdigest() == "7c5fec10791e0520539d049188601fd1670b363e6bc716bdff25d93fc1fe6fca"
+          marker = b"FROM --platform=$BUILDPLATFORM rust:1.95.0-bookworm AS builder\n"
+          assert original.count(marker) == 1
+          (context / "Dockerfile").write_bytes(original.replace(marker, marker + b"ARG CARGO_BUILD_JOBS=2\n", 1))
+          assert "pub(crate) const SCHEMA_VERSION: i32 = 28;" in (context / "src/state/schema.rs").read_text()
+          provenance = {
+              "source": os.environ["SOURCE_REVISION"],
+              "base": os.environ["BASE_REVISION"],
+              "schema": 28,
+              "dockerfile_sha256": hashlib.sha256(original).hexdigest(),
+              "temporary_dockerfile_change": "ARG CARGO_BUILD_JOBS=2 only",
+              "docs_exception": "frozen release and diagnostics both mismatch current wiki migrate-state; Docs and aggregate CI remain red",
+          }
+          out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "evidence"
+          (out / "source-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+          PY
+
+      - name: Build and test the single amd64 image offline
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --load \
+            --metadata-file "$RUNNER_TEMP/evidence/build-metadata.json" \
+            --label "org.opencontainers.image.source=https://github.com/rhoopr/kei" \
+            --label "org.opencontainers.image.revision=$SOURCE_REVISION" \
+            --label "org.opencontainers.image.version=0.24.1-diag853-feb441b" \
+            --label "io.rhoopr.kei.base-revision=$BASE_REVISION" \
+            --label "io.rhoopr.kei.diagnostic-contract=legacy_inventory_failure_v2" \
+            --tag "$IMAGE" "$RUNNER_TEMP/context"
+          docker image inspect "$IMAGE" > "$RUNNER_TEMP/evidence/image-inspect.json"
+          docker run --rm --network none --entrypoint /usr/local/bin/kei "$IMAGE" --version > "$RUNNER_TEMP/evidence/version.log"
+          docker run --rm --network none --entrypoint /usr/local/bin/kei "$IMAGE" sync --help > "$RUNNER_TEMP/evidence/sync-help.log"
+          docker run --rm --network none --entrypoint /bin/sh "$IMAGE" -c 'set -e; for marker in legacy_inventory_failure_v2 phase subreason eof_observed family_context child_soft_deleted; do grep -a -q -F "$marker" /usr/local/bin/kei; done'
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "evidence"
+          image = json.loads((root / "image-inspect.json").read_text())[0]
+          assert image["Os"] == "linux" and image["Architecture"] == "amd64"
+          labels = image["Config"]["Labels"]
+          expected = {
+              "org.opencontainers.image.source": "https://github.com/rhoopr/kei",
+              "org.opencontainers.image.revision": os.environ["SOURCE_REVISION"],
+              "org.opencontainers.image.version": "0.24.1-diag853-feb441b",
+              "io.rhoopr.kei.base-revision": os.environ["BASE_REVISION"],
+              "io.rhoopr.kei.diagnostic-contract": "legacy_inventory_failure_v2",
+          }
+          for key, value in expected.items():
+              assert labels.get(key) == value, key
+          assert (root / "version.log").read_text().strip() == "kei 0.24.1"
+          assert "Usage: kei sync" in (root / "sync-help.log").read_text()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("image_id=" + image["Id"] + "\n")
+          PY
+          docker save --output "$RUNNER_TEMP/evidence/image.tar" "$IMAGE"
+          cd "$RUNNER_TEMP/evidence"
+          sha256sum image.tar > image.tar.sha256
+
+      - name: Retain tested image and proof for this run only
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diagnostic-853-tested-image-${{ github.run_id }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: >-
+      needs.build.result == 'success' &&
+      github.repository == 'rhoopr/kei' &&
+      github.actor == 'rhoopr' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/automation/853-diagnostic-publisher-feb441bb' &&
+      github.event.created == true &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: ${{ runner.temp }}/evidence
+          merge-multiple: true
+
+      - name: Verify and load exactly the tested artifact
+        shell: bash
+        env:
+          TESTED_IMAGE_ID: ${{ needs.build.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          test "$IMAGE" = ghcr.io/rhoopr/kei:diag-853-v0241-feb441bbd6f9f1dd7ae4fa100fbe69c17beb2f98
+          cd "$RUNNER_TEMP/evidence"
+          test "$(wc -l < image.tar.sha256)" = 1
+          grep -Eq '^[0-9a-f]{64}  image.tar$' image.tar.sha256
+          sha256sum --check image.tar.sha256
+          docker load --input image.tar
+          docker image inspect "$IMAGE" > publisher-image-inspect.json
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "evidence"
+          built = json.loads((root / "image-inspect.json").read_text())[0]
+          loaded = json.loads((root / "publisher-image-inspect.json").read_text())[0]
+          assert loaded["Id"] == built["Id"] == os.environ["TESTED_IMAGE_ID"]
+          assert loaded["Os"] == "linux" and loaded["Architecture"] == "amd64"
+          assert loaded["Config"]["Labels"] == built["Config"]["Labels"]
+          assert loaded["RootFS"]["Layers"] == built["RootFS"]["Layers"]
+          PY
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: rhoopr
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push only the unused fixed tag and verify immutable readback
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$IMAGE" = ghcr.io/rhoopr/kei:diag-853-v0241-feb441bbd6f9f1dd7ae4fa100fbe69c17beb2f98
+          cd "$RUNNER_TEMP/evidence"
+          if docker buildx imagetools inspect "$IMAGE" > tag-before-push.log 2>&1; then
+            echo "Refusing to replace an existing diagnostic tag." >&2
+            exit 1
+          fi
+          grep -q ': not found' tag-before-push.log
+          docker push "$IMAGE" | tee push.log
+          docker buildx imagetools inspect "$IMAGE" > registry-inspect.txt
+          python3 - <<'PY'
+          import os, pathlib, re
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "evidence"
+          match = re.search(r"^Digest:\s+(sha256:[0-9a-f]{64})$", (root / "registry-inspect.txt").read_text(), re.M)
+          assert match is not None
+          digest = match.group(1)
+          assert digest in (root / "push.log").read_text()
+          (root / "immutable.txt").write_text("ghcr.io/rhoopr/kei@" + digest + "\n")
+          PY
+          immutable=$(cat immutable.txt)
+          docker buildx imagetools inspect --raw "$immutable" > registry-manifest.json
+          docker buildx imagetools inspect "$immutable" --format '{{json .Image}}' > registry-config.json
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "evidence"
+          reference = (root / "immutable.txt").read_text().strip()
+          raw = (root / "registry-manifest.json").read_bytes()
+          assert reference == "ghcr.io/rhoopr/kei@sha256:" + hashlib.sha256(raw).hexdigest()
+          manifest = json.loads(raw)
+          local = json.loads((root / "publisher-image-inspect.json").read_text())[0]
+          remote = json.loads((root / "registry-config.json").read_text())
+          assert manifest["config"]["digest"] == local["Id"]
+          assert remote["os"] == "linux" and remote["architecture"] == "amd64"
+          assert remote["config"]["Labels"] == local["Config"]["Labels"]
+          assert remote["rootfs"]["diff_ids"] == local["RootFS"]["Layers"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write("Verified diagnostics image: " + reference + "\n\n")
+              output.write("Source feb441bbd6f9f1dd7ae4fa100fbe69c17beb2f98; linux/amd64; schema 28 unchanged.\n\n")
+              output.write("Approved exception: Docs and aggregate CI remain red for the paired frozen-release/current-wiki mismatch; other executed checks passed. Reporter validation remains pending.\n")
+          PY
+
+      - name: Preserve publication/readback evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diagnostic-853-publication-proof-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/evidence/*.json
+            ${{ runner.temp }}/evidence/*.txt
+            ${{ runner.temp }}/evidence/*.log
+            ${{ runner.temp }}/evidence/*.sha256
+          if-no-files-found: warn
+          retention-days: 7
