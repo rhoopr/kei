@@ -55,6 +55,21 @@ pub(in crate::download) async fn fingerprint_downloaded_path(
     .await?
 }
 
+/// Import's durable-ownership exception uses the same confined, same-handle
+/// fingerprint as sync. A matching hash through a symlink is not ownership proof.
+pub(crate) async fn imported_path_matches_receipt(
+    root: &Path,
+    path: &Path,
+    expected_size: u64,
+    local_checksum: &str,
+) -> bool {
+    let Ok(fingerprint) = fingerprint_downloaded_path(root, path).await else {
+        return false;
+    };
+    fingerprint.size == expected_size
+        && data_encoding::HEXLOWER.encode(&fingerprint.sha256) == local_checksum
+}
+
 fn fingerprint_file_blocking(path: &Path) -> anyhow::Result<ExistingFileFingerprint> {
     Ok(fingerprint_file_snapshot_blocking(path)?.fingerprint)
 }

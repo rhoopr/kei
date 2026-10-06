@@ -1,6 +1,6 @@
 //! Library-scoped state snapshots and existing asset identity selection.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -988,27 +988,6 @@ impl DownloadContext {
         }
 
         if trust_state { Some(false) } else { None }
-    }
-
-    /// Durable current-generation ownership proof for import. Provider checksums
-    /// are compared only to stored provider checksums; local bytes use local SHA-256.
-    pub(crate) fn import_owned_file(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version: VersionSizeKey,
-        checksum: &str,
-    ) -> Option<(&Path, &str)> {
-        let stored = self
-            .downloaded_checksums
-            .get(library)?
-            .get(asset_id)?
-            .get(version.as_str())?;
-        if stored.as_ref() != checksum {
-            return None;
-        }
-        let file = self.downloaded_file(library, asset_id, version)?;
-        Some((&file.path, file.local_checksum.as_deref()?))
     }
 
     pub(in crate::download) fn downloaded_file(

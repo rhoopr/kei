@@ -339,22 +339,25 @@ fn log_progress_milestone(library_label: &str, matched: u64, show_progress: bool
 }
 
 /// Prepared rows retain selected-version metadata and candidate paths, not provider JSON.
-/// Memory is proportional to selected renditions and directory entries. No state
+/// Memory is proportional to selected renditions, durable catalogue paths and
+/// current receipts, and cached directory entries. No state
 /// writes happen until every selected pass has completed its enumeration.
 #[derive(Default)]
 struct ImportPreflight {
     candidates: Vec<PreparedImport>,
-    claimed_legacy_master_states: download::ClaimedLegacyMasterStates,
+    durable: Option<ImportDurableSnapshot>,
+    legacy_master_owners: std::collections::HashMap<(Arc<str>, Arc<str>), Arc<str>>,
 }
 
 struct PreparedImport {
     record: state::AssetRecord,
+    root: Arc<PathBuf>,
     child: Arc<str>,
     master: Arc<str>,
     url: Box<str>,
     expected_path: PathBuf,
     matches: Vec<(PathBuf, bool)>,
-    owned_file: Option<(PathBuf, String)>,
+    owned_files: Arc<[OwnedImportFile]>,
     prior_import: Option<state::db::ImportedRecord>,
 }
 
@@ -366,7 +369,85 @@ struct ImportOwner {
     checksum: Box<str>,
 }
 
+#[derive(Clone)]
+struct OwnedImportFile {
+    path: Arc<PathBuf>,
+    local_checksum: Arc<str>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ImportPhysicalOwner {
+    library: Arc<str>,
+    id: String,
+    version: VersionSizeKey,
+}
+
+struct ImportDurableSnapshot {
+    occupied_paths:
+        std::collections::HashMap<String, std::collections::HashSet<ImportPhysicalOwner>>,
+    receipts: std::collections::HashMap<ImportOwner, Arc<[OwnedImportFile]>>,
+}
+
+impl ImportDurableSnapshot {
+    async fn load(db: &state::SqliteStateDb) -> anyhow::Result<Self> {
+        use std::collections::{HashMap, HashSet};
+        // Occupancy includes historical paths and owners outside this import's
+        // selection. Only current provider-matching receipts may prove reuse.
+        let paths = state::ReconciliationStateStore::get_reconciliation_catalog_paths(db).await?;
+        let mut occupied_paths: HashMap<String, HashSet<ImportPhysicalOwner>> = HashMap::new();
+        for (index, path) in paths.into_iter().enumerate() {
+            if index.is_multiple_of(1024) {
+                tokio::task::yield_now().await;
+            }
+            occupied_paths
+                .entry(import_path_key(&path.path)?)
+                .or_default()
+                .insert(ImportPhysicalOwner {
+                    library: path.library,
+                    id: path.asset_id.to_string(),
+                    version: path.version_size,
+                });
+        }
+        let mut records = state::DownloadContextStateStore::get_downloaded_file_records(db).await?;
+        records.extend(state::DownloadContextStateStore::get_downloaded_path_records(db).await?);
+        let mut receipts: HashMap<ImportOwner, Vec<OwnedImportFile>> = HashMap::new();
+        for (index, record) in records.into_iter().enumerate() {
+            if index.is_multiple_of(1024) {
+                tokio::task::yield_now().await;
+            }
+            if let (Some(path), Some(hash)) = (record.local_path, record.local_checksum) {
+                receipts
+                    .entry(ImportOwner {
+                        library: Arc::from(record.library),
+                        id: record.id,
+                        version: record.version_size,
+                        checksum: record.checksum.into_boxed_str(),
+                    })
+                    .or_default()
+                    .push(OwnedImportFile {
+                        path: Arc::new(path),
+                        local_checksum: Arc::from(hash),
+                    });
+            }
+        }
+        Ok(Self {
+            occupied_paths,
+            receipts: receipts
+                .into_iter()
+                .map(|(owner, files)| (owner, Arc::from(files)))
+                .collect(),
+        })
+    }
+}
+
 impl PreparedImport {
+    fn physical_owner(&self) -> ImportPhysicalOwner {
+        ImportPhysicalOwner {
+            library: Arc::clone(&self.record.library),
+            id: self.record.id.to_string(),
+            version: self.record.version_size,
+        }
+    }
     fn owner(&self) -> ImportOwner {
         ImportOwner {
             library: Arc::clone(&self.record.library),
@@ -377,10 +458,10 @@ impl PreparedImport {
     }
 }
 
-fn import_path_key(path: &Path) -> String {
-    // Share sync's platform case normalization; AM/PM whitespace siblings are
-    // a single import match family on every platform.
-    crate::fs_util::normalized_path(path).into_owned()
+fn import_path_key(path: &Path) -> anyhow::Result<String> {
+    // Share reconciliation's checked absolute key, including platform case
+    // normalization. Relative spellings cannot hide an existing physical owner.
+    crate::fs_util::confined_path_key(path).context("Invalid import ownership path")
 }
 
 async fn import_match_paths(
@@ -435,29 +516,31 @@ impl ImportPreflight {
     ) -> anyhow::Result<ImportStats> {
         use std::collections::{HashMap, HashSet};
         use std::sync::atomic::Ordering;
+        if self.candidates.is_empty() {
+            return Ok(ImportStats::default());
+        }
         let mut expected_owners: HashMap<(String, u64), HashSet<ImportOwner>> = HashMap::new();
         let mut path_owners: HashMap<String, HashSet<ImportOwner>> = HashMap::new();
-        let mut durable_owners: HashMap<String, HashSet<ImportOwner>> = HashMap::new();
-        for candidate in &self.candidates {
+        let durable = self
+            .durable
+            .context("Import preflight has no durable ownership snapshot")?;
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            if index.is_multiple_of(1024) {
+                tokio::task::yield_now().await;
+            }
             let owner = candidate.owner();
             expected_owners
                 .entry((
-                    import_path_key(&candidate.expected_path),
+                    import_path_key(&candidate.expected_path)?,
                     candidate.record.size_bytes,
                 ))
                 .or_default()
                 .insert(owner.clone());
             for (path, _) in &candidate.matches {
                 path_owners
-                    .entry(import_path_key(path))
+                    .entry(import_path_key(path)?)
                     .or_default()
                     .insert(owner.clone());
-            }
-            if let Some((path, _)) = &candidate.owned_file {
-                durable_owners
-                    .entry(import_path_key(path))
-                    .or_default()
-                    .insert(owner);
             }
         }
         let heartbeat_state = Arc::new(HeartbeatState::default());
@@ -475,14 +558,15 @@ impl ImportPreflight {
                 anyhow::bail!("Import was interrupted before adopting the next file.");
             }
             let library_label = candidate.record.library.as_ref();
-            let owner = candidate.owner();
+            let physical_owner = candidate.physical_owner();
             let mut safe = Vec::new();
             let mut owned = None;
             for (path, qualified) in &candidate.matches {
-                let key = import_path_key(path);
-                let conflicting_durable_owner = durable_owners
+                let key = import_path_key(path)?;
+                let conflicting_durable_owner = durable
+                    .occupied_paths
                     .get(&key)
-                    .is_some_and(|owners| owners.iter().any(|other| other != &owner));
+                    .is_some_and(|owners| owners.iter().any(|other| other != &physical_owner));
                 if conflicting_durable_owner {
                     continue;
                 }
@@ -490,16 +574,22 @@ impl ImportPreflight {
                     path_owners.get(&key).is_some_and(|owners| owners.len() > 1)
                         || expected_owners
                             .get(&(
-                                import_path_key(&candidate.expected_path),
+                                import_path_key(&candidate.expected_path)?,
                                 candidate.record.size_bytes,
                             ))
                             .is_some_and(|owners| owners.len() > 1)
                         || candidate.matches.len() > 1;
-                if let Some((owned_path, hash)) = &candidate.owned_file
-                    && needs_owned_proof
-                    && import_path_key(owned_path) == key
-                    && download::file::compute_sha256(path).await.ok().as_deref()
-                        == Some(hash.as_str())
+                if needs_owned_proof
+                    && let Some(receipt) = candidate.owned_files.iter().find(|receipt| {
+                        import_path_key(&receipt.path).is_ok_and(|value| value == key)
+                    })
+                    && download::file::imported_path_matches_receipt(
+                        &candidate.root,
+                        path,
+                        candidate.record.size_bytes,
+                        &receipt.local_checksum,
+                    )
+                    .await
                 {
                     owned = Some(path.clone());
                     break;
@@ -509,7 +599,7 @@ impl ImportPreflight {
                     .is_some_and(|owners| owners.len() == 1);
                 let unique_base = expected_owners
                     .get(&(
-                        import_path_key(&candidate.expected_path),
+                        import_path_key(&candidate.expected_path)?,
                         candidate.record.size_bytes,
                     ))
                     .is_some_and(|owners| owners.len() == 1);
@@ -556,10 +646,10 @@ impl ImportPreflight {
                 let mtime_epoch = file_mtime_epoch(&metadata);
                 if candidate.prior_import.as_ref().is_some_and(|rec| {
                     rec.local_path == path
-                        && candidate
-                            .owned_file
-                            .as_ref()
-                            .is_some_and(|(_, hash)| hash == &rec.local_checksum)
+                        && candidate.owned_files.iter().any(|receipt| {
+                            receipt.path.as_ref() == &rec.local_path
+                                && receipt.local_checksum.as_ref() == rec.local_checksum
+                        })
                         && rec.imported_size == Some(metadata.len())
                         && rec.imported_mtime.is_some()
                         && rec.imported_mtime == mtime_epoch
@@ -680,6 +770,11 @@ where
     let mut stats = ImportStats::default();
     let mut scan_started_emitted = false;
     let identity_context = download::DownloadContext::load(db, false).await;
+    let import_root = Arc::new(path_config.directory().to_path_buf());
+    let mut claimed_legacy_master_states = download::ClaimedLegacyMasterStates::default();
+    if preflight.durable.is_none() {
+        preflight.durable = Some(ImportDurableSnapshot::load(db).await?);
+    }
 
     let heartbeat_state = Arc::new(HeartbeatState::default());
     let _heartbeat = HeartbeatGuard::spawn(
@@ -774,11 +869,32 @@ where
             continue;
         }
 
-        let state_record_name = identity_context.select_asset_state_record_name_checked(
+        // Sync's claim set is scoped to a pass. A repeated child in another
+        // pass must rerun the same checksum/date/owner guards. Keep a separate
+        // census owner only to stop a DIFFERENT child claiming the same master
+        // before any pass has committed its adoption.
+        let master_key = (Arc::from(library_label), Arc::from(asset.id()));
+        let transient_claim = preflight
+            .legacy_master_owners
+            .get(&master_key)
+            .is_some_and(|child| child.as_ref() != asset.asset_record_name())
+            && claimed_legacy_master_states.insert(master_key.clone());
+        let selected = identity_context.select_asset_state_record_name_checked(
             library_label,
             &asset,
-            &mut preflight.claimed_legacy_master_states,
-        )?;
+            &mut claimed_legacy_master_states,
+        );
+        // A synthetic sibling guard must not prevent the real owner appearing
+        // later in this pass; retain only claims naturally made by the selector.
+        if transient_claim {
+            claimed_legacy_master_states.remove(&master_key);
+        }
+        let state_record_name = selected?;
+        if state_record_name.as_ref() == asset.id() && asset.asset_record_name() != asset.id() {
+            preflight
+                .legacy_master_owners
+                .insert(master_key, asset.asset_record_name_arc());
+        }
         let asset = asset.with_state_record_name(state_record_name);
         let expected = expected_paths_for(&asset, path_config);
         if expected.is_empty() {
@@ -820,15 +936,19 @@ where
                 path_config,
                 expected_path.version_size,
             ));
-            let owned_file = identity_context
-                .import_owned_file(
-                    library_label,
-                    asset.state_id(),
-                    expected_path.version_size,
-                    &expected_path.checksum,
-                )
-                .map(|(path, hash)| (path.to_owned(), hash.to_owned()));
-            let prior_import = (owned_file.is_some()
+            let owner = ImportOwner {
+                library: Arc::from(library_label),
+                id: record.id.to_string(),
+                version: record.version_size,
+                checksum: record.checksum.clone(),
+            };
+            let owned_files = preflight
+                .durable
+                .as_ref()
+                .and_then(|snapshot| snapshot.receipts.get(&owner))
+                .cloned()
+                .unwrap_or_default();
+            let prior_import = (!owned_files.is_empty()
                 && (asset.state_id() == asset.asset_record_name()
                     || identity_context
                         .select_existing_asset_state_record_name(library_label, &asset)
@@ -845,12 +965,13 @@ where
             .flatten();
             preflight.candidates.push(PreparedImport {
                 record,
+                root: Arc::clone(&import_root),
                 child: Arc::from(asset.asset_record_name()),
                 master: Arc::from(asset.id()),
                 url: expected_path.url.clone(),
                 expected_path: expected_path.path.clone(),
                 matches,
-                owned_file,
+                owned_files,
                 prior_import,
             });
         }
@@ -2139,6 +2260,140 @@ mod wiremock_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id.as_ref(), "master-913");
         assert_eq!(rows[0].local_path.as_deref(), Some(master_path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn import_repeated_legacy_child_across_passes_preserves_sync_identity_and_sibling_guard()
+    {
+        for (persisted_owner, sibling_first) in
+            [(false, true), (false, false), (true, true), (true, false)]
+        {
+            let tmp = TempDir::new().unwrap();
+            let mut fixture = WiremockAsset::new("master-913", "legacy.JPG", "public.jpeg").orig(
+                32,
+                "legacy-checksum",
+                "public.jpeg",
+            );
+            fixture.child_record_name = "child-913".to_owned();
+            let photo = fixture.to_photo_asset();
+            let db = open_db(&tmp).await;
+            let record = crate::state::AssetRecord::new_pending(
+                Arc::from("test-all"),
+                "master-913".to_owned(),
+                VersionSizeKey::Original,
+                "legacy-checksum".to_owned(),
+                "legacy_bWFzdGV.JPG".to_owned(),
+                photo.created(),
+                Some(photo.added_date()),
+                32,
+                crate::state::MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+            if persisted_owner {
+                assert!(
+                    db.claim_legacy_master_state_owner("test-all", "master-913", "child-913")
+                        .await
+                        .unwrap()
+                );
+            }
+            let mut preflight = ImportPreflight::default();
+            let mut sibling = fixture.clone();
+            sibling.child_record_name = "other-child".to_owned();
+            let changed = fixture
+                .clone()
+                .orig(32, "changed-provider-generation", "public.jpeg");
+            let mut files = Vec::new();
+            let mixed_pass = if sibling_first {
+                vec![sibling, fixture.clone()]
+            } else {
+                vec![fixture.clone(), sibling]
+            };
+            for (index, observations) in [
+                vec![fixture.clone()],
+                vec![fixture],
+                mixed_pass,
+                vec![changed],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let root = tmp.path().join(format!("pass-{index}"));
+                let mut config = base_config(&root);
+                config.folder_structure = "none".to_owned();
+                config.file_match_policy = FileMatchPolicy::NameId7;
+                let path = root.join("legacy_bWFzdGV.JPG");
+                stage_file(&path, 32);
+                files.push(path);
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                drop(sender);
+                collect_import_assets(
+                    futures_util::stream::iter(
+                        observations
+                            .into_iter()
+                            .map(|observation| Ok(observation.to_photo_asset())),
+                    ),
+                    receiver,
+                    db.as_ref(),
+                    &config,
+                    "test-all",
+                    &mut DirCache::new(),
+                    ImportRunOptions::default(),
+                    &mut preflight,
+                )
+                .await
+                .unwrap();
+                assert_eq!(db.get_summary().await.unwrap().total_assets, 1);
+                assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+            }
+            assert_eq!(
+                preflight
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.record.id.as_ref())
+                    .collect::<Vec<_>>(),
+                if sibling_first {
+                    [
+                        "master-913",
+                        "master-913",
+                        "other-child",
+                        "master-913",
+                        "child-913",
+                    ]
+                } else {
+                    [
+                        "master-913",
+                        "master-913",
+                        "master-913",
+                        "other-child",
+                        "child-913",
+                    ]
+                }
+            );
+            let stats = preflight
+                .adopt(db.as_ref(), ImportRunOptions::default())
+                .await
+                .unwrap();
+            assert_eq!((stats.matched, stats.unmatched), (3, 2));
+            drop(db);
+            let db = open_db(&tmp).await;
+            let rows = all_downloaded(db.as_ref()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "master-913");
+            assert_eq!(rows[0].local_path.as_ref(), Some(&files[2]));
+            assert_eq!(db.get_asset_master_mappings().await.unwrap().len(), 1);
+            assert_eq!(
+                db.get_legacy_master_state_owners().await.unwrap(),
+                std::collections::HashSet::from([(
+                    "test-all".to_owned(),
+                    "master-913".to_owned(),
+                    "child-913".to_owned()
+                )])
+            );
+            assert!(db.get_pending().await.unwrap().is_empty());
+            for path in files {
+                assert_eq!(std::fs::read(path).unwrap(), vec![0; 32]);
+            }
+        }
     }
 
     #[tokio::test]
@@ -3667,6 +3922,210 @@ mod wiremock_tests {
             all_downloaded(db.as_ref()).await.len(),
             stats.matched as usize,
         );
+    }
+
+    #[tokio::test]
+    async fn import_refuses_foreign_owner_omitted_from_selection_including_historical_album_paths()
+    {
+        for receipt_kind in 0..3 {
+            let server = crate::start_wiremock_or_skip!();
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("photos");
+            let mut config = base_config(&root);
+            config.folder_structure = "none".to_owned();
+            config.file_match_policy = FileMatchPolicy::NameId7;
+            let mut fixture = WiremockAsset::new("master-second", "photo.JPG", "public.jpeg").orig(
+                12,
+                "provider-second",
+                "public.jpeg",
+            );
+            fixture.child_record_name = "alpha-second".to_owned();
+            let photo = fixture.to_photo_asset();
+            let path = root.join("photo_YWxwaGE.JPG");
+            stage_file(&path, 12);
+            let hash = crate::download::file::compute_sha256(&path).await.unwrap();
+            let db = open_db(&tmp).await;
+            let mut existing = crate::state::AssetRecord::new_pending(
+                Arc::from("test-all"),
+                "alpha-first".to_owned(),
+                VersionSizeKey::Original,
+                "provider-first".to_owned(),
+                "photo_YWxwaGE.JPG".to_owned(),
+                photo.created(),
+                Some(photo.added_date()),
+                12,
+                crate::state::MediaType::Photo,
+            );
+            db.import_adopt(&existing, &path, &hash, 12, None)
+                .await
+                .unwrap();
+            if receipt_kind != 0 {
+                let other = tmp.path().join("other-album/photo_YWxwaGE.JPG");
+                stage_file(&other, 12);
+                if receipt_kind == 2 {
+                    existing.checksum = "new-provider-generation".into();
+                }
+                db.import_adopt(&existing, &other, &hash, 12, None)
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..2 {
+                server.reset().await;
+                let stats = run_import(
+                    &server,
+                    std::slice::from_ref(&fixture),
+                    db.as_ref(),
+                    &config,
+                    false,
+                )
+                .await;
+                assert_eq!(
+                    (stats.matched, stats.unmatched),
+                    (0, 1),
+                    "receipt kind {receipt_kind}: {stats:?}"
+                );
+                assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+            }
+            drop(db);
+            let db = open_db(&tmp).await;
+            let rows = all_downloaded(db.as_ref()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "alpha-first");
+            assert_eq!(rows[0].checksum, existing.checksum);
+            assert_eq!(std::fs::read(path).unwrap(), vec![0; 12]);
+            assert!(db.get_pending().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn import_foreign_occupancy_uses_one_absolute_key_for_relative_and_absolute_root_spellings()
+     {
+        std::fs::create_dir_all(".scratch").unwrap();
+        for relative_receipt in [false, true] {
+            let server = crate::start_wiremock_or_skip!();
+            let tmp = TempDir::new_in(".scratch").unwrap();
+            let absolute = crate::fs_util::absolute_confined_path(tmp.path()).unwrap();
+            let cwd = std::env::current_dir().unwrap();
+            let relative = absolute.strip_prefix(&cwd).unwrap().to_path_buf();
+            let (existing_root, selected_root) = if relative_receipt {
+                (relative, absolute)
+            } else {
+                (absolute, relative)
+            };
+            let mut config = base_config(&selected_root.join("photos"));
+            config.folder_structure = "none".to_owned();
+            config.file_match_policy = FileMatchPolicy::NameId7;
+            let mut fixture = WiremockAsset::new("master-second", "photo.JPG", "public.jpeg").orig(
+                12,
+                "provider-second",
+                "public.jpeg",
+            );
+            fixture.child_record_name = "alpha-second".to_owned();
+            let photo = fixture.to_photo_asset();
+            let path = existing_root.join("photos/photo_YWxwaGE.JPG");
+            stage_file(&path, 12);
+            let hash = crate::download::file::compute_sha256(&path).await.unwrap();
+            let db = open_db(&tmp).await;
+            let existing = crate::state::AssetRecord::new_pending(
+                Arc::from("test-all"),
+                "alpha-first".to_owned(),
+                VersionSizeKey::Original,
+                "provider-first".to_owned(),
+                "photo_YWxwaGE.JPG".to_owned(),
+                photo.created(),
+                Some(photo.added_date()),
+                12,
+                crate::state::MediaType::Photo,
+            );
+            db.import_adopt(&existing, &path, &hash, 12, None)
+                .await
+                .unwrap();
+            let stats = run_import(&server, &[fixture], db.as_ref(), &config, false).await;
+            assert_eq!((stats.matched, stats.unmatched), (0, 1));
+            let rows = all_downloaded(db.as_ref()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "alpha-first");
+            assert_eq!(rows[0].local_path.as_ref(), Some(&path));
+            assert_eq!(std::fs::read(&path).unwrap(), vec![0; 12]);
+            assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn import_current_extra_album_receipt_resolves_ambiguous_base_but_stale_or_corrupt_receipt_does_not()
+     {
+        for proof_kind in 0..3 {
+            let server = crate::start_wiremock_or_skip!();
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("album-a");
+            let mut config = base_config(&root);
+            config.folder_structure = "none".to_owned();
+            config.file_match_policy = FileMatchPolicy::NameId7;
+            let mut first = WiremockAsset::new("master-first", "photo.JPG", "public.jpeg").orig(
+                12,
+                "provider-first",
+                "public.jpeg",
+            );
+            first.child_record_name = "alpha-first".to_owned();
+            let mut second = WiremockAsset::new("master-second", "photo.JPG", "public.jpeg").orig(
+                12,
+                "provider-second",
+                "public.jpeg",
+            );
+            second.child_record_name = "alpha-second".to_owned();
+            let photo = first.to_photo_asset();
+            let path = root.join("photo_YWxwaGE.JPG");
+            stage_file(&path, 12);
+            let hash = crate::download::file::compute_sha256(&path).await.unwrap();
+            let db = open_db(&tmp).await;
+            let mut record = crate::state::AssetRecord::new_pending(
+                Arc::from("test-all"),
+                "alpha-first".to_owned(),
+                VersionSizeKey::Original,
+                "provider-first".to_owned(),
+                "photo_YWxwaGE.JPG".to_owned(),
+                photo.created(),
+                Some(photo.added_date()),
+                12,
+                crate::state::MediaType::Photo,
+            );
+            db.import_adopt(&record, &path, &hash, 12, None)
+                .await
+                .unwrap();
+            let canonical = tmp.path().join("album-b/photo_YWxwaGE.JPG");
+            stage_file(&canonical, 12);
+            if proof_kind == 1 {
+                record.checksum = "stale-provider-generation".into();
+            }
+            db.import_adopt(&record, &canonical, &hash, 12, None)
+                .await
+                .unwrap();
+            if proof_kind == 2 {
+                std::fs::write(&path, vec![1; 12]).unwrap();
+            }
+            let stats = run_import(&server, &[first, second], db.as_ref(), &config, false).await;
+            assert_eq!(
+                (stats.matched, stats.unmatched),
+                if proof_kind == 0 { (1, 1) } else { (0, 2) },
+                "proof {proof_kind}: {stats:?}"
+            );
+            drop(db);
+            let db = open_db(&tmp).await;
+            let rows = all_downloaded(db.as_ref()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "alpha-first");
+            assert_eq!(rows[0].checksum, record.checksum);
+            assert_eq!(
+                rows[0].local_path.as_ref(),
+                Some(if proof_kind == 0 { &path } else { &canonical })
+            );
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                vec![if proof_kind == 2 { 1 } else { 0 }; 12]
+            );
+            assert_eq!(std::fs::read(canonical).unwrap(), vec![0; 12]);
+            assert!(db.get_pending().await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

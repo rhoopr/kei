@@ -55,8 +55,10 @@ those adopted files and downloads only new or previously failed assets.
 
 Import completes enumeration of every selected library and album pass before
 writing adoption rows. An interrupted or failed listing leaves those rows
-unwritten. The prepared candidate list uses memory proportional to selected
-renditions and cached directory entries.
+unwritten. The preflight uses memory proportional to selected renditions, all
+durable catalogue paths and current receipts, and cached directory entries.
+There is no fixed memory cap or disk spool. Existing owners, including omitted
+assets and historical album paths, prevent another asset adopting their files.
 
 The `name-id7` suffix uses the same selected child identity as sync, including
 its guarded legacy compatibility behavior. When two children share a short

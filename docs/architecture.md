@@ -1116,8 +1116,12 @@ guarded legacy master state ID as sync. It prepares selected rendition rows
 and paths for every selected pass before adoption, then checks the complete
 candidate census. Incomplete enumeration, fetcher panic, or cancellation before
 completion leaves all adoption rows, mappings, and legacy owners unwritten.
-The prepared list uses memory proportional to selected renditions and cached
-directory entries; it retains shared metadata rather than raw provider JSON.
+The preflight uses memory proportional to selected renditions, all durable
+catalogue paths and current receipts, and cached directory entries. Metadata
+and receipt slices are shared; raw provider JSON is not retained. There is no
+fixed memory cap or disk spool. Catalogue paths include historical and omitted
+assets, so an unselected owner still prevents adoption of its file. Equivalent
+relative and absolute paths use the same confined ownership key.
 Import uses sync's collision-family owner for full-ID and ordinal filenames.
 Different-size candidates remain distinguishable. An ambiguous short name,
 sanitized full-ID collision, or multiple ordinal siblings is refused unless an
