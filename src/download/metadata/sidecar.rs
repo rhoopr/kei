@@ -485,7 +485,12 @@ mod tests {
         write_sidecar(&media, &write, ".meta-tmp").await.unwrap();
         let bytes = fs::read(&sidecar).unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("User author"));
-        let file = fs::File::open(&sidecar).unwrap();
+        // Windows needs a writable handle to set the fixture timestamp.
+        let file = fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&sidecar)
+            .unwrap();
         file.set_times(
             fs::FileTimes::new()
                 .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(42)),
