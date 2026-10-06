@@ -33,6 +33,11 @@ struct InventoryBudget {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LegacyInventoryDiagnostic {
     pub(crate) reason: &'static str,
+    pub(crate) phase: &'static str,
+    pub(crate) subreason: &'static str,
+    pub(crate) eof_observed: bool,
+    pub(crate) family_context: &'static str,
+    pub(crate) child_soft_deleted: bool,
     pub(crate) pages: usize,
     pub(crate) records: usize,
     pub(crate) transferred_bytes: usize,
@@ -86,6 +91,7 @@ pub(crate) fn classify_legacy_inventory_error(
         .downcast_ref::<InventoryFailureKind>()
         .map(|kind| LegacyInventoryDiagnostic {
             reason: kind.as_str(),
+            subreason: kind.as_str(),
             ..LegacyInventoryDiagnostic::default()
         })
 }
@@ -181,12 +187,21 @@ impl PhotoAlbum {
         cancel: &CancellationToken,
         budget: InventoryBudget,
     ) -> anyhow::Result<CompleteLegacyInventory> {
-        let mut progress = LegacyInventoryDiagnostic::default();
+        let mut progress = LegacyInventoryDiagnostic {
+            phase: "initialization",
+            subreason: "missing_candidate_scope",
+            family_context: "not_applicable",
+            ..LegacyInventoryDiagnostic::default()
+        };
         self.scan_legacy_preservation_inventory(masters, cancel, budget, &mut progress)
             .await
             .map_err(|source: anyhow::Error| {
-                progress.reason = classify_legacy_inventory_error(&source)
-                    .map_or("invalid_inventory_evidence", |diagnostic| diagnostic.reason);
+                if let Some(diagnostic) = classify_legacy_inventory_error(&source) {
+                    progress.reason = diagnostic.reason;
+                    progress.subreason = diagnostic.subreason;
+                } else {
+                    progress.reason = "invalid_inventory_evidence";
+                }
                 LegacyInventoryFailure {
                     diagnostic: progress,
                     source,
@@ -212,6 +227,8 @@ impl PhotoAlbum {
         let mut seen_cursors = FxHashSet::default();
         let mut latest = FxHashMap::<String, (Record, usize)>::default();
         for _ in 0..budget.pages {
+            progress.phase = "request";
+            progress.subreason = "unclassified";
             let body =
                 build_changes_zone_request(&self.zone_id, cursor.as_deref(), 200).to_string();
             let response = tokio::select! {
@@ -220,6 +237,8 @@ impl PhotoAlbum {
                 response = session::retry_post(self.session.as_ref(), &url, &body, &[("Content-type", "text/plain")], &self.retry_config) => response.context(InventoryFailureKind::Provider)?,
             };
             progress.pages += 1;
+            progress.phase = "response_budget";
+            progress.subreason = "unclassified";
             let page_bytes = serialized_bytes(&response)?;
             progress.transferred_bytes = progress
                 .transferred_bytes
@@ -229,17 +248,23 @@ impl PhotoAlbum {
                 page_bytes <= budget.page_bytes,
                 InventoryFailureKind::PageBytes
             );
+            progress.phase = "envelope";
+            progress.subreason = "invalid_zone_envelope";
             let zones = response
                 .get("zones")
                 .and_then(Value::as_array)
                 .filter(|zones| zones.len() == 1)
                 .context("Invalid preservation inventory zones")?;
+            progress.subreason = "missing_zone_scope";
             let zone = zones
                 .first()
                 .context("Missing preservation inventory zone")?;
+            progress.subreason = "missing_zone_scope";
             let zone_id = zone
                 .get("zoneID")
                 .context("Missing preservation inventory zone")?;
+            progress.phase = "scope";
+            progress.subreason = "zone_scope_mismatch";
             anyhow::ensure!(
                 zone_id.get("zoneName") == self.zone_id.get("zoneName")
                     && self
@@ -248,14 +273,20 @@ impl PhotoAlbum {
                         .is_none_or(|owner| zone_id.get("ownerRecordName") == Some(owner)),
                 "Preservation inventory scope mismatch"
             );
+            progress.phase = "envelope";
+            progress.subreason = "completion_marker_missing";
             anyhow::ensure!(
                 zone.get("moreComing").and_then(Value::as_bool).is_some(),
                 "Missing preservation inventory completion marker"
             );
+            progress.subreason = "records_array_missing";
+            // Observation only. A terminal marker is not proof of a valid inventory.
+            progress.eof_observed = zone.get("moreComing").and_then(Value::as_bool) == Some(false);
             let records = zone
                 .get("records")
                 .and_then(Value::as_array)
                 .context("Missing preservation inventory records")?;
+            progress.subreason = "unclassified";
             progress.records = progress
                 .records
                 .checked_add(records.len())
@@ -265,6 +296,8 @@ impl PhotoAlbum {
                 InventoryFailureKind::Records
             );
             for record in records {
+                progress.phase = "record_envelope";
+                progress.subreason = "record_type_missing";
                 anyhow::ensure!(
                     record.get("deleted").and_then(Value::as_bool) == Some(true)
                         || record
@@ -273,10 +306,12 @@ impl PhotoAlbum {
                             .is_some_and(|kind| !kind.trim().is_empty()),
                     "Missing preservation record type"
                 );
+                progress.subreason = "record_provider_error";
                 anyhow::ensure!(
                     record.get("serverErrorCode").is_none_or(Value::is_null),
                     "Preservation inventory record error"
                 );
+                progress.subreason = "record_identity_missing";
                 anyhow::ensure!(
                     record
                         .get("recordName")
@@ -285,25 +320,35 @@ impl PhotoAlbum {
                     "Missing preservation record identity"
                 );
             }
+            progress.phase = "decode";
+            progress.subreason = "response_decode_failed";
             let response: ChangesZoneResponse = serde_json::from_value(response)?;
+            progress.subreason = "missing_zone_scope";
             let zone = response
                 .zones
                 .into_iter()
                 .next()
                 .context("Missing preservation inventory zone")?;
+            progress.phase = "provider_status";
+            progress.subreason = "zone_provider_error";
             check_changes_zone_error(
                 zone.server_error_code.as_deref(),
                 zone.reason.as_deref(),
                 &zone.zone_id.zone_name,
             )?;
+            progress.phase = "cursor";
+            progress.subreason = "cursor_missing";
             anyhow::ensure!(
                 !zone.sync_token.trim().is_empty(),
                 "Missing preservation inventory cursor"
             );
+            progress.subreason = "cursor_repeated";
             anyhow::ensure!(
                 seen_cursors.insert(zone.sync_token.clone()),
                 "Non-progressing preservation inventory"
             );
+            progress.phase = "retention";
+            progress.subreason = "unclassified";
             let cursor_bytes = zone
                 .sync_token
                 .len()
@@ -349,16 +394,32 @@ impl PhotoAlbum {
                 .map(|(record, _)| record)
                 .filter(|record| record.record_type == "CPLAsset" && record.deleted != Some(true))
             {
+                progress.phase = "child_reference";
+                progress.subreason = "child_master_reference_missing";
+                progress.family_context = "unknown";
+                progress.child_soft_deleted = record
+                    .fields
+                    .get("isDeleted")
+                    .and_then(|field| field.get("value"))
+                    .and_then(Value::as_i64)
+                    == Some(1);
                 let reference = record
                     .fields
                     .get("masterRef")
                     .and_then(|field| field.get("value"))
                     .context("Unsupported preservation identity")?;
+                progress.subreason = "child_master_identity_invalid";
                 let master = reference
                     .get("recordName")
                     .and_then(Value::as_str)
                     .filter(|id| !id.trim().is_empty())
                     .context("Unsupported preservation identity")?;
+                progress.subreason = "child_reference_scope_mismatch";
+                progress.family_context = if masters.contains(master) {
+                    "candidate"
+                } else {
+                    "unrelated"
+                };
                 anyhow::ensure!(
                     reference.get("zoneID").is_none_or(|zone| {
                         zone.get("zoneName")
@@ -382,6 +443,10 @@ impl PhotoAlbum {
             }
             // Compact unrelated records prove completeness only. Hydration must
             // consume complete candidate-family records, never their projections.
+            progress.phase = "family_hydration";
+            progress.subreason = "unclassified";
+            progress.family_context = "candidate";
+            progress.child_soft_deleted = false;
             let family_records = latest
                 .into_values()
                 .map(|(record, _)| record)
@@ -402,10 +467,14 @@ impl PhotoAlbum {
                 if let Some(asset) = event.asset
                     && masters.contains(asset.id())
                 {
+                    progress.phase = "capture_date";
+                    progress.subreason = "capture_date_missing";
                     anyhow::ensure!(
                         asset.asset_date_evidence().is_some(),
                         "Missing preservation capture date"
                     );
+                    progress.phase = "family_hydration";
+                    progress.subreason = "unexpected_child";
                     anyhow::ensure!(
                         expected.remove(asset.asset_record_name()),
                         "Unexpected preservation child"
@@ -413,17 +482,22 @@ impl PhotoAlbum {
                     children.push(asset.with_source_zone(Arc::from(self.zone_name())));
                 }
             }
+            progress.phase = "family_hydration";
+            progress.subreason = "family_hydration_incomplete";
             anyhow::ensure!(
                 expected.is_empty(),
                 "Incomplete preservation family hydration"
             );
             children.sort_by(|a, b| a.asset_record_name().cmp(b.asset_record_name()));
+            progress.subreason = "cursor_missing";
             return Ok(CompleteLegacyInventory {
                 library: self.zone_name().to_owned(),
                 cursor: cursor.context("Missing preservation inventory cursor")?,
                 children,
             });
         }
+        progress.phase = "pagination";
+        progress.subreason = "page_budget";
         anyhow::bail!(InventoryFailureKind::Pages)
     }
 }
@@ -683,6 +757,9 @@ mod tests {
             .unwrap_err();
         let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
         assert_eq!(diagnostic.reason, "retained_byte_budget");
+        assert_eq!(diagnostic.phase, "retention");
+        assert_eq!(diagnostic.subreason, "retained_byte_budget");
+        assert!(diagnostic.eof_observed);
         assert_eq!(diagnostic.retained_bytes, exact.retained_bytes);
         assert_eq!(diagnostic.pages, 1);
         assert_eq!(diagnostic.records, 3);
@@ -716,6 +793,9 @@ mod tests {
             .unwrap_err();
         let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
         assert_eq!(diagnostic.reason, "response_page_byte_budget");
+        assert_eq!(diagnostic.phase, "response_budget");
+        assert_eq!(diagnostic.subreason, "response_page_byte_budget");
+        assert!(!diagnostic.eof_observed);
         assert_eq!(diagnostic.transferred_bytes, bytes);
         assert_eq!(diagnostic.retained_bytes, 0);
     }
@@ -790,9 +870,349 @@ mod tests {
             .unwrap_err();
         let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
         assert_eq!(diagnostic.reason, "provider_request_failed");
+        assert_eq!(diagnostic.phase, "request");
+        assert_eq!(diagnostic.subreason, "provider_request_failed");
+        assert!(!diagnostic.eof_observed);
         let rendered = format!("{diagnostic:?} {error}");
         for private in ["private-record", "secret.invalid", "private-token"] {
             assert!(!rendered.contains(private), "{rendered}");
         }
+    }
+
+    // RELEASE_OUTCOME_CONTROLS_START
+    fn release_refusal_cases() -> Vec<(Value, &'static str, &'static str, &'static str)> {
+        let valid = canned_changes_page(&records(), "final", false);
+        let mut cases = Vec::new();
+        let mut add = |page, context, phase, subreason| {
+            cases.push((page, context, phase, subreason));
+        };
+        add(
+            json!({"zones":[]}),
+            "Invalid preservation inventory zones",
+            "envelope",
+            "invalid_zone_envelope",
+        );
+        let mut page = valid.clone();
+        page["zones"][0].as_object_mut().unwrap().remove("zoneID");
+        add(
+            page,
+            "Missing preservation inventory zone",
+            "envelope",
+            "missing_zone_scope",
+        );
+        let mut page = valid.clone();
+        page["zones"][0]["zoneID"]["zoneName"] = json!("private-other-zone");
+        add(
+            page,
+            "Preservation inventory scope mismatch",
+            "scope",
+            "zone_scope_mismatch",
+        );
+        let mut page = valid.clone();
+        page["zones"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("moreComing");
+        add(
+            page,
+            "Missing preservation inventory completion marker",
+            "envelope",
+            "completion_marker_missing",
+        );
+        let mut page = valid.clone();
+        page["zones"][0].as_object_mut().unwrap().remove("records");
+        add(
+            page,
+            "Missing preservation inventory records",
+            "envelope",
+            "records_array_missing",
+        );
+        let mut page = valid.clone();
+        page["zones"][0]["records"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("recordType");
+        add(
+            page,
+            "Missing preservation record type",
+            "record_envelope",
+            "record_type_missing",
+        );
+        let mut page = valid.clone();
+        page["zones"][0]["records"][1]["serverErrorCode"] = json!("private-provider-error");
+        add(
+            page,
+            "Preservation inventory record error",
+            "record_envelope",
+            "record_provider_error",
+        );
+        let mut page = valid.clone();
+        page["zones"][0]["records"][1]["recordName"] = json!("");
+        add(
+            page,
+            "Missing preservation record identity",
+            "record_envelope",
+            "record_identity_missing",
+        );
+        let mut page = valid.clone();
+        page["zones"][0]["syncToken"] = json!(" ");
+        add(
+            page,
+            "Missing preservation inventory cursor",
+            "cursor",
+            "cursor_missing",
+        );
+        let mut page = valid.clone();
+        page["zones"][0]["records"][1]["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("masterRef");
+        add(
+            page,
+            "Unsupported preservation identity",
+            "child_reference",
+            "child_master_reference_missing",
+        );
+        let mut page = valid.clone();
+        page["zones"][0]["records"][1]["fields"]["masterRef"]["value"]["recordName"] = json!("");
+        add(
+            page,
+            "Unsupported preservation identity",
+            "child_reference",
+            "child_master_identity_invalid",
+        );
+        let mut page = valid.clone();
+        page["zones"][0]["records"][1]["fields"]["masterRef"]["value"]["zoneID"] =
+            json!({"zoneName":"PrimarySync","ownerRecordName":"private-owner"});
+        add(
+            page,
+            "Cross-library preservation reference",
+            "child_reference",
+            "child_reference_scope_mismatch",
+        );
+        let mut page = valid;
+        page["zones"][0]["records"][1]["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("assetDate");
+        add(
+            page,
+            "Incomplete preservation family hydration",
+            "family_hydration",
+            "family_hydration_incomplete",
+        );
+        let mut page = canned_changes_page(&records(), "final", false);
+        page["zones"][0]["syncToken"] = Value::Null;
+        add(
+            page,
+            "invalid type: null",
+            "decode",
+            "response_decode_failed",
+        );
+        let mut page = canned_changes_page(&records(), "final", false);
+        page["zones"][0]["serverErrorCode"] = json!("BAD_REQUEST");
+        page["zones"][0]["reason"] = json!("private-provider-reason");
+        add(
+            page,
+            "private-provider-reason",
+            "provider_status",
+            "zone_provider_error",
+        );
+        let page = canned_changes_page(&[changes_asset("first", "master")], "final", false);
+        add(
+            page,
+            "Incomplete preservation family hydration",
+            "family_hydration",
+            "family_hydration_incomplete",
+        );
+        cases
+    }
+
+    #[tokio::test]
+    async fn release_inventory_outcome_controls_keep_guard_contexts() {
+        for (page, context, _, _) in release_refusal_cases() {
+            let error = album(vec![page])
+                .legacy_preservation_inventory(&masters(), &CancellationToken::new(), BUDGET)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.to_string().contains(context)),
+                "{context}: {error:#}"
+            );
+        }
+        let result = album(vec![canned_changes_page(&records(), "final", false)])
+            .legacy_preservation_inventory(&masters(), &CancellationToken::new(), BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(result.cursor, "final");
+        assert_eq!(
+            result
+                .children
+                .iter()
+                .map(|asset| asset.asset_record_name())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn release_inventory_outcome_controls_private_reference_matrix() {
+        for candidate in [false, true] {
+            for soft_deleted in [false, true] {
+                for owner in [None, Some("private-owner")] {
+                    let mut child = changes_asset(
+                        "private-child",
+                        if candidate {
+                            "master"
+                        } else {
+                            "private-master"
+                        },
+                    );
+                    child["fields"]["isDeleted"] = json!({"value":i64::from(soft_deleted)});
+                    child["fields"]["masterRef"]["value"]["zoneID"] =
+                        json!({"zoneName":"PrimarySync"});
+                    if let Some(owner) = owner {
+                        child["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                            json!(owner);
+                    }
+                    let pages = vec![
+                        canned_changes_page(&[changes_master("master")], "initial", true),
+                        canned_changes_page(&[child], "final", false),
+                    ];
+                    let result = album(pages)
+                        .legacy_preservation_inventory(
+                            &masters(),
+                            &CancellationToken::new(),
+                            BUDGET,
+                        )
+                        .await;
+                    if owner.is_some() {
+                        let error = result.unwrap_err();
+                        assert!(error.chain().any(
+                            |cause| cause.to_string() == "Cross-library preservation reference"
+                        ));
+                    } else {
+                        let inventory = result.unwrap();
+                        assert_eq!(inventory.cursor, "final");
+                        assert_eq!(
+                            inventory.children.len(),
+                            usize::from(candidate && !soft_deleted)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // RELEASE_OUTCOME_CONTROLS_END
+
+    fn diagnostic_warning(error: &anyhow::Error) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("warning.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            crate::download::legacy_preservation::log_preservation_hold("preparation", error);
+        });
+        std::fs::read_to_string(log).unwrap()
+    }
+
+    #[tokio::test]
+    async fn preservation_inventory_diagnostics_distinguish_generic_refusals_and_redact() {
+        for (page, _, phase, subreason) in release_refusal_cases() {
+            let error = album(vec![page])
+                .legacy_preservation_inventory(&masters(), &CancellationToken::new(), BUDGET)
+                .await.unwrap_err()
+                .context("private-provider-id https://private.invalid/?token=private-token /private/path");
+            let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
+            assert_eq!(diagnostic.reason, "invalid_inventory_evidence");
+            assert_eq!(diagnostic.phase, phase);
+            assert_eq!(diagnostic.subreason, subreason);
+            let log = diagnostic_warning(&error);
+            assert!(
+                log.contains("diagnostic=\"legacy_inventory_failure_v2\""),
+                "{log}"
+            );
+            assert!(log.contains(&format!("phase=\"{phase}\"")), "{log}");
+            assert!(log.contains(&format!("subreason=\"{subreason}\"")), "{log}");
+            for private in ["private", "first", "second", "token=", "https://"] {
+                assert!(!log.contains(private), "{log}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preservation_inventory_diagnostics_terminal_family_context_is_observation_only() {
+        for candidate in [false, true] {
+            for soft_deleted in [false, true] {
+                let mut child = changes_asset(
+                    "private-child",
+                    if candidate {
+                        "master"
+                    } else {
+                        "private-master"
+                    },
+                );
+                child["fields"]["isDeleted"] = json!({"value":i64::from(soft_deleted)});
+                child["fields"]["masterRef"]["value"]["zoneID"] =
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"private-owner"});
+                let error = album(vec![
+                    canned_changes_page(&[changes_master("master")], "initial", true),
+                    canned_changes_page(&[child], "final", false),
+                ])
+                .legacy_preservation_inventory(&masters(), &CancellationToken::new(), BUDGET)
+                .await
+                .unwrap_err();
+                let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
+                assert_eq!(diagnostic.reason, "invalid_inventory_evidence");
+                assert_eq!(diagnostic.phase, "child_reference");
+                assert_eq!(diagnostic.subreason, "child_reference_scope_mismatch");
+                assert!(diagnostic.eof_observed);
+                assert_eq!(
+                    diagnostic.family_context,
+                    if candidate { "candidate" } else { "unrelated" }
+                );
+                assert_eq!(diagnostic.child_soft_deleted, soft_deleted);
+                assert_eq!(diagnostic.pages, 2);
+                assert_eq!(diagnostic.records, 2);
+                let log = diagnostic_warning(&error);
+                assert!(log.contains("eof_observed=true"));
+                assert!(log.contains(&format!("child_soft_deleted={soft_deleted}")));
+                assert!(!log.contains("private"), "{log}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preservation_inventory_diagnostics_no_eof_or_missing_reference_never_infers_family() {
+        let mut page = canned_changes_page(&records(), "final", false);
+        page["zones"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("moreComing");
+        let error = album(vec![page])
+            .legacy_preservation_inventory(&masters(), &CancellationToken::new(), BUDGET)
+            .await
+            .unwrap_err();
+        let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
+        assert!(!diagnostic.eof_observed);
+        assert_eq!(diagnostic.family_context, "not_applicable");
+        let mut child = changes_asset("private-child", "master");
+        child["fields"]["isDeleted"] = json!({"value":1});
+        child["fields"].as_object_mut().unwrap().remove("masterRef");
+        let error = album(vec![canned_changes_page(&[child], "final", false)])
+            .legacy_preservation_inventory(&masters(), &CancellationToken::new(), BUDGET)
+            .await
+            .unwrap_err();
+        let diagnostic = super::classify_legacy_inventory_error(&error).unwrap();
+        assert!(diagnostic.eof_observed);
+        assert_eq!(diagnostic.family_context, "unknown");
+        assert!(diagnostic.child_soft_deleted);
+        assert_eq!(diagnostic.subreason, "child_master_reference_missing");
     }
 }

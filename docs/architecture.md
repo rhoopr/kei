@@ -904,6 +904,12 @@ new candidates. Exhausting a limit retains the hold. Sparse, malformed,
 cross-library or incomplete evidence cannot activate preservation. No diagnostic
 count is ownership proof.
 
+Inventory refusal logs add `legacy_inventory_failure_v2` with fixed phase and
+subreason labels, terminal-marker observation, failing family context and
+soft-deletion observation. These fields do not change validation, acceptance,
+budgets, retries or checkpoint authority. Provider identities and raw errors
+remain excluded.
+
 Failed preparation discovery records a versioned, library-scoped
 `legacy_preservation_inventory_retry:` receipt in the metadata table. An unchanged
 configuration and durable original-family evidence defer another preparation scan
