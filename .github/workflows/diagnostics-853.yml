@@ -1,4 +1,4 @@
-name: Publish #853 frozen-release diagnostics
+name: 'Publish #853 frozen-release diagnostics'
 
 on:
   push:
