@@ -24,6 +24,7 @@ const PART_FILE_RECENT_GRACE_SECS: i64 = 10 * 60;
 struct OwnedTempCleanup {
     removed: usize,
     retire: Vec<PathBuf>,
+    leases: crate::download::file::CleanupLeases,
 }
 
 /// Remove only stale exact paths from kei's durable temporary-file ownership
@@ -62,6 +63,14 @@ where
     let mut cleanup = OwnedTempCleanup::default();
     for record in owned {
         debug_assert!(record.claimed_at < cutoff_secs);
+        match cleanup.leases.try_acquire(&record.path) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                tracing::warn!(error = %error, "Could not coordinate owned temporary-file cleanup");
+                continue;
+            }
+        }
         let candidate = match crate::fs_util::open_confined_regular_file(root, &record.path) {
             Ok(candidate) => candidate,
             Err(error) => {

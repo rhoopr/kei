@@ -87,9 +87,9 @@ impl DownloadClient for Client {
     }
 }
 
-/// Derive a deterministic .part filename from the checksum so that
-/// concurrent downloads of different files don't collide. Base32-encoded
-/// because base64 contains `/` which is invalid in filenames.
+/// Derive a bounded staging filename from the lossless absolute destination
+/// and provider content generation. MMCS checksums identify generations; they
+/// are not local content hashes. Legacy checksum-only paths are not adopted.
 pub(in crate::download) fn temp_download_path(
     download_path: &Path,
     checksum: &str,
@@ -101,9 +101,7 @@ pub(in crate::download) fn temp_download_path(
     if decoded.is_empty() {
         anyhow::bail!("Apple returned an empty checksum.");
     }
-    let encoded = data_encoding::BASE32_NOPAD.encode(&decoded);
-    let download_dir = download_path.parent().unwrap_or_else(|| Path::new("."));
-    Ok(download_dir.join(format!("{encoded}{temp_suffix}")))
+    super::staging::staging_path(download_path, &decoded, temp_suffix)
 }
 
 /// Download a file from URL using .part temp files.
@@ -465,16 +463,22 @@ async fn attempt_download_with_publication<C: DownloadClient>(
             .await
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::AlreadyExists => DownloadError::Other(anyhow::anyhow!(
-                    "Another kei process is already writing {}. Only one kei instance may use the same download directory at a time.",
+                    "Temporary download path already exists or changed while creating {}.",
                     part_path.display()
                 )),
-                _ => DownloadError::Other(anyhow::anyhow!("Could not open temporary download file: {e}")),
+                _ => DownloadError::Other(anyhow::anyhow!(
+                    "Could not open temporary download file: {e}"
+                )),
             })?
     } else {
-        resume_file.ok_or_else(|| DownloadError::Other(anyhow::anyhow!(
-            "Resumed download lost its retained temporary file"
-        )))?
-    }.into_std().await;
+        resume_file.ok_or_else(|| {
+            DownloadError::Other(anyhow::anyhow!(
+                "Resumed download lost its retained temporary file"
+            ))
+        })?
+    }
+    .into_std()
+    .await;
     let (confined, file) = tokio::task::spawn_blocking(move || {
         confined.validate_identity(file_identity(&file)?)?;
         Ok::<_, std::io::Error>((confined, file))

@@ -143,7 +143,13 @@ pub(super) async fn publish_embed_metadata(
     prepared: crate::download::metadata::PreparedMetadataFile,
 ) -> EmbedWriteResult {
     let embed_path = path.to_path_buf();
-    match tokio::task::spawn_blocking(move || prepared.publish(&embed_path)).await {
+    match tokio::task::spawn_blocking(move || {
+        #[cfg(all(test, feature = "xmp"))]
+        publication_pause::wait(&embed_path);
+        prepared.publish(&embed_path)
+    })
+    .await
+    {
         Ok(Ok(output_fingerprint)) => EmbedWriteResult::Applied(Some(output_fingerprint)),
         Ok(Err(error)) => {
             let disposition = crate::download::file::classify_conditional_publish_error(&error);
@@ -199,3 +205,66 @@ pub(super) async fn write_embed_metadata(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "xmp"))]
+pub(in crate::download) mod publication_pause {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    struct Gate {
+        started: tokio::sync::Notify,
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<Gate>>>> = OnceLock::new();
+
+    pub(in crate::download) struct Pause(Arc<Gate>);
+    impl Pause {
+        pub(in crate::download) async fn started(&self) {
+            self.0.started.notified().await;
+        }
+        pub(in crate::download) fn release(&self) {
+            *self.0.released.lock().unwrap() = true;
+            self.0.changed.notify_all();
+        }
+    }
+    impl Drop for Pause {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    pub(in crate::download) fn install(path: &Path) -> Pause {
+        let gate = Arc::new(Gate {
+            started: tokio::sync::Notify::new(),
+            released: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        GATES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), gate.clone());
+        Pause(gate)
+    }
+
+    pub(super) fn wait(path: &Path) {
+        let gate = GATES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .remove(path);
+        if let Some(gate) = gate {
+            gate.started.notify_one();
+            let released = gate.released.lock().unwrap();
+            let (_released, timed_out) = gate
+                .changed
+                .wait_timeout_while(released, std::time::Duration::from_secs(10), |released| {
+                    !*released
+                })
+                .unwrap();
+            assert!(!timed_out.timed_out(), "publication pause must be released");
+        }
+    }
+}

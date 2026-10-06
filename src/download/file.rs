@@ -19,6 +19,7 @@ mod replacement;
 mod replacement_recovery;
 #[cfg(target_os = "linux")]
 use anyhow::Context;
+mod staging;
 mod transfer;
 mod validation;
 
@@ -47,6 +48,7 @@ pub(super) use replacement::classify_conditional_publish_error;
 #[cfg(feature = "xmp")]
 pub(super) use replacement::publish_file_if_unchanged;
 pub(super) use replacement::publish_file_if_unchanged_blocking;
+pub(super) use staging::{CleanupLeases, lock_download_destination};
 pub(super) use transfer::DownloadClient;
 pub(super) use transfer::DownloadLimits;
 pub(super) use transfer::DownloadOpts;

@@ -1168,6 +1168,30 @@ must pass before downloaded state can finalize. The task retains the file
 through metadata work and publication; an opt-in metadata replacement must
 match the writer's output fingerprint before it is accepted.
 The durable temporary-path claim alone does not authorize an append.
+Staging names use fixed-length SHA-256 digests of the lossless absolute
+destination and provider checksum generation, encoded as
+`kei-v1-<destination>-<generation><temp_suffix>`. MMCS checksums select a
+provider generation; they do not verify downloaded bytes. Different
+destinations have independent staging even when their bytes match.
+`file::staging` acquires an in-memory destination guard before claiming or
+inspecting a part. The task retains it through retries, resume, metadata,
+publication and claim retirement. Different generations and suffixes for one
+destination share that guard. Cancelled waiters cannot retire a peer's claim.
+The weak registry upgrades and prunes entries under one short mutex; active
+owned guards and waiting futures keep the shared destination mutex alive.
+Completed and cancelled guards retire dead entries. No permanent lock files
+are created. This coordination covers workers in one kei process, including
+separate databases used inside that process. It does not coordinate independent
+processes or hosts; existing cross-process limits remain, including network
+filesystems whose advisory locking is disabled or unsupported.
+Cleanup of versioned staging names takes the same destination guard through
+claim retirement. A busy guard preserves both bytes and the claim. Legacy
+checksum-only files are never adopted into a new destination's staging
+identity. Existing exact-path ownership claims can still authorize their
+stale orphan cleanup under the same age and confinement rules. Unclaimed
+legacy files remain untouched; this change performs no migration or discard.
+The streaming consumer cancels and drains after its authentication threshold,
+so detached filesystem or metadata operations complete before guard release.
 A resumed request rejected with HTTP 416 gets at most one fresh request per
 attempt. The retained part stays intact until an acceptable response can
 restart the transfer; a second 416 terminates that attempt. Transfer retry

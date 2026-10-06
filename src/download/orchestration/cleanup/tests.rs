@@ -198,3 +198,61 @@ async fn contract_temp_file_delete_requires_durable_ownership() {
         "cleanup must retire consumed ownership"
     );
 }
+
+#[tokio::test]
+async fn versioned_orphan_cleanup_holds_lease_through_retirement_and_preserves_active_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("a.jpg");
+    let part = crate::download::file::temp_download_path(&destination, "AAAA", ".part").unwrap();
+    std::fs::write(&part, b"retained").unwrap();
+    let record = crate::state::OwnedTempFile {
+        path: part.clone(),
+        claimed_at: 1,
+    };
+    let lease = crate::download::file::lock_download_destination(
+        &destination,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let cleanup = remove_owned_orphan_parts(
+        dir.path(),
+        std::slice::from_ref(&record),
+        i64::MAX / 2,
+        i64::MAX / 2,
+        0,
+    );
+    assert_eq!(cleanup.removed, 0);
+    assert!(cleanup.retire.is_empty());
+    assert_eq!(std::fs::read(&part).unwrap(), b"retained");
+    drop(lease);
+    let cleanup = remove_owned_orphan_parts(dir.path(), &[record], i64::MAX / 2, i64::MAX / 2, 0);
+    assert_eq!(cleanup.removed, 1);
+    assert_eq!(cleanup.retire.as_slice(), std::slice::from_ref(&part));
+    let mut peer = crate::download::file::CleanupLeases::default();
+    assert!(!peer.try_acquire(&part).unwrap());
+    drop(cleanup);
+    assert!(peer.try_acquire(&part).unwrap());
+}
+
+#[tokio::test]
+async fn owned_cleanup_reuses_destination_guard_for_multiple_stale_generations() {
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("a.jpg");
+    let parts: Vec<_> = ["AAAA", "AAAB"]
+        .iter()
+        .map(|checksum| {
+            let part =
+                crate::download::file::temp_download_path(&destination, checksum, ".part").unwrap();
+            std::fs::write(&part, b"stale generation").unwrap();
+            crate::state::OwnedTempFile {
+                path: part,
+                claimed_at: 1,
+            }
+        })
+        .collect();
+    let cleanup = remove_owned_orphan_parts(dir.path(), &parts, i64::MAX / 2, i64::MAX / 2, 0);
+    assert_eq!(cleanup.removed, 2);
+    assert_eq!(cleanup.retire.len(), 2);
+    assert!(parts.iter().all(|record| !record.path.exists()));
+}

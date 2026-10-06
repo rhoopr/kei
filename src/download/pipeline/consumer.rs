@@ -233,7 +233,9 @@ pub(super) async fn consume_stream_download_tasks(
                                     "Auth error threshold reached, aborting for re-authentication"
                                 );
                             });
-                            break;
+                            // Drain tasks before dropping their staging leases:
+                            // metadata and filesystem workers must finish first.
+                            pipeline_shutdown.cancel();
                         }
                     }
                     DownloadTaskErrorClass::ExpiredUrl => {
