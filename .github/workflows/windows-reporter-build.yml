@@ -1,0 +1,190 @@
+name: 'Build pinned Windows test binary for #913 and #914'
+
+# LOCAL DRAFT. Creating this exact remote branch would execute the workflow.
+# Hold branch creation/push, execution, artifact upload and public handoff for review.
+on:
+  push:
+    branches:
+      - automation/windows-913-914-386e68c
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-913-914-386e68c
+  cancel-in-progress: false
+
+env:
+  SOURCE_REVISION: 386e68cdb0b2302933946ba821327f616f73ce81
+  RUST_STABLE_TOOLCHAIN: '1.94.1'
+  BUILD_TARGET: x86_64-pc-windows-msvc
+  CARGO_BUILD_JOBS: '2'
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    if: >-
+      github.repository == 'rhoopr/kei' &&
+      github.actor == 'rhoopr' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/automation/windows-913-914-386e68c' &&
+      github.event.created == true &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: source
+    steps:
+      - name: Check out only the qualified source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rhoopr/kei
+          ref: 386e68cdb0b2302933946ba821327f616f73ce81
+          persist-credentials: false
+          path: source
+
+      - name: Check out the exact reviewed workflow and qualification files
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rhoopr/kei
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: handoff
+
+      - name: Verify source and prepare isolated build paths
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:SOURCE_REVISION) { throw 'Unexpected source commit' }
+          if (git status --porcelain) { throw 'Dirty source checkout' }
+          $handoff = Join-Path $env:GITHUB_WORKSPACE 'handoff'
+          $handoffHead = (git -C $handoff rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $handoffHead -ne $env:GITHUB_SHA) { throw 'Unexpected workflow commit' }
+          if (git -C $handoff status --porcelain) { throw 'Dirty handoff checkout' }
+          if (-not (Select-String -Path src/state/schema.rs -SimpleMatch 'pub(crate) const SCHEMA_VERSION: i32 = 34;')) {
+            throw 'Unexpected state schema'
+          }
+          if (-not (Select-String -Path Cargo.toml -Pattern '^version = "0\.24\.2-dev"$')) { throw 'Unexpected package version' }
+          $buildTarget = Join-Path $env:RUNNER_TEMP 'kei-build-target'
+          "CARGO_TARGET_DIR=$buildTarget" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install the release toolchain and Windows target
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+          targets: ${{ env.BUILD_TARGET }}
+
+      - name: Build locked release executable with default features
+        run: |
+          cargo build --locked --release --target $env:BUILD_TARGET --bin kei
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+
+      - name: Smoke-check and package the exact executable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:CARGO_TARGET_DIR "$env:BUILD_TARGET/release/kei.exe"
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ([BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x00004550 -or
+              [BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0x8664) { throw 'Expected Windows AMD64 PE executable' }
+          $version = (& $exe --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -ne 'kei 0.24.2-dev') { throw 'Version smoke check failed' }
+          $evidence = Join-Path $env:RUNNER_TEMP 'kei-evidence'
+          $package = Join-Path $env:RUNNER_TEMP 'kei-package'
+          New-Item -ItemType Directory -Path $evidence, $package | Out-Null
+          foreach ($command in @('sync', 'import-existing', 'login', 'migrate-state', 'manifest')) {
+            & $exe $command --help | Out-File (Join-Path $evidence "$command-help.txt") -Encoding utf8
+            if ($LASTEXITCODE -ne 0) { throw "Help smoke check failed: $command" }
+          }
+          if (git status --porcelain) { throw 'Build modified tracked source' }
+          Copy-Item -LiteralPath $exe -Destination (Join-Path $package 'kei.exe')
+          @'
+          kei 0.24.2-dev test build, Windows x86_64, not a tagged release.
+          Source: 386e68cdb0b2302933946ba821327f616f73ce81; state schema: 34.
+          Includes merged #913/#914 fixes. Windows reporter validation is pending.
+          Run only with separately reviewed scratch configs, state and media copies.
+          Old schema-28 state and legacy auth files need the current migration flow.
+          Do not replace the installed binary or point this build at production paths.
+          '@ | Set-Content (Join-Path $package 'TEST-BUILD.txt') -Encoding utf8
+          $zipName = 'kei-windows-x86_64-test-386e68c.zip'
+          $zip = Join-Path $evidence $zipName
+          Compress-Archive -Path "$package/*" -DestinationPath $zip
+          $exeHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  $zipName" | Set-Content (Join-Path $evidence 'SHA256SUMS.txt') -Encoding ascii
+          $provenance = [ordered]@{
+            repository = 'rhoopr/kei'
+            source_commit = $env:SOURCE_REVISION
+            source_tree = (git rev-parse 'HEAD^{tree}').Trim()
+            source_ci = 'https://github.com/rhoopr/kei/actions/runs/37513006192'
+            workflow_commit = $env:GITHUB_SHA
+            workflow_ref = $env:GITHUB_WORKFLOW_REF
+            run_url = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            runner = $env:RUNNER_OS
+            target = $env:BUILD_TARGET
+            pe_machine = 'AMD64 (0x8664)'
+            rustc = (rustc --version --verbose | Out-String).Trim()
+            cargo = (cargo --version | Out-String).Trim()
+            build_command = 'cargo build --locked --release --target x86_64-pc-windows-msvc --bin kei'
+            features = 'default'
+            version = $version
+            schema = 34
+            exe_sha256 = $exeHash
+            archive = $zipName
+            archive_sha256 = $zipHash
+            reporter_validation = 'pending; help/version smoke checks only'
+          }
+          $provenance | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $evidence 'provenance.json') -Encoding utf8
+          "Source: $env:SOURCE_REVISION; binary SHA-256: $exeHash; archive SHA-256: $zipHash" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Require offline Windows PowerShell 5.1 and 7 helper qualification
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $companions = Join-Path $env:GITHUB_WORKSPACE 'handoff/.github/reporter-handoffs/913-914'
+          $qualifier = Join-Path $companions 'qualify-helper.ps1'
+          $exe = Join-Path $env:CARGO_TARGET_DIR "$env:BUILD_TARGET/release/kei.exe"
+          $evidence = Join-Path $env:RUNNER_TEMP 'kei-evidence'
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -File $qualifier -CompanionRoot $companions -Exe $exe -FixtureRoot (Join-Path $env:RUNNER_TEMP 'kei-helper-51') -ProofPath (Join-Path $evidence 'helper-51.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell 5.1 qualification failed' }
+          & pwsh -NoLogo -NoProfile -NonInteractive -File $qualifier -CompanionRoot $companions -Exe $exe -FixtureRoot (Join-Path $env:RUNNER_TEMP 'kei-helper-7') -ProofPath (Join-Path $evidence 'helper-7.json')
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 7 qualification failed' }
+          $legacy = Get-Content (Join-Path $evidence 'helper-51.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+          $modern = Get-Content (Join-Path $evidence 'helper-7.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($legacy.result -ne 'passed' -or $legacy.powershell -notlike '5.1.*' -or
+              $modern.result -ne 'passed' -or $modern.powershell -notlike '7.*') { throw 'Unexpected PowerShell qualification proof' }
+
+      - name: Require offline Windows SQLite inspector qualification
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $companions = Join-Path $env:GITHUB_WORKSPACE 'handoff/.github/reporter-handoffs/913-914'
+          $evidence = Join-Path $env:RUNNER_TEMP 'kei-evidence'
+          $proof = Join-Path $evidence 'inspector-windows.json'
+          & python (Join-Path $companions 'qualify-inspector.py') $companions (Join-Path $env:RUNNER_TEMP ('kei-inspector space-' + [char]0x00e9)) $proof
+          if ($LASTEXITCODE -ne 0) { throw 'Windows inspector qualification failed' }
+          $inspector = Get-Content $proof -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($inspector.result -ne 'passed' -or $inspector.provider_operations -ne 0) { throw 'Unexpected inspector qualification proof' }
+          $provenancePath = Join-Path $evidence 'provenance.json'
+          $provenance = Get-Content $provenancePath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $hashes = [ordered]@{}
+          foreach ($name in @('reporter-validation.md', 'reporter-tools.ps1', 'inspect-state.py', 'qualify-helper.ps1', 'qualify-inspector.py')) {
+            $hashes[$name] = (Get-FileHash -LiteralPath (Join-Path $companions $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $provenance | Add-Member -NotePropertyName companion_sha256 -NotePropertyValue $hashes
+          $provenance | Add-Member -NotePropertyName offline_windows_qualification -NotePropertyValue @('helper-51.json', 'helper-7.json', 'inspector-windows.json')
+          $provenance | ConvertTo-Json -Depth 6 | Set-Content $provenancePath -Encoding utf8
+          if (git status --porcelain) { throw 'Qualification changed product source' }
+          if (git -C (Join-Path $env:GITHUB_WORKSPACE 'handoff') status --porcelain) { throw 'Qualification changed reviewed handoff files' }
+
+      - name: Retain the test archive and build evidence
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kei-windows-x86_64-test-386e68c-${{ github.run_id }}
+          path: ${{ runner.temp }}/kei-evidence/
+          if-no-files-found: error
+          retention-days: 14
