@@ -60,7 +60,7 @@ fn mutex_for_key(key: DestinationKey) -> anyhow::Result<Arc<DestinationMutex>> {
     let mut registry = DESTINATIONS
         .get_or_init(Mutex::default)
         .lock()
-        .map_err(|_| anyhow::anyhow!("Staging coordinator was poisoned"))?;
+        .map_err(|error| anyhow::anyhow!("Staging coordinator was poisoned: {error}"))?;
     if let Some(mutex) = registry.get(&key).and_then(Weak::upgrade) {
         return Ok(mutex);
     }
