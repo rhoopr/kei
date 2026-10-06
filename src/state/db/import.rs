@@ -14,6 +14,7 @@ use crate::state::error::StateError;
 use crate::state::types::{AssetRecord, METADATA_CAPTURE_REVISION};
 
 impl SqliteStateDb {
+    #[cfg(test)]
     pub(crate) async fn import_adopt(
         &self,
         record: &AssetRecord,
@@ -22,9 +23,32 @@ impl SqliteStateDb {
         imported_size: u64,
         imported_mtime: Option<i64>,
     ) -> Result<(), StateError> {
+        self.import_adopt_with_identity(
+            record,
+            local_path,
+            local_checksum,
+            imported_size,
+            imported_mtime,
+            None,
+        )
+        .await
+    }
+
+    /// Persist the provider child/master pair with the adopted row. Legacy
+    /// ownership is claimed in this transaction, never while merely matching.
+    pub(crate) async fn import_adopt_with_identity(
+        &self,
+        record: &AssetRecord,
+        local_path: &Path,
+        local_checksum: &str,
+        imported_size: u64,
+        imported_mtime: Option<i64>,
+        identity: Option<(&str, &str)>,
+    ) -> Result<(), StateError> {
         let record = record.clone();
         let local_path = local_path.to_path_buf();
         let local_checksum = local_checksum.to_owned();
+        let identity = identity.map(|(child, master)| (child.to_owned(), master.to_owned()));
 
         self.with_conn_mut("import_adopt", move |conn| {
             let tx = conn
@@ -66,7 +90,38 @@ impl SqliteStateDb {
                 }
             }
 
+            let protected_id: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1 AND asset_id=?2)",
+                rusqlite::params![record.library.as_ref(), record.id.as_ref()],
+                |row| row.get(0),
+            )?;
+            if protected_id {
+                return Err(StateError::Invariant {
+                    operation: "import_adopt",
+                    detail: "import identity is protected unattributed legacy evidence".into(),
+                });
+            }
             let now = Utc::now().timestamp();
+            if let Some((child, master)) = &identity {
+                if record.id.as_ref() == master && child != master {
+                    if !super::identity::claim_legacy_master_state_owner_in_tx(
+                        &tx, &record.library, master, child,
+                    )? {
+                        return Err(StateError::Invariant {
+                            operation: "import_adopt",
+                            detail: "legacy state owner changed before import adoption".into(),
+                        });
+                    }
+                } else if record.id.as_ref() != child {
+                    return Err(StateError::Invariant {
+                        operation: "import_adopt",
+                        detail: "import state identity is not the provider child or guarded master".into(),
+                    });
+                }
+                super::identity::upsert_asset_master_mapping_in_tx(
+                    &tx, &record.library, child, master,
+                )?;
+            }
             upsert_asset_row(&tx, &record, now)?;
             let rows = update_status_to_downloaded(
                 &tx,
@@ -171,14 +226,16 @@ impl ImportStateStore for SqliteStateDb {
         local_checksum: &str,
         imported_size: u64,
         imported_mtime: Option<i64>,
+        identity: Option<(&str, &str)>,
     ) -> Result<(), StateError> {
-        SqliteStateDb::import_adopt(
+        SqliteStateDb::import_adopt_with_identity(
             self,
             record,
             local_path,
             local_checksum,
             imported_size,
             imported_mtime,
+            identity,
         )
         .await
     }

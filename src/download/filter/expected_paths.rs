@@ -145,9 +145,16 @@ pub(in crate::download) fn stored_path_matches_current_collision_family(
         return false;
     };
 
-    collision_family_base_filenames(asset_id, derived, derived_paths, config)
-        .iter()
-        .any(|base| stored_filename_matches_base_family(stored_filename, base, asset_id))
+    collision_family_base_filenames(
+        asset_id,
+        &derived.filename,
+        derived.size,
+        derived.version_size,
+        primary_derived_path(derived_paths).map(|p| (p.filename.as_str(), p.size)),
+        config,
+    )
+    .iter()
+    .any(|(base, _)| stored_filename_matches_base_family(stored_filename, base, asset_id))
 }
 
 /// Also recognize the numbered still stems produced by older Live Photo plans.
@@ -201,36 +208,135 @@ pub(in crate::download) fn stored_path_matches_download_family(
     )
 }
 
+/// Shared collision-family shapes and whether the shape carries a full asset ID.
+/// The short name-id7 and size suffix alone are not ownership evidence.
 fn collision_family_base_filenames(
     asset_id: &str,
-    derived: &DerivedPath,
-    derived_paths: &[DerivedPath],
-    config: &DownloadConfig,
-) -> Vec<String> {
+    filename: &str,
+    size: u64,
+    version_size: VersionSizeKey,
+    primary: Option<(&str, u64)>,
+    config: &(impl PathDerivationSource + ?Sized),
+) -> Vec<(String, bool)> {
     let mut bases = vec![
-        derived.filename.clone(),
-        paths::add_dedup_suffix(&derived.filename, derived.size),
-        paths::insert_asset_identity_suffix(&derived.filename, asset_id),
+        (filename.to_owned(), false),
+        (paths::add_dedup_suffix(filename, size), false),
+        (
+            paths::insert_asset_identity_suffix(filename, asset_id),
+            true,
+        ),
     ];
-
-    if derived.version_size.is_live_photo_motion()
-        && let Some(primary) = primary_derived_path(derived_paths)
+    if version_size.is_live_photo_motion()
+        && let Some((primary_filename, primary_size)) = primary
     {
-        let primary_collision_filenames = [
-            paths::add_dedup_suffix(&primary.filename, primary.size),
-            paths::insert_asset_identity_suffix(&primary.filename, asset_id),
-        ];
-        for primary_filename in primary_collision_filenames {
-            bases.push(live_photo_motion_filename_for_primary(
-                &primary_filename,
-                config,
+        for (primary_filename, qualified) in [
+            (
+                paths::add_dedup_suffix(primary_filename, primary_size),
+                false,
+            ),
+            (
+                paths::insert_asset_identity_suffix(primary_filename, asset_id),
+                true,
+            ),
+        ] {
+            bases.push((
+                live_photo_motion_filename_for_primary(&primary_filename, config),
+                qualified,
             ));
         }
     }
-
     bases.sort();
     bases.dedup();
     bases
+}
+
+/// Prefixes for an indexed directory census. Exact family acceptance remains
+/// in `import_collision_family_match`, so an index hit is never ownership proof.
+pub(crate) fn import_collision_family_prefixes(
+    asset_id: &str,
+    expected: &ExpectedAssetPath,
+    all_expected: &[ExpectedAssetPath],
+    config: &(impl PathDerivationSource + ?Sized),
+) -> Vec<String> {
+    let Some(filename) = expected.path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let primary = all_expected
+        .iter()
+        .find(|p| p.version_size.is_primary_media())
+        .and_then(|p| Some((p.path.file_name()?.to_str()?, p.size)));
+    let mut prefixes = Vec::new();
+    for (base, _) in collision_family_base_filenames(
+        asset_id,
+        filename,
+        expected.size,
+        expected.version_size,
+        primary,
+        config,
+    ) {
+        // Exact bases include the extension, avoiding a broad scan of every
+        // other child's suffix when a flat directory has repeated basenames.
+        prefixes.push(paths::normalize_ampm(&base));
+        let identity = paths::insert_asset_identity_suffix(&base, asset_id);
+        if let Some(stem) = Path::new(&identity)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+        {
+            prefixes.push(paths::normalize_ampm(stem));
+        }
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
+}
+
+/// Import uses the same collision-family owner as sync. Return `Some(true)`
+/// only when the filename includes the full identity (including ordinal forms).
+/// Callers still census all candidate owners: sanitized full IDs can collide too.
+pub(crate) fn import_collision_family_match(
+    asset_id: &str,
+    expected: &ExpectedAssetPath,
+    all_expected: &[ExpectedAssetPath],
+    config: &(impl PathDerivationSource + ?Sized),
+    stored_path: &Path,
+) -> Option<bool> {
+    if stored_path.parent() != expected.path.parent() {
+        return None;
+    }
+    let filename = expected.path.file_name()?.to_str()?;
+    let stored = stored_path.file_name()?.to_str()?;
+    let primary = all_expected
+        .iter()
+        .find(|p| p.version_size.is_primary_media())
+        .and_then(|p| Some((p.path.file_name()?.to_str()?, p.size)));
+    let mut matched = None;
+    for (base, qualified) in collision_family_base_filenames(
+        asset_id,
+        filename,
+        expected.size,
+        expected.version_size,
+        primary,
+        config,
+    ) {
+        // Name-id7 does not use the generic size fallback, but sync can still
+        // emit full-identity collision filenames for its rendition tasks.
+        if config.file_match_policy() != FileMatchPolicy::NameSizeDedupWithSuffix
+            && !qualified
+            && base != filename
+        {
+            continue;
+        }
+        if stored_filename_matches_base_family(stored, &base, asset_id) {
+            let identity = qualified
+                || paths::filename_matches_identity_collision(
+                    &paths::normalize_ampm(&base),
+                    asset_id,
+                    &paths::normalize_ampm(stored),
+                );
+            matched = Some(matched.unwrap_or(false) || identity);
+        }
+    }
+    matched
 }
 
 fn primary_derived_path(derived_paths: &[DerivedPath]) -> Option<&DerivedPath> {
@@ -241,9 +347,9 @@ fn primary_derived_path(derived_paths: &[DerivedPath]) -> Option<&DerivedPath> {
 
 fn live_photo_motion_filename_for_primary(
     primary_filename: &str,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
 ) -> String {
-    match config.live_photo_mov_filename_policy {
+    match config.live_photo_mov_filename_policy() {
         crate::types::LivePhotoMovFilenamePolicy::Suffix => {
             paths::live_photo_mov_path_suffix(primary_filename)
         }

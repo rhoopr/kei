@@ -1110,14 +1110,32 @@ version and that its filename matches the recorded task filename.
 ### Import-existing
 
 `src/commands/import.rs` shares configuration, selection, pass planning, and
-path derivation with normal sync. It optionally compares remote prefix bytes,
-hashes the local candidate, and calls `ImportStateStore::import_adopt`.
+path derivation with normal sync. Before matching or consulting prior imports,
+it uses the download context's identity selector to install the same child or
+guarded legacy master state ID as sync. It prepares selected rendition rows
+and paths for every selected pass before adoption, then checks the complete
+candidate census. Incomplete enumeration, fetcher panic, or cancellation before
+completion leaves all adoption rows, mappings, and legacy owners unwritten.
+The prepared list uses memory proportional to selected renditions and cached
+directory entries; it retains shared metadata rather than raw provider JSON.
+Import uses sync's collision-family owner for full-ID and ordinal filenames.
+Different-size candidates remain distinguishable. An ambiguous short name,
+sanitized full-ID collision, or multiple ordinal siblings is refused unless an
+exact current-generation durable receipt and verified local SHA-256 identify
+the file. Provider MMCS checksums are compared to provider checksums, never to
+local SHA-256. It optionally compares remote prefix
+bytes, hashes the local candidate, and calls `ImportStateStore::import_adopt`.
+Adoption commits the provider child/master mapping and any compatible legacy
+owner in the same transaction as the imported row. Failed adoption rolls back
+both. Dry-run selects identity without persisting mappings or ownership.
+An unclaimed legacy row completes adoption before it can skip later rehashing.
 Adoption checks durable destination reservations in the same transaction as
 catalog updates. A different asset, rendition, or provider content generation
 cannot adopt a reserved path. Unknown legacy content remains occupied.
 A refused adoption logs a warning and does not count as a match.
-Size/mtime snapshots may skip later rehashing only while path, size, and mtime
-still match.
+Size/mtime snapshots may skip later rehashing only while the current provider
+checksum, path, size, mtime, and stored local checksum still match. Ambiguous
+paths always require a local hash verification before that shortcut.
 
 ## Data-safety invariants
 

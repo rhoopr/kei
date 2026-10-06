@@ -1,6 +1,6 @@
 //! Library-scoped state snapshots and existing asset identity selection.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,7 +81,7 @@ type LibraryMasterAssetSet = FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashSet<A
 /// durable child that owns a legacy master-keyed state row.
 type LibraryMasterAssetMap = FxHashMap<Arc<str>, FxHashMap<Arc<str>, Arc<str>>>;
 
-pub(in crate::download) type ClaimedLegacyMasterStates = FxHashSet<(Arc<str>, Arc<str>)>;
+pub(crate) type ClaimedLegacyMasterStates = FxHashSet<(Arc<str>, Arc<str>)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LegacyOwnerClaimMode {
@@ -117,7 +117,7 @@ const LEGACY_OWNER_CLAIM_MAX_ATTEMPTS: u32 = 3;
 const LEGACY_OWNER_CLAIM_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Default)]
-pub(in crate::download) struct DownloadContext {
+pub(crate) struct DownloadContext {
     /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
     /// are already downloaded. Three-level shape so multi-library syncs
     /// don't dedupe the same asset_id across zones (PR10 / schema v8).
@@ -210,7 +210,7 @@ impl DownloadContext {
     /// Load the download context from the state database. All state queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
-    pub(in crate::download) async fn load<D>(db: &D, retry_only: bool) -> Self
+    pub(crate) async fn load<D>(db: &D, retry_only: bool) -> Self
     where
         D: DownloadContextStateStore + DownloadStateStore + MetadataRewriteStore + ?Sized,
     {
@@ -822,7 +822,7 @@ impl DownloadContext {
         }
     }
 
-    pub(in crate::download) fn select_existing_asset_state_record_name(
+    pub(crate) fn select_existing_asset_state_record_name(
         &self,
         library: &str,
         asset: &PhotoAsset,
@@ -840,9 +840,10 @@ impl DownloadContext {
         }
     }
 
-    pub(in crate::download) async fn select_asset_state_record_name_for_download(
+    /// Select identity without durable writes, retaining sync's legacy guards.
+    /// Import uses this before rendering paths and commits ownership with adoption.
+    pub(crate) fn select_asset_state_record_name_checked(
         &self,
-        db: Option<&dyn DownloadStore>,
         library: &str,
         asset: &PhotoAsset,
         claimed_legacy_master_states: &mut ClaimedLegacyMasterStates,
@@ -857,8 +858,21 @@ impl DownloadContext {
                 detail: "provider identity collides with a protected legacy record".into(),
             });
         }
-        let state_record_name =
-            self.select_asset_state_record_name(library, asset, claimed_legacy_master_states);
+        Ok(self.select_asset_state_record_name(library, asset, claimed_legacy_master_states))
+    }
+
+    pub(in crate::download) async fn select_asset_state_record_name_for_download(
+        &self,
+        db: Option<&dyn DownloadStore>,
+        library: &str,
+        asset: &PhotoAsset,
+        claimed_legacy_master_states: &mut ClaimedLegacyMasterStates,
+    ) -> std::result::Result<Arc<str>, crate::state::error::StateError> {
+        let state_record_name = self.select_asset_state_record_name_checked(
+            library,
+            asset,
+            claimed_legacy_master_states,
+        )?;
         if state_record_name.as_ref() != asset.id()
             || self
                 .legacy_master_state_owners
@@ -974,6 +988,27 @@ impl DownloadContext {
         }
 
         if trust_state { Some(false) } else { None }
+    }
+
+    /// Durable current-generation ownership proof for import. Provider checksums
+    /// are compared only to stored provider checksums; local bytes use local SHA-256.
+    pub(crate) fn import_owned_file(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version: VersionSizeKey,
+        checksum: &str,
+    ) -> Option<(&Path, &str)> {
+        let stored = self
+            .downloaded_checksums
+            .get(library)?
+            .get(asset_id)?
+            .get(version.as_str())?;
+        if stored.as_ref() != checksum {
+            return None;
+        }
+        let file = self.downloaded_file(library, asset_id, version)?;
+        Some((&file.path, file.local_checksum.as_deref()?))
     }
 
     pub(in crate::download) fn downloaded_file(
