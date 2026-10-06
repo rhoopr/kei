@@ -1525,6 +1525,7 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
 #[derive(Clone)]
 struct PrivateSelectionCliPhotos {
     ranks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    rank_cycles: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
     lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -1602,7 +1603,11 @@ impl Respond for PrivateSelectionCliPhotos {
                 json!({"records":[{"fields":{"itemCount":{"value":Self::members(Some(scope)).len()}}}]})
             }).collect::<Vec<_>>()})
         } else if path.ends_with("/records/query") {
-            self.ranks.fetch_add(1, Ordering::SeqCst);
+            let rank = self.ranks.fetch_add(1, Ordering::SeqCst) + 1;
+            self.rank_cycles
+                .lock()
+                .unwrap()
+                .push((self.checks.load(Ordering::SeqCst), rank));
             let filters = body
                 .pointer("/query/filterBy")
                 .and_then(Value::as_array)
@@ -1621,7 +1626,14 @@ impl Respond for PrivateSelectionCliPhotos {
         } else {
             panic!("unexpected private selection CLI endpoint: {path}")
         };
-        ResponseTemplate::new(200).set_body_json(value)
+        let response = ResponseTemplate::new(200).set_body_json(value);
+        if path.ends_with("/records/query") && self.checks.load(Ordering::SeqCst) == 1 {
+            // Synthetic first-cycle delay makes an early debt-only baseline
+            // observable; later watch phases retain their normal timing.
+            response.set_delay(Duration::from_millis(300))
+        } else {
+            response
+        }
     }
 }
 
@@ -1632,6 +1644,7 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     let server = MockServer::start().await;
     let photos = PrivateSelectionCliPhotos {
         ranks: Arc::new(AtomicUsize::new(0)),
+        rank_cycles: Arc::new(std::sync::Mutex::new(Vec::new())),
         lookups: Arc::new(AtomicUsize::new(0)),
         checks: Arc::new(AtomicUsize::new(0)),
     };
@@ -1745,6 +1758,20 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         format!("{config}[watch]\ninterval=60\n[server]\nport=0\n"),
     )
     .unwrap();
+    let health_path = root.join("health.json");
+    let health_stamp = || {
+        // Health publication is a whole-cycle boundary. A concurrent plain
+        // write can be briefly incomplete; retry rather than count that as one.
+        std::fs::read(&health_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value["last_sync_at"].as_str().map(str::to_owned))
+    };
+    let mut last_health_stamp = health_stamp();
+    assert!(
+        last_health_stamp.is_some(),
+        "initial CLI cycle health receipt"
+    );
     let log = root.join("private-selection-service.log");
     let mut child = QuietServiceChild(
         std::process::Command::new(assert_cmd::cargo::cargo_bin!("kei"))
@@ -1770,28 +1797,68 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     );
     let started = std::time::Instant::now();
     let mut recovered = None;
-    while photos.checks.load(Ordering::SeqCst) < 3 && started.elapsed() < Duration::from_secs(210) {
+    let mut completed_cycles = 0;
+    while completed_cycles < 3 && started.elapsed() < Duration::from_secs(210) {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             child.0.try_wait().unwrap().is_none(),
             "{}",
             std::fs::read_to_string(&log).unwrap()
         );
-        if recovered.is_none()
-            && count("SELECT count(*) FROM provider_active_destinations WHERE verified_media=0")
-                == 0
-        {
-            recovered = Some((
-                photos.ranks.load(Ordering::SeqCst),
-                photos.lookups.load(Ordering::SeqCst),
-            ));
+        let Some(stamp) = health_stamp() else {
+            continue;
+        };
+        if last_health_stamp.as_ref() == Some(&stamp) {
+            continue;
+        }
+        last_health_stamp = Some(stamp);
+        completed_cycles += 1;
+        let counters = (
+            photos.ranks.load(Ordering::SeqCst),
+            photos.lookups.load(Ordering::SeqCst),
+        );
+        if completed_cycles == 1 {
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1"
+                ),
+                5,
+                "recovery must finish all media and metadata before quiet sampling"
+            );
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0 OR verified_metadata=0"
+                ),
+                0
+            );
+            assert_eq!(
+                count("SELECT count(*) FROM provider_active_generations WHERE sealed=0"),
+                0
+            );
+            recovered = Some(counters);
+        } else {
+            assert_eq!(
+                recovered,
+                Some(counters),
+                "completed quiet cycle {completed_cycles}"
+            );
         }
     }
-    tokio::time::sleep(Duration::from_secs(1)).await;
     child.0.kill().unwrap();
     child.0.wait().unwrap();
     let diagnostics = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(completed_cycles, 3, "{diagnostics}");
     assert!(photos.checks.load(Ordering::SeqCst) >= 3, "{diagnostics}");
+    assert!(
+        photos
+            .rank_cycles
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(phase, _)| *phase <= 1),
+        "quiet watch phases must issue no rank requests: {:?}",
+        photos.rank_cycles.lock().unwrap().clone()
+    );
     assert!(
         started.elapsed() >= Duration::from_secs(119),
         "real watch cadence"
@@ -1802,7 +1869,8 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
             photos.ranks.load(Ordering::SeqCst),
             photos.lookups.load(Ordering::SeqCst)
         )),
-        "two unchanged watch cycles must not repeat completed selection/hydration"
+        "two unchanged watch cycles must not repeat completed selection/hydration; rank phases={:?}",
+        photos.rank_cycles.lock().unwrap().clone()
     );
     assert_eq!(
         count(

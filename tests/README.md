@@ -1085,6 +1085,14 @@ reopen ownership, recover selected bytes through existing queues, then run two
 unchanged cycles and compare requests, hydration, rank calls and file times.
 Recent fixtures use independent global/per-filter asset oracles and count
 companions and publication separately from eligible assets.
+The actual CLI/watch composition begins with populated schema 33, executes
+schema 34 migration, and recovers five independent destinations after a B receipt
+fault. It samples the recovery baseline only after a fresh whole-cycle health
+receipt, then requires two further completed health receipts at the real
+60-second cadence. Delayed first-cycle rank replies expose premature sampling;
+rank-phase traces independently reject requests in either quiet cycle. Exact
+media bytes, metadata receipts, file times and zero media GETs remain separate
+assertions. A transient incomplete health JSON write never counts as completion.
 Exact refresh controls cover failed current inventory and sealed-root replay,
 including RAW provider/logical-key swaps and two album obligations sharing one
 physical path. Actual GET410 precedes refresh. Master/resource drift cannot
