@@ -57,16 +57,66 @@ fn metadata_rewrite_target(
     id: &str,
     version_size: &str,
     path: &Path,
-) -> Result<MetadataRewriteTarget, StateError> {
+) -> Result<Option<MetadataRewriteTarget>, StateError> {
+    // Legacy TEXT paths cannot identify a non-UTF-8 destination. Its active
+    // receipt remains independently keyed by the lossless native encoding.
+    let Some(path) = path.to_str() else {
+        return Ok(None);
+    };
     let primary = conn.query_row(
         "SELECT local_path IS ?4 FROM assets WHERE library = ?1 AND id = ?2 AND version_size = ?3",
-        rusqlite::params![library, id, version_size, path.to_string_lossy()], |row| row.get::<_, bool>(0),
+        rusqlite::params![library, id, version_size, path], |row| row.get::<_, bool>(0),
     ).optional().map_err(|e| StateError::query("metadata_rewrite_target", e))?.unwrap_or(false);
-    Ok(if primary {
+    Ok(Some(if primary {
         MetadataRewriteTarget::Catalogue
     } else {
         MetadataRewriteTarget::AdditionalPath
-    })
+    }))
+}
+
+/// Reusing an independently fingerprinted operation-owned prepared output
+/// updates the legacy projection of its input, while retaining rewrite debt.
+/// Native selection identity and original download provenance remain separate.
+pub(super) fn settle_selection_prepared_input(
+    conn: &Connection,
+    pending: &PendingMetadataRewrite,
+    actual: &(String, u64),
+) -> Result<(), StateError> {
+    if pending
+        .selection_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.prepared.as_ref())
+        != Some(actual)
+    {
+        return Err(StateError::ProviderSelectionInvalid);
+    }
+    let asset = &pending.asset;
+    let path = asset
+        .local_path
+        .as_deref()
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    let Some(target) = metadata_rewrite_target(
+        conn,
+        &asset.library,
+        &asset.id,
+        asset.version_size.as_str(),
+        path,
+    )?
+    else {
+        return Ok(());
+    };
+    let (table, evidence) = target.sql();
+    let changed=conn.execute(&format!("UPDATE {table} SET local_checksum=?6 WHERE library=?1 AND id=?2 AND version_size=?3 AND {evidence} AND local_checksum IS ?5 AND local_path IS ?7"),rusqlite::params![asset.library,asset.id,asset.version_size.as_str(),asset.metadata.metadata_hash,asset.local_checksum,actual.0,path.to_str()])?;
+    if changed > 0 && target == MetadataRewriteTarget::Catalogue {
+        record_metadata_path(
+            conn,
+            &asset.library,
+            &asset.id,
+            asset.version_size.as_str(),
+            MetadataPathWrite::Rewritten,
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn metadata_capture_remaining(
@@ -142,6 +192,15 @@ pub(super) fn metadata_capture_status(
     })
 }
 
+/// A lossy projection of a native receipt is not a legacy writer identity.
+/// Keep the legacy marker, but do not send its ambiguous TEXT path to either
+/// writer. Exact native work is selected through its active receipt instead.
+const UNAMBIGUOUS_LEGACY_PATH: &str = "NOT EXISTS(SELECT 1 FROM provider_active_destinations native \
+    WHERE native.library=rewrite_source.library AND native.asset_id=rewrite_source.id \
+      AND native.version_size=rewrite_source.version_size \
+      AND native.compat_path=rewrite_source.local_path \
+      AND json_extract(native.path,'$.encoding') != 'utf8')";
+
 fn query_pending_metadata_rewrites(
     conn: &Connection,
     queue: MetadataRewriteQueue,
@@ -149,6 +208,9 @@ fn query_pending_metadata_rewrites(
     offset: usize,
     limit: usize,
 ) -> Result<Vec<PendingMetadataRewrite>, StateError> {
+    if queue == MetadataRewriteQueue::Ordinary {
+        return query_selection_and_legacy_metadata(conn, libraries, offset, limit, None);
+    }
     let (queue_predicate, order) = match queue {
         MetadataRewriteQueue::Ordinary => (
             "metadata_write_failed_at IS NOT NULL",
@@ -170,7 +232,7 @@ fn query_pending_metadata_rewrites(
             capture_repair_output_checksum, capture_repair_output_size, source_checksum \
          FROM ({source}) AS rewrite_source WHERE {queue_predicate} AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=rewrite_source.library AND p.asset_id=rewrite_source.id) \
            AND status = 'downloaded' AND is_deleted = 0 AND local_path IS NOT NULL \
-           {scope} ORDER BY {order}, local_path LIMIT ? OFFSET ?"
+           AND {UNAMBIGUOUS_LEGACY_PATH} {scope} ORDER BY {order}, local_path LIMIT ? OFFSET ?"
     );
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let offset = i64::try_from(offset).unwrap_or(i64::MAX);
@@ -194,6 +256,102 @@ fn query_pending_metadata_rewrites(
         .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))
+}
+
+/// One bounded ordered page across existing TEXT receipts and exact active
+/// destinations; each active candidate is revalidated before reaching the writer.
+type MetadataCandidate = (bool, String, String, String, String, String, String, String);
+
+fn query_selection_and_legacy_metadata(
+    conn: &Connection,
+    libraries: Option<&[String]>,
+    offset: usize,
+    limit: usize,
+    generation: Option<&str>,
+) -> Result<Vec<PendingMetadataRewrite>, StateError> {
+    let source = metadata_rewrite_source_sql();
+    let generation_filter = if generation.is_some() {
+        " AND w.generation=?"
+    } else {
+        ""
+    };
+    let legacy_filter = if generation.is_some() { " AND 0" } else { "" };
+    let scope = libraries
+        .map(|values| format!(" AND library IN ({})", sqlite_placeholders(values.len())))
+        .unwrap_or_default();
+    let sql = format!(
+        r"WITH active AS (
+        SELECT w.*, min(g.created_at) OVER writer AS ready_at, g.scope,
+            json_extract(g.specification,'$.metadata_flags') AS flags,
+            row_number() OVER (writer ORDER BY (w.prepared_hash IS NULL),w.generation,w.pass_key,w.child) AS representative
+        FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
+        WHERE w.admitted=1 AND w.verified_media=1 AND w.verified_metadata=0
+            AND w.grouping_hash IS NOT NULL AND g.metadata_enabled=1 {generation_filter}
+        WINDOW writer AS (PARTITION BY g.scope,w.library,w.asset_id,w.master,
+            w.version_size,w.path,w.checksum,w.size_bytes,w.created_at,w.added_at,
+            w.metadata_hash,w.local_checksum,w.source_checksum,w.grouping_hash,
+            json_extract(g.specification,'$.metadata_flags'))
+    ) SELECT kind,generation,pass_key,child,library,id,version_size,path FROM (
+        SELECT 0 AS kind,'' AS generation,'' AS pass_key,'' AS child,library,id,version_size,
+            local_path AS path,metadata_write_failed_at * 1000 AS ready
+        FROM ({source}) rewrite_source WHERE metadata_write_failed_at IS NOT NULL AND status='downloaded'
+            AND is_deleted=0 AND local_path IS NOT NULL {legacy_filter}
+            AND NOT EXISTS(SELECT 1 FROM unattributed_legacy u WHERE u.library=rewrite_source.library AND u.asset_id=rewrite_source.id)
+            AND NOT EXISTS(SELECT 1 FROM active w WHERE w.library=rewrite_source.library AND w.asset_id=rewrite_source.id
+                AND w.version_size=rewrite_source.version_size AND w.metadata_hash IS rewrite_source.metadata_hash
+                AND w.checksum=rewrite_source.checksum AND w.compat_path=rewrite_source.local_path
+                AND json_extract(w.path,'$.encoding')='utf8' AND json_extract(w.path,'$.path')=rewrite_source.local_path)
+            AND {UNAMBIGUOUS_LEGACY_PATH}
+        UNION ALL SELECT 1,generation,pass_key,child,library,asset_id,version_size,path,ready_at
+            FROM active WHERE representative=1
+    ) WHERE 1=1 {scope} ORDER BY ready,library,id,version_size,path,generation,pass_key LIMIT ? OFFSET ?"
+    );
+    let bound = i64::try_from(limit).unwrap_or(i64::MAX);
+    let skip = i64::try_from(offset).unwrap_or(i64::MAX);
+    let mut parameters: Vec<&dyn rusqlite::ToSql> = Vec::new();
+    if let Some(generation) = generation.as_ref() {
+        parameters.push(generation);
+    }
+    if let Some(libraries) = libraries {
+        for library in libraries {
+            parameters.push(library);
+        }
+    }
+    parameters.push(&bound);
+    parameters.push(&skip);
+    let candidates: Vec<MetadataCandidate> = conn
+        .prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(parameters), |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut pending = Vec::with_capacity(candidates.len());
+    for (active, generation, key, child, library, id, version, path) in candidates {
+        if active {
+            let candidate = super::provider_generations::metadata_receipt(
+                conn,
+                &generation,
+                &key,
+                &child,
+                &version,
+                &path,
+            )?;
+            pending.push(candidate);
+        } else {
+            let row=conn.query_row(&format!("SELECT {ASSET_COLUMNS},capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size,source_checksum FROM ({source}) WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4"),rusqlite::params![library,id,version,path],row_to_pending_metadata_rewrite)?;
+            pending.push(row);
+        }
+    }
+    Ok(pending)
 }
 
 fn row_to_pending_metadata_rewrite(
@@ -230,6 +388,7 @@ fn row_to_pending_metadata_rewrite(
     };
     Ok(PendingMetadataRewrite {
         asset: row_to_asset_record(row)?,
+        selection_receipt: None,
         capture_repair_receipt,
         source_checksum: row.get(ASSET_COLUMN_COUNT + 3)?,
     })
@@ -328,7 +487,11 @@ impl SqliteStateDb {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("record_capture_repair_prepared::begin", e))?;
-            let target = metadata_rewrite_target(&tx, &library, &asset_id, &version_size, &path)?;
+            let Some(target) =
+                metadata_rewrite_target(&tx, &library, &asset_id, &version_size, &path)?
+            else {
+                return Ok(None);
+            };
             let (table, evidence) = target.sql();
 
             let updated = tx
@@ -352,7 +515,7 @@ impl SqliteStateDb {
                         selected_output_size,
                         output_checksum,
                         output_size_sql,
-                        path.to_string_lossy()
+                        path.to_str()
                     ],
                 )
                 .map_err(|e| StateError::query("record_capture_repair_prepared", e))?;
@@ -719,6 +882,20 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Current-root priority lane; total writer budgeting belongs to orchestration.
+    pub(crate) async fn pending_selection_metadata(
+        &self,
+        owner: super::account::AccountOwner,
+        generation: String,
+        limit: usize,
+    ) -> Result<Vec<PendingMetadataRewrite>, StateError> {
+        self.with_conn("reading current selected metadata", move |conn| {
+            super::account::validate_authenticated(conn, &owner)?;
+            query_selection_and_legacy_metadata(conn, None, 0, limit.min(250), Some(&generation))
+        })
+        .await
+    }
+
     pub(crate) async fn finish_metadata_rewrite(
         &self,
         pending: &PendingMetadataRewrite,
@@ -806,17 +983,18 @@ impl SqliteStateDb {
         let Some(path) = pending.asset.local_path.clone() else {
             return Ok(false);
         };
+        let selection_pending = pending.clone();
         self.with_conn_mut("finish_metadata_rewrite", move |conn| {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("finish_metadata_rewrite::begin", e))?;
             let target = metadata_rewrite_target(&tx, &library, &asset_id, &version_size, &path)?;
-            let (table, evidence) = target.sql();
-
-            let updated = tx
-                .execute(
-                    &format!(
-                        "UPDATE {table} SET \
+            let updated = if let Some(target) = target {
+                let (table, evidence) = target.sql();
+                let updated = tx
+                    .execute(
+                        &format!(
+                            "UPDATE {table} SET \
                         local_checksum = ?6, \
                         download_checksum = COALESCE(download_checksum, ?7), \
                         metadata_write_failed_at = CASE WHEN ?8 = 1 \
@@ -841,37 +1019,47 @@ impl SqliteStateDb {
                            capture_repair_metadata_hash IS ?11 \
                            AND capture_repair_output_checksum IS ?12 \
                            AND capture_repair_output_size IS ?13)) AND local_path IS ?14"
-                    ),
-                    rusqlite::params![
+                        ),
+                        rusqlite::params![
+                            &library,
+                            &asset_id,
+                            &version_size,
+                            metadata_hash,
+                            input_checksum,
+                            local_checksum,
+                            pre_rewrite_checksum,
+                            clear_ordinary,
+                            clear_capture,
+                            selected_capture,
+                            capture_metadata_hash,
+                            capture_output_checksum,
+                            capture_output_size,
+                            path.to_str()
+                        ],
+                    )
+                    .map_err(|e| StateError::query("finish_metadata_rewrite", e))?;
+                if updated > 0 && target == MetadataRewriteTarget::Catalogue {
+                    record_metadata_path(
+                        &tx,
                         &library,
                         &asset_id,
                         &version_size,
-                        metadata_hash,
-                        input_checksum,
-                        local_checksum,
-                        pre_rewrite_checksum,
-                        clear_ordinary,
-                        clear_capture,
-                        selected_capture,
-                        capture_metadata_hash,
-                        capture_output_checksum,
-                        capture_output_size,
-                        path.to_string_lossy()
-                    ],
-                )
-                .map_err(|e| StateError::query("finish_metadata_rewrite", e))?;
-            if updated > 0 && target == MetadataRewriteTarget::Catalogue {
-                record_metadata_path(
-                    &tx,
-                    &library,
-                    &asset_id,
-                    &version_size,
-                    MetadataPathWrite::Rewritten,
-                )?;
-            }
+                        MetadataPathWrite::Rewritten,
+                    )?;
+                }
+                updated
+            } else {
+                0
+            };
+            let selected = super::provider_generations::finish_metadata_receipt(
+                &tx,
+                &selection_pending,
+                local_checksum.as_deref(),
+                completion.clears(MetadataRewriteQueue::Ordinary),
+            )?;
             tx.commit()
                 .map_err(|e| StateError::query("finish_metadata_rewrite::commit", e))?;
-            Ok(updated > 0 && completion.clears(selected_queue))
+            Ok(selected.unwrap_or(updated > 0 && completion.clears(selected_queue)))
         })
         .await
     }
@@ -1314,6 +1502,21 @@ impl MetadataRewriteStore for SqliteStateDb {
     ) -> Result<Option<CaptureRepairReceipt>, StateError> {
         SqliteStateDb::record_capture_repair_prepared(self, pending, output_checksum, output_size)
             .await
+    }
+
+    async fn record_selection_metadata_prepared(
+        &self,
+        pending: &PendingMetadataRewrite,
+        output_checksum: &str,
+        output_size: u64,
+    ) -> Result<Option<super::SelectionMetadataReceipt>, StateError> {
+        SqliteStateDb::record_selection_metadata_prepared(
+            self,
+            pending,
+            output_checksum,
+            output_size,
+        )
+        .await
     }
 
     async fn finish_metadata_rewrite(

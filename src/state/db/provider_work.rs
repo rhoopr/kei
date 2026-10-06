@@ -277,6 +277,7 @@ pub(super) fn guard_projected_generation(
     conn: &rusqlite::Connection,
     record: &AssetRecord,
 ) -> Result<(), StateError> {
+    super::provider_generations::guard_generation(conn, record)?;
     if !has_projected_obligation(
         conn,
         &record.library,
@@ -310,6 +311,7 @@ pub(super) fn guard_projected_mapping(
     child: &str,
     master: &str,
 ) -> Result<(), StateError> {
+    super::provider_generations::guard_mapping(conn, library, child, master)?;
     if !has_projected_obligation(conn, library, child, None)? {
         return Ok(());
     }
@@ -330,6 +332,9 @@ pub(super) fn guard_projected_metadata(
     created: f64,
     added: Option<f64>,
 ) -> Result<(), StateError> {
+    super::provider_generations::guard_metadata(
+        conn, library, asset, version, metadata, created, added,
+    )?;
     if !has_projected_obligation(conn, library, asset, Some(version))? {
         return Ok(());
     }

@@ -23,6 +23,7 @@ mod membership;
 mod metadata;
 mod metadata_capture_retry;
 pub(crate) mod provider_catalog;
+pub(crate) mod provider_generations;
 pub(crate) mod provider_inbox;
 pub(crate) mod provider_selection;
 pub(crate) mod provider_work;
@@ -49,7 +50,8 @@ pub(crate) use contracts::{
     AssetGroupingRows, AssetVerificationState, CheckpointTransition, DownloadContextStateStore,
     DownloadedFileRecord, ManifestAssetRow, OwnedTempFile, ReconciliationCatalogPath,
     ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
-    ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken, TempFileOwnershipStore,
+    ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken, SelectionMetadataReceipt,
+    TempFileOwnershipStore,
 };
 
 #[cfg(test)]

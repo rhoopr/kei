@@ -1610,6 +1610,9 @@ mod wiremock_tests {
     fn base_config(directory: &StdPath) -> DownloadConfig {
         let dir_arc: Arc<StdPath> = Arc::from(directory);
         DownloadConfig {
+            selection_context: None,
+            selection_run: None,
+            selection_pass: None,
             directory: dir_arc,
             folder_structure: "%Y/%m/%d".to_string(),
             folder_structure_albums: Arc::from("{album}"),

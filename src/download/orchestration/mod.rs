@@ -6,6 +6,7 @@ pub(super) mod context;
 pub(super) mod delta;
 pub(super) mod dispatch;
 pub(super) mod full;
+pub(super) mod generation;
 pub(super) mod incremental;
 pub(super) mod maintenance;
 pub(super) mod models;

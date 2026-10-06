@@ -7,7 +7,113 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 33;
+pub(crate) const SCHEMA_VERSION: i32 = 34;
+
+fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
+ id TEXT PRIMARY KEY, account_key TEXT NOT NULL, provider_key TEXT NOT NULL,
+ scope TEXT NOT NULL, config_hash TEXT NOT NULL, basis TEXT NOT NULL,
+ metadata_enabled INTEGER NOT NULL CHECK(metadata_enabled IN (0,1)),
+ specification BLOB NOT NULL, specification_hash TEXT NOT NULL,
+ sealed INTEGER NOT NULL DEFAULT 0 CHECK(sealed IN (0,1)),
+ checkpoint_ready INTEGER NOT NULL DEFAULT 0 CHECK(checkpoint_ready IN (0,1)),
+ checkpoint_veto TEXT, seal_hash TEXT, seal_header_hash TEXT, created_at INTEGER NOT NULL,
+ replay_after TEXT, last_replayed_at INTEGER NOT NULL DEFAULT 0 CHECK(last_replayed_at>=0),
+ charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_rank_pages (
+ id TEXT PRIMARY KEY, generation TEXT NOT NULL REFERENCES provider_active_generations(id),
+ pass_key TEXT NOT NULL, request BLOB NOT NULL, request_hash TEXT NOT NULL,
+ body BLOB NOT NULL, body_hash TEXT NOT NULL,
+ charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0),
+ UNIQUE(generation,pass_key,request_hash,body_hash)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_selection_rank_records (
+ page_id TEXT NOT NULL REFERENCES provider_selection_rank_pages(id),
+ ordinal INTEGER NOT NULL CHECK(ordinal>=0), record_name TEXT NOT NULL,
+ record_type TEXT, deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
+ PRIMARY KEY(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_selection_rank_identity ON provider_selection_rank_records(record_name,page_id);
+CREATE TABLE IF NOT EXISTS provider_active_decisions (
+ generation TEXT NOT NULL REFERENCES provider_active_generations(id), pass_key TEXT NOT NULL,
+ child TEXT NOT NULL, manifest BLOB NOT NULL, manifest_hash TEXT NOT NULL,
+ outcome TEXT NOT NULL CHECK(outcome IN ('selected','excluded','deferred')),
+ admission TEXT NOT NULL CHECK(admission IN ('admitted','excluded','deferred')),
+ reason TEXT NOT NULL, admission_hash TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+ next_retry_at INTEGER NOT NULL DEFAULT 0,
+ charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0),
+ PRIMARY KEY(generation,pass_key,child)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_active_sources (
+ generation TEXT NOT NULL, pass_key TEXT NOT NULL, child TEXT NOT NULL,
+ page_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+ PRIMARY KEY(generation,pass_key,child,page_id,ordinal),
+ FOREIGN KEY(generation,pass_key,child) REFERENCES provider_active_decisions(generation,pass_key,child),
+ FOREIGN KEY(page_id,ordinal) REFERENCES provider_selection_rank_records(page_id,ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_active_destinations (
+ generation TEXT NOT NULL, pass_key TEXT NOT NULL, child TEXT NOT NULL,
+ library TEXT NOT NULL, asset_id TEXT NOT NULL, master TEXT NOT NULL,
+ version_size TEXT NOT NULL, path TEXT NOT NULL, compat_path TEXT NOT NULL,
+ checksum TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK(size_bytes>=0),
+ created_at REAL NOT NULL, added_at REAL, metadata_hash TEXT NOT NULL,
+ admitted INTEGER NOT NULL CHECK(admitted IN (0,1)),
+ verified_media INTEGER NOT NULL DEFAULT 0 CHECK(verified_media IN (0,1)),
+ verified_metadata INTEGER NOT NULL DEFAULT 0 CHECK(verified_metadata IN (0,1)),
+ local_checksum TEXT, source_checksum TEXT, grouping_hash TEXT, intent_hash TEXT, progress_hash TEXT,
+ prepared_checksum TEXT, prepared_size INTEGER, prepared_hash TEXT,
+ CHECK((prepared_checksum IS NULL AND prepared_size IS NULL AND prepared_hash IS NULL)
+    OR (prepared_checksum IS NOT NULL AND prepared_size IS NOT NULL AND prepared_hash IS NOT NULL
+        AND length(prepared_checksum)=64 AND prepared_size>=0 AND length(prepared_hash)=64)),
+ PRIMARY KEY(generation,pass_key,child,version_size,path),
+ FOREIGN KEY(generation,pass_key,child) REFERENCES provider_active_decisions(generation,pass_key,child)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_active_destination_identity ON provider_active_destinations(library,asset_id,version_size,admitted,verified_media,verified_metadata);
+")?;
+    for (table, columns, expected) in [
+        (
+            "provider_active_generations",
+            "id,account_key,provider_key,scope,config_hash,basis,metadata_enabled,specification,specification_hash,sealed,checkpoint_ready,checkpoint_veto,seal_hash,seal_header_hash,created_at,replay_after,last_replayed_at,charged_bytes",
+            &["id"][..],
+        ),
+        (
+            "provider_selection_rank_pages",
+            "id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes",
+            &["id"][..],
+        ),
+        (
+            "provider_selection_rank_records",
+            "page_id,ordinal,record_name,record_type,deleted",
+            &["page_id", "ordinal"][..],
+        ),
+        (
+            "provider_active_decisions",
+            "generation,pass_key,child,manifest,manifest_hash,outcome,admission,reason,admission_hash,attempts,next_retry_at,charged_bytes",
+            &["generation", "pass_key", "child"][..],
+        ),
+        (
+            "provider_active_sources",
+            "generation,pass_key,child,page_id,ordinal",
+            &["generation", "pass_key", "child", "page_id", "ordinal"][..],
+        ),
+        (
+            "provider_active_destinations",
+            "generation,pass_key,child,library,asset_id,master,version_size,path,compat_path,checksum,size_bytes,created_at,added_at,metadata_hash,admitted,verified_media,verified_metadata,local_checksum,source_checksum,grouping_hash,intent_hash,progress_hash,prepared_checksum,prepared_size,prepared_hash",
+            &["generation", "pass_key", "child", "version_size", "path"][..],
+        ),
+    ] {
+        conn.prepare(&format!("SELECT {columns} FROM {table} LIMIT 0"))?;
+        let actual: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
+            .query_map([table], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        if actual != expected {
+            return Err(StateError::ProviderSelectionInvalid);
+        }
+    }
+    Ok(())
+}
 
 fn migrate_provider_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"
@@ -1231,6 +1337,7 @@ fn migrate_to_version(
         31 => migrate_provider_work(conn)?,
         32 => migrate_provider_work_retries(conn)?,
         33 => migrate_provider_selection(conn)?,
+        34 => migrate_active_selection(conn)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,

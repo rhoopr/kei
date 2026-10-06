@@ -124,6 +124,30 @@ pub(in crate::download) async fn run_pending_page<D>(
 where
     D: MembershipStore + MetadataRewriteStore + ?Sized,
 {
+    run_pending_budget(
+        db,
+        metadata_flags,
+        capture_timestamp_repair,
+        temp_suffix,
+        shutdown_token,
+        library_scope,
+        (offset, METADATA_REWRITE_BATCH),
+    )
+    .await
+}
+
+pub(in crate::download) async fn run_pending_budget<D>(
+    db: &D,
+    metadata_flags: MetadataFlags,
+    capture_timestamp_repair: CaptureTimestampRepair,
+    temp_suffix: Arc<str>,
+    shutdown_token: &CancellationToken,
+    library_scope: Option<&[&str]>,
+    page: (usize, usize),
+) -> super::RewritePass
+where
+    D: MembershipStore + MetadataRewriteStore + ?Sized,
+{
     let selected_queue = if matches!(
         capture_timestamp_repair,
         CaptureTimestampRepair::ReplaceWithCaptureLocal
@@ -136,26 +160,64 @@ where
         .get_pending_metadata_rewrites_page_for_queue(
             selected_queue,
             library_scope,
-            offset,
-            METADATA_REWRITE_BATCH,
+            page.0,
+            page.1.min(METADATA_REWRITE_BATCH),
         )
         .await
     {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                target: "kei::download::metadata_rewrite",
-                error = %e, "Failed to load pending metadata rewrites");
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(target: "kei::download::metadata_rewrite", %error, "Failed to load pending metadata rewrites");
             return RewritePass {
                 failed: 1,
                 ..RewritePass::default()
             };
         }
     };
+    run_pending_rows(
+        db,
+        metadata_flags,
+        capture_timestamp_repair,
+        temp_suffix,
+        shutdown_token,
+        pending,
+    )
+    .await
+}
+
+/// Both selected destinations and ordinary retry pages use the same physical
+/// writer and exact durable finalization owner.
+pub(in crate::download) async fn run_pending_rows<D>(
+    db: &D,
+    metadata_flags: MetadataFlags,
+    capture_timestamp_repair: CaptureTimestampRepair,
+    temp_suffix: Arc<str>,
+    shutdown_token: &CancellationToken,
+    pending: Vec<crate::state::db::PendingMetadataRewrite>,
+) -> super::RewritePass
+where
+    D: MembershipStore + MetadataRewriteStore + ?Sized,
+{
+    let selected_queue = if matches!(
+        capture_timestamp_repair,
+        CaptureTimestampRepair::ReplaceWithCaptureLocal
+    ) {
+        MetadataRewriteQueue::CaptureRepair
+    } else {
+        MetadataRewriteQueue::Ordinary
+    };
     if pending.is_empty() {
         return RewritePass::default();
     }
-    let (groupings_by_library, grouping_read_failures) = if metadata_flags.uses_xmp_groupings() {
+    let needs_groupings = metadata_flags.uses_xmp_groupings()
+        || pending.iter().any(|row| {
+            row.selection_receipt.as_ref().is_some_and(|receipt| {
+                receipt.metadata_flags
+                    & (MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR).bits()
+                    != 0
+            })
+        });
+    let (groupings_by_library, grouping_read_failures) = if needs_groupings {
         load_pending_groupings(db, &pending).await
     } else {
         (HashMap::new(), HashSet::new())
@@ -175,6 +237,29 @@ where
     let mut retired_from_selected_queue = 0usize;
     for (idx, pending_rewrite) in pending.into_iter().enumerate() {
         let record = &pending_rewrite.asset;
+        let metadata_flags = if let Some(receipt) = &pending_rewrite.selection_receipt {
+            let Some(flags) = MetadataFlags::from_bits(receipt.metadata_flags) else {
+                errored += 1;
+                continue;
+            };
+            // A frozen obligation retains its requirements, but cannot turn a
+            // writer back on after the current explicit options disable it.
+            if !metadata_flags.contains(flags) {
+                deferred += 1;
+                continue;
+            }
+            if !cfg!(feature = "xmp") && flags.uses_xmp_groupings() {
+                deferred += 1;
+                continue;
+            }
+            flags
+        } else {
+            metadata_flags
+        };
+        if !metadata_flags.has_any_write() {
+            deferred += 1;
+            continue;
+        }
         if shutdown_token.is_cancelled() {
             deferred += pending_count - idx;
             tracing::info!(
@@ -182,7 +267,9 @@ where
                 "Shutdown requested, deferring remaining metadata rewrites");
             break;
         }
-        if grouping_read_failures.contains(record.library.as_ref()) {
+        if metadata_flags.uses_xmp_groupings()
+            && grouping_read_failures.contains(record.library.as_ref())
+        {
             errored += 1;
             continue;
         }
@@ -314,6 +401,15 @@ where
                     receipt_matches_fingerprint(receipt, fingerprint)
                 });
 
+        let recovered_selection_output = pending_rewrite
+            .selection_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.prepared.as_ref())
+            .zip(pre_rewrite_fingerprint)
+            .is_some_and(|((checksum, size), fingerprint)| {
+                *size == fingerprint.size && *checksum == fingerprint_checksum(fingerprint)
+            });
+
         // A file that no longer matches the recorded hash is not kei's to
         // rewrite: embedding would overwrite the evidence that `verify` and
         // `reconcile` rely on, and re-hashing would bless the damage. The
@@ -321,7 +417,8 @@ where
         let drifted = matches!(
             (&pre_rewrite_checksum, &record.local_checksum),
             (Some(actual), Some(recorded)) if actual != recorded
-        ) && !recovered_prepared_output;
+        ) && !recovered_prepared_output
+            && !recovered_selection_output;
         if drifted {
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
@@ -339,7 +436,9 @@ where
         let mut capture_embed_complete = false;
         let mut recovered_capture_only = false;
 
-        if recovered_prepared_output {
+        if recovered_selection_output {
+            outcome.embed_no_write = true;
+        } else if recovered_prepared_output {
             if capture_repair_is_verified(&path, Arc::clone(&payload), created_local).await {
                 capture_embed_complete = true;
                 recovered_capture_only = true;
@@ -376,6 +475,25 @@ where
                         );
                         outcome.embed_failed = true;
                     } else {
+                        if pending_for_finish.selection_receipt.is_some() {
+                            let output = prepared.output_fingerprint();
+                            match db
+                                .record_selection_metadata_prepared(
+                                    &pending_for_finish,
+                                    &fingerprint_checksum(output),
+                                    output.size,
+                                )
+                                .await
+                            {
+                                Ok(Some(receipt)) => {
+                                    pending_for_finish.selection_receipt = Some(receipt)
+                                }
+                                Ok(None) | Err(_) => {
+                                    errored += 1;
+                                    continue;
+                                }
+                            }
+                        }
                         if selected_queue == MetadataRewriteQueue::CaptureRepair {
                             let output = prepared.output_fingerprint();
                             let output_checksum = fingerprint_checksum(output);
@@ -541,6 +659,7 @@ where
                         "Failed to finalise metadata rewrite state"
                     );
                     if selected_queue == MetadataRewriteQueue::Ordinary
+                        && pending_rewrite.selection_receipt.is_none()
                         && pending_rewrite.capture_repair_receipt.is_none()
                         && let Err(fallback_error) = db
                             .finish_metadata_rewrite(

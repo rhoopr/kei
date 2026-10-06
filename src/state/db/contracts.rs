@@ -82,10 +82,23 @@ impl CaptureRepairReceipt {
     }
 }
 
+/// Exact native destination selected by the generation owner. The metadata
+/// writer receives this receipt without translating its path through SQLite TEXT.
+#[derive(Debug, Clone)]
+pub(crate) struct SelectionMetadataReceipt {
+    pub(crate) generation: String,
+    pub(crate) pass_key: String,
+    pub(crate) child: String,
+    pub(crate) grouping_hash: String,
+    pub(crate) metadata_flags: u8,
+    pub(crate) prepared: Option<(String, u64)>,
+}
+
 /// One queued metadata rewrite and its independently persisted capture debt.
 #[derive(Debug, Clone)]
 pub struct PendingMetadataRewrite {
     pub asset: AssetRecord,
+    pub(crate) selection_receipt: Option<SelectionMetadataReceipt>,
     pub capture_repair_receipt: Option<CaptureRepairReceipt>,
     /// SHA-256 captured from a verified download before embedding, for this
     /// exact path and provider rendition. Never inferred from local checksums.
@@ -910,6 +923,16 @@ pub trait MetadataRewriteStore: Send + Sync {
         output_checksum: &str,
         output_size: u64,
     ) -> Result<Option<CaptureRepairReceipt>, StateError>;
+    /// Persist exact operation-owned output before an active embedded rewrite
+    /// publishes it. Stores without selection ownership must refuse the write.
+    async fn record_selection_metadata_prepared(
+        &self,
+        _pending: &PendingMetadataRewrite,
+        _output_checksum: &str,
+        _output_size: u64,
+    ) -> Result<Option<SelectionMetadataReceipt>, StateError> {
+        Err(StateError::ProviderSelectionInvalid)
+    }
     async fn finish_metadata_rewrite(
         &self,
         pending: &PendingMetadataRewrite,

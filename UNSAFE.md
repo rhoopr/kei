@@ -101,3 +101,21 @@ The easiest local removals are:
 - The replacement recovery test launcher installs a seccomp filter in its
   child process before exec. The filter lives through `prctl`, rejects only
   flagged `renameat2` calls, and leaves the parent process unchanged.
+
+
+## Disposable Linux late-I/O qualification fixture
+
+`tests/fixtures/late_io_fixture.c` interposes `write`, `fdatasync` and `fsync`
+only inside an exclusive disposable test child. It is compiled locally and
+passed through that child's `LD_PRELOAD`; production executables do not load it.
+`pthread_once` resolves matching libc forwarding signatures before concurrent
+calls. `fstat` and bounded `/proc/self/fd` reads restrict injected failures to
+regular `.part` files beneath the immutable child-owned root, or its directories
+for the directory-sync case. Successful prefix writes precede injected errors.
+A bounded audit marker contains only operation, errno and byte progress.
+
+The fixture never changes a running host service or fault setting. Its parent
+runs one child per case and checks the actual syscall marker plus filesystem
+and reopened SQLite outcomes. Environment variables are supplied to the child
+without mutating the multithreaded parent's environment. No production Rust
+unsafe block or stronger power-loss/storage promise is introduced.

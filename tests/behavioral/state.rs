@@ -9,7 +9,7 @@ use rusqlite::OptionalExtension;
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 33). The shared helper
+/// `state::schema::SCHEMA_VERSION` (currently 34). The shared helper
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -27,7 +27,14 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 33;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 34;
+    let production_schema = include_str!("../../src/state/schema.rs");
+    assert!(
+        production_schema.contains(&format!(
+            "pub(crate) const SCHEMA_VERSION: i32 = {PRODUCTION_SCHEMA_VERSION};"
+        )),
+        "behavioral production-version pin must match the actual schema owner"
+    );
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -983,6 +990,57 @@ fn reconcile_on_empty_db_prints_guidance_and_exits_clean() {
 fn behavioral_helper_carries_every_migrated_column() {
     let dir = tempfile::tempdir().unwrap();
     let conn = create_state_db(dir.path(), "schema_check@example.com");
+
+    let shapes = |db: &rusqlite::Connection| {
+        db.prepare("SELECT type,name,sql FROM sqlite_master WHERE name LIKE 'provider_active_%' OR name LIKE 'provider_selection_rank_%' OR name IN ('idx_selection_rank_identity','idx_active_destination_identity') ORDER BY type,name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    let expected_shapes = |source: &str| {
+        // Match Rust's source normalization before extracting its raw-string DDL.
+        // include_str! retains checkout CRLFs; compiled raw strings use LFs.
+        let production_schema = source.replace("\r\n", "\n");
+        let begin = production_schema
+            .find("conn.execute_batch(r\"CREATE TABLE IF NOT EXISTS provider_active_generations")
+            .unwrap()
+            + "conn.execute_batch(r\"".len();
+        let remainder = production_schema.get(begin..).unwrap();
+        let end = remainder.find("\n\")?;").unwrap();
+        let expected = rusqlite::Connection::open_in_memory().unwrap();
+        expected
+            .execute_batch(remainder.get(..end).unwrap())
+            .unwrap();
+        shapes(&expected)
+    };
+    let lf_schema = include_str!("../../src/state/schema.rs").replace("\r\n", "\n");
+    let crlf_schema = lf_schema.replace('\n', "\r\n");
+    let actual = shapes(&conn);
+    for source in [lf_schema.as_str(), crlf_schema.as_str()] {
+        assert_eq!(
+            actual,
+            expected_shapes(source),
+            "schema34 helper must retain every additive table, key, constraint and index"
+        );
+        for (before, after) in [
+            (
+                "PRIMARY KEY(generation,pass_key,child)",
+                "PRIMARY KEY(generation,child,pass_key)",
+            ),
+            (
+                "CHECK(outcome IN ('selected','excluded','deferred'))",
+                "CHECK(outcome IN ('selected','excluded'))",
+            ),
+        ] {
+            let drifted = source.replacen(before, after, 1);
+            assert_ne!(source, drifted, "negative control must change the schema");
+            assert_ne!(
+                actual,
+                expected_shapes(&drifted),
+                "source newline normalization must not conceal key or constraint drift"
+            );
+        }
+    }
 
     fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
         conn.prepare(&format!("PRAGMA table_info({table})"))

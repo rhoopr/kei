@@ -158,7 +158,17 @@ pub(super) async fn include_pending_provider_work(
             {
                 return Ok(true);
             }
-            download::has_due_retained_work(&library.plan.passes, &config, controls).await
+            async {
+                let retained =
+                    download::has_due_retained_work(&library.plan.passes, &config, controls)
+                        .await?;
+                let selected =
+                    download::has_due_selection_work(&library.plan.passes, &config, controls)
+                        .await?
+                        .unwrap_or(false);
+                Ok::<_, anyhow::Error>(retained || selected)
+            }
+            .await
         }
         .await
         {

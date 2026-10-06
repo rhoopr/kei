@@ -169,6 +169,15 @@ pub(crate) async fn write_sidecar(
     let Some(prepared) = prepared else {
         return Ok(());
     };
+    let prepared = match prepared {
+        PreparedSidecar::Publish(prepared) => prepared,
+        PreparedSidecar::Unchanged(snapshot) => {
+            tokio::task::spawn_blocking(move || snapshot.validate())
+                .await
+                .context("Unchanged XMP sidecar validation task panicked")??;
+            return Ok(());
+        }
+    };
 
     // CONTRACT: XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT
     let publication = crate::download::file::publish_file_if_unchanged(
@@ -209,7 +218,12 @@ pub(crate) async fn write_sidecar(
     Ok(())
 }
 
-struct PreparedSidecar {
+enum PreparedSidecar {
+    Publish(SidecarPublication),
+    Unchanged(ReconciledSidecarSnapshot),
+}
+
+struct SidecarPublication {
     tmp_path: PathBuf,
     sidecar_path: PathBuf,
     expected: Option<crate::download::file::ExistingFileFingerprint>,
@@ -242,7 +256,7 @@ fn prepare_sidecar_write(
     crate::download::file::recover_file_replacement(&sidecar_path)?;
     // Seed the packet with any existing sidecar content so user-authored
     // ratings / keywords / develop settings from another tool survive.
-    let (mut meta, expected) = match std::fs::read(&sidecar_path) {
+    let (mut meta, expected, existing_bytes) = match std::fs::read(&sidecar_path) {
         Ok(existing_bytes) => {
             let existing = std::str::from_utf8(&existing_bytes).with_context(|| {
                 format!(
@@ -257,10 +271,10 @@ fn prepare_sidecar_write(
                 )
             })?;
             let fingerprint = fingerprint_bytes(&existing_bytes)?;
-            (parsed, Some(fingerprint))
+            (parsed, Some(fingerprint), Some(existing_bytes))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (XmpMeta::new().context("creating XmpMeta")?, None)
+            (XmpMeta::new().context("creating XmpMeta")?, None, None)
         }
         Err(e) => {
             return Err(e).with_context(|| {
@@ -276,6 +290,24 @@ fn prepare_sidecar_write(
     }
     apply_to_owned_sidecar(&mut meta, write)?;
     let bytes = meta.to_string().into_bytes();
+    if existing_bytes.as_deref() == Some(bytes.as_slice()) {
+        let parent = sidecar_path
+            .parent()
+            .context("Sidecar has no parent directory")?;
+        let path = crate::fs_util::ConfinedPath::open(
+            parent,
+            &sidecar_path,
+            crate::fs_util::ConfinedParents::Existing,
+        )?;
+        let snapshot =
+            ReconciledSidecarSnapshot::read(path)?.context("Unchanged sidecar disappeared")?;
+        anyhow::ensure!(
+            snapshot.bytes == bytes,
+            "Unchanged sidecar changed after preparation"
+        );
+        snapshot.validate()?;
+        return Ok(Some(PreparedSidecar::Unchanged(snapshot)));
+    }
 
     let (mut temp, tmp_path) = create_unique_sidecar_temp(&sidecar_path, temp_suffix)?;
     let guard = TmpGuard::new(&tmp_path);
@@ -292,7 +324,7 @@ fn prepare_sidecar_write(
         )
     })?;
     guard.disarm();
-    Ok(Some(PreparedSidecar {
+    Ok(Some(PreparedSidecar::Publish(SidecarPublication {
         tmp_path,
         sidecar_path,
         expected,
@@ -300,7 +332,7 @@ fn prepare_sidecar_write(
         output: fingerprint_bytes(&bytes)?,
         #[cfg(target_os = "linux")]
         identity: crate::fs_util::file_identity(&temp)?,
-    }))
+    })))
 }
 
 fn sidecar_temp_path(sidecar_path: &Path, temp_suffix: &str, sequence: u64) -> PathBuf {
@@ -430,6 +462,120 @@ mod tests {
         fs::remove_file(&media_path).ok();
     }
 
+    #[tokio::test]
+    async fn identical_sidecar_keeps_exact_packet_identity_timestamp_and_user_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("unchanged.jpg");
+        let sidecar = dir.path().join("unchanged.jpg.xmp");
+        fs::write(&media, b"placeholder").unwrap();
+        ensure_initialized();
+        let mut external = XmpMeta::new().unwrap();
+        external
+            .set_property(
+                xmp_ns::DC,
+                "creator",
+                &XmpValue::new("User author".to_owned()),
+            )
+            .unwrap();
+        fs::write(&sidecar, external.to_string().into_bytes()).unwrap();
+        let write = MetadataWrite {
+            title: Some("Owned title".into()),
+            ..MetadataWrite::default()
+        };
+        write_sidecar(&media, &write, ".meta-tmp").await.unwrap();
+        let bytes = fs::read(&sidecar).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("User author"));
+        // Windows needs a writable handle to set the fixture timestamp.
+        let file = fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&sidecar)
+            .unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(42)),
+        )
+        .unwrap();
+        let identity = crate::fs_util::file_identity(&file).unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        write_sidecar(&media, &write, ".meta-tmp").await.unwrap();
+        assert_eq!(fs::read(&sidecar).unwrap(), bytes);
+        assert_eq!(
+            crate::fs_util::file_identity(&fs::File::open(&sidecar).unwrap()).unwrap(),
+            identity
+        );
+        assert_eq!(
+            fs::metadata(&sidecar).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "identical packet creates no temporary publication"
+        );
+        write_sidecar(&media, &MetadataWrite::default(), ".meta-tmp")
+            .await
+            .unwrap();
+        let cleared = fs::read_to_string(&sidecar).unwrap();
+        assert!(cleared.contains("User author"));
+        assert!(
+            !cleared.contains("Owned title"),
+            "managed-field removal remains an actual write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_sidecar_refuses_links_replacement_parent_and_in_place_mutation() {
+        for fault in ["leaf-link", "replace-file", "replace-parent", "in-place"] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("owned");
+            fs::create_dir(&parent).unwrap();
+            let media = parent.join("same.jpg");
+            let sidecar = parent.join("same.jpg.xmp");
+            fs::write(&media, b"placeholder").unwrap();
+            let write = MetadataWrite {
+                title: Some("Same".into()),
+                ..MetadataWrite::default()
+            };
+            write_sidecar_with_default_suffix(&media, &write).unwrap();
+            let bytes = fs::read(&sidecar).unwrap();
+            if fault == "leaf-link" {
+                let other = dir.path().join("external.xmp");
+                fs::write(&other, &bytes).unwrap();
+                fs::remove_file(&sidecar).unwrap();
+                std::os::unix::fs::symlink(&other, &sidecar).unwrap();
+                assert!(prepare_sidecar_write(&media, &write, ".meta-tmp").is_err());
+                assert_eq!(fs::read(&other).unwrap(), bytes);
+                continue;
+            }
+            let super::PreparedSidecar::Unchanged(snapshot) =
+                prepare_sidecar_write(&media, &write, ".meta-tmp")
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("identical packet must retain an unchanged snapshot")
+            };
+            match fault {
+                "replace-file" => {
+                    fs::rename(&sidecar, parent.join("retained-original.xmp")).unwrap();
+                    fs::write(&sidecar, &bytes).unwrap();
+                }
+                "replace-parent" => {
+                    fs::rename(&parent, dir.path().join("retained-parent")).unwrap();
+                    fs::create_dir(&parent).unwrap();
+                    fs::write(&sidecar, &bytes).unwrap();
+                }
+                "in-place" => fs::write(&sidecar, b"external mutation").unwrap(),
+                _ => panic!("unexpected sidecar mutation fixture: {fault}"),
+            }
+            assert!(
+                snapshot.validate().is_err(),
+                "{fault}: no unchanged proof after mutation"
+            );
+        }
+    }
+
     #[test]
     fn write_sidecar_is_atomic_rewrite() {
         let dir = tempfile::tempdir().unwrap();
@@ -485,7 +631,7 @@ mod tests {
             .unwrap();
         std::fs::write(&sidecar_path, original.to_string().into_bytes()).unwrap();
 
-        let prepared = prepare_sidecar_write(
+        let super::PreparedSidecar::Publish(prepared) = prepare_sidecar_write(
             &media_path,
             &MetadataWrite {
                 rating: Some(4),
@@ -494,7 +640,9 @@ mod tests {
             ".meta-tmp",
         )
         .unwrap()
-        .expect("sidecar update should be prepared");
+        .expect("sidecar update should be prepared") else {
+            panic!("changed sidecar requires publication")
+        };
         let temp_path = prepared.tmp_path.clone();
 
         let external = b"external replacement after initial read";
@@ -526,7 +674,7 @@ mod tests {
         let sidecar_path = dir.path().join("appeared.jpg.xmp");
         std::fs::write(&media_path, b"placeholder").unwrap();
 
-        let prepared = prepare_sidecar_write(
+        let super::PreparedSidecar::Publish(prepared) = prepare_sidecar_write(
             &media_path,
             &MetadataWrite {
                 rating: Some(4),
@@ -535,7 +683,9 @@ mod tests {
             ".meta-tmp",
         )
         .unwrap()
-        .expect("new sidecar should be prepared");
+        .expect("new sidecar should be prepared") else {
+            panic!("changed sidecar requires publication")
+        };
         let temp_path = prepared.tmp_path.clone();
 
         let external = b"sidecar created by another application";
@@ -563,7 +713,7 @@ mod tests {
         let sidecar_path = dir.path().join("temp-conflict.jpg.xmp");
         std::fs::write(&media_path, b"placeholder").unwrap();
 
-        let prepared = prepare_sidecar_write(
+        let super::PreparedSidecar::Publish(prepared) = prepare_sidecar_write(
             &media_path,
             &MetadataWrite {
                 rating: Some(4),
@@ -572,7 +722,9 @@ mod tests {
             ".meta-tmp",
         )
         .unwrap()
-        .expect("initial sidecar should be prepared");
+        .expect("initial sidecar should be prepared") else {
+            panic!("changed sidecar requires publication")
+        };
         let retained_path = prepared.tmp_path.clone();
         let retained_bytes = std::fs::read(&retained_path).unwrap();
 

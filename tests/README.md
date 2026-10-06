@@ -1072,11 +1072,90 @@ profile. They do not qualify album selection, multi-destination publication,
 late filesystem faults, catalog selection activation or cursor ownership. Those
 are acceptance requirements for the next PR in the same phase.
 
+
+## Private selection activation and destination recovery
+
+`download::orchestration::queue_projection::tests::private_*` enters the actual
+private album/Unfiled dispatcher with account-owned file-backed SQLite, retained
+source observations, sparse debt, unknown BLOB tables and existing media and
+sidecars. It separates source capture, admission, exact destination media and
+metadata receipts. Album A/B overlap has independent obligations even when the
+canonical asset row already records A. Fixtures close all database handles,
+reopen ownership, recover selected bytes through existing queues, then run two
+unchanged cycles and compare requests, hydration, rank calls and file times.
+Recent fixtures use independent global/per-filter asset oracles and count
+companions and publication separately from eligible assets.
+The actual CLI/watch composition begins with populated schema 33, executes
+schema 34 migration, and recovers five independent destinations after a B receipt
+fault. It samples the recovery baseline only after a fresh whole-cycle health
+receipt, then requires two further completed health receipts at the real
+60-second cadence. Delayed first-cycle rank replies expose premature sampling;
+rank-phase traces independently reject requests in either quiet cycle. Exact
+media bytes, metadata receipts, file times and zero media GETs remain separate
+assertions. A transient incomplete health JSON write never counts as completion.
+Exact refresh controls cover failed current inventory and sealed-root replay,
+including RAW provider/logical-key swaps and two album obligations sharing one
+physical path. Actual GET410 precedes refresh. Master/resource drift cannot
+replace the failed task, while metadata drift leaves its frozen packet unchanged.
+Replay completes compatible aliases with one selected transfer and runs two
+quiet released-handle cycles without fresh rank enumeration.
+
+Committed corruption controls cover generation headers, normalized admission,
+source identity, destinations, grouping/writer intent and completion proof.
+Migration controls preserve populated schema-33/live-WAL histories and unknown
+tables across rollback and two reopens. Interrupted coverage remains unsealed
+when a later generation completes. Unresolved or incompatible historical
+versions retain their fences, deadlines and checkpoint debt while independent
+healthy work publishes. SQL faults surround queue projection, media completion,
+coverage seal and actual embedded metadata completion.
+
+Prepared-output controls require actual metadata bytes to land before the
+state-write fault, then recognize only the intent-bound measured output on
+reopen. Corrupted prepared checksums and arbitrary replacement bytes cannot
+acknowledge aliases. The source-drift control uses JPEG on a UTF-8 root. Its
+Linux native counterpart uses the existing HEIF writer with a real invalid-byte root
+and a distinct replacement-character UTF-8 sibling. Sibling media, sidecar and
+legacy markers remain unchanged while exact native receipts recover. XMPFiles
+requires a UTF-8 filename; a failed JPEG preparation cannot stand in for this
+native publication proof.
+
+`private_actual_late_io_faults_preserve_owned_work_and_recover_after_reopen`
+runs on Linux with `cc` and libc dynamic loading. It compiles
+`fixtures/late_io_fixture.c` into a disposable shim and launches one exclusive
+child per case. Only that child receives `LD_PRELOAD` and a child-owned root.
+Real `.part` prefix writes precede ENOSPC or EIO; transport EOF/cancellation
+compose with the outstanding write, and real file-sync errors precede final
+publication. Strict sidecar and reconciliation tempfile sync cases preserve
+existing bytes and do not produce completion receipts. The existing directory
+fsync warning policy remains unchanged and is checked after publication.
+The reconciliation syscall case invokes the existing copy owner directly;
+state/queue reconciliation has separate dispatcher controls.
+
+Each child proves the reached syscall, disk-error precedence, preserved old
+SQLite/filesystem evidence, released-handle recovery and two quiet cycles. The
+partial TCP endpoint remains alive and serves complete bytes after only the
+fault is removed, so changed transport identity cannot masquerade as recovery.
+These are local synthetic syscall proofs. They do not qualify another OS,
+network filesystem, sudden power loss, provider snapshots, reporter data or a
+stronger SQLite durability guarantee.
+
+Repeated-source controls retain every duplicate ordinal while measuring actual
+strict page decodes. Exact-fit and below-fit byte budgets, zero-capacity refusal,
+raw hash changes, unreferenced index corruption, missing rows and extra rows
+exercise the same validation owner. Proof reuse ends with its owning operation.
+The physical-writer fixture runs 300 current media writers and 600 per-pass
+aliases through unrelated source reseeds and two unchanged released-handle
+cycles; a three-writer control exercises the identical publication oracle during
+iteration. Media and complete sidecar bytes, receipts and file times remain
+independent assertions. Exact-packet sidecar controls also retain user fields,
+exercise managed-field clearing and reject leaf, file, parent and in-place
+mutations before unchanged success.
+
 ## Released schema upgrade history
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 33.
+binary (schema 25), then executes the current production CLI through schema 34.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,

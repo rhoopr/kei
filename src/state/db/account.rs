@@ -8,7 +8,7 @@ use crate::state::{error::StateError, schema};
 const ACCOUNT_OWNER_FORMAT_VERSION: i64 = 1;
 
 /// Configured scope plus an optional independently authenticated provider pin.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct AccountOwner {
     key: String,
     provider: Option<String>,

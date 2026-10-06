@@ -463,7 +463,7 @@ pub(in crate::download) async fn build_retry_download_tasks(
 /// Refresh exact selected resources through the authenticated source zone's
 /// bounded child/master lookup. Replanning and zone enumeration cannot change
 /// the task's path, rendition, metadata or publication authorization.
-pub(super) async fn build_incremental_expired_url_retry_tasks(
+pub(in crate::download) async fn build_incremental_expired_url_retry_tasks(
     passes: &[crate::commands::AlbumPass],
     retry_sources: &FxHashMap<RetryTaskKey, UrlRetrySource>,
     failed_tasks: &[DownloadTask],
