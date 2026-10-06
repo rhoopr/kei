@@ -1936,6 +1936,8 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_legacy_inventory_error",
         "classify_provider_lookup_error",
         "classify_rate_limit_error",
+        "classify_selection_confirmation_error",
+        "classify_selection_incremental_error",
         "classify_shadow_page_error",
         "classify_srp_post_error",
         "classify_sync_auth_error",

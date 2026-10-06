@@ -12,6 +12,9 @@ use crate::download::filter::{
 };
 use crate::download::finalize::finalize_failed;
 use crate::download::metadata_rewrite::MetadataFlags;
+use crate::download::orchestration::generation::{
+    SelectionConfirmationErrorClass, classify_selection_confirmation_error,
+};
 use crate::download::planner::{ExistingPathMatch, TaskPlanner};
 use crate::download::{
     ClaimedLegacyMasterStates, DownloadConfig, DownloadContext, DownloadStore, metadata_rewrite,
@@ -387,22 +390,29 @@ where
                             Err(error) => {
                                 enum_errors_producer
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if is_provider_session_error(&error) {
-                                    provider_auth_errors
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    run.session_expired
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    producer_pb.inc(1);
-                                    tracing::warn!(target: "kei::download::pipeline",
-                                        "Current selection confirmation requires session recovery");
-                                    return skips;
-                                }
-                                if !is_provider_session_error(&error)
-                                    && error.downcast_ref::<crate::download::orchestration::generation::SelectionRetryDeferred>().is_none()
-                                    && let Err(state_error)=run.defer_confirmation(key,observed_child).await {
-                                    state_write_failures_producer.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(target:"kei::download::pipeline",%state_error,"Could not persist deferred current identity");
+                                match classify_selection_confirmation_error(&error) {
+                                    SelectionConfirmationErrorClass::SessionExpired => {
+                                        provider_auth_errors
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        run.session_expired
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                        run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        producer_pb.inc(1);
+                                        tracing::warn!(target: "kei::download::pipeline",
+                                            "Current selection confirmation requires session recovery");
+                                        return skips;
+                                    }
+                                    SelectionConfirmationErrorClass::Refused => {
+                                        if let Err(state_error) =
+                                            run.defer_confirmation(key, observed_child).await
+                                        {
+                                            state_write_failures_producer
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            tracing::warn!(target: "kei::download::pipeline", %state_error,
+                                                "Could not persist deferred current identity");
+                                        }
+                                    }
+                                    SelectionConfirmationErrorClass::RetryDeferred => {}
                                 }
                                 run.held.store(true, std::sync::atomic::Ordering::Relaxed);
                                 tracing::warn!(target: "kei::download::pipeline", %error,

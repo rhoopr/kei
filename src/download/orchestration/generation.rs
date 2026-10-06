@@ -37,6 +37,27 @@ const DEFERRED_REASON: &str = "selection_generation_deferred";
 #[error("Selected identity retry is not due")]
 pub(in crate::download) struct SelectionRetryDeferred;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::download) enum SelectionConfirmationErrorClass {
+    SessionExpired,
+    RetryDeferred,
+    Refused,
+}
+
+/// Own typed confirmation classification before producer state mutation.
+/// An existing retry deadline must not be rescheduled by another observation.
+pub(in crate::download) fn classify_selection_confirmation_error(
+    error: &anyhow::Error,
+) -> SelectionConfirmationErrorClass {
+    if crate::icloud::photos::session::is_session_error(error) {
+        SelectionConfirmationErrorClass::SessionExpired
+    } else if error.downcast_ref::<SelectionRetryDeferred>().is_some() {
+        SelectionConfirmationErrorClass::RetryDeferred
+    } else {
+        SelectionConfirmationErrorClass::Refused
+    }
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }

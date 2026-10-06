@@ -76,6 +76,19 @@ fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
     IncrementalErrorClass::StaticFallback
 }
 
+/// An activation state refusal cannot start another rank inventory. All other
+/// errors retain the existing session, token, transport and decode classification.
+fn classify_selection_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
+    if error
+        .downcast_ref::<crate::state::error::StateError>()
+        .is_some()
+    {
+        IncrementalErrorClass::CaptureRefused
+    } else {
+        classify_incremental_error(error)
+    }
+}
+
 fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
     error
         .status()
@@ -402,16 +415,7 @@ async fn download_photos_with_sync_inner(
             .await
             {
                 Ok(result) => Ok(result),
-                // An activation state refusal cannot be repaired by starting
-                // another rank inventory in the same cycle.
-                Err(error)
-                    if error
-                        .downcast_ref::<crate::state::error::StateError>()
-                        .is_some() =>
-                {
-                    Err(error)
-                }
-                Err(error) => match classify_incremental_error(&error) {
+                Err(error) => match classify_selection_incremental_error(&error) {
                     IncrementalErrorClass::TokenFallback
                     | IncrementalErrorClass::StaticFallback => {
                         Box::pin(super::generation::inventory(
