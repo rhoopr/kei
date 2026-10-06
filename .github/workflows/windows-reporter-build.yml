@@ -5,13 +5,13 @@ name: 'Build pinned Windows test binary for #913 and #914'
 on:
   push:
     branches:
-      - automation/windows-913-914-386e68c
+      - automation/windows-913-914-386e68c-lf
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-913-914-386e68c
+  group: windows-913-914-386e68c-lf
   cancel-in-progress: false
 
 env:
@@ -27,7 +27,7 @@ jobs:
       github.repository == 'rhoopr/kei' &&
       github.actor == 'rhoopr' &&
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/automation/windows-913-914-386e68c' &&
+      github.ref == 'refs/heads/automation/windows-913-914-386e68c-lf' &&
       github.event.created == true &&
       github.event.before == '0000000000000000000000000000000000000000' &&
       github.run_attempt == 1
@@ -38,6 +38,14 @@ jobs:
         shell: pwsh
         working-directory: source
     steps:
+      - name: Preserve reviewed LF bytes in both Windows checkouts
+        working-directory: ${{ github.workspace }}
+        run: |
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Could not disable checkout conversion' }
+          git config --global core.eol lf
+          if ($LASTEXITCODE -ne 0) { throw 'Could not select LF checkout bytes' }
+
       - name: Check out only the qualified source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -64,6 +72,18 @@ jobs:
           $handoffHead = (git -C $handoff rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or $handoffHead -ne $env:GITHUB_SHA) { throw 'Unexpected workflow commit' }
           if (git -C $handoff status --porcelain) { throw 'Dirty handoff checkout' }
+          $expectedCompanions = [ordered]@{
+            'reporter-validation.md' = '5bf56b2f4624e810169e8d7dab081b53ee4baa9a56f638a408adb7dea17e7108'
+            'reporter-tools.ps1' = 'e0bbd4074a8d8baeb2473a9c24e41722dd04b0ef5982f7e4a753557d39c8b38d'
+            'inspect-state.py' = '617374a11a24acccce4e1303a90269b3d9485be994deff91a61114847498ff97'
+            'qualify-helper.ps1' = '29ce5ff6bb7fde4d880472cbce1285b6e8cc17ac25dac3f994a4381b776db935'
+            'qualify-inspector.py' = '43bd119aad70c05ed6609d0f221545abaa0690c8c83e59964639ad7991c65aeb'
+          }
+          foreach ($name in $expectedCompanions.Keys) {
+            $path = Join-Path $handoff ".github/reporter-handoffs/913-914/$name"
+            $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedCompanions[$name]) { throw "Reviewed companion bytes differ: $name" }
+          }
           if (-not (Select-String -Path src/state/schema.rs -SimpleMatch 'pub(crate) const SCHEMA_VERSION: i32 = 34;')) {
             throw 'Unexpected state schema'
           }
