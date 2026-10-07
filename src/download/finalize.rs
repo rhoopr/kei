@@ -53,6 +53,9 @@ pub(super) enum DownloadedFinalization {
     },
 }
 
+#[cfg(test)]
+pub(in crate::download) mod finalization_probe;
+
 /// Persist success state for a task that has already landed safely on disk.
 /// A failed metadata write records a retry marker; retiring markers is left to
 /// the rewrite drain. On failure, the caller receives a deferred write record
@@ -140,10 +143,14 @@ where
             crate::test_helpers::process_death_point("state-persisted");
             DownloadedFinalization::Persisted
         }
-        Err(error) => DownloadedFinalization::Deferred {
-            write,
-            error: Box::new(error),
-        },
+        Err(error) => {
+            #[cfg(test)]
+            finalization_probe::observe(&task.download_path).await;
+            DownloadedFinalization::Deferred {
+                write,
+                error: Box::new(error),
+            }
+        }
     }
 }
 

@@ -792,8 +792,12 @@ continue; it cannot enter the size-only fallback.
 Fresh downloads to an affected reserved pending destination retain the original
 publication inode and current-root no-follow namespace through immediate and
 bounded deferred finalization. Each attempt revalidates both identity and the
-publication fingerprint. A changed leaf, ancestor, link or byte sequence retains
-the media and pending debt instead of committing stale verified provenance.
+publication fingerprint. Changes observed at revalidation retain the media and
+pending debt instead of committing stale verified provenance. Retained ownership
+and revalidation do not atomically exclude arbitrary Unix changes after the last
+validation while a database write awaits execution. Cleanup re-enumeration and
+collecting incremental dispatch preserve the affected task's proof requirement;
+cleanup also requires the original failed generation's checksum and size.
 Equivalent root spelling is rebased component-wise using platform ownership keys;
 this does not relax filesystem no-follow traversal or mutate the saved ledger.
 

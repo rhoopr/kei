@@ -139,7 +139,36 @@ async fn enumerated_reserved_pending(
     ))
 }
 
-pub(super) async fn validate_enumerated_reserved_pending(
+/// Preserve finalization proof only for the already-pending rendition and its
+/// current-content saved cross-parent aliases, including direct dispatch paths.
+pub(in crate::download) fn mark_reserved_pending_task(
+    ctx: &DownloadContext,
+    planner: &TaskPlanner,
+    config: &DownloadConfig,
+    task: &mut DownloadTask,
+) -> Result<()> {
+    let pending = ctx
+        .pending_ids
+        .get(task.library.as_ref())
+        .and_then(|assets| assets.get(task.asset_id.as_ref()))
+        .is_some_and(|versions| versions.contains(task.version_size.as_str()));
+    if pending
+        && !planner
+            .cross_parent_retry_destinations(
+                &task.library,
+                &task.asset_id,
+                task.version_size,
+                &task.checksum,
+                task.size,
+            )?
+            .is_empty()
+    {
+        task.pending_cross_parent_root = Some(Arc::clone(&config.directory));
+    }
+    Ok(())
+}
+
+pub(in crate::download) async fn validate_enumerated_reserved_pending(
     db: &dyn DownloadStore,
     config: &DownloadConfig,
     asset: &PhotoAsset,

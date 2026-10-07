@@ -26,8 +26,8 @@ use crate::icloud::photos::session::is_session_error as is_provider_session_erro
 use super::StreamPipelineShared;
 use super::adoption::{
     PendingOnDiskAdoption, adopt_pending_on_disk_skip, adopt_pending_on_disk_task,
-    effective_asset_library, effective_asset_library_arc, state_confirmed_current_path_exists,
-    validate_enumerated_reserved_pending,
+    effective_asset_library, effective_asset_library_arc, mark_reserved_pending_task,
+    state_confirmed_current_path_exists, validate_enumerated_reserved_pending,
 };
 use super::task::capture_repair_requested;
 
@@ -752,33 +752,16 @@ where
                         let mut disposition = AssetDisposition::Unresolved;
 
                         for mut task in plan.tasks {
-                            if download_ctx
-                                .pending_ids
-                                .get(task.library.as_ref())
-                                .and_then(|assets| assets.get(task.asset_id.as_ref()))
-                                .is_some_and(|versions| {
-                                    versions.contains(task.version_size.as_str())
-                                })
-                            {
-                                match task_planner.cross_parent_retry_destinations(
-                                    &task.library,
-                                    &task.asset_id,
-                                    task.version_size,
-                                    &task.checksum,
-                                    task.size,
-                                ) {
-                                    Ok(destinations) if !destinations.is_empty() => {
-                                        task.pending_cross_parent_root =
-                                            Some(Arc::clone(&config.directory));
-                                    }
-                                    Ok(_) => {}
-                                    Err(error) => {
-                                        enum_errors_producer
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        tracing::error!(%error, "Reserved pending task confinement failed");
-                                        continue 'assets;
-                                    }
-                                }
+                            if let Err(error) = mark_reserved_pending_task(
+                                &download_ctx,
+                                &task_planner,
+                                config,
+                                &mut task,
+                            ) {
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(%error, "Reserved pending task confinement failed");
+                                continue 'assets;
                             }
                             // Mark assets that have exceeded the retry limit as failed.
                             if let Some(attempts) =

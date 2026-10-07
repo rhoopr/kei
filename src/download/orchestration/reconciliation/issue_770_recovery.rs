@@ -1919,3 +1919,266 @@ async fn issue_770_recovery_case_equivalent_root_replays_absence_and_durable_pro
         fixture.assert_preserved().await;
     }
 }
+
+#[tokio::test]
+async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_proof() {
+    let server = crate::start_wiremock_or_skip!();
+    let fixture = RecoveryFixture::new(&server).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config = fixture.config.clone();
+    config.folder_structure = "old-album".into();
+    config.retry.max_retries = 0;
+    let asset = PhotoAsset::new(fixture.records[0].clone(), fixture.records[1].clone());
+    let first = crate::download::pipeline::stream_and_download_from_stream(
+        &Client::new(),
+        futures_util::stream::iter(vec![Ok(asset)]),
+        &Arc::new(config.clone()),
+        DownloadControls::download_hidden(),
+        1,
+        CancellationToken::new(),
+        crate::download::pipeline::StreamRuntime::new(None, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first.failed.len(),
+        1,
+        "synthetic non-expiry transfer failure"
+    );
+    let failed = first.failed;
+    assert!(
+        failed[0].pending_cross_parent_root.is_some(),
+        "producer must require proof for the affected pending rendition"
+    );
+    let mut pass = issue_770_pass(PassKind::Unfiled, &fixture.records);
+    pass.album = album_with_session(
+        "PrimarySync",
+        "",
+        Box::new(RecoveryLookupSession {
+            records: Arc::new(fixture.records.clone()),
+            enumerate: true,
+        }),
+    );
+    for mode in [
+        crate::download::CleanupUrlRefresh::Enumerate,
+        crate::download::CleanupUrlRefresh::Lookup,
+    ] {
+        let retry = crate::download::build_retry_download_tasks(
+            &[pass.clone()],
+            &config,
+            &failed,
+            mode,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.tasks.len(), 1);
+        assert_eq!(retry.tasks[0].download_path, failed[0].download_path);
+        assert_eq!(
+            retry.tasks[0].pending_cross_parent_root, failed[0].pending_cross_parent_root,
+            "both cleanup routes must retain the affected task's required publication proof"
+        );
+    }
+    // Ordinary failures retain their ordinary finalization policy.
+    let mut ordinary = failed.clone();
+    ordinary[0].pending_cross_parent_root = None;
+    let retry = crate::download::build_retry_download_tasks(
+        &[pass.clone()],
+        &config,
+        &ordinary,
+        crate::download::CleanupUrlRefresh::Enumerate,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.tasks.len(), 1);
+    assert!(retry.tasks[0].pending_cross_parent_root.is_none());
+    for changed_size in [false, true] {
+        let mut records = fixture.records.clone();
+        let resource = &mut records[0]["fields"]["resOriginalRes"]["value"];
+        if changed_size {
+            resource["size"] = json!(fixture.bytes.len() + 1);
+        } else {
+            resource["fileChecksum"] = json!("new-provider-generation");
+        }
+        let mut changed_pass = issue_770_pass(PassKind::Unfiled, &records);
+        changed_pass.album = album_with_session(
+            "PrimarySync",
+            "",
+            Box::new(RecoveryLookupSession {
+                records: Arc::new(records.clone()),
+                enumerate: true,
+            }),
+        );
+        // Bypass saved-generation reservation refusal to test cleanup's own
+        // generation boundary with an otherwise identical retry key.
+        let mut fresh_config = config.clone();
+        fresh_config.state_db = None;
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let mut planner = TaskPlanner::for_download(None).await.unwrap();
+        let plan = planner
+            .plan_download_asset(&asset, &fresh_config)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].download_path, failed[0].download_path);
+        let retry = crate::download::build_retry_download_tasks(
+            &[changed_pass],
+            &fresh_config,
+            &failed,
+            crate::download::CleanupUrlRefresh::Enumerate,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            retry.tasks.is_empty(),
+            "old failure cannot authorize changed provider content"
+        );
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let ledger = fixture.db.get_reconciliation_reservations().await.unwrap();
+    assert!(fixture.ledger.iter().all(|row| ledger.contains(row)));
+    assert!(
+        fixture
+            .db
+            .get_downloaded_page(0, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn issue_770_recovery_collecting_incremental_revalidates_deferred_publication() {
+    for changed in [false, true] {
+        let server = crate::start_wiremock_or_skip!();
+        let fixture = RecoveryFixture::new(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/pending.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(fixture.bytes.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = fixture.config.clone();
+        config.folder_structure = "old-album".into();
+        let asset = PhotoAsset::new(fixture.records[0].clone(), fixture.records[1].clone());
+        let mut planner = TaskPlanner::for_download(Some(fixture.db.as_ref()))
+            .await
+            .unwrap();
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let published = plan.tasks[0].download_path.clone();
+        let mut pass = issue_770_pass(PassKind::Unfiled, &fixture.records);
+        pass.album = album_with_session(
+            "PrimarySync",
+            "",
+            Box::new(
+                crate::test_helpers::MockPhotosFlow::new()
+                    .changes_zone_page(
+                        fixture.records.clone(),
+                        "synthetic-created-successor",
+                        false,
+                    )
+                    .build(),
+            ),
+        );
+        fixture.db.acquire_lock("770 collecting finalization fault").unwrap().execute_batch(
+            "CREATE TEMP TRIGGER issue_770_collecting_fail BEFORE UPDATE OF status ON assets WHEN NEW.status = 'downloaded' BEGIN SELECT RAISE(FAIL, 'injected collecting finalization failure'); END;"
+        ).unwrap();
+        let probe =
+            crate::download::finalize::finalization_probe::FailedFinalizationProbe::for_path(
+                &published,
+            );
+        let watcher = async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), probe.observed())
+                .await
+                .expect("must observe the failed initial receipt transaction");
+            let mut bytes = fixture.bytes.clone();
+            if changed {
+                *bytes.last_mut().unwrap() ^= 1;
+            }
+            assert_eq!(std::fs::read(&published).unwrap(), fixture.bytes);
+            if changed {
+                std::fs::write(&published, &bytes).unwrap();
+            }
+            fixture
+                .db
+                .acquire_lock("770 permit deferred retry")
+                .unwrap()
+                .execute_batch("DROP TRIGGER issue_770_collecting_fail;")
+                .unwrap();
+            probe.release();
+            bytes
+        };
+        let passes = [pass];
+        let config = Arc::new(config);
+        let client = Client::new();
+        let operation = crate::download::orchestration::incremental::download_photos_incremental_collecting_inner(
+            &client, &passes, &config, "synthetic-created-predecessor",
+            DownloadControls::download_hidden(), CancellationToken::new(),
+            std::time::Duration::from_secs(3600),
+        );
+        let (result, bytes) = tokio::join!(operation, watcher);
+        let result = result.unwrap();
+        assert_eq!(std::fs::read(&published).unwrap(), bytes);
+        assert_eq!(
+            fixture.db.get_downloaded_page(0, 10).await.unwrap().len(),
+            usize::from(!changed),
+            "collecting incremental cannot finalize stale publication bytes: {result:?}"
+        );
+        if changed {
+            assert!(result.stats.state_write_failures > 0);
+            assert!(
+                !fixture.db.get_pending().await.unwrap().is_empty()
+                    || !fixture.db.get_failed().await.unwrap().is_empty()
+            );
+        }
+        let ledger = fixture.db.get_reconciliation_reservations().await.unwrap();
+        assert!(fixture.ledger.iter().all(|row| ledger.contains(row)));
+    }
+}
+
+#[tokio::test]
+async fn issue_770_recovery_collecting_incremental_retains_unreceipted_reserved_file() {
+    let server = crate::start_wiremock_or_skip!();
+    let mut fixture = RecoveryFixture::new(&server).await;
+    std::fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
+    std::fs::write(&fixture.destination, &fixture.bytes).unwrap();
+    fixture.config.folder_structure = "old-album".into();
+    for _ in 0..2 {
+        fixture.reopen().await;
+        let mut pass = issue_770_pass(PassKind::Unfiled, &fixture.records);
+        pass.album = album_with_session(
+            "PrimarySync",
+            "",
+            Box::new(
+                crate::test_helpers::MockPhotosFlow::new()
+                    .changes_zone_page(
+                        fixture.records.clone(),
+                        "synthetic-created-successor",
+                        false,
+                    )
+                    .build(),
+            ),
+        );
+        let result = crate::download::orchestration::incremental::download_photos_incremental_collecting_inner(
+            &Client::new(), &[pass], &Arc::new(fixture.config.clone()),
+            "synthetic-created-predecessor", DownloadControls::download_hidden(),
+            CancellationToken::new(), std::time::Duration::from_secs(3600),
+        ).await.unwrap();
+        assert_eq!(result.stats.downloaded, 0);
+        assert!(result.stats.enumeration_errors > 0);
+        assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        fixture.assert_preserved().await;
+    }
+}

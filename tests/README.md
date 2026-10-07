@@ -323,7 +323,11 @@ Additional coverage supplies nonempty provider enumeration and ordinary streamin
 assets, repeats refusals across pass order and SQLite reopen, and replaces bytes,
 leaf identity and ancestor namespaces between an initial failed receipt write and
 an otherwise successful deferred transaction. The unchanged-file deferred control
-must recover. Case-equivalent root rebasing has Windows/macOS-gated coverage;
+must recover. A synthetic non-expiry failure exercises both cleanup URL refresh
+routes, and a Created delta exercises collecting incremental dispatch through a
+failed immediate receipt write and changed-byte deferred retry. Both direct
+routes retain the affected rendition's publication-proof requirement.
+Case-equivalent root rebasing has Windows/macOS-gated coverage;
 Linux qualification does not establish Windows runtime or junction behavior.
 
 Existing cross-parent files require durable matching local-hash proof. MMCS
