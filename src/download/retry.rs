@@ -418,7 +418,8 @@ impl PendingRetryPlanning<'_> {
                     )?
                     .is_empty()
                 {
-                    task.pending_cross_parent_root = Some(Arc::clone(&pass_config.directory));
+                    task.pending_cross_parent_root =
+                        Some(Arc::new(pass_config.directory.to_path_buf()));
                 }
             }
             let queued_targets: Vec<PendingRetryTarget> = retry_tasks

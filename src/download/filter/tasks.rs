@@ -1,6 +1,6 @@
 //! Download task construction from derived paths, metadata, and collision results.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, Local};
@@ -37,8 +37,9 @@ pub(in crate::download) struct DownloadTask {
     pub(in crate::download) download_path: PathBuf,
     pub(in crate::download) publication: FinalPublication,
     /// Only cross-parent reserved pending recovery retains publication proof
-    /// through finalization; ordinary task policy is unchanged.
-    pub(in crate::download) pending_cross_parent_root: Option<Arc<Path>>,
+    /// through finalization; ordinary task policy is unchanged. A sized root
+    /// keeps this optional Arc within the task's existing memory budget.
+    pub(in crate::download) pending_cross_parent_root: Option<Arc<PathBuf>>,
     pub(in crate::download) checksum: Box<str>,
     /// iCloud asset ID for state tracking. Shared with the producer's
     /// dedup set and any deferred state writes via refcount bump.

@@ -464,7 +464,7 @@ mod tests {
             .unwrap();
         let db = SqliteStateDb::open_in_memory().unwrap();
         let mut pending_task = task("PENDING", path.clone());
-        pending_task.pending_cross_parent_root = Some(Arc::from(dir.path()));
+        pending_task.pending_cross_parent_root = Some(Arc::new(dir.path().to_path_buf()));
         let result = finalize_downloaded_with_proof(
             &db,
             &Arc::from(LIBRARY),
@@ -575,7 +575,7 @@ mod tests {
             let db = SqliteStateDb::open_in_memory().unwrap();
             seed_pending(&db, "PENDING", "pending.jpg").await;
             let mut pending_task = task("PENDING", path);
-            pending_task.pending_cross_parent_root = Some(Arc::from(dir.path()));
+            pending_task.pending_cross_parent_root = Some(Arc::new(dir.path().to_path_buf()));
             let result = finalize_downloaded_with_proof(
                 &db,
                 &Arc::from(LIBRARY),

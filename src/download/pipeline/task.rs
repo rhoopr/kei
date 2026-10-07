@@ -277,7 +277,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
         // checksum that may have been refreshed after an embedded rewrite.
         let download_checksum = Some(download_checksum.or(unmodified_checksum).unwrap_or_else(|| local_checksum.clone()));
         let retained = match &task.pending_cross_parent_root {
-            Some(root) => Some(downloaded.retain_pending_publication(root, &task.download_path).await?),
+            Some(root) => Some(downloaded.retain_pending_publication(root.as_path(), &task.download_path).await?),
             None => None,
         };
         if let Some(proof) = &retained {

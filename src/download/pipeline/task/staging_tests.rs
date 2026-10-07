@@ -134,7 +134,7 @@ async fn issue_770_recovery_fresh_task_transports_original_publication_owner() {
     let body = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
     let client = StaticClient { body: body.clone() };
     let mut pending = task(path.clone(), "PENDING", body.len() as u64);
-    pending.pending_cross_parent_root = Some(Arc::from(dir.path()));
+    pending.pending_cross_parent_root = Some(Arc::new(dir.path().to_path_buf()));
     let result = run(&client, &pending, &CancellationToken::new(), None)
         .await
         .unwrap();

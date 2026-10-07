@@ -163,7 +163,7 @@ pub(in crate::download) fn mark_reserved_pending_task(
             )?
             .is_empty()
     {
-        task.pending_cross_parent_root = Some(Arc::clone(&config.directory));
+        task.pending_cross_parent_root = Some(Arc::new(config.directory.to_path_buf()));
     }
     Ok(())
 }
