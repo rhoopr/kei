@@ -406,6 +406,21 @@ impl PendingRetryPlanning<'_> {
                     .persist_download_reservations(self.db, &retry_tasks)
                     .await?;
             }
+            for task in &mut retry_tasks {
+                if !self
+                    .task_planner
+                    .cross_parent_retry_destinations(
+                        &task.library,
+                        &task.asset_id,
+                        task.version_size,
+                        &task.checksum,
+                        task.size,
+                    )?
+                    .is_empty()
+                {
+                    task.pending_cross_parent_root = Some(Arc::clone(&pass_config.directory));
+                }
+            }
             let queued_targets: Vec<PendingRetryTarget> = retry_tasks
                 .iter()
                 .map(PendingRetryTarget::from_task)

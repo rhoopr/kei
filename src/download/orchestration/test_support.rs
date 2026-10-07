@@ -33,6 +33,7 @@ pub(super) fn retry_test_task(
         url: format!("https://p01.icloud-content.com/{asset_id}").into(),
         download_path: Path::new("/tmp/codex/kei/retry-tests").join(path),
         publication: file::FinalPublication::NoReplace,
+        pending_cross_parent_root: None,
         checksum: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
         asset_id: Arc::from(asset_id),
         asset_record_name: Arc::from(asset_id),

@@ -784,7 +784,18 @@ The file owner retains no-follow directory capabilities and the regular-file
 handle, revalidates identity and bytes before the immediate state write, and
 retains those capabilities through that write. Failed adoption writes retain
 debt and later attempts must reopen and reverify; no hash-only deferred adoption
-write is queued.
+write is queued. Both ordinary and selection enumeration inspect all matching
+aliases before metadata actions, skip adoption, task adoption or touched-state
+promotion. A refusal holds that asset's debt while other enumerated assets may
+continue; it cannot enter the size-only fallback.
+
+Fresh downloads to an affected reserved pending destination retain the original
+publication inode and current-root no-follow namespace through immediate and
+bounded deferred finalization. Each attempt revalidates both identity and the
+publication fingerprint. A changed leaf, ancestor, link or byte sequence retains
+the media and pending debt instead of committing stale verified provenance.
+Equivalent root spelling is rebased component-wise using platform ownership keys;
+this does not relax filesystem no-follow traversal or mutate the saved ledger.
 
 **Recovery limitation:** an existing cross-parent reserved file without a trusted
 matching local hash remains untouched and pending. This includes a crash after

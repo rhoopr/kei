@@ -319,6 +319,12 @@ both pass orders and Album/SmartFolder/Unfiled composition, outstanding companio
 targets, failed reservation/finalization writes, cancellation and unsafe or
 foreign durable evidence. Smart-folder reconciliation remains incomplete by
 the existing selection policy; this slice does not prove config convergence.
+Additional coverage supplies nonempty provider enumeration and ordinary streaming
+assets, repeats refusals across pass order and SQLite reopen, and replaces bytes,
+leaf identity and ancestor namespaces between an initial failed receipt write and
+an otherwise successful deferred transaction. The unchanged-file deferred control
+must recover. Case-equivalent root rebasing has Windows/macOS-gated coverage;
+Linux qualification does not establish Windows runtime or junction behavior.
 
 Existing cross-parent files require durable matching local-hash proof. MMCS
 fixtures deliberately differ from local SHA-256. Conflicting or unreceipted
@@ -326,7 +332,7 @@ bytes and links must survive repeated refusal and SQLite reopen with pending
 debt intact. A publication-before-receipt failure remains blocked after restart;
 it does not prove automatic recovery. Trusted adoption covers equivalent root
 spellings, all pass orders, failed immediate writes and fresh proof checks after
-restart. Ordinary adoption policy is outside this change.
+restart. Unrelated ordinary adoption policy remains unchanged.
 
 The next bounded [#862](https://github.com/rhoopr/kei/issues/862) slice extends
 `just test scenario config-reconciliation` with existing fixtures and production

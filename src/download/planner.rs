@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::icloud::photos::PhotoAsset;
@@ -720,16 +720,9 @@ impl TaskPlanner {
                                     ),
                                     "reserved pending retry destination has conflicting ownership or content"
                                 );
-                                let root = crate::fs_util::absolute_confined_path(&config.directory)?;
-                                let destination = crate::fs_util::absolute_confined_path(destination)?;
-                                let relative = destination.strip_prefix(&root).context(
-                                    "reserved pending retry destination is outside the current download root",
+                                task.download_path = crate::fs_util::reserved_path_under_root(
+                                    &config.directory, destination,
                                 )?;
-                                anyhow::ensure!(
-                                    !relative.as_os_str().is_empty(),
-                                    "reserved pending retry destination does not name a file"
-                                );
-                                task.download_path = config.directory.join(relative);
                                 anyhow::ensure!(
                                     PathPlanningMode::Reconciliation.key(&task.download_path)?
                                         == destination_key,

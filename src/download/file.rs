@@ -29,7 +29,7 @@ mod test_support;
 pub(super) use fingerprint::ExistingFileFingerprint;
 pub(crate) use fingerprint::compute_sha256;
 pub(crate) use fingerprint::imported_path_matches_receipt;
-pub(super) use fingerprint::retain_pending_file;
+pub(super) use fingerprint::{RetainedPendingFile, retain_pending_file};
 pub(super) use fingerprint::{fingerprint_downloaded_path, fingerprint_regular_file};
 #[cfg(test)]
 pub(super) use publication::rename_part_to_final;

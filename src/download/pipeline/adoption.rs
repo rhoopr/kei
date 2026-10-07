@@ -84,26 +84,111 @@ fn pending_filename_matches_derived(pending_filename: &str, derived_filename: &s
         || pending_filename.eq_ignore_ascii_case(derived_filename)
 }
 
+/// A saved cross-parent alias protects the whole pending rendition even if
+/// the current enumerating pass happens to render a same-parent alias.
+async fn enumerated_reserved_pending(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &DownloadContext,
+    planner: &TaskPlanner,
+    derived: &DerivedPath,
+    finalize: bool,
+) -> Result<Option<PendingRetryAdoption>> {
+    let library = effective_asset_library(asset, config);
+    if !pending_versions_for_asset(ctx, library, asset)
+        .is_some_and(|versions| versions.contains(derived.version_size.as_str()))
+    {
+        return Ok(None);
+    }
+    let destinations = planner.cross_parent_retry_destinations(
+        library,
+        asset.state_id(),
+        derived.version_size,
+        &derived.checksum,
+        derived.size,
+    )?;
+    if destinations.is_empty() {
+        return Ok(None);
+    }
+    let recorded = ctx.pending_file_matching_checksum(
+        library,
+        asset.state_id(),
+        derived.version_size,
+        &derived.checksum,
+    );
+    let evidence = PendingRetryFileEvidence {
+        version_size: derived.version_size,
+        filename: &derived.filename,
+        checksum: &derived.checksum,
+        size: derived.size,
+        local_path: PendingRetryLocalPath::Unrecorded,
+        cross_parent_recorded_file: recorded,
+    };
+    Ok(Some(
+        adopt_cross_parent_pending_file(
+            db,
+            config,
+            asset,
+            planner,
+            &evidence,
+            &destinations,
+            finalize,
+        )
+        .await?,
+    ))
+}
+
+pub(super) async fn validate_enumerated_reserved_pending(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &DownloadContext,
+    planner: &TaskPlanner,
+) -> Result<bool> {
+    let mut affected = false;
+    for derived in derive_expected_paths(asset, config) {
+        affected |= enumerated_reserved_pending(db, config, asset, ctx, planner, &derived, false)
+            .await?
+            .is_some();
+    }
+    Ok(affected)
+}
+
 pub(super) async fn adopt_pending_on_disk_skip(
     state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     ctx: &DownloadContext,
     task_planner: &mut TaskPlanner,
-) -> PendingOnDiskAdoptionSummary {
+) -> Result<PendingOnDiskAdoptionSummary> {
     let Some(db) = state_db else {
-        return PendingOnDiskAdoptionSummary::default();
+        return Ok(PendingOnDiskAdoptionSummary::default());
     };
     let library = effective_asset_library(asset, config);
     let pending_versions = pending_versions_for_asset(ctx, library, asset);
     let Some(pending_versions) = pending_versions else {
-        return PendingOnDiskAdoptionSummary::default();
+        return Ok(PendingOnDiskAdoptionSummary::default());
     };
 
     let mut summary = PendingOnDiskAdoptionSummary::default();
     for derived in derive_expected_paths(asset, config) {
         let version_size = derived.version_size.as_str();
         if !pending_versions.contains(version_size) {
+            continue;
+        }
+        if let Some(adoption) =
+            enumerated_reserved_pending(db, config, asset, ctx, task_planner, &derived, true)
+                .await?
+        {
+            summary.retained_cross_parent = true;
+            anyhow::ensure!(
+                adoption != PendingRetryAdoption::NotFound,
+                "Reserved pending file is absent; retaining debt for exact targeted recovery"
+            );
+            if adoption == PendingRetryAdoption::StateWriteFailed {
+                summary.state_write_failures += 1;
+            }
             continue;
         }
         match adopt_pending_derived_path(
@@ -129,12 +214,13 @@ pub(super) async fn adopt_pending_on_disk_skip(
         }
     }
 
-    summary
+    Ok(summary)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PendingOnDiskAdoptionSummary {
     pub(super) state_write_failures: usize,
+    pub(super) retained_cross_parent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +285,7 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
             task_planner,
             &evidence,
             &reserved,
+            true,
         )
         .await;
     }
@@ -320,6 +407,7 @@ async fn adopt_cross_parent_pending_file(
     task_planner: &TaskPlanner,
     evidence: &PendingRetryFileEvidence<'_>,
     destinations: &[PathBuf],
+    finalize: bool,
 ) -> Result<PendingRetryAdoption> {
     let Some(derived) = derive_expected_paths(asset, config)
         .into_iter()
@@ -333,7 +421,10 @@ async fn adopt_cross_parent_pending_file(
     };
     let library = effective_asset_library(asset, config);
     let mut verified = None;
-    for destination in destinations {
+    for saved_destination in destinations {
+        let destination =
+            crate::fs_util::reserved_path_under_root(&config.directory, saved_destination)?;
+        let destination = &destination;
         anyhow::ensure!(
             task_planner.retry_path_allowed(
                 library,
@@ -383,11 +474,15 @@ async fn adopt_cross_parent_pending_file(
             retained.fingerprint.size == evidence.size || metadata_changed_size,
             "Reserved cross-parent pending file does not match its recorded size evidence"
         );
-        verified = Some((destination, retained, recorded));
+        verified = Some((destination.clone(), retained, recorded));
     }
     let Some((destination, retained, recorded)) = verified else {
         return Ok(PendingRetryAdoption::NotFound);
     };
+    if !finalize {
+        retained.validate().await?;
+        return Ok(PendingRetryAdoption::Adopted);
+    }
     let record = asset_record_for_derived_path(Arc::from(library), asset, &derived, config);
     if let Err(error) = db.upsert_seen(&record).await {
         tracing::warn!(%error, "Failed to refresh reserved cross-parent pending file");
@@ -402,7 +497,7 @@ async fn adopt_cross_parent_pending_file(
             library,
             asset.state_id(),
             evidence.version_size.as_str(),
-            destination,
+            &destination,
             &data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256),
             recorded.download_checksum.as_deref(),
             capture_repair_requested(config),
@@ -423,12 +518,38 @@ pub(super) async fn adopt_pending_on_disk_task(
     ctx: &DownloadContext,
     task_planner: &mut TaskPlanner,
     task: &DownloadTask,
-) -> Option<PendingOnDiskAdoption> {
-    let db = state_db?;
+) -> Result<Option<PendingOnDiskAdoption>> {
+    let Some(db) = state_db else {
+        return Ok(None);
+    };
     let library = effective_asset_library(asset, config);
-    let pending_versions = pending_versions_for_asset(ctx, library, asset)?;
+    let Some(pending_versions) = pending_versions_for_asset(ctx, library, asset) else {
+        return Ok(None);
+    };
     if !pending_versions.contains(task.version_size.as_str()) {
-        return None;
+        return Ok(None);
+    }
+
+    if let Some(derived) = derive_expected_paths(asset, config)
+        .into_iter()
+        .find(|derived| {
+            derived.version_size == task.version_size
+                && derived.checksum == task.checksum
+                && derived.size == task.size
+        })
+        && let Some(adoption) =
+            enumerated_reserved_pending(db, config, asset, ctx, task_planner, &derived, true)
+                .await?
+    {
+        return Ok(match adoption {
+            PendingRetryAdoption::NotFound => None,
+            PendingRetryAdoption::Adopted => {
+                Some(PendingOnDiskAdoption::Adopted(task.download_path.clone()))
+            }
+            PendingRetryAdoption::StateWriteFailed => Some(
+                PendingOnDiskAdoption::StateWriteFailed(task.download_path.clone()),
+            ),
+        });
     }
 
     if let Some(adoption) = adopt_pending_task_path(
@@ -446,7 +567,7 @@ pub(super) async fn adopt_pending_on_disk_task(
     )
     .await
     {
-        return Some(adoption);
+        return Ok(Some(adoption));
     }
 
     for derived in derive_expected_paths(asset, config) {
@@ -475,11 +596,11 @@ pub(super) async fn adopt_pending_on_disk_task(
         )
         .await
         {
-            return Some(adoption);
+            return Ok(Some(adoption));
         }
     }
 
-    None
+    Ok(None)
 }
 
 fn path_matches_recorded_file(path: &Path, recorded_path: &Path) -> bool {

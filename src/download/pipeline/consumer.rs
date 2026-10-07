@@ -10,7 +10,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::download::filter::DownloadTask;
 use crate::download::finalize::{
     DownloadedFinalization, PendingStateWrite, check_state_write_circuit_breaker,
-    finalize_downloaded, finalize_failed,
+    finalize_downloaded_with_proof, finalize_failed,
 };
 use crate::download::metadata_rewrite::MetadataFlags;
 use crate::retry::RetryConfig;
@@ -130,7 +130,7 @@ pub(super) async fn consume_stream_download_tasks(
         // can tell which album's items are downloading.
         pb.set_message(format!("{} \u{00b7} {filename}", config.pass_label()));
         match result {
-            Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
+            Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes, retained)) => {
                 downloaded += 1;
                 bytes_downloaded_total += bytes_dl;
                 // Photos / videos fire in both modes (SyncStats serialises
@@ -162,7 +162,7 @@ pub(super) async fn consume_stream_download_tasks(
                     });
                 }
                 if let Some(db) = &state_db {
-                    match finalize_downloaded(
+                    match finalize_downloaded_with_proof(
                         db.as_ref(),
                         &task.library,
                         &task,
@@ -170,6 +170,7 @@ pub(super) async fn consume_stream_download_tasks(
                         download_checksum,
                         exif_ok,
                         mark_capture_repair_after_download,
+                        retained.clone(),
                     )
                     .await
                     {

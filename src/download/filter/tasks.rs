@@ -1,6 +1,6 @@
 //! Download task construction from derived paths, metadata, and collision results.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, Local};
@@ -36,6 +36,9 @@ pub(in crate::download) struct DownloadTask {
     pub(in crate::download) url: Box<str>,
     pub(in crate::download) download_path: PathBuf,
     pub(in crate::download) publication: FinalPublication,
+    /// Only cross-parent reserved pending recovery retains publication proof
+    /// through finalization; ordinary task policy is unchanged.
+    pub(in crate::download) pending_cross_parent_root: Option<Arc<Path>>,
     pub(in crate::download) checksum: Box<str>,
     /// iCloud asset ID for state tracking. Shared with the producer's
     /// dedup set and any deferred state writes via refcount bump.
@@ -203,6 +206,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 url,
                 download_path: p,
                 publication: FinalPublication::NoReplace,
+                pending_cross_parent_root: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
@@ -270,6 +274,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 url,
                 download_path: p,
                 publication: FinalPublication::NoReplace,
+                pending_cross_parent_root: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
@@ -332,6 +337,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 url,
                 download_path: p,
                 publication: FinalPublication::NoReplace,
+                pending_cross_parent_root: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),

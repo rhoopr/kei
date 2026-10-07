@@ -65,6 +65,10 @@ pub(in crate::download) struct RetainedPendingFile {
 }
 
 impl RetainedPendingFile {
+    pub(super) fn identity(&self) -> std::io::Result<crate::fs_util::FileIdentity> {
+        crate::fs_util::file_identity(&self.file)
+    }
+
     pub(in crate::download) async fn validate(self: &Arc<Self>) -> anyhow::Result<()> {
         let retained = Arc::clone(self);
         tokio::task::spawn_blocking(move || {

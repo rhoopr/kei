@@ -78,6 +78,7 @@ fn task(path: std::path::PathBuf, id: &str, size: u64) -> DownloadTask {
         url: "synthetic".into(),
         download_path: path,
         publication: FinalPublication::NoReplace,
+        pending_cross_parent_root: None,
         checksum: "AAAA".into(),
         asset_id: id.into(),
         asset_record_name: id.into(),
@@ -105,7 +106,7 @@ async fn run<C: DownloadClient>(
     task: &DownloadTask,
     token: &CancellationToken,
     db: Option<&dyn crate::download::DownloadStore>,
-) -> anyhow::Result<(bool, String, Option<String>, u64, u64)> {
+) -> anyhow::Result<super::DownloadSingleResult> {
     download_single_task(
         client,
         task,
@@ -124,6 +125,37 @@ async fn run<C: DownloadClient>(
         },
     )
     .await
+}
+
+#[tokio::test]
+async fn issue_770_recovery_fresh_task_transports_original_publication_owner() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("old-album/pending.jpg");
+    let body = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
+    let client = StaticClient { body: body.clone() };
+    let mut pending = task(path.clone(), "PENDING", body.len() as u64);
+    pending.pending_cross_parent_root = Some(Arc::from(dir.path()));
+    let result = run(&client, &pending, &CancellationToken::new(), None)
+        .await
+        .unwrap();
+    let proof = result
+        .5
+        .expect("affected transfer must transport its original publication proof");
+    assert_eq!(
+        data_encoding::HEXLOWER.encode(&proof.fingerprint.sha256),
+        result.1
+    );
+    proof.validate().await.unwrap();
+    std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+    std::fs::write(&path, &body).unwrap();
+    assert!(
+        proof.validate().await.is_err(),
+        "same bytes on another inode are not the publication owner"
+    );
+    assert_eq!(
+        std::fs::read(path.with_extension("preserved")).unwrap(),
+        body
+    );
 }
 
 #[tokio::test]

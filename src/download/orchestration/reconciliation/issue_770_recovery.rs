@@ -39,6 +39,7 @@ fn issue_770_pass(kind: PassKind, records: &[Value]) -> AlbumPass {
             },
             Box::new(RecoveryLookupSession {
                 records: Arc::new(records.to_vec()),
+                enumerate: false,
             }),
         ),
         exclude_ids: Arc::new(FxHashSet::default()),
@@ -48,6 +49,7 @@ fn issue_770_pass(kind: PassKind, records: &[Value]) -> AlbumPass {
 #[derive(Clone)]
 struct RecoveryLookupSession {
     records: Arc<Vec<Value>>,
+    enumerate: bool,
 }
 
 #[async_trait::async_trait]
@@ -67,11 +69,16 @@ impl PhotosSession for RecoveryLookupSession {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|_| json!({"records": [{"fields": {"itemCount": {"value": 0}}}]}))
+                .map(|_| json!({"records": [{"fields": {"itemCount": {"value": usize::from(self.enumerate)}}}]}))
                 .collect::<Vec<_>>();
             return Ok(json!({"batch": batch}));
         }
         if url.contains("/records/query?") {
+            if self.enumerate {
+                return Ok(
+                    json!({"records": self.records.as_ref(), "syncToken": "enumerated-current-query"}),
+                );
+            }
             return Ok(json!({"records": [], "syncToken": "empty-current-query"}));
         }
         if url.contains("/changes/zone?") {
@@ -83,6 +90,163 @@ impl PhotosSession for RecoveryLookupSession {
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn issue_770_recovery_enumerated_cross_parent_pending_cannot_certify_unproven_bytes() {
+    let server = crate::start_wiremock_or_skip!();
+    let fixture = RecoveryFixture::new(&server).await;
+    let mut bytes = fixture.bytes.clone();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
+    std::fs::write(&fixture.destination, &bytes).unwrap();
+    let mut config = fixture.config.clone();
+    config.folder_structure = "old-album".into();
+    let mut pass = issue_770_pass(PassKind::Unfiled, &fixture.records);
+    pass.album = album_with_session(
+        "PrimarySync",
+        "",
+        Box::new(RecoveryLookupSession {
+            records: Arc::new(fixture.records.clone()),
+            enumerate: true,
+        }),
+    );
+    let asset = PhotoAsset::new(fixture.records[0].clone(), fixture.records[1].clone());
+    let result = crate::download::pipeline::stream_and_download_from_stream(
+        &Client::new(),
+        futures_util::stream::iter(vec![Ok(asset)]),
+        &Arc::new(config.with_pass(&pass)),
+        DownloadControls::download_hidden(),
+        1,
+        CancellationToken::new(),
+        crate::download::pipeline::StreamRuntime::new(None, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.assets_seen, 1, "must exercise nonempty enumeration");
+    assert!(
+        fixture
+            .db
+            .get_downloaded_page(0, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "enumeration must not mint ownership proof for conflicting reserved bytes"
+    );
+    assert_eq!(std::fs::read(&fixture.destination).unwrap(), bytes);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn issue_770_recovery_nonempty_source_enumeration_retains_unproven_debt_in_every_order() {
+    for kinds in [
+        vec![PassKind::SmartFolder, PassKind::Unfiled],
+        vec![PassKind::Unfiled, PassKind::SmartFolder],
+        vec![PassKind::Album, PassKind::SmartFolder, PassKind::Unfiled],
+    ] {
+        for conflicting in [false, true] {
+            let server = crate::start_wiremock_or_skip!();
+            let mut fixture = RecoveryFixture::new(&server).await;
+            let mut bytes = fixture.bytes.clone();
+            if conflicting {
+                *bytes.last_mut().unwrap() ^= 1;
+            }
+            std::fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
+            std::fs::write(&fixture.destination, &bytes).unwrap();
+            fixture.config.folder_structure = "old-album".into();
+            fixture.config.folder_structure_albums = "old-album".into();
+            for _ in 0..2 {
+                fixture.reopen().await;
+                let mut passes = fixture.passes(&kinds);
+                for pass in &mut passes {
+                    pass.album = album_with_session(
+                        "PrimarySync",
+                        &pass.album.name,
+                        Box::new(RecoveryLookupSession {
+                            records: Arc::new(fixture.records.clone()),
+                            enumerate: true,
+                        }),
+                    );
+                }
+                let result = download_photos_with_sync(
+                    &Client::new(),
+                    &passes,
+                    Arc::new(fixture.config.clone()),
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result.stats.assets_seen > 0,
+                    "must enumerate source assets: {result:?}"
+                );
+                assert_eq!(result.stats.downloaded, 0, "{result:?}");
+                assert!(
+                    fixture
+                        .db
+                        .get_downloaded_page(0, 10)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    !fixture.db.get_pending().await.unwrap().is_empty()
+                        || !fixture.db.get_failed().await.unwrap().is_empty()
+                );
+                assert_eq!(std::fs::read(&fixture.destination).unwrap(), bytes);
+                assert!(server.received_requests().await.unwrap().is_empty());
+                fixture.assert_preserved().await;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn issue_770_recovery_nonempty_enumeration_cannot_adopt_linked_reserved_files() {
+    for ancestor in [false, true] {
+        let server = crate::start_wiremock_or_skip!();
+        let mut fixture = RecoveryFixture::new(&server).await;
+        let outside = TempDir::new().unwrap();
+        let outside_path = outside.path().join("pending.jpg");
+        std::fs::write(&outside_path, &fixture.bytes).unwrap();
+        if ancestor {
+            std::os::unix::fs::symlink(outside.path(), fixture.destination.parent().unwrap())
+                .unwrap();
+        } else {
+            std::fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside_path, &fixture.destination).unwrap();
+        }
+        fixture.config.folder_structure = "old-album".into();
+        for _ in 0..2 {
+            fixture.reopen().await;
+            let asset = PhotoAsset::new(fixture.records[0].clone(), fixture.records[1].clone());
+            let result = crate::download::pipeline::stream_and_download_from_stream(
+                &Client::new(),
+                futures_util::stream::iter(vec![Ok(asset)]),
+                &Arc::new(fixture.config.clone()),
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                crate::download::pipeline::StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.assets_seen, 1);
+            assert!(
+                fixture
+                    .db
+                    .get_downloaded_page(0, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(std::fs::read(&outside_path).unwrap(), fixture.bytes);
+            assert!(server.received_requests().await.unwrap().is_empty());
+            fixture.assert_preserved().await;
+        }
     }
 }
 
@@ -1673,5 +1837,85 @@ async fn issue_770_recovery_reserved_links_cannot_publish_outside_root() {
         );
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[tokio::test]
+async fn issue_770_recovery_case_equivalent_root_replays_absence_and_durable_proof() {
+    for with_proof in [false, true] {
+        let server = crate::start_wiremock_or_skip!();
+        let fixture = RecoveryFixture::new(&server).await;
+        if with_proof {
+            std::fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
+            std::fs::write(&fixture.destination, &fixture.bytes).unwrap();
+            let hash = file::compute_sha256(&fixture.destination).await.unwrap();
+            fixture
+                .db
+                .mark_downloaded(
+                    "PrimarySync",
+                    "PENDING",
+                    "original",
+                    &fixture.destination,
+                    &hash,
+                    None,
+                )
+                .await
+                .unwrap();
+            fixture
+                .db
+                .mark_failed("PrimarySync", "PENDING", "original", "synthetic retry")
+                .await
+                .unwrap();
+            fixture
+                .db
+                .prepare_for_retry(
+                    Some("PrimarySync"),
+                    crate::state::RetryErrorRetention::Clear,
+                )
+                .await
+                .unwrap();
+        }
+        let root = fixture.root.path();
+        let alternate = root.with_file_name(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_uppercase(),
+        );
+        assert_ne!(alternate, root);
+        let mut config = fixture.config.clone();
+        config.directory = Arc::from(alternate);
+        let retry = build_pending_retry_download_tasks(
+            &fixture.passes(&[PassKind::SmartFolder, PassKind::Unfiled]),
+            &config,
+            DownloadRunMode::Download,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        if with_proof {
+            assert!(retry.tasks.is_empty());
+            assert!(retry.unmatched_targets.is_empty());
+            let rows = fixture.db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                crate::fs_util::confined_path_key(rows[0].local_path.as_ref().unwrap()).unwrap(),
+                crate::fs_util::confined_path_key(&fixture.destination).unwrap()
+            );
+        } else {
+            assert_eq!(retry.tasks.len(), 1);
+            assert!(
+                retry.tasks[0]
+                    .download_path
+                    .starts_with(config.directory.as_ref())
+            );
+            assert_eq!(
+                crate::fs_util::confined_path_key(&retry.tasks[0].download_path).unwrap(),
+                crate::fs_util::confined_path_key(&fixture.destination).unwrap()
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        fixture.assert_preserved().await;
     }
 }

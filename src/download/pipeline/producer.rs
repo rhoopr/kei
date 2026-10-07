@@ -27,6 +27,7 @@ use super::StreamPipelineShared;
 use super::adoption::{
     PendingOnDiskAdoption, adopt_pending_on_disk_skip, adopt_pending_on_disk_task,
     effective_asset_library, effective_asset_library_arc, state_confirmed_current_path_exists,
+    validate_enumerated_reserved_pending,
 };
 use super::task::capture_repair_requested;
 
@@ -347,7 +348,7 @@ where
             }
         };
         tokio::pin!(combined);
-        while let Some(result) = combined.next().await {
+        'assets: while let Some(result) = combined.next().await {
             if producer_shutdown.is_cancelled() {
                 break;
             }
@@ -369,6 +370,7 @@ where
                     // context.
                     let mut metadata_refresh_attempted = false;
                     let mut selected_plan = None;
+                    let mut reserved_pending = false;
                     if let Some(run) = &config.selection_run {
                         if run
                             .session_expired
@@ -444,6 +446,27 @@ where
                                         "Selection could not preserve legacy state ownership");
                                     producer_pb.inc(1);
                                     continue;
+                                }
+                            }
+                        }
+                        if let Some(db) = &producer_state_db {
+                            match validate_enumerated_reserved_pending(
+                                db.as_ref(),
+                                config,
+                                &asset,
+                                &download_ctx,
+                                &task_planner,
+                            )
+                            .await
+                            {
+                                Ok(affected) => reserved_pending = affected,
+                                Err(error) => {
+                                    enum_errors_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::error!(%error, "Reserved pending selection refused unsafe local evidence");
+                                    producer_pb.inc(1);
+                                    continue 'assets;
                                 }
                             }
                         }
@@ -526,6 +549,24 @@ where
                                     producer_pb.inc(1);
                                     continue;
                                 }
+                            }
+                        }
+                        match validate_enumerated_reserved_pending(
+                            db.as_ref(),
+                            config,
+                            &asset,
+                            &download_ctx,
+                            &task_planner,
+                        )
+                        .await
+                        {
+                            Ok(affected) => reserved_pending = affected,
+                            Err(error) => {
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(%error, "Reserved pending enumeration refused unsafe local evidence");
+                                producer_pb.inc(1);
+                                continue 'assets;
                             }
                         }
                         // Apply changed provider metadata before filtering and
@@ -654,7 +695,7 @@ where
                         // is already on disk; if adoption fails, the touched
                         // flush still lets stuck-pipeline recovery promote it.
                         let candidates = extract_skip_candidates(&asset, config.as_ref());
-                        if !metadata_refresh_attempted {
+                        if !reserved_pending && !metadata_refresh_attempted {
                             metadata_rewrite::tag_if_needed(
                                 producer_state_db.as_deref(),
                                 config,
@@ -664,21 +705,44 @@ where
                             )
                             .await;
                         }
-                        let adoption = adopt_pending_on_disk_skip(
+                        let adoption = match adopt_pending_on_disk_skip(
                             producer_state_db.as_deref(),
                             config,
                             &asset,
                             &download_ctx,
                             &mut task_planner,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(adoption) => adoption,
+                            Err(error) => {
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(%error, "Reserved pending skip refused unsafe local evidence");
+                                continue 'assets;
+                            }
+                        };
                         if adoption.state_write_failures > 0 {
                             state_write_failures_producer.fetch_add(
                                 adoption.state_write_failures,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         }
-                        if producer_state_db.is_some() {
+                        if reserved_pending
+                            && !(metadata_refresh_attempted
+                                || adoption.retained_cross_parent
+                                    && adoption.state_write_failures > 0)
+                        {
+                            metadata_rewrite::tag_if_needed(
+                                producer_state_db.as_deref(),
+                                config,
+                                &asset,
+                                &candidates,
+                                &download_ctx,
+                            )
+                            .await;
+                        }
+                        if producer_state_db.is_some() && !adoption.retained_cross_parent {
                             let library = effective_asset_library_arc(&asset, config);
                             touched_assets.push((library, asset.state_id_arc()));
                         }
@@ -687,7 +751,35 @@ where
                     } else {
                         let mut disposition = AssetDisposition::Unresolved;
 
-                        for task in plan.tasks {
+                        for mut task in plan.tasks {
+                            if download_ctx
+                                .pending_ids
+                                .get(task.library.as_ref())
+                                .and_then(|assets| assets.get(task.asset_id.as_ref()))
+                                .is_some_and(|versions| {
+                                    versions.contains(task.version_size.as_str())
+                                })
+                            {
+                                match task_planner.cross_parent_retry_destinations(
+                                    &task.library,
+                                    &task.asset_id,
+                                    task.version_size,
+                                    &task.checksum,
+                                    task.size,
+                                ) {
+                                    Ok(destinations) if !destinations.is_empty() => {
+                                        task.pending_cross_parent_root =
+                                            Some(Arc::clone(&config.directory));
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        enum_errors_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::error!(%error, "Reserved pending task confinement failed");
+                                        continue 'assets;
+                                    }
+                                }
+                            }
                             // Mark assets that have exceeded the retry limit as failed.
                             if let Some(attempts) =
                                 download_ctx.attempt_count(&task.library, &task.asset_id)
@@ -732,7 +824,7 @@ where
                             }
 
                             if let Some(db) = &producer_state_db {
-                                if let Some(adoption) = adopt_pending_on_disk_task(
+                                let adoption = match adopt_pending_on_disk_task(
                                     producer_state_db.as_deref(),
                                     config,
                                     &asset,
@@ -742,6 +834,15 @@ where
                                 )
                                 .await
                                 {
+                                    Ok(adoption) => adoption,
+                                    Err(error) => {
+                                        enum_errors_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::error!(%error, "Reserved pending task refused unsafe local evidence");
+                                        continue 'assets;
+                                    }
+                                };
+                                if let Some(adoption) = adoption {
                                     disposition = disposition.max(AssetDisposition::OnDisk);
                                     match adoption {
                                         PendingOnDiskAdoption::Adopted(existing_path) => {
