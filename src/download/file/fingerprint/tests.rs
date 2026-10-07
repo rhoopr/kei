@@ -3,6 +3,61 @@ use tempfile::TempDir;
 use super::compute_sha256;
 
 #[tokio::test]
+async fn issue_770_recovery_retained_file_rejects_changed_bytes_and_identity() {
+    for replace_inode in [false, true] {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("pending.jpg");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let retained = super::retain_pending_file(root.path(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        retained.validate().await.unwrap();
+        if replace_inode {
+            std::fs::rename(&path, root.path().join("retained.jpg")).unwrap();
+            std::fs::write(&path, b"original bytes").unwrap();
+        } else {
+            std::fs::write(&path, b"changed! bytes").unwrap();
+        }
+        assert!(retained.validate().await.is_err());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn issue_770_recovery_retained_file_rejects_leaf_and_ancestor_links() {
+    for parent_link in [false, true] {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let parent = root.path().join("album");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("pending.jpg");
+        let outside_file = outside.path().join("pending.jpg");
+        std::fs::write(&path, b"same bytes").unwrap();
+        std::fs::write(&outside_file, b"same bytes").unwrap();
+        let retained = super::retain_pending_file(root.path(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        retained.validate().await.unwrap();
+        if parent_link {
+            std::fs::rename(&parent, root.path().join("retained-album")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+        } else {
+            std::fs::rename(&path, parent.join("retained.jpg")).unwrap();
+            std::os::unix::fs::symlink(&outside_file, &path).unwrap();
+        }
+        assert!(retained.validate().await.is_err());
+        assert!(
+            super::retain_pending_file(root.path(), &path)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"same bytes");
+    }
+}
+
+#[tokio::test]
 async fn test_compute_sha256_known_content() {
     let dir = TempDir::new().unwrap();
     let file_path = dir.path().join("known.bin");

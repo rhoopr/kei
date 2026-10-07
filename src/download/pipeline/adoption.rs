@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use rustc_hash::FxHashSet;
 
 use crate::download::file::{LocalFileSizeExpectation, local_file_size_matches_state};
@@ -163,6 +164,9 @@ pub(in crate::download) struct PendingRetryFileEvidence<'a> {
     pub(in crate::download) filename: &'a str,
     pub(in crate::download) checksum: &'a str,
     pub(in crate::download) local_path: PendingRetryLocalPath<'a>,
+    /// Stored current-generation proof, checked by confined keys only in the
+    /// cross-parent route; ordinary adoption keeps its existing spelling policy.
+    pub(in crate::download) cross_parent_recorded_file: Option<&'a RecordedLocalFile>,
     pub(in crate::download) size: u64,
 }
 
@@ -179,7 +183,25 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
     task_planner: &mut TaskPlanner,
     planned_tasks: &[DownloadTask],
     evidence: PendingRetryFileEvidence<'_>,
-) -> PendingRetryAdoption {
+) -> Result<PendingRetryAdoption> {
+    let reserved = task_planner.cross_parent_retry_destinations(
+        effective_asset_library(asset, config),
+        asset.state_id(),
+        evidence.version_size,
+        evidence.checksum,
+        evidence.size,
+    )?;
+    if !reserved.is_empty() {
+        return adopt_cross_parent_pending_file(
+            db,
+            config,
+            asset,
+            task_planner,
+            &evidence,
+            &reserved,
+        )
+        .await;
+    }
     // A content change can leave historical catalog evidence after the new
     // reserved sibling was published but finalization failed. Its immutable
     // content-specific reservation and verified bytes permit adoption; the old
@@ -193,11 +215,11 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
             && let Some(adoption) =
                 adopt_pending_task_path(db, config, asset, task_planner, task, None).await
         {
-            return adoption.into();
+            return Ok(adoption.into());
         }
     }
     if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
-        return PendingRetryAdoption::NotFound;
+        return Ok(PendingRetryAdoption::NotFound);
     }
 
     if let PendingRetryLocalPath::Current(recorded_file) = evidence.local_path {
@@ -207,7 +229,7 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
             .and_then(|filename| filename.to_str())
             .is_some_and(|filename| pending_filename_matches_derived(evidence.filename, filename));
         if !recorded_filename_matches {
-            return PendingRetryAdoption::NotFound;
+            return Ok(PendingRetryAdoption::NotFound);
         }
 
         task_planner.prepare_path_parent(local_path).await;
@@ -228,7 +250,7 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
             )
             .await
             {
-                return adoption.into();
+                return Ok(adoption.into());
             }
         }
 
@@ -252,10 +274,10 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
             )
             .await
             {
-                return adoption.into();
+                return Ok(adoption.into());
             }
         }
-        return PendingRetryAdoption::NotFound;
+        return Ok(PendingRetryAdoption::NotFound);
     }
 
     for task in planned_tasks.iter().filter(|task| {
@@ -266,7 +288,7 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
         if let Some(adoption) =
             adopt_pending_task_path(db, config, asset, task_planner, task, None).await
         {
-            return adoption.into();
+            return Ok(adoption.into());
         }
     }
 
@@ -282,11 +304,116 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
         if let Some(adoption) =
             adopt_pending_derived_path(db, config, asset, task_planner, &derived, None).await
         {
-            return adoption.into();
+            return Ok(adoption.into());
         }
     }
 
-    PendingRetryAdoption::NotFound
+    Ok(PendingRetryAdoption::NotFound)
+}
+
+/// Saved provider generations identify ownership, not hashes of local bytes.
+/// Never mint proof from the file that this route is deciding whether to adopt.
+async fn adopt_cross_parent_pending_file(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task_planner: &TaskPlanner,
+    evidence: &PendingRetryFileEvidence<'_>,
+    destinations: &[PathBuf],
+) -> Result<PendingRetryAdoption> {
+    let Some(derived) = derive_expected_paths(asset, config)
+        .into_iter()
+        .find(|derived| {
+            derived.version_size == evidence.version_size
+                && derived.checksum.as_ref() == evidence.checksum
+                && derived.size == evidence.size
+        })
+    else {
+        return Ok(PendingRetryAdoption::NotFound);
+    };
+    let library = effective_asset_library(asset, config);
+    let mut verified = None;
+    for destination in destinations {
+        anyhow::ensure!(
+            task_planner.retry_path_allowed(
+                library,
+                asset.state_id(),
+                evidence.version_size,
+                evidence.checksum,
+                evidence.size,
+                destination,
+            ),
+            "Reserved cross-parent pending destination has incompatible ownership"
+        );
+        let Some(retained) =
+            crate::download::file::retain_pending_file(&config.directory, destination)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Cannot safely inspect reserved cross-parent pending destination {}",
+                        destination.display(),
+                    )
+                })?
+        else {
+            continue;
+        };
+        let Some(recorded) = evidence.cross_parent_recorded_file else {
+            anyhow::bail!(
+                "Reserved cross-parent pending file has no durable matching local-hash proof; retaining file and pending debt"
+            );
+        };
+        anyhow::ensure!(
+            crate::fs_util::confined_path_key(&recorded.path)?
+                == crate::fs_util::confined_path_key(destination)?,
+            "Reserved cross-parent pending file has no durable hash proof at this destination"
+        );
+        let checksum = recorded.local_checksum.as_deref().context(
+            "Reserved cross-parent pending file has no durable matching local-hash proof; retaining file and pending debt",
+        )?;
+        anyhow::ensure!(
+            checksum.len() == 64
+                && data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256) == checksum,
+            "Reserved cross-parent pending file does not match its durable local-hash proof"
+        );
+        let metadata_changed_size = recorded
+            .download_checksum
+            .as_deref()
+            .is_some_and(|download| download != checksum);
+        anyhow::ensure!(
+            retained.fingerprint.size == evidence.size || metadata_changed_size,
+            "Reserved cross-parent pending file does not match its recorded size evidence"
+        );
+        verified = Some((destination, retained, recorded));
+    }
+    let Some((destination, retained, recorded)) = verified else {
+        return Ok(PendingRetryAdoption::NotFound);
+    };
+    let record = asset_record_for_derived_path(Arc::from(library), asset, &derived, config);
+    if let Err(error) = db.upsert_seen(&record).await {
+        tracing::warn!(%error, "Failed to refresh reserved cross-parent pending file");
+        return Ok(PendingRetryAdoption::StateWriteFailed);
+    }
+    // Keep both the inode and directory capabilities across the immediate DB
+    // write. A failed write retains pending debt; every later attempt must reopen
+    // and verify independently. This route creates no deferred hash-only write.
+    retained.validate().await?;
+    let finalized = db
+        .mark_downloaded_with_capture_repair(
+            library,
+            asset.state_id(),
+            evidence.version_size.as_str(),
+            destination,
+            &data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256),
+            recorded.download_checksum.as_deref(),
+            capture_repair_requested(config),
+        )
+        .await;
+    drop(retained);
+    if let Err(error) = finalized {
+        tracing::warn!(%error, "Failed to finalize reserved cross-parent pending file");
+        return Ok(PendingRetryAdoption::StateWriteFailed);
+    }
+    Ok(PendingRetryAdoption::Adopted)
 }
 
 pub(super) async fn adopt_pending_on_disk_task(

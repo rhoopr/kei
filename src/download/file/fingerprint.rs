@@ -1,6 +1,7 @@
 //! File hashes and same-read size and media-prefix snapshots.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::fs_util::{ConfinedParents, ConfinedPath};
 use anyhow::Context;
@@ -51,6 +52,61 @@ pub(in crate::download) async fn fingerprint_downloaded_path(
         let fingerprint = fingerprint_open_file_snapshot_blocking(&mut file, &path)?.fingerprint;
         confined.validate_identity(identity)?;
         Ok(fingerprint)
+    })
+    .await?
+}
+
+/// Keep the exact confined file and namespace alive through pending adoption.
+#[derive(Debug)]
+pub(in crate::download) struct RetainedPendingFile {
+    path: ConfinedPath,
+    file: std::fs::File,
+    pub(in crate::download) fingerprint: ExistingFileFingerprint,
+}
+
+impl RetainedPendingFile {
+    pub(in crate::download) async fn validate(self: &Arc<Self>) -> anyhow::Result<()> {
+        let retained = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let identity = crate::fs_util::file_identity(&retained.file)?;
+            let mut file = retained.path.validate_identity(identity)?;
+            anyhow::ensure!(
+                fingerprint_open_file_snapshot_blocking(&mut file, retained.path.path())?
+                    .fingerprint
+                    == retained.fingerprint,
+                "Reserved pending file changed before adoption finalization"
+            );
+            retained.path.validate_identity(identity)?;
+            Ok(())
+        })
+        .await?
+    }
+}
+
+/// Missing regular files may be downloaded; unsafe entries must not be adopted.
+pub(in crate::download) async fn retain_pending_file(
+    root: &Path,
+    path: &Path,
+) -> anyhow::Result<Option<Arc<RetainedPendingFile>>> {
+    let root = root.to_path_buf();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let confined = match ConfinedPath::open(&root, &path, ConfinedParents::Existing) {
+            Ok(confined) => confined,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(mut file) = confined.open_optional_regular()? else {
+            return Ok(None);
+        };
+        let identity = crate::fs_util::file_identity(&file)?;
+        let fingerprint = fingerprint_open_file_snapshot_blocking(&mut file, &path)?.fingerprint;
+        confined.validate_identity(identity)?;
+        Ok(Some(Arc::new(RetainedPendingFile {
+            path: confined,
+            file,
+            fingerprint,
+        })))
     })
     .await?
 }
