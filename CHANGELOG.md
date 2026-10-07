@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.0] - 2026-10-07
+
+### Added
+
+- Added `kei migrate-state --legacy-db PATH --confirm-ownership` for explicit adoption of a legacy database after a fresh login. It preserves the source and copies committed SQLite WAL content into a validated account-bound destination without overwriting existing state. ([#900](https://github.com/rhoopr/kei/pull/900), [#901](https://github.com/rhoopr/kei/pull/901))
+
+### Changed
+
+- State, session, cache, lock and encrypted-credential filenames now bind to the exact username and iCloud realm. Existing users must independently verify legacy database ownership and run `migrate-state`, even without a known filename collision. Legacy auth files remain preserved but unused; encrypted-backend passwords must be saved again. State schema advances from 28 to 34. Stop all writers and take a matched cold backup of configuration/state and media/sidecars before upgrading. Older binaries cannot read the upgraded database; rollback requires the matched old set and old binary. See [upgrade guidance](https://github.com/rhoopr/kei/blob/v0.25.0/docs/v0.25-upgrade.md). ([#900](https://github.com/rhoopr/kei/pull/900), [#903](https://github.com/rhoopr/kei/pull/903), [#904](https://github.com/rhoopr/kei/pull/904), [#906](https://github.com/rhoopr/kei/pull/906), [#911](https://github.com/rhoopr/kei/pull/911), [#912](https://github.com/rhoopr/kei/pull/912))
+- Supported private-library selections retain destination-specific recovery work across restarts and configuration changes. Eligible observed provider work can enter existing queues in bounded batches, and quiet watch cycles resume unfinished work. Shared, mixed and unsupported selections retain their existing execution paths; this does not establish a complete or atomic provider snapshot. ([#903](https://github.com/rhoopr/kei/pull/903), [#904](https://github.com/rhoopr/kei/pull/904), [#905](https://github.com/rhoopr/kei/pull/905), [#906](https://github.com/rhoopr/kei/pull/906), [#908](https://github.com/rhoopr/kei/pull/908), [#911](https://github.com/rhoopr/kei/pull/911), [#912](https://github.com/rhoopr/kei/pull/912))
+
+### Fixed
+
+- Rejected partial or malformed scoped provider pages before accepting their records or checkpoint tokens. ([#899](https://github.com/rhoopr/kei/pull/899))
+- Bounded expired-URL refresh and isolated affected tasks instead of replaying unrelated work. Primary ownership discovery no longer depends on unrelated library indexing, and recent selection recovers eligible records outside delta arrival order. ([#902](https://github.com/rhoopr/kei/pull/902), [#907](https://github.com/rhoopr/kei/pull/907), [#909](https://github.com/rhoopr/kei/pull/909))
+- `import-existing` records sync-compatible asset identities and refuses ambiguous same-path adoption. Reopened sync can retain the imported files rather than downloading them again. ([#915](https://github.com/rhoopr/kei/pull/915), addresses [#913](https://github.com/rhoopr/kei/issues/913))
+- Concurrent assets with identical download content no longer compete for one staging-file ownership claim. Distinct asset destinations retain independent state, including after reopening sync. ([#916](https://github.com/rhoopr/kei/pull/916), addresses [#914](https://github.com/rhoopr/kei/issues/914))
+- Closed replacement-manifest handles before terminal cleanup, and added distinct refresh/preservation rejection diagnostics. ([#893](https://github.com/rhoopr/kei/pull/893), [#910](https://github.com/rhoopr/kei/pull/910))
+
+### Known limitations
+
+- Legacy hard-link preservation remains blocked by [#853](https://github.com/rhoopr/kei/issues/853) and [#884](https://github.com/rhoopr/kei/issues/884). Existing duplicates, unknown historical ownership and damaged media are not automatically repaired.
+- The affected-library Windows/NTFS reporter accepted the qualified main build containing #915/#916. Those results identify that exact development build; release archive verification is separate. Physical NFS/NAS behavior, general HEIF memory bounds and historical archive completeness remain unqualified by this release.
+
 ## [0.24.1] - 2026-10-03
 
 ### Changed
