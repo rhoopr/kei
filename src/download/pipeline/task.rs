@@ -167,7 +167,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
             crate::download::file::DownloadOpts {
                 skip_rename: needs_embed,
                 expected_size: if task.size > 0 { Some(task.size) } else { None },
-                publication: task.publication,
+                publication: task.publication(),
             },
             crate::download::file::DownloadLimits {
                 rate_limit_counter: context.rate_limit_counter,
@@ -223,7 +223,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
         }
 
         if part_path.is_some() {
-            downloaded.publish(&task.download_path, task.publication).await?;
+            downloaded.publish(&task.download_path, task.publication()).await?;
         }
 
         // Embed work already captured the original checksum. Otherwise take

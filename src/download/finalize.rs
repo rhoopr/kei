@@ -164,7 +164,7 @@ pub(super) async fn finalize_failed<D>(
 where
     D: DownloadStateStore + ?Sized,
 {
-    let durable_error = match task.publication {
+    let durable_error = match task.publication() {
         super::file::FinalPublication::NoReplace => error,
         super::file::FinalPublication::ReplaceTruncated(_) => {
             crate::commands::reconcile::FILE_TRUNCATED_REASON
@@ -426,7 +426,7 @@ mod tests {
         DownloadTask {
             url: "https://example.test/photo.jpg".into(),
             download_path: path,
-            publication: crate::download::file::FinalPublication::NoReplace,
+            replacement_fingerprint: None,
             pending_cross_parent_root: None,
             checksum: "remote_checksum".into(),
             asset_id: Arc::from(asset_id),
@@ -800,12 +800,11 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         seed_pending(&db, "FINAL_REPAIR", "repair.jpg").await;
         let mut task = task("FINAL_REPAIR", PathBuf::from("repair.jpg"));
-        task.publication = crate::download::file::FinalPublication::ReplaceTruncated(
-            crate::download::file::ExistingFileFingerprint {
+        task.replacement_fingerprint =
+            Some(Arc::new(crate::download::file::ExistingFileFingerprint {
                 size: 3,
                 sha256: [7; 32],
-            },
-        );
+            }));
 
         finalize_failed(&db, &Arc::from(LIBRARY), &task, "network failed")
             .await

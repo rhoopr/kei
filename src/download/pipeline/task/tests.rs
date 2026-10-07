@@ -238,7 +238,7 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
     let make_task = |asset_id: &str, checksum_byte: u8, rating: u8| DownloadTask {
         url: format!("{}/{asset_id}.jpg", server.uri()).into(),
         download_path: download_path.clone(),
-        publication: crate::download::file::FinalPublication::NoReplace,
+        replacement_fingerprint: None,
         pending_cross_parent_root: None,
         checksum: base64::engine::general_purpose::STANDARD
             .encode([checksum_byte; 32])
@@ -506,7 +506,7 @@ async fn temporary_ownership_retires_after_publish_and_interruption() {
     let make_task = |name: &str, checksum_byte: u8| DownloadTask {
         url: format!("https://example.invalid/{name}.jpg").into(),
         download_path: dir.path().join(format!("{name}.jpg")),
-        publication: crate::download::file::FinalPublication::NoReplace,
+        replacement_fingerprint: None,
         pending_cross_parent_root: None,
         checksum: base64::engine::general_purpose::STANDARD
             .encode([checksum_byte; 32])

@@ -376,7 +376,7 @@ impl PendingRetryPlanning<'_> {
                             continue;
                         }
                         task.download_path = local_path.to_path_buf();
-                        task.publication = file::FinalPublication::ReplaceTruncated(fingerprint);
+                        task.replacement_fingerprint = Some(Arc::new(fingerprint));
                     } else {
                         let Some(retry_path) = self
                             .task_planner

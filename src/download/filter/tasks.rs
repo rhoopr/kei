@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, FixedOffset, Local};
 use rustc_hash::FxHashMap;
 
-use crate::download::file::FinalPublication;
+use crate::download::file::{ExistingFileFingerprint, FinalPublication};
 use crate::download::{DownloadConfig, paths};
 use crate::state::{MediaType, VersionSizeKey};
 use crate::types::FileMatchPolicy;
@@ -35,10 +35,13 @@ pub(in crate::download) struct DownloadTask {
     // Heap types first
     pub(in crate::download) url: Box<str>,
     pub(in crate::download) download_path: PathBuf,
-    pub(in crate::download) publication: FinalPublication,
+    /// Only truncated repair stores a replacement authorization. Sharing the
+    /// immutable fingerprint keeps platform task layouts within the existing
+    /// budget; ordinary no-replace tasks do not allocate this evidence.
+    pub(in crate::download) replacement_fingerprint: Option<Arc<ExistingFileFingerprint>>,
     /// Only cross-parent reserved pending recovery retains publication proof
-    /// through finalization; ordinary task policy is unchanged. A sized root
-    /// keeps this optional Arc within the task's existing memory budget.
+    /// through finalization; ordinary task policy is unchanged. Clones share
+    /// the original current-root association.
     pub(in crate::download) pending_cross_parent_root: Option<Arc<PathBuf>>,
     pub(in crate::download) checksum: Box<str>,
     /// iCloud asset ID for state tracking. Shared with the producer's
@@ -72,6 +75,15 @@ pub(in crate::download) struct DownloadTask {
 }
 
 impl DownloadTask {
+    /// Resolve the existing publication policy without storing its wide
+    /// fingerprint variant inline in every queued task.
+    pub(in crate::download) fn publication(&self) -> FinalPublication {
+        match &self.replacement_fingerprint {
+            Some(expected) => FinalPublication::ReplaceTruncated(**expected),
+            None => FinalPublication::NoReplace,
+        }
+    }
+
     /// Project the task fields the recap renderer needs (basename of the
     /// download path, byte size, capture timestamp). Lives here because
     /// the path-to-filename and `created_local` source are private to
@@ -206,7 +218,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             tasks.push(DownloadTask {
                 url,
                 download_path: p,
-                publication: FinalPublication::NoReplace,
+                replacement_fingerprint: None,
                 pending_cross_parent_root: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
@@ -274,7 +286,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             tasks.push(DownloadTask {
                 url,
                 download_path: p,
-                publication: FinalPublication::NoReplace,
+                replacement_fingerprint: None,
                 pending_cross_parent_root: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
@@ -337,7 +349,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             tasks.push(DownloadTask {
                 url,
                 download_path: p,
-                publication: FinalPublication::NoReplace,
+                replacement_fingerprint: None,
                 pending_cross_parent_root: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
@@ -1002,6 +1014,8 @@ mod tests {
     #[test]
     fn test_download_task_size() {
         use std::mem::size_of;
+        // Fail target-specific test compilation before an expensive suite tail.
+        const { assert!(size_of::<DownloadTask>() <= 200) };
         assert!(
             size_of::<DownloadTask>() <= 200,
             "DownloadTask size {} exceeds 200 bytes",

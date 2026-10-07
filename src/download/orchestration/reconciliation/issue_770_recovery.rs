@@ -250,6 +250,20 @@ async fn issue_770_recovery_nonempty_enumeration_cannot_adopt_linked_reserved_fi
     }
 }
 
+fn expected_hidden_original_request_key(config: &DownloadConfig, records: &[Value]) -> String {
+    let asset = PhotoAsset::new(
+        records.first().expect("fixture master").clone(),
+        records.get(1).expect("fixture child").clone(),
+    )
+    .with_state_record_name(Arc::from("PENDING"));
+    let hidden = issue_770_pass(PassKind::SmartFolder, records);
+    let requested = crate::download::filter::expected_paths_for(&asset, &config.with_pass(&hidden))
+        .into_iter()
+        .find(|path| path.version_size == VersionSizeKey::Original)
+        .expect("fixture original Hidden request");
+    crate::fs_util::confined_path_key(&requested.path).unwrap()
+}
+
 async fn issue_770_seed(root: &TempDir) -> (DownloadConfig, Vec<Value>, std::path::PathBuf) {
     let records = incremental_photo_records_with_url(
         "PENDING",
@@ -363,7 +377,7 @@ async fn issue_770_recovery_recorded_choice_replays_across_sqlite_reopen() {
     assert_eq!(first.tasks.len(), 1);
     assert_eq!(first.tasks[0].download_path, old_path);
     assert!(matches!(
-        first.tasks[0].publication,
+        first.tasks[0].publication(),
         file::FinalPublication::NoReplace
     ));
     let db = config.state_db.take().unwrap();
@@ -372,7 +386,10 @@ async fn issue_770_recovery_recorded_choice_replays_across_sqlite_reopen() {
         .iter()
         .find(|r| r.asset_id.as_ref() == "PENDING")
         .unwrap();
-    assert!(reservation.requested_path_key.0.contains("/Hidden/"));
+    assert_eq!(
+        reservation.requested_path_key.0,
+        expected_hidden_original_request_key(&config, &records)
+    );
     assert_eq!(reservation.destination_path, old_path);
     assert!(!old_path.exists());
     drop(db);
@@ -580,6 +597,7 @@ impl RecoveryFixture {
         .unwrap();
         assert_eq!(first.tasks.len(), 1);
         assert_eq!(first.tasks[0].download_path, destination);
+        let expected_requested_key = expected_hidden_original_request_key(&config, &records);
         let ledger = config
             .state_db
             .as_ref()
@@ -588,7 +606,7 @@ impl RecoveryFixture {
             .await
             .unwrap();
         assert!(ledger.iter().any(|row| row.asset_id.as_ref() == "PENDING"
-            && row.requested_path_key.0.contains("/Hidden/")
+            && row.requested_path_key.0 == expected_requested_key
             && row.destination_path == destination));
         let db = Arc::new(
             SqliteStateDb::open(&root.path().join("state.db"))

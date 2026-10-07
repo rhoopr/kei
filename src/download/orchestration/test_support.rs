@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use crate::commands::{AlbumPass, PassKind};
+use crate::download::filter;
 use crate::download::filter::DownloadTask;
-use crate::download::{file, filter};
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotoAsset, PhotosSession};
 use crate::retry::RetryConfig;
 use crate::state::{SqliteStateDb, VersionSizeKey};
@@ -32,7 +32,7 @@ pub(super) fn retry_test_task(
     DownloadTask {
         url: format!("https://p01.icloud-content.com/{asset_id}").into(),
         download_path: Path::new("/tmp/codex/kei/retry-tests").join(path),
-        publication: file::FinalPublication::NoReplace,
+        replacement_fingerprint: None,
         pending_cross_parent_root: None,
         checksum: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
         asset_id: Arc::from(asset_id),

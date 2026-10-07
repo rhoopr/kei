@@ -8,7 +8,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::{DownloadSingleContext, download_single_task};
-use crate::download::file::{DownloadClient, DownloadResponse, FinalPublication};
+use crate::download::file::{DownloadClient, DownloadResponse};
 use crate::download::filter::{DownloadTask, MetadataPayload};
 use crate::download::metadata_rewrite::MetadataFlags;
 use crate::retry::RetryConfig;
@@ -77,7 +77,7 @@ fn task(path: std::path::PathBuf, id: &str, size: u64) -> DownloadTask {
     DownloadTask {
         url: "synthetic".into(),
         download_path: path,
-        publication: FinalPublication::NoReplace,
+        replacement_fingerprint: None,
         pending_cross_parent_root: None,
         checksum: "AAAA".into(),
         asset_id: id.into(),
