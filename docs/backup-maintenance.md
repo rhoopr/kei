@@ -194,7 +194,7 @@ schema 33 or earlier cannot open the upgraded database. Rollback requires
 the matched old state and media with the retained old binary; switching only
 the binary or restoring only the database is unsafe. Do not reset state or
 lower its schema version to bypass this check. See the
-[upgrade guide](v0.24.1-upgrade.md).
+[upgrade guide](v0.25-upgrade.md).
 
 Kei marks unresolved asset identity cycles incomplete. Status
 remains unsafe across restarts and successful syncs in other libraries until
