@@ -481,10 +481,19 @@ mod tests {
                 write_file(&path).await;
             }
             "ancestor" => {
-                std::fs::rename(path.parent().unwrap(), dir.path().join("preserved-album"))
-                    .unwrap();
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                write_file(&path).await;
+                #[cfg(windows)]
+                assert!(
+                    std::fs::rename(path.parent().unwrap(), dir.path().join("preserved-album"))
+                        .is_err(),
+                    "live Windows directory capabilities must deny ancestor replacement"
+                );
+                #[cfg(not(windows))]
+                {
+                    std::fs::rename(path.parent().unwrap(), dir.path().join("preserved-album"))
+                        .unwrap();
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    write_file(&path).await;
+                }
             }
             #[cfg(unix)]
             "leaf-link" => {
@@ -505,6 +514,9 @@ mod tests {
         }
         let mut pending = vec![write];
         let flush = flush_pending_state_writes_retaining_failures(&db, &mut pending).await;
+        #[cfg(windows)]
+        let unsafe_change = mutation != "unchanged" && mutation != "ancestor";
+        #[cfg(not(windows))]
         let unsafe_change = mutation != "unchanged";
         assert_eq!(flush.failures, usize::from(unsafe_change), "{mutation}");
         assert_eq!(
