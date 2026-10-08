@@ -4017,13 +4017,15 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                 config.download.legacy_preservation_allow_hardlinks = allow_hardlinks;
                 let mut missing_current = None;
                 let mut current_aliases = std::collections::HashMap::new();
-                if cycle == 2 && hardlink_fault.is_some() {
+                if cycle == 2
+                    && let Some(hardlink_fault) = hardlink_fault
+                {
                     for (index, path) in completed_outputs.keys().enumerate() {
                         let alias = dir.path().join(format!("importer-current-{index}"));
                         std::fs::hard_link(path, &alias).unwrap();
                         current_aliases.insert(alias, std::fs::read(path).unwrap());
                     }
-                    match hardlink_fault.unwrap() {
+                    match hardlink_fault {
                         LegacyHardlinkFault::OriginalBytes => {
                             let mut changed = bytes.to_vec();
                             changed[15] ^= 1;
