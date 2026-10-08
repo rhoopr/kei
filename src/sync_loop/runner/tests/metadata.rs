@@ -4015,13 +4015,13 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                             )
                         ));
                 config.download.legacy_preservation_allow_hardlinks = allow_hardlinks;
+                let mut missing_current = None;
+                let mut current_aliases = std::collections::HashMap::new();
                 if cycle == 2 && hardlink_fault.is_some() {
                     for (index, path) in completed_outputs.keys().enumerate() {
-                        std::fs::hard_link(
-                            path,
-                            dir.path().join(format!("importer-current-{index}")),
-                        )
-                        .unwrap();
+                        let alias = dir.path().join(format!("importer-current-{index}"));
+                        std::fs::hard_link(path, &alias).unwrap();
+                        current_aliases.insert(alias, std::fs::read(path).unwrap());
                     }
                     match hardlink_fault.unwrap() {
                         LegacyHardlinkFault::OriginalBytes => {
@@ -4068,6 +4068,16 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                             );
                             std::fs::remove_file(current).unwrap();
                             assert!(!current.exists(), "current receipt path must be absent");
+                            missing_current = Some(current.clone());
+                            // A normal Full pass can repair missing Current evidence
+                            // before recertification. Refuse that repair here so the
+                            // actual checkpoint boundary must retain the missing-file hold.
+                            server.reset().await;
+                            Mock::given(method("GET"))
+                                .and(path("/child.jpg"))
+                                .respond_with(ResponseTemplate::new(404))
+                                .mount(&server)
+                                .await;
                         }
                         _ => {}
                     }
@@ -4290,11 +4300,39 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                     let (original, sidecar) = original_before.unwrap();
                     assert_eq!(std::fs::read(&legacy_path).unwrap(), original);
                     assert_eq!(std::fs::read(&legacy_xmp).ok(), sidecar);
-                    assert_eq!(
-                        server.received_requests().await.unwrap().len(),
-                        requests_before,
-                        "qualification fault must hold before a new transfer"
-                    );
+                    if let Some(path) = &missing_current {
+                        assert!(
+                            !path.exists(),
+                            "failed repair must leave Current media absent"
+                        );
+                        assert!(
+                            server.received_requests().await.unwrap().len() > requests_before,
+                            "missing Current must exercise the rejected provider repair"
+                        );
+                        assert_eq!(
+                            proofs, retained_proofs,
+                            "missing evidence must not mint a proof"
+                        );
+                        assert_eq!(
+                            inner.legacy_preservations("PrimarySync").await.unwrap()[0]
+                                .active_generation,
+                            None,
+                            "missing Current evidence must invalidate the old active proof"
+                        );
+                    } else {
+                        assert_eq!(
+                            server.received_requests().await.unwrap().len(),
+                            requests_before,
+                            "qualification fault must hold before a new transfer"
+                        );
+                    }
+                    for (alias, expected) in &current_aliases {
+                        assert_eq!(
+                            &std::fs::read(alias).unwrap(),
+                            expected,
+                            "external Current alias bytes must remain intact"
+                        );
+                    }
                     assert!(
                         inner
                             .get_legacy_master_state_owners()
