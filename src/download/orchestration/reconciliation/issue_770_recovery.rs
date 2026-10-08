@@ -546,6 +546,7 @@ async fn issue_770_recovery_preserves_smart_selection_completeness_veto() {
         .await
         .unwrap();
         assert!(!result.complete);
+        assert!(result.complete_after_smart_query);
         assert_eq!(result.stats.failed, 0);
         assert_eq!(std::fs::read(&old_path).unwrap(), vec![7u8; 1024]);
     }
@@ -553,6 +554,7 @@ async fn issue_770_recovery_preserves_smart_selection_completeness_veto() {
         .await
         .unwrap();
     assert!(control.complete, "{control:?}");
+    assert!(!control.complete_after_smart_query);
     assert_eq!(control.stats.failed, 0);
     assert_eq!(control.stats.downloaded, 0);
 }

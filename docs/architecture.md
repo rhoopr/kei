@@ -774,7 +774,7 @@ downloads and local reconciliation retain the requested-directory replay check.
 Retries stop planning another pass once every pending rendition for that asset
 is matched or safely adopted; outstanding companions still require planning.
 This does not migrate or discard reservations, alter selection completeness, or
-promote a pending path configuration with smart-folder selection.
+authorize promotion of a pending path configuration with smart-folder selection.
 
 Cross-parent pending adoption requires an independently durable local SHA-256
 for the exact destination and current provider generation. It checks every saved
@@ -820,6 +820,16 @@ checks and does not hash the still when same-size current companions satisfy
 the existing skip rules. New companions use a verified still filename. Existing
 companions with older numbered still stems remain usable after hash verification;
 Kei does not rename or delete them.
+
+Historical smart-folder membership cannot complete local path reconciliation. It reports separate conditional evidence when the fresh smart query
+is its only remaining dependency: album snapshots and catalog identity must be
+complete, with no deferred missing file or failed local work. The cycle owner
+can discharge that dependency only after successful current smart enumeration
+and durable work satisfy the existing checkpoint checks. Recent or lower-date
+bounds, a stale plan, interruption, unresolved identity, failed enumeration or
+state writes retain the pending path hash. Every selected library must finish;
+current smart query evidence does not establish global inventory completeness
+or replace provider checkpoint policy.
 
 Local path reconciliation retains an unowned legacy master with multiple
 historical children as unresolved work, even when targeted lookup returns one
