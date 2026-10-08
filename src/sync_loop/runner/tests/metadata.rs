@@ -4046,11 +4046,28 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                             .unwrap();
                         }
                         LegacyHardlinkFault::CurrentMissing => {
-                            let current = completed_outputs
-                                .keys()
-                                .find(|path| path.extension().is_some_and(|ext| ext == "jpg"))
+                            let current_receipts = state::SqliteStateDb::open(&database)
+                                .await
+                                .unwrap()
+                                .get_downloaded_page(0, 20)
+                                .await
                                 .unwrap();
+                            let current = current_receipts
+                                .iter()
+                                .find(|row| {
+                                    row.id.as_ref() == names[0]
+                                        && row.version_size == state::VersionSizeKey::Original
+                                })
+                                .expect("persisted current child media receipt")
+                                .local_path
+                                .as_ref()
+                                .expect("current child media receipt path");
+                            assert!(
+                                completed_outputs.contains_key(current),
+                                "missing-current fault must target a previously verified output"
+                            );
                             std::fs::remove_file(current).unwrap();
+                            assert!(!current.exists(), "current receipt path must be absent");
                         }
                         _ => {}
                     }
