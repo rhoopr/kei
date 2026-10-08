@@ -2996,3 +2996,6 @@ async fn path_reconciliation_copies_catalog_file_without_provider_inventory() {
     assert_eq!(summary.pending, 0);
     assert_eq!(summary.failed, 1);
 }
+
+#[path = "issue_770_recovery.rs"]
+mod issue_770_recovery;

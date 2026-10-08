@@ -1008,6 +1008,38 @@ pub(crate) fn confined_path_key(path: &Path) -> std::io::Result<String> {
     Ok(normalized_path(&absolute_confined_path(path)?).into_owned())
 }
 
+/// Rebase a reserved destination using platform ownership-key component rules.
+/// Parent traversal is rejected before comparison; filesystem opens still use
+/// the existing no-follow policy beneath the current root spelling.
+pub(crate) fn reserved_path_under_root(root: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    let absolute_root = absolute_confined_path(root)?;
+    let absolute_path = absolute_confined_path(path)?;
+    let root_key = confined_path_key(&absolute_root)?;
+    let path_key = confined_path_key(&absolute_path)?;
+    if Path::new(&path_key)
+        .strip_prefix(Path::new(&root_key))
+        .is_err()
+        || absolute_path.components().count() <= absolute_root.components().count()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Reserved destination is outside the current download root",
+        ));
+    }
+    let relative: PathBuf = absolute_path
+        .components()
+        .skip(absolute_root.components().count())
+        .collect();
+    let rebased = root.join(relative);
+    if confined_path_key(&rebased)? != path_key {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Rebased destination does not match its reservation",
+        ));
+    }
+    Ok(rebased)
+}
+
 /// Resolve a confined path without changing parent-component semantics.
 ///
 /// Returns `InvalidInput` for any `..` component: removing it lexically can
@@ -1211,6 +1243,42 @@ where
 mod tests {
     use super::*;
     use std::io;
+
+    #[test]
+    fn issue_770_recovery_reserved_rebase_preserves_component_confinement() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = root.path().join("Album/pending.jpg");
+        let current = root.path().join(".");
+        let replay = reserved_path_under_root(&current, &saved).unwrap();
+        assert_eq!(
+            confined_path_key(&replay).unwrap(),
+            confined_path_key(&saved).unwrap()
+        );
+        assert!(reserved_path_under_root(root.path(), root.path()).is_err());
+        assert!(
+            reserved_path_under_root(root.path(), &root.path().join("../outside.jpg")).is_err()
+        );
+        let outside = root.path().with_extension("sibling").join("pending.jpg");
+        assert!(reserved_path_under_root(root.path(), &outside).is_err());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn issue_770_recovery_reserved_rebase_accepts_case_equivalent_root_only() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("Photos");
+        let saved = root.path().join("pHOTOS/Album/Pending.jpg");
+        let replay = reserved_path_under_root(&current, &saved).unwrap();
+        assert_eq!(replay, current.join("Album/Pending.jpg"));
+        assert_eq!(
+            confined_path_key(&replay).unwrap(),
+            confined_path_key(&saved).unwrap()
+        );
+        assert!(
+            reserved_path_under_root(&current, &root.path().join("Photos-other/pending.jpg"))
+                .is_err()
+        );
+    }
 
     #[cfg(windows)]
     #[test]

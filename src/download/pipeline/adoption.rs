@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use rustc_hash::FxHashSet;
 
 use crate::download::file::{LocalFileSizeExpectation, local_file_size_matches_state};
@@ -83,26 +84,140 @@ fn pending_filename_matches_derived(pending_filename: &str, derived_filename: &s
         || pending_filename.eq_ignore_ascii_case(derived_filename)
 }
 
+/// A saved cross-parent alias protects the whole pending rendition even if
+/// the current enumerating pass happens to render a same-parent alias.
+async fn enumerated_reserved_pending(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &DownloadContext,
+    planner: &TaskPlanner,
+    derived: &DerivedPath,
+    finalize: bool,
+) -> Result<Option<PendingRetryAdoption>> {
+    let library = effective_asset_library(asset, config);
+    if !pending_versions_for_asset(ctx, library, asset)
+        .is_some_and(|versions| versions.contains(derived.version_size.as_str()))
+    {
+        return Ok(None);
+    }
+    let destinations = planner.cross_parent_retry_destinations(
+        library,
+        asset.state_id(),
+        derived.version_size,
+        &derived.checksum,
+        derived.size,
+    )?;
+    if destinations.is_empty() {
+        return Ok(None);
+    }
+    let recorded = ctx.pending_file_matching_checksum(
+        library,
+        asset.state_id(),
+        derived.version_size,
+        &derived.checksum,
+    );
+    let evidence = PendingRetryFileEvidence {
+        version_size: derived.version_size,
+        filename: &derived.filename,
+        checksum: &derived.checksum,
+        size: derived.size,
+        local_path: PendingRetryLocalPath::Unrecorded,
+        cross_parent_recorded_file: recorded,
+    };
+    Ok(Some(
+        adopt_cross_parent_pending_file(
+            db,
+            config,
+            asset,
+            planner,
+            &evidence,
+            &destinations,
+            finalize,
+        )
+        .await?,
+    ))
+}
+
+/// Preserve finalization proof only for the already-pending rendition and its
+/// current-content saved cross-parent aliases, including direct dispatch paths.
+pub(in crate::download) fn mark_reserved_pending_task(
+    ctx: &DownloadContext,
+    planner: &TaskPlanner,
+    config: &DownloadConfig,
+    task: &mut DownloadTask,
+) -> Result<()> {
+    let pending = ctx
+        .pending_ids
+        .get(task.library.as_ref())
+        .and_then(|assets| assets.get(task.asset_id.as_ref()))
+        .is_some_and(|versions| versions.contains(task.version_size.as_str()));
+    if pending
+        && !planner
+            .cross_parent_retry_destinations(
+                &task.library,
+                &task.asset_id,
+                task.version_size,
+                &task.checksum,
+                task.size,
+            )?
+            .is_empty()
+    {
+        task.pending_cross_parent_root = Some(Arc::new(config.directory.to_path_buf()));
+    }
+    Ok(())
+}
+
+pub(in crate::download) async fn validate_enumerated_reserved_pending(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &DownloadContext,
+    planner: &TaskPlanner,
+) -> Result<bool> {
+    let mut affected = false;
+    for derived in derive_expected_paths(asset, config) {
+        affected |= enumerated_reserved_pending(db, config, asset, ctx, planner, &derived, false)
+            .await?
+            .is_some();
+    }
+    Ok(affected)
+}
+
 pub(super) async fn adopt_pending_on_disk_skip(
     state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     ctx: &DownloadContext,
     task_planner: &mut TaskPlanner,
-) -> PendingOnDiskAdoptionSummary {
+) -> Result<PendingOnDiskAdoptionSummary> {
     let Some(db) = state_db else {
-        return PendingOnDiskAdoptionSummary::default();
+        return Ok(PendingOnDiskAdoptionSummary::default());
     };
     let library = effective_asset_library(asset, config);
     let pending_versions = pending_versions_for_asset(ctx, library, asset);
     let Some(pending_versions) = pending_versions else {
-        return PendingOnDiskAdoptionSummary::default();
+        return Ok(PendingOnDiskAdoptionSummary::default());
     };
 
     let mut summary = PendingOnDiskAdoptionSummary::default();
     for derived in derive_expected_paths(asset, config) {
         let version_size = derived.version_size.as_str();
         if !pending_versions.contains(version_size) {
+            continue;
+        }
+        if let Some(adoption) =
+            enumerated_reserved_pending(db, config, asset, ctx, task_planner, &derived, true)
+                .await?
+        {
+            summary.retained_cross_parent = true;
+            anyhow::ensure!(
+                adoption != PendingRetryAdoption::NotFound,
+                "Reserved pending file is absent; retaining debt for exact targeted recovery"
+            );
+            if adoption == PendingRetryAdoption::StateWriteFailed {
+                summary.state_write_failures += 1;
+            }
             continue;
         }
         match adopt_pending_derived_path(
@@ -128,12 +243,13 @@ pub(super) async fn adopt_pending_on_disk_skip(
         }
     }
 
-    summary
+    Ok(summary)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PendingOnDiskAdoptionSummary {
     pub(super) state_write_failures: usize,
+    pub(super) retained_cross_parent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +279,9 @@ pub(in crate::download) struct PendingRetryFileEvidence<'a> {
     pub(in crate::download) filename: &'a str,
     pub(in crate::download) checksum: &'a str,
     pub(in crate::download) local_path: PendingRetryLocalPath<'a>,
+    /// Stored current-generation proof, checked by confined keys only in the
+    /// cross-parent route; ordinary adoption keeps its existing spelling policy.
+    pub(in crate::download) cross_parent_recorded_file: Option<&'a RecordedLocalFile>,
     pub(in crate::download) size: u64,
 }
 
@@ -179,7 +298,26 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
     task_planner: &mut TaskPlanner,
     planned_tasks: &[DownloadTask],
     evidence: PendingRetryFileEvidence<'_>,
-) -> PendingRetryAdoption {
+) -> Result<PendingRetryAdoption> {
+    let reserved = task_planner.cross_parent_retry_destinations(
+        effective_asset_library(asset, config),
+        asset.state_id(),
+        evidence.version_size,
+        evidence.checksum,
+        evidence.size,
+    )?;
+    if !reserved.is_empty() {
+        return adopt_cross_parent_pending_file(
+            db,
+            config,
+            asset,
+            task_planner,
+            &evidence,
+            &reserved,
+            true,
+        )
+        .await;
+    }
     // A content change can leave historical catalog evidence after the new
     // reserved sibling was published but finalization failed. Its immutable
     // content-specific reservation and verified bytes permit adoption; the old
@@ -193,11 +331,11 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
             && let Some(adoption) =
                 adopt_pending_task_path(db, config, asset, task_planner, task, None).await
         {
-            return adoption.into();
+            return Ok(adoption.into());
         }
     }
     if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
-        return PendingRetryAdoption::NotFound;
+        return Ok(PendingRetryAdoption::NotFound);
     }
 
     if let PendingRetryLocalPath::Current(recorded_file) = evidence.local_path {
@@ -207,7 +345,7 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
             .and_then(|filename| filename.to_str())
             .is_some_and(|filename| pending_filename_matches_derived(evidence.filename, filename));
         if !recorded_filename_matches {
-            return PendingRetryAdoption::NotFound;
+            return Ok(PendingRetryAdoption::NotFound);
         }
 
         task_planner.prepare_path_parent(local_path).await;
@@ -228,7 +366,7 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
             )
             .await
             {
-                return adoption.into();
+                return Ok(adoption.into());
             }
         }
 
@@ -252,10 +390,10 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
             )
             .await
             {
-                return adoption.into();
+                return Ok(adoption.into());
             }
         }
-        return PendingRetryAdoption::NotFound;
+        return Ok(PendingRetryAdoption::NotFound);
     }
 
     for task in planned_tasks.iter().filter(|task| {
@@ -266,7 +404,7 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
         if let Some(adoption) =
             adopt_pending_task_path(db, config, asset, task_planner, task, None).await
         {
-            return adoption.into();
+            return Ok(adoption.into());
         }
     }
 
@@ -282,11 +420,124 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
         if let Some(adoption) =
             adopt_pending_derived_path(db, config, asset, task_planner, &derived, None).await
         {
-            return adoption.into();
+            return Ok(adoption.into());
         }
     }
 
-    PendingRetryAdoption::NotFound
+    Ok(PendingRetryAdoption::NotFound)
+}
+
+/// Saved provider generations identify ownership, not hashes of local bytes.
+/// Never mint proof from the file that this route is deciding whether to adopt.
+async fn adopt_cross_parent_pending_file(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task_planner: &TaskPlanner,
+    evidence: &PendingRetryFileEvidence<'_>,
+    destinations: &[PathBuf],
+    finalize: bool,
+) -> Result<PendingRetryAdoption> {
+    let Some(derived) = derive_expected_paths(asset, config)
+        .into_iter()
+        .find(|derived| {
+            derived.version_size == evidence.version_size
+                && derived.checksum.as_ref() == evidence.checksum
+                && derived.size == evidence.size
+        })
+    else {
+        return Ok(PendingRetryAdoption::NotFound);
+    };
+    let library = effective_asset_library(asset, config);
+    let mut verified = None;
+    for saved_destination in destinations {
+        let destination =
+            crate::fs_util::reserved_path_under_root(&config.directory, saved_destination)?;
+        let destination = &destination;
+        anyhow::ensure!(
+            task_planner.retry_path_allowed(
+                library,
+                asset.state_id(),
+                evidence.version_size,
+                evidence.checksum,
+                evidence.size,
+                destination,
+            ),
+            "Reserved cross-parent pending destination has incompatible ownership"
+        );
+        let Some(retained) =
+            crate::download::file::retain_pending_file(&config.directory, destination)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Cannot safely inspect reserved cross-parent pending destination {}",
+                        destination.display(),
+                    )
+                })?
+        else {
+            continue;
+        };
+        let Some(recorded) = evidence.cross_parent_recorded_file else {
+            anyhow::bail!(
+                "Reserved cross-parent pending file has no durable matching local-hash proof; retaining file and pending debt"
+            );
+        };
+        anyhow::ensure!(
+            crate::fs_util::confined_path_key(&recorded.path)?
+                == crate::fs_util::confined_path_key(destination)?,
+            "Reserved cross-parent pending file has no durable hash proof at this destination"
+        );
+        let checksum = recorded.local_checksum.as_deref().context(
+            "Reserved cross-parent pending file has no durable matching local-hash proof; retaining file and pending debt",
+        )?;
+        anyhow::ensure!(
+            checksum.len() == 64
+                && data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256) == checksum,
+            "Reserved cross-parent pending file does not match its durable local-hash proof"
+        );
+        let metadata_changed_size = recorded
+            .download_checksum
+            .as_deref()
+            .is_some_and(|download| download != checksum);
+        anyhow::ensure!(
+            retained.fingerprint.size == evidence.size || metadata_changed_size,
+            "Reserved cross-parent pending file does not match its recorded size evidence"
+        );
+        verified = Some((destination.clone(), retained, recorded));
+    }
+    let Some((destination, retained, recorded)) = verified else {
+        return Ok(PendingRetryAdoption::NotFound);
+    };
+    if !finalize {
+        retained.validate().await?;
+        return Ok(PendingRetryAdoption::Adopted);
+    }
+    let record = asset_record_for_derived_path(Arc::from(library), asset, &derived, config);
+    if let Err(error) = db.upsert_seen(&record).await {
+        tracing::warn!(%error, "Failed to refresh reserved cross-parent pending file");
+        return Ok(PendingRetryAdoption::StateWriteFailed);
+    }
+    // Keep both the inode and directory capabilities across the immediate DB
+    // write. A failed write retains pending debt; every later attempt must reopen
+    // and verify independently. This route creates no deferred hash-only write.
+    retained.validate().await?;
+    let finalized = db
+        .mark_downloaded_with_capture_repair(
+            library,
+            asset.state_id(),
+            evidence.version_size.as_str(),
+            &destination,
+            &data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256),
+            recorded.download_checksum.as_deref(),
+            capture_repair_requested(config),
+        )
+        .await;
+    drop(retained);
+    if let Err(error) = finalized {
+        tracing::warn!(%error, "Failed to finalize reserved cross-parent pending file");
+        return Ok(PendingRetryAdoption::StateWriteFailed);
+    }
+    Ok(PendingRetryAdoption::Adopted)
 }
 
 pub(super) async fn adopt_pending_on_disk_task(
@@ -296,12 +547,38 @@ pub(super) async fn adopt_pending_on_disk_task(
     ctx: &DownloadContext,
     task_planner: &mut TaskPlanner,
     task: &DownloadTask,
-) -> Option<PendingOnDiskAdoption> {
-    let db = state_db?;
+) -> Result<Option<PendingOnDiskAdoption>> {
+    let Some(db) = state_db else {
+        return Ok(None);
+    };
     let library = effective_asset_library(asset, config);
-    let pending_versions = pending_versions_for_asset(ctx, library, asset)?;
+    let Some(pending_versions) = pending_versions_for_asset(ctx, library, asset) else {
+        return Ok(None);
+    };
     if !pending_versions.contains(task.version_size.as_str()) {
-        return None;
+        return Ok(None);
+    }
+
+    if let Some(derived) = derive_expected_paths(asset, config)
+        .into_iter()
+        .find(|derived| {
+            derived.version_size == task.version_size
+                && derived.checksum == task.checksum
+                && derived.size == task.size
+        })
+        && let Some(adoption) =
+            enumerated_reserved_pending(db, config, asset, ctx, task_planner, &derived, true)
+                .await?
+    {
+        return Ok(match adoption {
+            PendingRetryAdoption::NotFound => None,
+            PendingRetryAdoption::Adopted => {
+                Some(PendingOnDiskAdoption::Adopted(task.download_path.clone()))
+            }
+            PendingRetryAdoption::StateWriteFailed => Some(
+                PendingOnDiskAdoption::StateWriteFailed(task.download_path.clone()),
+            ),
+        });
     }
 
     if let Some(adoption) = adopt_pending_task_path(
@@ -319,7 +596,7 @@ pub(super) async fn adopt_pending_on_disk_task(
     )
     .await
     {
-        return Some(adoption);
+        return Ok(Some(adoption));
     }
 
     for derived in derive_expected_paths(asset, config) {
@@ -348,11 +625,11 @@ pub(super) async fn adopt_pending_on_disk_task(
         )
         .await
         {
-            return Some(adoption);
+            return Ok(Some(adoption));
         }
     }
 
-    None
+    Ok(None)
 }
 
 fn path_matches_recorded_file(path: &Path, recorded_path: &Path) -> bool {

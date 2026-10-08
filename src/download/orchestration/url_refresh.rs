@@ -408,6 +408,15 @@ pub(in crate::download) async fn build_retry_download_tasks(
 
     let mut pending_keys: FxHashSet<RetryTaskKey> =
         failed_tasks.iter().map(RetryTaskKey::from).collect();
+    // Re-enumeration builds new tasks, so it must preserve the affected
+    // failure's publication-proof requirement instead of falling back to an
+    // ordinary hash-only finalization. This does not authorize a new provider
+    // generation under the old reserved failure.
+    let retained_pending_failures: FxHashMap<_, _> = failed_tasks
+        .iter()
+        .filter(|task| task.pending_cross_parent_root.is_some())
+        .map(|task| (RetryTaskKey::from(task), task))
+        .collect();
     let retry_state_ids = retry_state_ids_by_asset_record(failed_tasks);
     let requested_count = pending_keys.len();
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
@@ -444,7 +453,16 @@ pub(in crate::download) async fn build_retry_download_tasks(
             if plan.filter_reason.is_some() {
                 continue;
             }
-            take_matching_retry_tasks(plan.tasks, &mut pending_keys, &mut retry.tasks);
+            let tasks = plan.tasks.into_iter().filter_map(|mut task| {
+                if let Some(failed) = retained_pending_failures.get(&RetryTaskKey::from(&task)) {
+                    if task.checksum != failed.checksum || task.size != failed.size {
+                        return None;
+                    }
+                    task.pending_cross_parent_root = failed.pending_cross_parent_root.clone();
+                }
+                Some(task)
+            });
+            take_matching_retry_tasks(tasks, &mut pending_keys, &mut retry.tasks);
         }
     }
 

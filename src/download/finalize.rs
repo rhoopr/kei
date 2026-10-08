@@ -26,6 +26,8 @@ pub(super) struct PendingStateWrite {
     pub(super) local_checksum: String,
     pub(super) download_checksum: Option<String>,
     pub(super) mark_capture_repair: bool,
+    pub(super) retained: Option<Arc<super::file::RetainedPendingFile>>,
+    pub(super) requires_retained: bool,
 }
 
 /// Maximum retry attempts for deferred state writes.
@@ -47,14 +49,18 @@ pub(super) enum DownloadedFinalization {
     Persisted,
     Deferred {
         write: PendingStateWrite,
-        error: crate::state::error::StateError,
+        error: Box<crate::state::error::StateError>,
     },
 }
+
+#[cfg(test)]
+pub(in crate::download) mod finalization_probe;
 
 /// Persist success state for a task that has already landed safely on disk.
 /// A failed metadata write records a retry marker; retiring markers is left to
 /// the rewrite drain. On failure, the caller receives a deferred write record
 /// for bounded retry.
+#[cfg(test)]
 pub(super) async fn finalize_downloaded<D>(
     db: &D,
     library: &Arc<str>,
@@ -67,16 +73,59 @@ pub(super) async fn finalize_downloaded<D>(
 where
     D: DownloadFinalizationStore + ?Sized,
 {
+    finalize_downloaded_with_proof(
+        db,
+        library,
+        task,
+        local_checksum,
+        download_checksum,
+        exif_ok,
+        mark_capture_repair,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn finalize_downloaded_with_proof<D>(
+    db: &D,
+    library: &Arc<str>,
+    task: &DownloadTask,
+    local_checksum: String,
+    download_checksum: Option<String>,
+    exif_ok: bool,
+    mark_capture_repair: bool,
+    retained: Option<Arc<super::file::RetainedPendingFile>>,
+) -> DownloadedFinalization
+where
+    D: DownloadFinalizationStore + ?Sized,
+{
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("published");
+    let write = PendingStateWrite {
+        library: Arc::clone(library),
+        asset_id: task.asset_id.clone(),
+        version_size: task.version_size,
+        download_path: task.download_path.clone(),
+        local_checksum,
+        download_checksum,
+        mark_capture_repair,
+        retained,
+        requires_retained: task.pending_cross_parent_root.is_some(),
+    };
+    if let Err(error) = validate_pending_write(&write).await {
+        return DownloadedFinalization::Deferred {
+            write,
+            error: Box::new(error),
+        };
+    }
     match db
         .mark_verified_download(
             library,
             &task.asset_id,
             task.version_size.as_str(),
             &task.download_path,
-            &local_checksum,
-            download_checksum.as_deref(),
+            &write.local_checksum,
+            write.download_checksum.as_deref(),
             mark_capture_repair,
         )
         .await
@@ -94,18 +143,14 @@ where
             crate::test_helpers::process_death_point("state-persisted");
             DownloadedFinalization::Persisted
         }
-        Err(error) => DownloadedFinalization::Deferred {
-            write: PendingStateWrite {
-                library: Arc::clone(library),
-                asset_id: task.asset_id.clone(),
-                version_size: task.version_size,
-                download_path: task.download_path.clone(),
-                local_checksum,
-                download_checksum,
-                mark_capture_repair,
-            },
-            error,
-        },
+        Err(error) => {
+            #[cfg(test)]
+            finalization_probe::observe(&task.download_path).await;
+            DownloadedFinalization::Deferred {
+                write,
+                error: Box::new(error),
+            }
+        }
     }
 }
 
@@ -119,7 +164,7 @@ pub(super) async fn finalize_failed<D>(
 where
     D: DownloadStateStore + ?Sized,
 {
-    let durable_error = match task.publication {
+    let durable_error = match task.publication() {
         super::file::FinalPublication::NoReplace => error,
         super::file::FinalPublication::ReplaceTruncated(_) => {
             crate::commands::reconcile::FILE_TRUNCATED_REASON
@@ -166,6 +211,33 @@ async fn update_metadata_marker<D>(
     }
 }
 
+async fn validate_pending_write(
+    write: &PendingStateWrite,
+) -> Result<(), crate::state::error::StateError> {
+    if write.requires_retained && write.retained.is_none() {
+        return Err(crate::state::error::StateError::Invariant {
+            operation: "reserved pending finalization",
+            detail: "Missing original publication proof".into(),
+        });
+    }
+    if let Some(proof) = &write.retained {
+        let result = async {
+            proof.validate().await?;
+            anyhow::ensure!(
+                data_encoding::HEXLOWER.encode(&proof.fingerprint.sha256) == write.local_checksum,
+                "Retained publication hash does not match the receipt"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        result.map_err(|error| crate::state::error::StateError::Invariant {
+            operation: "reserved pending finalization",
+            detail: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
 async fn retry_pending_state_write<D>(
     db: &D,
     write: &PendingStateWrite,
@@ -177,6 +249,11 @@ where
     use rand::RngExt;
 
     for attempt in 1..=STATE_WRITE_MAX_RETRIES {
+        if let Err(error) = validate_pending_write(write).await {
+            tracing::warn!(asset_id = %write.asset_id, %error,
+                "Reserved pending publication proof changed; retaining media and pending debt");
+            return false;
+        }
         match db
             .mark_verified_download(
                 &write.library,
@@ -349,7 +426,8 @@ mod tests {
         DownloadTask {
             url: "https://example.test/photo.jpg".into(),
             download_path: path,
-            publication: crate::download::file::FinalPublication::NoReplace,
+            replacement_fingerprint: None,
+            pending_cross_parent_root: None,
             checksum: "remote_checksum".into(),
             asset_id: Arc::from(asset_id),
             asset_record_name: Arc::from(asset_id),
@@ -372,6 +450,156 @@ mod tests {
 
     async fn write_file(path: &Path) {
         tokio::fs::write(path, b"finalized").await.unwrap();
+    }
+
+    async fn reserved_deferred_boundary(mutation: &str) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old-album/pending.jpg");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_file(&path).await;
+        let checksum = super::super::file::compute_sha256(&path).await.unwrap();
+        let proof = super::super::file::retain_pending_file(dir.path(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let mut pending_task = task("PENDING", path.clone());
+        pending_task.pending_cross_parent_root = Some(Arc::new(dir.path().to_path_buf()));
+        let result = finalize_downloaded_with_proof(
+            &db,
+            &Arc::from(LIBRARY),
+            &pending_task,
+            checksum.clone(),
+            Some(checksum),
+            true,
+            false,
+            Some(proof),
+        )
+        .await;
+        let DownloadedFinalization::Deferred { write, .. } = result else {
+            panic!("missing row must defer the write");
+        };
+        seed_pending(&db, "PENDING", "pending.jpg").await;
+        match mutation {
+            "unchanged" => {}
+            "bytes" => std::fs::write(&path, b"different").unwrap(),
+            "inode" => {
+                std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+                write_file(&path).await;
+            }
+            "ancestor" => {
+                #[cfg(windows)]
+                assert!(
+                    std::fs::rename(path.parent().unwrap(), dir.path().join("preserved-album"))
+                        .is_err(),
+                    "live Windows directory capabilities must deny ancestor replacement"
+                );
+                #[cfg(not(windows))]
+                {
+                    std::fs::rename(path.parent().unwrap(), dir.path().join("preserved-album"))
+                        .unwrap();
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    write_file(&path).await;
+                }
+            }
+            #[cfg(unix)]
+            "leaf-link" => {
+                std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+                std::os::unix::fs::symlink(path.with_extension("preserved"), &path).unwrap();
+            }
+            #[cfg(unix)]
+            "ancestor-link" => {
+                std::fs::rename(path.parent().unwrap(), dir.path().join("preserved-album"))
+                    .unwrap();
+                std::os::unix::fs::symlink(
+                    dir.path().join("preserved-album"),
+                    path.parent().unwrap(),
+                )
+                .unwrap();
+            }
+            _ => panic!("unknown mutation"),
+        }
+        let mut pending = vec![write];
+        let flush = flush_pending_state_writes_retaining_failures(&db, &mut pending).await;
+        #[cfg(windows)]
+        let unsafe_change = mutation != "unchanged" && mutation != "ancestor";
+        #[cfg(not(windows))]
+        let unsafe_change = mutation != "unchanged";
+        assert_eq!(flush.failures, usize::from(unsafe_change), "{mutation}");
+        assert_eq!(
+            pending.len(),
+            usize::from(unsafe_change),
+            "must retain refused write"
+        );
+        assert_eq!(
+            db.get_downloaded_page(0, 10).await.unwrap().len(),
+            usize::from(!unsafe_change)
+        );
+        if unsafe_change {
+            assert_eq!(db.get_pending().await.unwrap().len(), 1);
+            let again = flush_pending_state_writes_retaining_failures(&db, &mut pending).await;
+            assert_eq!(
+                again.failures, 1,
+                "proof cannot be minted during another attempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_770_recovery_deferred_publication_rechecks_bytes_identity_and_namespace() {
+        for mutation in ["unchanged", "bytes", "inode", "ancestor"] {
+            reserved_deferred_boundary(mutation).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue_770_recovery_deferred_publication_refuses_leaf_and_ancestor_links() {
+        for mutation in ["leaf-link", "ancestor-link"] {
+            reserved_deferred_boundary(mutation).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_770_recovery_immediate_finalization_requires_original_unchanged_proof() {
+        for missing in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("pending.jpg");
+            write_file(&path).await;
+            let checksum = super::super::file::compute_sha256(&path).await.unwrap();
+            let proof = super::super::file::retain_pending_file(dir.path(), &path)
+                .await
+                .unwrap()
+                .unwrap();
+            std::fs::write(&path, b"different").unwrap();
+            let db = SqliteStateDb::open_in_memory().unwrap();
+            seed_pending(&db, "PENDING", "pending.jpg").await;
+            let mut pending_task = task("PENDING", path);
+            pending_task.pending_cross_parent_root = Some(Arc::new(dir.path().to_path_buf()));
+            let result = finalize_downloaded_with_proof(
+                &db,
+                &Arc::from(LIBRARY),
+                &pending_task,
+                checksum.clone(),
+                Some(checksum),
+                true,
+                false,
+                if missing { None } else { Some(proof) },
+            )
+            .await;
+            let DownloadedFinalization::Deferred { write, .. } = result else {
+                panic!("missing or changed publication proof must refuse immediate write");
+            };
+            let mut pending = vec![write];
+            assert_eq!(
+                flush_pending_state_writes_retaining_failures(&db, &mut pending)
+                    .await
+                    .failures,
+                1
+            );
+            assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+            assert_eq!(db.get_pending().await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -572,12 +800,11 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         seed_pending(&db, "FINAL_REPAIR", "repair.jpg").await;
         let mut task = task("FINAL_REPAIR", PathBuf::from("repair.jpg"));
-        task.publication = crate::download::file::FinalPublication::ReplaceTruncated(
-            crate::download::file::ExistingFileFingerprint {
+        task.replacement_fingerprint =
+            Some(Arc::new(crate::download::file::ExistingFileFingerprint {
                 size: 3,
                 sha256: [7; 32],
-            },
-        );
+            }));
 
         finalize_failed(&db, &Arc::from(LIBRARY), &task, "network failed")
             .await

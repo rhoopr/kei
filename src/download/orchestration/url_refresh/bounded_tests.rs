@@ -725,7 +725,7 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
     assert_eq!(refreshed.version_size, task.version_size);
     assert!(Arc::ptr_eq(&refreshed.metadata, &task.metadata));
     assert!(matches!(
-        refreshed.publication,
+        refreshed.publication(),
         crate::download::file::FinalPublication::NoReplace
     ));
     let client = reqwest::Client::new();

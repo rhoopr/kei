@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::download::filter::DownloadTask;
 use crate::download::finalize::{
     DownloadedFinalization, PendingStateWrite, check_state_write_circuit_breaker,
-    finalize_downloaded, finalize_failed, flush_pending_state_writes,
+    finalize_downloaded_with_proof, finalize_failed, flush_pending_state_writes,
 };
 use crate::download::metadata_rewrite::MetadataFlags;
 use crate::download::{DownloadReporting, DownloadStore};
@@ -179,7 +179,7 @@ pub(in crate::download) async fn run_download_pass(
     // the end of the pass — defeating the point of parallel cleanup.
     while let Some((task, result)) = download_stream.next().await {
         match &result {
-            Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
+            Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes, retained)) => {
                 downloaded += 1;
                 downloaded_tasks.push(task.clone());
                 bytes_downloaded_total += bytes_dl;
@@ -204,7 +204,7 @@ pub(in crate::download) async fn run_download_pass(
                     });
                 }
                 if let Some(db) = &state_db {
-                    match finalize_downloaded(
+                    match finalize_downloaded_with_proof(
                         db.as_ref(),
                         &task.library,
                         &task,
@@ -212,6 +212,7 @@ pub(in crate::download) async fn run_download_pass(
                         download_checksum.clone(),
                         *exif_ok,
                         mark_capture_repair_after_download,
+                        retained.clone(),
                     )
                     .await
                     {

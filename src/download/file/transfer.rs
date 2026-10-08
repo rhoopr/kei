@@ -619,6 +619,28 @@ pub(in crate::download) struct DownloadedFile {
 }
 
 impl DownloadedFile {
+    /// Retain the current-root namespace only if it still names the exact
+    /// publication owner. The owner remains live while the guard is acquired.
+    pub(in crate::download) async fn retain_pending_publication(
+        &self,
+        root: &Path,
+        path: &Path,
+    ) -> anyhow::Result<Arc<super::fingerprint::RetainedPendingFile>> {
+        let retained = super::fingerprint::retain_pending_file(root, path)
+            .await?
+            .context("Published reserved pending file disappeared")?;
+        anyhow::ensure!(
+            retained.identity()? == file_identity(&self.retained.file)?,
+            "Reserved pending publication owner changed before finalization"
+        );
+        anyhow::ensure!(
+            retained.fingerprint == self.fingerprint().await?,
+            "Reserved pending publication bytes changed before finalization"
+        );
+        retained.validate().await?;
+        Ok(retained)
+    }
+
     pub(in crate::download) async fn fingerprint(&self) -> anyhow::Result<ExistingFileFingerprint> {
         let retained = Arc::clone(&self.retained);
         tokio::task::spawn_blocking(move || {

@@ -15,8 +15,9 @@ use crate::download::filter::DownloadTask;
 use crate::download::metadata_rewrite::CaptureTimestampRepair;
 use crate::download::pipeline::{
     AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, StreamRuntime, build_download_outcome,
-    format_duration, log_sync_summary, run_download_pass, state_confirmed_current_path_exists,
-    stream_and_download_from_stream,
+    format_duration, log_sync_summary, mark_reserved_pending_task, run_download_pass,
+    state_confirmed_current_path_exists, stream_and_download_from_stream,
+    validate_enumerated_reserved_pending,
 };
 use crate::download::{filter, metadata_rewrite, planner};
 use crate::icloud::photos::PhotoAsset;
@@ -914,6 +915,21 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         )]
         let effective_config = &pass_configs[*pass_index];
 
+        if controls.run_mode.downloads_files()
+            && let Some(db) = &config.state_db
+            && let Err(error) = validate_enumerated_reserved_pending(
+                db.as_ref(),
+                effective_config,
+                asset,
+                &download_ctx,
+                &task_planner,
+            )
+            .await
+        {
+            enumeration_errors += 1;
+            tracing::error!(%error, "Reserved pending incremental asset refused unsafe local evidence");
+            continue;
+        }
         let mut plan = task_planner
             .plan_download_asset(asset, effective_config)
             .await?;
@@ -1019,6 +1035,9 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .await?;
         }
 
+        for task in &mut plan.tasks {
+            mark_reserved_pending_task(&download_ctx, &task_planner, effective_config, task)?;
+        }
         for task in &plan.tasks {
             retry_sources.insert(
                 RetryTaskKey::from(task),

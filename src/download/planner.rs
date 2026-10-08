@@ -28,6 +28,12 @@ struct ReconciliationOwner {
     version_size: VersionSizeKey,
 }
 
+#[derive(Clone, Copy)]
+enum ReservedReplay {
+    RequestedDirectory,
+    PendingRetry,
+}
+
 /// Keep durable path ownership off the stack of the shared async planner.
 #[derive(Debug, Default)]
 struct ReconciliationPlanning {
@@ -323,6 +329,27 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
+        self.plan_download_asset_with_replay(asset, config, ReservedReplay::RequestedDirectory)
+            .await
+    }
+
+    /// A durable retry may have recorded a destination in another directory.
+    /// Replay that exact choice only beneath the current download root.
+    pub(super) async fn plan_pending_retry_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Result<AssetTaskPlan> {
+        self.plan_download_asset_with_replay(asset, config, ReservedReplay::PendingRetry)
+            .await
+    }
+
+    async fn plan_download_asset_with_replay(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        replay: ReservedReplay,
+    ) -> Result<AssetTaskPlan> {
         self.reconciliation.reservations.clear();
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
             return Ok(AssetTaskPlan {
@@ -371,7 +398,7 @@ impl TaskPlanner {
             // Adoption verifies existing files separately. Reuse the
             // ownership-aware plan, including exact saved destination choices.
             mode => {
-                self.plan_owned_asset(asset, config, mode, primary_filename)
+                self.plan_owned_asset(asset, config, mode, primary_filename, replay)
                     .await
             }
         }
@@ -435,6 +462,36 @@ impl TaskPlanner {
                 task.size,
                 &task.download_path,
             )
+    }
+
+    /// Inspect every saved alias before a pass can fall back to size-only adoption.
+    pub(super) fn cross_parent_retry_destinations(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+        checksum: &str,
+        size: u64,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let mut destinations = Vec::new();
+        for ((owner, content, requested), destination) in &self.reconciliation.destinations {
+            if owner.library.as_ref() != library
+                || owner.asset_id.as_ref() != asset_id
+                || owner.version_size != version_size
+                || content.checksum.as_ref() != checksum
+                || content.size != size
+            {
+                continue;
+            }
+            let destination_key = PathPlanningMode::Reconciliation.key(destination)?;
+            if Path::new(requested.as_ref()).parent()
+                != Path::new(destination_key.as_ref()).parent()
+                && !destinations.contains(destination)
+            {
+                destinations.push(destination.clone());
+            }
+        }
+        Ok(destinations)
     }
 
     fn add_reconciliation_claim(
@@ -562,6 +619,7 @@ impl TaskPlanner {
             config,
             PathPlanningMode::Reconciliation,
             primary_filename,
+            ReservedReplay::RequestedDirectory,
         )
         .await
     }
@@ -572,6 +630,7 @@ impl TaskPlanner {
         config: &DownloadConfig,
         mode: PathPlanningMode,
         primary_filename: Option<&str>,
+        replay: ReservedReplay,
     ) -> Result<AssetTaskPlan> {
         let expected = super::filter::expected_paths_for(asset, config);
         let library = asset
@@ -635,17 +694,42 @@ impl TaskPlanner {
                             !self.claimed_paths.contains_key(&destination_key),
                             "reserved reconciliation destination has another owner"
                         );
-                        let filename = destination.file_name().ok_or_else(|| {
-                            anyhow::anyhow!("reserved destination has no filename")
-                        })?;
-                        // Preserve the current root spelling while replaying the
-                        // exact reserved leaf, including identity/ordinal suffixes.
-                        task.download_path = requested.path.with_file_name(filename);
-                        anyhow::ensure!(
-                            PathPlanningMode::Reconciliation.key(&task.download_path)?
-                                == destination_key,
-                            "reserved reconciliation destination left its requested directory"
-                        );
+                        match replay {
+                            ReservedReplay::RequestedDirectory => {
+                                let filename = destination.file_name().ok_or_else(|| {
+                                    anyhow::anyhow!("reserved destination has no filename")
+                                })?;
+                                // Preserve the current root spelling while replaying the
+                                // exact reserved leaf, including identity/ordinal suffixes.
+                                task.download_path = requested.path.with_file_name(filename);
+                                anyhow::ensure!(
+                                    PathPlanningMode::Reconciliation.key(&task.download_path)?
+                                        == destination_key,
+                                    "reserved reconciliation destination left its requested directory"
+                                );
+                            }
+                            ReservedReplay::PendingRetry => {
+                                anyhow::ensure!(
+                                    self.retry_path_allowed(
+                                        &task.library,
+                                        &task.asset_id,
+                                        task.version_size,
+                                        &task.checksum,
+                                        task.size,
+                                        destination,
+                                    ),
+                                    "reserved pending retry destination has conflicting ownership or content"
+                                );
+                                task.download_path = crate::fs_util::reserved_path_under_root(
+                                    &config.directory, destination,
+                                )?;
+                                anyhow::ensure!(
+                                    PathPlanningMode::Reconciliation.key(&task.download_path)?
+                                        == destination_key,
+                                    "pending retry destination does not match its reservation"
+                                );
+                            }
+                        }
                     }
                     let destination_key =
                         PathPlanningMode::Reconciliation.key(&task.download_path)?;

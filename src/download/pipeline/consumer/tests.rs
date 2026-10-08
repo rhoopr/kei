@@ -29,6 +29,8 @@ async fn flush_pending_state_writes_succeeds_on_first_try() {
         local_checksum: "abc".into(),
         download_checksum: None,
         mark_capture_repair: false,
+        retained: None,
+        requires_retained: false,
     }];
     let failures = flush_pending_state_writes(&db, &pending).await;
     assert_eq!(failures, 0);
@@ -48,6 +50,8 @@ async fn flush_pending_state_writes_recovers_after_transient_failure() {
         local_checksum: "abc".into(),
         download_checksum: None,
         mark_capture_repair: false,
+        retained: None,
+        requires_retained: false,
     }];
     let failures = flush_pending_state_writes(&db, &pending).await;
     assert_eq!(failures, 0);
@@ -69,6 +73,8 @@ async fn flush_pending_state_writes_reports_persistent_failure() {
         local_checksum: "abc".into(),
         download_checksum: None,
         mark_capture_repair: false,
+        retained: None,
+        requires_retained: false,
     }];
     let failures = flush_pending_state_writes(&db, &pending).await;
     assert_eq!(failures, 1);
@@ -89,6 +95,8 @@ async fn flush_pending_state_writes_partial_recovery() {
             local_checksum: "abc".into(),
             download_checksum: None,
             mark_capture_repair: false,
+            retained: None,
+            requires_retained: false,
         },
         PendingStateWrite {
             library: "PrimarySync".into(),
@@ -98,6 +106,8 @@ async fn flush_pending_state_writes_partial_recovery() {
             local_checksum: "def".into(),
             download_checksum: None,
             mark_capture_repair: false,
+            retained: None,
+            requires_retained: false,
         },
     ];
     let failures = flush_pending_state_writes(&db, &pending).await;
@@ -122,6 +132,8 @@ async fn flush_pending_state_writes_retains_all_records() {
             local_checksum: format!("ck_{i}"),
             download_checksum: Some(format!("dl_ck_{i}")),
             mark_capture_repair: false,
+            retained: None,
+            requires_retained: false,
         })
         .collect();
 
@@ -142,6 +154,8 @@ async fn flush_pending_state_writes_retains_only_persistent_failures() {
             local_checksum: "abc".into(),
             download_checksum: None,
             mark_capture_repair: false,
+            retained: None,
+            requires_retained: false,
         },
         PendingStateWrite {
             library: "PrimarySync".into(),
@@ -151,6 +165,8 @@ async fn flush_pending_state_writes_retains_only_persistent_failures() {
             local_checksum: "def".into(),
             download_checksum: None,
             mark_capture_repair: false,
+            retained: None,
+            requires_retained: false,
         },
     ];
 

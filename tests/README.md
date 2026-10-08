@@ -309,6 +309,35 @@ it does not qualify power-loss durability, arbitrary crash points or real mounts
 
 ## Tactical external-state recovery
 
+The `issue_770_recovery` tests in pending-recovery and config-reconciliation
+exercise a production-written reservation whose Hidden request points to a
+recorded album destination. File-backed SQLite is reopened before recovery and
+after publication. A local media server supplies verified still and motion bytes;
+tests assert exact destinations, publication hashes and receipts, retained old
+media and custom metadata, and an unchanged quiet recovery cycle. They cover
+both pass orders and Album/SmartFolder/Unfiled composition, outstanding companion
+targets, failed reservation/finalization writes, cancellation and unsafe or
+foreign durable evidence. Smart-folder reconciliation remains incomplete by
+the existing selection policy; this slice does not prove config convergence.
+Additional coverage supplies nonempty provider enumeration and ordinary streaming
+assets, repeats refusals across pass order and SQLite reopen, and replaces bytes,
+leaf identity and ancestor namespaces between an initial failed receipt write and
+an otherwise successful deferred transaction. The unchanged-file deferred control
+must recover. A synthetic non-expiry failure exercises both cleanup URL refresh
+routes, and a Created delta exercises collecting incremental dispatch through a
+failed immediate receipt write and changed-byte deferred retry. Both direct
+routes retain the affected rendition's publication-proof requirement.
+Case-equivalent root rebasing has Windows/macOS-gated coverage;
+Linux qualification does not establish Windows runtime or junction behavior.
+
+Existing cross-parent files require durable matching local-hash proof. MMCS
+fixtures deliberately differ from local SHA-256. Conflicting or unreceipted
+bytes and links must survive repeated refusal and SQLite reopen with pending
+debt intact. A publication-before-receipt failure remains blocked after restart;
+it does not prove automatic recovery. Trusted adoption covers equivalent root
+spellings, all pass orders, failed immediate writes and fresh proof checks after
+restart. Unrelated ordinary adoption policy remains unchanged.
+
 The next bounded [#862](https://github.com/rhoopr/kei/issues/862) slice extends
 `just test scenario config-reconciliation` with existing fixtures and production
 owners. It adds these specific interactions to coverage already present:

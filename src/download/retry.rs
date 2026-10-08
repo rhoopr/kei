@@ -269,9 +269,16 @@ impl PendingRetryPlanning<'_> {
         let mut state_write_failed_targets = FxHashSet::default();
         let mut filter_reasons = Vec::<filter::FilterReason>::new();
         for (pass_index, pass_config) in self.pass_configs.iter().enumerate() {
+            if !self
+                .pending_targets
+                .iter()
+                .any(|target| target.asset_id.as_ref() == state_id)
+            {
+                break;
+            }
             let plan = self
                 .task_planner
-                .plan_download_asset(asset, pass_config)
+                .plan_pending_retry_asset(asset, pass_config)
                 .await?;
             let targets: Vec<PendingRetryTarget> = self
                 .pending_targets
@@ -294,10 +301,13 @@ impl PendingRetryPlanning<'_> {
                         filename: &evidence.filename,
                         checksum: &evidence.checksum,
                         local_path: evidence.local_path_evidence_under(&pass_config.directory),
+                        cross_parent_recorded_file: evidence
+                            .downloaded_at
+                            .and(evidence.local_file.as_ref()),
                         size: evidence.size_bytes,
                     },
                 )
-                .await
+                .await?
                 {
                     pipeline::PendingRetryAdoption::Adopted => {
                         self.pending_targets.remove(&target);
@@ -366,7 +376,7 @@ impl PendingRetryPlanning<'_> {
                             continue;
                         }
                         task.download_path = local_path.to_path_buf();
-                        task.publication = file::FinalPublication::ReplaceTruncated(fingerprint);
+                        task.replacement_fingerprint = Some(Arc::new(fingerprint));
                     } else {
                         let Some(retry_path) = self
                             .task_planner
@@ -395,6 +405,22 @@ impl PendingRetryPlanning<'_> {
                 self.task_planner
                     .persist_download_reservations(self.db, &retry_tasks)
                     .await?;
+            }
+            for task in &mut retry_tasks {
+                if !self
+                    .task_planner
+                    .cross_parent_retry_destinations(
+                        &task.library,
+                        &task.asset_id,
+                        task.version_size,
+                        &task.checksum,
+                        task.size,
+                    )?
+                    .is_empty()
+                {
+                    task.pending_cross_parent_root =
+                        Some(Arc::new(pass_config.directory.to_path_buf()));
+                }
             }
             let queued_targets: Vec<PendingRetryTarget> = retry_tasks
                 .iter()
@@ -1173,6 +1199,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::state::ReconciliationStateStore;
     use crate::test_helpers::TestAssetRecord;
 
     fn candidate(master: &str, asset: &str, checksum: &str, size: u64) -> PhotoAsset {
@@ -1201,6 +1228,112 @@ mod tests {
                 },
             }),
         )
+    }
+
+    #[tokio::test]
+    async fn issue_770_recovery_finishes_every_rendition_before_skipping_other_passes() {
+        let root = tempfile::TempDir::new().unwrap();
+        let db = crate::state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let records = [
+            TestAssetRecord::new("PAIR")
+                .checksum("still")
+                .size(100)
+                .build(),
+            TestAssetRecord::new("PAIR")
+                .version_size(VersionSizeKey::LiveOriginal)
+                .checksum("motion")
+                .size(200)
+                .build(),
+            TestAssetRecord::new("OTHER").build(),
+        ];
+        for record in &records {
+            db.upsert_seen(record).await.unwrap();
+        }
+        let held = root.path().join("held.jpg");
+        let key = crate::fs_util::confined_path_key(&held).unwrap();
+        db.reserve_reconciliation_paths(&[crate::state::ReconciliationReservation {
+            library: Arc::from("PrimarySync"),
+            asset_id: "HELD".into(),
+            version_size: VersionSizeKey::Original,
+            content: Some(crate::state::ReconciliationContent {
+                checksum: "held".into(),
+                size: 1,
+            }),
+            requested_path_key: crate::state::ReconciliationPathKey(key.clone()),
+            destination_path_key: crate::state::ReconciliationPathKey(key),
+            destination_path: held,
+        }])
+        .await
+        .unwrap();
+        let asset = PhotoAsset::new(
+            json!({"recordName": "PAIR", "fields": {
+                "filenameEnc": {"value": "pair.jpg"}, "itemType": {"value": "public.jpeg"},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {"downloadURL": "http://127.0.0.1:9/still", "fileChecksum": "still", "size": 100}},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalVidComplRes": {"value": {"downloadURL": "http://127.0.0.1:9/motion", "fileChecksum": "motion", "size": 200}},
+            }}),
+            json!({"recordName": "asset-PAIR", "fields": {
+                "assetDate": {"value": 1700000000000i64}, "addedDate": {"value": 1700000000000i64},
+            }}),
+        );
+        let mut still = DownloadConfig::test_default();
+        still.directory = Arc::from(root.path());
+        still.live_photo_mode = crate::types::LivePhotoMode::ImageOnly;
+        let mut both = still.clone();
+        both.live_photo_mode = crate::types::LivePhotoMode::Both;
+        let mut invalid_later = both.clone();
+        invalid_later.directory = Arc::from(root.path().join("invalid/.."));
+        let configs = [Arc::new(still), Arc::new(both), Arc::new(invalid_later)];
+        let evidence = records
+            .iter()
+            .map(|record| {
+                (
+                    PendingRetryTarget::from_record(record),
+                    PendingRetryEvidence::from_record(record),
+                )
+            })
+            .collect();
+        let mut targets = records
+            .iter()
+            .map(PendingRetryTarget::from_record)
+            .collect();
+        let mut planner = planner::TaskPlanner::for_download(Some(&db)).await.unwrap();
+        let mut tasks = Vec::new();
+        let mut sources = FxHashMap::default();
+        PendingRetryPlanning {
+            db: &db,
+            run_mode: super::super::DownloadRunMode::Download,
+            pass_configs: &configs,
+            pending_evidence: &evidence,
+            pending_targets: &mut targets,
+            task_planner: &mut planner,
+            tasks: &mut tasks,
+            retry_sources: &mut sources,
+        }
+        .plan_resolved_asset(&asset, "PAIR")
+        .await
+        .unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(targets.len(), 1);
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.asset_id.as_ref() == "OTHER")
+        );
+        for (version, pass_index) in [
+            (VersionSizeKey::Original, 0),
+            (VersionSizeKey::LiveOriginal, 1),
+        ] {
+            let task = tasks
+                .iter()
+                .find(|task| task.version_size == version)
+                .unwrap();
+            assert_eq!(sources[&RetryTaskKey::from(task)].pass_index, pass_index);
+        }
+        assert_eq!(db.get_pending().await.unwrap().len(), 3);
     }
 
     #[tokio::test]

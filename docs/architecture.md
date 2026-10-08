@@ -765,6 +765,48 @@ the catalog still records the previous source. Dry runs and filename listings
 do not commit choices. Recorded retry paths follow the same ownership checks. Explicit truncated-file repair can still use its own path
 when the existing fingerprint and repair authorization pass.
 
+Durable pending retries can record a destination in another directory after a
+recorded-path override. Only pending retry planning replays that exact choice
+when its library, asset, rendition, checksum, size and path ownership match and
+the destination is beneath the current download root without parent traversal.
+It preserves the root spelling and validates the saved destination key. Ordinary
+downloads and local reconciliation retain the requested-directory replay check.
+Retries stop planning another pass once every pending rendition for that asset
+is matched or safely adopted; outstanding companions still require planning.
+This does not migrate or discard reservations, alter selection completeness, or
+promote a pending path configuration with smart-folder selection.
+
+Cross-parent pending adoption requires an independently durable local SHA-256
+for the exact destination and current provider generation. It checks every saved
+alias before allowing a pass to use ordinary adoption. MMCS is a generation
+signature, not a local SHA-256; size and media headers cannot supply this proof.
+The file owner retains no-follow directory capabilities and the regular-file
+handle, revalidates identity and bytes before the immediate state write, and
+retains those capabilities through that write. Failed adoption writes retain
+debt and later attempts must reopen and reverify; no hash-only deferred adoption
+write is queued. Both ordinary and selection enumeration inspect all matching
+aliases before metadata actions, skip adoption, task adoption or touched-state
+promotion. A refusal holds that asset's debt while other enumerated assets may
+continue; it cannot enter the size-only fallback.
+
+Fresh downloads to an affected reserved pending destination retain the original
+publication inode and current-root no-follow namespace through immediate and
+bounded deferred finalization. Each attempt revalidates both identity and the
+publication fingerprint. Changes observed at revalidation retain the media and
+pending debt instead of committing stale verified provenance. Retained ownership
+and revalidation do not atomically exclude arbitrary Unix changes after the last
+validation while a database write awaits execution. Cleanup re-enumeration and
+collecting incremental dispatch preserve the affected task's proof requirement;
+cleanup also requires the original failed generation's checksum and size.
+Equivalent root spelling is rebased component-wise using platform ownership keys;
+this does not relax filesystem no-follow traversal or mutate the saved ledger.
+
+**Recovery limitation:** an existing cross-parent reserved file without a trusted
+matching local hash remains untouched and pending. This includes a crash after
+publication but before any durable receipt commits. These bytes cannot be
+automatically adopted, replaced or discarded; this slice does not fetch fresh
+provider bytes to establish an independent comparison.
+
 Download planning also loads current-content publication receipts from
 `asset_metadata_paths`. An additional album copy can satisfy a download only
 in that pass's destination and filename family. The planner rejects foreign

@@ -85,13 +85,22 @@ pub(super) fn log_interrupted_download(
     });
 }
 
+pub(super) type DownloadSingleResult = (
+    bool,
+    String,
+    Option<String>,
+    u64,
+    u64,
+    Option<Arc<crate::download::file::RetainedPendingFile>>,
+);
+
 pub(super) async fn download_single_task<C: crate::download::file::DownloadClient>(
     client: &C,
     task: &DownloadTask,
     retry_config: &RetryConfig,
     metadata_flags: MetadataFlags,
     context: DownloadSingleContext<'_>,
-) -> Result<(bool, String, Option<String>, u64, u64)> {
+) -> Result<DownloadSingleResult> {
     // A producer can commit retry state immediately before cancellation. Do not
     // start another HTTP request for its queued task while draining that batch.
     if context.shutdown_token.is_cancelled() {
@@ -147,7 +156,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
             .context("Could not record temporary-file ownership")?;
     }
 
-    let result: Result<(bool, String, Option<String>, u64, u64)> = async {
+    let result: Result<DownloadSingleResult> = async {
         let mut downloaded = Box::pin(crate::download::file::download_file_with_mode(
             client,
             &task.url,
@@ -158,7 +167,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
             crate::download::file::DownloadOpts {
                 skip_rename: needs_embed,
                 expected_size: if task.size > 0 { Some(task.size) } else { None },
-                publication: task.publication,
+                publication: task.publication(),
             },
             crate::download::file::DownloadLimits {
                 rate_limit_counter: context.rate_limit_counter,
@@ -214,7 +223,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
         }
 
         if part_path.is_some() {
-            downloaded.publish(&task.download_path, task.publication).await?;
+            downloaded.publish(&task.download_path, task.publication()).await?;
         }
 
         // Embed work already captured the original checksum. Otherwise take
@@ -267,12 +276,21 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
         // Future sidecar-only retries must not infer provenance from a local
         // checksum that may have been refreshed after an embedded rewrite.
         let download_checksum = Some(download_checksum.or(unmodified_checksum).unwrap_or_else(|| local_checksum.clone()));
+        let retained = match &task.pending_cross_parent_root {
+            Some(root) => Some(downloaded.retain_pending_publication(root.as_path(), &task.download_path).await?),
+            None => None,
+        };
+        if let Some(proof) = &retained {
+            anyhow::ensure!(data_encoding::HEXLOWER.encode(&proof.fingerprint.sha256) == local_checksum,
+                "Reserved pending publication changed after checksum capture");
+        }
         Ok((
             exif_ok,
             local_checksum,
             download_checksum,
             downloaded.bytes_written,
             disk_bytes,
+            retained,
         ))
     }
     .await;

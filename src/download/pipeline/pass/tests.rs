@@ -66,7 +66,8 @@ fn test_run_download_pass_skips_all_tasks_when_cancelled() {
                         DownloadTask {
                             url: "https://p01.icloud-content.com/a".into(),
                             download_path: dir.path().join("a.jpg"),
-                            publication: crate::download::file::FinalPublication::NoReplace,
+                            replacement_fingerprint: None,
+                            pending_cross_parent_root: None,
                             checksum: "aaa".into(),
                             created_local: chrono::Local::now().fixed_offset(),
                             size: 1000,
@@ -80,7 +81,8 @@ fn test_run_download_pass_skips_all_tasks_when_cancelled() {
                         DownloadTask {
                             url: "https://p01.icloud-content.com/b".into(),
                             download_path: dir.path().join("b.jpg"),
-                            publication: crate::download::file::FinalPublication::NoReplace,
+                            replacement_fingerprint: None,
+                            pending_cross_parent_root: None,
                             checksum: "bbb".into(),
                             created_local: chrono::Local::now().fixed_offset(),
                             size: 2000,
@@ -141,7 +143,8 @@ fn test_run_download_pass_processes_tasks_when_not_cancelled() {
                     let tasks = vec![DownloadTask {
                         url: "https://0.0.0.0:1/nonexistent".into(),
                         download_path: dir.path().join("c.jpg"),
-                        publication: crate::download::file::FinalPublication::NoReplace,
+                        replacement_fingerprint: None,
+                        pending_cross_parent_root: None,
                         checksum: "ccc".into(),
                         created_local: chrono::Local::now().fixed_offset(),
                         size: 500,
@@ -215,7 +218,8 @@ async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
     let task = DownloadTask {
         url: format!("{}/photo.jpg", server.uri()).into(),
         download_path: download_path.clone(),
-        publication: crate::download::file::FinalPublication::NoReplace,
+        replacement_fingerprint: None,
+        pending_cross_parent_root: None,
         checksum: checksum.into(),
         asset_id: "UNKNOWN_MEDIA".into(),
         asset_record_name: "UNKNOWN_MEDIA".into(),
@@ -303,7 +307,8 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
         .map(|i| DownloadTask {
             url: format!("{}/photo_{i}.jpg", server.uri()).into(),
             download_path: dir.path().join(format!("photo_{i}.jpg")),
-            publication: crate::download::file::FinalPublication::NoReplace,
+            replacement_fingerprint: None,
+            pending_cross_parent_root: None,
             checksum: checksum.clone().into(),
             asset_id: format!("CIRCUIT_{i}").into(),
             asset_record_name: format!("CIRCUIT_{i}").into(),
