@@ -192,7 +192,7 @@ fn check_link_count(
         let first_use = trust
             .paths
             .lock()
-            .map_err(|_| anyhow::anyhow!("Legacy hardlink trust tracker unavailable"))?
+            .map_err(|_poison| anyhow::anyhow!("Legacy hardlink trust tracker unavailable"))?
             .insert(path.to_path_buf());
         if first_use {
             tracing::debug!(
