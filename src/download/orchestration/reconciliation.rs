@@ -21,6 +21,9 @@ use super::url_refresh::RetryTaskKey;
 #[derive(Debug, Default)]
 pub(crate) struct PathReconciliationResult {
     pub(crate) complete: bool,
+    /// Local work is complete, but only a fresh smart-folder query can finish
+    /// selection reconciliation. This never authorizes promotion on its own.
+    pub(crate) complete_after_smart_query: bool,
     pub(crate) stats: SyncStats,
 }
 
@@ -64,6 +67,7 @@ pub(crate) async fn reconcile_catalog_paths(
         tracing::warn!(error = %format!("{error:#}"), "Could not recover replacements before path reconciliation; keeping catalogue paths and checkpoints unchanged");
         return Ok(PathReconciliationResult {
             complete: false,
+            complete_after_smart_query: false,
             stats: SyncStats {
                 failed: 1,
                 ..SyncStats::default()
@@ -97,6 +101,7 @@ pub(crate) async fn reconcile_catalog_paths(
     if records.is_empty() {
         return Ok(PathReconciliationResult {
             complete: true,
+            complete_after_smart_query: false,
             stats: SyncStats::default(),
         });
     }
@@ -110,6 +115,7 @@ pub(crate) async fn reconcile_catalog_paths(
             tracing::warn!(error = %format!("{error:#}"), "Could not recover recorded source; keeping catalogue paths and checkpoints unchanged");
             return Ok(PathReconciliationResult {
                 complete: false,
+                complete_after_smart_query: false,
                 stats: SyncStats {
                     failed: 1,
                     ..SyncStats::default()
@@ -292,6 +298,7 @@ pub(crate) async fn reconcile_catalog_paths(
                             tracing::warn!(%error, "Path reconciliation could not reserve planned paths");
                             return Ok(PathReconciliationResult {
                                 complete: false,
+                                complete_after_smart_query: false,
                                 stats,
                             });
                         }
@@ -390,6 +397,7 @@ pub(crate) async fn reconcile_catalog_paths(
         tracing::warn!(%error, "Could not persist reconciliation destinations before publication");
         return Ok(PathReconciliationResult {
             complete: false,
+            complete_after_smart_query: false,
             stats,
         });
     }
@@ -516,15 +524,19 @@ pub(crate) async fn reconcile_catalog_paths(
         }
     }
     stats.interrupted = shutdown_token.is_cancelled();
-    let complete = batch.complete
-        && selection_complete
+    let local_complete = batch.complete
+        && album_membership_complete
         && targets.is_empty()
         && !deferred_to_pending_retry
         && stats.failed == 0
         && stats.exif_failures == 0
         && stats.state_write_failures == 0
         && !stats.interrupted;
-    Ok(PathReconciliationResult { complete, stats })
+    Ok(PathReconciliationResult {
+        complete: local_complete && selection_complete,
+        complete_after_smart_query: local_complete && !selection_complete,
+        stats,
+    })
 }
 
 #[cfg(test)]

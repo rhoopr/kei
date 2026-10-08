@@ -682,6 +682,13 @@ pub(crate) async fn run_cycle(
     let mut enum_config_hash_outcome = EnumConfigHashOutcome::Unchanged;
     let mut pending_download_config_hash = None;
     let mut path_reconciliation_complete = true;
+    let path_reconciliation_has_smart_folders = library_states.iter().any(|state| {
+        state
+            .plan
+            .passes
+            .iter()
+            .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder)
+    });
     let mut checkpoint_hold_action: Option<&'static str> = None;
     let enum_config_hash = download::compute_config_hash(config);
 
@@ -937,6 +944,7 @@ pub(crate) async fn run_cycle(
             Arc::from(lib_state.zone_name.as_str()),
         );
         let download_client = shared_session.read().await.download_client().clone();
+        let mut path_reconciliation_requires_smart_query = false;
         if pending_download_config_hash.is_some() {
             let reconciliation = download::reconcile_catalog_paths(
                 &lib_state.plan.passes,
@@ -944,7 +952,13 @@ pub(crate) async fn run_cycle(
                 shutdown_token.clone(),
             )
             .await?;
-            path_reconciliation_complete = path_reconciliation_complete && reconciliation.complete;
+            path_reconciliation_requires_smart_query = lib_state
+                .plan
+                .passes
+                .iter()
+                .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
+            path_reconciliation_complete &=
+                reconciliation.complete || reconciliation.complete_after_smart_query;
             let reconciliation_failures = reconciliation
                 .stats
                 .failed
@@ -1137,6 +1151,25 @@ pub(crate) async fn run_cycle(
                 && !sync_result.checkpoint.interrupted
                 && sync_result.checkpoint.enumeration_errors == 0
                 && !shutdown_token.is_cancelled();
+        if path_reconciliation_requires_smart_query {
+            // Historical smart membership cannot complete local reconciliation.
+            // Only the current unbounded query plus durable successful work can
+            // discharge that dependency; source checkpoint policy stays separate.
+            path_reconciliation_complete &= library_completed_without_errors
+                && download_controls.run_mode.downloads_files()
+                && download_config.recent.is_none()
+                && download_config.skip_created_before.is_none()
+                && sync_result.full_enumeration_ran
+                && matches!(
+                    source_checkpoint_decision(
+                        &sync_result,
+                        config.runtime.dry_run,
+                        cycle_has_stale_plan,
+                        checkpoint_basis,
+                    ),
+                    SourceCheckpointDecision::Advance { .. }
+                );
+        }
         if should_warn_zero_assets(
             &sync_result,
             library_completed_without_errors,
@@ -1476,6 +1509,8 @@ pub(crate) async fn run_cycle(
     }
 
     if path_reconciliation_complete
+        && (!path_reconciliation_has_smart_folders
+            || (cycle_failed_count == 0 && db_sync_token_advance_safe && !cycle_has_stale_plan))
         && !cycle_session_expired
         && !shutdown_token.is_cancelled()
         && let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash)
