@@ -11,6 +11,23 @@ use super::{
 };
 
 #[test]
+fn legacy_preservation_allow_hardlinks_does_not_change_download_or_enumeration_hashes() {
+    let mut download = test_config();
+    assert!(!download.legacy_preservation_allow_hardlinks);
+    let ordinary = hash_download_config(&download);
+    let migration = hash_legacy_download_config(&download);
+    download.legacy_preservation_allow_hardlinks = true;
+    assert_eq!(hash_download_config(&download), ordinary);
+    assert_eq!(hash_legacy_download_config(&download), migration);
+
+    let temporary = TempDir::new().unwrap();
+    let mut runtime = build_config_with(temporary.path(), "/photos", |_| {});
+    let ordinary = compute_config_hash(&runtime);
+    runtime.download.legacy_preservation_allow_hardlinks = true;
+    assert_eq!(compute_config_hash(&runtime), ordinary);
+}
+
+#[test]
 fn test_hash_download_config_deterministic() {
     let config = test_config();
     let hash1 = hash_download_config(&config);

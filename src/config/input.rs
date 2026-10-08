@@ -77,6 +77,7 @@ pub(crate) struct TomlDownload {
     pub threads: Option<u16>,
     pub bandwidth_limit: Option<String>,
     pub temp_suffix: Option<String>,
+    pub legacy_preservation_allow_hardlinks: Option<bool>,
     pub retry: Option<TomlRetry>,
 }
 
@@ -235,6 +236,7 @@ mod tests {
             "download.threads",
             "download.bandwidth_limit",
             "download.temp_suffix",
+            "download.legacy_preservation_allow_hardlinks",
             "download.retry.per_transfer",
             "download.retry.per_asset",
             "filters.libraries",

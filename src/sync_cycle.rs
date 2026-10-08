@@ -748,7 +748,6 @@ pub(crate) async fn run_cycle(
         );
         let download_config_hash = download::hash_download_config(&probe_config);
         {
-            use sha2::{Digest, Sha256};
             let mut zones = library_states
                 .iter()
                 .map(|library| library.zone_name.clone())
@@ -772,9 +771,10 @@ pub(crate) async fn run_cycle(
                 config.runtime.repair_capture_timestamps,
                 config.runtime.repair_truncated
             ]);
-            preservation_config_hash = Some(
-                data_encoding::HEXLOWER.encode(&Sha256::digest(policy.to_string().as_bytes())),
-            );
+            preservation_config_hash = Some(hash_legacy_preservation_policy(
+                &policy,
+                probe_config.legacy_preservation_allow_hardlinks,
+            ));
         }
 
         let legacy_download_config_hash = download::hash_legacy_download_config(&probe_config);
@@ -1674,10 +1674,35 @@ where
     .mode
 }
 
+/// Keep strict-policy hashes byte-compatible with existing preservation proofs.
+/// The opt-in affects only legacy evidence qualification, not download provenance.
+pub(crate) fn hash_legacy_preservation_policy(
+    policy: &serde_json::Value,
+    allow_hardlinks: bool,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(policy.to_string().as_bytes());
+    if allow_hardlinks {
+        hash.update(b"\0legacy-preservation-allow-hardlinks:v1");
+    }
+    data_encoding::HEXLOWER.encode(&hash.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::PassKind;
+
+    #[test]
+    fn legacy_preservation_trust_hash_preserves_strict_compatibility() {
+        let policy = serde_json::json!([1, 1, "coverage", "None", false, false, false]);
+        // Historical SHA-256 of the exact serialized strict policy, independently computed.
+        let strict = "6f307ea388dd8281b2db2d31c9a8ba37f3c910027bbdb47e95c014477ddf358f";
+        assert_eq!(hash_legacy_preservation_policy(&policy, false), strict);
+        assert_ne!(hash_legacy_preservation_policy(&policy, true), strict);
+        assert_eq!(hash_legacy_preservation_policy(&policy, false), strict);
+    }
 
     fn make_library_state(has_passes: bool) -> LibraryState {
         LibraryState {

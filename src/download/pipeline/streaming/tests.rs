@@ -46,6 +46,7 @@ async fn test_producer_panic_propagates_as_error() {
         refresh_metadata: false,
         capture_timestamp_repair: crate::download::CaptureTimestampRepair::Preserve,
         repair_truncated: false,
+        legacy_preservation_allow_hardlinks: false,
         concurrent_downloads: 1,
         recent: None,
         recent_scope: crate::cli::RecentScope::Global,

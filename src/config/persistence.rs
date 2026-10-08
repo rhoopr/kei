@@ -68,6 +68,10 @@ impl Config {
                 } else {
                     Some(self.download.temp_suffix.clone())
                 },
+                legacy_preservation_allow_hardlinks: self
+                    .download
+                    .legacy_preservation_allow_hardlinks
+                    .then_some(true),
                 retry: Some(TomlRetry {
                     per_transfer: Some(self.retry.max_retries),
                     // Emit `per_asset` only when the user has
@@ -371,6 +375,7 @@ pub(crate) fn persist_first_run_config(
             threads: None,
             bandwidth_limit: None,
             temp_suffix: None,
+            legacy_preservation_allow_hardlinks: d.legacy_preservation_allow_hardlinks,
             retry: None,
         }),
         filters: None,
@@ -426,6 +431,57 @@ mod tests {
     use crate::config::runtime::{Config, MediaKind};
     use crate::config::test_support::{default_globals, default_password, default_sync};
     use std::path::PathBuf;
+
+    #[test]
+    fn legacy_preservation_allow_hardlinks_roundtrip_and_bootstrap() {
+        for enabled in [false, true] {
+            let toml: TomlConfig = toml::from_str(&format!(
+                "[download]\nlegacy_preservation_allow_hardlinks = {enabled}"
+            ))
+            .unwrap();
+            let cfg = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&toml),
+            )
+            .unwrap();
+            let persisted = cfg.to_toml();
+            assert_eq!(
+                persisted
+                    .download
+                    .as_ref()
+                    .unwrap()
+                    .legacy_preservation_allow_hardlinks,
+                enabled.then_some(true)
+            );
+            let serialized = toml::to_string(&persisted).unwrap();
+            let reparsed: TomlConfig = toml::from_str(&serialized).unwrap();
+            let rebuilt = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&reparsed),
+            )
+            .unwrap();
+            assert_eq!(
+                rebuilt.download.legacy_preservation_allow_hardlinks,
+                enabled
+            );
+
+            let (_directory, path) = persist_test_dir("legacy_hardlinks");
+            persist_first_run_config(&path, &cfg, None).unwrap();
+            let bootstrap: TomlConfig =
+                toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                bootstrap
+                    .download
+                    .unwrap()
+                    .legacy_preservation_allow_hardlinks,
+                enabled.then_some(true)
+            );
+        }
+    }
 
     #[test]
     fn test_to_toml_omits_default_max_download_attempts() {

@@ -453,6 +453,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             refresh_metadata: config.runtime.refresh_metadata,
             capture_timestamp_repair,
             repair_truncated: config.runtime.repair_truncated,
+            legacy_preservation_allow_hardlinks: config
+                .download
+                .legacy_preservation_allow_hardlinks,
             concurrent_downloads: config.download.threads_num as usize,
             recent: config.filters.recent,
             recent_scope: config.filters.recent_scope,
