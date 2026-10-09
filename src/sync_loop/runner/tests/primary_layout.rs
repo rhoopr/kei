@@ -2104,6 +2104,18 @@ async fn review501_legacy_changed_extensions_and_aliases_retire_after_revert() {
             }
             histories.push(path);
         }
+        let receipts =
+            crate::state::db::DownloadContextStateStore::get_primary_layout_receipts(&db)
+                .await
+                .unwrap();
+        for history in &histories {
+            assert!(
+                receipts.iter().any(|receipt| {
+                    receipt.local_path.as_ref() == Some(history) && receipt.is_preserved_history
+                }),
+                "preserved history must remain a reuse source, not a visible legacy alias"
+            );
+        }
         let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
         let inventory = (
             summary.bound_families,

@@ -596,6 +596,7 @@ impl SqliteStateDb {
                 let version_size: String = row.get(2)?;
                 let local_path: Option<String> = row.get(4)?;
                 Ok(DownloadedFileRecord {
+                    is_preserved_history: false,
                     is_current_path: true,
                     added_at: row
                         .get::<_, Option<f64>>(7)?
@@ -1479,6 +1480,7 @@ impl DownloadContextStateStore for SqliteStateDb {
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DownloadedFileRecord {
+                    is_preserved_history: false,
                     is_current_path: row.get(7)?,
                     added_at: row.get::<_, Option<f64>>(8)?.map(|date| decode_asset_date(date, 8)).transpose()?,
                     library: row.get(0)?,
@@ -1512,6 +1514,7 @@ impl DownloadContextStateStore for SqliteStateDb {
                 let version_size = VersionSizeKey::from_str(&file.version)
                     .ok_or(StateError::ProviderSelectionInvalid)?;
                 receipts.push(DownloadedFileRecord {
+                    is_preserved_history: true,
                     library: operation.library,
                     id: operation.child,
                     version_size,
@@ -1541,6 +1544,7 @@ impl DownloadContextStateStore for SqliteStateDb {
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DownloadedFileRecord {
+                    is_preserved_history: false,
                     is_current_path: row.get(7)?,
                     added_at: row.get::<_, Option<f64>>(8)?.map(|date| decode_asset_date(date, 8)).transpose()?,
                     library: row.get(0)?,

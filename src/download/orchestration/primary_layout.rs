@@ -30,13 +30,20 @@ pub(in crate::download) struct LayoutOutcome {
 pub(in crate::download) struct LayoutSession {
     receipts: rustc_hash::FxHashMap<(String, String), Vec<DownloadedFileRecord>>,
     owners: rustc_hash::FxHashMap<String, Vec<ReconciliationCatalogPath>>,
+    history_paths: rustc_hash::FxHashSet<String>,
     preview_claims: std::sync::Mutex<rustc_hash::FxHashSet<String>>,
 }
 impl LayoutSession {
     pub(in crate::download) async fn load(db: &dyn DownloadStore) -> Result<Self> {
         let mut receipts: rustc_hash::FxHashMap<(String, String), Vec<DownloadedFileRecord>> =
             rustc_hash::FxHashMap::default();
+        let mut history_paths = rustc_hash::FxHashSet::default();
         for record in db.get_primary_layout_receipts().await? {
+            if record.is_preserved_history
+                && let Some(path) = &record.local_path
+            {
+                history_paths.insert(path_key(path)?);
+            }
             receipts
                 .entry((record.library.clone(), record.id.clone()))
                 .or_default()
@@ -53,6 +60,7 @@ impl LayoutSession {
         Ok(Self {
             receipts,
             owners,
+            history_paths,
             preview_claims: Default::default(),
         })
     }
@@ -388,7 +396,10 @@ async fn plan(
             // selection nor the latest catalogue filename can census earlier
             // edits or extensions. Only this pass's parent is eligible; other
             // roots and private history remain retained reuse sources.
-            if path.parent() != Some(parent.as_path()) {
+            if record.is_preserved_history
+                || path.parent() != Some(parent.as_path())
+                || session.history_paths.contains(&path_key(path)?)
+            {
                 continue;
             }
             let Some(actual) = snapshot(&config.directory, path).await? else {

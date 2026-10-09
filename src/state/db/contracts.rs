@@ -42,6 +42,9 @@ pub struct ImportedRecord {
 #[derive(Debug)]
 pub(crate) struct DownloadedFileRecord {
     pub(crate) added_at: Option<DateTime<Utc>>,
+    /// Immutable preserved history is a reuse source, never a legacy alias
+    /// eligible for relocation or retirement, even if config targets its parent.
+    pub(crate) is_preserved_history: bool,
     /// This receipt is also the catalog's current path, not an additional copy.
     pub(crate) is_current_path: bool,
     pub(crate) library: String,
