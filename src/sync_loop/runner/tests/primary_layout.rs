@@ -2564,6 +2564,7 @@ async fn review501_explicit_metadata_refresh_uses_preserving_layout_owner() {
                 .is_empty()
         );
         if let Some(xmp) = &xmp {
+            #[cfg(feature = "xmp")]
             let fresh_xmp = std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap();
             #[cfg(feature = "xmp")]
             {
