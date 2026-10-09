@@ -1486,17 +1486,36 @@ evidence, not pending work, and remain part of the dependency comparison. No met
 that creates debt holds the cursor; a later cycle may qualify after configured
 current-child work completes.
 
-Original media and sidecars are fingerprinted through confined paths; links,
+Original media and sidecars are fingerprinted through confined paths. Symlinks,
 pending temporary writes, replacement journals, shared paths and changed bytes
-reject qualification. Preparation warnings retain the aggregate
+reject qualification. Multiple hard links also reject qualification by default. Preparation warnings retain the aggregate
 `invalid_original_files` candidate count and expose `shared_file_links` as a subset,
 counting each candidate once at its first rejected media or sidecar. Typed shared-link
 errors also expose only the fixed reason `shared_file_links` at certification and
-checkpoint stages. Original and current-child files retain the same independent-object
-requirement; a hash recheck does not authorize shared inode writes.
+checkpoint stages. The TOML-only `[download].legacy_preservation_allow_hardlinks`
+flag defaults to false. True waives only the hard-link-count check for original
+and current-child media and sidecars during legacy qualification and revalidation.
+Actual use emits one redacted aggregate warning per library cycle, deduplicated
+by evidence path; enabling the flag without linked evidence emits no warning.
+Other confined-path, byte, receipt, debt and checkpoint validation stays intact.
+Preparation, certification and checkpoint validation consume the same flag.
+Its value is bound into the separate legacy policy hash; ordinary download and
+enumeration hashes remain unchanged. False retains the previous legacy hash.
+
+The opt-in assumes external tools are coordinated so they do not change linked
+contents, metadata, or kei-managed names during the operation. It does not prove
+inode independence: distinct original and current paths can share an inode.
+It adds no account-wide alias census or read-only enforcement. Existing
+identical-file reuse can set timestamps through aliases even when metadata
+outputs are disabled. Metadata repair, timestamp repair, pending-file handling
+and replacement recovery remain unchanged. General hardlink support and stronger
+preservation guarantees remain open under #884.
+
 Shared-root replacement recovery checks protected paths from
 all libraries before opening a journal, including unselected libraries. Current child files and sidecar presence are also bound
-into the receipt. Original files are never moved, rewritten, adopted or deleted.
+into the receipt. The preservation owner never moves, rewrites, adopts or deletes
+original paths. With the hardlink opt-in, that path protection cannot prevent
+changes made through another alias by an unchanged write path.
 Normal downloads, metadata repair, local path reconciliation, imports and source
 tombstones respect the protection before byte writes; SQL guards provide defense
 in depth. `reconcile` reports drift in protected originals without converting

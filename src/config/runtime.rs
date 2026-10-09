@@ -82,6 +82,7 @@ pub struct DownloadSettings {
     pub folder_structure_smart_folders: String,
     pub filename_exclude: Vec<glob::Pattern>,
     pub temp_suffix: String,
+    pub legacy_preservation_allow_hardlinks: bool,
     pub threads_num: u16,
     pub bandwidth_limit: Option<u64>,
     pub no_progress_bar: bool,

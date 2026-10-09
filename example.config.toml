@@ -95,6 +95,14 @@ threads = 10
 # Description: Suffix for partial media downloads. Metadata writers use separate unique temporary names. Publication is guarded; suffix and age alone never authorize cleanup.
 temp_suffix = ".kei-tmp"
 
+# Option: download.legacy_preservation_allow_hardlinks
+# Default value: false
+# Valid values: true, false; TOML only
+# Description: Waives link-count refusal during legacy preservation qualification and revalidation for originals and current outputs, including sidecars. Other validation remains required.
+# Trust requirement: Coordinate external tools so they do not change linked contents, metadata, or kei-managed names during the operation. Distinct paths can share an inode.
+# Limitation: This is not a read-only mode. Existing identical-file reuse can set timestamps through aliases even with metadata output disabled; repair and recovery behavior is unchanged.
+legacy_preservation_allow_hardlinks = false
+
 [download.retry]
 # Option: download.retry.per_transfer
 # Default value: 3

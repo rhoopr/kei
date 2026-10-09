@@ -126,6 +126,19 @@ Metadata capture in the catalogue is automatic. Embedded metadata and XMP
 sidecars are opt-in. See [Metadata output](docs/metadata.md) for supported
 formats, safe refusals, and explicit timestamp repair.
 
+Legacy preservation normally refuses files with multiple hard links. The TOML-only
+`[download].legacy_preservation_allow_hardlinks = true` setting waives that
+link-count check for legacy originals and qualifying current outputs, including
+sidecars. When used, it emits one warning per library cycle with the number of
+distinct evidence paths whose shared-link check was waived. It assumes you coordinate external tools so they do not change linked
+contents, metadata, or kei-managed names during the operation.
+
+This setting does not make kei read-only: distinct original and current paths
+can share an inode, and existing identical-file reuse can set timestamps through
+aliases even when metadata output is disabled. Repair and recovery behavior is
+unchanged. Other preservation checks still apply. Broader hardlink support remains
+open in [#884](https://github.com/rhoopr/kei/issues/884).
+
 Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
 
 ## Docs

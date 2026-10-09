@@ -3,6 +3,7 @@
 //! and current family receipts. State rechecks dependencies in the cursor transaction.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use base64::Engine as _;
@@ -154,10 +155,60 @@ pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) 
     }
 }
 
+/// The opt-in trusts every alias of these qualified evidence paths. Counts
+/// describe paths, not physical files. Last-owner Drop also covers early exits
+/// and cancellation while an actual blocking check still owns the tracker.
+#[derive(Default)]
+struct HardlinkTrust {
+    paths: Mutex<FxHashSet<PathBuf>>,
+}
+
+impl Drop for HardlinkTrust {
+    fn drop(&mut self) {
+        let affected_paths = self
+            .paths
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        if affected_paths != 0 {
+            tracing::warn!(
+                affected_paths,
+                diagnostic = "legacy_preservation_hardlink_trust",
+                "Legacy preservation hardlink trust used in one library cycle; coordination of file contents, metadata and managed names is assumed"
+            );
+        }
+    }
+}
+
+fn check_link_count(
+    result: std::io::Result<u64>,
+    path: &Path,
+    trust: Option<&Arc<HardlinkTrust>>,
+) -> anyhow::Result<()> {
+    let links = result?;
+    anyhow::ensure!(links > 0, "Legacy preservation file has no live links");
+    if links > 1 {
+        let trust = trust.ok_or(LegacyFileError::SharedFileLinks)?;
+        let first_use = trust
+            .paths
+            .lock()
+            .map_err(|_poison| anyhow::anyhow!("Legacy hardlink trust tracker unavailable"))?
+            .insert(path.to_path_buf());
+        if first_use {
+            tracing::debug!(
+                link_count = links,
+                "Legacy preservation used explicit hardlink trust for a qualified evidence path"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub(crate) struct LegacyCycle {
     preserved: Vec<LegacyPreservation>,
     prepared_proofs: Vec<LegacyActivationProof>,
+    hardlink_trust: Option<Arc<HardlinkTrust>>,
 }
 
 impl LegacyCycle {
@@ -175,15 +226,27 @@ impl LegacyCycle {
         config_hash: &str,
         cancel: &CancellationToken,
     ) -> anyhow::Result<Self> {
+        let hardlink_trust = config
+            .legacy_preservation_allow_hardlinks
+            .then(|| Arc::new(HardlinkTrust::default()));
         let mut preserved = db.legacy_preservations(&config.library).await?;
         for record in &mut preserved {
             let dependencies = db
                 .legacy_dependency_evidence(&record.library, &record.asset_id)
                 .await?;
-            let files_valid = verify_files(&record.files, &config.temp_suffix, cancel).await;
+            let files_valid = verify_files(
+                &record.files,
+                &config.temp_suffix,
+                cancel,
+                hardlink_trust.as_ref(),
+            )
+            .await;
             let current_files_valid = if let Some(evidence) = &record.provider_evidence {
                 match provider_files(evidence) {
-                    Ok(files) => verify_files(&files, &config.temp_suffix, cancel).await,
+                    Ok(files) => {
+                        verify_files(&files, &config.temp_suffix, cancel, hardlink_trust.as_ref())
+                            .await
+                    }
                     Err(error) => Err(error),
                 }
             } else {
@@ -226,6 +289,7 @@ impl LegacyCycle {
                 return Ok(Self {
                     preserved,
                     prepared_proofs: Vec::new(),
+                    hardlink_trust,
                 });
             }
             let masters = candidates
@@ -260,6 +324,7 @@ impl LegacyCycle {
                                     required,
                                     &config.temp_suffix,
                                     cancel,
+                                    hardlink_trust.as_ref(),
                                 )
                                 .await
                                 {
@@ -316,6 +381,7 @@ impl LegacyCycle {
         Ok(Self {
             preserved,
             prepared_proofs: Vec::new(),
+            hardlink_trust,
         })
     }
 
@@ -350,11 +416,25 @@ impl LegacyCycle {
             .iter()
             .filter(|record| record.active_generation.is_none())
         {
-            verify_files(&record.files, &config.temp_suffix, cancel).await?;
+            verify_files(
+                &record.files,
+                &config.temp_suffix,
+                cancel,
+                self.hardlink_trust.as_ref(),
+            )
+            .await?;
             let before = db
                 .legacy_dependency_evidence(&record.library, &record.asset_id)
                 .await?;
-            let provider_evidence = qualify_family(db, config, record, &inventory, cancel).await?;
+            let provider_evidence = qualify_family(
+                db,
+                config,
+                record,
+                &inventory,
+                cancel,
+                self.hardlink_trust.as_ref(),
+            )
+            .await?;
             anyhow::ensure!(
                 before
                     == db
@@ -398,7 +478,13 @@ impl LegacyCycle {
     ) -> anyhow::Result<Vec<LegacyActivationProof>> {
         let mut proofs = Vec::new();
         for record in &self.preserved {
-            verify_files(&record.files, &config.temp_suffix, cancel).await?;
+            verify_files(
+                &record.files,
+                &config.temp_suffix,
+                cancel,
+                self.hardlink_trust.as_ref(),
+            )
+            .await?;
             let current = db
                 .legacy_dependency_evidence(&record.library, &record.asset_id)
                 .await?;
@@ -409,7 +495,13 @@ impl LegacyCycle {
                         .as_deref()
                         .context("Missing legacy current file evidence")?,
                 )?;
-                verify_files(&files, &config.temp_suffix, cancel).await?;
+                verify_files(
+                    &files,
+                    &config.temp_suffix,
+                    cancel,
+                    self.hardlink_trust.as_ref(),
+                )
+                .await?;
                 anyhow::ensure!(
                     record.dependency_evidence.as_deref() == Some(current.as_str()),
                     "Legacy current coverage changed"
@@ -429,6 +521,7 @@ impl LegacyCycle {
                     &provider_files(&proof.provider_evidence)?,
                     &config.temp_suffix,
                     cancel,
+                    self.hardlink_trust.as_ref(),
                 )
                 .await?;
                 proof.next_cursor = token.to_owned();
@@ -451,6 +544,7 @@ async fn fingerprint(
     required: bool,
     temp_suffix: &str,
     cancel: &CancellationToken,
+    hardlink_trust: Option<&Arc<HardlinkTrust>>,
 ) -> anyhow::Result<LegacyFileEvidence> {
     anyhow::ensure!(!cancel.is_cancelled(), "Legacy preservation cancelled");
     anyhow::ensure!(
@@ -460,6 +554,7 @@ async fn fingerprint(
     let root_owned = root.to_path_buf();
     let path_owned = path.to_path_buf();
     let suffix = temp_suffix.to_owned();
+    let hardlink_trust = hardlink_trust.cloned();
     let present = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let confined = crate::fs_util::ConfinedPath::open(
             &root_owned,
@@ -481,12 +576,11 @@ async fn fingerprint(
         }
         let file = confined.open_optional_regular()?;
         if let Some(file) = &file {
-            let links = crate::fs_util::file_link_count(file)?;
-            anyhow::ensure!(links <= 1, LegacyFileError::SharedFileLinks);
-            anyhow::ensure!(
-                links == 1,
-                "Legacy preservation requires independent file objects"
-            );
+            check_link_count(
+                crate::fs_util::file_link_count(file),
+                &path_owned,
+                hardlink_trust.as_ref(),
+            )?;
         }
         Ok(file.is_some())
     })
@@ -510,6 +604,7 @@ async fn verify_files(
     files: &[LegacyFileEvidence],
     temp_suffix: &str,
     cancel: &CancellationToken,
+    hardlink_trust: Option<&Arc<HardlinkTrust>>,
 ) -> anyhow::Result<()> {
     for expected in files {
         let actual = fingerprint(
@@ -518,6 +613,7 @@ async fn verify_files(
             expected.sha256.is_some(),
             temp_suffix,
             cancel,
+            hardlink_trust,
         )
         .await?;
         anyhow::ensure!(
@@ -534,6 +630,7 @@ async fn qualify_family(
     record: &LegacyPreservation,
     inventory: &CompleteLegacyInventory,
     cancel: &CancellationToken,
+    hardlink_trust: Option<&Arc<HardlinkTrust>>,
 ) -> anyhow::Result<String> {
     let children: Vec<_> = inventory
         .children
@@ -608,8 +705,15 @@ async fn qualify_family(
                     "Legacy current output has conflicting catalog ownership"
                 );
             }
-            let file =
-                fingerprint(&config.directory, path, true, &config.temp_suffix, cancel).await?;
+            let file = fingerprint(
+                &config.directory,
+                path,
+                true,
+                &config.temp_suffix,
+                cancel,
+                hardlink_trust,
+            )
+            .await?;
             anyhow::ensure!(
                 file.sha256 == receipt.local_checksum
                     && verified_current_content(
@@ -629,6 +733,7 @@ async fn qualify_family(
                 sidecar_required,
                 &config.temp_suffix,
                 cancel,
+                hardlink_trust,
             )
             .await?;
             anyhow::ensure!(
@@ -696,25 +801,35 @@ mod tests {
         let path = root.join("original.jpg");
         std::fs::write(&path, b"synthetic original").unwrap();
         let cancel = CancellationToken::new();
-        let media = fingerprint(root, &path, true, ".kei-tmp", &cancel)
+        let media = fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
             .await
             .unwrap();
-        let absent = fingerprint(root, &sidecar(&path), false, ".kei-tmp", &cancel)
+        let absent = fingerprint(root, &sidecar(&path), false, ".kei-tmp", &cancel, None)
             .await
             .unwrap();
         let files = vec![media, absent];
-        verify_files(&files, ".kei-tmp", &cancel).await.unwrap();
+        verify_files(&files, ".kei-tmp", &cancel, None)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"synthetic original");
         assert!(!sidecar(&path).exists());
         std::fs::write(sidecar(&path), b"new sidecar").unwrap();
-        assert!(verify_files(&files, ".kei-tmp", &cancel).await.is_err());
+        assert!(
+            verify_files(&files, ".kei-tmp", &cancel, None)
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read(sidecar(&path)).unwrap(), b"new sidecar");
         std::fs::write(&path, b"changed original").unwrap();
-        assert!(verify_files(&files, ".kei-tmp", &cancel).await.is_err());
+        assert!(
+            verify_files(&files, ".kei-tmp", &cancel, None)
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"changed original");
         cancel.cancel();
         assert!(
-            fingerprint(root, &path, true, ".kei-tmp", &cancel)
+            fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
                 .await
                 .is_err()
         );
@@ -730,7 +845,7 @@ mod tests {
         let linked = root.join("alias.jpg");
         std::fs::hard_link(&path, &linked).unwrap();
         assert!(
-            fingerprint(root, &path, true, ".kei-tmp", &cancel)
+            fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
                 .await
                 .is_err()
         );
@@ -739,7 +854,7 @@ mod tests {
         {
             std::os::unix::fs::symlink(&path, &linked).unwrap();
             assert!(
-                fingerprint(root, &linked, true, ".kei-tmp", &cancel)
+                fingerprint(root, &linked, true, ".kei-tmp", &cancel, None)
                     .await
                     .is_err()
             );
@@ -747,7 +862,7 @@ mod tests {
         let temporary = root.join("original.jpg.kei-tmp");
         std::fs::write(&temporary, b"pending").unwrap();
         assert!(
-            fingerprint(root, &path, true, ".kei-tmp", &cancel)
+            fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
                 .await
                 .is_err()
         );
@@ -768,12 +883,12 @@ mod tests {
         ] {
             let path = root.join(name);
             std::fs::write(&path, b"verified synthetic bytes").unwrap();
-            let evidence = fingerprint(root, &path, true, ".kei-tmp", &cancel)
+            let evidence = fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
                 .await
                 .unwrap();
             let alias = root.join(format!("{name}.alias"));
             std::fs::hard_link(&path, &alias).unwrap();
-            let error = verify_files(&[evidence], ".kei-tmp", &cancel)
+            let error = verify_files(&[evidence], ".kei-tmp", &cancel, None)
                 .await
                 .unwrap_err()
                 .context("private-provider-id/private-path");
@@ -947,5 +1062,326 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn preservation_hardlink_opt_in_checks_original_current_media_and_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cancel = CancellationToken::new();
+        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
+        let mut files = Vec::new();
+        for name in [
+            "original.jpg",
+            "original.jpg.xmp",
+            "current.jpg",
+            "current.jpg.xmp",
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, b"qualified bytes").unwrap();
+            let alias = root.join(format!("{name}.external-alias"));
+            std::fs::hard_link(&path, &alias).unwrap();
+            let error = fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                super::classify_legacy_file_error(&error),
+                Some("shared_file_links")
+            );
+            let evidence = fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
+                .await
+                .unwrap();
+            assert_eq!(evidence.size, Some(15));
+            assert!(evidence.sha256.is_some());
+            assert_eq!(std::fs::read(&path).unwrap(), b"qualified bytes");
+            assert_eq!(std::fs::read(&alias).unwrap(), b"qualified bytes");
+            files.push(evidence);
+        }
+        assert_eq!(trust.paths.lock().unwrap().len(), 4);
+        assert!(
+            verify_files(&files, ".kei-tmp", &cancel, None)
+                .await
+                .is_err()
+        );
+        verify_files(&files, ".kei-tmp", &cancel, Some(&trust))
+            .await
+            .unwrap();
+        verify_files(&files, ".kei-tmp", &cancel, Some(&trust))
+            .await
+            .unwrap();
+        assert_eq!(
+            trust.paths.lock().unwrap().len(),
+            4,
+            "reverification counts each evidence path once"
+        );
+        // Mutation through an external alias still fails the unchanged byte proof.
+        std::fs::write(root.join("current.jpg.external-alias"), b"changed bytes").unwrap();
+        assert!(
+            verify_files(&files, ".kei-tmp", &cancel, Some(&trust))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.join("current.jpg")).unwrap(),
+            b"changed bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.join("original.jpg")).unwrap(),
+            b"qualified bytes"
+        );
+    }
+
+    #[test]
+    fn preservation_hardlink_trust_requires_positive_successful_link_queries() {
+        let path = std::path::Path::new("/private-provider-id/private-path");
+        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
+        super::check_link_count(Ok(1), path, None).unwrap();
+        super::check_link_count(Ok(1), path, Some(&trust)).unwrap();
+        for enabled in [None, Some(&trust)] {
+            assert!(super::check_link_count(Ok(0), path, enabled).is_err());
+            let error = super::check_link_count(
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "private-provider-id/private-path",
+                )),
+                path,
+                enabled,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        assert!(
+            trust.paths.lock().unwrap().is_empty(),
+            "zero and unknown links are never waived"
+        );
+        let error = super::check_link_count(Ok(2), path, None).unwrap_err();
+        assert_eq!(
+            super::classify_legacy_file_error(&error),
+            Some("shared_file_links")
+        );
+        super::check_link_count(Ok(2), path, Some(&trust)).unwrap();
+        super::check_link_count(Ok(100), path, Some(&trust)).unwrap();
+        assert_eq!(trust.paths.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn preservation_hardlink_warning_is_actual_use_only_deduplicated_and_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("trust.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let unused = std::sync::Arc::new(super::HardlinkTrust::default());
+            super::check_link_count(Ok(1), std::path::Path::new("private-unused"), Some(&unused))
+                .unwrap();
+            drop(unused);
+            assert!(std::fs::read_to_string(&log).unwrap().is_empty());
+            let trust = std::sync::Arc::new(super::HardlinkTrust::default());
+            for path in [
+                "private-provider-id/original.jpg",
+                "private-provider-id/original.jpg",
+                "private-provider-id/current.jpg.xmp",
+            ] {
+                super::check_link_count(Ok(2), std::path::Path::new(path), Some(&trust)).unwrap();
+            }
+            let actual_worker_owner = std::sync::Arc::clone(&trust);
+            drop(trust);
+            assert!(
+                std::fs::read_to_string(&log).unwrap().is_empty(),
+                "actual worker ownership delays the aggregate"
+            );
+            drop(actual_worker_owner);
+        });
+        let output = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            output.matches("legacy_preservation_hardlink_trust").count(),
+            1
+        );
+        assert!(output.contains("affected_paths=2"));
+        assert!(output.contains("one library cycle"));
+        assert!(output.contains("contents, metadata and managed names"));
+        assert!(!output.contains("private"));
+        assert!(!output.contains(&dir.path().display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn preservation_hardlink_opt_in_keeps_hash_absence_temp_and_cancellation_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("original.jpg");
+        let alias = root.join("external-alias.jpg");
+        std::fs::write(&path, b"original bytes").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        let cancel = CancellationToken::new();
+        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
+        let media = fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
+            .await
+            .unwrap();
+        let missing_sidecar = fingerprint(
+            root,
+            &sidecar(&path),
+            false,
+            ".kei-tmp",
+            &cancel,
+            Some(&trust),
+        )
+        .await
+        .unwrap();
+        assert!(missing_sidecar.sha256.is_none());
+        assert!(
+            fingerprint(
+                root,
+                &root.join("missing.jpg"),
+                true,
+                ".kei-tmp",
+                &cancel,
+                Some(&trust)
+            )
+            .await
+            .is_err()
+        );
+        for suffix in [".kei-tmp", ".part"] {
+            let pending = root.join(format!("original.jpg{suffix}"));
+            std::fs::write(&pending, b"pending bytes").unwrap();
+            assert!(
+                fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&pending).unwrap(), b"pending bytes");
+            std::fs::remove_file(pending).unwrap();
+        }
+        verify_files(
+            &[media.clone(), missing_sidecar.clone()],
+            ".kei-tmp",
+            &cancel,
+            Some(&trust),
+        )
+        .await
+        .unwrap();
+        std::fs::write(sidecar(&path), b"new sidecar").unwrap();
+        assert!(
+            verify_files(&[missing_sidecar], ".kei-tmp", &cancel, Some(&trust))
+                .await
+                .is_err()
+        );
+        std::fs::write(&alias, b"changed through alias").unwrap();
+        assert!(
+            verify_files(&[media], ".kei-tmp", &cancel, Some(&trust))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed through alias");
+        cancel.cancel();
+        assert!(
+            fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preservation_hardlink_opt_in_keeps_symlink_special_and_parent_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("original.jpg");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let cancel = CancellationToken::new();
+        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
+        let leaf_alias = root.join("leaf-alias.jpg");
+        std::os::unix::fs::symlink(&path, &leaf_alias).unwrap();
+        assert!(
+            fingerprint(root, &leaf_alias, true, ".kei-tmp", &cancel, Some(&trust))
+                .await
+                .is_err()
+        );
+        std::os::unix::fs::symlink(&path, sidecar(&path)).unwrap();
+        assert!(
+            fingerprint(
+                root,
+                &sidecar(&path),
+                false,
+                ".kei-tmp",
+                &cancel,
+                Some(&trust)
+            )
+            .await
+            .is_err()
+        );
+        std::os::unix::fs::symlink(outside.path(), root.join("parent-alias")).unwrap();
+        std::fs::write(outside.path().join("original.jpg"), b"outside bytes").unwrap();
+        assert!(
+            fingerprint(
+                root,
+                &root.join("parent-alias/original.jpg"),
+                true,
+                ".kei-tmp",
+                &cancel,
+                Some(&trust)
+            )
+            .await
+            .is_err()
+        );
+        std::fs::create_dir(root.join("special.jpg")).unwrap();
+        assert!(
+            fingerprint(
+                root,
+                &root.join("special.jpg"),
+                true,
+                ".kei-tmp",
+                &cancel,
+                Some(&trust)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            trust.paths.lock().unwrap().is_empty(),
+            "unsafe entries never reach a trust waiver"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn preservation_hardlink_opt_in_keeps_replacement_journal_guard() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("original.jpg");
+        std::fs::write(&path, b"original bytes").unwrap();
+        std::fs::hard_link(&path, root.join("external-alias.jpg")).unwrap();
+        let cancel = CancellationToken::new();
+        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
+        // Existing production journal codec: .kei-replace- + SHA256(native leaf).
+        let digest =
+            data_encoding::HEXLOWER.encode(&Sha256::digest(path.file_name().unwrap().as_bytes()));
+        let journal = root.join(format!(".kei-replace-{digest}"));
+        std::fs::create_dir(&journal).unwrap();
+        assert!(
+            super::super::file::has_replacement_journal(root, &path)
+                .await
+                .unwrap()
+        );
+        assert!(
+            fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
+                .await
+                .is_err()
+        );
+        assert!(journal.is_dir());
+        assert!(
+            trust.paths.lock().unwrap().is_empty(),
+            "journal holds before a waiver is used"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
     }
 }

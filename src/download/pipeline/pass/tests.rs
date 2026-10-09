@@ -402,6 +402,7 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         refresh_metadata: false,
         capture_timestamp_repair: crate::download::CaptureTimestampRepair::Preserve,
         repair_truncated: false,
+        legacy_preservation_allow_hardlinks: false,
         concurrent_downloads: 10,
         recent: None,
         recent_scope: crate::cli::RecentScope::Global,

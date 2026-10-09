@@ -3633,7 +3633,28 @@ async fn exercise_ambiguous_child_cycles(fault: AmbiguousChildFault) {
     Box::pin(exercise_legacy_child_cycles(fault, &[2, 3])).await;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyHardlinkFault {
+    Quiet,
+    Disable,
+    DisableCurrentOnly,
+    OriginalBytes,
+    OriginalSidecarMissing,
+    OriginalTemp,
+    #[cfg(target_os = "linux")]
+    OriginalJournal,
+    CurrentMissing,
+}
+
 async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: &[usize]) {
+    exercise_legacy_child_cycles_with_hardlinks(fault, child_counts, None).await;
+}
+
+async fn exercise_legacy_child_cycles_with_hardlinks(
+    fault: AmbiguousChildFault,
+    child_counts: &[usize],
+    hardlink_fault: Option<LegacyHardlinkFault>,
+) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -3648,6 +3669,7 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
         omit_hidden: bool,
         incomplete_inventory: bool,
         inventory_requests: Arc<std::sync::atomic::AtomicUsize>,
+        quiet_token: &'static str,
     }
     #[async_trait::async_trait]
     impl crate::icloud::photos::PhotosSession for ChildSession {
@@ -3682,7 +3704,7 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                 && !self.bridge_debt
             {
                 return Ok(
-                    serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":[]}]}),
+                    serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":self.quiet_token,"moreComing":false,"records":[]}]}),
                 );
             }
             if url.contains("/changes/zone?") {
@@ -3834,8 +3856,18 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
             std::fs::write(&legacy_path, bytes).unwrap();
             std::fs::write(&legacy_xmp, b"legacy sidecar: never adopt or replace").unwrap();
             let external_alias = dir.path().join("importer-alias.jpg");
-            if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
+            if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal)
+                || hardlink_fault
+                    .is_some_and(|fault| fault != LegacyHardlinkFault::DisableCurrentOnly)
+            {
                 std::fs::hard_link(&legacy_path, &external_alias).unwrap();
+                if hardlink_fault.is_some() {
+                    std::fs::hard_link(
+                        &legacy_xmp,
+                        dir.path().join("importer-original-sidecar.xmp"),
+                    )
+                    .unwrap();
+                }
             }
             let legacy_motion = destination.join("photo.MOV");
             let legacy_motion_xmp = destination.join("photo.MOV.xmp");
@@ -3956,10 +3988,16 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
             let mut retry = rows(&database, retry_sql);
             let revision = rows(&database, revision_sql);
             let mappings = rows(&database, mapping_sql);
-            let config = make_run_cycle_config();
             let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
             let mut completed_requests = 0;
-            let mut completed_outputs = std::collections::HashMap::new();
+            let mut completed_outputs =
+                std::collections::HashMap::<std::path::PathBuf, Vec<u8>>::new();
+            let mut retained_proofs = Vec::new();
+            let mut retained_original = Vec::new();
+            let mut retained_paths = Vec::new();
+            let legacy_metadata_paths_sql =
+                "SELECT * FROM asset_metadata_paths WHERE id='legacy-master' ORDER BY local_path";
+            let legacy_metadata_paths = rows(&database, legacy_metadata_paths_sql);
             let inventory_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let relocating = matches!(
                 fault,
@@ -3967,6 +4005,94 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     | AmbiguousChildFault::PreserveInventoryRecovery
             );
             for cycle in 0..if relocating { 4 } else { 3 } {
+                let mut config = make_run_cycle_config();
+                let allow_hardlinks = hardlink_fault.is_some()
+                    && !(cycle >= 2
+                        && matches!(
+                            hardlink_fault,
+                            Some(
+                                LegacyHardlinkFault::Disable
+                                    | LegacyHardlinkFault::DisableCurrentOnly
+                            )
+                        ));
+                config.download.legacy_preservation_allow_hardlinks = allow_hardlinks;
+                let mut missing_current = None;
+                let mut current_aliases = std::collections::HashMap::new();
+                if cycle == 2
+                    && let Some(hardlink_fault) = hardlink_fault
+                {
+                    for (index, path) in completed_outputs.keys().enumerate() {
+                        let alias = dir.path().join(format!("importer-current-{index}"));
+                        std::fs::hard_link(path, &alias).unwrap();
+                        current_aliases.insert(alias, std::fs::read(path).unwrap());
+                    }
+                    match hardlink_fault {
+                        LegacyHardlinkFault::OriginalBytes => {
+                            let mut changed = bytes.to_vec();
+                            changed[15] ^= 1;
+                            std::fs::write(&legacy_path, changed).unwrap();
+                        }
+                        LegacyHardlinkFault::OriginalSidecarMissing => {
+                            std::fs::remove_file(&legacy_xmp).unwrap()
+                        }
+                        LegacyHardlinkFault::OriginalTemp => std::fs::write(
+                            legacy_path.with_file_name("photo.jpg.part"),
+                            b"pending legacy temporary",
+                        )
+                        .unwrap(),
+                        #[cfg(target_os = "linux")]
+                        LegacyHardlinkFault::OriginalJournal => {
+                            let digest =
+                                data_encoding::HEXLOWER.encode(&Sha256::digest(b"photo.jpg"));
+                            std::fs::create_dir(
+                                legacy_path.with_file_name(format!(".kei-replace-{digest}")),
+                            )
+                            .unwrap();
+                        }
+                        LegacyHardlinkFault::CurrentMissing => {
+                            let current_receipts = state::SqliteStateDb::open(&database)
+                                .await
+                                .unwrap()
+                                .get_downloaded_page(0, 20)
+                                .await
+                                .unwrap();
+                            let current = current_receipts
+                                .iter()
+                                .find(|row| {
+                                    row.id.as_ref() == names[0]
+                                        && row.version_size == state::VersionSizeKey::Original
+                                })
+                                .expect("persisted current child media receipt")
+                                .local_path
+                                .as_ref()
+                                .expect("current child media receipt path");
+                            assert!(
+                                completed_outputs.contains_key(current),
+                                "missing-current fault must target a previously verified output"
+                            );
+                            std::fs::remove_file(current).unwrap();
+                            assert!(!current.exists(), "current receipt path must be absent");
+                            missing_current = Some(current.clone());
+                            // A normal Full pass can repair missing Current evidence
+                            // before recertification. Refuse that repair here so the
+                            // actual checkpoint boundary must retain the missing-file hold.
+                            server.reset().await;
+                            Mock::given(method("GET"))
+                                .and(path("/child.jpg"))
+                                .respond_with(ResponseTemplate::new(404))
+                                .mount(&server)
+                                .await;
+                        }
+                        _ => {}
+                    }
+                }
+                let original_before = hardlink_fault.map(|_| {
+                    (
+                        std::fs::read(&legacy_path).unwrap(),
+                        std::fs::read(&legacy_xmp).ok(),
+                    )
+                });
+                let requests_before = server.received_requests().await.unwrap().len();
                 let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
                 let cancel = CancellationToken::new();
                 let db: Arc<dyn download::DownloadStore> = if cycle == 0
@@ -4006,6 +4132,11 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     ) || (cycle == 0
                         && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery)),
                     inventory_requests: Arc::clone(&inventory_requests),
+                    quiet_token: if hardlink_fault.is_some() && cycle >= 2 {
+                        "later"
+                    } else {
+                        "after"
+                    },
                 };
                 let mut primary = make_run_cycle_library_state_with_album(
                     "PrimarySync",
@@ -4030,6 +4161,7 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                 );
                 let builder = |mode, excluded, groups, library| {
                     let mut built = base_builder(mode, excluded, groups, library);
+                    Arc::make_mut(&mut built).legacy_preservation_allow_hardlinks = allow_hardlinks;
                     if relocating && cycle >= 2 {
                         let current = Arc::make_mut(&mut built);
                         current.folder_structure = "relocated".into();
@@ -4038,6 +4170,51 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     }
                     built
                 };
+                if hardlink_fault.is_some() {
+                    let probe = builder(
+                        download::SyncMode::Full,
+                        Arc::new(rustc_hash::FxHashSet::default()),
+                        Arc::new(download::AssetGroupings::default()),
+                        Arc::from("PrimarySync"),
+                    );
+                    let policy = serde_json::json!([
+                        1,
+                        state::METADATA_CAPTURE_REVISION,
+                        download::sync_coverage_fingerprint_json(
+                            &config,
+                            "icloud",
+                            1,
+                            &["PrimarySync".to_owned()],
+                            &download::compute_config_hash(&config),
+                            &download::hash_download_config(&probe)
+                        )
+                        .unwrap(),
+                        format!("{:?}", probe.metadata),
+                        config.runtime.refresh_metadata,
+                        config.runtime.repair_capture_timestamps,
+                        config.runtime.repair_truncated
+                    ]);
+                    let trusted_hash =
+                        crate::sync_cycle::hash_legacy_preservation_policy(&policy, true);
+                    let strict_hash =
+                        crate::sync_cycle::hash_legacy_preservation_policy(&policy, false);
+                    assert_ne!(
+                        trusted_hash, strict_hash,
+                        "trust flag must qualify a separate legacy proof policy"
+                    );
+                    if cycle == 2 {
+                        let hashes = rows(
+                            &database,
+                            "SELECT config_hash FROM unattributed_legacy_proofs",
+                        );
+                        if !hashes.is_empty() {
+                            assert!(
+                                hashes.iter().all(|row| row[0]
+                                    == rusqlite::types::Value::Text(trusted_hash.clone()))
+                            );
+                        }
+                    }
+                }
                 let warning_path = dir.path().join(format!("cycle-{cycle}.log"));
                 let subscriber = tracing_subscriber::fmt()
                     .with_ansi(false)
@@ -4059,8 +4236,142 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                     &cancel,
                 )
                 .with_subscriber(subscriber)
-                .await
-                .unwrap();
+                .await;
+                if cycle >= 2
+                    && hardlink_fault.is_some_and(|fault| fault != LegacyHardlinkFault::Quiet)
+                {
+                    if let Ok(result) = &result {
+                        assert!(
+                            result.stats.sync_token_blocked,
+                            "trust fault must retain the checkpoint: {hardlink_fault:?}"
+                        );
+                        assert_eq!(
+                            result.stats.downloaded, 0,
+                            "held qualification must not publish new outputs"
+                        );
+                    }
+                    if matches!(
+                        hardlink_fault,
+                        Some(
+                            LegacyHardlinkFault::Disable | LegacyHardlinkFault::DisableCurrentOnly
+                        )
+                    ) {
+                        assert_eq!(
+                            inner.legacy_preservations("PrimarySync").await.unwrap()[0]
+                                .active_generation,
+                            None,
+                            "disabling trust must deactivate the formerly trusted proof"
+                        );
+                    }
+                    assert_eq!(
+                        inner
+                            .get_metadata("sync_token:PrimarySync")
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("after")
+                    );
+                    assert_eq!(rows(&database, receipt_sql), receipt);
+                    assert_eq!(rows(&database, retry_sql), retry);
+                    assert_eq!(rows(&database, revision_sql), revision);
+                    assert_eq!(rows(&database, mapping_sql), mappings);
+                    assert_eq!(
+                        rows(&database, legacy_metadata_paths_sql),
+                        legacy_metadata_paths
+                    );
+                    assert_eq!(
+                        rows(
+                            &database,
+                            "SELECT evidence_version,original_evidence,files,prepared_at FROM unattributed_legacy"
+                        ),
+                        retained_original
+                    );
+                    assert_eq!(
+                        rows(
+                            &database,
+                            "SELECT * FROM unattributed_legacy_paths ORDER BY path_key"
+                        ),
+                        retained_paths
+                    );
+                    let proofs = rows(
+                        &database,
+                        "SELECT * FROM unattributed_legacy_proofs ORDER BY generation",
+                    );
+                    assert!(
+                        retained_proofs.iter().all(|proof| proofs.contains(proof)),
+                        "old proof history must survive failed active revalidation"
+                    );
+                    let (original, sidecar) = original_before.unwrap();
+                    assert_eq!(std::fs::read(&legacy_path).unwrap(), original);
+                    assert_eq!(std::fs::read(&legacy_xmp).ok(), sidecar);
+                    if let Some(path) = &missing_current {
+                        assert!(
+                            !path.exists(),
+                            "failed repair must leave Current media absent"
+                        );
+                        assert!(
+                            server.received_requests().await.unwrap().len() > requests_before,
+                            "missing Current must exercise the rejected provider repair"
+                        );
+                        assert_eq!(
+                            proofs, retained_proofs,
+                            "missing evidence must not mint a proof"
+                        );
+                        assert_eq!(
+                            inner.legacy_preservations("PrimarySync").await.unwrap()[0]
+                                .active_generation,
+                            None,
+                            "missing Current evidence must invalidate the old active proof"
+                        );
+                    } else {
+                        assert_eq!(
+                            server.received_requests().await.unwrap().len(),
+                            requests_before,
+                            "qualification fault must hold before a new transfer"
+                        );
+                    }
+                    for (alias, expected) in &current_aliases {
+                        assert_eq!(
+                            &std::fs::read(alias).unwrap(),
+                            expected,
+                            "external Current alias bytes must remain intact"
+                        );
+                    }
+                    assert!(
+                        inner
+                            .get_legacy_master_state_owners()
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    continue;
+                }
+                let result = result.unwrap();
+                if hardlink_fault.is_some() {
+                    assert_eq!(
+                        rows(&database, legacy_metadata_paths_sql),
+                        legacy_metadata_paths
+                    );
+                    let (original, sidecar) = original_before.unwrap();
+                    assert_eq!(std::fs::read(&legacy_path).unwrap(), original);
+                    assert_eq!(std::fs::read(&legacy_xmp).ok(), sidecar);
+                    let proofs = rows(
+                        &database,
+                        "SELECT * FROM unattributed_legacy_proofs ORDER BY generation",
+                    );
+                    assert!(retained_proofs.iter().all(|proof| proofs.contains(proof)));
+                    if cycle == 1 {
+                        retained_proofs = proofs;
+                        retained_original = rows(
+                            &database,
+                            "SELECT evidence_version,original_evidence,files,prepared_at FROM unattributed_legacy",
+                        );
+                        retained_paths = rows(
+                            &database,
+                            "SELECT * FROM unattributed_legacy_paths ORDER BY path_key",
+                        );
+                    }
+                }
                 if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
                     let log = std::fs::read_to_string(&warning_path).unwrap();
                     let warning = log
@@ -4179,7 +4490,15 @@ async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: 
                         .await
                         .unwrap()
                         .as_deref(),
-                    Some(if activated { "after" } else { "before" }),
+                    Some(if activated {
+                        if hardlink_fault.is_some() && cycle >= 2 {
+                            "later"
+                        } else {
+                            "after"
+                        }
+                    } else {
+                        "before"
+                    }),
                     "checkpoint {label}: {:?}",
                     result.stats
                 );
@@ -4630,6 +4949,60 @@ async fn run_cycle_single_survivor_shared_original_keeps_hold() {
     Box::pin(exercise_legacy_child_cycles(
         AmbiguousChildFault::PreserveSharedOriginal,
         &[1],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_hardlink_opt_in_original_and_current_qualify_after_reopen() {
+    Box::pin(exercise_legacy_child_cycles_with_hardlinks(
+        AmbiguousChildFault::Preserve,
+        &[1],
+        Some(LegacyHardlinkFault::Quiet),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_hardlink_opt_in_disable_revalidates_original_and_current_only() {
+    for fault in [
+        LegacyHardlinkFault::Disable,
+        LegacyHardlinkFault::DisableCurrentOnly,
+    ] {
+        Box::pin(exercise_legacy_child_cycles_with_hardlinks(
+            AmbiguousChildFault::Preserve,
+            &[1],
+            Some(fault),
+        ))
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_hardlink_opt_in_keeps_byte_sidecar_and_pending_write_holds() {
+    for fault in [
+        LegacyHardlinkFault::OriginalBytes,
+        LegacyHardlinkFault::OriginalSidecarMissing,
+        LegacyHardlinkFault::OriginalTemp,
+        #[cfg(target_os = "linux")]
+        LegacyHardlinkFault::OriginalJournal,
+        LegacyHardlinkFault::CurrentMissing,
+    ] {
+        Box::pin(exercise_legacy_child_cycles_with_hardlinks(
+            AmbiguousChildFault::Preserve,
+            &[1],
+            Some(fault),
+        ))
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_hardlink_opt_in_incomplete_inventory_still_holds() {
+    Box::pin(exercise_legacy_child_cycles_with_hardlinks(
+        AmbiguousChildFault::PreserveIncompleteInventory,
+        &[1],
+        Some(LegacyHardlinkFault::Quiet),
     ))
     .await;
 }

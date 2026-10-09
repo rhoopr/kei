@@ -462,6 +462,7 @@ pub(crate) struct DownloadConfig {
     pub(crate) refresh_metadata: bool,
     pub(crate) capture_timestamp_repair: CaptureTimestampRepair,
     pub(crate) repair_truncated: bool,
+    pub(crate) legacy_preservation_allow_hardlinks: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
     pub(crate) recent_scope: crate::cli::RecentScope,
@@ -625,6 +626,10 @@ impl std::fmt::Debug for DownloadConfig {
             .field("refresh_metadata", &self.refresh_metadata)
             .field("capture_timestamp_repair", &self.capture_timestamp_repair)
             .field("repair_truncated", &self.repair_truncated)
+            .field(
+                "legacy_preservation_allow_hardlinks",
+                &self.legacy_preservation_allow_hardlinks,
+            )
             .field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
             .field("recent_scope", &self.recent_scope)
@@ -675,6 +680,7 @@ impl DownloadConfig {
             refresh_metadata: false,
             capture_timestamp_repair: CaptureTimestampRepair::Preserve,
             repair_truncated: false,
+            legacy_preservation_allow_hardlinks: false,
             concurrent_downloads: 1,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,

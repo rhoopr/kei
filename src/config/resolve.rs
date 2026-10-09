@@ -864,6 +864,9 @@ impl Config {
                 folder_structure_smart_folders,
                 filename_exclude,
                 temp_suffix,
+                legacy_preservation_allow_hardlinks: toml_dl
+                    .and_then(|download| download.legacy_preservation_allow_hardlinks)
+                    .unwrap_or(false),
                 threads_num,
                 bandwidth_limit,
                 no_progress_bar,
@@ -967,6 +970,33 @@ mod tests {
     };
     use chrono::NaiveDate;
     use std::path::PathBuf;
+
+    #[test]
+    fn legacy_preservation_allow_hardlinks_defaults_false_and_resolves_toml() {
+        for (input, expected) in [
+            ("", false),
+            ("legacy_preservation_allow_hardlinks = false", false),
+            ("legacy_preservation_allow_hardlinks = true", true),
+        ] {
+            let toml: TomlConfig = toml::from_str(&format!("[download]\n{input}")).unwrap();
+            let cfg = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&toml),
+            )
+            .unwrap();
+            assert_eq!(cfg.download.legacy_preservation_allow_hardlinks, expected);
+        }
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert!(!cfg.download.legacy_preservation_allow_hardlinks);
+    }
 
     #[test]
     fn test_build_defaults_no_toml() {
