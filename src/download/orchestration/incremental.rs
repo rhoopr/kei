@@ -368,6 +368,18 @@ async fn apply_changed_provider_metadata(
     let Some(db) = &config.state_db else {
         return;
     };
+    match super::primary_layout::owns_metadata(asset, config).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            summary.state_transition_failures += 1;
+            summary
+                .token_unsafe_reason
+                .get_or_insert(PROVIDER_METADATA_STATE_WRITE_FAILED_REASON);
+            tracing::warn!(%error, "Could not resolve managed metadata ownership for delta");
+            return;
+        }
+    }
     let library = asset.source_zone().unwrap_or(&config.library);
     let capture = filter::metadata_capture(asset);
     if !download_ctx.has_provider_metadata_drift(library, asset.state_id(), &capture) {

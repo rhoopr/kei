@@ -307,6 +307,21 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
                         let asset = asset
                             .clone()
                             .with_state_record_name(Arc::from(state_id.as_str()));
+                        // Establish this pass's grouping evidence before the
+                        // layout commits matching selected metadata. Adding it
+                        // afterward would queue an ordinary writer into the
+                        // just-committed managed slot.
+                        if let Err(error) = planner::record_album_membership_if_named(
+                            db.as_ref(),
+                            &effective,
+                            &asset,
+                        )
+                        .await
+                        {
+                            stats.failed += 1;
+                            tracing::warn!(%error, "Managed reconciliation could not persist album membership");
+                            continue;
+                        }
                         match super::primary_layout::process_asset(
                             client,
                             asset,

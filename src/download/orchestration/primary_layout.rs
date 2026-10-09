@@ -225,6 +225,28 @@ async fn confirm(asset: &PhotoAsset, config: &DownloadConfig) -> Result<PhotoAss
     Ok(confirmed.asset.with_state_record_name(asset.state_id_arc()))
 }
 
+/// The ordinary whole-asset metadata refresher must not create obligations
+/// for slots whose selected-resource metadata is owned by the layout journal.
+pub(in crate::download) async fn owns_metadata(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+) -> Result<bool> {
+    if !config.primary_layout_active || filter::is_asset_filtered(asset, config).is_some() {
+        return Ok(false);
+    }
+    if config.edited_naming == EditedNaming::Primary {
+        return Ok(true);
+    }
+    let db = config
+        .state_db
+        .as_deref()
+        .context("Managed layout requires a database")?;
+    Ok(db
+        .primary_layout_binding(family(asset, config)?)
+        .await?
+        .is_some())
+}
+
 /// Returns None for an ordinary suffix family that has never been managed.
 pub(in crate::download) async fn process_asset(
     client: &reqwest::Client,
@@ -858,16 +880,21 @@ async fn prepare(
                     continue;
                 };
                 if data_encoding::HEXLOWER.encode(&actual.sha256) == *checksum {
-                    found = Some(
-                        file_receipt(
-                            &config.directory,
-                            path,
-                            record.version_size.as_str(),
-                            &receipt.checksum,
-                            receipt.download_checksum.clone(),
-                        )
-                        .await?,
+                    #[cfg(test)]
+                    crate::test_helpers::primary_source_snapshot_point(path).await?;
+                    let candidate = file_receipt(
+                        &config.directory,
+                        path,
+                        record.version_size.as_str(),
+                        &receipt.checksum,
+                        receipt.download_checksum.clone(),
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        candidate.fingerprint == actual,
+                        "Retained primary source changed while proving its receipt"
                     );
+                    found = Some(candidate);
                     break;
                 }
             }

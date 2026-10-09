@@ -1563,16 +1563,47 @@ async fn primary_layout_stale_writers_and_downloaded_receipts_cannot_finalize_cu
     );
 }
 
+// Source metadata retries read valid JPEG structure; truncated marker bytes
+// are suitable for byte-only transitions but cannot qualify sidecar migration.
+const VALID_ORIGINAL: &[u8] = include_bytes!("../../../../tests/data/media/metadata.jpg");
+const VALID_EDIT: &[u8] = include_bytes!("../../../../tests/data/media/pattern.jpg");
+fn records_with_original(
+    server: &MockServer,
+    original: &[u8],
+    edit: Option<(&str, &[u8])>,
+) -> Vec<Value> {
+    let mut result = records(server, edit);
+    result[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(original.len());
+    result[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(provider_hash(original));
+    result
+}
+async fn server_with_media(original: &[u8], edit_one: &[u8], edit_two: &[u8]) -> MockServer {
+    let server = MockServer::start().await;
+    for (name, bytes) in [
+        ("original", original),
+        ("edit-one", edit_one),
+        ("edit-two", edit_two),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&server)
+            .await;
+    }
+    server
+}
+
 // Regression cases supplied by the independent review of c202d07, extended
 // with exact sidecar and catalogue oracles and two quiet reopened cycles.
 #[tokio::test]
 async fn review501_legacy_original_survives_adjusted_only_migration_as_archive() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     #[cfg(feature = "xmp")]
     let sidecar_modes = [false, true];
     #[cfg(not(feature = "xmp"))]
     let sidecar_modes = [false];
     for sidecar in sidecar_modes {
-        let server = server().await;
+        let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
         let root = tempfile::tempdir().unwrap();
         let media = root.path().join("media");
         let options = |resolution| CycleOptions {
@@ -1583,17 +1614,17 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
         };
         let (initial, _) = cycle_options(
             root.path(),
-            records(&server, None),
+            records_with_original(&server, VALID_ORIGINAL, None),
             false,
             EditedNaming::Suffix,
             options(crate::types::PhotoResolution::Original),
         )
         .await;
         assert_eq!(initial.failed_count, 0);
-        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
         let original_sidecar =
             sidecar.then(|| std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap());
-        let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+        let edited = records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
         let (migrated, _) = cycle_options(
             root.path(),
             edited.clone(),
@@ -1603,13 +1634,20 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
         )
         .await;
         assert_eq!(
-            migrated.failed_count, 0,
-            "sidecar={sidecar}: {:?}",
-            migrated.stats
+            migrated.failed_count,
+            0,
+            "sidecar={sidecar}: {:?}; events {:?}",
+            migrated.stats,
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::WARN
+                    || event.level == tracing::Level::ERROR)
+                .collect::<Vec<_>>()
         );
         assert!(migrated.db_sync_token_advance_safe);
-        assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
-        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
+        assert_bytes(&media.join("IMG_0501_original.JPG"), VALID_ORIGINAL);
         if let Some(expected) = &original_sidecar {
             assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), expected);
         }
@@ -1618,7 +1656,7 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
             "SELECT checksum,local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'",
             [], |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
-        assert_eq!(checksum, provider_hash(ORIGINAL));
+        assert_eq!(checksum, provider_hash(VALID_ORIGINAL));
         assert_eq!(
             std::path::PathBuf::from(local_path),
             media.join("IMG_0501_original.JPG")
@@ -1653,8 +1691,8 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
             assert!(quiet.db_sync_token_advance_safe);
             assert_eq!(quiet.stats.downloaded, 0);
             assert_eq!(lookups, 0);
-            assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
-            assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+            assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
+            assert_bytes(&media.join("IMG_0501_original.JPG"), VALID_ORIGINAL);
             if let Some(expected) = &original_sidecar {
                 assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), expected);
             }
@@ -1663,17 +1701,43 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
                 requests.len()
             );
         }
+        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(
+            db.get_pending_metadata_rewrites(100)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an archive must not re-enter the ordinary writer queue"
+        );
+        // Prepared repair evidence must remain visible to source-deletion
+        // guards even when the original is archived and unselected.
+        let archive = media.join("IMG_0501_original.JPG");
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        conn.execute("UPDATE assets SET capture_repair_metadata_hash='synthetic-prepared-repair',capture_repair_output_checksum=?1,capture_repair_output_size=?2 WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'", rusqlite::params![data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_ORIGINAL)), VALID_ORIGINAL.len()]).unwrap();
+        conn.execute("UPDATE asset_metadata_paths SET capture_repair_metadata_hash='synthetic-prepared-repair',capture_repair_output_checksum=?1,capture_repair_output_size=?2 WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?3", rusqlite::params![data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_ORIGINAL)), VALID_ORIGINAL.len(),archive.to_str().unwrap()]).unwrap();
+        drop(conn);
+        assert!(
+            db.mark_master_family_soft_deleted("PrimarySync", "501", None)
+                .await
+                .is_err(),
+            "archival hid prepared capture-repair debt from source deletion"
+        );
+        assert_bytes(&archive, VALID_ORIGINAL);
+        assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
     }
 }
 
 #[tokio::test]
 async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     #[cfg(feature = "xmp")]
     let sidecar_modes = [false, true];
     #[cfg(not(feature = "xmp"))]
     let sidecar_modes = [false];
     for sidecar in sidecar_modes {
-        let server = server().await;
+        let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
         let root = tempfile::tempdir().unwrap();
         let media = root.path().join("media");
         let options = || CycleOptions {
@@ -1683,18 +1747,18 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
         };
         let (initial, _) = cycle_options(
             root.path(),
-            records(&server, Some(("edit-one", EDIT_ONE))),
+            records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT))),
             false,
             EditedNaming::Suffix,
             options(),
         )
         .await;
         assert_eq!(initial.failed_count, 0);
-        assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_ONE);
+        assert_bytes(&media.join("IMG_0501_edited.JPG"), VALID_EDIT);
         let edited_sidecar =
             sidecar.then(|| std::fs::read(media.join("IMG_0501_edited.JPG.xmp")).unwrap());
         let requests = server.received_requests().await.unwrap().len();
-        let current = records(&server, None);
+        let current = records_with_original(&server, VALID_ORIGINAL, None);
         let (migrated, _) = cycle_options(
             root.path(),
             current.clone(),
@@ -1704,12 +1768,19 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
         )
         .await;
         assert_eq!(
-            migrated.failed_count, 0,
-            "sidecar={sidecar}: {:?}",
-            migrated.stats
+            migrated.failed_count,
+            0,
+            "sidecar={sidecar}: {:?}; events {:?}",
+            migrated.stats,
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::WARN
+                    || event.level == tracing::Level::ERROR)
+                .collect::<Vec<_>>()
         );
         assert!(migrated.db_sync_token_advance_safe);
-        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
         assert!(!media.join("IMG_0501_edited.JPG").exists());
         assert!(!media.join("IMG_0501_edited.JPG.xmp").exists());
         let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
@@ -1719,7 +1790,7 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
         let history = manifest
             .iter()
             .flat_map(|row| &row.preserved_files)
-            .find(|receipt| std::fs::read(receipt.native_path.to_path()).unwrap() == EDIT_ONE)
+            .find(|receipt| std::fs::read(receipt.native_path.to_path()).unwrap() == VALID_EDIT)
             .expect("reverted edit has no independently preserved history receipt");
         let path = history.native_path.to_path();
         assert!(
@@ -1728,10 +1799,10 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
                 .components()
                 .any(|part| part.as_os_str() == ".kei-history")
         );
-        assert_eq!(history.provider_checksum, provider_hash(EDIT_ONE));
+        assert_eq!(history.provider_checksum, provider_hash(VALID_EDIT));
         assert_eq!(
             history.local_checksum,
-            data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE))
+            data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_EDIT))
         );
         if let Some(expected) = &edited_sidecar {
             let mut xmp = path.as_os_str().to_os_string();
@@ -1767,8 +1838,8 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
             assert!(quiet.db_sync_token_advance_safe);
             assert_eq!(quiet.stats.downloaded, 0);
             assert_eq!(lookups, 0);
-            assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-            assert_bytes(&path, EDIT_ONE);
+            assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
+            assert_bytes(&path, VALID_EDIT);
             if let Some(expected) = &edited_sidecar {
                 let mut xmp = path.as_os_str().to_os_string();
                 xmp.push(".xmp");
@@ -1795,6 +1866,7 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
 
 #[tokio::test]
 async fn review501_started_old_root_finishes_before_new_root_commits() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     for (directory, template) in [("new-root", ""), ("media", "new-template")] {
         for naming in [EditedNaming::Primary, EditedNaming::Suffix] {
             let server = server().await;
@@ -1897,8 +1969,21 @@ async fn review501_started_old_root_finishes_before_new_root_commits() {
                         .iter()
                         .filter(|request| request.url.path() == endpoint)
                         .count(),
-                    1,
-                    "recorded recovery redownloaded bytes: {endpoint}"
+                    // A different suffix family follows ordinary naming and
+                    // downloads its selected original; it does not adopt the
+                    // former family's managed _original archive as a suffix alias.
+                    if naming == EditedNaming::Suffix && endpoint == "/original" {
+                        2
+                    } else {
+                        1
+                    },
+                    "unexpected GET count: {endpoint}, {directory}/{template}, {naming:?}; events {:?}",
+                    capture
+                        .events()
+                        .into_iter()
+                        .filter(|event| event.level == tracing::Level::WARN
+                            || event.level == tracing::Level::ERROR)
+                        .collect::<Vec<_>>()
                 );
             }
         }
@@ -2161,6 +2246,107 @@ async fn review501_legacy_changed_extensions_and_aliases_retire_after_revert() {
                 ),
                 inventory
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn review501_retained_source_mutation_between_snapshots_holds_publication() {
+    for replace_inode in [false, true] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("media/IMG_0501.JPG");
+        for edit in [("edit-one", EDIT_ONE), ("edit-two", EDIT_TWO)] {
+            let (result, _) = cycle(
+                root.path(),
+                records(&server, Some(edit)),
+                false,
+                EditedNaming::Primary,
+            )
+            .await;
+            assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+            assert!(result.db_sync_token_advance_safe);
+        }
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let manifest = db.get_manifest_assets().await.unwrap();
+        let history = manifest
+            .iter()
+            .flat_map(|row| &row.preserved_files)
+            .find(|file| file.provider_checksum == provider_hash(EDIT_ONE))
+            .expect("edit-one history missing")
+            .native_path
+            .to_path();
+        drop(db);
+        assert_bytes(&history, EDIT_ONE);
+        let changed = b"unrelated local bytes introduced between source snapshots";
+        let hook = crate::test_helpers::primary_source_mutation(
+            history.clone(),
+            changed.to_vec(),
+            replace_inode,
+        );
+        let requests = server.received_requests().await.unwrap().len();
+        let (held, _) = cycle(
+            root.path(),
+            records(&server, Some(("edit-one", EDIT_ONE))),
+            false,
+            EditedNaming::Primary,
+        )
+        .await;
+        assert!(
+            hook.fired(),
+            "the deterministic proof boundary was not exercised"
+        );
+        assert!(!held.db_sync_token_advance_safe);
+        assert!(held.failed_count > 0, "{:?}", held.stats);
+        assert_bytes(&history, changed);
+        assert_bytes(&current, EDIT_TWO);
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let local: String = conn.query_row("SELECT local_checksum FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'", [], |row| row.get(0)).unwrap();
+        assert_ne!(
+            local,
+            data_encoding::HEXLOWER.encode(&Sha256::digest(changed))
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='committed'"
+            ),
+            2
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')"
+            ),
+            1
+        );
+        drop(conn);
+        // Restore only the synthetic fixture's known history bytes. The held
+        // journal must then converge without changing provider identity or GETs.
+        std::fs::write(&history, EDIT_ONE).unwrap();
+        for quiet in [false, true, true] {
+            let (result, _) = cycle(
+                root.path(),
+                records(&server, Some(("edit-one", EDIT_ONE))),
+                quiet,
+                EditedNaming::Primary,
+            )
+            .await;
+            assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+            assert!(result.db_sync_token_advance_safe);
+            assert_bytes(&current, EDIT_ONE);
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+            let (checksum, local, path): (String, String, String) = conn.query_row("SELECT checksum,local_checksum,local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+            assert_eq!(checksum, provider_hash(EDIT_ONE));
+            assert_eq!(
+                local,
+                data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE))
+            );
+            assert_eq!(std::path::PathBuf::from(path), current);
         }
     }
 }
