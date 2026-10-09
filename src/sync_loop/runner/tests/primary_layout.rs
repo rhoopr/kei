@@ -150,6 +150,7 @@ struct CycleOptions {
     pass_kind: PassKind,
     resolution: crate::types::PhotoResolution,
     private: bool,
+    #[cfg(feature = "xmp")]
     sidecar: bool,
     controls: download::DownloadControls,
     mov_policy: crate::types::LivePhotoMovFilenamePolicy,
@@ -164,6 +165,7 @@ impl Default for CycleOptions {
             pass_kind: PassKind::Unfiled,
             resolution: crate::types::PhotoResolution::Original,
             private: false,
+            #[cfg(feature = "xmp")]
             sidecar: false,
             controls: download::DownloadControls::download_hidden(),
             mov_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
@@ -254,7 +256,10 @@ async fn cycle_options(
         config.edited = true;
         config.edited_naming = naming;
         config.resolution = resolution;
-        config.metadata.xmp_sidecar = options.sidecar;
+        #[cfg(feature = "xmp")]
+        {
+            config.metadata.xmp_sidecar = options.sidecar;
+        }
         config.live_photo_mov_filename_policy = options.mov_policy;
         config.live_photo_mode = options.live_mode;
         config.folder_structure = options.folder_structure.to_owned();
@@ -270,7 +275,10 @@ async fn cycle_options(
     config.photos.edited = true;
     config.photos.edited_naming = naming;
     config.photos.resolution = resolution;
-    config.metadata.xmp_sidecar = options.sidecar;
+    #[cfg(feature = "xmp")]
+    {
+        config.metadata.xmp_sidecar = options.sidecar;
+    }
     config.photos.live_photo_mov_filename_policy = options.mov_policy;
     config.photos.live_photo_mode = options.live_mode;
     let (_session_root, session) = make_shared_session_for_run_cycle().await;

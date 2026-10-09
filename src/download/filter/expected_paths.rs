@@ -850,7 +850,16 @@ fn apply_primary_naming(
         // role. This preserves literal provider names ending in _edited/_original.
         let base = if key == VersionSizeKey::LiveOriginal || key == VersionSizeKey::LiveAdjusted {
             let base = usable_asset_base_filename(asset, ctx);
-            live_photo_motion_filename_for_primary(&base, config)
+            let base = live_photo_motion_filename_for_primary(&base, config);
+            let version = ctx.versions.get(if key == VersionSizeKey::LiveAdjusted {
+                AssetVersionSize::LiveAdjusted
+            } else {
+                AssetVersionSize::LiveOriginal
+            });
+            let Some(version) = version else {
+                continue;
+            };
+            mapped_version_filename(asset.state_id(), &base, &version.asset_type)
         } else {
             let version = ctx.versions.get(match key {
                 VersionSizeKey::Adjusted => AssetVersionSize::Adjusted,
@@ -991,6 +1000,178 @@ mod tests {
                             && task.checksum == path.checksum)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn primary_layout_preserves_selection_keys_checksums_urls_sizes_and_metadata() {
+        let asset = TestPhotoAsset::new("SELECTION_501")
+            .filename("IMG.JPG")
+            .adjusted_version(
+                "https://p01.icloud-content.com/edit",
+                "edited-checksum",
+                1200,
+                "public.jpeg",
+            )
+            .alt_version(
+                "https://p01.icloud-content.com/raw",
+                "raw-checksum",
+                2000,
+                "com.adobe.raw-image",
+            )
+            .live_photo("https://p01.icloud-content.com/live", "live-checksum", 3000)
+            .live_adjusted(
+                "https://p01.icloud-content.com/live-edit",
+                "live-edit-checksum",
+                4000,
+            )
+            .build();
+        for resolution in [
+            crate::types::PhotoResolution::Original,
+            crate::types::PhotoResolution::Medium,
+            crate::types::PhotoResolution::Thumb,
+            crate::types::PhotoResolution::None,
+        ] {
+            for force in [false, true] {
+                for raw in [RawPolicy::AsIs, RawPolicy::PreferRaw, RawPolicy::PreferJpeg] {
+                    for live in [
+                        LivePhotoMode::Both,
+                        LivePhotoMode::VideoOnly,
+                        LivePhotoMode::ImageOnly,
+                        LivePhotoMode::Skip,
+                    ] {
+                        for alternative in [false, true] {
+                            for matching in [
+                                FileMatchPolicy::NameId7,
+                                FileMatchPolicy::NameSizeDedupWithSuffix,
+                            ] {
+                                let mut config = test_config();
+                                config.edited = true;
+                                config.resolution = resolution;
+                                config.force_resolution = force;
+                                config.raw_policy = raw;
+                                config.live_photo_mode = live;
+                                config.alternative = alternative;
+                                config.file_match_policy = matching;
+                                let suffix = super::derive_expected_paths(&asset, &config);
+                                config.edited_naming = crate::types::EditedNaming::Primary;
+                                let primary = super::derive_expected_paths(&asset, &config);
+                                let selection = |paths: &[super::DerivedPath]| {
+                                    paths
+                                        .iter()
+                                        .map(|path| {
+                                            (
+                                                path.version_size,
+                                                path.checksum.to_string(),
+                                                path.url.to_string(),
+                                                path.size,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                };
+                                assert_eq!(
+                                    selection(&primary),
+                                    selection(&suffix),
+                                    "{resolution:?}/{force}/{raw:?}/{live:?}/{alternative}/{matching:?}"
+                                );
+                                for path in &primary {
+                                    if path.naming_role == super::NamingRole::OriginalArchive {
+                                        assert!(
+                                            path.filename
+                                                .rsplit_once('.')
+                                                .unwrap()
+                                                .0
+                                                .ends_with("_original")
+                                        );
+                                    }
+                                    let primary_metadata =
+                                        crate::download::filter::metadata_for_selected_version(
+                                            &asset,
+                                            &config,
+                                            path.version_size,
+                                        );
+                                    let mut legacy = config.clone();
+                                    legacy.edited_naming = crate::types::EditedNaming::Suffix;
+                                    let legacy_metadata =
+                                        crate::download::filter::metadata_for_selected_version(
+                                            &asset,
+                                            &legacy,
+                                            path.version_size,
+                                        );
+                                    assert_eq!(
+                                        primary_metadata.compute_hash(),
+                                        legacy_metadata.compute_hash()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let same_url = TestPhotoAsset::new("DEDUP_501")
+            .adjusted_version(
+                "https://p01.icloud-content.com/orig",
+                "abc123",
+                1000,
+                "public.jpeg",
+            )
+            .build();
+        let mut config = test_config();
+        config.edited = true;
+        config.edited_naming = crate::types::EditedNaming::Primary;
+        let paths = super::derive_expected_paths(&same_url, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert_eq!(paths[0].naming_role, super::NamingRole::Current);
+        assert!(!paths[0].filename.contains("_original"));
+    }
+
+    #[test]
+    fn primary_layout_motion_uses_selected_provider_extension() {
+        let resource = |url: &str, checksum: &str| serde_json::json!({"value":{"size":100,"downloadURL":url,"fileChecksum":checksum}});
+        let master = serde_json::json!({"recordName":"MOTION_UTI_501","fields":{
+            "filenameEnc":{"type":"STRING","value":"IMG.HEIC"},
+            "itemType":{"value":"public.heic"},
+            "resOriginalRes":resource("https://p01.icloud-content.com/original","original"),
+            "resOriginalFileType":{"value":"public.heic"},
+            "resJPEGFullRes":resource("https://p01.icloud-content.com/adjusted","adjusted"),
+            "resJPEGFullFileType":{"value":"public.jpeg"},
+            "resOriginalVidComplRes":resource("https://p01.icloud-content.com/original-motion","original-motion"),
+            "resOriginalVidComplFileType":{"value":"com.apple.quicktime-movie"},
+            "resVidComplRes":resource("https://p01.icloud-content.com/adjusted-motion","adjusted-motion"),
+            "resVidComplFileType":{"value":"public.jpeg"}
+        }});
+        let asset =
+            crate::icloud::photos::PhotoAsset::new(master, serde_json::json!({"fields":{}}));
+        let mut config = test_config();
+        config.edited = true;
+        config.edited_naming = crate::types::EditedNaming::Primary;
+        for (policy, expected) in [
+            (LivePhotoMovFilenamePolicy::Suffix, "IMG_HEVC.JPG"),
+            (LivePhotoMovFilenamePolicy::Original, "IMG.JPG"),
+        ] {
+            config.live_photo_mov_filename_policy = policy;
+            let paths = expected_paths_for(&asset, &config);
+            let motion = paths
+                .iter()
+                .find(|path| path.version_size == VersionSizeKey::LiveAdjusted)
+                .unwrap();
+            assert_eq!(motion.path.file_name().unwrap(), expected);
+            assert_eq!(motion.checksum.as_ref(), "adjusted-motion");
+            let original = paths
+                .iter()
+                .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+                .unwrap();
+            assert!(
+                original
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .ends_with("_original.MOV")
+            );
         }
     }
 
