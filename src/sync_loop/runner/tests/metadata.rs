@@ -3641,6 +3641,7 @@ enum LegacyHardlinkFault {
     OriginalBytes,
     OriginalSidecarMissing,
     OriginalTemp,
+    #[cfg(target_os = "linux")]
     OriginalJournal,
     CurrentMissing,
 }
@@ -4039,6 +4040,7 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                             b"pending legacy temporary",
                         )
                         .unwrap(),
+                        #[cfg(target_os = "linux")]
                         LegacyHardlinkFault::OriginalJournal => {
                             let digest =
                                 data_encoding::HEXLOWER.encode(&Sha256::digest(b"photo.jpg"));
@@ -4976,13 +4978,13 @@ async fn run_cycle_legacy_hardlink_opt_in_disable_revalidates_original_and_curre
     }
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn run_cycle_legacy_hardlink_opt_in_keeps_byte_sidecar_and_pending_write_holds() {
     for fault in [
         LegacyHardlinkFault::OriginalBytes,
         LegacyHardlinkFault::OriginalSidecarMissing,
         LegacyHardlinkFault::OriginalTemp,
+        #[cfg(target_os = "linux")]
         LegacyHardlinkFault::OriginalJournal,
         LegacyHardlinkFault::CurrentMissing,
     ] {
