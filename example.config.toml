@@ -208,6 +208,12 @@ live_photo_mov_filename_policy = "suffix"
 # Description: Also downloads adjusted or edited stills and videos when Apple provides them.
 edited = false
 
+# Option: photos.edited_naming
+# Default value: suffix
+# Valid values: suffix, primary
+# Description: primary requires edited=true; preserves owned originals and edit history before managing the ordinary filename. See docs/edited-primary.md.
+edited_naming = "suffix"
+
 # Option: photos.alternative
 # Default value: false
 # Valid values: true, false

@@ -945,8 +945,9 @@ pub(crate) async fn run_cycle(
         );
         let download_client = shared_session.read().await.download_client().clone();
         let mut path_reconciliation_requires_smart_query = false;
-        if pending_download_config_hash.is_some() {
-            let reconciliation = download::reconcile_catalog_paths(
+        if pending_download_config_hash.is_some() && download_controls.run_mode.downloads_files() {
+            let reconciliation = download::reconcile_catalog_paths_with_client(
+                &download_client,
                 &lib_state.plan.passes,
                 Arc::clone(&download_config),
                 shutdown_token.clone(),

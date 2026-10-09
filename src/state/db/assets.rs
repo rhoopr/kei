@@ -1467,6 +1467,36 @@ impl DownloadContextStateStore for SqliteStateDb {
         SqliteStateDb::get_downloaded_file_records(self).await
     }
 
+    async fn get_primary_layout_receipts(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
+        self.with_conn("get_primary_layout_receipts", |conn| {
+            let mut statement = conn.prepare_cached(
+                "SELECT p.library, p.id, p.version_size, p.provider_checksum, p.local_path, \
+                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path), a.added_at \
+                 FROM asset_metadata_paths p JOIN assets a \
+                   ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
+                 WHERE a.is_deleted = 0 \
+                 ORDER BY (p.local_path IS a.local_path) DESC, p.local_path",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(DownloadedFileRecord {
+                    is_current_path: row.get(7)?,
+                    added_at: row.get::<_, Option<f64>>(8)?.map(|date| decode_asset_date(date, 8)).transpose()?,
+                    library: row.get(0)?,
+                    id: row.get(1)?,
+                    version_size: VersionSizeKey::from_str(&row.get::<_, String>(2)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    checksum: row.get(3)?,
+                    local_path: Some(PathBuf::from(row.get::<_, String>(4)?)),
+                    local_checksum: row.get(5)?,
+                    download_checksum: row.get(6)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StateError::from)
+        })
+        .await
+    }
+
     async fn get_downloaded_path_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
         self.with_conn("get_downloaded_path_records", |conn| {
             let mut statement = conn.prepare_cached(

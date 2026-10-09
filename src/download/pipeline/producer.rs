@@ -211,6 +211,12 @@ pub(super) struct StreamProducerMetrics {
     pub(super) provider_auth_errors: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) state_write_failures: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) enumeration_complete: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) layout_downloaded: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) layout_photos: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) layout_videos: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) layout_recap: Arc<std::sync::Mutex<crate::download::recap::RunRecap>>,
+    pub(super) layout_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) layout_disk_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub(super) struct StreamProducer {
@@ -219,6 +225,7 @@ pub(super) struct StreamProducer {
 }
 
 pub(super) fn spawn_stream_download_producer<S>(
+    client: reqwest::Client,
     combined: S,
     download_ctx: Arc<DownloadContext>,
     task_tx: mpsc::Sender<DownloadTask>,
@@ -240,6 +247,12 @@ where
     let provider_auth_errors = Arc::clone(&metrics.provider_auth_errors);
     let state_write_failures_producer = Arc::clone(&metrics.state_write_failures);
     let enumeration_complete_producer = Arc::clone(&metrics.enumeration_complete);
+    let layout_downloaded = Arc::clone(&metrics.layout_downloaded);
+    let layout_photos = Arc::clone(&metrics.layout_photos);
+    let layout_videos = Arc::clone(&metrics.layout_videos);
+    let layout_recap = Arc::clone(&metrics.layout_recap);
+    let layout_bytes = Arc::clone(&metrics.layout_bytes);
+    let layout_disk_bytes = Arc::clone(&metrics.layout_disk_bytes);
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -661,6 +674,62 @@ where
                             }
                         }
                     };
+                    if let Some(session) = task_planner.managed_layout_session() {
+                        match crate::download::orchestration::primary_layout::process_asset(
+                            &client,
+                            asset.clone(),
+                            config,
+                            &session,
+                            &producer_shutdown,
+                        )
+                        .await
+                        {
+                            Ok(Some((_asset, outcome))) => {
+                                layout_downloaded.fetch_add(
+                                    outcome.downloaded,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                layout_photos.fetch_add(
+                                    outcome.photos_downloaded,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                layout_videos.fetch_add(
+                                    outcome.videos_downloaded,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if let Ok(mut recap) = layout_recap.lock() {
+                                    for downloaded in outcome.downloaded_assets {
+                                        recap.observe(config.pass_label(), downloaded);
+                                    }
+                                }
+                                layout_bytes.fetch_add(
+                                    outcome.network_bytes,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                layout_disk_bytes.fetch_add(
+                                    outcome.disk_bytes,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if outcome.downloaded == 0 {
+                                    skips.on_disk += 1;
+                                }
+                            }
+                            Ok(None) => {
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if let Some(run) = &config.selection_run {
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                tracing::error!(%error,"Primary layout remains pending; checkpoint held");
+                            }
+                        }
+                        producer_pb.inc(1);
+                        continue 'assets;
+                    }
                     if let Some(db) = &producer_state_db
                         && let Err(error) = task_planner
                             .persist_download_reservations(db.as_ref(), &plan.tasks)

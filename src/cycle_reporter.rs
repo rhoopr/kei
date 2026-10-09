@@ -317,13 +317,22 @@ where
             return;
         };
         let (failed_assets, failed_assets_truncated) = self.failed_asset_sample().await;
+        let mut stats = input.stats.clone();
+        if let Some(db) = self.state_db {
+            match db.get_summary().await {
+                Ok(summary) => stats.primary_layout = summary.primary_layout,
+                Err(error) => {
+                    tracing::warn!(%error,"Failed to fetch managed-primary inventory for report")
+                }
+            }
+        }
         let report = report::SyncReport {
             version: "3",
             kei_version: env!("CARGO_PKG_VERSION"),
             timestamp: chrono::Utc::now().to_rfc3339(),
             status: input.status.as_report_str().to_string(),
             options: self.run_options.clone(),
-            stats: input.stats.clone(),
+            stats,
             failed_assets,
             failed_assets_truncated,
         };

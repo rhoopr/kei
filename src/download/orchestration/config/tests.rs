@@ -973,3 +973,27 @@ fn enumeration_hash_binds_recent_scope_only_when_the_count_is_active() {
         compute_config_hash(&disabled_per_filter)
     );
 }
+
+#[test]
+fn primary_layout_policy_preserves_legacy_suffix_hash_and_provider_cursor_safety() {
+    let mut config = DownloadConfig::test_default();
+    config.directory = Arc::from(std::path::Path::new("/photos"));
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    // Independently encoded baseline v3 vector: its bytes precede #501.
+    assert_eq!(hash_download_config(&config), "940dc54a52395669");
+    config.edited_naming = crate::types::EditedNaming::Primary;
+    assert_ne!(hash_download_config(&config), "940dc54a52395669");
+    let temporary = TempDir::new().unwrap();
+    let mut runtime = build_config_with(temporary.path(), "/photos", |_| {});
+    runtime.photos.edited = true;
+    let enumeration = compute_config_hash(&runtime);
+    runtime.photos.edited_naming = crate::types::EditedNaming::Primary;
+    assert_eq!(
+        compute_config_hash(&runtime),
+        enumeration,
+        "naming alone must retain provider cursor safety"
+    );
+}

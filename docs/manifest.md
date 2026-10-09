@@ -66,3 +66,5 @@ Columns:
 ```text
 library,asset_id,version,filename,local_path,checksum,local_checksum,download_checksum,size_bytes,created_at,added_at,downloaded_at,last_seen_at,media_type,status,albums
 ```
+
+Managed edited-primary archives add an optional `preserved_files` array to each rendition's JSON row. It identifies independently preserved earlier provider checksums and exact local media/sidecar hashes using lossless native path encoding, family and operation identifiers, previous generation and journal phase. An old adjusted row whose primary path was handed over has a null `local_path`; its retained bytes are addressed by these receipts. CSV includes a JSON-valued `preserved_files` column only when at least one row has preserved receipts. Default suffix archives keep the existing JSON and sixteen-column CSV shape.

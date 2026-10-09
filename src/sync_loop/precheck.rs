@@ -119,7 +119,11 @@ pub(super) async fn include_pending_local_work(
                 true
             }
         };
-        if capture_pending || rewrite_pending || identity_pending {
+        let layout_pending = db
+            .primary_layout_operations(zone.to_owned())
+            .await
+            .map_or(true, |rows| !rows.is_empty());
+        if capture_pending || rewrite_pending || identity_pending || layout_pending {
             local_work_zones.insert(library.zone_name.clone());
         }
     }

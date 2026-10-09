@@ -132,6 +132,7 @@ pub(crate) struct TomlPhotos {
     pub live_photo_mode: Option<LivePhotoMode>,
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
     pub edited: Option<bool>,
+    pub edited_naming: Option<crate::types::EditedNaming>,
     pub alternative: Option<bool>,
     pub raw_policy: Option<RawPolicy>,
     pub file_match_policy: Option<FileMatchPolicy>,

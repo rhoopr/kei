@@ -23,6 +23,58 @@ pub(in crate::download) enum PublishResult {
     DestinationExists,
 }
 
+/// A retirement move must consume the source atomically. Link publication is
+/// deliberately unavailable because later unlink would race a foreign writer.
+pub(in crate::download) fn move_layout_confined(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        renameat2_confined_blocking(source, destination, libc::RENAME_NOREPLACE)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        rename_confined_macos(source, destination, libc::RENAME_EXCL)
+    }
+    #[cfg(windows)]
+    {
+        move_file_no_replace_blocking(source.path(), destination.path())
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Conditional alias retirement is unsupported on this platform",
+        ))
+    }
+}
+
+/// Exchange only entries in the retained, no-follow parent capabilities.
+/// Linux unsupported exchange is reported to the conditional replacement
+/// owner, which retains these capabilities through its journal fallback.
+#[cfg(unix)]
+pub(in crate::download) fn exchange_layout_confined(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        renameat2_confined_blocking(source, destination, libc::RENAME_EXCHANGE)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        rename_confined_macos(source, destination, libc::RENAME_SWAP)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Confined primary layout exchange is unsupported on this platform",
+        ))
+    }
+}
+
 pub(in crate::download) fn publish_reconciliation_part_blocking(
     part: &ConfinedPath,
     destination: &ConfinedPath,

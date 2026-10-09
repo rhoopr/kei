@@ -1383,6 +1383,14 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl MetadataRewriteStore for SqliteStateDb {
+    async fn guard_primary_writer(&self, path: &Path) -> Result<(), StateError> {
+        let path = path.to_owned();
+        self.with_conn("guard_primary_writer", move |conn| {
+            super::primary_layout::guard_writer(conn, &path)
+        })
+        .await
+    }
+
     async fn legacy_child_receipts(
         &self,
         library: &str,

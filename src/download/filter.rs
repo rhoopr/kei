@@ -42,11 +42,11 @@ pub(super) use expected_paths::{
     stored_path_matches_download_family,
 };
 pub(crate) use expected_paths::{
-    ExpectedAssetPath, expected_paths_for, import_collision_family_match,
+    ExpectedAssetPath, NamingRole, expected_paths_for, import_collision_family_match,
     import_collision_family_prefixes,
 };
 pub(crate) use metadata::AssetGroupings;
-pub(super) use metadata::MetadataPayload;
+pub(super) use metadata::{MetadataPayload, build_selected_payload};
 pub(super) use tasks::{DownloadTask, filter_asset_to_tasks, filter_asset_to_tasks_with_primary};
 pub(super) use versions::{VersionsView, extract_skip_candidates};
 pub(crate) use versions::{

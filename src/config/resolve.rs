@@ -239,6 +239,7 @@ pub(crate) struct PathDerivationFields {
     pub live_resolution: LivePhotoResolution,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub edited: bool,
+    pub edited_naming: crate::types::EditedNaming,
     pub alternative: bool,
     pub raw_policy: RawPolicy,
     pub file_match_policy: FileMatchPolicy,
@@ -291,6 +292,13 @@ pub(crate) fn resolve_path_derivation_fields(
         LivePhotoMovFilenamePolicy::Suffix,
     );
     let edited = resolve_flag(cli.edited, toml_photos.and_then(|p| p.edited));
+    let edited_naming = toml_photos
+        .and_then(|p| p.edited_naming)
+        .unwrap_or_default();
+    anyhow::ensure!(
+        edited_naming != crate::types::EditedNaming::Primary || edited,
+        "[photos].edited_naming = \"primary\" requires [photos].edited = true."
+    );
     let alternative = resolve_flag(cli.alternative, toml_photos.and_then(|p| p.alternative));
     anyhow::ensure!(
         resolution != PhotoResolution::None || edited || alternative,
@@ -324,6 +332,7 @@ pub(crate) fn resolve_path_derivation_fields(
         live_resolution,
         live_photo_mov_filename_policy,
         edited,
+        edited_naming,
         alternative,
         raw_policy,
         file_match_policy,
@@ -605,6 +614,7 @@ impl Config {
             live_resolution,
             live_photo_mov_filename_policy,
             edited,
+            edited_naming,
             alternative,
             raw_policy,
             file_match_policy,
@@ -891,6 +901,7 @@ impl Config {
                 live_photo_mode,
                 live_photo_mov_filename_policy,
                 edited,
+                edited_naming,
                 alternative,
                 raw_policy,
                 file_match_policy,
@@ -970,6 +981,56 @@ mod tests {
     };
     use chrono::NaiveDate;
     use std::path::PathBuf;
+
+    #[test]
+    fn edited_naming_is_opt_in_and_requires_edited_selection() {
+        for (text, expected) in [
+            ("", crate::types::EditedNaming::Suffix),
+            (
+                "[photos]\nedited=true\nedited_naming='primary'",
+                crate::types::EditedNaming::Primary,
+            ),
+            (
+                "[photos]\nedited=true\nedited_naming='suffix'",
+                crate::types::EditedNaming::Suffix,
+            ),
+        ] {
+            let parsed: TomlConfig = toml::from_str(text).unwrap();
+            let config = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&parsed),
+            )
+            .unwrap();
+            assert_eq!(config.photos.edited_naming, expected);
+            let serialized = config
+                .to_toml()
+                .photos
+                .and_then(|photos| photos.edited_naming);
+            assert_eq!(
+                serialized,
+                (expected == crate::types::EditedNaming::Primary).then_some(expected)
+            );
+        }
+        let parsed: TomlConfig = toml::from_str("[photos]\nedited_naming='primary'").unwrap();
+        let error = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&parsed),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires [photos].edited = true")
+        );
+        assert!(
+            toml::from_str::<TomlConfig>("[photos]\nedited=true\nedited_naming='anything'")
+                .is_err()
+        );
+    }
 
     #[test]
     fn legacy_preservation_allow_hardlinks_defaults_false_and_resolves_toml() {

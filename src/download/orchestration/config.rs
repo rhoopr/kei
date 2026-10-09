@@ -369,6 +369,9 @@ fn hash_download_config_with_date_bounds(
         });
         hasher.update(b"\0");
     }
+    if config.edited_naming == crate::types::EditedNaming::Primary {
+        hasher.update(b"\0kei:edited-primary:v1\0");
+    }
     finalize_hash(hasher)
 }
 
@@ -471,6 +474,11 @@ pub(crate) struct DownloadConfig {
     pub(crate) live_resolution: AssetVersionSize,
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub(crate) edited: bool,
+    pub(crate) edited_naming: crate::types::EditedNaming,
+    pub(crate) primary_layout_active: bool,
+    pub(crate) primary_layout_preview: bool,
+    pub(crate) primary_layout_source: Option<Arc<crate::icloud::photos::PhotoAlbum>>,
+    pub(crate) primary_layout_pass: Option<String>,
     pub(crate) alternative: bool,
     pub(crate) raw_policy: RawPolicy,
     pub(crate) file_match_policy: FileMatchPolicy,
@@ -546,7 +554,9 @@ impl DownloadConfig {
             paths::TOKEN_LIBRARY,
         ];
         let any_token = |s: &str| PER_PASS_TOKENS.iter().any(|t| s.contains(t));
-        self.selection_run.is_some()
+        self.primary_layout_active
+            || self.primary_layout_preview
+            || self.selection_run.is_some()
             || any_token(&self.folder_structure)
             || any_token(&self.folder_structure_albums)
             || any_token(&self.folder_structure_smart_folders)
@@ -573,6 +583,8 @@ impl DownloadConfig {
             pass,
         );
         Self {
+            primary_layout_source: Some(Arc::new(pass.album.clone())),
+            primary_layout_pass: Some(super::generation::pass_key(pass)),
             selection_pass: self
                 .selection_run
                 .as_ref()
@@ -689,6 +701,11 @@ impl DownloadConfig {
             live_resolution: AssetVersionSize::LiveOriginal,
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             edited: false,
+            edited_naming: crate::types::EditedNaming::Suffix,
+            primary_layout_active: false,
+            primary_layout_preview: false,
+            primary_layout_source: None,
+            primary_layout_pass: None,
             alternative: false,
             raw_policy: RawPolicy::AsIs,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,

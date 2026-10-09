@@ -108,6 +108,16 @@ pub(crate) async fn run_status(
             }
         }
     }
+    if let Some(primary) = &summary.primary_layout {
+        println!(
+            "Managed primary: {} bound families; {} independently preserved files; {} pending operations ({} held)",
+            primary.bound_families,
+            primary.preserved_files,
+            primary.pending_operations,
+            primary.held_operations
+        );
+        println!("  Preserved files are local copies, separate from sync network downloads.");
+    }
     println!("{}", backup_status_line(&summary));
     println!();
 

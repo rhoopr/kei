@@ -41,6 +41,7 @@ pub(crate) struct ExpectedAssetPath {
     /// Which version this is (Original, LiveOriginal, Medium, ...). Drives the
     /// state-DB row key and `MediaType` classification.
     pub(crate) version_size: VersionSizeKey,
+    pub(crate) naming_role: NamingRole,
 }
 
 /// Bare expected path for one version, before any on-disk / claimed-path
@@ -60,10 +61,29 @@ pub(in crate::download) struct DerivedPath {
     pub(in crate::download) checksum: Box<str>,
     pub(in crate::download) size: u64,
     pub(in crate::download) version_size: VersionSizeKey,
+    pub(in crate::download) naming_role: NamingRole,
     /// True for the primary photo (where AM/PM whitespace variants matter
     /// when matching on disk), false for the MOV companion. Sync's
     /// collision layer threads this into `resolve_download_path`.
     pub(in crate::download) check_ampm_on_disk: bool,
+}
+
+/// Placement role is independent of the stable rendition key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum NamingRole {
+    #[default]
+    Rendition,
+    Current,
+    OriginalArchive,
+}
+
+impl NamingRole {
+    pub(in crate::download) fn suffix(self) -> &'static str {
+        match self {
+            Self::OriginalArchive => "_original",
+            Self::Current | Self::Rendition => "",
+        }
+    }
 }
 
 /// Real filename if the asset has one, otherwise a deterministic
@@ -145,6 +165,9 @@ pub(in crate::download) fn stored_path_matches_current_collision_family(
         return false;
     };
 
+    if config.edited_naming == crate::types::EditedNaming::Primary {
+        return primary_filename_matches(&derived.filename, stored_filename, derived.naming_role);
+    }
     collision_family_base_filenames(
         asset_id,
         &derived.filename,
@@ -261,6 +284,49 @@ pub(crate) fn import_collision_family_prefixes(
     let Some(filename) = expected.path.file_name().and_then(|name| name.to_str()) else {
         return Vec::new();
     };
+    if config.edited_naming() == crate::types::EditedNaming::Primary {
+        let stem = Path::new(filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(filename);
+        let stem = if expected.naming_role == NamingRole::OriginalArchive {
+            stem.strip_suffix("_original").unwrap_or(stem)
+        } else {
+            stem
+        };
+        let base = if expected.naming_role == NamingRole::OriginalArchive {
+            format!(
+                "{stem}.{}",
+                Path::new(filename)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("")
+            )
+        } else {
+            filename.to_owned()
+        };
+        let shortened = paths::role_filename(
+            &base,
+            &format!("-{}", "0".repeat(64)),
+            expected.naming_role.suffix(),
+        );
+        let shortened = Path::new(&shortened)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        let shortened = if expected.naming_role == NamingRole::OriginalArchive {
+            shortened.strip_suffix("_original").unwrap_or(shortened)
+        } else {
+            shortened
+        };
+        let shortened = shortened
+            .strip_suffix(&format!("-{}", "0".repeat(64)))
+            .unwrap_or(shortened);
+        return vec![
+            paths::normalize_ampm(stem),
+            paths::normalize_ampm(shortened),
+        ];
+    }
     let primary = all_expected
         .iter()
         .find(|p| p.version_size.is_primary_media())
@@ -290,6 +356,46 @@ pub(crate) fn import_collision_family_prefixes(
     prefixes
 }
 
+fn primary_filename_matches(filename: &str, stored: &str, role: NamingRole) -> bool {
+    if paths::normalize_ampm(filename) == paths::normalize_ampm(stored) {
+        return true;
+    }
+    let Some((candidate, extension)) = stored.rsplit_once('.') else {
+        return false;
+    };
+    let candidate = if role == NamingRole::OriginalArchive {
+        let Some(candidate) = candidate.strip_suffix("_original") else {
+            return false;
+        };
+        candidate
+    } else {
+        candidate
+    };
+    let Some((_, qualifier)) = candidate.rsplit_once('-') else {
+        return false;
+    };
+    if qualifier.len() != 64 || !qualifier.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let base = if role == NamingRole::OriginalArchive {
+        let Some((stem, ext)) = filename.rsplit_once('.') else {
+            return false;
+        };
+        let Some(stem) = stem.strip_suffix("_original") else {
+            return false;
+        };
+        format!("{stem}.{ext}")
+    } else {
+        filename.to_owned()
+    };
+    let rendered = paths::role_filename(&base, &format!("-{qualifier}"), role.suffix());
+    let Some((_, expected_extension)) = rendered.rsplit_once('.') else {
+        return false;
+    };
+    extension.eq_ignore_ascii_case(expected_extension)
+        && paths::normalize_ampm(&rendered) == paths::normalize_ampm(stored)
+}
+
 /// Import uses the same collision-family owner as sync. Return `Some(true)`
 /// only when the filename includes the full identity (including ordinal forms).
 /// Callers still census all candidate owners: sanitized full IDs can collide too.
@@ -305,6 +411,10 @@ pub(crate) fn import_collision_family_match(
     }
     let filename = expected.path.file_name()?.to_str()?;
     let stored = stored_path.file_name()?.to_str()?;
+    if config.edited_naming() == crate::types::EditedNaming::Primary {
+        return primary_filename_matches(filename, stored, expected.naming_role).then_some(false);
+    }
+
     let primary = all_expected
         .iter()
         .find(|p| p.version_size.is_primary_media())
@@ -503,6 +613,7 @@ pub(in crate::download) fn derive_primary(
         checksum: version.checksum.clone(),
         size: version.size,
         version_size: VersionSizeKey::from(effective_size),
+        naming_role: NamingRole::Rendition,
         check_ampm_on_disk: true,
     })
 }
@@ -542,6 +653,7 @@ fn derive_suffixed_extra(
         checksum: version.checksum.clone(),
         size: version.size,
         version_size: VersionSizeKey::from(key),
+        naming_role: NamingRole::Rendition,
         check_ampm_on_disk,
     }
 }
@@ -642,6 +754,7 @@ pub(in crate::download) fn derive_mov_companion(
         checksum: live_version.checksum.clone(),
         size: live_version.size,
         version_size: VersionSizeKey::from(effective_live_size),
+        naming_role: NamingRole::Rendition,
         check_ampm_on_disk: false,
     })
 }
@@ -694,11 +807,75 @@ pub(in crate::download) fn derive_expected_paths(
             .iter()
             .any(|seen| seen.as_ref() == mov.url.as_ref())
         {
-            return out;
+            return apply_primary_naming(asset, config, &ctx, out);
         }
         out.push(mov);
     }
-    out
+    apply_primary_naming(asset, config, &ctx, out)
+}
+
+fn apply_primary_naming(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &(impl PathDerivationSource + ?Sized),
+    ctx: &DerivationContext<'_>,
+    mut paths: Vec<DerivedPath>,
+) -> Vec<DerivedPath> {
+    if config.edited_naming() != crate::types::EditedNaming::Primary {
+        return paths;
+    }
+    let adjusted_still = paths
+        .iter()
+        .any(|p| p.version_size == VersionSizeKey::Adjusted);
+    let adjusted_motion = paths
+        .iter()
+        .any(|p| p.version_size == VersionSizeKey::LiveAdjusted);
+    let video_only = config.live_photo_mode() == LivePhotoMode::VideoOnly;
+    for p in &mut paths {
+        let key = p.version_size;
+        let role = match key {
+            VersionSizeKey::Adjusted => NamingRole::Current,
+            VersionSizeKey::Original if adjusted_still => NamingRole::OriginalArchive,
+            VersionSizeKey::Original => NamingRole::Current,
+            VersionSizeKey::LiveOriginal if adjusted_still || (video_only && adjusted_motion) => {
+                NamingRole::OriginalArchive
+            }
+            VersionSizeKey::LiveOriginal => NamingRole::Current,
+            VersionSizeKey::LiveAdjusted if adjusted_still || video_only => NamingRole::Current,
+            _ => NamingRole::Rendition,
+        };
+        if role == NamingRole::Rendition {
+            continue;
+        }
+        // Derive from the provider stem, never from a filename with an inferred
+        // role. This preserves literal provider names ending in _edited/_original.
+        let base = if key == VersionSizeKey::LiveOriginal || key == VersionSizeKey::LiveAdjusted {
+            let base = usable_asset_base_filename(asset, ctx);
+            live_photo_motion_filename_for_primary(&base, config)
+        } else {
+            let version = ctx.versions.get(match key {
+                VersionSizeKey::Adjusted => AssetVersionSize::Adjusted,
+                _ => AssetVersionSize::Original,
+            });
+            let Some(version) = version else {
+                continue;
+            };
+            mapped_version_filename(asset.state_id(), &ctx.base_filename, &version.asset_type)
+        };
+        let base = match config.file_match_policy() {
+            FileMatchPolicy::NameId7 => paths::apply_name_id7(&base, asset.state_id()),
+            FileMatchPolicy::NameSizeDedupWithSuffix => base,
+        };
+        p.filename = paths::role_filename(&base, "", role.suffix());
+        p.path = paths::local_download_path(
+            config.directory(),
+            config.folder_structure(),
+            &ctx.created_local,
+            &p.filename,
+            config.album_name(),
+        );
+        p.naming_role = role;
+    }
+    paths
 }
 
 /// Compute the file paths sync would produce for an asset under the given
@@ -716,6 +893,7 @@ pub(crate) fn expected_paths_for(
             checksum: d.checksum,
             url: d.url,
             version_size: d.version_size,
+            naming_role: d.naming_role,
         })
         .collect()
 }
@@ -737,6 +915,153 @@ mod tests {
     use super::super::config::PathDerivationConfig;
     use super::super::test_support::{filter_asset_fresh, test_config};
     use super::{ExpectedAssetPath, expected_paths_for};
+
+    #[test]
+    fn primary_layout_live_names_preserve_rendition_pair_and_extension() {
+        let asset = TestPhotoAsset::new("LIVE_PRIMARY")
+            .filename("IMG_original.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .adjusted_version(
+                "https://p01.icloud-content.com/edited",
+                "adjusted-checksum",
+                2400,
+                "public.jpeg",
+            )
+            .live_photo(
+                "https://p01.icloud-content.com/original-motion",
+                "original-motion-checksum",
+                3000,
+            )
+            .live_adjusted(
+                "https://p01.icloud-content.com/adjusted-motion",
+                "adjusted-motion-checksum",
+                3200,
+            )
+            .build();
+        let mut config = test_config();
+        config.edited = true;
+        config.edited_naming = crate::types::EditedNaming::Primary;
+        for (policy, expected_motion) in [
+            (LivePhotoMovFilenamePolicy::Suffix, "IMG_original_HEVC"),
+            (LivePhotoMovFilenamePolicy::Original, "IMG_original"),
+        ] {
+            config.live_photo_mov_filename_policy = policy;
+            let paths = expected_paths_for(&asset, &config);
+            let expected = [
+                (
+                    VersionSizeKey::Original,
+                    "IMG_original_original.HEIC".to_owned(),
+                    "test_ck",
+                ),
+                (
+                    VersionSizeKey::Adjusted,
+                    "IMG_original.JPG".to_owned(),
+                    "adjusted-checksum",
+                ),
+                (
+                    VersionSizeKey::LiveOriginal,
+                    format!("{expected_motion}_original.MOV"),
+                    "original-motion-checksum",
+                ),
+                (
+                    VersionSizeKey::LiveAdjusted,
+                    format!("{expected_motion}.MOV"),
+                    "adjusted-motion-checksum",
+                ),
+            ];
+            assert_eq!(paths.len(), 4);
+            for (version, name, checksum) in expected {
+                let path = paths
+                    .iter()
+                    .find(|path| path.version_size == version)
+                    .unwrap();
+                assert_eq!(path.path.file_name().unwrap().to_str().unwrap(), name);
+                if version != VersionSizeKey::Original {
+                    assert_eq!(path.checksum.as_ref(), checksum);
+                }
+            }
+            let tasks = filter_asset_fresh(&asset, &config);
+            for path in paths {
+                assert!(
+                    tasks
+                        .iter()
+                        .any(|task| task.version_size == path.version_size
+                            && task.download_path == path.path
+                            && task.checksum == path.checksum)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn primary_layout_long_collision_original_has_terminal_role_and_shared_match() {
+        let mut config = test_config();
+        config.edited = true;
+        config.edited_naming = crate::types::EditedNaming::Primary;
+        let asset = TestPhotoAsset::new("LONG_PRIMARY")
+            .filename(&format!("{}.HEIC", "猫".repeat(100)))
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .adjusted_version(
+                "https://p01.icloud-content.com/edited",
+                "adjusted",
+                5000,
+                "public.jpeg",
+            )
+            .build();
+        let paths = super::derive_expected_paths(&asset, &config);
+        for derived in &paths {
+            let expected = expected_paths_for(&asset, &config)
+                .into_iter()
+                .find(|path| path.version_size == derived.version_size)
+                .unwrap();
+            let name = derived.path.file_name().unwrap().to_str().unwrap();
+            let (stem, ext) = name.rsplit_once('.').unwrap();
+            let base = if derived.naming_role == super::NamingRole::OriginalArchive {
+                format!("{}.{}", stem.strip_suffix("_original").unwrap(), ext)
+            } else {
+                name.to_owned()
+            };
+            let qualified = paths::role_filename(
+                &base,
+                &format!("-{}", "a".repeat(64)),
+                derived.naming_role.suffix(),
+            );
+            assert!(qualified.len() <= 255);
+            if derived.version_size == VersionSizeKey::Original {
+                assert!(qualified.ends_with("_original.HEIC"));
+            }
+            let candidate = derived.path.with_file_name(&qualified);
+            assert_eq!(
+                super::import_collision_family_match(
+                    asset.state_id(),
+                    &expected,
+                    &expected_paths_for(&asset, &config),
+                    &config,
+                    &candidate
+                ),
+                Some(false)
+            );
+            assert!(super::stored_path_matches_download_family(
+                asset.state_id(),
+                derived,
+                &paths,
+                &config,
+                &candidate
+            ));
+            assert!(
+                super::import_collision_family_prefixes(
+                    asset.state_id(),
+                    &expected,
+                    &expected_paths_for(&asset, &config),
+                    &config
+                )
+                .iter()
+                .any(|prefix| paths::normalize_ampm(&qualified).starts_with(prefix))
+            );
+        }
+    }
 
     /// Live-photo HEIC primary with both LiveOriginal and LiveMedium MOV
     /// companions. Covers the live_resolution=Medium path.
@@ -1023,6 +1348,7 @@ mod tests {
             live_resolution: crate::types::LivePhotoResolution::Original,
             live_photo_mov_filename_policy: sync_config.live_photo_mov_filename_policy,
             edited: sync_config.edited,
+            edited_naming: sync_config.edited_naming,
             alternative: sync_config.alternative,
             raw_policy: sync_config.raw_policy,
             file_match_policy: sync_config.file_match_policy,

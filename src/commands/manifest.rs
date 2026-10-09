@@ -29,6 +29,8 @@ struct ManifestRow {
     media_type: String,
     status: String,
     albums: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    preserved_files: Vec<crate::state::db::primary_layout::PreservedManifestFile>,
 }
 
 impl From<ManifestAssetRow> for ManifestRow {
@@ -50,6 +52,7 @@ impl From<ManifestAssetRow> for ManifestRow {
             media_type: row.media_type,
             status: row.status,
             albums: row.albums,
+            preserved_files: row.preserved_files,
         }
     }
 }
@@ -127,7 +130,12 @@ fn render_csv(rows: &[ManifestRow]) -> anyhow::Result<String> {
     ];
 
     let mut out = String::new();
-    push_csv_record(&mut out, HEADER);
+    let has_preserved_files = rows.iter().any(|row| !row.preserved_files.is_empty());
+    let mut header = HEADER.to_vec();
+    if has_preserved_files {
+        header.push("preserved_files");
+    }
+    push_csv_record(&mut out, &header);
     for row in rows {
         let albums = serde_json::to_string(&row.albums)?;
         let size_bytes = row.size_bytes.to_string();
@@ -138,7 +146,7 @@ fn render_csv(rows: &[ManifestRow]) -> anyhow::Result<String> {
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_default();
         let last_seen_at = row.last_seen_at.to_rfc3339();
-        let fields = [
+        let mut fields = vec![
             row.library.as_str(),
             row.asset_id.as_str(),
             row.version.as_str(),
@@ -156,6 +164,10 @@ fn render_csv(rows: &[ManifestRow]) -> anyhow::Result<String> {
             row.status.as_str(),
             albums.as_str(),
         ];
+        let preserved_files = serde_json::to_string(&row.preserved_files)?;
+        if has_preserved_files {
+            fields.push(&preserved_files);
+        }
         push_csv_record(&mut out, &fields);
     }
     Ok(out)
@@ -340,7 +352,7 @@ mod tests {
 
     #[test]
     fn csv_escapes_special_fields_and_keeps_albums_as_json() {
-        let rows = vec![ManifestRow {
+        let mut rows = vec![ManifestRow {
             library: "PrimarySync".to_string(),
             asset_id: "ASSET,1".to_string(),
             version: "original".to_string(),
@@ -357,6 +369,7 @@ mod tests {
             media_type: "photo".to_string(),
             status: "pending".to_string(),
             albums: vec!["Family".to_string(), "Vacation, 2024".to_string()],
+            preserved_files: Vec::new(),
         }];
 
         let csv = render_csv(&rows).expect("csv");
@@ -364,5 +377,40 @@ mod tests {
         assert!(csv.contains("\"ASSET,1\""));
         assert!(csv.contains("\"quote\"\"photo.jpg\""));
         assert!(csv.contains("\"[\"\"Family\"\",\"\"Vacation, 2024\"\"]\""));
+        assert_eq!(csv.lines().next().unwrap().split(',').count(), 16);
+        assert!(
+            serde_json::to_value(&rows).unwrap()[0]
+                .get("preserved_files")
+                .is_none()
+        );
+        rows[0]
+            .preserved_files
+            .push(crate::state::db::primary_layout::PreservedManifestFile {
+                operation: "operation-501".into(),
+                family: "family-501".into(),
+                previous_generation: 2,
+                phase: "committed".into(),
+                native_path: crate::state::db::provider_selection::SelectionPath::Utf8(
+                    "/photos/.kei-history/old.jpg".into(),
+                ),
+                provider_checksum: "earlier-provider-checksum".into(),
+                local_checksum: "exact-local-checksum".into(),
+                source_checksum: Some("source-checksum".into()),
+                sidecar_checksum: Some("sidecar-checksum".into()),
+                size_bytes: 42,
+            });
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(
+            json[0]["preserved_files"][0]["native_path"],
+            serde_json::json!({"encoding":"utf8","path":"/photos/.kei-history/old.jpg"})
+        );
+        assert_eq!(
+            json[0]["preserved_files"][0]["provider_checksum"],
+            "earlier-provider-checksum"
+        );
+        let csv = render_csv(&rows).unwrap();
+        assert!(csv.lines().next().unwrap().ends_with(",preserved_files"));
+        assert_eq!(csv.lines().next().unwrap().split(',').count(), 17);
+        assert!(csv.contains("earlier-provider-checksum"));
     }
 }

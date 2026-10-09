@@ -647,7 +647,14 @@ impl SelectionRun {
                         break;
                     }
                 }
-                let path = if let Some(previous) = &previous
+                let path = if planner.managed_layout_session().is_some() {
+                    plan.tasks
+                        .iter()
+                        .find(|task| task.version_size == derived.version_size)
+                        .context("Managed layout lost its pinned rendition path")?
+                        .download_path
+                        .clone()
+                } else if let Some(previous) = &previous
                     && previous.decision.confirmation.is_some()
                 {
                     previous

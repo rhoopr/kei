@@ -12,7 +12,7 @@ use crate::download::DownloadConfig;
 /// Carried separately from the rest of `AssetMetadata` so the download layer
 /// only sees fields a writer can actually use. Fields are owned (not borrowed)
 /// because the task moves across async boundaries.
-#[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize, Debug, Clone, Default)]
 #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
 pub(in crate::download) struct MetadataPayload {
     /// Source capture offset in seconds from UTC, when valid.
@@ -121,7 +121,7 @@ impl AssetGroupings {
     }
 }
 
-pub(super) fn build_payload(
+pub(in crate::download) fn build_payload(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> Arc<MetadataPayload> {
@@ -129,6 +129,24 @@ pub(super) fn build_payload(
         .asset_groupings
         .metadata_payload(asset.state_id(), asset.metadata());
     // The current pass is newer evidence than the cycle's grouping preload.
+    if let Some(album) = config.album_name.as_deref().filter(|name| !name.is_empty())
+        && !payload.keywords.iter().any(|keyword| keyword == album)
+    {
+        payload.keywords.push(album.to_owned());
+    }
+    Arc::new(payload)
+}
+
+/// Keep source/rendition provenance aligned with the stable selected key.
+pub(in crate::download) fn build_selected_payload(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    version: crate::state::VersionSizeKey,
+) -> Arc<MetadataPayload> {
+    let metadata = super::versions::metadata_for_selected_version(asset, config, version);
+    let mut payload = config
+        .asset_groupings
+        .metadata_payload(asset.state_id(), &metadata);
     if let Some(album) = config.album_name.as_deref().filter(|name| !name.is_empty())
         && !payload.keywords.iter().any(|keyword| keyword == album)
     {

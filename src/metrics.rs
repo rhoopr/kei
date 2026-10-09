@@ -1298,6 +1298,7 @@ mod tests {
         downloaded_bytes: u64,
     ) -> SyncSummary {
         SyncSummary {
+            primary_layout: None,
             unresolved_identity_zones: 0,
             unresolved_sparse_records: 0,
             deferred_sparse_records: 0,

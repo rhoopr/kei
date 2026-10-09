@@ -177,6 +177,71 @@ pub(crate) struct ReconciliationCatalogPath {
 /// Durable destination ownership for local catalog reconciliation.
 #[async_trait]
 pub(crate) trait ReconciliationStateStore: Send + Sync {
+    async fn primary_layout_binding(
+        &self,
+        _family: String,
+    ) -> Result<Option<super::primary_layout::LayoutBinding>, StateError> {
+        Ok(None)
+    }
+    async fn primary_layout_operations(
+        &self,
+        _library: String,
+    ) -> Result<Vec<super::primary_layout::LayoutOperation>, StateError> {
+        Ok(Vec::new())
+    }
+    async fn begin_primary_layout(
+        &self,
+        _op: super::primary_layout::LayoutOperation,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout",
+            detail: "state store does not support primary layouts".into(),
+        })
+    }
+    async fn cancel_primary_layout(&self, _operation: String) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout",
+            detail: "state store does not support primary layouts".into(),
+        })
+    }
+    async fn hold_primary_layout(&self, _operation: String) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout",
+            detail: "state store does not support primary layouts".into(),
+        })
+    }
+    async fn save_primary_layout(
+        &self,
+        _op: super::primary_layout::LayoutOperation,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout",
+            detail: "state store does not support primary layouts".into(),
+        })
+    }
+    async fn commit_primary_layout(
+        &self,
+        _op: super::primary_layout::LayoutOperation,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout",
+            detail: "state store does not support primary layouts".into(),
+        })
+    }
+    async fn has_primary_layouts(&self, _library: &str) -> Result<bool, StateError> {
+        Ok(false)
+    }
+    async fn guard_primary_slot(
+        &self,
+        _library: &str,
+        _child: &str,
+        _version: &str,
+        _checksum: &str,
+        _path: &Path,
+    ) -> Result<(), StateError> {
+        Ok(())
+    }
+
     async fn get_reconciliation_catalog_paths(
         &self,
     ) -> Result<Vec<ReconciliationCatalogPath>, StateError>;
@@ -197,6 +262,12 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
 #[async_trait]
 pub(crate) trait DownloadContextStateStore: Send + Sync {
     async fn get_downloaded_file_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError>;
+
+    /// Historical content is visible only to the preservation owner, which
+    /// must prove exact local bytes and the complete legacy ownership census.
+    async fn get_primary_layout_receipts(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
+        self.get_downloaded_path_records().await
+    }
 
     /// Current-content publication receipts, including additional album paths.
     async fn get_downloaded_path_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
@@ -824,6 +895,11 @@ pub trait MembershipStore: Send + Sync {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
+    /// Managed slots are rewritten only by their preservation-backed layout owner.
+    async fn guard_primary_writer(&self, _path: &Path) -> Result<(), StateError> {
+        Ok(())
+    }
+
     async fn legacy_child_receipts(
         &self,
         _library: &str,
@@ -1034,4 +1110,5 @@ pub(crate) struct ManifestAssetRow {
     pub(crate) media_type: String,
     pub(crate) status: String,
     pub(crate) albums: Vec<String>,
+    pub(crate) preserved_files: Vec<super::primary_layout::PreservedManifestFile>,
 }

@@ -56,6 +56,8 @@ pub(super) struct TaskPlanner {
     path_mode: PathPlanningMode,
     reconciliation: Box<ReconciliationPlanning>,
     dir_cache: paths::DirCache,
+    layout_session: Option<Arc<super::orchestration::primary_layout::LayoutSession>>,
+    managed_plan: bool,
 }
 
 impl TaskPlanner {
@@ -65,6 +67,8 @@ impl TaskPlanner {
             path_mode: PathPlanningMode::Download,
             reconciliation: Box::default(),
             dir_cache: paths::DirCache::new(),
+            layout_session: None,
+            managed_plan: false,
         }
     }
 
@@ -217,6 +221,20 @@ impl TaskPlanner {
             let (Some(path), Some(checksum)) = (&record.local_path, &record.local_checksum) else {
                 continue;
             };
+            if let Some(db) = config.state_db.as_deref()
+                && db
+                    .guard_primary_slot(
+                        &owner.library,
+                        &owner.asset_id,
+                        version_size.as_str(),
+                        &derived.checksum,
+                        path,
+                    )
+                    .await
+                    .is_err()
+            {
+                continue;
+            }
             if record.checksum != derived.checksum.as_ref()
                 || !super::filter::stored_path_matches_download_family(
                     asset.state_id(),
@@ -350,6 +368,7 @@ impl TaskPlanner {
         config: &DownloadConfig,
         replay: ReservedReplay,
     ) -> Result<AssetTaskPlan> {
+        self.managed_plan = false;
         self.reconciliation.reservations.clear();
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
             return Ok(AssetTaskPlan {
@@ -357,6 +376,36 @@ impl TaskPlanner {
                 filter_reason: Some(filter_reason),
                 malformed_resource: None,
             });
+        }
+        if config.primary_layout_active || config.primary_layout_preview {
+            if self.layout_session.is_none() {
+                self.layout_session =
+                    Some(Arc::new(if let Some(db) = config.state_db.as_deref() {
+                        super::orchestration::primary_layout::LayoutSession::load(db).await?
+                    } else {
+                        anyhow::ensure!(
+                            config.primary_layout_preview,
+                            "Primary naming requires an owned database"
+                        );
+                        super::orchestration::primary_layout::LayoutSession::default()
+                    }));
+            }
+            if let Some(session) = &self.layout_session {
+                let tasks = if config.primary_layout_preview {
+                    super::orchestration::primary_layout::preview_asset(asset, config, session)
+                        .await?
+                } else {
+                    super::orchestration::primary_layout::plan_asset(asset, config, session).await?
+                };
+                if let Some(tasks) = tasks {
+                    self.managed_plan = true;
+                    return Ok(AssetTaskPlan {
+                        tasks,
+                        filter_reason: None,
+                        malformed_resource: None,
+                    });
+                }
+            }
         }
         let derived = super::filter::derive_expected_paths(asset, config);
         let primary_path = if derived
@@ -517,6 +566,14 @@ impl TaskPlanner {
         &self.reconciliation.reservations
     }
 
+    pub(super) fn managed_layout_session(
+        &self,
+    ) -> Option<Arc<super::orchestration::primary_layout::LayoutSession>> {
+        self.managed_plan
+            .then(|| self.layout_session.as_ref().map(Arc::clone))
+            .flatten()
+    }
+
     /// Commit final choices, including recorded-path overrides, before dispatch.
     /// Drain each plan once so a streaming pass does not retain a growing write batch.
     pub(super) async fn persist_download_reservations(
@@ -524,6 +581,9 @@ impl TaskPlanner {
         db: &dyn DownloadStore,
         tasks: &[DownloadTask],
     ) -> Result<()> {
+        if self.managed_plan {
+            return Ok(());
+        }
         let mut reservations = std::mem::take(&mut self.reconciliation.reservations);
         reservations.retain_mut(|reservation| {
             let Some(task) = tasks.iter().find(|task| {

@@ -21,6 +21,7 @@ pub(crate) trait PathDerivationSource {
     fn live_resolution(&self) -> AssetVersionSize;
     fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy;
     fn edited(&self) -> bool;
+    fn edited_naming(&self) -> crate::types::EditedNaming;
     fn alternative(&self) -> bool;
     fn raw_policy(&self) -> RawPolicy;
     fn file_match_policy(&self) -> FileMatchPolicy;
@@ -51,6 +52,7 @@ pub(crate) struct PathDerivationConfig {
     pub(crate) live_resolution: AssetVersionSize,
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub(crate) edited: bool,
+    pub(crate) edited_naming: crate::types::EditedNaming,
     pub(crate) alternative: bool,
     pub(crate) raw_policy: RawPolicy,
     pub(crate) file_match_policy: FileMatchPolicy,
@@ -83,6 +85,7 @@ impl PathDerivationConfig {
             live_resolution: fields.live_resolution.to_asset_version_size(),
             live_photo_mov_filename_policy: fields.live_photo_mov_filename_policy,
             edited: fields.edited,
+            edited_naming: fields.edited_naming,
             alternative: fields.alternative,
             raw_policy: fields.raw_policy,
             file_match_policy: fields.file_match_policy,
@@ -190,6 +193,10 @@ impl PathDerivationSource for PathDerivationConfig {
         self.live_photo_mov_filename_policy
     }
 
+    fn edited_naming(&self) -> crate::types::EditedNaming {
+        self.edited_naming
+    }
+
     fn edited(&self) -> bool {
         self.edited
     }
@@ -262,6 +269,10 @@ impl PathDerivationSource for DownloadConfig {
 
     fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy {
         self.live_photo_mov_filename_policy
+    }
+
+    fn edited_naming(&self) -> crate::types::EditedNaming {
+        self.edited_naming
     }
 
     fn edited(&self) -> bool {

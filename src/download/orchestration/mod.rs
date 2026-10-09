@@ -10,6 +10,7 @@ pub(super) mod generation;
 pub(super) mod incremental;
 pub(super) mod maintenance;
 pub(super) mod models;
+pub(super) mod primary_layout;
 pub(super) mod queue_projection;
 pub(super) mod recent;
 pub(super) mod reconciliation;

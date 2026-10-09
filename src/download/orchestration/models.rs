@@ -316,6 +316,9 @@ impl SyncResult {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SyncStats {
     pub assets_seen: u64,
+    /// Durable inventory at report time, distinct from this cycle's network counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) primary_layout: Option<crate::state::types::PrimaryLayoutSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_total_at_start: Option<u64>,
     #[serde(skip_serializing_if = "is_false")]
@@ -500,6 +503,8 @@ impl SyncStats {
     // Per-zone composition folds safety fields only in CheckpointEvidence.
     // Cycle reports separately aggregate their projected counters above.
     fn accumulate_report_counters(&mut self, other: &SyncStats) {
+        // primary_layout is a database-wide inventory assigned by the report
+        // owner after the cycle. Summing it across passes would duplicate history.
         self.assets_seen += other.assets_seen;
         let had_api_total = self.api_total_at_start.is_some();
         let other_has_api_total = other.api_total_at_start.is_some();

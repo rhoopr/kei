@@ -1728,7 +1728,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 
 | Contract | Owner | Required behavior |
 |----------|-------|-------------------|
-| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
+| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization, or opt-in `photos.edited_naming="primary"` carries a journaled owned-slot handover with an independent exact preservation receipt. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
 | `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/orchestration/cleanup.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/orchestration/` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
@@ -1792,3 +1792,13 @@ Update this file in the same pull request when a change:
 
 Keep the guide focused on stable ownership and safety. Source code remains the
 final authority.
+
+## Managed edited-primary layouts
+
+`download/orchestration/primary_layout.rs` owns opt-in `photos.edited_naming` transitions. The shared selected-rendition renderer assigns current/original-archive roles without changing rendition keys, RAW selection or URL deduplication. The layout owner confirms current provider resources through the Photos adapter, prepares all selected members, preserves displaced media and sidecars as independent exact copies, then conditionally publishes and retires verified obsolete aliases. Default suffix families retain ordinary append-only behavior.
+
+Schema 35 adds independently addressable layout bindings, operations, members, path claims and immutable preservation receipts under `state/db/primary_layout.rs`. Scoped native paths, stable child and pass identity, source/config decisions and a checked binding generation pin each operation. Durable phases are planned, prepared, preserved, publishing and committed; cancellation retains its journal and private prepared files. Recovery runs after filesystem replacement recovery and before ordinary source dispatch. A started handover finishes its recorded generation before new source/config work may plan another operation.
+
+The claims fence ordinary transfer, finalization, adoption and queued metadata. Metadata for selected renditions is prepared off the visible path; it commits with the new binding and matching provider selection receipts. Local path reconciliation uses this same layout owner for managed families. Current/archived media and sidecars must match their pinned fingerprints. Unknown ownership or local changes hold completion and protect existing contents. Historical catalogue receipts remain evidence, not permission to write a superseded slot.
+
+Files in a Live Photo family are reserved and prepared together. Publication across separate files is recoverable rather than simultaneously atomic to external readers. Filesystems without the required atomic conditional publication/retirement operations leave durable work pending. See [edited primary usage](edited-primary.md) for storage, exclusion and downgrade guidance.

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::rows::{ASSET_COLUMNS, encode_asset_date};
 use crate::state::error::StateError;
@@ -384,6 +384,17 @@ pub(super) fn update_status_to_downloaded(
     mark_capture_repair: bool,
     downloaded_at: i64,
 ) -> Result<usize, StateError> {
+    let checksum: Option<String> = conn
+        .query_row(
+            "SELECT checksum FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+            rusqlite::params![library, id, version_size],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(checksum) = checksum {
+        super::primary_layout::guard_slot(conn, library, id, version_size, &checksum, local_path)?;
+        super::primary_layout::guard_downloaded_checksum(conn, local_path, local_checksum)?;
+    }
     let mut stmt = conn
         .prepare_cached(
             "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
@@ -507,7 +518,7 @@ pub(super) fn metadata_rewrite_source_sql() -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let source = format!(
         "SELECT {ASSET_COLUMNS}, metadata_write_failed_at, capture_repair_metadata_hash, \
              capture_repair_output_checksum, capture_repair_output_size, \
              (SELECT p.source_checksum FROM asset_metadata_paths p \
@@ -519,5 +530,10 @@ pub(super) fn metadata_rewrite_source_sql() -> String {
          FROM asset_metadata_paths p JOIN assets a \
            ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
          WHERE p.local_path IS NOT a.local_path AND p.provider_checksum = a.checksum"
+    );
+    // Committed handovers retain historical markers without presenting a
+    // displaced rendition as a current writer into its former primary slot.
+    format!(
+        "SELECT * FROM ({source}) current_receipt WHERE NOT EXISTS(SELECT 1 FROM primary_layout_superseded_paths retired WHERE retired.library=current_receipt.library AND retired.child=current_receipt.id AND retired.version=current_receipt.version_size AND retired.provider_checksum=current_receipt.checksum AND retired.compat_path=current_receipt.local_path AND NOT EXISTS(SELECT 1 FROM primary_layout_claims active WHERE active.library=retired.library AND active.child=retired.child AND active.version=retired.version AND active.provider_checksum=retired.provider_checksum AND active.native_path=retired.native_path AND active.operation IS NULL))"
     )
 }

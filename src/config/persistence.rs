@@ -168,6 +168,8 @@ impl Config {
                     Some(self.photos.live_photo_mov_filename_policy)
                 },
                 edited: if self.photos.edited { Some(true) } else { None },
+                edited_naming: (self.photos.edited_naming != crate::types::EditedNaming::Suffix)
+                    .then_some(self.photos.edited_naming),
                 alternative: if self.photos.alternative {
                     Some(true)
                 } else {

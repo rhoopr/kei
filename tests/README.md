@@ -1273,3 +1273,11 @@ test separately proves that cached valid descriptors cannot publish ownership
 before the selected scope passes its own check. Malformed-list tests prove that
 invalid complete-list evidence is never cached. Existing queue admission tests
 cover capture attachment, durable receipts, rollback, replay and unchanged follow-up.
+
+### Managed edited-primary qualification
+
+`cargo test --all-features --lib primary_layout` exercises the opt-in owner with file-backed SQLite, synthetic provider generations and a real local HTTP server. The fixture checks original, two edits, revert, preserved media/sidecar hashes, rendition keys, manifests, private destination generations, suffix migration/reversal, collisions, source drift, read-only plans, state-write failure, process death and quiet reopened cycles. The ignored worker is launched and killed by the parent process-death test; it is not a skipped standalone proof.
+
+The process-death oracle restarts at every journal boundary, checks independently retained old bytes before completion, and requires two subsequent zero-download, zero-lookup cycles. Real Live Photo fixture bytes cover both MOV naming policies; automated byte preservation does not qualify Immich pairing. Manual Immich testing requires both exclusion patterns documented in `docs/edited-primary.md`.
+
+Qualification requires the full `just gate` at the candidate commit plus the final format and strict all-target/all-feature Clippy checks. Record macOS, Windows and target-filesystem checks separately; Linux fixture results do not stand in for unrun platform checks.

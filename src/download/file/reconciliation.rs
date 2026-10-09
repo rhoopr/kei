@@ -263,7 +263,10 @@ fn finish_reconciled_copy(
     })))
 }
 
-fn reconciliation_source_root(download_root: &Path, source: &Path) -> anyhow::Result<PathBuf> {
+pub(in crate::download) fn reconciliation_source_root(
+    download_root: &Path,
+    source: &Path,
+) -> anyhow::Result<PathBuf> {
     let download_root = crate::fs_util::absolute_confined_path(download_root)?;
     let source = crate::fs_util::absolute_confined_path(source)?;
     if source.starts_with(&download_root) {
