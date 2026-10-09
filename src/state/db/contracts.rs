@@ -53,6 +53,30 @@ pub(crate) struct DownloadedFileRecord {
     pub(crate) download_checksum: Option<String>,
 }
 
+/// Snapshot of an unchanged prior current publication, never completed-state
+/// evidence until conditional recovery commits. Additional paths stay excluded.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingPublicationRecord {
+    pub(crate) library: String,
+    pub(crate) id: String,
+    pub(crate) version_size: VersionSizeKey,
+    pub(crate) status: String,
+    pub(crate) checksum: String,
+    pub(crate) size: u64,
+    pub(crate) filename: String,
+    pub(crate) created_at: f64,
+    pub(crate) added_at: Option<f64>,
+    pub(crate) metadata_hash: Option<String>,
+    pub(crate) local_path: PathBuf,
+    pub(crate) local_checksum: String,
+    pub(crate) download_checksum: String,
+    pub(crate) downloaded_at: i64,
+    pub(crate) download_attempts: i64,
+    pub(crate) last_error: Option<String>,
+    pub(crate) receipt_download_checksum: Option<String>,
+    pub(crate) source_checksum: Option<String>,
+}
+
 /// Metadata-rewrite debt selected for one bounded drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataRewriteQueue {
@@ -201,6 +225,29 @@ pub(crate) trait DownloadContextStateStore: Send + Sync {
     /// Current-content publication receipts, including additional album paths.
     async fn get_downloaded_path_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
         Ok(Vec::new())
+    }
+
+    /// Only current catalog paths with retained current-content publication proof.
+    async fn get_pending_publication(
+        &self,
+        _library: &str,
+        _id: &str,
+        _version: VersionSizeKey,
+    ) -> Result<Option<PendingPublicationRecord>, StateError> {
+        Ok(None)
+    }
+
+    /// Recover only a still-matching snapshot and resolved identity. False means
+    /// stale or cancelled; it never authorizes fallback from the old plan.
+    async fn recover_pending_publication(
+        &self,
+        _proof: &PendingPublicationRecord,
+        _selected: &AssetRecord,
+        _child: &str,
+        _master: &str,
+        _shutdown: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool, StateError> {
+        Ok(false)
     }
 }
 
