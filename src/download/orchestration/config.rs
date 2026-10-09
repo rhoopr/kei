@@ -479,6 +479,7 @@ pub(crate) struct DownloadConfig {
     pub(crate) primary_layout_preview: bool,
     pub(crate) primary_layout_source: Option<Arc<crate::icloud::photos::PhotoAlbum>>,
     pub(crate) primary_layout_pass: Option<String>,
+    pub(crate) primary_layout_pass_kind: Option<crate::commands::PassKind>,
     pub(crate) alternative: bool,
     pub(crate) raw_policy: RawPolicy,
     pub(crate) file_match_policy: FileMatchPolicy,
@@ -585,6 +586,7 @@ impl DownloadConfig {
         Self {
             primary_layout_source: Some(Arc::new(pass.album.clone())),
             primary_layout_pass: Some(super::generation::pass_key(pass)),
+            primary_layout_pass_kind: Some(pass.kind),
             selection_pass: self
                 .selection_run
                 .as_ref()
@@ -706,6 +708,7 @@ impl DownloadConfig {
             primary_layout_preview: false,
             primary_layout_source: None,
             primary_layout_pass: None,
+            primary_layout_pass_kind: None,
             alternative: false,
             raw_policy: RawPolicy::AsIs,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,

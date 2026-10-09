@@ -55,6 +55,22 @@ impl ReconciliationStateStore for SqliteStateDb {
             Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_bindings WHERE library=?1 OR source_library=?1) OR EXISTS(SELECT 1 FROM primary_layout_operations WHERE source_library=?1 AND phase NOT IN ('committed','cancelled'))",[library],|r|r.get(0))?)
         }).await
     }
+    async fn primary_layout_owns_asset(
+        &self,
+        library: &str,
+        child: &str,
+    ) -> Result<bool, StateError> {
+        let (library, child) = (library.to_owned(), child.to_owned());
+        self.with_conn("primary_layout_owns_asset", move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM primary_layout_bindings WHERE library=?1 AND child=?2)
+                    OR EXISTS(SELECT 1 FROM primary_layout_claims WHERE library=?1 AND child=?2)",
+                rusqlite::params![library, child],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
     async fn guard_primary_slot(
         &self,
         library: &str,

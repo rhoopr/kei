@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS primary_layout_superseded_paths (
 CREATE INDEX IF NOT EXISTS primary_layout_superseded_compat ON primary_layout_superseded_paths(library,child,version,provider_checksum,compat_path);
 CREATE INDEX IF NOT EXISTS primary_layout_binding_source ON primary_layout_bindings(source_library);
 CREATE INDEX IF NOT EXISTS primary_layout_binding_owner ON primary_layout_bindings(library,child);
+CREATE INDEX IF NOT EXISTS primary_layout_claim_owner ON primary_layout_claims(library,child);
 CREATE INDEX IF NOT EXISTS primary_layout_pending_library ON primary_layout_operations(source_library,phase);
 ";
 
@@ -108,6 +109,8 @@ pub(crate) struct LayoutOperation {
     pub(crate) asset_record_name: String,
     pub(crate) pass: String,
     pub(crate) metadata_flags: u8,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) refresh_metadata: bool,
     pub(crate) root: SelectionPath,
     pub(crate) generation: i64,
     pub(crate) decision: String,
@@ -129,6 +132,10 @@ pub(crate) struct PreservedManifestFile {
     pub(crate) source_checksum: Option<String>,
     pub(crate) sidecar_checksum: Option<String>,
     pub(crate) size_bytes: u64,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn invalid(detail: impl Into<String>) -> StateError {
@@ -521,6 +528,7 @@ mod tests {
             asset_record_name: "provider-child".into(),
             pass: "album-pass".into(),
             metadata_flags: 3,
+            refresh_metadata: true,
             root: SelectionPath::from_path(root),
             generation: 0,
             decision: "source-and-config-generation".into(),
@@ -558,6 +566,19 @@ mod tests {
         let expected = serde_json::to_value(&op).unwrap();
         let decoded: LayoutOperation = decode(&encode(&op).unwrap()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+        let mut legacy = expected.clone();
+        legacy.as_object_mut().unwrap().remove("refresh_metadata");
+        let decoded_legacy: LayoutOperation =
+            decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            !decoded_legacy.refresh_metadata,
+            "older journals must not invent forced refresh intent"
+        );
+        assert_eq!(
+            serde_json::to_value(decoded_legacy).unwrap(),
+            legacy,
+            "default refresh intent must preserve old journal identity"
+        );
         let binding = LayoutBinding {
             family: op.family,
             library: op.library,

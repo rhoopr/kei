@@ -231,20 +231,27 @@ pub(in crate::download) async fn owns_metadata(
     asset: &PhotoAsset,
     config: &DownloadConfig,
 ) -> Result<bool> {
-    if !config.primary_layout_active || filter::is_asset_filtered(asset, config).is_some() {
+    if !config.primary_layout_active {
         return Ok(false);
-    }
-    if config.edited_naming == EditedNaming::Primary {
-        return Ok(true);
     }
     let db = config
         .state_db
         .as_deref()
         .context("Managed layout requires a database")?;
-    Ok(db
-        .primary_layout_binding(family(asset, config)?)
+    // The ordinary refresh touches every stored path for this provider child.
+    // A base config has no concrete pass key, so a family miss cannot establish
+    // that all of those paths are ordinary. Claims also cover pending bindings.
+    if db
+        .primary_layout_owns_asset(
+            asset.source_zone().unwrap_or(&config.library),
+            asset.state_id(),
+        )
         .await?
-        .is_some())
+    {
+        return Ok(true);
+    }
+    Ok(config.edited_naming == EditedNaming::Primary
+        && filter::is_asset_filtered(asset, config).is_none())
 }
 
 /// Returns None for an ordinary suffix family that has never been managed.
@@ -285,7 +292,15 @@ async fn process_asset_inner(
         .context("Primary naming requires an owned state database")?;
     let family = family(&observed, config)?;
     let binding = db.primary_layout_binding(family.clone()).await?;
-    if config.edited_naming == EditedNaming::Suffix && binding.is_none() {
+    if config.edited_naming == EditedNaming::Suffix
+        && binding.is_none()
+        && !db
+            .primary_layout_owns_asset(
+                observed.source_zone().unwrap_or(&config.library),
+                observed.state_id(),
+            )
+            .await?
+    {
         return Ok(None);
     }
     if binding.is_none() && filter::derive_expected_paths(&observed, config).is_empty() {
@@ -297,9 +312,17 @@ async fn process_asset_inner(
     if cancel.is_cancelled() {
         anyhow::bail!("Primary layout interrupted")
     }
-    if binding.as_ref().is_some_and(|b| {
-        b.decision == decision(&observed, config).unwrap_or_default() && b.policy == policy(config)
-    }) {
+    let pending = db
+        .primary_layout_operations(config.library.to_string())
+        .await?;
+    let has_pending = pending.iter().any(|op| op.family == family);
+    if !has_pending
+        && !config.refresh_metadata
+        && binding.as_ref().is_some_and(|b| {
+            b.decision == decision(&observed, config).unwrap_or_default()
+                && b.policy == policy(config)
+        })
+    {
         for file in &binding.as_ref().context("Missing committed binding")?.files {
             validate_file(&config.directory, file).await?;
         }
@@ -316,6 +339,8 @@ async fn process_asset_inner(
     );
     let desired = decision(&asset, config)?;
     if let Some(binding) = &binding
+        && !has_pending
+        && !config.refresh_metadata
         && binding.decision == desired
         && binding.policy == policy(config)
     {
@@ -324,9 +349,6 @@ async fn process_asset_inner(
         }
         return Ok(Some((asset, LayoutOutcome::default())));
     }
-    let pending = db
-        .primary_layout_operations(config.library.to_string())
-        .await?;
     let mut op = if let Some(op) = pending.into_iter().find(|op| op.family == family) {
         if op.decision == desired {
             op
@@ -696,6 +718,7 @@ async fn plan(
         library: asset.source_zone().unwrap_or(&config.library).to_owned(),
         child: asset.state_id().to_owned(),
         metadata_flags: crate::download::pipeline::MetadataFlags::from(config).bits(),
+        refresh_metadata: config.refresh_metadata,
         asset_record_name: asset.asset_record_name().to_owned(),
         pass: config
             .primary_layout_pass
@@ -918,7 +941,9 @@ async fn prepare(
                 )
                 .await?;
             }
-            if source.metadata_decision.as_deref() != Some(transform.as_str()) {
+            if op.refresh_metadata
+                || source.metadata_decision.as_deref() != Some(transform.as_str())
+            {
                 let flags = crate::download::pipeline::MetadataFlags::from(config);
                 let fingerprint = crate::download::file::ExistingFileFingerprint {
                     size: media.size,
@@ -1266,7 +1291,18 @@ pub(in crate::download) async fn preview_asset(
         None
     };
     if config.edited_naming == EditedNaming::Suffix && binding.is_none() {
-        return Ok(None);
+        let managed = if let Some(db) = config.state_db.as_deref() {
+            db.primary_layout_owns_asset(
+                asset.source_zone().unwrap_or(&config.library),
+                asset.state_id(),
+            )
+            .await?
+        } else {
+            false
+        };
+        if !managed {
+            return Ok(None);
+        }
     }
     if filter::derive_expected_paths(asset, config).is_empty() {
         return Ok(Some(Vec::new()));
@@ -1362,7 +1398,15 @@ pub(in crate::download) async fn plan_asset(
     {
         return Ok(Some(Vec::new()));
     }
-    if config.edited_naming == EditedNaming::Suffix && binding.is_none() {
+    if config.edited_naming == EditedNaming::Suffix
+        && binding.is_none()
+        && !db
+            .primary_layout_owns_asset(
+                asset.source_zone().unwrap_or(&config.library),
+                asset.state_id(),
+            )
+            .await?
+    {
         return Ok(None);
     }
     let observed_decision = decision(asset, config)?;

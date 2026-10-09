@@ -234,6 +234,17 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
     async fn has_primary_layouts(&self, _library: &str) -> Result<bool, StateError> {
         Ok(false)
     }
+    /// Whole-asset metadata refresh must resolve ownership across all passes.
+    async fn primary_layout_owns_asset(
+        &self,
+        _library: &str,
+        _child: &str,
+    ) -> Result<bool, StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout_owns_asset",
+            detail: "state store does not support managed metadata ownership".into(),
+        })
+    }
     async fn guard_primary_slot(
         &self,
         _library: &str,

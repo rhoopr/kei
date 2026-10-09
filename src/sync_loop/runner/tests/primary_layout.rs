@@ -145,6 +145,7 @@ async fn cycle_resolution(
     .await
 }
 struct CycleOptions {
+    refresh_metadata: bool,
     media_directory: &'static str,
     folder_structure: &'static str,
     pass_kind: PassKind,
@@ -160,6 +161,7 @@ struct CycleOptions {
 impl Default for CycleOptions {
     fn default() -> Self {
         Self {
+            refresh_metadata: false,
             media_directory: "media",
             folder_structure: "",
             pass_kind: PassKind::Unfiled,
@@ -253,6 +255,7 @@ async fn cycle_options(
     let build = |mode, exclude, groups, zone| {
         let mut config = base(mode, exclude, groups, zone);
         let config = Arc::make_mut(&mut config);
+        config.refresh_metadata = options.refresh_metadata;
         config.edited = true;
         config.edited_naming = naming;
         config.resolution = resolution;
@@ -272,6 +275,7 @@ async fn cycle_options(
     config.download.folder_structure = options.folder_structure.to_owned();
     config.download.folder_structure_albums = options.folder_structure.to_owned();
     config.download.folder_structure_smart_folders = options.folder_structure.to_owned();
+    config.runtime.refresh_metadata = options.refresh_metadata;
     config.photos.edited = true;
     config.photos.edited_naming = naming;
     config.photos.resolution = resolution;
@@ -625,6 +629,17 @@ async fn primary_layout_migrates_suffix_and_disables_without_redownload() {
         downloads,
         "migration fetched verified local media"
     );
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    assert!(
+        db.get_all_asset_albums("PrimarySync")
+            .await
+            .unwrap()
+            .is_empty(),
+        "unfiled path label became real membership and would suppress reversal"
+    );
+    drop(db);
     let (disabled, _) = cycle(root.path(), edited.clone(), true, EditedNaming::Suffix).await;
     assert_eq!(disabled.failed_count, 0, "{:?}", disabled.stats);
     assert!(disabled.db_sync_token_advance_safe);
@@ -1943,9 +1958,17 @@ async fn review501_started_old_root_finishes_before_new_root_commits() {
                 )
                 .await;
                 assert_eq!(
-                    result.failed_count, 0,
-                    "{directory}/{template}, {naming:?}: {:?}",
-                    result.stats
+                    result.failed_count,
+                    0,
+                    "{directory}/{template}, {naming:?}: {:?}, events {:?}",
+                    result.stats,
+                    capture
+                        .events()
+                        .into_iter()
+                        .filter(
+                            |e| e.level == tracing::Level::WARN || e.level == tracing::Level::ERROR
+                        )
+                        .collect::<Vec<_>>()
                 );
                 assert!(result.db_sync_token_advance_safe);
                 assert_bytes(&adjusted_path, EDIT_TWO);
@@ -1982,14 +2005,7 @@ async fn review501_started_old_root_finishes_before_new_root_commits() {
                         .iter()
                         .filter(|request| request.url.path() == endpoint)
                         .count(),
-                    // A different suffix family follows ordinary naming and
-                    // downloads its selected original; it does not adopt the
-                    // former family's managed _original archive as a suffix alias.
-                    if naming == EditedNaming::Suffix && endpoint == "/original" {
-                        2
-                    } else {
-                        1
-                    },
+                    1,
                     "unexpected GET count: {endpoint}, {directory}/{template}, {naming:?}; events {:?}",
                     capture
                         .events()
@@ -2362,4 +2378,347 @@ async fn review501_retained_source_mutation_between_snapshots_holds_publication(
             assert_eq!(std::path::PathBuf::from(path), current);
         }
     }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn review501_suffix_album_collecting_delta_uses_managed_metadata_owner() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let options = || CycleOptions {
+        pass_kind: PassKind::Album,
+        sidecar: true,
+        // No private capture context: selected album deltas use collecting routing.
+        private: false,
+        ..CycleOptions::default()
+    };
+    let current = records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
+    for (naming, quiet) in [(EditedNaming::Primary, false), (EditedNaming::Suffix, true)] {
+        let (result, _) =
+            cycle_options(root.path(), current.clone(), quiet, naming, options()).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+    }
+    let old_xmp = std::fs::read(media.join("IMG_0501_edited.JPG.xmp")).unwrap();
+    let archive_xmp = std::fs::read(media.join("IMG_0501_original.JPG.xmp")).unwrap();
+    let requests = server.received_requests().await.unwrap().len();
+    let mut changed = current;
+    changed[1]["recordChangeTag"] = json!("ct-asset-caption");
+    changed[1]["fields"]["captionEnc"] =
+        json!({"type":"STRING","value":"caption changed after suffix reversal"});
+    let (result, _) = cycle_options(
+        root.path(),
+        changed.clone(),
+        false,
+        EditedNaming::Suffix,
+        options(),
+    )
+    .await;
+    assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+    assert!(result.db_sync_token_advance_safe);
+    assert_eq!(result.stats.downloaded, 0);
+    assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
+    assert_bytes(&media.join("IMG_0501_edited.JPG"), VALID_EDIT);
+    let xmp = std::fs::read_to_string(media.join("IMG_0501_edited.JPG.xmp")).unwrap();
+    assert!(
+        xmp.contains("caption changed after suffix reversal"),
+        "stats {:?}, lookups/events {:?}: {xmp}",
+        result.stats,
+        capture.events()
+    );
+    assert_ne!(xmp.as_bytes(), old_xmp);
+    assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), &archive_xmp);
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    assert!(
+        db.get_pending_metadata_rewrites(100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "whole-asset refresh left competing ordinary markers"
+    );
+    let manifest = db.get_manifest_assets().await.unwrap();
+    let retained = manifest
+        .iter()
+        .flat_map(|row| &row.preserved_files)
+        .any(|file| {
+            let mut path = file.native_path.to_path().as_os_str().to_os_string();
+            path.push(".xmp");
+            std::fs::read(std::path::PathBuf::from(path)).is_ok_and(|bytes| bytes == old_xmp)
+        });
+    assert!(
+        retained,
+        "prior adjusted sidecar was not independently preserved"
+    );
+    drop(db);
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let title: String = conn.query_row("SELECT title FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'", [], |row| row.get(0)).unwrap();
+    assert_eq!(title, "caption changed after suffix reversal");
+    drop(conn);
+    for _ in 0..2 {
+        let (quiet, lookups) = cycle_options(
+            root.path(),
+            changed.clone(),
+            true,
+            EditedNaming::Suffix,
+            options(),
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+        assert!(quiet.db_sync_token_advance_safe);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(lookups, 0);
+        assert_bytes(&media.join("IMG_0501_edited.JPG.xmp"), xmp.as_bytes());
+        assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), &archive_xmp);
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+}
+
+#[tokio::test]
+async fn review501_explicit_metadata_refresh_uses_preserving_layout_owner() {
+    #[cfg(feature = "xmp")]
+    let modes = [false, true];
+    #[cfg(not(feature = "xmp"))]
+    let modes = [false];
+    for sidecar in modes {
+        let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let options = |refresh_metadata| CycleOptions {
+            refresh_metadata,
+            #[cfg(feature = "xmp")]
+            sidecar,
+            ..CycleOptions::default()
+        };
+        #[cfg(not(feature = "xmp"))]
+        let _ = sidecar;
+        let current =
+            records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
+        let (initial, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            false,
+            EditedNaming::Primary,
+            options(false),
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0);
+        let xmp = sidecar.then(|| std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap());
+        let requests = server.received_requests().await.unwrap().len();
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let (generation, hash): (i64, String) = conn.query_row("SELECT b.generation,a.metadata_hash FROM primary_layout_bindings b JOIN assets a ON a.library=b.library AND a.id=b.child WHERE a.version_size='adjusted'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        // Simulate stale catalogue capture without changing any owned media.
+        conn.execute("UPDATE assets SET metadata_hash='stale-catalogue-capture' WHERE version_size='adjusted'", []).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_refresh_prepare BEFORE UPDATE OF phase ON primary_layout_operations WHEN NEW.phase='prepared' BEGIN SELECT RAISE(FAIL,'injected forced-refresh preparation failure'); END").unwrap();
+        drop(conn);
+        let (held, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(true),
+        )
+        .await;
+        assert!(held.failed_count > 0);
+        assert!(!held.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let refresh: bool = conn.query_row("SELECT json_extract(CAST(header AS TEXT),'$.refresh_metadata') FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')", [], |row| row.get(0)).unwrap();
+        assert!(refresh, "forced refresh intent was not durable");
+        conn.execute_batch("DROP TRIGGER fail_refresh_prepare")
+            .unwrap();
+        drop(conn);
+        // Restart without the one-shot operator flag. Recorded intent and work
+        // must still complete before the unchanged-binding shortcut can run.
+        let (refreshed, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(false),
+        )
+        .await;
+        assert_eq!(refreshed.failed_count, 0, "{:?}", refreshed.stats);
+        assert!(refreshed.db_sync_token_advance_safe);
+        assert_eq!(refreshed.stats.downloaded, 0);
+        assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
+        assert_bytes(&media.join("IMG_0501_original.JPG"), VALID_ORIGINAL);
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let (new_generation, new_hash): (i64,String) = conn.query_row("SELECT b.generation,a.metadata_hash FROM primary_layout_bindings b JOIN assets a ON a.library=b.library AND a.id=b.child WHERE a.version_size='adjusted'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert!(
+            new_generation > generation,
+            "explicit refresh silently took the unchanged-binding shortcut"
+        );
+        assert_eq!(new_hash, hash);
+        drop(conn);
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(
+            db.get_pending_metadata_rewrites(100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        if let Some(xmp) = &xmp {
+            let fresh_xmp = std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap();
+            #[cfg(feature = "xmp")]
+            {
+                let parsed: xmp_toolkit::XmpMeta =
+                    std::str::from_utf8(&fresh_xmp).unwrap().parse().unwrap();
+                let old: xmp_toolkit::XmpMeta = std::str::from_utf8(xmp).unwrap().parse().unwrap();
+                for (namespace, key) in [
+                    (xmp_toolkit::xmp_ns::XMP, "CreateDate"),
+                    (xmp_toolkit::xmp_ns::EXIF, "DateTimeOriginal"),
+                ] {
+                    assert_eq!(
+                        parsed.property(namespace, key).unwrap().value,
+                        old.property(namespace, key).unwrap().value
+                    );
+                }
+                assert!(String::from_utf8_lossy(&fresh_xmp).contains("TestAlbum"));
+            }
+            assert!(
+                db.get_manifest_assets()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .flat_map(|row| &row.preserved_files)
+                    .any(|file| {
+                        let mut path = file.native_path.to_path().as_os_str().to_os_string();
+                        path.push(".xmp");
+                        std::fs::read(std::path::PathBuf::from(path))
+                            .is_ok_and(|bytes| bytes == *xmp)
+                    }),
+                "forced refresh did not retain prior metadata bytes"
+            );
+        }
+        drop(db);
+        for _ in 0..2 {
+            let (quiet, lookups) = cycle_options(
+                root.path(),
+                current.clone(),
+                true,
+                EditedNaming::Primary,
+                options(false),
+            )
+            .await;
+            assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+            assert!(quiet.db_sync_token_advance_safe);
+            assert_eq!(quiet.stats.downloaded, 0);
+            assert_eq!(lookups, 0);
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+}
+
+#[tokio::test]
+async fn review501_suffix_album_collecting_edit_recovers_without_redownload() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let options = || CycleOptions {
+        pass_kind: PassKind::Album,
+        private: false,
+        ..CycleOptions::default()
+    };
+    let first = records(&server, Some(("edit-one", EDIT_ONE)));
+    for (naming, quiet) in [(EditedNaming::Primary, false), (EditedNaming::Suffix, true)] {
+        let (result, _) = cycle_options(root.path(), first.clone(), quiet, naming, options()).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+    }
+    rusqlite::Connection::open(root.path().join("state.db")).unwrap().execute_batch(
+        "CREATE TRIGGER fail_collecting_layout_commit BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'injected collecting layout commit failure'); END"
+    ).unwrap();
+    let second = records(&server, Some(("edit-two", EDIT_TWO)));
+    let (held, _) = cycle_options(
+        root.path(),
+        second.clone(),
+        false,
+        EditedNaming::Suffix,
+        options(),
+    )
+    .await;
+    assert!(held.failed_count > 0);
+    assert!(!held.db_sync_token_advance_safe);
+    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+    assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_TWO);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='publishing'"
+        ),
+        1
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.path() == "/edit-two")
+            .count(),
+        1
+    );
+    rusqlite::Connection::open(root.path().join("state.db"))
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_collecting_layout_commit")
+        .unwrap();
+    for index in 0..3 {
+        let (result, lookups) = cycle_options(
+            root.path(),
+            second.clone(),
+            true,
+            EditedNaming::Suffix,
+            options(),
+        )
+        .await;
+        if index > 0 {
+            assert_eq!(lookups, 0);
+        }
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_TWO);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            requests.len()
+        );
+    }
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    assert!(
+        db.get_manifest_assets()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|row| &row.preserved_files)
+            .any(|file| {
+                file.provider_checksum == provider_hash(EDIT_ONE)
+                    && std::fs::read(file.native_path.to_path())
+                        .is_ok_and(|bytes| bytes == EDIT_ONE)
+            }),
+        "collecting edit lost its prior managed revision"
+    );
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let (provider,local,path): (String,String,String) = conn.query_row("SELECT checksum,local_checksum,local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!(provider, provider_hash(EDIT_TWO));
+    assert_eq!(
+        local,
+        data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_TWO))
+    );
+    assert_eq!(
+        std::path::PathBuf::from(path),
+        media.join("IMG_0501_edited.JPG")
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')"
+        ),
+        0
+    );
 }

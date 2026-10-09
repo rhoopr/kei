@@ -311,12 +311,13 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
                         // layout commits matching selected metadata. Adding it
                         // afterward would queue an ordinary writer into the
                         // just-committed managed slot.
-                        if let Err(error) = planner::record_album_membership_if_named(
-                            db.as_ref(),
-                            &effective,
-                            &asset,
-                        )
-                        .await
+                        if pass.kind == crate::commands::PassKind::Album
+                            && let Err(error) = planner::record_album_membership_if_named(
+                                db.as_ref(),
+                                &effective,
+                                &asset,
+                            )
+                            .await
                         {
                             stats.failed += 1;
                             tracing::warn!(%error, "Managed reconciliation could not persist album membership");

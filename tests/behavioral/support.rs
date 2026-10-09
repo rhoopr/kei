@@ -701,6 +701,8 @@ CREATE TABLE IF NOT EXISTS primary_layout_superseded_paths (
 );
 CREATE INDEX IF NOT EXISTS primary_layout_superseded_compat ON primary_layout_superseded_paths(library,child,version,provider_checksum,compat_path);
 CREATE INDEX IF NOT EXISTS primary_layout_binding_source ON primary_layout_bindings(source_library);
+CREATE INDEX IF NOT EXISTS primary_layout_binding_owner ON primary_layout_bindings(library,child);
+CREATE INDEX IF NOT EXISTS primary_layout_claim_owner ON primary_layout_claims(library,child);
 CREATE INDEX IF NOT EXISTS primary_layout_pending_library ON primary_layout_operations(source_library,phase);
 ").unwrap();
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)

@@ -420,6 +420,7 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         primary_layout_preview: false,
         primary_layout_source: None,
         primary_layout_pass: None,
+        primary_layout_pass_kind: None,
         alternative: false,
         raw_policy: RawPolicy::AsIs,
         file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,

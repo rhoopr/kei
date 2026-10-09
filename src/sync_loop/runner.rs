@@ -469,6 +469,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             primary_layout_preview: false,
             primary_layout_source: None,
             primary_layout_pass: None,
+            primary_layout_pass_kind: None,
             alternative: config.photos.alternative,
             raw_policy: config.photos.raw_policy,
             file_match_policy: config.photos.file_match_policy,

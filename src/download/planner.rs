@@ -1131,6 +1131,13 @@ pub(super) async fn record_album_membership_if_named<D>(
 where
     D: MembershipStore + ?Sized,
 {
+    // An unfiled path label is not evidence of actual album membership.
+    // Recording it would exclude the asset from later unfiled reconciliation.
+    if config.primary_layout_active
+        && config.primary_layout_pass_kind == Some(crate::commands::PassKind::Unfiled)
+    {
+        return Ok(());
+    }
     let Some(album_name) = config.album_name.as_deref().filter(|name| !name.is_empty()) else {
         return Ok(());
     };
