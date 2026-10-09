@@ -327,29 +327,59 @@ pub(super) async fn publish_part_no_replace(
     }
 }
 
+/// Match the standard library's absolute-path handling before passing paths to
+/// Win32 APIs directly. Extended paths avoid MAX_PATH without registry or
+/// manifest requirements; native UTF-16 units and existing namespaces survive.
+#[cfg(windows)]
+fn windows_api_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    if path.as_os_str().encode_wide().any(|unit| unit == 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains NUL",
+        ));
+    }
+    // GetFullPathNameW resolves relative paths and Win32 separators/components
+    // without filesystem traversal. Already verbatim paths stay unchanged.
+    let absolute = std::path::absolute(path)?;
+    let wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    let prefix = match absolute.components().next() {
+        Some(Component::Prefix(prefix)) => prefix.kind(),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows publication requires an absolute path",
+            ));
+        }
+    };
+    let mut result: Vec<u16> = match prefix {
+        Prefix::Disk(_) => r"\\?\".encode_utf16().chain(wide).collect(),
+        Prefix::UNC(_, _) => r"\\?\UNC\"
+            .encode_utf16()
+            .chain(wide.into_iter().skip(2))
+            .collect(),
+        Prefix::Verbatim(_)
+        | Prefix::VerbatimUNC(_, _)
+        | Prefix::VerbatimDisk(_)
+        | Prefix::DeviceNS(_) => wide,
+    };
+    result.push(0);
+    Ok(result)
+}
+
 #[cfg(windows)]
 pub(super) fn move_file_no_replace_blocking(
     part_path: &Path,
     final_path: &Path,
 ) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
-    fn nul_terminated(path: &Path) -> std::io::Result<Vec<u16>> {
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if wide.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "path contains NUL",
-            ));
-        }
-        wide.push(0);
-        Ok(wide)
-    }
-
-    let part = nul_terminated(part_path)?;
-    let final_path = nul_terminated(final_path)?;
-    // SAFETY: both path arguments are valid NUL-terminated Windows strings.
+    let part = windows_api_path(part_path)?;
+    let final_path = windows_api_path(final_path)?;
+    // SAFETY: both path arguments are live NUL-terminated absolute Windows
+    // strings, with extended namespaces for ordinary drive and UNC paths.
     // MOVEFILE_WRITE_THROUGH keeps the existing durable-publish intent, and
     // omitting MOVEFILE_REPLACE_EXISTING gives this promotion no-overwrite
     // semantics.
@@ -367,25 +397,13 @@ pub(super) fn replace_file_with_backup_blocking(
     replacement_path: &Path,
     backup_path: &Path,
 ) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
 
-    fn nul_terminated(path: &Path) -> std::io::Result<Vec<u16>> {
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if wide.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "path contains NUL",
-            ));
-        }
-        wide.push(0);
-        Ok(wide)
-    }
-
-    let final_path = nul_terminated(final_path)?;
-    let replacement = nul_terminated(replacement_path)?;
-    let backup = nul_terminated(backup_path)?;
-    // SAFETY: every path is a valid NUL-terminated Windows string. The final
+    let final_path = windows_api_path(final_path)?;
+    let replacement = windows_api_path(replacement_path)?;
+    let backup = windows_api_path(backup_path)?;
+    // SAFETY: every path is a live NUL-terminated absolute Windows string
+    // with extended-length support. The final
     // path exists, the replacement is the verified `.part` file, and Windows
     // atomically moves the displaced bytes to the distinct backup path.
     let rc = unsafe {
@@ -410,5 +428,123 @@ fn destination_exists_or(err: std::io::Error, final_path: &Path) -> std::io::Res
         Ok(PublishResult::DestinationExists)
     } else {
         Err(err)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{
+        PublishResult, move_layout_confined, publish_part_no_replace,
+        publish_reconciliation_part_blocking, windows_api_path,
+    };
+    use crate::fs_util::{ConfinedParents, ConfinedPath};
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::Path;
+
+    #[test]
+    fn windows_api_paths_preserve_native_units_and_resolve_win32_syntax() {
+        for (input, expected) in [
+            (
+                r"C:/photos/./nested/../media.jpg",
+                r"\\?\C:\photos\media.jpg",
+            ),
+            (
+                r"\\server\share\photos\media.jpg",
+                r"\\?\UNC\server\share\photos\media.jpg",
+            ),
+            (r"\\?\C:\photos\media.jpg", r"\\?\C:\photos\media.jpg"),
+            (
+                r"\\?\UNC\server\share\media.jpg",
+                r"\\?\UNC\server\share\media.jpg",
+            ),
+            (r"\\.\C:\photos\media.jpg", r"\\.\C:\photos\media.jpg"),
+        ] {
+            let mut units: Vec<u16> = expected.encode_utf16().collect();
+            units.push(0);
+            assert_eq!(
+                windows_api_path(Path::new(input)).unwrap(),
+                units,
+                "{input}"
+            );
+        }
+        let relative = Path::new("native-relative.jpg");
+        assert_eq!(
+            windows_api_path(relative).unwrap(),
+            windows_api_path(&std::path::absolute(relative).unwrap()).unwrap()
+        );
+        let mut native: Vec<u16> = r"C:\photos\".encode_utf16().collect();
+        native.push(0xd800);
+        native.extend(".jpg".encode_utf16());
+        let mut expected: Vec<u16> = r"\\?\".encode_utf16().collect();
+        expected.extend(&native);
+        expected.push(0);
+        assert_eq!(
+            windows_api_path(Path::new(&OsString::from_wide(&native))).unwrap(),
+            expected
+        );
+        native.push(0);
+        assert_eq!(
+            windows_api_path(Path::new(&OsString::from_wide(&native)))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_long_paths_publish_without_overwrite_and_retire_confined_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root
+            .path()
+            .join("nested".repeat(20))
+            .join("nested".repeat(20));
+        tokio::fs::create_dir_all(&parent).await.unwrap();
+        let stage = parent.join("source.part");
+        let target = parent.join("primary.jpg");
+        let retired = parent.join("retired.jpg");
+        assert!(stage.as_os_str().encode_wide().count() > 260);
+        assert!(target.as_os_str().encode_wide().count() > 260);
+        tokio::fs::write(&stage, b"verified source").await.unwrap();
+        assert_eq!(
+            publish_part_no_replace(&stage, &target).await.unwrap(),
+            PublishResult::Published
+        );
+        assert!(!stage.exists());
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"verified source");
+        tokio::fs::write(&stage, b"second source").await.unwrap();
+        assert_eq!(
+            publish_part_no_replace(&stage, &target).await.unwrap(),
+            PublishResult::DestinationExists
+        );
+        assert_eq!(tokio::fs::read(&stage).await.unwrap(), b"second source");
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"verified source");
+        let root = root.path().to_owned();
+        tokio::task::spawn_blocking(move || {
+            let source = ConfinedPath::open(&root, &stage, ConfinedParents::Existing).unwrap();
+            let destination =
+                ConfinedPath::open(&root, &target, ConfinedParents::Existing).unwrap();
+            let retired = ConfinedPath::open(&root, &retired, ConfinedParents::Existing).unwrap();
+            assert_eq!(
+                publish_reconciliation_part_blocking(&source, &destination).unwrap(),
+                PublishResult::DestinationExists
+            );
+            assert_eq!(std::fs::read(source.path()).unwrap(), b"second source");
+            assert_eq!(
+                std::fs::read(destination.path()).unwrap(),
+                b"verified source"
+            );
+            move_layout_confined(&destination, &retired).unwrap();
+            assert_eq!(std::fs::read(retired.path()).unwrap(), b"verified source");
+            assert!(!destination.path().exists());
+            assert_eq!(
+                publish_reconciliation_part_blocking(&source, &destination).unwrap(),
+                PublishResult::Published
+            );
+            assert_eq!(std::fs::read(destination.path()).unwrap(), b"second source");
+            assert!(!source.path().exists());
+        })
+        .await
+        .unwrap();
     }
 }

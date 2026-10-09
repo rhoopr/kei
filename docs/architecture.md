@@ -150,6 +150,13 @@ replacement calls platform primitives and fingerprinting; reconciliation calls
 platform primitives and fingerprinting; validation uses fingerprinting for
 local-size evidence. Platform primitives do not decide replacement or retry
 policy. In particular, Windows partial-exchange recovery stays in replacement.
+Windows native move and backup-replacement calls share an absolute, lossless
+UTF-16 path adapter. It resolves ordinary Win32 separators and components
+without filesystem traversal, then supplies extended drive or UNC paths.
+Existing verbatim namespaces and native units remain intact; embedded NUL is
+rejected. Stored paths, confinement, no-overwrite flags, ownership checks and
+replacement recovery do not change. This avoids MAX_PATH failures in nested
+managed-primary staging without requiring a registry or manifest change.
 
 Pipeline tests use `download::pipeline::<owner>::tests::<test_name>` instead
 of `download::pipeline::tests::<test_name>`. The owners are `adoption`,
