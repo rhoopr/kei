@@ -335,22 +335,24 @@ mod tests {
         let native = root.path().join(std::ffi::OsString::from_vec(vec![
             b'm', 0xff, b'.', b'j', b'p', b'g',
         ]));
-        tokio::fs::write(&native, b"native exact bytes")
-            .await
-            .unwrap();
         let receipt = crate::state::db::provider_selection::SelectionPath::from_path(&native);
         let encoded = serde_json::to_vec(&receipt).unwrap();
         let decoded: crate::state::db::provider_selection::SelectionPath =
             serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.to_path(), native);
-        assert!(
-            snapshot(root.path(), &decoded.to_path())
-                .await
-                .unwrap()
-                .is_some()
-        );
-        std::fs::hard_link(&native, root.path().join("hardlink.jpg")).unwrap();
-        assert!(snapshot(root.path(), &native).await.is_err());
+        // The macOS fixture filesystem rejects non-UTF-8 names. Keep the receipt oracle
+        // above on every Unix platform and use a supported physical filename
+        // for the macOS snapshot and hardlink guards.
+        #[cfg(target_os = "macos")]
+        let physical = root.path().join("native.jpg");
+        #[cfg(not(target_os = "macos"))]
+        let physical = decoded.to_path();
+        tokio::fs::write(&physical, b"native exact bytes")
+            .await
+            .unwrap();
+        assert!(snapshot(root.path(), &physical).await.unwrap().is_some());
+        std::fs::hard_link(&physical, root.path().join("hardlink.jpg")).unwrap();
+        assert!(snapshot(root.path(), &physical).await.is_err());
         assert_eq!(tokio::fs::read(media).await.unwrap(), b"outside user media");
     }
 }
