@@ -1715,7 +1715,7 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
         // guards even when the original is archived and unselected.
         let archive = media.join("IMG_0501_original.JPG");
         let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-        conn.execute("UPDATE assets SET capture_repair_metadata_hash='synthetic-prepared-repair',capture_repair_output_checksum=?1,capture_repair_output_size=?2 WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'", rusqlite::params![data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_ORIGINAL)), VALID_ORIGINAL.len()]).unwrap();
+        conn.execute("UPDATE assets SET capture_repair_metadata_hash='synthetic-prepared-repair',capture_repair_output_checksum=?1,capture_repair_output_size=?2 WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'", rusqlite::params![data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_ORIGINAL)), i64::try_from(VALID_ORIGINAL.len()).unwrap()]).unwrap();
         conn.execute("UPDATE asset_metadata_paths SET capture_repair_metadata_hash='synthetic-prepared-repair',capture_repair_output_checksum=?1,capture_repair_output_size=?2 WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?3", rusqlite::params![data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_ORIGINAL)), VALID_ORIGINAL.len(),archive.to_str().unwrap()]).unwrap();
         drop(conn);
         assert!(
