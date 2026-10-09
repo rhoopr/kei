@@ -212,18 +212,33 @@ async fn pending_publication_recovery_refuses_stale_row_and_receipt_snapshots() 
 
 #[tokio::test]
 async fn pending_publication_recovery_rechecks_all_owners_and_preserves_unknown_identity() {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Case {
+        Library,
+        Id,
+        Rendition,
+        Malformed,
+        Reservation,
+        UnknownContent,
+        OtherDestination,
+        UnknownIdentity,
+        ProtectedId,
+        ProtectedPath,
+        Mapping,
+    }
+
     for case in [
-        "library",
-        "id",
-        "rendition",
-        "malformed",
-        "reservation",
-        "unknown-content",
-        "other-destination",
-        "unknown-identity",
-        "protected-id",
-        "protected-path",
-        "mapping",
+        Case::Library,
+        Case::Id,
+        Case::Rendition,
+        Case::Malformed,
+        Case::Reservation,
+        Case::UnknownContent,
+        Case::OtherDestination,
+        Case::UnknownIdentity,
+        Case::ProtectedId,
+        Case::ProtectedPath,
+        Case::Mapping,
     ] {
         let (_dir, db, record) = fixture().await;
         let proof = db
@@ -235,23 +250,23 @@ async fn pending_publication_recovery_rechecks_all_owners_and_preserves_unknown_
         {
             let conn = db.acquire_lock("inject ownership change").unwrap();
             match case {
-                "library" | "id" | "rendition" | "malformed" => {
-                    let library = if case == "library" {
+                Case::Library | Case::Id | Case::Rendition | Case::Malformed => {
+                    let library = if case == Case::Library {
                         "SharedSync-other"
                     } else {
                         "PrimarySync"
                     };
-                    let id = if case == "id" || case == "malformed" {
+                    let id = if case == Case::Id || case == Case::Malformed {
                         "foreign"
                     } else {
                         "L1"
                     };
-                    let version = if case == "rendition" {
+                    let version = if case == Case::Rendition {
                         "original"
                     } else {
                         "live_original"
                     };
-                    let path = if case == "malformed" {
+                    let path = if case == Case::Malformed {
                         "old/../BROKEN.MOV".to_owned()
                     } else {
                         proof
@@ -266,8 +281,8 @@ async fn pending_publication_recovery_rechecks_all_owners_and_preserves_unknown_
                     conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum) VALUES(?1,?2,?3,?4,'foreign')",
                         rusqlite::params![library,id,version,path]).unwrap();
                 }
-                "reservation" | "unknown-content" | "other-destination" => {
-                    let path = if case == "other-destination" {
+                Case::Reservation | Case::UnknownContent | Case::OtherDestination => {
+                    let path = if case == Case::OtherDestination {
                         proof.local_path.with_file_name("other.MOV")
                     } else {
                         proof.local_path.clone()
@@ -275,31 +290,30 @@ async fn pending_publication_recovery_rechecks_all_owners_and_preserves_unknown_
                     let destination = crate::fs_util::confined_path_key(&path).unwrap();
                     conn.execute("INSERT INTO reconciliation_paths(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) \
                         VALUES('PrimarySync',?1,'live_original',?2,?3,?4,?5,?6)",
-                        rusqlite::params![if case=="reservation" {"foreign"} else {"L1"},key,destination,path.to_str().unwrap(),
-                            if case=="unknown-content" {""} else {"provider-a"},if case=="unknown-content" {-1} else {5}]).unwrap();
+                        rusqlite::params![if case==Case::Reservation {"foreign"} else {"L1"},key,destination,path.to_str().unwrap(),
+                            if case==Case::UnknownContent {""} else {"provider-a"},if case==Case::UnknownContent {-1} else {5}]).unwrap();
                 }
-                "unknown-identity" => {
+                Case::UnknownIdentity => {
                     conn.execute("INSERT INTO asset_verifications VALUES('PrimarySync','L1','live_original','unknown','unresolved',1)",[]).unwrap();
                 }
-                "protected-id" => {
+                Case::ProtectedId => {
                     conn.execute("INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) \
                     VALUES('PrimarySync','L1',1,'{}','[]',1)",[]).unwrap();
                 }
-                "protected-path" => {
+                Case::ProtectedPath => {
                     conn.execute("INSERT INTO unattributed_legacy_paths VALUES('PrimarySync','legacy',?1,?2)",rusqlite::params![key,proof.local_path.to_str().unwrap()]).unwrap();
                 }
-                "mapping" => {
+                Case::Mapping => {
                     conn.execute("INSERT INTO asset_master_mappings VALUES('PrimarySync','L1','different-master',1)",[]).unwrap();
                 }
-                _ => unreachable!(),
             }
         }
         let result = db
             .recover_pending_publication(&proof, &record, "L1", "L1", &CancellationToken::new())
             .await;
-        assert!(!matches!(result, Ok(true)), "{case}");
-        assert_eq!(status(&db), "pending", "{case}");
-        if case == "unknown-identity" {
+        assert!(!matches!(result, Ok(true)), "{case:?}");
+        assert_eq!(status(&db), "pending", "{case:?}");
+        if case == Case::UnknownIdentity {
             assert_eq!(
                 db.acquire_lock("unknown debt kept")
                     .unwrap()

@@ -133,43 +133,55 @@ async fn current_pending_publication_keeps_legacy_path_and_serializes_concurrent
 
 #[tokio::test]
 async fn current_pending_publication_refuses_changed_bytes_content_and_filename_scope() {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Case {
+        SameSizeCorruption,
+        Short,
+        Missing,
+        ProviderChecksum,
+        ProviderSize,
+        WrongFamily,
+        WrongParent,
+        HistoricalOnly,
+    }
+
     for case in [
-        "same-size-corruption",
-        "short",
-        "missing",
-        "provider-checksum",
-        "provider-size",
-        "wrong-family",
-        "wrong-parent",
-        "historical-only",
+        Case::SameSizeCorruption,
+        Case::Short,
+        Case::Missing,
+        Case::ProviderChecksum,
+        Case::ProviderSize,
+        Case::WrongFamily,
+        Case::WrongParent,
+        Case::HistoricalOnly,
     ] {
         let (_dir, db, config, asset, file) = fixture().await;
         match case {
-            "same-size-corruption" => {
+            Case::SameSizeCorruption => {
                 let mut bytes = MOVIE.to_vec();
                 bytes[0] = 1;
                 fs::write(&file, bytes).unwrap();
             }
-            "short" => {
+            Case::Short => {
                 fs::write(&file, b"short").unwrap();
             }
-            "missing" => {
+            Case::Missing => {
                 fs::remove_file(&file).unwrap();
             }
-            "provider-checksum" => {
+            Case::ProviderChecksum => {
                 db.acquire_lock("provider changed")
                     .unwrap()
                     .execute_batch("UPDATE assets SET checksum='new-content'")
                     .unwrap();
             }
-            "provider-size" => {
+            Case::ProviderSize => {
                 db.acquire_lock("provider size changed")
                     .unwrap()
                     .execute_batch("UPDATE assets SET size_bytes=size_bytes+1")
                     .unwrap();
             }
-            "wrong-family" | "wrong-parent" | "historical-only" => {
-                let target = if case == "wrong-parent" {
+            Case::WrongFamily | Case::WrongParent | Case::HistoricalOnly => {
+                let target = if case == Case::WrongParent {
                     config
                         .directory
                         .join("OtherAlbum")
@@ -185,7 +197,7 @@ async fn current_pending_publication_refuses_changed_bytes_content_and_filename_
                     [target.to_str().unwrap()],
                 )
                 .unwrap();
-                if case != "historical-only" {
+                if case != Case::HistoricalOnly {
                     conn.execute(
                         "UPDATE asset_metadata_paths SET local_path=?1",
                         [target.to_str().unwrap()],
@@ -193,7 +205,6 @@ async fn current_pending_publication_refuses_changed_bytes_content_and_filename_
                     .unwrap();
                 }
             }
-            _ => unreachable!(),
         }
         let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
         assert_eq!(
@@ -208,9 +219,9 @@ async fn current_pending_publication_refuses_changed_bytes_content_and_filename_
             .await
             .unwrap(),
             None,
-            "{case}"
+            "{case:?}"
         );
-        assert_eq!(status(&db), "pending", "{case}");
+        assert_eq!(status(&db), "pending", "{case:?}");
     }
 }
 

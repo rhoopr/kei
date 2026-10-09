@@ -39,8 +39,13 @@ fn read_publication(
                 version_size: version,
                 status: row.get(0)?,
                 checksum: row.get(1)?,
-                size: u64::try_from(row.get::<_, i64>(2)?)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                size: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
                 filename: row.get(3)?,
                 created_at: row.get(4)?,
                 added_at: row.get(5)?,
