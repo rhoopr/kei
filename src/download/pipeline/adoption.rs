@@ -18,6 +18,9 @@ use crate::state::{AssetRecord, VersionSizeKey};
 
 use super::task::capture_repair_requested;
 
+mod current_publication;
+pub(in crate::download) use current_publication::recover_current_pending_publication;
+
 pub(super) fn effective_asset_library<'a>(
     asset: &'a PhotoAsset,
     config: &'a DownloadConfig,
@@ -184,12 +187,92 @@ pub(in crate::download) async fn validate_enumerated_reserved_pending(
     Ok(affected)
 }
 
+/// Resolve current publications before a fresh plan can save another destination.
+/// Both completed and failed finalizations must stay out of dispatch and saving.
+#[derive(Default)]
+pub(super) struct PendingCurrentPublications {
+    pub(super) retained_versions: FxHashSet<VersionSizeKey>,
+    pub(super) state_write_failures: usize,
+}
+
+pub(super) async fn recover_pending_current_publications(
+    state_db: Option<&dyn DownloadStore>,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &DownloadContext,
+    task_planner: &mut TaskPlanner,
+    planned_tasks: &[DownloadTask],
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<PendingCurrentPublications> {
+    let mut recovered = PendingCurrentPublications::default();
+    let Some(db) = state_db else {
+        return Ok(recovered);
+    };
+    let library = effective_asset_library(asset, config);
+    let pending_versions = pending_versions_for_asset(ctx, library, asset);
+    for derived in derive_expected_paths(asset, config) {
+        let pending = pending_versions
+            .is_some_and(|versions| versions.contains(derived.version_size.as_str()));
+        // A healthy current publication must not acquire a fresh different
+        // choice that would preclude its next retry. Do not reinterpret an
+        // already durable destination or hash healthy files without a choice.
+        let fresh_choice = planned_tasks.iter().any(|task| {
+            if task.library.as_ref() != library
+                || task.asset_id.as_ref() != asset.state_id()
+                || task.version_size != derived.version_size
+                || task.checksum != derived.checksum
+                || task.size != derived.size
+                || task_planner.has_durable_destination(task)
+            {
+                return false;
+            }
+            let Ok(destination) = crate::fs_util::confined_path_key(&task.download_path) else {
+                return false;
+            };
+            task_planner
+                .reconciliation_reservations()
+                .iter()
+                .any(|reservation| {
+                    reservation.library == task.library
+                        && reservation.asset_id.as_ref() == task.asset_id.as_ref()
+                        && reservation.version_size == task.version_size
+                        && reservation.content.as_ref().is_some_and(|content| {
+                            content.checksum == task.checksum && content.size == task.size
+                        })
+                        && reservation.destination_path_key.0 == destination
+                        && crate::fs_util::confined_path_key(&reservation.destination_path)
+                            .is_ok_and(|key| key == destination)
+                })
+        });
+        if !pending && !fresh_choice {
+            continue;
+        }
+        if let Some(adoption) = recover_current_pending_publication(
+            db,
+            config,
+            asset,
+            task_planner,
+            derived.version_size,
+            shutdown,
+        )
+        .await?
+        {
+            recovered.retained_versions.insert(derived.version_size);
+            if matches!(adoption, PendingOnDiskAdoption::StateWriteFailed(_)) {
+                recovered.state_write_failures += 1;
+            }
+        }
+    }
+    Ok(recovered)
+}
+
 pub(super) async fn adopt_pending_on_disk_skip(
     state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     ctx: &DownloadContext,
     task_planner: &mut TaskPlanner,
+    recovered_versions: &FxHashSet<VersionSizeKey>,
 ) -> Result<PendingOnDiskAdoptionSummary> {
     let Some(db) = state_db else {
         return Ok(PendingOnDiskAdoptionSummary::default());
@@ -203,7 +286,9 @@ pub(super) async fn adopt_pending_on_disk_skip(
     let mut summary = PendingOnDiskAdoptionSummary::default();
     for derived in derive_expected_paths(asset, config) {
         let version_size = derived.version_size.as_str();
-        if !pending_versions.contains(version_size) {
+        if !pending_versions.contains(version_size)
+            || recovered_versions.contains(&derived.version_size)
+        {
             continue;
         }
         if let Some(adoption) =
@@ -253,7 +338,7 @@ pub(super) struct PendingOnDiskAdoptionSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum PendingOnDiskAdoption {
+pub(in crate::download) enum PendingOnDiskAdoption {
     Adopted(PathBuf),
     StateWriteFailed(PathBuf),
 }

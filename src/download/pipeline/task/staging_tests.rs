@@ -850,7 +850,7 @@ async fn auth_abort_waits_for_detached_metadata_publication_before_unlock() {
         .await;
     Mock::given(method("GET"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(401).set_delay(std::time::Duration::from_millis(250)))
+        .respond_with(ResponseTemplate::new(401))
         .expect(3)
         .mount(&server)
         .await;
@@ -868,6 +868,7 @@ async fn auth_abort_waits_for_detached_metadata_publication_before_unlock() {
         .unwrap();
     let pause = crate::download::metadata_rewrite::publication_pause::install(&part);
     let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut auth_tasks = Vec::new();
     for index in 0..4 {
         let mut task = task(
             dir.path().join(format!("{index}.jpg")),
@@ -903,9 +904,12 @@ async fn auth_abort_waits_for_detached_metadata_publication_before_unlock() {
         ))
         .await
         .unwrap();
-        tx.send(task).await.unwrap();
+        if index == 0 {
+            tx.send(task).await.unwrap();
+        } else {
+            auth_tasks.push(task);
+        }
     }
-    drop(tx);
     let shutdown = CancellationToken::new();
     let pipeline_shutdown = shutdown.clone();
     let mut worker = tokio::spawn(async move {
@@ -934,6 +938,23 @@ async fn auth_abort_waits_for_detached_metadata_publication_before_unlock() {
     tokio::time::timeout(std::time::Duration::from_secs(5), pause.started())
         .await
         .unwrap();
+    assert!(!shutdown.is_cancelled());
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/auth")
+            .count(),
+        0,
+        "auth failures must not start before publication is paused"
+    );
+    // Introduce auth failures only after detached publication owns the destination.
+    for task in auth_tasks {
+        tx.send(task).await.unwrap();
+    }
+    drop(tx);
     tokio::time::timeout(std::time::Duration::from_secs(5), shutdown.cancelled())
         .await
         .unwrap();

@@ -27,7 +27,8 @@ use super::StreamPipelineShared;
 use super::adoption::{
     PendingOnDiskAdoption, adopt_pending_on_disk_skip, adopt_pending_on_disk_task,
     effective_asset_library, effective_asset_library_arc, mark_reserved_pending_task,
-    state_confirmed_current_path_exists, validate_enumerated_reserved_pending,
+    recover_pending_current_publications, state_confirmed_current_path_exists,
+    validate_enumerated_reserved_pending,
 };
 use super::task::capture_repair_requested;
 
@@ -648,7 +649,7 @@ where
                         );
                     }
 
-                    let plan = if let Some(plan) = selected_plan {
+                    let mut plan = if let Some(plan) = selected_plan {
                         plan
                     } else {
                         match task_planner.plan_download_asset(&asset, config).await {
@@ -661,16 +662,6 @@ where
                             }
                         }
                     };
-                    if let Some(db) = &producer_state_db
-                        && let Err(error) = task_planner
-                            .persist_download_reservations(db.as_ref(), &plan.tasks)
-                            .await
-                    {
-                        state_write_failures_producer
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::error!(target: "kei::download::pipeline", %error, "Failed to reserve download paths before publication");
-                        return skips;
-                    }
                     if let Some(reason) = plan.filter_reason {
                         skips.record_filter_reason(reason);
                         producer_pb.inc(1);
@@ -686,6 +677,50 @@ where
                         );
                         producer_pb.inc(1);
                         continue;
+                    }
+
+                    // A newly saved destination must not preclude recovery of
+                    // the proven current publication. Consume each recovery
+                    // once and reserve only the remaining transfer tasks.
+                    let recovered = match recover_pending_current_publications(
+                        producer_state_db.as_deref(),
+                        config,
+                        &asset,
+                        &download_ctx,
+                        &mut task_planner,
+                        &plan.tasks,
+                        &producer_shutdown,
+                    )
+                    .await
+                    {
+                        Ok(recovered) => recovered,
+                        Err(error) => {
+                            enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(%error, "Current publication recovery refused unsafe local evidence");
+                            continue 'assets;
+                        }
+                    };
+                    state_write_failures_producer.fetch_add(
+                        recovered.state_write_failures,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    plan.tasks.retain(|task| {
+                        if recovered.retained_versions.contains(&task.version_size) {
+                            task_planner.release_unpublished_task_claim(task);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if let Some(db) = &producer_state_db
+                        && let Err(error) = task_planner
+                            .persist_download_reservations(db.as_ref(), &plan.tasks)
+                            .await
+                    {
+                        state_write_failures_producer
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(target: "kei::download::pipeline", %error, "Failed to reserve download paths before publication");
+                        return skips;
                     }
 
                     if plan.tasks.is_empty() {
@@ -711,6 +746,7 @@ where
                             &asset,
                             &download_ctx,
                             &mut task_planner,
+                            &recovered.retained_versions,
                         )
                         .await
                         {
@@ -742,7 +778,10 @@ where
                             )
                             .await;
                         }
-                        if producer_state_db.is_some() && !adoption.retained_cross_parent {
+                        if producer_state_db.is_some()
+                            && !adoption.retained_cross_parent
+                            && recovered.state_write_failures == 0
+                        {
                             let library = effective_asset_library_arc(&asset, config);
                             touched_assets.push((library, asset.state_id_arc()));
                         }
