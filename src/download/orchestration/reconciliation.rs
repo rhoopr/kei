@@ -86,6 +86,26 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
         });
     }
 
+    let managed = config.edited_naming == crate::types::EditedNaming::Primary
+        || db.has_primary_layouts(&config.library).await?;
+    // A changed root or template identifies a new family. Finish recorded
+    // handovers before reading catalogue paths or allowing that family to
+    // commit, so an old operation cannot later restore stale rendition facts.
+    // The layout owner also recovers replacements at each recorded old root.
+    if managed
+        && let Err(error) =
+            super::primary_layout::recover(client, passes, &config, &shutdown_token).await
+    {
+        tracing::warn!(error = %format!("{error:#}"), "Could not recover managed layouts before path reconciliation; keeping checkpoints unchanged");
+        return Ok(PathReconciliationResult {
+            stats: SyncStats {
+                failed: 1,
+                ..SyncStats::default()
+            },
+            ..PathReconciliationResult::default()
+        });
+    }
+
     let protected: std::collections::HashSet<String> = db
         .get_protected_legacy_ids()
         .await?
@@ -186,8 +206,6 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
         }
     }
 
-    let managed = config.edited_naming == crate::types::EditedNaming::Primary
-        || db.has_primary_layouts(&config.library).await?;
     let layout_session = if managed {
         Some(super::primary_layout::LayoutSession::load(db.as_ref()).await?)
     } else {

@@ -1562,3 +1562,405 @@ async fn primary_layout_stale_writers_and_downloaded_receipts_cannot_finalize_cu
         )
     );
 }
+
+// Regression cases supplied by the independent review of c202d07, extended
+// with exact sidecar and catalogue oracles and two quiet reopened cycles.
+#[tokio::test]
+async fn review501_legacy_original_survives_adjusted_only_migration_as_archive() {
+    #[cfg(feature = "xmp")]
+    let sidecar_modes = [false, true];
+    #[cfg(not(feature = "xmp"))]
+    let sidecar_modes = [false];
+    for sidecar in sidecar_modes {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let options = |resolution| CycleOptions {
+            resolution,
+            #[cfg(feature = "xmp")]
+            sidecar,
+            ..CycleOptions::default()
+        };
+        let (initial, _) = cycle_options(
+            root.path(),
+            records(&server, None),
+            false,
+            EditedNaming::Suffix,
+            options(crate::types::PhotoResolution::Original),
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0);
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        let original_sidecar =
+            sidecar.then(|| std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap());
+        let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+        let (migrated, _) = cycle_options(
+            root.path(),
+            edited.clone(),
+            false,
+            EditedNaming::Primary,
+            options(crate::types::PhotoResolution::None),
+        )
+        .await;
+        assert_eq!(
+            migrated.failed_count, 0,
+            "sidecar={sidecar}: {:?}",
+            migrated.stats
+        );
+        assert!(migrated.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
+        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+        if let Some(expected) = &original_sidecar {
+            assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), expected);
+        }
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let (checksum, local_path): (String, String) = conn.query_row(
+            "SELECT checksum,local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(checksum, provider_hash(ORIGINAL));
+        assert_eq!(
+            std::path::PathBuf::from(local_path),
+            media.join("IMG_0501_original.JPG")
+        );
+        drop(conn);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/original")
+                .count(),
+            1,
+            "migration invented an unselected original download"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/edit-one")
+                .count(),
+            1
+        );
+        for _ in 0..2 {
+            let (quiet, lookups) = cycle_options(
+                root.path(),
+                edited.clone(),
+                true,
+                EditedNaming::Primary,
+                options(crate::types::PhotoResolution::None),
+            )
+            .await;
+            assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+            assert!(quiet.db_sync_token_advance_safe);
+            assert_eq!(quiet.stats.downloaded, 0);
+            assert_eq!(lookups, 0);
+            assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
+            assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+            if let Some(expected) = &original_sidecar {
+                assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), expected);
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                requests.len()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
+    #[cfg(feature = "xmp")]
+    let sidecar_modes = [false, true];
+    #[cfg(not(feature = "xmp"))]
+    let sidecar_modes = [false];
+    for sidecar in sidecar_modes {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let options = || CycleOptions {
+            #[cfg(feature = "xmp")]
+            sidecar,
+            ..CycleOptions::default()
+        };
+        let (initial, _) = cycle_options(
+            root.path(),
+            records(&server, Some(("edit-one", EDIT_ONE))),
+            false,
+            EditedNaming::Suffix,
+            options(),
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0);
+        assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_ONE);
+        let edited_sidecar =
+            sidecar.then(|| std::fs::read(media.join("IMG_0501_edited.JPG.xmp")).unwrap());
+        let requests = server.received_requests().await.unwrap().len();
+        let current = records(&server, None);
+        let (migrated, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            false,
+            EditedNaming::Primary,
+            options(),
+        )
+        .await;
+        assert_eq!(
+            migrated.failed_count, 0,
+            "sidecar={sidecar}: {:?}",
+            migrated.stats
+        );
+        assert!(migrated.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert!(!media.join("IMG_0501_edited.JPG").exists());
+        assert!(!media.join("IMG_0501_edited.JPG.xmp").exists());
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let manifest = db.get_manifest_assets().await.unwrap();
+        let history = manifest
+            .iter()
+            .flat_map(|row| &row.preserved_files)
+            .find(|receipt| std::fs::read(receipt.native_path.to_path()).unwrap() == EDIT_ONE)
+            .expect("reverted edit has no independently preserved history receipt");
+        let path = history.native_path.to_path();
+        assert!(
+            path.strip_prefix(&media)
+                .unwrap()
+                .components()
+                .any(|part| part.as_os_str() == ".kei-history")
+        );
+        assert_eq!(history.provider_checksum, provider_hash(EDIT_ONE));
+        assert_eq!(
+            history.local_checksum,
+            data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE))
+        );
+        if let Some(expected) = &edited_sidecar {
+            let mut xmp = path.as_os_str().to_os_string();
+            xmp.push(".xmp");
+            assert_bytes(&std::path::PathBuf::from(xmp), expected);
+            assert_eq!(
+                history.sidecar_checksum.as_deref(),
+                Some(
+                    data_encoding::HEXLOWER
+                        .encode(&Sha256::digest(expected))
+                        .as_str()
+                )
+            );
+        }
+        let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
+        let inventory = (
+            summary.bound_families,
+            summary.preserved_files,
+            summary.pending_operations,
+            summary.held_operations,
+        );
+        drop(db);
+        for _ in 0..2 {
+            let (quiet, lookups) = cycle_options(
+                root.path(),
+                current.clone(),
+                true,
+                EditedNaming::Primary,
+                options(),
+            )
+            .await;
+            assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+            assert!(quiet.db_sync_token_advance_safe);
+            assert_eq!(quiet.stats.downloaded, 0);
+            assert_eq!(lookups, 0);
+            assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+            assert_bytes(&path, EDIT_ONE);
+            if let Some(expected) = &edited_sidecar {
+                let mut xmp = path.as_os_str().to_os_string();
+                xmp.push(".xmp");
+                assert_bytes(&std::path::PathBuf::from(xmp), expected);
+            }
+            assert!(!media.join("IMG_0501_edited.JPG").exists());
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
+            assert_eq!(
+                (
+                    summary.bound_families,
+                    summary.preserved_files,
+                    summary.pending_operations,
+                    summary.held_operations
+                ),
+                inventory
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn review501_started_old_root_finishes_before_new_root_commits() {
+    for (directory, template) in [("new-root", ""), ("media", "new-template")] {
+        for naming in [EditedNaming::Primary, EditedNaming::Suffix] {
+            let server = server().await;
+            let root = tempfile::tempdir().unwrap();
+            let old_media = root.path().join("media");
+            let (initial, _) = cycle(
+                root.path(),
+                records(&server, None),
+                false,
+                EditedNaming::Primary,
+            )
+            .await;
+            assert_eq!(initial.failed_count, 0);
+            let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+            conn.execute_batch("CREATE TRIGGER fail_layout_commit BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'independent review commit failure'); END").unwrap();
+            drop(conn);
+            let (failed, _) = cycle(
+                root.path(),
+                records(&server, Some(("edit-one", EDIT_ONE))),
+                false,
+                EditedNaming::Primary,
+            )
+            .await;
+            assert!(!failed.db_sync_token_advance_safe);
+            assert_eq!(
+                db_count(
+                    root.path(),
+                    "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='publishing'"
+                ),
+                1
+            );
+            assert_bytes(&old_media.join("IMG_0501.JPG"), EDIT_ONE);
+            rusqlite::Connection::open(root.path().join("state.db"))
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_layout_commit")
+                .unwrap();
+            let current = records(&server, Some(("edit-two", EDIT_TWO)));
+            let parent = root.path().join(directory).join(template);
+            let adjusted_path = parent.join(if naming == EditedNaming::Primary {
+                "IMG_0501.JPG"
+            } else {
+                "IMG_0501_edited.JPG"
+            });
+            let original_path = parent.join(if naming == EditedNaming::Primary {
+                "IMG_0501_original.JPG"
+            } else {
+                "IMG_0501.JPG"
+            });
+            for quiet in [false, true, true] {
+                let before_requests = server.received_requests().await.unwrap().len();
+                let (result, lookups) = cycle_options(
+                    root.path(),
+                    current.clone(),
+                    quiet,
+                    naming,
+                    CycleOptions {
+                        media_directory: directory,
+                        folder_structure: template,
+                        ..CycleOptions::default()
+                    },
+                )
+                .await;
+                assert_eq!(
+                    result.failed_count, 0,
+                    "{directory}/{template}, {naming:?}: {:?}",
+                    result.stats
+                );
+                assert!(result.db_sync_token_advance_safe);
+                assert_bytes(&adjusted_path, EDIT_TWO);
+                assert_bytes(&original_path, ORIGINAL);
+                assert_bytes(&old_media.join("IMG_0501.JPG"), EDIT_ONE);
+                assert_bytes(&old_media.join("IMG_0501_original.JPG"), ORIGINAL);
+                let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+                let (checksum, local_path): (String, String) = conn.query_row(
+                    "SELECT checksum,local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                assert_eq!(checksum, provider_hash(EDIT_TWO));
+                assert_eq!(std::path::PathBuf::from(local_path), adjusted_path);
+                assert_eq!(
+                    db_count(
+                        root.path(),
+                        "SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')"
+                    ),
+                    0
+                );
+                if quiet {
+                    assert_eq!(result.stats.downloaded, 0);
+                    assert_eq!(lookups, 0);
+                    assert_eq!(
+                        server.received_requests().await.unwrap().len(),
+                        before_requests
+                    );
+                }
+            }
+            let requests = server.received_requests().await.unwrap();
+            for endpoint in ["/original", "/edit-one", "/edit-two"] {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.url.path() == endpoint)
+                        .count(),
+                    1,
+                    "recorded recovery redownloaded bytes: {endpoint}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn review501_changed_unselected_legacy_original_holds_migration() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let (initial, _) = cycle(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Suffix,
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0);
+    let modified = b"locally modified original bytes";
+    std::fs::write(media.join("IMG_0501.JPG"), modified).unwrap();
+    let requests = server.received_requests().await.unwrap().len();
+    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (held, _) = cycle_resolution(
+        root.path(),
+        edited.clone(),
+        false,
+        EditedNaming::Primary,
+        crate::types::PhotoResolution::None,
+    )
+    .await;
+    assert!(held.failed_count > 0);
+    assert!(!held.db_sync_token_advance_safe);
+    assert_bytes(&media.join("IMG_0501.JPG"), modified);
+    assert!(!media.join("IMG_0501_original.JPG").exists());
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    // Restore only this synthetic fixture's exact owned bytes, then recover.
+    std::fs::write(media.join("IMG_0501.JPG"), ORIGINAL).unwrap();
+    let (recovered, _) = cycle_resolution(
+        root.path(),
+        edited.clone(),
+        true,
+        EditedNaming::Primary,
+        crate::types::PhotoResolution::None,
+    )
+    .await;
+    assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
+    assert!(recovered.db_sync_token_advance_safe);
+    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+    for _ in 0..2 {
+        let (quiet, lookups) = cycle_resolution(
+            root.path(),
+            edited.clone(),
+            true,
+            EditedNaming::Primary,
+            crate::types::PhotoResolution::None,
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0);
+        assert!(quiet.db_sync_token_advance_safe);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(lookups, 0);
+    }
+}

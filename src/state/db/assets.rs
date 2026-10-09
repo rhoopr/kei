@@ -596,6 +596,7 @@ impl SqliteStateDb {
                 let version_size: String = row.get(2)?;
                 let local_path: Option<String> = row.get(4)?;
                 Ok(DownloadedFileRecord {
+                    catalog_filename: None,
                     is_current_path: true,
                     added_at: row
                         .get::<_, Option<f64>>(7)?
@@ -1471,7 +1472,7 @@ impl DownloadContextStateStore for SqliteStateDb {
         self.with_conn("get_primary_layout_receipts", |conn| {
             let mut statement = conn.prepare_cached(
                 "SELECT p.library, p.id, p.version_size, p.provider_checksum, p.local_path, \
-                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path), a.added_at \
+                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path), a.added_at, a.filename \
                  FROM asset_metadata_paths p JOIN assets a \
                    ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
                  WHERE a.is_deleted = 0 \
@@ -1479,6 +1480,7 @@ impl DownloadContextStateStore for SqliteStateDb {
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DownloadedFileRecord {
+                    catalog_filename: Some(row.get(9)?),
                     is_current_path: row.get(7)?,
                     added_at: row.get::<_, Option<f64>>(8)?.map(|date| decode_asset_date(date, 8)).transpose()?,
                     library: row.get(0)?,
@@ -1512,6 +1514,7 @@ impl DownloadContextStateStore for SqliteStateDb {
                 let version_size = VersionSizeKey::from_str(&file.version)
                     .ok_or(StateError::ProviderSelectionInvalid)?;
                 receipts.push(DownloadedFileRecord {
+                    catalog_filename: None,
                     library: operation.library,
                     id: operation.child,
                     version_size,
@@ -1541,6 +1544,7 @@ impl DownloadContextStateStore for SqliteStateDb {
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DownloadedFileRecord {
+                    catalog_filename: None,
                     is_current_path: row.get(7)?,
                     added_at: row.get::<_, Option<f64>>(8)?.map(|date| decode_asset_date(date, 8)).transpose()?,
                     library: row.get(0)?,

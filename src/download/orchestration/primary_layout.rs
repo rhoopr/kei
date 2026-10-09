@@ -375,6 +375,12 @@ async fn plan(
             ..config.clone()
         };
         let derived = filter::derive_expected_paths(asset, &legacy);
+        let parent = crate::download::paths::local_download_dir(
+            &config.directory,
+            &config.folder_structure,
+            &asset.created_local(),
+            config.album_name.as_deref(),
+        );
         for record in session.receipts(
             asset.source_zone().unwrap_or(&config.library),
             asset.state_id(),
@@ -382,19 +388,28 @@ async fn plan(
             let (Some(path), Some(checksum)) = (&record.local_path, &record.local_checksum) else {
                 continue;
             };
-            let Some(expected) = derived
+            // Selection is a future download obligation, not the inventory
+            // of already-owned local renditions. A retained original or an
+            // adjusted rendition absent after a revert still has its scoped
+            // durable task filename and exact local checksum. Only the current
+            // pass parent is eligible; prior roots and history stay retained.
+            let recorded_name_matches = path.parent() == Some(parent.as_path())
+                && record.catalog_filename.as_deref().is_some_and(|filename| {
+                    path.file_name().and_then(|name| name.to_str()) == Some(filename)
+                });
+            let rendered_family_matches = derived
                 .iter()
                 .find(|p| p.version_size == record.version_size)
-            else {
-                continue;
-            };
-            if !filter::stored_path_matches_download_family(
-                asset.state_id(),
-                expected,
-                &derived,
-                &legacy,
-                path,
-            ) {
+                .is_some_and(|expected| {
+                    filter::stored_path_matches_download_family(
+                        asset.state_id(),
+                        expected,
+                        &derived,
+                        &legacy,
+                        path,
+                    )
+                });
+            if !recorded_name_matches && !rendered_family_matches {
                 continue;
             }
             let Some(actual) = snapshot(&config.directory, path).await? else {
