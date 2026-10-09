@@ -304,7 +304,6 @@ impl DownloadContext {
         let mut downloaded_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in downloaded_records {
             let crate::state::DownloadedFileRecord {
-                catalog_filename: _,
                 is_current_path: _,
                 added_at,
                 library,

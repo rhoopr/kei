@@ -1964,3 +1964,191 @@ async fn review501_changed_unselected_legacy_original_holds_migration() {
         assert_eq!(lookups, 0);
     }
 }
+
+#[tokio::test]
+async fn review501_legacy_changed_extensions_and_aliases_retire_after_revert() {
+    let heic = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/media/pattern.heic"
+    ));
+    #[cfg(feature = "xmp")]
+    let sidecar_modes = [false, true];
+    #[cfg(not(feature = "xmp"))]
+    let sidecar_modes = [false];
+    for sidecar in sidecar_modes {
+        let server = server().await;
+        Mock::given(method("GET"))
+            .and(path("/edit-heic"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(heic.as_slice()))
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let options = || CycleOptions {
+            #[cfg(feature = "xmp")]
+            sidecar,
+            ..CycleOptions::default()
+        };
+        let mut first = records(&server, Some(("edit-heic", heic.as_slice())));
+        first[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.heic"});
+        let (initial, _) =
+            cycle_options(root.path(), first, false, EditedNaming::Suffix, options()).await;
+        assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+        assert_bytes(&media.join("IMG_0501_edited.HEIC"), heic);
+        let second = records(&server, Some(("edit-two", EDIT_TWO)));
+        let (updated, _) =
+            cycle_options(root.path(), second, false, EditedNaming::Suffix, options()).await;
+        assert_eq!(updated.failed_count, 0, "{:?}", updated.stats);
+        assert_bytes(&media.join("IMG_0501_edited.HEIC"), heic);
+        assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_TWO);
+        // Two durable aliases can have identical content and sidecars but
+        // distinct inodes. They need distinct journaled retirement slots.
+        let alias_name = format!("IMG_0501_edited-{}.JPG", EDIT_TWO.len());
+        let alias = media.join(&alias_name);
+        std::fs::copy(media.join("IMG_0501_edited.JPG"), &alias).unwrap();
+        if sidecar {
+            std::fs::copy(
+                media.join("IMG_0501_edited.JPG.xmp"),
+                media.join(format!("{alias_name}.xmp")),
+            )
+            .unwrap();
+        }
+        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "asset-501",
+            "adjusted",
+            &alias,
+            &data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_TWO)),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(db);
+        let old_files: Vec<_> = [
+            ("IMG_0501_edited.HEIC", heic.as_slice()),
+            ("IMG_0501_edited.JPG", EDIT_TWO),
+            (alias_name.as_str(), EDIT_TWO),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| {
+            let xmp = sidecar.then(|| std::fs::read(media.join(format!("{name}.xmp"))).unwrap());
+            (name.to_owned(), bytes, xmp)
+        })
+        .collect();
+        let requests = server.received_requests().await.unwrap().len();
+        let current = records(&server, None);
+        let (migrated, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            false,
+            EditedNaming::Primary,
+            options(),
+        )
+        .await;
+        assert_eq!(
+            migrated.failed_count, 0,
+            "sidecar={sidecar}: {:?}",
+            migrated.stats
+        );
+        assert!(migrated.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let manifest = db.get_manifest_assets().await.unwrap();
+        let mut histories = Vec::new();
+        for (name, bytes, expected_xmp) in &old_files {
+            assert!(!media.join(name).exists(), "left old visible alias {name}");
+            assert!(!media.join(format!("{name}.xmp")).exists());
+            let receipt = manifest
+                .iter()
+                .flat_map(|row| &row.preserved_files)
+                .find(|receipt| {
+                    receipt
+                        .native_path
+                        .to_path()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        == Some(name.as_str())
+                })
+                .expect("missing per-path historical receipt");
+            let path = receipt.native_path.to_path();
+            assert!(
+                path.strip_prefix(&media)
+                    .unwrap()
+                    .components()
+                    .any(|part| part.as_os_str() == ".kei-history")
+            );
+            assert_bytes(&path, bytes);
+            assert_eq!(receipt.provider_checksum, provider_hash(bytes));
+            assert_eq!(
+                receipt.local_checksum,
+                data_encoding::HEXLOWER.encode(&Sha256::digest(bytes))
+            );
+            if let Some(expected) = expected_xmp {
+                let mut xmp = path.as_os_str().to_os_string();
+                xmp.push(".xmp");
+                assert_bytes(&std::path::PathBuf::from(xmp), expected);
+                assert_eq!(
+                    receipt.sidecar_checksum.as_deref(),
+                    Some(
+                        data_encoding::HEXLOWER
+                            .encode(&Sha256::digest(expected))
+                            .as_str()
+                    )
+                );
+            }
+            histories.push(path);
+        }
+        let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
+        let inventory = (
+            summary.bound_families,
+            summary.preserved_files,
+            summary.pending_operations,
+            summary.held_operations,
+        );
+        drop(db);
+        for _ in 0..2 {
+            let (quiet, lookups) = cycle_options(
+                root.path(),
+                current.clone(),
+                true,
+                EditedNaming::Primary,
+                options(),
+            )
+            .await;
+            assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+            assert!(quiet.db_sync_token_advance_safe);
+            assert_eq!(quiet.stats.downloaded, 0);
+            assert_eq!(lookups, 0);
+            assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+            for ((name, bytes, expected_xmp), history) in old_files.iter().zip(&histories) {
+                assert!(!media.join(name).exists());
+                assert_bytes(history, bytes);
+                if let Some(expected) = expected_xmp {
+                    let mut xmp = history.as_os_str().to_os_string();
+                    xmp.push(".xmp");
+                    assert_bytes(&std::path::PathBuf::from(xmp), expected);
+                }
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
+            assert_eq!(
+                (
+                    summary.bound_families,
+                    summary.preserved_files,
+                    summary.pending_operations,
+                    summary.held_operations
+                ),
+                inventory
+            );
+        }
+    }
+}

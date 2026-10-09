@@ -42,9 +42,6 @@ pub struct ImportedRecord {
 #[derive(Debug)]
 pub(crate) struct DownloadedFileRecord {
     pub(crate) added_at: Option<DateTime<Utc>>,
-    /// Recorded task filename for the owned legacy census, independent of
-    /// current selection. Naming alone never establishes path ownership.
-    pub(crate) catalog_filename: Option<String>,
     /// This receipt is also the catalog's current path, not an additional copy.
     pub(crate) is_current_path: bool,
     pub(crate) library: String,

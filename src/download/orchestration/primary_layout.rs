@@ -370,11 +370,6 @@ async fn plan(
     anyhow::ensure!(!persist || db.is_some(), "Missing primary layout database");
     let mut oldfiles = binding.map_or(Vec::new(), |b| b.files.clone());
     if binding.is_none() {
-        let legacy = DownloadConfig {
-            edited_naming: EditedNaming::Suffix,
-            ..config.clone()
-        };
-        let derived = filter::derive_expected_paths(asset, &legacy);
         let parent = crate::download::paths::local_download_dir(
             &config.directory,
             &config.folder_structure,
@@ -385,58 +380,57 @@ async fn plan(
             asset.source_zone().unwrap_or(&config.library),
             asset.state_id(),
         ) {
-            let (Some(path), Some(checksum)) = (&record.local_path, &record.local_checksum) else {
+            let Some(path) = &record.local_path else {
                 continue;
             };
-            // Selection is a future download obligation, not the inventory
-            // of already-owned local renditions. A retained original or an
-            // adjusted rendition absent after a revert still has its scoped
-            // durable task filename and exact local checksum. Only the current
-            // pass parent is eligible; prior roots and history stay retained.
-            let recorded_name_matches = path.parent() == Some(parent.as_path())
-                && record.catalog_filename.as_deref().is_some_and(|filename| {
-                    path.file_name().and_then(|name| name.to_str()) == Some(filename)
-                });
-            let rendered_family_matches = derived
-                .iter()
-                .find(|p| p.version_size == record.version_size)
-                .is_some_and(|expected| {
-                    filter::stored_path_matches_download_family(
-                        asset.state_id(),
-                        expected,
-                        &derived,
-                        &legacy,
-                        path,
-                    )
-                });
-            if !recorded_name_matches && !rendered_family_matches {
+            // Each durable per-path receipt pins its own historical filename,
+            // rendition and provider/local checksums. Neither current provider
+            // selection nor the latest catalogue filename can census earlier
+            // edits or extensions. Only this pass's parent is eligible; other
+            // roots and private history remain retained reuse sources.
+            if path.parent() != Some(parent.as_path()) {
                 continue;
             }
             let Some(actual) = snapshot(&config.directory, path).await? else {
                 continue;
             };
+            let checksum = record
+                .local_checksum
+                .as_deref()
+                .context("Legacy layout media has no trusted local checksum")?;
             anyhow::ensure!(
-                data_encoding::HEXLOWER.encode(&actual.sha256) == *checksum,
+                !record.checksum.is_empty(),
+                "Legacy layout media has no trusted provider rendition"
+            );
+            anyhow::ensure!(
+                data_encoding::HEXLOWER.encode(&actual.sha256) == checksum,
                 "Legacy layout media changed locally"
             );
             anyhow::ensure!(
-                session
+                session.owners(path)?.any(|owner| {
+                    owner.library.as_ref() == record.library
+                        && owner.asset_id.as_ref() == record.id
+                        && owner.version_size == record.version_size
+                }) && session
                     .owners(path)?
-                    .all(|r| r.library.as_ref() == record.library
-                        && r.asset_id.as_ref() == record.id),
+                    .all(|owner| owner.library.as_ref() == record.library
+                        && owner.asset_id.as_ref() == record.id),
                 "Ambiguous legacy primary path owner"
             );
             if oldfiles.iter().all(|f| f.path.to_path() != *path) {
-                oldfiles.push(
-                    file_receipt(
-                        &config.directory,
-                        path,
-                        record.version_size.as_str(),
-                        &record.checksum,
-                        record.download_checksum.clone(),
-                    )
-                    .await?,
+                let file = file_receipt(
+                    &config.directory,
+                    path,
+                    record.version_size.as_str(),
+                    &record.checksum,
+                    record.download_checksum.clone(),
+                )
+                .await?;
+                anyhow::ensure!(
+                    file.fingerprint == actual,
+                    "Legacy layout media changed during ownership verification"
                 );
+                oldfiles.push(file);
             }
         }
     }
@@ -643,7 +637,7 @@ async fn plan(
         // needs its own private slot pinned by this operation's journal.
         let retirement = preserved_path
             .to_path()
-            .with_file_name(format!(".retired-{operation}"));
+            .with_file_name(format!(".retired-{operation}-{}", members.len()));
         members.push(LayoutMember {
             record: None,
             destination: None,
