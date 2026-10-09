@@ -2291,13 +2291,16 @@ async fn path_reconciliation_preserves_mtime_and_metadata_across_retry() {
         ) {
             continue;
         }
-        reconciliation_metadata_transition(mode).await;
+        Box::pin(reconciliation_metadata_transition(mode)).await;
     }
 }
 
 #[tokio::test]
 async fn path_reconciliation_rejects_hardlinked_destination_then_recovers() {
-    reconciliation_metadata_transition(ReconciliationMetadataCase::HardLinkedDestination).await;
+    Box::pin(reconciliation_metadata_transition(
+        ReconciliationMetadataCase::HardLinkedDestination,
+    ))
+    .await;
 }
 
 #[derive(Debug)]
