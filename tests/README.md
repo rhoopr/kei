@@ -1276,7 +1276,7 @@ cover capture attachment, durable receipts, rollback, replay and unchanged follo
 
 ### Managed edited-primary qualification
 
-`cargo test --all-features --lib primary_layout` exercises the opt-in owner with file-backed SQLite, synthetic provider generations and a real local HTTP server. The fixture checks original, two edits, revert, preserved media/sidecar hashes, rendition keys, manifests, private destination generations, suffix migration/reversal, collisions, source drift, read-only plans, state-write failure, process death and quiet reopened cycles. The ignored worker is launched and killed by the parent process-death test; it is not a skipped standalone proof.
+`cargo test --all-features --lib primary_layout` exercises the opt-in owner with file-backed SQLite, synthetic provider generations and a real local HTTP server. The fixture checks original, two edits, revert, edit-again from verified history, HEIC/JPEG extension changes, preserved media/sidecar hashes, rendition keys, manifests, private destination generations, suffix migration/reversal, collisions, source drift, read-only plans, state-write failure, process death and quiet reopened cycles. The ignored worker is launched and killed by the parent process-death test; it is not a skipped standalone proof.
 
 The process-death oracle restarts at every journal boundary, checks independently retained old bytes before completion, and requires two subsequent zero-download, zero-lookup cycles. Real Live Photo fixture bytes cover both MOV naming policies; automated byte preservation does not qualify Immich pairing. Manual Immich testing requires both exclusion patterns documented in `docs/edited-primary.md`.
 

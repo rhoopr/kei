@@ -1491,8 +1491,39 @@ impl DownloadContextStateStore for SqliteStateDb {
                     download_checksum: row.get(6)?,
                 })
             })?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(StateError::from)
+            let mut receipts = rows.collect::<Result<Vec<_>, _>>()?;
+            // Earlier revisions are independently owned sources, not current
+            // path ownership. Reuse them only through the layout owner's exact
+            // native-path and SHA proof plus a retained inode before copying to a stage.
+            let mut history = conn.prepare_cached(
+                "SELECT o.header,p.evidence FROM primary_layout_preserved p \
+                 JOIN primary_layout_operations o ON o.operation=p.operation \
+                 WHERE o.phase='committed' ORDER BY o.operation,p.member",
+            )?;
+            let history = history.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for entry in history {
+                let (header, evidence) = entry?;
+                let operation: super::primary_layout::LayoutOperation =
+                    super::primary_layout::decode(&header)?;
+                let file: super::primary_layout::LayoutFile =
+                    super::primary_layout::decode(&evidence)?;
+                let version_size = VersionSizeKey::from_str(&file.version)
+                    .ok_or(StateError::ProviderSelectionInvalid)?;
+                receipts.push(DownloadedFileRecord {
+                    library: operation.library,
+                    id: operation.child,
+                    version_size,
+                    checksum: file.provider_checksum,
+                    local_path: Some(file.path.to_path()),
+                    local_checksum: Some(data_encoding::HEXLOWER.encode(&file.fingerprint.sha256)),
+                    download_checksum: file.source_checksum,
+                    is_current_path: false,
+                    added_at: None,
+                });
+            }
+            Ok(receipts)
         })
         .await
     }

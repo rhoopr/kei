@@ -445,6 +445,162 @@ async fn contract_file_publish_no_overwrite_primary_layout_edits_revert_and_quie
         );
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
     }
+    // Reusing a previously observed edit after a confirmed revert must retain
+    // its stable provider rendition and independent historical receipts.
+    let edited_again = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (again, _) = cycle(
+        root.path(),
+        edited_again.clone(),
+        false,
+        EditedNaming::Primary,
+    )
+    .await;
+    assert_eq!(again.failed_count, 0, "{:?}", again.stats);
+    assert!(again.db_sync_token_advance_safe);
+    assert_eq!(
+        again.stats.downloaded, 0,
+        "re-observed edit ignored its verified history source"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+    let requests = server.received_requests().await.unwrap().len();
+    let operations = db_count(
+        root.path(),
+        "SELECT COUNT(*) FROM primary_layout_operations",
+    );
+    for _ in 0..2 {
+        let (quiet, lookups) = cycle(
+            root.path(),
+            edited_again.clone(),
+            true,
+            EditedNaming::Primary,
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0);
+        assert!(quiet.db_sync_token_advance_safe);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(lookups, 0);
+        assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
+        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations"
+            ),
+            operations
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    let manifest = db.get_manifest_assets().await.unwrap();
+    let files: std::collections::HashSet<_> = manifest
+        .iter()
+        .flat_map(|row| &row.preserved_files)
+        .map(|receipt| receipt.native_path.to_path())
+        .collect();
+    let inventory = db.get_summary().await.unwrap().primary_layout.unwrap();
+    assert_eq!(
+        inventory.preserved_files,
+        u64::try_from(files.len()).unwrap(),
+        "inventory counted multiple receipts for one physical preserved file"
+    );
+}
+
+#[tokio::test]
+async fn primary_layout_heic_jpeg_extension_changes_retire_only_preserved_owned_aliases() {
+    let original = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/media/pattern.heic"
+    ));
+    let server = MockServer::start().await;
+    for (endpoint, bytes) in [
+        ("original", original.as_slice()),
+        ("edit-one", EDIT_ONE),
+        ("edit-two", EDIT_TWO),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{endpoint}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&server)
+            .await;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    for (index, edit, current_name, current_bytes) in [
+        (0, None, "IMG_0501.HEIC", original.as_slice()),
+        (1, Some(("edit-one", EDIT_ONE)), "IMG_0501.JPG", EDIT_ONE),
+        (2, None, "IMG_0501.HEIC", original.as_slice()),
+        (3, Some(("edit-two", EDIT_TWO)), "IMG_0501.JPG", EDIT_TWO),
+    ] {
+        let mut current = records(&server, edit);
+        current[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0501.HEIC");
+        current[0]["fields"]["itemType"] = json!({"value":"public.heic"});
+        current[0]["fields"]["resOriginalRes"] = resource(&server.uri(), "original", original);
+        current[0]["fields"]["resOriginalFileType"] = json!({"value":"public.heic"});
+        let (changed, _) = cycle(root.path(), current.clone(), false, EditedNaming::Primary).await;
+        assert_eq!(
+            changed.failed_count, 0,
+            "transition {index}: {:?}",
+            changed.stats
+        );
+        assert!(changed.db_sync_token_advance_safe);
+        assert_bytes(&media.join(current_name), current_bytes);
+        let obsolete = if current_name.ends_with(".HEIC") {
+            "IMG_0501.JPG"
+        } else {
+            "IMG_0501.HEIC"
+        };
+        assert!(
+            !media.join(obsolete).exists(),
+            "obsolete visible alias at transition {index}"
+        );
+        if index == 0 {
+            assert!(!media.join("IMG_0501_original.HEIC").exists());
+        } else {
+            assert_bytes(&media.join("IMG_0501_original.HEIC"), original);
+        }
+        let operations = db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations",
+        );
+        let requests = server.received_requests().await.unwrap().len();
+        for _ in 0..2 {
+            let (quiet, lookups) =
+                cycle(root.path(), current.clone(), true, EditedNaming::Primary).await;
+            assert_eq!(quiet.failed_count, 0);
+            assert!(quiet.db_sync_token_advance_safe);
+            assert_eq!(quiet.stats.downloaded, 0);
+            assert_eq!(lookups, 0, "transition {index}: {:?}", quiet.stats);
+            assert_bytes(&media.join(current_name), current_bytes);
+            assert!(!media.join(obsolete).exists());
+            assert_eq!(
+                db_count(
+                    root.path(),
+                    "SELECT COUNT(*) FROM primary_layout_operations"
+                ),
+                operations
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        }
+    }
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    let manifest = db.get_manifest_assets().await.unwrap();
+    assert!(
+        manifest
+            .iter()
+            .flat_map(|row| &row.preserved_files)
+            .any(|receipt| std::fs::read(receipt.native_path.to_path()).unwrap() == EDIT_ONE)
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        3,
+        "local revert redownloaded a proved original"
+    );
 }
 
 #[tokio::test]

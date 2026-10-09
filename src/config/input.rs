@@ -255,6 +255,7 @@ mod tests {
             "photos.live_photo_mode",
             "photos.live_photo_mov_filename_policy",
             "photos.edited",
+            "photos.edited_naming",
             "photos.alternative",
             "photos.raw_policy",
             "photos.file_match_policy",

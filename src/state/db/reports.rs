@@ -441,7 +441,7 @@ impl SqliteStateDb {
                 )?);
             }
 
-            let primary = conn.query_row("SELECT (SELECT COUNT(*) FROM primary_layout_bindings),(SELECT COUNT(*) FROM primary_layout_preserved),(SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')),(SELECT COUNT(*) FROM primary_layout_operations WHERE conflict IS NOT NULL AND phase NOT IN ('committed','cancelled'))",[],|row|Ok(crate::state::types::PrimaryLayoutSummary {bound_families:u64::try_from(row.get::<_,i64>(0)?).unwrap_or(0),preserved_files:u64::try_from(row.get::<_,i64>(1)?).unwrap_or(0),pending_operations:u64::try_from(row.get::<_,i64>(2)?).unwrap_or(0),held_operations:u64::try_from(row.get::<_,i64>(3)?).unwrap_or(0)}))?;
+            let primary = conn.query_row("SELECT (SELECT COUNT(*) FROM primary_layout_bindings),(SELECT COUNT(DISTINCT native_path) FROM primary_layout_preserved),(SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')),(SELECT COUNT(*) FROM primary_layout_operations WHERE conflict IS NOT NULL AND phase NOT IN ('committed','cancelled'))",[],|row|Ok(crate::state::types::PrimaryLayoutSummary {bound_families:u64::try_from(row.get::<_,i64>(0)?).unwrap_or(0),preserved_files:u64::try_from(row.get::<_,i64>(1)?).unwrap_or(0),pending_operations:u64::try_from(row.get::<_,i64>(2)?).unwrap_or(0),held_operations:u64::try_from(row.get::<_,i64>(3)?).unwrap_or(0)}))?;
             let primary_layout = (primary.bound_families + primary.preserved_files + primary.pending_operations > 0).then_some(primary);
             Ok(SyncSummary {
                 primary_layout,

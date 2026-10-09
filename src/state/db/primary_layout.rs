@@ -411,6 +411,15 @@ impl SqliteStateDb {
                     files.push(installed.clone());
                 }
             }
+            if op.members.iter().any(|member|member.record.is_some()) {
+                // Match the ordinary verified-download finalizer: the selected
+                // metadata was captured from the confirmed provider source and
+                // committed with its independently validated files.
+                super::asset_writes::record_metadata_capture_revision(
+                    &tx,&op.library,&op.child,crate::state::METADATA_CAPTURE_REVISION,
+                    chrono::Utc::now().timestamp(),
+                )?;
+            }
             for old in op.members.iter().filter_map(|member|member.old.as_ref()) {
                 if !files.iter().any(|file|file.path==old.path && file.version==old.version && file.provider_checksum==old.provider_checksum) {
                     tx.execute("INSERT OR IGNORE INTO primary_layout_superseded_paths VALUES(?1,?2,?3,?4,?5,?6)",params![op.library,op.child,old.version,old.provider_checksum,encode(&old.path)?,old.path.to_path().to_str()])?;

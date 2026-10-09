@@ -712,6 +712,10 @@ where
                                 );
                                 if outcome.downloaded == 0 {
                                     skips.on_disk += 1;
+                                } else {
+                                    // This asset completed through the layout
+                                    // owner instead of the ordinary task queue.
+                                    assets_forwarded += 1;
                                 }
                             }
                             Ok(None) => {

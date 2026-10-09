@@ -623,14 +623,12 @@ async fn plan(
             continue;
         }
         let preserved_path = preservation_path(&old, &family);
-        let retirement = preserved_path.to_path().with_file_name(format!(
-            ".retired-{}",
-            old.path
-                .to_path()
-                .file_name()
-                .context("Missing obsolete primary filename")?
-                .to_string_lossy()
-        ));
+        // The same contents may become current and retire again after a revert.
+        // Their immutable history path remains stable, but each consumed inode
+        // needs its own private slot pinned by this operation's journal.
+        let retirement = preserved_path
+            .to_path()
+            .with_file_name(format!(".retired-{operation}"));
         members.push(LayoutMember {
             record: None,
             destination: None,
@@ -1147,7 +1145,10 @@ pub(in crate::download) async fn finish(
                         .preserved
                         .as_ref()
                         .context("Missing sidecar preservation")?;
-                    let retired = sidecar(&preserved.path.to_path()).with_extension("xmp.retired");
+                    let retired = preserved
+                        .path
+                        .to_path()
+                        .with_file_name(format!(".retired-sidecar-{}-{index}", op.operation));
                     file::primary_layout::retire(&root, &xmp_path, &retired, old).await?;
                 } else {
                     anyhow::ensure!(
