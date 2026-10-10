@@ -383,6 +383,9 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "assets_seen",
         ]),
         "support_checkpoint_v1" => Some(&[
+            "decision",
+            "basis",
+            "persistence",
             "reason",
             "recovery",
             "token_present",
@@ -442,6 +445,19 @@ pub(crate) fn fixed_label(value: &str) -> bool {
 }
 
 const LABELS: &[&str] = &[
+    "dry_run",
+    "stale_pass_plan",
+    "state_not_durable",
+    "token_proof_incomplete",
+    "legacy_preservation_incomplete",
+    "inventory_delta_bridge_failed",
+    "incremental_delta",
+    "complete_inventory",
+    "inventory_with_delta_bridge",
+    "no_state_db",
+    "staged_reconciliation",
+    "stored",
+    "stored_hold",
     "name_only_indexing",
     "selected_qualified_indexing",
     "private",

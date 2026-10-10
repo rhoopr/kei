@@ -294,6 +294,18 @@ pub(crate) enum SourceCheckpointDecision {
     },
 }
 
+/// Capture the owning decision without serializing its provider token.
+pub(crate) fn checkpoint_support_fields(decision: &SourceCheckpointDecision) -> serde_json::Value {
+    match decision {
+        SourceCheckpointDecision::Advance { basis, .. } => serde_json::json!({
+            "decision":"advanced", "basis":basis.as_str(), "recovery":"none"
+        }),
+        SourceCheckpointDecision::Preserve { reason, recovery } => serde_json::json!({
+            "decision":"preserved", "reason":reason.as_str(), "recovery":recovery.as_str()
+        }),
+    }
+}
+
 fn source_checkpoint_decision(
     result: &download::SyncResult,
     dry_run: bool,
@@ -1564,6 +1576,8 @@ pub(crate) async fn run_cycle(
                 && sync_result.checkpoint.state_write_failures == 0
                 && !legacy_cycle.requires_inventory()));
 
+        let mut checkpoint_evidence = checkpoint_support_fields(&checkpoint_decision);
+        let mut checkpoint_persistence = "no_state_db";
         match checkpoint_decision {
             SourceCheckpointDecision::Advance { token, basis } => {
                 crate::metrics::record_checkpoint_decision("advanced", basis.as_str());
@@ -1607,6 +1621,9 @@ pub(crate) async fn run_cycle(
                                 error = %e,
                                 "Failed to retain completed zone reconciliation checkpoint"
                             );
+                            checkpoint_persistence = "failed";
+                        } else {
+                            checkpoint_persistence = "staged_reconciliation";
                         }
                     } else {
                         let mut metadata_updates = vec![(lib_state.sync_token_key.clone(), token)];
@@ -1649,7 +1666,9 @@ pub(crate) async fn run_cycle(
                             db_sync_token_advance_safe = false;
                             path_reconciliation_cycle_safe = false;
                             tracing::warn!(error = %e, "Failed to store provider checkpoint");
+                            checkpoint_persistence = "failed";
                         } else {
+                            checkpoint_persistence = "stored";
                             if cycle_has_stale_plan && !lib_state.plan_is_stale {
                                 tracing::warn!(
                                     zone = %lib_state.zone_name,
@@ -1705,6 +1724,9 @@ pub(crate) async fn run_cycle(
                 {
                     path_reconciliation_cycle_safe = false;
                     tracing::debug!(error = %e, "Failed to persist checkpoint hold status");
+                    checkpoint_persistence = "failed";
+                } else if state_db.is_some() {
+                    checkpoint_persistence = "stored_hold";
                 }
                 let diagnostic = sync_result
                     .stats
@@ -1725,17 +1747,43 @@ pub(crate) async fn run_cycle(
             }
         }
 
+        if let Some(fields) = checkpoint_evidence.as_object_mut() {
+            fields.insert(
+                "persistence".into(),
+                serde_json::json!(checkpoint_persistence),
+            );
+            fields.insert(
+                "token_present".into(),
+                serde_json::json!(sync_result.sync_token.is_some()),
+            );
+            fields.insert(
+                "full_enumeration".into(),
+                serde_json::json!(sync_result.full_enumeration_ran),
+            );
+            fields.insert(
+                "identity_incomplete".into(),
+                serde_json::json!(sync_result.checkpoint.identity_incomplete),
+            );
+            fields.insert(
+                "state_write_failures".into(),
+                serde_json::json!(sync_result.checkpoint.state_write_failures),
+            );
+            fields.insert(
+                "enumeration_errors".into(),
+                serde_json::json!(sync_result.checkpoint.enumeration_errors),
+            );
+            if checkpoint_persistence == "failed" {
+                fields.insert(
+                    "recovery".into(),
+                    serde_json::json!("replay_from_prior_token"),
+                );
+            }
+        }
         crate::support::observe_scoped(
             &lib_state.zone_name,
             None,
             "support_checkpoint_v1",
-            serde_json::json!({
-                "reason": sync_result.stats.sync_token_blocked_reason.unwrap_or(if sync_result.stats.sync_token_blocked { "provider_checkpoint_preserved" } else { "advanced" }),
-                "token_present": sync_result.sync_token.is_some(), "full_enumeration": sync_result.full_enumeration_ran,
-                "identity_incomplete": sync_result.checkpoint.identity_incomplete,
-                "state_write_failures": sync_result.checkpoint.state_write_failures,
-                "enumeration_errors": sync_result.checkpoint.enumeration_errors,
-            }),
+            checkpoint_evidence,
         );
         crate::support::observe_scoped(
             &lib_state.zone_name,

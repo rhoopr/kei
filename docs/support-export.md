@@ -42,7 +42,7 @@ The version 1 export has a versioned allowlist and these sections:
 - Bounded read-only account state totals and durable retry, unresolved identity,
   metadata, publication and reconciliation work counts.
 - Retained operation/cycle IDs, UTC times, outcomes, transfer versus disk-write
-  totals, checkpoint reasons, token receiver and recovery counts.
+  totals, checkpoint decisions, reasons, recovery actions and persistence results, token receiver and recovery counts.
 - Grouped typed lookup, owner/discovery, inventory, sparse-reference, metadata,
   transfer, import, publication and completion evidence. New free-text provider
   failures remain unavailable until an explicit safe contract is added.

@@ -138,3 +138,69 @@ fn tim_paired_counts_remain_overlapping_observations() {
     assert_eq!(h.cycles[0].diagnostics.len(), 3);
     assert_eq!(h.cycles[0].diagnostics[1].fields["rejected_requests"], 17);
 }
+
+#[test]
+fn owning_checkpoint_decisions_survive_support_allowlist_without_tokens() {
+    use crate::download::RecoveryAction;
+    use crate::sync_cycle::{
+        CheckpointBasis, CheckpointHoldReason, SourceCheckpointDecision, checkpoint_support_fields,
+    };
+    for reason in [
+        CheckpointHoldReason::DryRun,
+        CheckpointHoldReason::StalePassPlan,
+        CheckpointHoldReason::Interrupted,
+        CheckpointHoldReason::SessionExpired,
+        CheckpointHoldReason::EnumerationIncomplete,
+        CheckpointHoldReason::StateNotDurable,
+        CheckpointHoldReason::TokenProofIncomplete,
+        CheckpointHoldReason::LegacyPreservationIncomplete,
+    ] {
+        let decision = SourceCheckpointDecision::Preserve {
+            reason,
+            recovery: RecoveryAction::ReplayFromPriorToken,
+        };
+        let fields = checkpoint_support_fields(&decision);
+        let projected =
+            super::privacy::diagnostic("support_checkpoint_v1", fields.as_object().unwrap())
+                .unwrap();
+        assert_eq!(serde_json::Value::Object(projected), fields);
+        assert_eq!(fields["decision"], "preserved");
+    }
+    for basis in [
+        CheckpointBasis::IncrementalDelta,
+        CheckpointBasis::CompleteInventory,
+        CheckpointBasis::InventoryWithDeltaBridge,
+    ] {
+        let fields = checkpoint_support_fields(&SourceCheckpointDecision::Advance {
+            token: "PRIVATE_PROVIDER_TOKEN".into(),
+            basis,
+        });
+        let projected =
+            super::privacy::diagnostic("support_checkpoint_v1", fields.as_object().unwrap())
+                .unwrap();
+        assert_eq!(serde_json::Value::Object(projected), fields);
+        assert!(!fields.to_string().contains("PRIVATE"));
+    }
+    for persistence in [
+        "failed",
+        "stored",
+        "stored_hold",
+        "staged_reconciliation",
+        "no_state_db",
+    ] {
+        let fields = serde_json::json!({"persistence": persistence});
+        assert_eq!(
+            serde_json::Value::Object(
+                super::privacy::diagnostic("support_checkpoint_v1", fields.as_object().unwrap())
+                    .unwrap()
+            ),
+            fields
+        );
+    }
+    assert_eq!(
+        super::privacy::stats(
+            &serde_json::json!({"sync_token_blocked_reason":"inventory_delta_bridge_failed"})
+        )["sync_token_blocked_reason"],
+        "inventory_delta_bridge_failed"
+    );
+}
