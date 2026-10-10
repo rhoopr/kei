@@ -42,7 +42,8 @@ The version 1 export has a versioned allowlist and these sections:
 - Bounded read-only account state totals and durable retry, unresolved identity,
   metadata, publication and reconciliation work counts.
 - Retained operation/cycle IDs, UTC times, outcomes, transfer versus disk-write
-  totals, checkpoint decisions, reasons, recovery actions and persistence results, token receiver and recovery counts.
+  totals, checkpoint decisions, reasons, recovery actions and persistence
+  results, token receiver and recovery counts.
 - Grouped typed lookup, owner/discovery, inventory, sparse-reference, metadata,
   transfer, import, publication and completion evidence. New free-text provider
   failures remain unavailable until an explicit safe contract is added.
@@ -58,7 +59,8 @@ Normal sync, service-run and import operations retain evidence independently of
 log verbosity. Recording is optional evidence and cannot change backup or
 checkpoint decisions. History is account-scoped and persists across restarts.
 It retains at most 16 records, 128 diagnostic groups per record and 512 KiB.
-An asynchronous queue holds at most 256 observations. Repeated observations
+An asynchronous queue holds at most 256 observations. If a cycle handoff is
+lost, its later observations are omitted rather than assigned to a prior cycle. Repeated observations
 with identical fixed fields are grouped; overflow and rotation are counted.
 The worker serializes accepted observations, fsyncs a private staging file and
 atomically replaces the history under a single-writer lock. Writes coalesce for up to 500 ms; orderly shutdown
@@ -87,6 +89,12 @@ transition, not durable finalization. A successful receipt recovery describes
 state recovery without a new byte publication. Fractional metadata observations
 contain booleans and verification results, never capture dates or locations.
 Absent fields were not recorded; null selection comparability is unavailable.
+Initial inventory, delta bridge and combined invocation counts are labeled
+separately. Query completion is recorded by the provider fetcher; aggregate
+absence of errors never asserts inventory completeness. Import records identify
+child versus legacy-master selection and path-shape matches without identifiers.
+Metadata plan records compare source and actual planned precision in one event;
+publication failure does not assert whether replacement committed when unknown.
 Current CLI overrides appear in retained effective settings rather than the
 collector's current-file view.
 

@@ -646,3 +646,21 @@ pub(crate) fn test_layer() -> (Recorder, impl Fn() -> Vec<Value>) {
             .collect()
     })
 }
+
+/// The same sanitized reader used by offline collection, exposed only to tests
+/// that exercise a production owner through the real persistent worker.
+#[cfg(test)]
+pub(crate) fn test_retained_events(path: &Path) -> Vec<Value> {
+    let (history, status) = read(path);
+    assert_eq!(status, "available");
+    history
+        .cycles
+        .into_iter()
+        .flat_map(|cycle| {
+            cycle
+                .diagnostics
+                .into_iter()
+                .map(|d| serde_json::json!({"kind":d.kind,"fields":d.fields}))
+        })
+        .collect()
+}

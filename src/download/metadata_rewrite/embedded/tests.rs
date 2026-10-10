@@ -234,8 +234,10 @@ async fn embed_path_replaces_orphaned_offset_before_writing_timestamp() {
 async fn production_metadata_plan_and_io_error_are_safe_support_evidence() {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::layer::SubscriberExt;
-    let (layer, drain) = crate::support::history::test_layer();
     let dir = tempfile::tempdir().unwrap();
+    let history = dir.path().join("retained.support.json");
+    let (layer, guard) =
+        crate::support::history::start(history.clone(), serde_json::json!({})).unwrap();
     let path = dir.path().join("PRIVATE_MEDIA.jpg");
     let created = chrono::DateTime::parse_from_rfc3339("2026-10-10T10:20:30.123+00:00").unwrap();
     let result = super::prepare_embed_metadata(
@@ -250,7 +252,8 @@ async fn production_metadata_plan_and_io_error_are_safe_support_evidence() {
     .with_subscriber(tracing_subscriber::registry().with(layer))
     .await;
     assert!(matches!(result, super::EmbedPrepareResult::Failed));
-    let evidence = drain();
+    guard.finish().await;
+    let evidence = crate::support::history::test_retained_events(&history);
     let plan = evidence
         .iter()
         .find(|v| v["kind"] == "support_metadata_v1" && v["fields"]["source_fractional"] == true)

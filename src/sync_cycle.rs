@@ -2167,7 +2167,7 @@ mod tests {
                 Some("PRIVATE_TOKEN".into()),
                 download::SyncStats {
                     assets_seen: 3899,
-                    api_total_at_start: 3899,
+                    api_total_at_start: Some(3899),
                     ..Default::default()
                 },
             );
@@ -2177,7 +2177,7 @@ mod tests {
                 Some("PRIVATE_SUCCESSOR".into()),
                 download::SyncStats {
                     assets_seen: 238,
-                    api_total_at_start: 238,
+                    api_total_at_start: Some(238),
                     ..Default::default()
                 },
             );

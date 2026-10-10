@@ -456,8 +456,10 @@ async fn sidecar_write_reads_source_gps_from_dng_content() {
 async fn production_sidecar_io_error_is_typed_support_evidence() {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::layer::SubscriberExt;
-    let (layer, drain) = crate::support::history::test_layer();
     let dir = tempfile::tempdir().unwrap();
+    let history = dir.path().join("retained.support.json");
+    let (layer, guard) =
+        crate::support::history::start(history.clone(), serde_json::json!({})).unwrap();
     let path = dir.path().join("absent").join("PRIVATE_MEDIA.jpg");
     let ok = write_sidecar_metadata(
         &path,
@@ -469,7 +471,8 @@ async fn production_sidecar_io_error_is_typed_support_evidence() {
     .with_subscriber(tracing_subscriber::registry().with(layer))
     .await;
     assert!(!ok);
-    let evidence = drain();
+    guard.finish().await;
+    let evidence = crate::support::history::test_retained_events(&history);
     assert!(evidence.iter().any(|v| v["kind"] == "support_task_error_v1"
         && v["fields"]["stage"] == "sidecar_write"
         && v["fields"]["errno"].is_number()));
